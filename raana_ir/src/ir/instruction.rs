@@ -1,6 +1,18 @@
-use super::types::Type;
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    num::NonZeroU32,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
+use crate::ir::{
+    inst_kind::{
+        Binary, BlockArgRef, Branch, Call, Float, FuncArgRef, GetElemPtr, GetPtr, GlobalAlloc,
+        Integer, Jump, Load, Return, Store,
+    },
+    types::Type,
+};
+
+#[derive(Debug, Clone)]
 pub struct InstData {
     ty: Type,
     name: Option<String>,
@@ -8,6 +20,7 @@ pub struct InstData {
     used_by: HashSet<Inst>,
 }
 
+#[derive(Debug, Clone)]
 pub enum InstKind {
     Undef,
     ZeroInit,
@@ -19,7 +32,7 @@ pub enum InstKind {
     Return(Return),
     GetElemPtr(GetElemPtr),
     GetPtr(GetPtr),
-    Alloc(Alloc),
+    Alloc,
     GlobalAlloc(GlobalAlloc),
     Store(Store),
     Load(Load),
@@ -28,84 +41,16 @@ pub enum InstKind {
     FunkArgRef(FuncArgRef),
 }
 
-pub struct Integer {
-    value: i32,
+pub type Inst = NonZeroU32;
+
+static LOCAL_INST_ID: AtomicU32 = AtomicU32::new(0x00000001);
+
+static GLOBAL_INST_ID: AtomicU32 = AtomicU32::new(0x40000000);
+
+pub fn next_local_inst_id() -> Inst {
+    unsafe { NonZeroU32::new_unchecked(LOCAL_INST_ID.fetch_add(1, Ordering::Relaxed)) }
 }
 
-pub struct Float {
-    value: f32,
+pub fn next_global_inst_id() -> Inst {
+    unsafe { NonZeroU32::new_unchecked(GLOBAL_INST_ID.fetch_add(1, Ordering::Relaxed)) }
 }
-
-pub struct Binary {
-    op: BinaryOp,
-    lhs: Inst,
-    rhs: Inst,
-}
-
-pub enum BinaryOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Rem,
-}
-
-pub struct Jump {
-    target: BasicBlock,
-    args: Vec<Inst>,
-}
-
-pub struct Branch {
-    t_target: BasicBlock,
-    t_args: Vec<Inst>,
-    f_target: BasicBlock,
-    f_args: Vec<Inst>,
-}
-
-pub struct Return {
-    value: Option<Inst>,
-}
-
-pub struct GetElemPtr {
-    base: Inst,
-    offset: Inst,
-}
-
-pub struct GetPtr {
-    base: Inst,
-    offset: Inst,
-}
-
-pub struct Alloc;
-
-pub struct Store {
-    src: Inst,
-    dest: Inst,
-}
-
-pub struct Load {
-    src: Inst,
-    dest: Inst,
-}
-
-pub struct Call {
-    callee: Function,
-    args: Vec<Inst>,
-}
-
-pub struct BlockArgRef {
-    index: usize,
-}
-
-pub struct FuncArgRef {
-    index: usize,
-}
-
-pub struct GlobalAlloc {
-    init: Inst,
-}
-
-// Temporary placeholder.
-pub struct Inst;
-pub struct BasicBlock;
-pub struct Function;

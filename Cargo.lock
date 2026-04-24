@@ -3,9 +3,9 @@
 version = 4
 
 [[package]]
-name = "RannaIR"
+name = "raana_ir"
 version = "0.1.0"
 
 [[package]]
-name = "SoyoCompiler"
+name = "soyo_compiler"
 version = "0.1.0"

@@ -1,3 +1,8 @@
+use crate::ir::{
+    instruction::{InstData, InstKind},
+    types::Type,
+};
+
 #[derive(Debug, Clone)]
 pub struct Integer {
     value: i32,
@@ -6,6 +11,10 @@ pub struct Integer {
 impl Integer {
     pub fn value(&self) -> i32 {
         self.value
+    }
+
+    pub(crate) fn new_data(value: i32) -> InstData {
+        InstData::new(Type::get_i32(), InstKind::Integer(Integer { value }))
     }
 }
 
@@ -17,5 +26,9 @@ pub struct Float {
 impl Float {
     pub fn value(&self) -> f32 {
         self.value
+    }
+
+    pub(crate) fn new_data(value: f32) -> InstData {
+        InstData::new(Type::get_f32(), InstKind::Float(Float { value }))
     }
 }

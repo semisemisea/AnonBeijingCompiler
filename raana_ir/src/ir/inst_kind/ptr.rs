@@ -1,4 +1,7 @@
-use crate::ir::instruction::Inst;
+use crate::ir::{
+    instruction::{Inst, InstData, InstKind},
+    types::Type,
+};
 
 #[derive(Debug, Clone)]
 pub struct GetElemPtr {
@@ -7,12 +10,16 @@ pub struct GetElemPtr {
 }
 
 impl GetElemPtr {
-    pub fn base(&self) -> std::num::NonZero<u32> {
+    pub fn base(&self) -> Inst {
         self.base
     }
 
-    pub fn offset(&self) -> std::num::NonZero<u32> {
+    pub fn offset(&self) -> Inst {
         self.offset
+    }
+
+    pub fn new_data(base: Inst, offset: Inst, ty: Type) -> InstData {
+        InstData::new(ty, InstKind::GetElemPtr(GetElemPtr { base, offset }))
     }
 }
 
@@ -23,11 +30,15 @@ pub struct GetPtr {
 }
 
 impl GetPtr {
-    pub fn base(&self) -> std::num::NonZero<u32> {
+    pub fn base(&self) -> Inst {
         self.base
     }
 
-    pub fn offset(&self) -> std::num::NonZero<u32> {
+    pub fn offset(&self) -> Inst {
         self.offset
+    }
+
+    pub fn new_data(base: Inst, offset: Inst, ty: Type) -> InstData {
+        InstData::new(ty, InstKind::GetPtr(GetPtr { base, offset }))
     }
 }

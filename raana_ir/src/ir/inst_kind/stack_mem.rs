@@ -1,4 +1,7 @@
-use crate::ir::instruction::Inst;
+use crate::ir::{
+    instruction::{Inst, InstData, InstKind},
+    types::Type,
+};
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -7,27 +10,30 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn src(&self) -> std::num::NonZero<u32> {
+    pub fn src(&self) -> Inst {
         self.src
     }
 
-    pub fn dest(&self) -> std::num::NonZero<u32> {
+    pub fn dest(&self) -> Inst {
         self.dest
+    }
+
+    pub fn new_data(src: Inst, dest: Inst) -> InstData {
+        InstData::new(Type::get_unit(), InstKind::Store(Store { src, dest }))
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Load {
     src: Inst,
-    dest: Inst,
 }
 
 impl Load {
-    pub fn src(&self) -> std::num::NonZero<u32> {
+    pub fn src(&self) -> Inst {
         self.src
     }
 
-    pub fn dest(&self) -> std::num::NonZero<u32> {
-        self.dest
+    pub fn new_data(src: Inst, ty: Type) -> InstData {
+        InstData::new(ty, InstKind::Load(Load { src }))
     }
 }

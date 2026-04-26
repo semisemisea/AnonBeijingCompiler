@@ -1,4 +1,7 @@
-use crate::ir::instruction::Inst;
+use crate::ir::{
+    instruction::{Inst, InstData, InstKind},
+    types::Type,
+};
 
 #[derive(Debug, Clone)]
 pub struct Return {
@@ -6,7 +9,11 @@ pub struct Return {
 }
 
 impl Return {
-    pub fn value(&self) -> Option<std::num::NonZero<u32>> {
+    pub fn value(&self) -> Option<Inst> {
         self.value
+    }
+
+    pub fn new_data(value: Option<Inst>) -> InstData {
+        InstData::new(Type::get_unit(), InstKind::Return(Return { value }))
     }
 }

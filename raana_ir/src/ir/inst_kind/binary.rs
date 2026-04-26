@@ -1,4 +1,7 @@
-use crate::ir::instruction::Inst;
+use crate::ir::{
+    instruction::{Inst, InstData, InstKind},
+    types::Type,
+};
 
 #[derive(Debug, Clone)]
 pub struct Binary {
@@ -12,12 +15,16 @@ impl Binary {
         &self.op
     }
 
-    pub fn lhs(&self) -> std::num::NonZero<u32> {
+    pub fn lhs(&self) -> Inst {
         self.lhs
     }
 
-    pub fn rhs(&self) -> std::num::NonZero<u32> {
+    pub fn rhs(&self) -> Inst {
         self.rhs
+    }
+
+    pub fn new_data(lhs: Inst, rhs: Inst, op: BinaryOp, ty: Type) -> InstData {
+        InstData::new(ty, InstKind::Binary(Binary { lhs, rhs, op }))
     }
 }
 

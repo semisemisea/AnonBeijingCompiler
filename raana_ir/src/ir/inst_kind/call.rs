@@ -1,4 +1,8 @@
-use crate::ir::{function::Function, instruction::Inst};
+use crate::ir::{
+    function::Function,
+    instruction::{Inst, InstData, InstKind},
+    types::Type,
+};
 
 #[derive(Debug, Clone)]
 pub struct Call {
@@ -7,11 +11,15 @@ pub struct Call {
 }
 
 impl Call {
-    pub fn callee(&self) -> std::num::NonZero<u32> {
+    pub fn callee(&self) -> Function {
         self.callee
     }
 
-    pub fn args(&self) -> &[std::num::NonZero<u32>] {
+    pub fn args(&self) -> &[Inst] {
         &self.args
+    }
+
+    pub fn new_data(callee: Function, args: Vec<Inst>, ty: Type) -> InstData {
+        InstData::new(ty, InstKind::Call(Call { callee, args }))
     }
 }

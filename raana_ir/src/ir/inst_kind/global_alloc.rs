@@ -1,4 +1,7 @@
-use crate::ir::instruction::Inst;
+use crate::ir::{
+    instruction::{Inst, InstData, InstKind},
+    types::Type,
+};
 
 #[derive(Debug, Clone)]
 pub struct GlobalAlloc {
@@ -6,7 +9,11 @@ pub struct GlobalAlloc {
 }
 
 impl GlobalAlloc {
-    pub fn init(&self) -> std::num::NonZero<u32> {
+    pub fn init(&self) -> Inst {
         self.init
+    }
+
+    pub fn new_data(init: Inst, ty: Type) -> InstData {
+        InstData::new(ty, InstKind::GlobalAlloc(GlobalAlloc { init }))
     }
 }

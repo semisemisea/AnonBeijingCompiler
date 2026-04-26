@@ -12,10 +12,21 @@ pub struct BasicBlockData {
     insts: LinkedList<Inst>,
 }
 
-pub type BasicBlock = NonZeroU32;
+impl BasicBlockData {
+    pub fn new(name: String, params: Vec<Inst>) -> BasicBlockData {
+        BasicBlockData {
+            name,
+            params,
+            insts: LinkedList::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BasicBlock(NonZeroU32);
 
 static BBID: AtomicU32 = AtomicU32::new(1);
 
 fn next_bbid() -> BasicBlock {
-    unsafe { NonZeroU32::new_unchecked(BBID.fetch_add(1, Ordering::Relaxed)) }
+    BasicBlock(unsafe { NonZeroU32::new_unchecked(BBID.fetch_add(1, Ordering::Relaxed)) })
 }

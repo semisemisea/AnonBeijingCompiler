@@ -104,6 +104,10 @@ impl Type {
         matches!(self.0.as_ref(), TypeKind::Float32)
     }
 
+    pub fn is_scalar(&self) -> bool {
+        self.is_i32() || self.is_f32()
+    }
+
     pub fn is_unit(&self) -> bool {
         matches!(self.0.as_ref(), TypeKind::Unit)
     }
@@ -114,6 +118,24 @@ impl Type {
             TypeKind::Int32 | TypeKind::Float32 => 4,
             TypeKind::Array(base, len) => base.size() * len,
             TypeKind::Pointer(..) | TypeKind::Function(..) => POINTER_SIZE,
+        }
+    }
+
+    /// If it is a pointer, then return its base.
+    /// Otherwise panic.
+    pub fn derefernce(&self) -> Type {
+        match self.0.as_ref() {
+            TypeKind::Pointer(base) => base.clone(),
+            _ => panic!("{self} is not a pointer."),
+        }
+    }
+
+    /// If it is an array, then return its element's type.
+    /// Otherwise panic.
+    pub fn get_array_elem_ty(&self) -> Type {
+        match self.0.as_ref() {
+            TypeKind::Array(base, _) => base.clone(),
+            _ => panic!("{self} is not an array"),
         }
     }
 }

@@ -1,7 +1,7 @@
 use crate::ir::{
     arena::{Arena, ArenaMut, GlobalArena},
     builder::GlobalBuilder,
-    function::{Function, FunctionData, next_function_id},
+    function::{next_function_id, Function, FunctionData},
     instruction::Inst,
     types::Type,
 };

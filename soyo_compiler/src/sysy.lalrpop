@@ -1,0 +1,280 @@
+use crate::ast_utils::item::*;
+use raana_ir::ir::BinaryOp;
+use raana_ir::ir::Type;
+
+grammar;
+
+match {
+  r"\s*" => {},
+  r"//[^\n\r]*[\n\r]*" => {},
+  r"/\*[^*]*\*+(?:[^/*][^*]*\*+)*/" => {},
+  _
+}
+
+Comma<T>: Vec<T> = {
+    <mut v:(<T> ",")*> <e: T?> => match e {
+        None => v,
+        Some(e) => {
+            v.push(e);
+            v
+        }
+    }
+}
+
+// ======================================================
+pub CompUnits: CompUnits = <comp_units: CompUnit*> => CompUnits {<>};
+
+CompUnit: CompUnit = {
+    // 1. Const Declaration (无歧义)
+    <c_decl: ConstDecl> => CompUnit::Decl(Decl::ConstDecl(c_decl)),
+
+    // 2. Void Function (无歧义)
+    "void" <ident: Ident> "(" <params: Comma<FuncFParam>> ")" <block: Block> => {
+        CompUnit::FuncDef(FuncDef {
+            func_type: Type::get_unit(),
+            ident,
+            params,
+            block,
+        })
+    },
+
+    // 3. Int Start (有歧义: int Ident ...)
+    // 策略：解析 "int" 和 Ident，然后调用 IntSuffix 规则。
+    // IntSuffix 返回一个闭包，我们把 ident 传给它来构造结果。
+    "int" <ident: Ident> <builder: IntSuffix> => builder(ident),
+}
+
+// 这是一个后缀规则，处理 int Ident 之后的部分
+// 返回类型是一个闭包，接收 Ident (Rc<str>)，返回 CompUnit
+IntSuffix: Box<dyn FnOnce(std::rc::Rc<str>) -> CompUnit> = {
+    // 分支 A: 遇到左括号 -> 函数定义
+    "(" <params: Comma<FuncFParam>> ")" <block: Block> => {
+        Box::new(move |ident| CompUnit::FuncDef(FuncDef {
+            func_type: Type::get_i32(), // 既然进入了 IntSuffix，说明开头是 int
+            ident,
+            params,
+            block,
+        }))
+    },
+
+    // 分支 B: 遇到赋值号或分号或逗号 -> 变量声明
+    // 这里的逻辑是：解析可选的初始化值，以及后续可能的更多变量定义
+    <arr_dim: ("[" <ConstExp> "]")*><init_val: ("=" <InitVal>)?> <mut rest: ("," <VarDef>)*> ";" => {
+        Box::new(move |ident| {
+            // 将第一个变量（前缀解析的 ident + 这里解析的 init）构建出来
+            let first_def = VarDef { ident, arr_dim, init_val };
+            // 插到列表最前面
+            rest.insert(0, first_def);
+            
+            CompUnit::Decl(Decl::VarDecl(VarDecl {
+                btype: Type::get_i32(),
+                var_defs: rest,
+            }))
+        })
+    }
+}
+// ======================================================
+
+// pub CompUnits: CompUnits = <comp_units: CompUnit*> => CompUnits {<>};
+
+
+// CompUnit: CompUnit = {
+//     <func_def: FuncDef> => CompUnit::FuncDef (func_def),
+//     <decl: Decl> => CompUnit::Decl (decl),
+// }
+
+Decl: Decl = {
+    <c_decl: ConstDecl> => Decl::ConstDecl(c_decl),
+    <v_decl: VarDecl> => Decl::VarDecl(v_decl),
+};
+
+BType: Type = "int" => Type::get_i32();
+
+ConstDecl: ConstDecl = "const" <btype: BType> <const_defs: Comma<ConstDef>> ";" => ConstDecl { 
+    btype,
+    const_defs,
+};
+
+ConstDef: ConstDef = <ident: Ident> <arr_dim: ("[" <ConstExp> "]")*> "=" <const_init_val: ConstInitVal> => ConstDef {
+    ident,
+    arr_dim,
+    const_init_val,
+};
+
+ConstInitVal: ConstInitVal = {
+    <const_exp: ConstExp> => ConstInitVal::Normal(const_exp),
+    "{" <dims: Comma<ConstInitVal>> "}" => ConstInitVal::Array(dims),
+}
+
+VarDecl: VarDecl = <btype: BType> <var_defs: Comma<VarDef>> ";" => VarDecl {
+    btype,
+    var_defs,
+};
+
+VarDef: VarDef = <ident: Ident> <arr_dim: ("[" <ConstExp> "]")*> <init_val: ("=" <InitVal>)?> => VarDef {ident, arr_dim, init_val};
+
+InitVal: InitVal = {
+    <exp: Exp> => InitVal::Normal(exp),
+    "{"<dims: Comma<InitVal>> "}" => InitVal::Array(dims),
+}
+
+FuncFParam: FuncFParam = {
+    <b_type: BType> <ident: Ident> => FuncFParam {b_type, ident, arr_ty: None},
+    <b_type: BType> <ident: Ident> "[]" => FuncFParam {b_type, ident, arr_ty: Some(vec![])},
+    <b_type: BType> <ident: Ident> "[]" <arr_ty: ("[" <ConstExp> "]")+> => FuncFParam {b_type, ident, arr_ty: Some(arr_ty)},
+}
+
+FuncDef: FuncDef = {
+  <func_type: FuncType> <ident: Ident> "(" <params: Comma<FuncFParam>> ")" <block: Block> => {
+    FuncDef {<>}
+  }
+};
+
+FuncType: Type = {
+    "int" => Type::get_i32(),
+    "void" => Type::get_unit(),
+}
+
+Block: Block = "{" <block_items: BlockItem*> "}" => Block {block_items};
+
+BlockItem: BlockItem = {
+    <decl: Decl> => BlockItem::Decl(decl),
+    <stmt: Stmt> => BlockItem::Stmt(stmt),
+};
+
+Stmt: Stmt = {
+    MatchedStmt,
+    OpenStmt,
+}
+
+AssignStmt: AssignStmt = <l_val: LVal> "=" <exp: Exp> ";" => AssignStmt {l_val, exp};
+
+ReturnStmt: ReturnStmt = "return" <exp: Exp?> ";" => ReturnStmt {exp};
+
+WhileStmt: WhileStmt = "while" "(" <cond: Exp> ")" <body: MatchedStmt> => WhileStmt {cond, body:Box::new(body)};
+
+Break: Break = "break" ";" => Break;
+
+Continue: Continue = "continue" ";" => Continue;
+
+MatchedStmt: Stmt = {
+    <assign: AssignStmt> => Stmt::Assign(assign),
+
+    <block: Block> => Stmt::Block(block),
+
+    <exp: Exp?> ";" => Stmt::Single(exp),
+    
+    <break_stmt: Break> => Stmt::Break(break_stmt),
+
+    <continue_stmt: Continue> => Stmt::Continue(continue_stmt),
+
+    <while_stmt: WhileStmt> => Stmt::WhileStmt(while_stmt),
+
+    "if" "(" <cond: Exp> ")" <then_branch: MatchedStmt> "else" <else_branch: MatchedStmt> => 
+        Stmt::IfStmt(IfStmt {cond, then_branch: Box::new(then_branch), else_branch: Some(Box::new(else_branch))}),
+    
+    <return_stmt: ReturnStmt> => Stmt::Return(return_stmt),
+};
+
+OpenStmt: Stmt = {
+    "if" "(" <cond: Exp> ")" <then_branch: Stmt> => Stmt::IfStmt(IfStmt{cond, then_branch: Box::new(then_branch), else_branch: None}),
+    "if" "(" <cond: Exp> ")" <then_branch: MatchedStmt> "else" <else_branch: OpenStmt> => 
+        Stmt::IfStmt (IfStmt{cond, then_branch: Box::new(then_branch), else_branch: Some(Box::new(else_branch))}),
+}
+
+LVal: LVal = <ident: Ident> <index: ("[" <Exp> "]")*> => LVal {ident, index};
+
+Number: i32 = <num: IntConst> => <>;
+
+Ident: std::rc::Rc<str> = r"[_a-zA-Z][_a-zA-Z0-9]*" =>  std::rc::Rc::from(<>);
+
+IntConst: i32 = {
+  r"[1-9][0-9]*" => i32::from_str_radix(<>, 10).unwrap(),
+  r"0[0-7]*" => i32::from_str_radix(<>, 8).unwrap(),
+  r"0[xX][0-9a-fA-F]+" => i32::from_str_radix(&<>[2..], 16).unwrap(),
+};
+
+Exp: Exp = <lor_exp: LOrExp> => Exp {<>};
+
+PrimaryExp: PrimaryExp = {
+  "(" <exp: Exp> ")" => PrimaryExp::Exp(exp),
+  <l_val: LVal> => PrimaryExp::LVal(l_val),
+  <num: Number> => PrimaryExp::Number(num),
+};
+
+UnaryOp: UnaryOp = {
+  "+" => UnaryOp::Add,
+  "-" => UnaryOp::Minus,
+  "!" => UnaryOp::Negation,
+};
+
+BinaryOp: BinaryOp = {
+    "+" => BinaryOp::Add,
+    "-" => BinaryOp::Sub,
+    "*" => BinaryOp::Mul,
+    "/" => BinaryOp::Div,
+    "%" => BinaryOp::Mod,
+};
+
+UnaryExp: UnaryExp = {
+  <primary_exp: PrimaryExp> => UnaryExp::PrimaryExp(Box::new(primary_exp)),
+  <unary_op: UnaryOp> <unary_exp: UnaryExp> => UnaryExp::Unary(unary_op, Box::new(unary_exp)),
+  <func_call: FuncCall> => UnaryExp::FuncCall(func_call),
+};
+
+FuncCall: FuncCall = <ident: Ident> "(" <args: Comma<Exp>> ")" => FuncCall {ident, args};
+
+AddExpOnlyOp: BinaryOp = {
+    "+" => BinaryOp::Add,
+    "-" => BinaryOp::Sub,
+};
+
+AddExp: AddExp = {
+    <mul_exp: MulExp> => AddExp::MulExp(mul_exp),
+    <add_exp: AddExp> <op: AddExpOnlyOp> <mul_exp: MulExp> => AddExp::Comp(Box::new(add_exp), op, mul_exp),
+};
+
+MulExpOnlyOp: BinaryOp = {
+    "*" => BinaryOp::Mul,
+    "/" => BinaryOp::Div,
+    "%" => BinaryOp::Mod,
+};
+
+MulExp: MulExp = {
+    <unary_exp: UnaryExp> => MulExp::UnaryExp(<>),
+    <mul_exp:MulExp> <op: MulExpOnlyOp> <unary_exp: UnaryExp> => MulExp::Comp(Box::new(mul_exp), op, unary_exp),
+};
+
+LOrExp: LOrExp = {
+    <land_exp: LAndExp> => LOrExp::LAndExp(land_exp),
+    <lor_exp: LOrExp> "||" <land_exp: LAndExp> => LOrExp::Comp(Box::new(lor_exp), land_exp),
+};
+
+LAndExp: LAndExp = {
+    <eq_exp: EqExp> => LAndExp::EqExp(eq_exp),
+    <land_exp: LAndExp> "&&" <eq_exp: EqExp> => LAndExp::Comp(Box::new(land_exp), eq_exp),
+};
+
+EqExpOnlyOp: BinaryOp = {
+    "==" => BinaryOp::Eq,
+    "!=" => BinaryOp::NotEq,
+};
+
+EqExp: EqExp = {
+    <rel_exp: RelExp> => EqExp::RelExp(rel_exp),
+    <eq_exp: EqExp> <op: EqExpOnlyOp> <rel_exp: RelExp> => EqExp::Comp(Box::new(eq_exp), op, rel_exp),
+};
+
+RelExpOnlyOp: BinaryOp = {
+    "<" => BinaryOp::Lt,
+    ">" => BinaryOp::Gt,
+    "<=" => BinaryOp::Le,
+    ">=" => BinaryOp::Ge,
+};
+
+RelExp: RelExp = {
+    <add_exp: AddExp> => RelExp::AddExp(add_exp),
+    <rel_exp: RelExp> <op: RelExpOnlyOp> <add_exp: AddExp> => RelExp::Comp(Box::new(rel_exp), op, add_exp),
+};
+
+ConstExp: ConstExp = <exp: Exp> => ConstExp { exp };

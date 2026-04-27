@@ -1,8 +1,8 @@
 use crate::ir::{
     basic_block::{BasicBlock, BasicBlockArena, BasicBlockData},
-    function::{Function, FunctionArena, FunctionData, next_function_id},
+    function::{next_function_id, Function, FunctionArena, FunctionData},
     instruction::{
-        GlobalInstArena, Inst, InstData, LocalInstArena, next_global_inst_id, next_local_inst_id,
+        next_global_inst_id, next_local_inst_id, GlobalInstArena, Inst, InstData, LocalInstArena,
     },
 };
 

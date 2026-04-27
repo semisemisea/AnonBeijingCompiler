@@ -10,11 +10,17 @@ mod types;
 
 pub mod builder_trait {
     pub use super::builder::{
-        BasicBlockBuilder, GlobalInstBuilder, LocalInstBuilder, ScalarInstBuilder,
+        BasicBlockBuilder, BasicBlockBuilders, GlobalBuilder, GlobalInstBuilder, InstInsert,
+        LocalBuilder, LocalInstBuilder, ScalarInstBuilder,
     };
 }
 
-pub use inst_kind::BinaryOp;
-pub use inst_kind::InstKind;
+pub use basic_block::BasicBlock;
+pub use function::{Function, FunctionData};
+pub use inst_kind::{
+    Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, GetElemPtr, GetPtr, InstKind, Integer,
+    Jump, Load, Return, Store,
+};
+pub use instruction::{Inst, InstData};
 pub use program::Program;
-pub use types::Type;
+pub use types::{Type, TypeKind};

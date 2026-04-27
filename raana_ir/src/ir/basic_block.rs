@@ -55,7 +55,7 @@ impl BasicBlockData {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BasicBlock(NonZeroU32);
 
 static BBID: AtomicU32 = AtomicU32::new(1);

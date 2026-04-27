@@ -1,14 +1,14 @@
-mod aggregate;
-mod arg_ref;
-mod binary;
-mod branch;
-mod call;
-mod global_alloc;
-mod jump;
-mod ptr;
-mod r3turn;
-mod scalar;
-mod stack_mem;
+pub mod aggregate;
+pub mod arg_ref;
+pub mod binary;
+pub mod branch;
+pub mod call;
+pub mod global_alloc;
+pub mod jump;
+pub mod ptr;
+pub mod r3turn;
+pub mod scalar;
+pub mod stack_mem;
 
 pub use aggregate::Aggregate;
 pub use arg_ref::BlockArgRef;

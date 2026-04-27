@@ -15,6 +15,6 @@ pub mod builder_trait {
 }
 
 pub use inst_kind::BinaryOp;
-// pub use inst_kind::InstKind;
+pub use inst_kind::InstKind;
 pub use program::Program;
 pub use types::Type;

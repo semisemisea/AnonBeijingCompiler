@@ -5,19 +5,28 @@ use std::{
 };
 
 use crate::ir::{
-    inst_kind::{
-        Aggregate, Binary, BlockArgRef, Branch, Call, Float, FuncArgRef, GetElemPtr, GetPtr,
-        GlobalAlloc, Integer, Jump, Load, Return, Store,
-    },
+    inst_kind::{BasicBlockUsage, InstKind, InstUsage},
     types::Type,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct InstData {
     ty: Type,
     name: Option<String>,
     kind: InstKind,
     used_by: HashSet<Inst>,
+}
+
+impl Clone for InstData {
+    /// With empty used_by hashset.
+    fn clone(&self) -> Self {
+        InstData {
+            ty: self.ty.clone(),
+            name: self.name.clone(),
+            kind: self.kind.clone(),
+            used_by: HashSet::new(),
+        }
+    }
 }
 
 impl InstData {
@@ -39,35 +48,45 @@ impl InstData {
         &self.used_by
     }
 
-    pub fn used_by_mut(&mut self) -> &mut HashSet<Inst> {
+    pub(in crate::ir) fn used_by_mut(&mut self) -> &mut HashSet<Inst> {
         &mut self.used_by
+    }
+
+    pub fn ty(&self) -> &Type {
+        &self.ty
+    }
+
+    pub fn kind(&self) -> &InstKind {
+        &self.kind
+    }
+
+    pub fn is_const(&self) -> bool {
+        self.kind().is_const()
+    }
+
+    pub fn inst_usage(&self) -> InstUsage<'_> {
+        InstUsage {
+            data: self.kind(),
+            index: 0,
+        }
+    }
+
+    pub fn bb_usage(&self) -> BasicBlockUsage<'_> {
+        BasicBlockUsage {
+            data: self.kind(),
+            index: 0,
+        }
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum InstKind {
-    Undef,
-    ZeroInit,
-    Integer(Integer),
-    Float(Float),
-    Binary(Binary),
-    Jump(Jump),
-    Branch(Branch),
-    Return(Return),
-    GetElemPtr(GetElemPtr),
-    GetPtr(GetPtr),
-    Alloc,
-    GlobalAlloc(GlobalAlloc),
-    Store(Store),
-    Load(Load),
-    Call(Call),
-    BlockArgRef(BlockArgRef),
-    FunkArgRef(FuncArgRef),
-    Aggregate(Aggregate),
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Inst(NonZeroU32);
+
+impl Inst {
+    pub fn is_global(&self) -> bool {
+        self.0.get() >= GLOBAL_ID_START_FROM
+    }
+}
 
 impl std::fmt::Display for Inst {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -75,24 +94,64 @@ impl std::fmt::Display for Inst {
     }
 }
 
-static LOCAL_INST_ID: AtomicU32 = AtomicU32::new(0x00000001);
+const LOCAL_ID_START_FROM: u32 = 0x00000001;
 
-static GLOBAL_INST_ID: AtomicU32 = AtomicU32::new(0x40000000);
+const GLOBAL_ID_START_FROM: u32 = 0x40000000;
 
-pub fn next_local_inst_id() -> Inst {
+static LOCAL_INST_ID: AtomicU32 = AtomicU32::new(LOCAL_ID_START_FROM);
+
+static GLOBAL_INST_ID: AtomicU32 = AtomicU32::new(GLOBAL_ID_START_FROM);
+
+pub(in crate::ir) fn next_local_inst_id() -> Inst {
     Inst(unsafe { NonZeroU32::new_unchecked(LOCAL_INST_ID.fetch_add(1, Ordering::Relaxed)) })
 }
 
-pub fn next_global_inst_id() -> Inst {
+pub(in crate::ir) fn next_global_inst_id() -> Inst {
     Inst(unsafe { NonZeroU32::new_unchecked(GLOBAL_INST_ID.fetch_add(1, Ordering::Relaxed)) })
 }
 
-pub struct InstArena {
+#[derive(Debug, Clone)]
+pub struct LocalInstArena {
     data: Vec<InstData>,
 }
 
-impl InstArena {
-    fn new() -> InstArena {
-        InstArena { data: Vec::new() }
+#[derive(Debug, Clone)]
+pub struct GlobalInstArena {
+    data: Vec<InstData>,
+}
+
+impl LocalInstArena {
+    pub fn new() -> LocalInstArena {
+        LocalInstArena { data: Vec::new() }
+    }
+
+    pub fn alloc(&mut self, data: InstData) {
+        self.data.push(data);
+    }
+
+    pub fn data_of(&self, inst: Inst) -> &InstData {
+        &self.data[(inst.0.get() - LOCAL_ID_START_FROM) as usize]
+    }
+
+    pub fn mut_data_of(&mut self, inst: Inst) -> &mut InstData {
+        &mut self.data[(inst.0.get() - LOCAL_ID_START_FROM) as usize]
+    }
+}
+
+impl GlobalInstArena {
+    pub fn new() -> GlobalInstArena {
+        GlobalInstArena { data: Vec::new() }
+    }
+
+    pub fn alloc(&mut self, data: InstData) {
+        self.data.push(data);
+    }
+
+    pub fn data_of(&self, inst: Inst) -> &InstData {
+        &self.data[(inst.0.get() - GLOBAL_ID_START_FROM) as usize]
+    }
+
+    pub fn mut_data_of(&mut self, inst: Inst) -> &mut InstData {
+        &mut self.data[(inst.0.get() - GLOBAL_ID_START_FROM) as usize]
     }
 }

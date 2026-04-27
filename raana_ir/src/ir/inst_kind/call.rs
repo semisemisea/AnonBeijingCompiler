@@ -1,6 +1,7 @@
 use crate::ir::{
     function::Function,
-    instruction::{Inst, InstData, InstKind},
+    inst_kind::InstKind,
+    instruction::{Inst, InstData},
     types::Type,
 };
 

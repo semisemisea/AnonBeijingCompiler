@@ -1,7 +1,4 @@
-use crate::ir::{
-    instruction::{InstData, InstKind},
-    types::Type,
-};
+use crate::ir::{inst_kind::InstKind, instruction::InstData, types::Type};
 
 #[derive(Debug, Clone)]
 pub struct Integer {

@@ -1,11 +1,13 @@
 use crate::ir::{
+    Program,
+    arena::{Arena, ArenaMut},
     basic_block::{BasicBlock, BasicBlockData},
     function::Function,
     inst_kind::{
         Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Float, GetElemPtr, GetPtr,
-        GlobalAlloc, Integer, Jump, Load, Return, Store,
+        GlobalAlloc, InstKind, Integer, Jump, Load, Return, Store,
     },
-    instruction::{Inst, InstData, InstKind},
+    instruction::{Inst, InstData},
     types::Type,
 };
 
@@ -18,10 +20,9 @@ pub trait InfoQuery {
 
 pub trait InstInsert {
     fn insert_inst(&mut self, data: InstData) -> Inst;
-    fn add_used_by(&mut self, inst: Inst, used_by: Inst);
 }
 
-pub trait InstBuilder: InstInsert + InfoQuery + Sized {
+pub trait ScalarInstBuilder: InstInsert + InfoQuery + Sized {
     fn raw(&mut self, data: InstData) -> Inst {
         self.insert_inst(data)
     }
@@ -35,7 +36,7 @@ pub trait InstBuilder: InstInsert + InfoQuery + Sized {
     }
 
     /// Undef have type unit here.
-    fn undef(&mut self, value: f32) -> Inst {
+    fn undef(&mut self) -> Inst {
         self.insert_inst(InstData::new(Type::get_unit(), InstKind::Undef))
     }
 
@@ -58,7 +59,7 @@ pub trait InstBuilder: InstInsert + InfoQuery + Sized {
     }
 }
 
-pub trait LocalInstBuilder: InstBuilder {
+pub trait LocalInstBuilder: ScalarInstBuilder {
     fn binary(&mut self, lhs: Inst, rhs: Inst, op: BinaryOp) -> Inst {
         let lhs_type = self.inst_type(lhs);
         let rhs_type = self.inst_type(rhs);
@@ -75,13 +76,14 @@ pub trait LocalInstBuilder: InstBuilder {
 
     fn branch(
         &mut self,
+        cond: Inst,
         t_target: BasicBlock,
         t_args: Vec<Inst>,
         f_target: BasicBlock,
         f_args: Vec<Inst>,
     ) -> Inst {
         // TODO: Type check
-        self.insert_inst(Branch::new_data(t_target, t_args, f_target, f_args))
+        self.insert_inst(Branch::new_data(cond, t_target, t_args, f_target, f_args))
     }
 
     fn jump(&mut self, target: BasicBlock, args: Vec<Inst>) -> Inst {
@@ -131,7 +133,7 @@ pub trait LocalInstBuilder: InstBuilder {
     }
 }
 
-pub trait GlobalBuilder: InstBuilder {
+pub trait GlobalInstBuilder: ScalarInstBuilder {
     fn global_alloc(&mut self, init: Inst) -> Inst {
         self.insert_inst(GlobalAlloc::new_data(init, self.inst_type(init)))
     }
@@ -141,7 +143,7 @@ pub trait BasicBlockBuilder: Sized + InstInsert {
     fn insert_bb(&mut self, data: BasicBlockData) -> BasicBlock;
 
     /// return all the instruction of parameter. Give it name if you want.
-    fn basic_block(&mut self, name: String, params_ty: Vec<Type>) -> (BasicBlock, Vec<Inst>) {
+    fn basic_block(&mut self, name: String, params_ty: Vec<Type>) -> BasicBlock {
         assert!(
             params_ty.iter().all(|p| !p.is_unit()),
             "parameter type must not be `unit`!"
@@ -151,14 +153,92 @@ pub trait BasicBlockBuilder: Sized + InstInsert {
             .enumerate()
             .map(|(i, ty)| self.insert_inst(BlockArgRef::new_data(i, ty.clone())))
             .collect();
-        (
-            self.insert_bb(BasicBlockData::new(name, params.clone())),
-            params,
-        )
+        self.insert_bb(BasicBlockData::new(name, params))
+    }
+}
+
+pub trait ArenaQuery {
+    fn arena(&self) -> Arena;
+}
+
+impl<T: ArenaQuery> InfoQuery for T {
+    fn inst_type(&self, inst: Inst) -> Type {
+        self.arena().inst_data(inst).ty().clone()
     }
 
-    fn add_param(&mut self, bb: BasicBlock, new_param_ty: Type) -> Inst {
-        // TODO:
-        todo!()
+    fn is_const(&self, inst: Inst) -> bool {
+        self.arena().inst_data(inst).kind().is_const()
+    }
+
+    fn bb_params(&self, bb: BasicBlock) -> &[Inst] {
+        self.arena().bb_data(bb).params()
+    }
+
+    fn func_type(&self, func: Function) -> Type {
+        self.arena().func_data(func).ret_ty().clone()
+    }
+}
+
+pub struct LocalBuilder<'a> {
+    pub(crate) arena: ArenaMut<'a>,
+}
+
+impl ArenaQuery for LocalBuilder<'_> {
+    fn arena(&self) -> Arena {
+        self.arena.freeze()
+    }
+}
+
+impl InstInsert for LocalBuilder<'_> {
+    fn insert_inst(&mut self, data: InstData) -> Inst {
+        self.arena.alloc_local_inst(data)
+    }
+}
+
+impl ScalarInstBuilder for LocalBuilder<'_> {}
+
+impl LocalInstBuilder for LocalBuilder<'_> {}
+
+pub struct GlobalBuilder<'a> {
+    pub(in crate::ir) program: &'a mut Program,
+}
+
+impl ArenaQuery for GlobalBuilder<'_> {
+    fn arena(&self) -> Arena {
+        Arena::new(None, Some(self.program.global_arena()))
+    }
+}
+
+impl InstInsert for GlobalBuilder<'_> {
+    fn insert_inst(&mut self, data: InstData) -> Inst {
+        let id = ArenaMut::new(None, Some(self.program.global_arena_mut())).alloc_global_inst(data);
+        self.program.inst_layout_push(id);
+        id
+    }
+}
+
+impl ScalarInstBuilder for GlobalBuilder<'_> {}
+
+impl GlobalInstBuilder for GlobalBuilder<'_> {}
+
+pub struct BasicBlockBuilders<'a> {
+    pub(crate) arena: ArenaMut<'a>,
+}
+
+impl ArenaQuery for BasicBlockBuilders<'_> {
+    fn arena(&self) -> Arena {
+        self.arena.freeze()
+    }
+}
+
+impl InstInsert for BasicBlockBuilders<'_> {
+    fn insert_inst(&mut self, data: InstData) -> Inst {
+        self.arena.alloc_local_inst(data)
+    }
+}
+
+impl BasicBlockBuilder for BasicBlockBuilders<'_> {
+    fn insert_bb(&mut self, data: BasicBlockData) -> BasicBlock {
+        self.arena.alloc_basic_block(data)
     }
 }

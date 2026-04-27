@@ -1,7 +1,4 @@
-use crate::ir::{
-    instruction::{InstData, InstKind},
-    types::Type,
-};
+use crate::ir::{inst_kind::InstKind, instruction::InstData, types::Type};
 
 #[derive(Debug, Clone)]
 pub struct BlockArgRef {
@@ -21,4 +18,14 @@ impl BlockArgRef {
 #[derive(Debug, Clone)]
 pub struct FuncArgRef {
     index: usize,
+}
+
+impl FuncArgRef {
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    pub fn new_data(index: usize, ty: Type) -> InstData {
+        InstData::new(ty, InstKind::FuncArgRef(FuncArgRef { index }))
+    }
 }

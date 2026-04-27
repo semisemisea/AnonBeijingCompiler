@@ -1,5 +1,6 @@
 use crate::ir::{
-    instruction::{Inst, InstData, InstKind},
+    inst_kind::InstKind,
+    instruction::{Inst, InstData},
     types::Type,
 };
 

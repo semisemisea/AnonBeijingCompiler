@@ -1,6 +1,6 @@
 use crate::ir::{
     basic_block::{BasicBlock, BasicBlockArena, BasicBlockData},
-    function::{next_function_id, Function, FunctionArena, FunctionData},
+    function::{Function, FunctionArena, FunctionData},
     instruction::{
         next_global_inst_id, next_local_inst_id, GlobalInstArena, Inst, InstData, LocalInstArena,
     },
@@ -87,6 +87,10 @@ impl<'a> Arena<'a> {
 
     pub fn func_data(&self, func: Function) -> &'a FunctionData {
         self.global.unwrap().func_arena.data_of(func)
+    }
+
+    pub fn set_local(&mut self, local: Option<&'a LocalArena>) {
+        self.local = local;
     }
 }
 

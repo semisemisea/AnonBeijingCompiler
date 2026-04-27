@@ -77,6 +77,10 @@ impl InstData {
             index: 0,
         }
     }
+
+    pub fn name(&self) -> Option<&String> {
+        self.name.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

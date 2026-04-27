@@ -37,3 +37,19 @@ pub enum BinaryOp {
     Div,
     Rem,
 }
+
+impl std::fmt::Display for BinaryOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                BinaryOp::Add => "add",
+                BinaryOp::Sub => "sub",
+                BinaryOp::Mul => "mul",
+                BinaryOp::Div => "div",
+                BinaryOp::Rem => "rem",
+            }
+        )
+    }
+}

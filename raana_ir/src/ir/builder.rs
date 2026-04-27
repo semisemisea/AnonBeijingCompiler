@@ -27,7 +27,7 @@ pub trait ScalarInstBuilder: InstInsert + InfoQuery + Sized {
         self.insert_inst(data)
     }
 
-    fn interger(&mut self, value: i32) -> Inst {
+    fn integer(&mut self, value: i32) -> Inst {
         self.insert_inst(Integer::new_data(value))
     }
 
@@ -211,8 +211,11 @@ impl ArenaQuery for GlobalBuilder<'_> {
 
 impl InstInsert for GlobalBuilder<'_> {
     fn insert_inst(&mut self, data: InstData) -> Inst {
+        let is_global_alloc = matches!(data.kind(), InstKind::GlobalAlloc(..));
         let id = ArenaMut::new(None, Some(self.program.global_arena_mut())).alloc_global_inst(data);
-        self.program.inst_layout_push(id);
+        if is_global_alloc {
+            self.program.inst_layout_push(id);
+        }
         id
     }
 }

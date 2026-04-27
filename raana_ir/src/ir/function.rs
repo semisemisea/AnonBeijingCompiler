@@ -89,6 +89,10 @@ impl FunctionData {
     pub fn params(&self) -> &[Inst] {
         &self.params
     }
+
+    pub(crate) fn local_arena(&self) -> &LocalArena {
+        &self.local_arena
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

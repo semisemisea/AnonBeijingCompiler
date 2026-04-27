@@ -25,11 +25,11 @@ impl Program {
         GlobalBuilder { program: self }
     }
 
-    pub(in crate::ir) fn global_arena(&self) -> &GlobalArena {
+    pub(crate) fn global_arena(&self) -> &GlobalArena {
         &self.global_arena
     }
 
-    pub(in crate::ir) fn global_arena_mut(&mut self) -> &mut GlobalArena {
+    pub(crate) fn global_arena_mut(&mut self) -> &mut GlobalArena {
         &mut self.global_arena
     }
 
@@ -66,5 +66,9 @@ impl Program {
         let id = next_function_id();
         self.func_layout_push(id);
         id
+    }
+
+    pub fn function_layout(&self) -> &[Function] {
+        &self.function_layout
     }
 }

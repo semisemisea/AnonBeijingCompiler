@@ -1,12 +1,12 @@
-mod arena;
-mod basic_block;
-mod builder;
-mod function;
-mod inst_kind;
-mod instruction;
-mod layout;
-mod program;
-mod types;
+pub(crate) mod arena;
+pub(crate) mod basic_block;
+pub(crate) mod builder;
+pub(crate) mod function;
+pub(crate) mod inst_kind;
+pub(crate) mod instruction;
+pub(crate) mod layout;
+pub(crate) mod program;
+pub(crate) mod types;
 
 pub mod builder_trait {
     pub use super::builder::{

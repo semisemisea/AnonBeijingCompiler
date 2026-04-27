@@ -130,6 +130,10 @@ impl BasicBlockLayout {
     pub fn insts_mut(&mut self) -> &mut LayoutList<Inst, ()> {
         &mut self.insts
     }
+
+    pub fn bb(&self) -> BasicBlock {
+        self.bb
+    }
 }
 
 impl Layout {

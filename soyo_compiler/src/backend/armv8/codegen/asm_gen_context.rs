@@ -1,18 +1,17 @@
 use std::collections::{HashMap, HashSet};
 
 use raana_ir::ir::{
-    BasicBlock,
-    Function, FunctionData,
-    Aggregate,
-    Inst, InstKind,
-    Type,
-    Program,
+    Aggregate, BasicBlock, Function, FunctionData, Inst as IrInst, InstKind, Program, Type,
 };
 
 use crate::backend::armv8::{
-    codegen::{epilogue::Epilogue, register_alloc::{AllocationState, RegisterAllocation}, register_manager::RegisterManager},
-    inst::Inst as AsmInst,
-    register::Register,
+    codegen::{
+        epilogue::Epilogue,
+        register_alloc::{AllocationState, RegisterAllocation},
+        register_manager::RegisterManager,
+    },
+    inst::{AddSubImm, AddSubOperand, Inst},
+    register::{Bit, IReg, IntRegister, Register},
 };
 
 type List = Vec<AsmInst>;
@@ -40,9 +39,9 @@ macro_rules! push {
 macro_rules! import_reg_and_inst {
     () => {
         #[allow(unused)]
-        use Register::*;
+        use Inst::*;
         #[allow(unused)]
-        use AsmInst::*;
+        use Register::*;
     };
 }
 const SHIFT_WIDTH: usize = 2;
@@ -94,7 +93,7 @@ impl AsmGenContext {
         self.stack_slots.get(&val).copied()
     }
 
-    pub fn register_or_offset(&mut self, val: Inst) -> Option<usize> {
+    pub fn register_or_offset(&mut self, val: IrInst) -> Option<usize> {
         match self.allocation.get(&val).unwrap() {
             AllocationState::Register(register) => {
                 self.reg_pool.push_register(*register);
@@ -211,7 +210,9 @@ impl AsmGenContext {
     }
 
     pub fn prologue(&mut self, offset: usize, call_ra: bool, callee_usage: HashSet<Register>) {
-        use Register::{ra, sp};
+        let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
+        let ra = Register::I(IReg(Bit::b64, IntRegister::x30));
+
         let offset = offset as i32;
 
         if offset != 0 {
@@ -260,7 +261,7 @@ impl AsmGenContext {
         program.func(*self.curr_func_hanlde())
     }
 
-    pub fn load_to_para_register(&mut self, program: &Program, val: Inst, reg: Register) {
+    pub fn load_to_para_register(&mut self, program: &Program, val: IrInst, reg: Register) {
         import_reg_and_inst!();
         let data = self.curr_func_data(program).dfg().value(val);
         match data.kind() {
@@ -285,7 +286,7 @@ impl AsmGenContext {
         }
     }
 
-    pub fn load_to_register(&mut self, program: &Program, val: Inst) {
+    pub fn load_to_register(&mut self, program: &Program, val: IrInst) {
         if val.is_global() {
             self.load_address(
                 program
@@ -370,24 +371,29 @@ impl AsmGenContext {
         self.write_inst(add {
             rd: ans,
             rs1: lhs,
-            rs2: rhs,
+            rs2: AddSubOperand::Register(rhs),
         });
     }
 
     pub fn add_sp(&mut self) {
         import_reg_and_inst!();
+        let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
         let rhs = self.reg_pool.take_register();
         let ans = self.reg_pool.alloc_temp();
         self.write_inst(add {
             rd: ans,
             rs1: sp,
-            rs2: rhs,
+            rs2: AddSubOperand::Register(rhs),
         });
     }
 
     pub fn add(&mut self, rd: Register, rs1: Register, rs2: Register) {
         import_reg_and_inst!();
-        self.write_inst(add { rd, rs1, rs2 });
+        self.write_inst(add {
+            rd,
+            rs1,
+            rs2: AddSubOperand::Register(rs2),
+        });
     }
 
     pub fn allocation_mut(&mut self) -> &mut RegisterAllocation {
@@ -396,5 +402,314 @@ impl AsmGenContext {
 
     pub fn curr_inst(&self) -> Option<Inst> {
         self.curr_inst
+    }
+}
+
+impl AsmGenContext {
+    // undef should not have any memory moves when being efficiency.
+    pub fn undef_take_temp(&mut self) {
+        self.reg_pool.alloc_temp();
+    }
+
+    #[inline]
+    pub fn load_imm(&mut self, imm: i32) {
+        import_reg_and_inst!();
+        let temp_reg = self.reg_pool.alloc_temp();
+        self.write_inst(li { rd: temp_reg, imm });
+    }
+
+    pub fn save_word_at_curr_inst(&mut self) {
+        self.save_word_at_inst(self.curr_inst.unwrap());
+    }
+
+    pub fn save_word_at_inst(&mut self, val: Value) {
+        match self.allocation.get(&val).unwrap() {
+            AllocationState::Register(register) => {
+                let source = self.reg_pool.take_register();
+                self.mv(source, *register)
+            }
+            AllocationState::Stack(offset) => {
+                self.save_word_with_offset(*offset as _);
+            }
+        }
+    }
+
+    pub fn save_word(&mut self, rs2: Register, imm: i32, rs1: Register) {
+        import_reg_and_inst!();
+        if (-2048..2048).contains(&imm) {
+            self.write_inst(sw {
+                rs2,
+                imm12: imm,
+                rs1,
+            });
+        } else {
+            self.load_imm(imm);
+            let imm_reg = self.reg_pool.take_register();
+            self.add(imm_reg, rs1, imm_reg);
+            self.write_inst(sw {
+                rs2,
+                imm12: 0,
+                rs1: imm_reg,
+            });
+        }
+    }
+
+    #[inline]
+    pub fn save_word_with_offset(&mut self, offset: i32) {
+        import_reg_and_inst!();
+        if (-2048..2048).contains(&offset) {
+            let temp_reg = self.reg_pool.take_register();
+            self.write_inst(sw {
+                rs2: temp_reg,
+                imm12: offset,
+                rs1: sp,
+            });
+        } else {
+            self.load_imm(offset);
+            self.add_sp();
+            let add_temp = self.reg_pool.take_register();
+            let temp_reg = self.reg_pool.take_register();
+            self.write_inst(sw {
+                rs2: temp_reg,
+                imm12: 0,
+                rs1: add_temp,
+            });
+        }
+    }
+
+    #[inline]
+    pub fn save_word_at_address(&mut self) {
+        import_reg_and_inst!();
+        let val_reg = self.reg_pool.take_register();
+        let address_reg = self.reg_pool.take_register();
+        self.write_inst(sw {
+            rs2: val_reg,
+            imm12: 0,
+            rs1: address_reg,
+        });
+    }
+
+    pub fn load_word(&mut self, rd: Register, offset: i32, rs: Register) {
+        import_reg_and_inst!();
+        if (-2048..2048).contains(&offset) {
+            self.write_inst(lw {
+                rd,
+                imm12: offset,
+                rs,
+            });
+        } else {
+            self.load_imm(offset);
+            self.add_sp();
+            let add_temp = self.reg_pool.take_register();
+            self.write_inst(lw {
+                rd,
+                imm12: 0,
+                rs: add_temp,
+            });
+        }
+    }
+
+    pub fn add_imm(&mut self, rd: Register, imm: i32, rs: Register) {
+        import_reg_and_inst!();
+        if (-2048..2048).contains(&imm) {
+            let imm12 = AddSubOperand::Immediate(AddSubImm::Imm12(imm as u16));
+            self.write_inst(add {
+                rd,
+                rs1: rs,
+                rs2: imm12,
+            })
+        } else {
+            self.load_imm(imm);
+            let imm_reg = self.reg_pool.take_register();
+            self.write_inst(add {
+                rd,
+                rs1: rs,
+                rs2: AddSubOperand::Register(imm_reg),
+            });
+        }
+    }
+
+    #[inline]
+    pub fn load_word_sp(&mut self, offset: i32) {
+        use Register::sp;
+        import_reg_and_inst!();
+        if (-2048..2048).contains(&offset) {
+            let temp_reg = self.reg_pool.alloc_temp();
+            self.write_inst(lw {
+                rd: temp_reg,
+                imm12: offset,
+                rs: sp,
+            });
+        } else {
+            self.load_imm(offset);
+            self.add_sp();
+            let add_temp = self.reg_pool.take_register();
+            let temp_reg = self.reg_pool.alloc_temp();
+            self.write_inst(lw {
+                rd: temp_reg,
+                imm12: 0,
+                rs: add_temp,
+            });
+        };
+    }
+
+    pub fn load_address(&mut self, label: String) {
+        import_reg_and_inst!();
+        let temp_reg = self.reg_pool.alloc_temp();
+        self.write_inst(la {
+            rd: temp_reg,
+            label,
+        });
+    }
+
+    pub fn load_from_address(&mut self) {
+        import_reg_and_inst!();
+        let address_reg = self.reg_pool.take_register();
+        let value_reg = self.reg_pool.alloc_temp();
+        self.write_inst(lw {
+            rd: value_reg,
+            imm12: 0,
+            rs: address_reg,
+        });
+    }
+
+    pub fn binary_op(&mut self, op: BinaryOp) {
+        import_reg_and_inst!();
+        let rhs = self.reg_pool.take_register();
+        let lhs = self.reg_pool.take_register();
+        let res = self.reg_pool.alloc_temp();
+        match op {
+            BinaryOp::NotEq => {
+                self.write_inst(sub {
+                    rd: res,
+                    rs1: lhs,
+                    rs2: AddSubOperand::Register(rhs),
+                });
+                self.write_inst(snez { rd: res, rs: res });
+            }
+            BinaryOp::Eq => {
+                self.write_inst(sub {
+                    rd: res,
+                    rs1: lhs,
+                    rs2: AddSubOperand::Register(rhs),
+                });
+                self.write_inst(seqz { rd: res, rs: res });
+            }
+            BinaryOp::Gt => self.write_inst(sgt {
+                rd: res,
+                rs1: lhs,
+                rs2: rhs,
+            }),
+            BinaryOp::Lt => self.write_inst(slt {
+                rd: res,
+                rs1: lhs,
+                rs2: rhs,
+            }),
+            BinaryOp::Ge => {
+                self.write_inst(slt {
+                    rd: res,
+                    rs1: lhs,
+                    rs2: rhs,
+                });
+                self.write_inst(seqz { rd: res, rs: res });
+            }
+            BinaryOp::Le => {
+                self.write_inst(sgt {
+                    rd: res,
+                    rs1: lhs,
+                    rs2: rhs,
+                });
+                self.write_inst(seqz { rd: res, rs: res });
+            }
+            BinaryOp::Add => self.write_inst(add {
+                rd: res,
+                rs1: lhs,
+                rs2: AddSubOperand::Register(rhs),
+            }),
+
+            BinaryOp::Sub => self.write_inst(sub {
+                rd: res,
+                rs1: lhs,
+                rs2: AddSubOperand::Register(rhs),
+            }),
+            BinaryOp::Mul => self.write_inst(mul {
+                rd: res,
+                rs1: lhs,
+                rs2: rhs,
+            }),
+            BinaryOp::Div => self.write_inst(div {
+                rd: res,
+                rs1: lhs,
+                rs2: rhs,
+            }),
+            BinaryOp::Mod => self.write_inst(rem {
+                rd: res,
+                rs1: lhs,
+                rs2: rhs,
+            }),
+            BinaryOp::And => todo!(),
+            BinaryOp::Or => todo!(),
+            BinaryOp::Xor => todo!(),
+            BinaryOp::Shl => self.write_inst(sll {
+                rd: res,
+                rs1: lhs,
+                rs2: rhs,
+            }),
+            BinaryOp::Shr => todo!(),
+            BinaryOp::Sar => self.write_inst(sra {
+                rd: res,
+                rs1: lhs,
+                rs2: rhs,
+            }),
+        }
+    }
+
+    pub fn ret(&mut self) {
+        import_reg_and_inst!();
+        let source = self.reg_pool.take_register();
+        self.write_inst(mv { rd: a0, rs: source });
+        self.epilogue_stack
+            .last_mut()
+            .unwrap()
+            .mark()
+            .clone()
+            .finish(self);
+    }
+
+    fn mv(&mut self, source: Register, dest: Register) {
+        import_reg_and_inst!();
+        self.write_inst(mv {
+            rd: dest,
+            rs: source,
+        });
+    }
+
+    pub fn void_ret(&mut self) {
+        self.epilogue_stack
+            .last_mut()
+            .unwrap()
+            .mark()
+            .clone()
+            .finish(self);
+    }
+
+    pub fn jump(&mut self, bb: BasicBlock, program: &Program) {
+        import_reg_and_inst!();
+        self.write_inst(j {
+            label: self.get_bb_name(bb, program),
+        });
+    }
+
+    pub fn if_jump(&mut self, true_bb: BasicBlock, false_bb: BasicBlock, program: &Program) {
+        import_reg_and_inst!();
+        let cond_reg = self.reg_pool.take_register();
+        self.write_inst(bnez {
+            rs: cond_reg,
+            label: self.get_bb_name(true_bb, program),
+        });
+        self.write_inst(beqz {
+            rs: cond_reg,
+            label: self.get_bb_name(false_bb, program),
+        });
     }
 }

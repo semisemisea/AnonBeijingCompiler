@@ -1383,7 +1383,7 @@ impl ToRaanaIR for BinaryOp {
             return;
         }
 
-        let operation = ctx.new_local_value().binary(lhs, rhs, *self);
+        let operation = ctx.new_local_value().binary(*self, lhs, rhs);
         ctx.push_val(operation);
         ctx.push_inst(operation);
     }

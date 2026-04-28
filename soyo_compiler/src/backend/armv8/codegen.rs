@@ -29,7 +29,7 @@ pub fn inst_size(func: &FunctionData, val: Inst) -> usize {
 }
 
 impl GenerateAsm for FunctionData {
-    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) -> anyhow::Result<()> {
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         ctx.writeln(&format!("{}:", self.name().strip_prefix("@").unwrap()));
         ctx.incr_indent();
 
@@ -103,19 +103,18 @@ impl GenerateAsm for FunctionData {
                     ctx.insert_inst(inst, curr_offset);
                 }
                 ctx.curr_inst_mut().replace(inst);
-                inst.generate(program, ctx)?;
+                inst.generate(program, ctx);
                 curr_offset += inst_size(self, inst);
             }
         }
 
         ctx.decr_indent();
         ctx.pop_epilogue();
-        Ok(())
     }
 }
 
 impl GenerateAsm for Inst {
-    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) -> anyhow::Result<()> {
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         match ctx.curr_func_data(program).dfg().value(*self).kind() {
             InstKind::Integer(int) => int.generate(program, ctx),
             InstKind::Alloc => todo!(),
@@ -141,7 +140,7 @@ impl GenerateAsm for Inst {
 /// }
 /// ```
 impl GenerateAsm for GetPtr {
-    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) -> anyhow::Result<()> {
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         let global_flag = self.src().is_global();
         // element type size
         let pointee_size = if global_flag {
@@ -170,7 +169,6 @@ impl GenerateAsm for GetPtr {
         }
 
         ctx.save_word_at_curr_inst();
-        Ok(())
     }
 }
 
@@ -182,7 +180,7 @@ impl GenerateAsm for GetPtr {
 /// ```
 impl GenerateAsm for GetElemPtr {
     // base_addr + elem_ty_size * index
-    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) -> anyhow::Result<()> {
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         let global_flag = self.src().is_global();
         let ptr_flag = if global_flag {
             false
@@ -226,7 +224,6 @@ impl GenerateAsm for GetElemPtr {
         }
 
         ctx.save_word_at_curr_inst();
-        Ok(())
     }
 }
 
@@ -237,7 +234,7 @@ impl GenerateAsm for GetElemPtr {
 /// }
 /// ```
 impl GenerateAsm for Call {
-    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) -> anyhow::Result<()> {
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         // arity of the function
         let arity = self.args().len();
 
@@ -276,8 +273,6 @@ impl GenerateAsm for Call {
             ctx.alloc_ret_reg();
             ctx.save_word_at_curr_inst();
         }
-
-        Ok(())
     }
 }
 
@@ -287,10 +282,9 @@ impl GenerateAsm for Call {
 /// }
 /// ```
 impl GenerateAsm for BlockArgRef {
-    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) -> anyhow::Result<()> {
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         let curr_inst = ctx.curr_inst_mut().unwrap();
         ctx.load_to_register(program, curr_inst);
-        Ok(())
     }
 }
 
@@ -304,7 +298,7 @@ impl GenerateAsm for BlockArgRef {
 /// }
 ///```
 impl GenerateAsm for Branch {
-    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) -> anyhow::Result<()> {
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         ctx.load_to_register(program, self.cond());
         let true_args_and_params = self
             .true_args()
@@ -322,7 +316,6 @@ impl GenerateAsm for Branch {
                 ctx.save_word_at_inst(param);
             });
         ctx.if_jump(self.true_bb(), self.false_bb(), program);
-        Ok(())
     }
 }
 
@@ -333,7 +326,7 @@ impl GenerateAsm for Branch {
 /// }
 ///```
 impl GenerateAsm for Jump {
-    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) -> anyhow::Result<()> {
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         let args_and_params = self
             .args()
             .iter()
@@ -343,29 +336,26 @@ impl GenerateAsm for Jump {
             ctx.save_word_at_inst(param);
         });
         ctx.jump(self.target(), program);
-        Ok(())
     }
 }
 
 impl GenerateAsm for Return {
-    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) -> anyhow::Result<()> {
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         if let Some(ret_val) = self.value() {
             ctx.load_to_register(program, ret_val);
             ctx.ret();
         } else {
             ctx.void_ret();
         }
-        Ok(())
     }
 }
 
 impl GenerateAsm for Binary {
-    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) -> anyhow::Result<()> {
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         ctx.load_to_register(program, self.lhs());
         ctx.load_to_register(program, self.rhs());
         ctx.binary_op(self.op());
         ctx.save_word_at_curr_inst();
-        Ok(())
     }
 }
 
@@ -376,7 +366,7 @@ impl GenerateAsm for Binary {
 /// ```
 /// Get 1 register
 impl GenerateAsm for Load {
-    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) -> anyhow::Result<()> {
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         let global_flag = self.src().is_global();
         let ptr_flag = if global_flag {
             false
@@ -401,7 +391,6 @@ impl GenerateAsm for Load {
             }
             ctx.save_word_at_curr_inst();
         }
-        Ok(())
     }
 }
 
@@ -409,8 +398,7 @@ impl GenerateAsm for Alloc {
     /// alloc is marker instruction for IR representation, we have already allocate a stack(sp) to
     /// store the instruction, so it won't have counterpart in RISC-V instruction
     #[allow(unused)]
-    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) -> anyhow::Result<()> {
-        Ok(())
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
     }
 }
 
@@ -421,7 +409,7 @@ impl GenerateAsm for Alloc {
 /// }
 /// ```
 impl GenerateAsm for Store {
-    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) -> anyhow::Result<()> {
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         if self.dest().is_global() {
             ctx.load_address(get_glob_var_name(self.dest(), program));
             ctx.load_to_register(program, self.value());
@@ -440,7 +428,6 @@ impl GenerateAsm for Store {
                 }
             };
         }
-        Ok(())
     }
 }
 
@@ -452,9 +439,8 @@ impl GenerateAsm for Store {
 /// This instruction produce a i32 as instruction return value.
 impl GenerateAsm for Integer {
     /// Load a ingeter immediate to a register.
-    fn generate(&self, _program: &Program, ctx: &mut AsmGenContext) -> anyhow::Result<()> {
+    fn generate(&self, _program: &Program, ctx: &mut AsmGenContext) {
         ctx.load_imm(self.value());
-        Ok(())
     }
 }
 

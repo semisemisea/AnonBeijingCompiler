@@ -368,7 +368,7 @@ global %1 = alloc <init = 5, type = i32, size = 4>
         fd.layout_mut().push_bb_back(b);
         let o = fd.new_local_inst().integer(1);
         let t = fd.new_local_inst().integer(2);
-        let add = fd.new_local_inst().binary(o, t, BinaryOp::Add);
+        let add = fd.new_local_inst().binary(BinaryOp::Add, o, t);
         fd.layout_mut()
             .bbs_mut()
             .get_mut_last()

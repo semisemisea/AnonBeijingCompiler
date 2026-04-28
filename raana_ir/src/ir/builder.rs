@@ -1,4 +1,5 @@
 use crate::ir::{
+    Program,
     arena::{Arena, ArenaMut},
     basic_block::{BasicBlock, BasicBlockData},
     function::Function,
@@ -8,7 +9,6 @@ use crate::ir::{
     },
     instruction::{Inst, InstData},
     types::Type,
-    Program,
 };
 
 pub trait InfoQuery {
@@ -60,7 +60,7 @@ pub trait ScalarInstBuilder: InstInsert + InfoQuery + Sized {
 }
 
 pub trait LocalInstBuilder: ScalarInstBuilder {
-    fn binary(&mut self, lhs: Inst, rhs: Inst, op: BinaryOp) -> Inst {
+    fn binary(&mut self, op: BinaryOp, lhs: Inst, rhs: Inst) -> Inst {
         let lhs_type = self.inst_type(lhs);
         let rhs_type = self.inst_type(rhs);
         assert!(lhs_type.is_scalar(), "lhs of binary is not scalar");

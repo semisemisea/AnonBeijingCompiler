@@ -1,8 +1,9 @@
-use crate::frontend::utils::{item, AstGenContext, Symbol, ToKoopaIR};
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use super::items;
+use crate::frontend::utils::{AstGenContext, Symbol, ToRaanaIR};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use raana_ir::ir::{builder_trait::*, *};
 
-impl ToKoopaIR for item::CompUnits {
+impl ToRaanaIR for items::CompUnits {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         ctx.decl_library_functions()?;
         self.comp_units
@@ -15,7 +16,7 @@ impl ToKoopaIR for item::CompUnits {
     }
 }
 
-impl ToKoopaIR for item::CompUnit {
+impl ToRaanaIR for items::CompUnit {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         match self {
@@ -29,7 +30,7 @@ impl ToKoopaIR for item::CompUnit {
     }
 }
 
-impl ToKoopaIR for item::FuncDef {
+impl ToRaanaIR for items::FuncDef {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         // Register the function to get handle
         let data = FunctionData::new(
@@ -90,7 +91,7 @@ impl ToKoopaIR for item::FuncDef {
     }
 }
 
-impl ToKoopaIR for item::Block {
+impl ToRaanaIR for items::Block {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
@@ -109,7 +110,7 @@ impl ToKoopaIR for item::Block {
     }
 }
 
-impl ToKoopaIR for item::BlockItem {
+impl ToRaanaIR for items::BlockItem {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
@@ -126,7 +127,7 @@ impl ToKoopaIR for item::BlockItem {
     }
 }
 
-impl ToKoopaIR for item::Decl {
+impl ToRaanaIR for items::Decl {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
@@ -147,7 +148,7 @@ impl ToKoopaIR for item::Decl {
     }
 }
 
-impl ToKoopaIR for item::ConstDecl {
+impl ToRaanaIR for items::ConstDecl {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
@@ -176,7 +177,7 @@ impl ToKoopaIR for item::ConstDecl {
     }
 }
 
-impl ToKoopaIR for item::ConstDef {
+impl ToRaanaIR for items::ConstDef {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());
@@ -317,7 +318,7 @@ impl ToKoopaIR for item::ConstDef {
     }
 }
 
-impl ToKoopaIR for item::ConstInitVal {
+impl ToRaanaIR for items::ConstInitVal {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
@@ -342,7 +343,7 @@ impl ToKoopaIR for item::ConstInitVal {
     }
 }
 
-impl ToKoopaIR for item::ConstExp {
+impl ToRaanaIR for items::ConstExp {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
@@ -357,7 +358,7 @@ impl ToKoopaIR for item::ConstExp {
     }
 }
 
-impl ToKoopaIR for item::VarDecl {
+impl ToRaanaIR for items::VarDecl {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());
@@ -378,7 +379,7 @@ impl ToKoopaIR for item::VarDecl {
     }
 }
 
-impl ToKoopaIR for item::VarDef {
+impl ToRaanaIR for items::VarDef {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());
@@ -548,7 +549,7 @@ impl ToKoopaIR for item::VarDef {
     }
 }
 
-impl ToKoopaIR for item::InitVal {
+impl ToRaanaIR for items::InitVal {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
@@ -569,7 +570,7 @@ impl ToKoopaIR for item::InitVal {
     }
 }
 
-impl ToKoopaIR for item::Stmt {
+impl ToRaanaIR for items::Stmt {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
@@ -592,7 +593,7 @@ impl ToKoopaIR for item::Stmt {
     }
 }
 
-impl ToKoopaIR for item::Break {
+impl ToRaanaIR for items::Break {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());
@@ -608,7 +609,7 @@ impl ToKoopaIR for item::Break {
     }
 }
 
-impl ToKoopaIR for item::Continue {
+impl ToRaanaIR for items::Continue {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());
@@ -624,7 +625,7 @@ impl ToKoopaIR for item::Continue {
     }
 }
 
-impl ToKoopaIR for item::WhileStmt {
+impl ToRaanaIR for items::WhileStmt {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());
@@ -663,7 +664,7 @@ impl ToKoopaIR for item::WhileStmt {
     }
 }
 
-impl ToKoopaIR for item::ReturnStmt {
+impl ToRaanaIR for items::ReturnStmt {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());
@@ -685,7 +686,7 @@ impl ToKoopaIR for item::ReturnStmt {
     }
 }
 
-impl ToKoopaIR for item::IfStmt {
+impl ToRaanaIR for items::IfStmt {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());
@@ -728,7 +729,7 @@ impl ToKoopaIR for item::IfStmt {
     }
 }
 
-impl ToKoopaIR for item::AssignStmt {
+impl ToRaanaIR for items::AssignStmt {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());
@@ -758,7 +759,7 @@ impl ToKoopaIR for item::AssignStmt {
     }
 }
 
-impl ToKoopaIR for item::Exp {
+impl ToRaanaIR for items::Exp {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
@@ -773,7 +774,7 @@ impl ToKoopaIR for item::Exp {
     }
 }
 
-impl ToKoopaIR for item::LOrExp {
+impl ToRaanaIR for items::LOrExp {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());
@@ -877,7 +878,7 @@ impl ToKoopaIR for item::LOrExp {
     }
 }
 
-impl ToKoopaIR for item::LAndExp {
+impl ToRaanaIR for items::LAndExp {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());
@@ -982,7 +983,7 @@ impl ToKoopaIR for item::LAndExp {
     }
 }
 
-impl ToKoopaIR for item::EqExp {
+impl ToRaanaIR for items::EqExp {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
@@ -1011,7 +1012,7 @@ impl ToKoopaIR for item::EqExp {
     }
 }
 
-impl ToKoopaIR for item::RelExp {
+impl ToRaanaIR for items::RelExp {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
@@ -1040,7 +1041,7 @@ impl ToKoopaIR for item::RelExp {
     }
 }
 
-impl ToKoopaIR for item::AddExp {
+impl ToRaanaIR for items::AddExp {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
@@ -1069,7 +1070,7 @@ impl ToKoopaIR for item::AddExp {
     }
 }
 
-impl ToKoopaIR for item::MulExp {
+impl ToRaanaIR for items::MulExp {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
@@ -1098,7 +1099,7 @@ impl ToKoopaIR for item::MulExp {
     }
 }
 
-impl ToKoopaIR for item::UnaryExp {
+impl ToRaanaIR for items::UnaryExp {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
@@ -1127,7 +1128,7 @@ impl ToKoopaIR for item::UnaryExp {
     }
 }
 
-impl ToKoopaIR for item::FuncCall {
+impl ToRaanaIR for items::FuncCall {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());
@@ -1167,7 +1168,7 @@ impl ToKoopaIR for item::FuncCall {
     }
 }
 
-impl ToKoopaIR for item::PrimaryExp {
+impl ToRaanaIR for items::PrimaryExp {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());
@@ -1284,7 +1285,7 @@ impl ToKoopaIR for item::PrimaryExp {
     }
 }
 
-impl ToKoopaIR for item::LVal {
+impl ToRaanaIR for items::LVal {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());
@@ -1332,7 +1333,7 @@ impl ToKoopaIR for item::LVal {
     }
 }
 
-impl ToKoopaIR for BinaryOp {
+impl ToRaanaIR for BinaryOp {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());
@@ -1379,7 +1380,7 @@ impl ToKoopaIR for BinaryOp {
             return Ok(());
         }
 
-        let operation = ctx.new_local_value().binary(lhs, rhs,*self);
+        let operation = ctx.new_local_value().binary(lhs, rhs, *self);
         ctx.push_val(operation);
         ctx.push_inst(operation);
         Ok(())
@@ -1440,7 +1441,7 @@ impl ToKoopaIR for BinaryOp {
     }
 }
 
-impl ToKoopaIR for item::UnaryOp {
+impl ToRaanaIR for items::UnaryOp {
     fn convert(&self, ctx: &mut AstGenContext) -> Result<()> {
         if ctx.is_complete_bb() {
             return Ok(());

@@ -10,7 +10,7 @@ use raana_ir::ir::{FunctionData, Inst, InstKind};
 
 use crate::{
     backend::armv8::register::Register,
-    opt::utils::{self, get_terminator_inst, IDAllocator, VIDAlloc},
+    opt::utils::{self, IDAllocator, VIDAlloc, get_terminator_inst},
 };
 
 type VRegister = Reverse<Register>;

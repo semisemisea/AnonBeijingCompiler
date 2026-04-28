@@ -1,22 +1,18 @@
 mod asm_gen_context;
 mod epilogue;
+mod generate_asm;
 mod register_alloc;
 mod register_manager;
-mod generate_asm;
 
 use raana_ir::ir::{
-    FunctionData, InstKind, Inst, Program, Type, TypeKind,
-    Binary, BlockArgRef, Branch, Call, GetElemPtr, GetPtr, Integer, Jump, Load, Return, Store
+    Binary, BlockArgRef, Branch, Call, FunctionData, GetElemPtr, GetPtr, Inst, InstKind, Integer,
+    Jump, Load, Program, Return, Store, Type, TypeKind,
 };
 
-use crate::{
-    backend::armv8::register::Register,
-};
-use register_alloc::{
-    RegisterAllocationResult
-};
-use generate_asm::GenerateAsm;
+use crate::backend::armv8::register::Register;
 use asm_gen_context::AsmGenContext;
+use generate_asm::GenerateAsm;
+use register_alloc::RegisterAllocationResult;
 
 const AUTO_FUNC_ARG_ON_STACK: bool = true;
 

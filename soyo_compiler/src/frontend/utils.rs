@@ -431,11 +431,8 @@ impl AstGenContext {
 
     pub fn pop_i32(&mut self) -> i32 {
         let val = self.pop_val().unwrap();
-        if self.as_i32(val).is_none() {
-            panic!();
-        }
         self.as_i32(val)
-            .unwrap_or_else(|| panic!("Not a integer {:?}", val))
+            .unwrap_or_else(|| panic!("Not an integer {:?}", val))
     }
 
     pub fn set_value_name(&mut self, val: Inst, ident: Ident) {

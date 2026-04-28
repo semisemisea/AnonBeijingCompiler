@@ -7,6 +7,7 @@ use crate::ir::{
     function::FunctionData,
     inst_kind::{Binary, Branch, Call, GetElemPtr, GetPtr, Jump, Load, Return, Store},
     instruction::{Inst, InstData},
+    layout::BasicBlockLayout,
 };
 
 pub struct Writer<'a> {
@@ -108,33 +109,38 @@ impl Writer<'_> {
         }
         writeln!(self.buffer, ">: {{")?;
         for bb_layout in data.layout().bbs() {
-            let bb_data = self.arena.bb_data(bb_layout.bb());
-            write!(self.buffer, "{}", bb_data.name())?;
-            if let Some((&last, rest)) = bb_data.params().split_last() {
-                write!(self.buffer, "(")?;
-                for &inst in rest {
-                    write!(
-                        self.buffer,
-                        "{}: {}, ",
-                        get_name!(self, inst),
-                        self.arena.inst_data(inst).ty()
-                    )?;
-                }
-                write!(
-                    self.buffer,
-                    "{}: {}",
-                    get_name!(self, last),
-                    self.arena.inst_data(last).ty()
-                )?;
-                write!(self.buffer, ")")?;
-            }
-            writeln!(self.buffer, ":")?;
-            for &inst in bb_layout.insts() {
-                write!(self.buffer, "    ")?;
-                self.visit_local_inst(inst, self.arena.inst_data(inst))?
-            }
+            self.visit_bb(bb_layout)?;
         }
         writeln!(self.buffer, "}}")
+    }
+
+    fn visit_bb(&mut self, layout: &BasicBlockLayout) -> std::fmt::Result {
+        let data = self.arena.bb_data(layout.bb());
+        write!(self.buffer, "{}", data.name())?;
+        if let Some((&last, rest)) = data.params().split_last() {
+            write!(self.buffer, "(")?;
+            for &inst in rest {
+                write!(
+                    self.buffer,
+                    "{}: {}, ",
+                    get_name!(self, inst),
+                    self.arena.inst_data(inst).ty()
+                )?;
+            }
+            write!(
+                self.buffer,
+                "{}: {}",
+                get_name!(self, last),
+                self.arena.inst_data(last).ty()
+            )?;
+            write!(self.buffer, ")")?;
+        }
+        writeln!(self.buffer, ":")?;
+        for &inst in layout.insts() {
+            write!(self.buffer, "    ")?;
+            self.visit_local_inst(inst, self.arena.inst_data(inst))?
+        }
+        Ok(())
     }
 
     fn visit_local_inst(&mut self, inst: Inst, data: &InstData) -> std::fmt::Result {
@@ -189,7 +195,7 @@ impl Writer<'_> {
         write!(self.buffer, "br {}, ", get_name!(self, branch.cond()))?;
         write!(
             self.buffer,
-            "{}",
+            "@{}",
             self.arena.bb_data(branch.t_target()).name()
         )?;
         if let Some((&last, rest)) = branch.t_args().split_last() {

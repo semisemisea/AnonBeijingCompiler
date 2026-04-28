@@ -430,7 +430,7 @@ impl AstGenContext {
     }
 
     pub fn pop_i32(&mut self) -> i32 {
-        let val = self.pop_val().unwrap();
+        let val = self.pop_val().expect("Value stack is empty");
         self.as_i32(val)
             .unwrap_or_else(|| panic!("Not an integer {:?}", val))
     }

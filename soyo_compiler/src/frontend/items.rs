@@ -41,8 +41,8 @@ impl FuncFParam {
             .as_ref()
             .map(|arr_ty| {
                 Type::get_pointer(arr_ty.iter().rfold(self.b_type.clone(), |ty, off| {
-                    off.global_convert(ctx)?;
-                    let idx = ctx.pop_i32()? as usize;
+                    off.global_convert(ctx);
+                    let idx = ctx.pop_i32() as usize;
                     Type::get_array(ty, idx)
                 }))
             })
@@ -54,9 +54,9 @@ impl FuncFParam {
         self.arr_ty
             .as_ref()
             .map(|arr_ty| {
-                Type::get_pointer(arr_ty.iter().try_rfold(self.b_type.clone(), |ty, off| {
-                    off.convert(ctx)?;
-                    let idx = ctx.pop_i32()? as usize;
+                Type::get_pointer(arr_ty.iter().rfold(self.b_type.clone(), |ty, off| {
+                    off.convert(ctx);
+                    let idx = ctx.pop_i32() as usize;
                     Type::get_array(ty, idx)
                 }))
             })
@@ -130,7 +130,7 @@ pub enum ConstInitVal {
 }
 
 impl ConstInitVal {
-    pub fn init_val_shape(&self, array_shape: &[i32]) -> Result<Vec<Option<&ConstExp>>> {
+    pub fn init_val_shape(&self, array_shape: &[i32]) -> Vec<Option<&ConstExp>> {
         let Self::Array(c_init_vals) = self else {
             unreachable!()
         };
@@ -145,7 +145,7 @@ impl ConstInitVal {
                 Self::Array(nested) => {
                     // WARNING: Brace around scalar. Caused by over-nested, specifically,
                     // when braces is more than dimension.
-                    // ensure!(
+                    // assert!(
                     //     array_shape.len() > 1,
                     //     "Invalid initialization value: Brace around scalar, maybe because you nested too deep"
                     // );
@@ -161,13 +161,13 @@ impl ConstInitVal {
 
                     // WARNING: Brace around scalar. Caused when unaligned brace appear. Need
                     // more demonstation.
-                    // ensure!(
+                    // assert!(
                     //     count > 0,
                     //     "Invalid initialization value: Brace around scalar. This is a warning in C but compile error in SysY."
                     // );
                     v.extend(
                         init_val
-                            .init_val_shape(&array_shape[array_shape.len() - count..])?
+                            .init_val_shape(&array_shape[array_shape.len() - count..])
                             .into_iter(),
                     );
                 }
@@ -175,7 +175,7 @@ impl ConstInitVal {
         }
         // if the initialization values are more than needed, simply truncate it.
         v.resize(capacity, None);
-        Ok(v)
+        v
     }
 }
 
@@ -208,7 +208,7 @@ pub enum InitVal {
 }
 
 impl InitVal {
-    pub fn init_val_shape(&self, array_shape: &[i32]) -> Result<Vec<Option<&Exp>>> {
+    pub fn init_val_shape(&self, array_shape: &[i32]) -> Vec<Option<&Exp>> {
         let Self::Array(c_init_vals) = self else {
             unreachable!()
         };
@@ -223,7 +223,7 @@ impl InitVal {
                 Self::Array(nested) => {
                     // WARNING: Brace around scalar. Caused by over-nested, specifically,
                     // when braces is more than dimension.
-                    // ensure!(
+                    // assert!(
                     //     array_shape.len() > 1,
                     //     "Invalid initialization value: Brace around scalar, maybe because you nested too deep"
                     // );
@@ -239,13 +239,13 @@ impl InitVal {
 
                     // WARNING: Brace around scalar. Caused when unaligned brace appear. Need
                     // more demonstation.
-                    // ensure!(
+                    // assert!(
                     //     count > 0,
                     //     "Invalid initialization value: Brace around scalar. This is a warning in C but compile error in SysY."
                     // );
                     v.extend(
                         init_val
-                            .init_val_shape(&array_shape[array_shape.len() - count..])?
+                            .init_val_shape(&array_shape[array_shape.len() - count..])
                             .into_iter(),
                     );
                 }
@@ -253,7 +253,7 @@ impl InitVal {
         }
         // if the initialization values are more than needed, simply truncate it.
         v.resize(capacity, None);
-        Ok(v)
+        v
     }
 }
 

@@ -108,7 +108,7 @@ impl AsmGenContext {
     //     todo!()
     // }
 
-    pub fn generate(mut self, program: &Program) -> anyhow::Result<List> {
+    pub fn generate(mut self, program: &Program) -> List {
         // Target platform is 32bit.
         // So before actual generation we set the size of ptr.
         Type::set_ptr_size(4);
@@ -184,11 +184,11 @@ impl AsmGenContext {
 
             self.push_func(func);
             let func_data = program.func(func);
-            func_data.generate(program, &mut self)?;
+            func_data.generate(program, &mut self);
             self.pop_func();
             self.writeln("");
         }
-        Ok(self.inst_list)
+        self.inst_list
     }
 
     #[inline]

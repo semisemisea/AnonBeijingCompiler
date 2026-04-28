@@ -1,16 +1,15 @@
 /// Define how a AST node should convert to Koopa IR.
 ///
-/// Required method: `fn convert(&self, ctx: &mut AstGenContext) -> Result<()>;`
+/// Required method: `fn convert(&self, ctx: &mut AstGenContext);`
 ///
 /// @param `ctx`: Context that store everything needed to convert.
 pub trait ToRaanaIR {
-    fn convert(&self, ctx: &mut AstGenContext) -> Result<()>;
+    fn convert(&self, ctx: &mut AstGenContext);
 
-    fn global_convert(&self, ctx: &mut AstGenContext) -> Result<()>;
+    fn global_convert(&self, ctx: &mut AstGenContext);
 }
 
 use super::items::*;
-use anyhow::{Context, Result};
 use raana_ir::ir::{builder_trait::*, *};
 use std::collections::{
     HashMap,
@@ -134,18 +133,17 @@ impl AstGenContext {
     }
 
     #[inline]
-    pub fn insert_const(&mut self, ident: Ident, val: Inst) -> Result<()> {
+    pub fn insert_const(&mut self, ident: Ident, val: Inst) {
         assert!(
             self.curr_scope().get(&ident).is_none(),
             "Redefine the constant {}",
             &*ident
         );
         self.curr_scope_mut().insert(ident, Symbol::Constant(val));
-        Ok(())
     }
 
     #[inline]
-    pub fn insert_var(&mut self, ident: Ident, val: Inst) -> Result<()> {
+    pub fn insert_var(&mut self, ident: Ident, val: Inst) {
         assert!(
             // self.global_scope().get(&ident).is_none()
             self.curr_scope().get(&ident).is_none(),
@@ -153,17 +151,15 @@ impl AstGenContext {
             &*ident
         );
         self.curr_scope_mut().insert(ident, Symbol::Variable(val));
-        Ok(())
     }
 
     #[inline]
-    pub fn insert_func(&mut self, ident: Ident, func: Function) -> Result<()> {
+    pub fn insert_func(&mut self, ident: Ident, func: Function) {
         debug_assert!(self.symbol_table.len() == 1);
         match self.curr_scope_mut().entry(ident.clone()) {
             Occupied(_) => panic!("Redefine the function {}", &*ident),
             Vacant(e) => {
                 e.insert(Symbol::Callable(func));
-                Ok(())
             }
         }
     }
@@ -338,57 +334,55 @@ impl AstGenContext {
         )
     }
 
-    pub fn decl_library_functions(&mut self) -> Result<()> {
+    pub fn decl_library_functions(&mut self) {
         let getint = self.program.new_func(FunctionData::new_decl(
             "@getint".into(),
             vec![],
             Type::get_i32(),
         ));
-        self.insert_func(std::rc::Rc::from("getint"), getint)?;
+        self.insert_func(std::rc::Rc::from("getint"), getint);
         let getch = self.program.new_func(FunctionData::new_decl(
             "@getch".into(),
             vec![],
             Type::get_i32(),
         ));
-        self.insert_func(std::rc::Rc::from("getch"), getch)?;
+        self.insert_func(std::rc::Rc::from("getch"), getch);
         let getarray = self.program.new_func(FunctionData::new_decl(
             "@getarray".into(),
             vec![Type::get_pointer(Type::get_i32())],
             Type::get_i32(),
         ));
-        self.insert_func(std::rc::Rc::from("getarray"), getarray)?;
+        self.insert_func(std::rc::Rc::from("getarray"), getarray);
         let putint = self.program.new_func(FunctionData::new_decl(
             "@putint".into(),
             vec![Type::get_i32()],
             Type::get_unit(),
         ));
-        self.insert_func(std::rc::Rc::from("putint"), putint)?;
+        self.insert_func(std::rc::Rc::from("putint"), putint);
         let putch = self.program.new_func(FunctionData::new_decl(
             "@putch".into(),
             vec![Type::get_i32()],
             Type::get_unit(),
         ));
-        self.insert_func(std::rc::Rc::from("putch"), putch)?;
+        self.insert_func(std::rc::Rc::from("putch"), putch);
         let putarray = self.program.new_func(FunctionData::new_decl(
             "@putarray".into(),
             vec![Type::get_i32(), Type::get_pointer(Type::get_i32())],
             Type::get_unit(),
         ));
-        self.insert_func(std::rc::Rc::from("putarray"), putarray)?;
+        self.insert_func(std::rc::Rc::from("putarray"), putarray);
         let starttime = self.program.new_func(FunctionData::new_decl(
             "@starttime".into(),
             vec![],
             Type::get_unit(),
         ));
-        self.insert_func(std::rc::Rc::from("starttime"), starttime)?;
+        self.insert_func(std::rc::Rc::from("starttime"), starttime);
         let stoptime = self.program.new_func(FunctionData::new_decl(
             "@stoptime".into(),
             vec![],
             Type::get_unit(),
         ));
-        self.insert_func(std::rc::Rc::from("stoptime"), stoptime)?;
-
-        Ok(())
+        self.insert_func(std::rc::Rc::from("stoptime"), stoptime);
     }
 
     #[inline]
@@ -435,12 +429,13 @@ impl AstGenContext {
         }
     }
 
-    pub fn pop_i32(&mut self) -> anyhow::Result<i32> {
+    pub fn pop_i32(&mut self) -> i32 {
         let val = self.pop_val().unwrap();
         if self.as_i32(val).is_none() {
             panic!();
         }
-        self.as_i32(val).context(format!("Not a integer {:?}", val))
+        self.as_i32(val)
+            .unwrap_or_else(|| panic!("Not a integer {:?}", val))
     }
 
     pub fn set_value_name(&mut self, val: Inst, ident: Ident) {

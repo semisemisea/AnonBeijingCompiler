@@ -1,7 +1,7 @@
 use crate::ir::{
     arena::{Arena, ArenaMut, GlobalArena},
     builder::GlobalBuilder,
-    function::{next_function_id, Function, FunctionData},
+    function::{Function, FunctionData, next_function_id},
     instruction::Inst,
     types::Type,
 };
@@ -36,6 +36,7 @@ impl Program {
     pub(in crate::ir) fn arena_mut(&mut self) -> ArenaMut<'_> {
         ArenaMut::new_global(&mut self.global_arena)
     }
+
     pub fn arena(&self) -> Arena<'_> {
         Arena::new_global(&self.global_arena)
     }

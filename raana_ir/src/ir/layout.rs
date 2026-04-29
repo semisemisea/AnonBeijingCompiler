@@ -73,10 +73,21 @@ pub struct BasicBlocks<'a> {
     layout: &'a Layout,
 }
 
+// impl Iterator for BasicBlocks<'_> {
+//     fn next(&mut self) -> Option<Self::Item> {
+//
+//     }
+// }
+
 impl BasicBlocks<'_> {
     #[deprecated]
     pub fn keys(&self) -> impl Iterator<Item = BasicBlock> {
         self.layout.bbs.iter().map(|bl| bl.bb)
+    }
+
+    #[deprecated]
+    pub fn node(&self, bb: BasicBlock) -> &BasicBlockLayout {
+        self.layout.basicblock(bb)
     }
 }
 

@@ -67,6 +67,7 @@ impl<'a> Arena<'a> {
     pub fn new(local: Option<&'a LocalArena>, global: Option<&'a GlobalArena>) -> Arena<'a> {
         Arena { local, global }
     }
+
     pub fn new_local(local: &'a LocalArena) -> Arena<'a> {
         Arena {
             local: Some(local),
@@ -99,6 +100,24 @@ impl<'a> Arena<'a> {
 
     pub fn set_local(&mut self, local: Option<&'a LocalArena>) {
         self.local = local;
+    }
+
+    #[deprecated]
+    pub fn value(&self, value: Inst) -> &InstData {
+        self.inst_data(value)
+    }
+
+    #[deprecated]
+    pub fn values(&self) -> impl Iterator<Item = &InstData> {
+        self.global
+            .unwrap()
+            .inst_arena
+            .datas()
+            .chain(self.local.unwrap().inst_arena.datas())
+    }
+    #[deprecated]
+    pub fn bb(&self, bb: BasicBlock) -> &BasicBlockData {
+        self.local.unwrap().bb_arena.data_of(bb)
     }
 }
 

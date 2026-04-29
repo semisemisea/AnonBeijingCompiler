@@ -40,6 +40,16 @@ impl FunctionData {
         }
     }
 
+    #[deprecated]
+    pub fn dfg(&self) -> Arena<'_> {
+        self.arena()
+    }
+
+    #[deprecated]
+    pub fn dfg_mut(&mut self) -> ArenaMut<'_> {
+        self.arena_mut()
+    }
+
     pub fn layout(&self) -> &Layout {
         &self.layout
     }

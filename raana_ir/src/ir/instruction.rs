@@ -140,6 +140,10 @@ impl LocalInstArena {
     pub fn mut_data_of(&mut self, inst: Inst) -> &mut InstData {
         &mut self.data[(inst.0.get() - LOCAL_ID_START_FROM) as usize]
     }
+
+    pub fn datas(&self) -> impl Iterator<Item = &InstData> {
+        self.data.iter()
+    }
 }
 
 impl GlobalInstArena {
@@ -157,5 +161,9 @@ impl GlobalInstArena {
 
     pub fn mut_data_of(&mut self, inst: Inst) -> &mut InstData {
         &mut self.data[(inst.0.get() - GLOBAL_ID_START_FROM) as usize]
+    }
+
+    pub fn datas(&self) -> impl Iterator<Item = &InstData> {
+        self.data.iter()
     }
 }

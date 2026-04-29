@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 
-use raana_ir::ir::{
-    Function, FunctionData,
-    BinaryOp,
-    Inst, InstKind,
-};
+use crate::ir::{BinaryOp, Function, FunctionData, Inst, InstKind};
+
+use crate::opt::pass::Pass;
 
 use crate::opt::utils::{self, BIDAlloc, BId, DomTree, IDAllocator, VIDAlloc};
 
@@ -12,9 +10,7 @@ pub struct GlobalInstNumbering;
 
 type InstNumber = usize;
 
-// TODO: BinaryOp has no `Copy` trait yet.
-// #[derive(Debug, Hash, Clone, Copy, PartialEq, Eq)]
-#[derive(Debug, Hash, Clone, PartialEq, Eq)]
+#[derive(Debug, Hash, Clone, Copy, PartialEq, Eq)]
 enum InstType {
     Const(i32),
     // in the SSA-form, everything is constant.
@@ -139,7 +135,7 @@ impl LayeredMap {
     }
 }
 
-impl FunctionPass for GlobalInstNumbering {
+impl Pass for GlobalInstNumbering {
     fn run_on(&mut self, _func: Function, data: &mut FunctionData) {
         // function declaration. we just have to skip it.
         if data.layout().entry_bb().is_none() {
@@ -154,7 +150,7 @@ impl FunctionPass for GlobalInstNumbering {
         let (graph, prece) = utils::build_cfg_both(data, &mut bb_alloc);
 
         // entry bb must be the first to be allocated.
-        assert!(bb_alloc.get_id(&data.layout().entry_bb().unwrap()) == 0);
+        assert!(bb_alloc.get_id(&data.layout().entry_bb().unwrap().bb()) == 0);
 
         let rpo_path = utils::rpo_path(&graph);
         let idom_map = utils::idom(&prece, &rpo_path);

@@ -4,15 +4,9 @@ use crate::opt::utils::{self, BId, CFGGraph, DomTree, IDAllocator, IDomMap, VId}
 
 const FUNC_ARG_OPT_ENABLE: bool = false;
 
-use raana_ir::{
-    ir::{
-        BasicBlock,
-        builder_trait::{ScalarInstBuilder},
-        Function, FunctionData,
-        BlockArgRef,
-        Inst, InstKind,
-    },
-    // opt::{FunctionPass},
+use crate::{
+    ir::{BasicBlock, BlockArgRef, Function, FunctionData, Inst, InstKind},
+    opt::pass::Pass,
 };
 
 pub struct SSATransform;
@@ -34,7 +28,7 @@ type InsertTable = Vec<Vec<(VId, Index)>>;
 // Recording each variable version while doing SSA elimination.
 type ValStack = Vec<Vec<Inst>>;
 
-impl FunctionPass for SSATransform {
+impl Pass for SSATransform {
     fn run_on(&mut self, func: Function, data: &mut FunctionData) {
         // function declaration. skip.
         if data.layout().entry_bb().is_none() {
@@ -74,12 +68,12 @@ impl FunctionPass for SSATransform {
         eprintln!("dominance_tree: {donimnace_tree:?}");
 
         // then we can do frontier analysis
-        let dom_frontier = dominance_analysis(&bb_id, &prece, &idom_map);
+        let dom_frontier = dominance_analysis(&bb_id.bb(), &prece, &idom_map);
         eprintln!("dominance_frontier: {dom_frontier:?}");
 
         // find out where are varaibles defined.
         let mut val_id = IDAllocator::new(1);
-        let val_usage = variable_analysis(&mut val_id, &mut bb_id, data);
+        let val_usage = variable_analysis(&mut val_id, &mut bb_id.bb(), data);
         eprintln!("val_usage: {val_usage:?}");
 
         // variable(vid) is insert as basic block(bbid) at index(usize)
@@ -149,7 +143,7 @@ impl FunctionPass for SSATransform {
             &donimnace_tree,
             &mut val_stack,
             &val_id,
-            &bb_id,
+            &bb_id.bb(),
             data,
             &insert_table,
             &mut remove_list,

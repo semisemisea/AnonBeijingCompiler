@@ -1,14 +1,10 @@
 use std::collections::{HashSet, VecDeque};
 
-use raana_ir::{
-    ir::{
-        BasicBlock,
-        builder_trait::{ScalarInstBuilder, LocalInstBuilder},
-        Function, FunctionData,
-        BinaryOp,
-        Inst, InstKind,
-    },
-    // opt::FunctionPass,
+use crate::opt::pass::Pass;
+
+use crate::ir::{
+    BasicBlock, BinaryOp, Function, FunctionData, Inst, InstKind,
+    builder_trait::{LocalInstBuilder, ScalarInstBuilder},
 };
 
 use crate::opt::utils::{BId, IDAllocator, VId, visit_and_replace};
@@ -121,13 +117,13 @@ type SSAWorklist = VecDeque<Inst>;
 
 const REMOVE_FLAG: bool = true;
 
-impl FunctionPass for SparseConditionConstantPropagation {
+impl Pass for SparseConditionConstantPropagation {
     fn run_on(&mut self, _func: Function, data: &mut FunctionData) {
         let Some(entry_bb) = data.layout().entry_bb() else {
             return;
         };
         let mut bb_allocator: IDAllocator<BasicBlock, BId> = IDAllocator::new(1);
-        bb_allocator.check_or_alloc_id_same(entry_bb);
+        bb_allocator.check_or_alloc_id_same(entry_bb.bb());
 
         let mut edge_visited = EdgeSet::new();
         let mut vertex_visited = HashSet::new();
@@ -246,7 +242,7 @@ impl FunctionPass for SparseConditionConstantPropagation {
                 })
                 .collect::<Vec<_>>();
             for bb in remove_list {
-                data.layout_mut().bbs_mut().remove(&bb);
+                data.layout_mut().bbs_mut().remove(bb);
                 // data.dfg_mut().remove_bb(bb);
             }
 

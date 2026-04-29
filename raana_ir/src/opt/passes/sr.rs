@@ -1,14 +1,11 @@
-use raana_ir::{
-    ir::{
-        builder_trait::{LocalInstBuilder},
-        BinaryOp, Function, FunctionData, InstKind,
-    },
-    // opt::{FunctionPass},
+use crate::{
+    ir::{BinaryOp, Function, FunctionData, InstKind, builder_trait::LocalInstBuilder},
+    opt::pass::Pass,
 };
 
 pub struct StrengthReduction;
 
-impl FunctionPass for StrengthReduction {
+impl Pass for StrengthReduction {
     fn run_on(&mut self, func: Function, data: &mut FunctionData) {
         self.local_reduction(data);
     }

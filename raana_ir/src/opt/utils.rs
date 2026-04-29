@@ -1,12 +1,8 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
-use raana_ir::{
+use crate::{
     ir::{
-        BasicBlock,
-        builder_trait::LocalInstBuilder,
-        FunctionData,
-        Inst, InstKind,
-        Type, TypeKind,
+        BasicBlock, FunctionData, Inst, InstKind, Type, TypeKind, builder_trait::LocalInstBuilder,
     },
     // opt::{FunctionPass, ModulePass},
 };

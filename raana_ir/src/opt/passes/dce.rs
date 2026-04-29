@@ -1,9 +1,8 @@
 #![allow(unused)]
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use raana_ir::{
+use crate::{
     ir::{
-        builder_trait::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
         BasicBlock,
         BinaryOp,
         Function,
@@ -13,11 +12,15 @@ use raana_ir::{
         InstKind,
         // dfg,
         Program,
+        builder_trait::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
     },
     // opt::{FunctionPass, ModulePass},
 };
 
-use crate::opt::utils::{build_cfg_both, BId, IDAllocator, VId};
+use crate::opt::{
+    pass::Pass,
+    utils::{BId, IDAllocator, VId, build_cfg_both},
+};
 
 pub struct DeadPhiElimination;
 pub struct DeadCodeElimination;
@@ -31,8 +34,8 @@ const REMOVE_FLAG: bool = true;
 /// I/O
 /// Function (call to function)
 /// Branches and Return
-impl ModulePass for DeadCodeElimination {
-    fn run_on(&mut self, program: &mut Program) {
+impl Pass for DeadCodeElimination {
+    fn run(&mut self, program: &mut Program) {
         let mut val_id = IDAllocator::new(1);
         for (&func, data) in program.funcs_mut() {
             self.run_on_func(func, data, &mut val_id);
@@ -199,7 +202,7 @@ impl DeadCodeElimination {
     }
 }
 
-impl FunctionPass for DeadPhiElimination {
+impl Pass for DeadPhiElimination {
     fn run_on(&mut self, func: Function, data: &mut FunctionData) {
         let mut bb_allocator: IDAllocator<BasicBlock, BId> = IDAllocator::new(1);
         let mut unused_params_indices = Vec::with_capacity(data.layout().bbs().len());
@@ -259,7 +262,7 @@ impl FunctionPass for DeadPhiElimination {
     }
 }
 
-impl FunctionPass for UnreachableBasicBlock {
+impl Pass for UnreachableBasicBlock {
     fn run_on(&mut self, func: Function, data: &mut FunctionData) {
         if data.layout().entry_bb().is_none() {
             return;
@@ -310,7 +313,7 @@ impl FunctionPass for UnreachableBasicBlock {
                 //     // data.dfg_mut().remove_value(val);
                 // }
 
-                data.layout_mut().bbs_mut().remove(&bb);
+                data.layout_mut().bbs_mut().remove(bb);
                 // data.dfg_mut().remove_bb(bb);
             }
         }
@@ -340,7 +343,7 @@ fn is_jump_inst(val: Inst, data: &FunctionData) -> bool {
     matches!(data.dfg().value(val).kind(), InstKind::Jump(..))
 }
 
-impl FunctionPass for JumpOnlyElimination {
+impl Pass for JumpOnlyElimination {
     fn run_on(&mut self, func: Function, data: &mut FunctionData) {
         let Some(entry_bb) = data.layout().entry_bb() else {
             return;
@@ -409,7 +412,7 @@ impl FunctionPass for JumpOnlyElimination {
             }
 
             // if data.layout().entry_bb().unwrap() != bb {
-            data.layout_mut().bbs_mut().remove(&bb);
+            data.layout_mut().bbs_mut().remove(bb);
             // } else {
             //     let (key, node) = data.layout_mut().bbs_mut().remove(&target_bb).unwrap();
             //     data.layout_mut().bbs_mut().remove(&bb);

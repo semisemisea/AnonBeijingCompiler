@@ -307,6 +307,8 @@ name = "raana_ir"
 version = "0.1.0"
 dependencies = [
  "index_list",
+ "itertools",
+ "num-traits",
 ]
 
 [[package]]
@@ -395,10 +397,8 @@ name = "soyo_compiler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "itertools",
  "lalrpop",
  "lalrpop-util",
- "num-traits",
  "raana_ir",
 ]
 

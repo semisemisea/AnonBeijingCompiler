@@ -393,7 +393,6 @@ dependencies = [
  "itertools",
  "lalrpop",
  "lalrpop-util",
- "num-traits",
  "raana_ir",
 ]
 

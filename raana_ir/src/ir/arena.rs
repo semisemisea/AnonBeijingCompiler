@@ -2,7 +2,7 @@ use crate::ir::{
     basic_block::{BasicBlock, BasicBlockArena, BasicBlockData},
     function::{Function, FunctionArena, FunctionData},
     instruction::{
-        next_global_inst_id, next_local_inst_id, GlobalInstArena, Inst, InstData, LocalInstArena,
+        GlobalInstArena, Inst, InstData, LocalInstArena, next_global_inst_id, next_local_inst_id,
     },
 };
 
@@ -30,6 +30,14 @@ impl GlobalArena {
 
     pub fn func_arena(&self) -> &FunctionArena {
         &self.func_arena
+    }
+
+    pub fn func_arena_mut(&mut self) -> &mut FunctionArena {
+        &mut self.func_arena
+    }
+
+    pub fn inst_arena_mut(&mut self) -> &mut GlobalInstArena {
+        &mut self.inst_arena
     }
 }
 

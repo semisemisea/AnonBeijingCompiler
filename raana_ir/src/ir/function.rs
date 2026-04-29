@@ -125,4 +125,22 @@ impl FunctionArena {
     pub fn alloc(&mut self, func_data: FunctionData) {
         self.data.push(func_data);
     }
+
+    pub fn functions(&self) -> impl Iterator<Item = (Function, &FunctionData)> {
+        self.data.iter().enumerate().map(|(i, data)| {
+            (
+                unsafe { Function(NonZeroU32::new_unchecked(i as u32 + 1)) },
+                data,
+            )
+        })
+    }
+
+    pub fn functions_mut(&mut self) -> impl Iterator<Item = (Function, &mut FunctionData)> {
+        self.data.iter_mut().enumerate().map(|(i, data)| {
+            (
+                unsafe { Function(NonZeroU32::new_unchecked(i as u32 + 1)) },
+                data,
+            )
+        })
+    }
 }

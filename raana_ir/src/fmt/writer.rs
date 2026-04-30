@@ -108,7 +108,7 @@ impl Writer<'_> {
             )?;
         }
         writeln!(self.buffer, ">: {{")?;
-        for bb_layout in data.layout().bbs() {
+        for bb_layout in data.layout().basicblocks() {
             self.visit_bb(bb_layout)?;
         }
         writeln!(self.buffer, "}}")
@@ -370,14 +370,14 @@ global %1 = alloc <init = 5, type = i32, size = 4>
         let t = fd.new_local_inst().integer(2);
         let add = fd.new_local_inst().binary(BinaryOp::Add, o, t);
         fd.layout_mut()
-            .bbs_mut()
+            .basicblocks_mut()
             .get_mut_last()
             .unwrap()
             .insts_mut()
             .insert_last(add);
         let ret = fd.new_local_inst().ret(None);
         fd.layout_mut()
-            .bbs_mut()
+            .basicblocks_mut()
             .get_mut_last()
             .unwrap()
             .insts_mut()

@@ -10,7 +10,9 @@ use crate::backend::armv8::{
         register_alloc::{AllocationState, RegisterAllocation},
         register_manager::RegisterManager,
     },
-    inst::{AddSubImm, AddSubOperand, Inst},
+    inst::{
+        AddSubImm, AddSubOperand, Inst, LoadSaveOffset, MovOperand, MoveWideImm, MoveWideImmShift,
+    },
     register::{Bit, IReg, IntRegister, Register},
 };
 
@@ -415,7 +417,23 @@ impl AsmGenContext {
     pub fn load_imm(&mut self, imm: i32) {
         import_reg_and_inst!();
         let temp_reg = self.reg_pool.alloc_temp();
-        self.write_inst(li { rd: temp_reg, imm });
+        if (-32768..32768).contains(&imm) {
+            self.write_inst(mov {
+                rd: temp_reg,
+                src: MovOperand::Immediate(MoveWideImm::Imm16(imm as u16, MoveWideImmShift::B0)),
+            });
+        } else {
+            let immz = (imm & 0xFFFF) as u16; // Low 16 bits
+            let immk = ((imm >> 16) & 0xFFFF) as u16; // High 16 bits
+            self.write_inst(movz {
+                rd: temp_reg,
+                imm: MoveWideImm::Imm16(immz, MoveWideImmShift::B0),
+            });
+            self.write_inst(movk {
+                rd: temp_reg,
+                imm: MoveWideImm::Imm16(immk, MoveWideImmShift::B16),
+            });
+        }
     }
 
     pub fn save_word_at_curr_inst(&mut self) {
@@ -437,19 +455,19 @@ impl AsmGenContext {
     pub fn save_word(&mut self, rs2: Register, imm: i32, rs1: Register) {
         import_reg_and_inst!();
         if (-2048..2048).contains(&imm) {
-            self.write_inst(sw {
-                rs2,
-                imm12: imm,
-                rs1,
+            self.write_inst(sdr {
+                rd: rs2,
+                rs: rs1,
+                offset: LoadSaveOffset::Imm12(imm as i16),
             });
         } else {
             self.load_imm(imm);
             let imm_reg = self.reg_pool.take_register();
             self.add(imm_reg, rs1, imm_reg);
-            self.write_inst(sw {
-                rs2,
-                imm12: 0,
-                rs1: imm_reg,
+            self.write_inst(sdr {
+                rd: rs2,
+                rs: imm_reg,
+                offset: LoadSaveOffset::Imm12(0),
             });
         }
     }
@@ -459,20 +477,20 @@ impl AsmGenContext {
         import_reg_and_inst!();
         if (-2048..2048).contains(&offset) {
             let temp_reg = self.reg_pool.take_register();
-            self.write_inst(sw {
-                rs2: temp_reg,
-                imm12: offset,
-                rs1: sp,
+            self.write_inst(sdr {
+                rd: temp_reg,
+                rs: sp,
+                offset: LoadSaveOffset::Imm12(offset as i16),
             });
         } else {
             self.load_imm(offset);
             self.add_sp();
             let add_temp = self.reg_pool.take_register();
             let temp_reg = self.reg_pool.take_register();
-            self.write_inst(sw {
-                rs2: temp_reg,
-                imm12: 0,
-                rs1: add_temp,
+            self.write_inst(sdr {
+                rd: temp_reg,
+                rs: add_temp,
+                offset: LoadSaveOffset::Imm12(0),
             });
         }
     }
@@ -492,19 +510,19 @@ impl AsmGenContext {
     pub fn load_word(&mut self, rd: Register, offset: i32, rs: Register) {
         import_reg_and_inst!();
         if (-2048..2048).contains(&offset) {
-            self.write_inst(lw {
+            self.write_inst(ldr {
                 rd,
-                imm12: offset,
                 rs,
+                offset: LoadSaveOffset::Imm12(offset as i16),
             });
         } else {
             self.load_imm(offset);
             self.add_sp();
             let add_temp = self.reg_pool.take_register();
-            self.write_inst(lw {
+            self.write_inst(ldr {
                 rd,
-                imm12: 0,
                 rs: add_temp,
+                offset: LoadSaveOffset::Imm12(0),
             });
         }
     }
@@ -512,7 +530,7 @@ impl AsmGenContext {
     pub fn add_imm(&mut self, rd: Register, imm: i32, rs: Register) {
         import_reg_and_inst!();
         if (-2048..2048).contains(&imm) {
-            let imm12 = AddSubOperand::Immediate(AddSubImm::Imm12(imm as u16));
+            let imm12 = AddSubOperand::Immediate(AddSubImm::Imm12(imm as i16));
             self.write_inst(add {
                 rd,
                 rs1: rs,
@@ -535,20 +553,20 @@ impl AsmGenContext {
         import_reg_and_inst!();
         if (-2048..2048).contains(&offset) {
             let temp_reg = self.reg_pool.alloc_temp();
-            self.write_inst(lw {
+            self.write_inst(ldr {
                 rd: temp_reg,
-                imm12: offset,
                 rs: sp,
+                offset: LoadSaveOffset::Imm12(offset as i16),
             });
         } else {
             self.load_imm(offset);
             self.add_sp();
             let add_temp = self.reg_pool.take_register();
             let temp_reg = self.reg_pool.alloc_temp();
-            self.write_inst(lw {
+            self.write_inst(ldr {
                 rd: temp_reg,
-                imm12: 0,
                 rs: add_temp,
+                offset: LoadSaveOffset::Imm12(0),
             });
         };
     }

@@ -4,7 +4,7 @@ use crate::backend::armv8::register::Register;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddSubImm {
-    Imm12(u16),
+    Imm12(i16),
     Imm12Lsl12(u16),
 }
 
@@ -72,6 +72,12 @@ pub enum LogicOperand {
 pub enum MovOperand {
     Register(Register),
     Immediate(MoveWideImm),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadSaveOffset {
+    Imm12(i16),
+    Register(Register),
 }
 
 #[allow(unused)]
@@ -158,6 +164,30 @@ pub enum Inst {
         rs2: ShiftImm,
     },
     ret,
+    // memory ops
+    /// Load word: `ldr rd, [rs, offset]`
+    ldr {
+        rd: Register,
+        rs: Register,
+        offset: LoadSaveOffset,
+    },
+    /// Save word: `sdr rs, [rd, offset]`
+    sdr {
+        rs: Register,
+        rd: Register,
+        offset: LoadSaveOffset,
+    },
+    /// Get far address: `adrp rd, label`
+    /// To get a address of a label not reachable by `adr`, we can use `adrp` to get the page address, then use `ldr` with an offset to get the exact address.
+    /// ```arm
+    /// adrp x0, label
+    /// add x0, x0, :lo12:label
+    /// ldr x0, x0
+    /// ```
+    adrp {
+        rd: Register,
+        label: String,
+    },
     _string {
         indent_level: usize,
         str: String,

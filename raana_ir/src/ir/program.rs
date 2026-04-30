@@ -25,15 +25,15 @@ impl Program {
         GlobalBuilder { program: self }
     }
 
-    pub(crate) fn global_arena(&self) -> &GlobalArena {
+    pub fn global_arena(&self) -> &GlobalArena {
         &self.global_arena
     }
 
-    pub(crate) fn global_arena_mut(&mut self) -> &mut GlobalArena {
+    pub fn global_arena_mut(&mut self) -> &mut GlobalArena {
         &mut self.global_arena
     }
 
-    pub(in crate::ir) fn arena_mut(&mut self) -> ArenaMut<'_> {
+    pub fn arena_mut(&mut self) -> ArenaMut<'_> {
         ArenaMut::new_global(&mut self.global_arena)
     }
 

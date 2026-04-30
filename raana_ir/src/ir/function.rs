@@ -100,8 +100,12 @@ impl FunctionData {
         &self.params
     }
 
-    pub(crate) fn local_arena(&self) -> &LocalArena {
+    pub fn local_arena(&self) -> &LocalArena {
         &self.local_arena
+    }
+
+    pub fn local_arena_mut(&mut self) -> &mut LocalArena {
+        &mut self.local_arena
     }
 }
 

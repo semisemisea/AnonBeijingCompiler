@@ -1,4 +1,4 @@
-pub(crate) mod arena;
+pub mod arena;
 pub(crate) mod basic_block;
 pub(crate) mod builder;
 pub(crate) mod function;

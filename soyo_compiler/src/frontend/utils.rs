@@ -10,7 +10,11 @@ pub trait ToRaanaIR {
 }
 
 use super::items::*;
-use raana_ir::ir::{builder_trait::*, *};
+use raana_ir::ir::{
+    arena::{Arena, ArenaMut},
+    builder_trait::*,
+    *,
+};
 use std::collections::{
     HashMap,
     hash_map::Entry::{Occupied, Vacant},
@@ -50,8 +54,8 @@ impl AstGenContext {
         }
     }
 
-    pub fn get_global_val(&self, val: Inst) -> Option<Number> {
-        if let InstKind::Integer(int) = self.program.borrow_value(val).kind() {
+    pub fn get_global_val(&self, inst: Inst) -> Option<Number> {
+        if let InstKind::Integer(int) = self.global_arena().inst_data(inst).kind() {
             return Some(int.value());
         }
         None
@@ -61,18 +65,17 @@ impl AstGenContext {
         let sym = self.global_scope().get(ident);
         sym.map(|&x| match x {
             Symbol::Constant(int) => {
-                let borrow_value = self.program.borrow_value(int);
-                let InstKind::Integer(int) = borrow_value.kind() else {
+                let InstKind::Integer(int) = self.global_arena().inst_data(int).kind() else {
                     unreachable!();
                 };
                 int.value()
             }
             Symbol::Variable(var) => {
-                let borrow_value = self.program.borrow_value(var);
-                let InstKind::GlobalAlloc(glob_alloc) = borrow_value.kind() else {
+                let InstKind::GlobalAlloc(glob_alloc) = self.global_arena().inst_data(var).kind()
+                else {
                     unreachable!();
                 };
-                match self.program.borrow_value(glob_alloc.init()).kind() {
+                match self.global_arena().inst_data(glob_alloc.init()).kind() {
                     InstKind::Integer(int) => int.value(),
                     InstKind::ZeroInit => 0,
                     _ => unreachable!(),
@@ -97,14 +100,9 @@ impl AstGenContext {
     pub fn add_entry_bb(&mut self) -> BasicBlock {
         let func_data = self.curr_func_data_mut();
         let entry_bb = func_data
-            .dfg_mut()
-            .new_bb()
-            .basic_block(Some("%entry".into()));
-        func_data
-            .layout_mut()
-            .bbs_mut()
-            .push_key_back(entry_bb)
-            .unwrap();
+            .new_basic_block()
+            .basic_block("%entry".into(), vec![]);
+        func_data.layout_mut().push_bb_back(entry_bb);
         entry_bb
     }
 
@@ -195,12 +193,35 @@ impl AstGenContext {
 
     #[inline]
     pub fn curr_func_data_mut(&mut self) -> &mut FunctionData {
-        self.program.func_mut(*self.func_stack.last().unwrap())
+        self.program.func_data_mut(*self.func_stack.last().unwrap())
     }
 
     #[inline]
     pub fn curr_func_data(&self) -> &FunctionData {
-        self.program.func(*self.func_stack.last().unwrap())
+        self.program.func_data(*self.func_stack.last().unwrap())
+    }
+
+    pub fn full_arena(&self) -> Arena<'_> {
+        Arena::new(
+            Some(self.curr_func_data().local_arena()),
+            Some(self.program.global_arena()),
+        )
+    }
+
+    pub fn local_arena(&self) -> Arena<'_> {
+        self.curr_func_data().arena()
+    }
+
+    pub fn local_arena_mut(&mut self) -> ArenaMut<'_> {
+        self.curr_func_data_mut().arena_mut()
+    }
+
+    pub fn global_arena(&self) -> Arena<'_> {
+        self.program.arena()
+    }
+
+    pub fn global_arena_mut(&mut self) -> ArenaMut<'_> {
+        self.program.arena_mut()
     }
 
     #[inline]
@@ -210,14 +231,12 @@ impl AstGenContext {
         let curr_bb = self.curr_bb.unwrap();
         self.curr_func_data()
             .layout()
-            .bbs()
-            .node(&curr_bb)
-            .unwrap()
+            .basicblock(curr_bb)
             .insts()
-            .back_key()
+            .get_last()
             .is_some_and(|&inst| {
                 matches!(
-                    self.curr_func_data().dfg().value(inst).kind(),
+                    self.local_arena().inst_data(inst).kind(),
                     InstKind::Branch(_) | InstKind::Jump(_) | InstKind::Return(_)
                 )
             })
@@ -225,33 +244,21 @@ impl AstGenContext {
 
     #[inline]
     /// No effect when a basic block is completed (a.k.a have `br`, `jump` or `ret` at the end)
-    pub fn push_inst(&mut self, val: Inst) {
+    pub fn push_inst(&mut self, inst: Inst) {
         let curr_bb = self.curr_bb.unwrap();
         if !self.is_complete_bb() {
             self.curr_func_data_mut()
                 .layout_mut()
-                .bb_mut(curr_bb)
-                .insts_mut()
-                .push_key_back(val)
-                .unwrap();
-        } else {
-            // eprintln!(
-            //     "remove val: {val:?} {:?}",
-            //     self.curr_func_data().dfg().value(val).kind()
-            // );
-            // self.curr_func_data_mut().dfg_mut().remove_value(val);
+                .insert_inst(curr_bb, inst);
         }
     }
 
-    // TODO: pending for layout.
-    pub fn remove_inst(&mut self, val: Inst) {
+    pub fn remove_inst(&mut self, inst: Inst) {
         let curr_basic_blcok = self.curr_bb.unwrap();
         let _ = self
             .curr_func_data_mut()
             .layout_mut()
-            .bb_mut(curr_basic_blcok)
-            .insts_mut()
-            .remove(&val);
+            .remove_inst(curr_basic_blcok, inst);
     }
 
     #[inline]
@@ -272,15 +279,11 @@ impl AstGenContext {
     #[must_use]
     #[inline]
     pub fn new_bb(&mut self) -> BasicBlockBuilders<'_> {
-        self.curr_func_data_mut().dfg_mut().new_bb()
+        self.curr_func_data_mut().new_basic_block()
     }
 
     pub fn register_bb(&mut self, bb: BasicBlock) {
-        self.curr_func_data_mut()
-            .layout_mut()
-            .bbs_mut()
-            .push_key_back(bb)
-            .unwrap()
+        self.curr_func_data_mut().layout_mut().push_bb_back(bb);
     }
 
     // TODO: pending for layout.
@@ -291,9 +294,8 @@ impl AstGenContext {
 
     #[must_use]
     #[inline]
-    // TODO: confused.
     pub fn new_local_value(&mut self) -> LocalBuilder<'_> {
-        self.curr_func_data_mut().dfg_mut().new_value()
+        self.curr_func_data_mut().new_local_inst()
     }
 
     #[inline]
@@ -312,8 +314,8 @@ impl AstGenContext {
     }
 
     #[inline]
-    pub fn bb_params(&mut self, bb: BasicBlock) -> &[Inst] {
-        self.curr_func_data_mut().dfg().bb(bb).params()
+    pub fn bb_params(&self, bb: BasicBlock) -> &[Inst] {
+        self.curr_func_data().arena().bb_data(bb).params()
     }
 
     #[inline]
@@ -335,69 +337,57 @@ impl AstGenContext {
     }
 
     pub fn decl_library_functions(&mut self) {
-        let getint = self.program.new_func(FunctionData::new_decl(
-            "@getint".into(),
-            vec![],
-            Type::get_i32(),
-        ));
+        let getint = self
+            .program
+            .new_function(Type::get_i32(), "getint".into(), vec![]);
         self.insert_func(std::rc::Rc::from("getint"), getint);
-        let getch = self.program.new_func(FunctionData::new_decl(
-            "@getch".into(),
-            vec![],
-            Type::get_i32(),
-        ));
+        let getch = self
+            .program
+            .new_function(Type::get_i32(), "@getch".into(), vec![]);
         self.insert_func(std::rc::Rc::from("getch"), getch);
-        let getarray = self.program.new_func(FunctionData::new_decl(
+        let getarray = self.program.new_function(
+            Type::get_i32(),
             "@getarray".into(),
             vec![Type::get_pointer(Type::get_i32())],
-            Type::get_i32(),
-        ));
+        );
         self.insert_func(std::rc::Rc::from("getarray"), getarray);
-        let putint = self.program.new_func(FunctionData::new_decl(
-            "@putint".into(),
-            vec![Type::get_i32()],
-            Type::get_unit(),
-        ));
+        let putint =
+            self.program
+                .new_function(Type::get_unit(), "@putint".into(), vec![Type::get_i32()]);
         self.insert_func(std::rc::Rc::from("putint"), putint);
-        let putch = self.program.new_func(FunctionData::new_decl(
-            "@putch".into(),
-            vec![Type::get_i32()],
-            Type::get_unit(),
-        ));
+        let putch =
+            self.program
+                .new_function(Type::get_unit(), "@putch".into(), vec![Type::get_i32()]);
         self.insert_func(std::rc::Rc::from("putch"), putch);
-        let putarray = self.program.new_func(FunctionData::new_decl(
+        let putarray = self.program.new_function(
+            Type::get_unit(),
             "@putarray".into(),
             vec![Type::get_i32(), Type::get_pointer(Type::get_i32())],
-            Type::get_unit(),
-        ));
+        );
         self.insert_func(std::rc::Rc::from("putarray"), putarray);
-        let starttime = self.program.new_func(FunctionData::new_decl(
-            "@starttime".into(),
-            vec![],
-            Type::get_unit(),
-        ));
+        let starttime = self
+            .program
+            .new_function(Type::get_unit(), "@starttime".into(), vec![]);
         self.insert_func(std::rc::Rc::from("starttime"), starttime);
-        let stoptime = self.program.new_func(FunctionData::new_decl(
-            "@stoptime".into(),
-            vec![],
-            Type::get_unit(),
-        ));
+        let stoptime = self
+            .program
+            .new_function(Type::get_unit(), "@stoptime".into(), vec![]);
         self.insert_func(std::rc::Rc::from("stoptime"), stoptime);
     }
 
     #[inline]
-    fn local_val_as_i32(&self, val: Inst) -> Option<i32> {
-        debug_assert!(!val.is_global());
-        match self.curr_func_data().dfg().value(val).kind() {
+    fn local_val_as_i32(&self, inst: Inst) -> Option<i32> {
+        debug_assert!(!inst.is_global());
+        match self.local_arena().inst_data(inst).kind() {
             InstKind::Integer(int) => Some(int.value()),
             _ => None,
         }
     }
 
     #[inline]
-    fn global_val_as_i32(&self, val: Inst) -> Option<i32> {
-        debug_assert!(val.is_global());
-        match self.program.borrow_value(val).kind() {
+    fn global_val_as_i32(&self, inst: Inst) -> Option<i32> {
+        debug_assert!(inst.is_global());
+        match self.global_arena().inst_data(inst).kind() {
             InstKind::Integer(int) => Some(int.value()),
             _ => None,
         }
@@ -412,13 +402,13 @@ impl AstGenContext {
     }
 
     #[inline]
-    fn global_val_as_i32_val(&mut self, val: Inst) -> Inst {
-        assert!(val.is_global());
-        let int = match self.program.borrow_value(val).kind() {
+    fn global_val_as_i32_val(&mut self, inst: Inst) -> Inst {
+        assert!(inst.is_global());
+        let int = match self.global_arena().inst_data(inst).kind() {
             InstKind::Integer(int) => int.value(),
             _ => unreachable!(),
         };
-        self.curr_func_data_mut().dfg_mut().new_value().integer(int)
+        self.curr_func_data_mut().new_local_inst().integer(int)
     }
 
     pub fn as_i32_val(&mut self, val: Inst) -> Inst {
@@ -437,23 +427,24 @@ impl AstGenContext {
 
     pub fn set_value_name(&mut self, val: Inst, ident: Ident) {
         if val.is_global() {
-            self.program
-                .set_value_name(val, Some(format!("%gv_{}", ident.clone())));
+            self.global_arena_mut()
+                .inst_data_mut(val)
+                .set_name(format!("gv_{}", ident.clone()));
         } else {
-            self.curr_func_data_mut()
-                .dfg_mut()
-                .set_value_name(val, Some(format!("%v_{}", ident.clone())));
+            self.local_arena_mut()
+                .inst_data_mut(inst)
+                .set_name(format!("%v_{}", ident.clone()));
         }
     }
 
-    pub fn is_pointer_to_array(&self, val: Inst) -> bool {
-        if val.is_global() {
-            match self.program.borrow_value(val).ty().kind() {
+    pub fn is_pointer_to_array(&self, inst: Inst) -> bool {
+        if inst.is_global() {
+            match self.global_arena().inst_data(inst).ty().kind() {
                 TypeKind::Pointer(point_to) => matches!(point_to.kind(), TypeKind::Array(..)),
                 _ => false,
             }
         } else {
-            match self.curr_func_data().dfg().value(val).ty().kind() {
+            match self.local_arena().inst_data(inst).ty().kind() {
                 TypeKind::Pointer(point_to) => matches!(point_to.kind(), TypeKind::Array(..)),
                 _ => false,
             }

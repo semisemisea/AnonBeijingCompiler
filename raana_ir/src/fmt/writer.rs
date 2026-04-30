@@ -2,9 +2,8 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::ir::{
-    InstKind, Program, Type,
+    Function, FunctionData, InstKind, Program, Type,
     arena::Arena,
-    function::FunctionData,
     inst_kind::{Binary, Branch, Call, GetElemPtr, GetPtr, Jump, Load, Return, Store},
     instruction::{Inst, InstData},
     layout::BasicBlockLayout,
@@ -12,24 +11,58 @@ use crate::ir::{
 
 pub struct Writer<'a> {
     buffer: String,
-    program: &'a Program,
+    program: ProgramWrapper<'a>,
     symbol: HashMap<Inst, String>,
     counter: u32,
-    arena: Arena<'a>,
 }
+struct ProgramWrapper<'a> {
+    pub program: &'a Program,
+    pub curr_func: Option<Function>,
+}
+
+impl<'a> std::ops::Deref for ProgramWrapper<'a> {
+    type Target = &'a Program;
+    fn deref(&self) -> &Self::Target {
+        &self.program
+    }
+}
+
+impl Arena for ProgramWrapper<'_> {
+    fn local(&self) -> &crate::ir::arena::LocalArena {
+        self.program
+            .func_data(self.curr_func.unwrap())
+            .local_arena()
+    }
+    fn global(&self) -> &crate::ir::arena::GlobalArena {
+        self.program.global_arena()
+    }
+
+    fn local_mut(&mut self) -> &mut crate::ir::arena::LocalArena {
+        unimplemented!()
+    }
+    fn global_mut(&mut self) -> &mut crate::ir::arena::GlobalArena {
+        unimplemented!()
+    }
+}
+
+macro_rules! put_name {
+    ($self:expr, $inst:expr) => {
+        if let Some(name) = $self.program.inst_data($inst).name() {
+            $self.symbol.insert($inst, format!("%{}", name));
+        } else {
+            $self.symbol.insert($inst, format!("%{}", $self.counter));
+            $self.counter += 1;
+        }
+    };
+}
+
 macro_rules! get_name {
     ($self: expr, $inst: expr) => {{
-        let data = $self.arena.inst_data($inst);
+        let data = $self.program.inst_data($inst);
         match data.kind() {
             InstKind::Integer(i) => i.value().to_string(),
             InstKind::Float(i) => i.value().to_string(),
-            _ => $self
-                .arena
-                .inst_data($inst)
-                .name()
-                .unwrap_or_else(|| $self.symbol.get(&$inst).unwrap())
-                // just work for now
-                .to_string(),
+            _ => $self.symbol.get(&$inst).unwrap().clone(),
         }
     }};
 }
@@ -38,41 +71,35 @@ impl Writer<'_> {
     pub fn new(program: &Program) -> Writer {
         Writer {
             buffer: String::new(),
-            program,
+            program: ProgramWrapper {
+                program,
+                curr_func: None,
+            },
             symbol: HashMap::new(),
             counter: 0,
-            arena: Arena::new(None, Some(program.global_arena())),
-        }
-    }
-
-    fn put_name(&mut self, inst: Inst) {
-        if self.arena.inst_data(inst).name().is_none() {
-            self.symbol.insert(inst, self.counter.to_string());
-            self.counter += 1;
         }
     }
 
     pub fn write(&mut self) -> std::fmt::Result {
         for &global_inst in self.program.global_inst_layout() {
-            let data = self.program.arena().inst_data(global_inst);
-            self.visit_global_inst(global_inst, data)?;
+            self.visit_global_inst(global_inst)?;
         }
 
         for &func in self.program.function_layout() {
-            // let func_data = self.program.func_data(func);
-            let func_data = self.arena.func_data(func);
-            self.arena.set_local(Some(func_data.local_arena()));
-            self.visit_func(func_data)?;
+            self.program.curr_func.replace(func);
+            let data = self.program.program.func_data(func);
+            self.visit_func(data)?;
         }
         Ok(())
     }
 
-    fn visit_global_inst(&mut self, inst: Inst, data: &InstData) -> std::fmt::Result {
-        self.put_name(inst);
+    fn visit_global_inst(&mut self, inst: Inst) -> std::fmt::Result {
+        put_name!(self, inst);
+        let data = self.program.inst_data(inst);
         match data.kind() {
             InstKind::GlobalAlloc(global_alloc) => write!(
                 self.buffer,
-                "global %{} = alloc <init = {}, type = {}, size = {}>",
+                "global {} = alloc <init = {}, type = {}, size = {}>",
                 get_name!(self, inst),
                 get_name!(self, global_alloc.init()),
                 data.ty(),
@@ -84,9 +111,19 @@ impl Writer<'_> {
     }
 
     fn visit_func(&mut self, data: &FunctionData) -> std::fmt::Result {
+        data.params()
+            .to_vec()
+            .iter()
+            .for_each(|&inst| put_name!(self, inst));
+        let is_decl = data.layout().is_decl();
+        if is_decl {
+            write!(self.buffer, "declare")?;
+        } else {
+            write!(self.buffer, "define")?;
+        }
         write!(
             self.buffer,
-            "define func <name = {}, ret_ty = {}",
+            " func <name = {}, ret_ty = {}",
             data.name(),
             data.ret_ty()
         )?;
@@ -97,15 +134,19 @@ impl Writer<'_> {
                     self.buffer,
                     "{}: {}, ",
                     get_name!(self, inst),
-                    self.arena.inst_data(inst).ty()
+                    self.program.inst_data(inst).ty()
                 )?;
             }
             write!(
                 self.buffer,
                 "{}: {})",
                 get_name!(self, last),
-                self.arena.inst_data(last).ty()
+                self.program.inst_data(last).ty()
             )?;
+        }
+        if is_decl {
+            writeln!(self.buffer, ">")?;
+            return writeln!(self.buffer);
         }
         writeln!(self.buffer, ">: {{")?;
         for bb_layout in data.layout().basicblocks() {
@@ -115,7 +156,10 @@ impl Writer<'_> {
     }
 
     fn visit_bb(&mut self, layout: &BasicBlockLayout) -> std::fmt::Result {
-        let data = self.arena.bb_data(layout.bb());
+        let data = self.program.bb_data(layout.bb());
+        for &inst in self.program.bb_data(layout.bb()).params().iter() {
+            put_name!(self, inst)
+        }
         write!(self.buffer, "{}", data.name())?;
         if let Some((&last, rest)) = data.params().split_last() {
             write!(self.buffer, "(")?;
@@ -124,29 +168,34 @@ impl Writer<'_> {
                     self.buffer,
                     "{}: {}, ",
                     get_name!(self, inst),
-                    self.arena.inst_data(inst).ty()
+                    self.program.inst_data(inst).ty()
                 )?;
             }
             write!(
                 self.buffer,
                 "{}: {}",
                 get_name!(self, last),
-                self.arena.inst_data(last).ty()
+                self.program.inst_data(last).ty()
             )?;
             write!(self.buffer, ")")?;
         }
         writeln!(self.buffer, ":")?;
         for &inst in layout.insts() {
             write!(self.buffer, "    ")?;
-            self.visit_local_inst(inst, self.arena.inst_data(inst))?
+            let data = self
+                .program
+                .program
+                .func_data(self.program.curr_func.unwrap())
+                .inst_data(inst);
+            self.visit_local_inst(inst, data)?
         }
         Ok(())
     }
 
     fn visit_local_inst(&mut self, inst: Inst, data: &InstData) -> std::fmt::Result {
-        self.put_name(inst);
+        put_name!(self, inst);
         if !data.ty().is_unit() {
-            write!(self.buffer, "%{} = ", get_name!(self, inst))?;
+            write!(self.buffer, "{} = ", get_name!(self, inst))?;
         }
 
         match data.kind() {
@@ -170,13 +219,7 @@ impl Writer<'_> {
     }
 
     fn visit_alloc(&mut self, ty: &Type) -> std::fmt::Result {
-        let base = ty.derefernce();
-        write!(
-            self.buffer,
-            "alloc <type = {}, size = {}>",
-            base,
-            base.size()
-        )
+        write!(self.buffer, "alloc <type = {}, size = {}>", ty, ty.size())
     }
 
     fn visit_binary(&mut self, binary: &Binary, ty: &Type) -> std::fmt::Result {
@@ -196,7 +239,7 @@ impl Writer<'_> {
         write!(
             self.buffer,
             "@{}",
-            self.arena.bb_data(branch.t_target()).name()
+            self.program.bb_data(branch.t_target()).name()
         )?;
         if let Some((&last, rest)) = branch.t_args().split_last() {
             write!(self.buffer, "(")?;
@@ -210,7 +253,7 @@ impl Writer<'_> {
         write!(
             self.buffer,
             "{}",
-            self.arena.bb_data(branch.f_target()).name()
+            self.program.bb_data(branch.f_target()).name()
         )?;
         if let Some((&last, rest)) = branch.f_args().split_last() {
             write!(self.buffer, "(")?;
@@ -229,7 +272,7 @@ impl Writer<'_> {
     }
 
     fn visit_call(&mut self, call: &Call) -> std::fmt::Result {
-        let callee_data = self.arena.func_data(call.callee());
+        let callee_data = self.program.func_data(call.callee());
         write!(
             self.buffer,
             "call <name = {}, type = {}, size = {}>",
@@ -241,7 +284,7 @@ impl Writer<'_> {
 
     fn visit_get_elem_ptr(&mut self, get_elem_ptr: &GetElemPtr) -> std::fmt::Result {
         let base_ty = self
-            .arena
+            .program
             .inst_data(get_elem_ptr.base())
             .ty()
             .get_array_elem_ty();
@@ -256,7 +299,7 @@ impl Writer<'_> {
     }
 
     fn visit_get_ptr(&mut self, get_ptr: &GetPtr) -> std::fmt::Result {
-        let base_ty = self.arena.inst_data(get_ptr.base()).ty().derefernce();
+        let base_ty = self.program.inst_data(get_ptr.base()).ty().derefernce();
         write!(
             self.buffer,
             "getptr {}, {} <type = {}, size = {}>",
@@ -271,7 +314,7 @@ impl Writer<'_> {
         write!(
             self.buffer,
             "jump {}",
-            self.arena.bb_data(jump.target()).name()
+            self.program.bb_data(jump.target()).name()
         )?;
         if let Some((&last, rest)) = jump.args().split_last() {
             write!(self.buffer, "(")?;
@@ -290,13 +333,13 @@ impl Writer<'_> {
     }
 
     fn visit_load(&mut self, load: &Load) -> std::fmt::Result {
-        let ty = self.arena.inst_data(load.src()).ty();
+        let ty = self.program.inst_data(load.src()).ty().clone();
         write!(
             self.buffer,
             "load {} <type = {}, size = {}>",
             get_name!(self, load.src()),
-            ty,
-            ty.size()
+            ty.derefernce(),
+            ty.derefernce().size()
         )
     }
 

@@ -1,5 +1,5 @@
 use crate::ir::{
-    arena::{Arena, ArenaMut, GlobalArena},
+    arena::{Arena, GlobalArena},
     builder::GlobalBuilder,
     function::{Function, FunctionData, next_function_id},
     instruction::Inst,
@@ -10,6 +10,24 @@ pub struct Program {
     global_arena: GlobalArena,
     function_layout: Vec<Function>,
     global_inst_layout: Vec<Inst>,
+}
+
+impl Arena for Program {
+    fn local(&self) -> &super::arena::LocalArena {
+        unimplemented!()
+    }
+
+    fn global(&self) -> &GlobalArena {
+        self.global_arena()
+    }
+
+    fn local_mut(&mut self) -> &mut super::arena::LocalArena {
+        unimplemented!()
+    }
+
+    fn global_mut(&mut self) -> &mut GlobalArena {
+        self.global_arena_mut()
+    }
 }
 
 impl Program {
@@ -33,14 +51,6 @@ impl Program {
         &mut self.global_arena
     }
 
-    pub fn arena_mut(&mut self) -> ArenaMut<'_> {
-        ArenaMut::new_global(&mut self.global_arena)
-    }
-
-    pub fn arena(&self) -> Arena<'_> {
-        Arena::new_global(&self.global_arena)
-    }
-
     pub fn func_data(&self, func: Function) -> &FunctionData {
         self.global_arena.func_arena.data_of(func)
     }
@@ -62,8 +72,7 @@ impl Program {
     }
 
     pub fn new_function(&mut self, ret_ty: Type, name: String, params_ty: Vec<Type>) -> Function {
-        self.arena_mut()
-            .alloc_function(FunctionData::new(ret_ty, name, params_ty));
+        self.alloc_function(FunctionData::new(ret_ty, name, params_ty));
         let id = next_function_id();
         self.func_layout_push(id);
         id

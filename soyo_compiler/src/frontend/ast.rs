@@ -1,6 +1,6 @@
 use super::items;
 use crate::frontend::utils::{AstGenContext, Symbol, ToRaanaIR};
-use raana_ir::ir::{builder_trait::*, *};
+use raana_ir::ir::{arena::Arena, builder_trait::*, *};
 
 impl ToRaanaIR for items::CompUnits {
     fn convert(&self, ctx: &mut AstGenContext) {
@@ -19,8 +19,8 @@ impl ToRaanaIR for items::CompUnit {
     #[inline]
     fn convert(&self, ctx: &mut AstGenContext) {
         match self {
-            item::CompUnit::FuncDef(func_def) => func_def.convert(ctx),
-            item::CompUnit::Decl(decl) => decl.global_convert(ctx),
+            items::CompUnit::FuncDef(func_def) => func_def.convert(ctx),
+            items::CompUnit::Decl(decl) => decl.global_convert(ctx),
         }
     }
 
@@ -32,15 +32,16 @@ impl ToRaanaIR for items::CompUnit {
 impl ToRaanaIR for items::FuncDef {
     fn convert(&self, ctx: &mut AstGenContext) {
         // Register the function to get handle
-        let data = FunctionData::new(
+        let param_ty = self
+            .params
+            .iter()
+            .map(|x| x.ty_global(ctx))
+            .collect::<Vec<_>>();
+        let func = ctx.program.new_function(
             self.func_type.clone(),
-            format!("@{}", self.ident),
-            self.params
-                .iter()
-                .map(|x| x.ty_global(ctx))
-                .collect::<Vec<_>>(),
+            self.ident.as_ref().to_string(),
+            param_ty,
         );
-        let func = ctx.program.new_func(data);
         // Prologue
         // - Add function to the stack
         // - Insert the "entry" basic block and save it.
@@ -112,8 +113,8 @@ impl ToRaanaIR for items::BlockItem {
             return;
         }
         match self {
-            item::BlockItem::Decl(decl) => decl.convert(ctx),
-            item::BlockItem::Stmt(stmt) => stmt.convert(ctx),
+            items::BlockItem::Decl(decl) => decl.convert(ctx),
+            items::BlockItem::Stmt(stmt) => stmt.convert(ctx),
         }
     }
 
@@ -129,16 +130,16 @@ impl ToRaanaIR for items::Decl {
             return;
         }
         match self {
-            item::Decl::ConstDecl(c_decl) => c_decl.convert(ctx),
-            item::Decl::VarDecl(v_decl) => v_decl.convert(ctx),
+            items::Decl::ConstDecl(c_decl) => c_decl.convert(ctx),
+            items::Decl::VarDecl(v_decl) => v_decl.convert(ctx),
         }
     }
 
     #[inline]
     fn global_convert(&self, ctx: &mut AstGenContext) {
         match self {
-            item::Decl::ConstDecl(c_decl) => c_decl.global_convert(ctx),
-            item::Decl::VarDecl(v_decl) => v_decl.global_convert(ctx),
+            items::Decl::ConstDecl(c_decl) => c_decl.global_convert(ctx),
+            items::Decl::VarDecl(v_decl) => v_decl.global_convert(ctx),
         }
     }
 }
@@ -181,7 +182,7 @@ impl ToRaanaIR for items::ConstDef {
         // not an array
         if self.arr_dim.is_empty() {
             // Get the init val
-            let item::ConstInitVal::Normal(_) = self.const_init_val else {
+            let items::ConstInitVal::Normal(_) = self.const_init_val else {
                 panic!("Invalid assign: array to a integer")
             };
             self.const_init_val.convert(ctx);
@@ -213,7 +214,7 @@ impl ToRaanaIR for items::ConstDef {
             ctx.set_value_name(alloc_var, self.ident.clone());
             ctx.push_inst(alloc_var);
 
-            if !matches!(self.const_init_val, item::ConstInitVal::Array(_)) {
+            if !matches!(self.const_init_val, items::ConstInitVal::Array(_)) {
                 panic!("Invalid assign: integer to an array")
             }
             let exps = self.const_init_val.init_val_shape(&array_shape);
@@ -284,7 +285,7 @@ impl ToRaanaIR for items::ConstDef {
                 })
                 .collect::<Vec<_>>();
 
-            if !matches!(self.const_init_val, item::ConstInitVal::Array(_)) {
+            if !matches!(self.const_init_val, items::ConstInitVal::Array(_)) {
                 panic!("Invalid assign: integer to an array")
             };
             let exps = self.const_init_val.init_val_shape(&array_shape);
@@ -320,8 +321,8 @@ impl ToRaanaIR for items::ConstInitVal {
             return;
         }
         match self {
-            item::ConstInitVal::Normal(const_exp) => const_exp.convert(ctx),
-            item::ConstInitVal::Array(const_exps) => {
+            items::ConstInitVal::Normal(const_exp) => const_exp.convert(ctx),
+            items::ConstInitVal::Array(const_exps) => {
                 for const_exp in const_exps {
                     const_exp.convert(ctx);
                 }
@@ -332,8 +333,8 @@ impl ToRaanaIR for items::ConstInitVal {
     #[inline]
     fn global_convert(&self, ctx: &mut AstGenContext) {
         match self {
-            item::ConstInitVal::Normal(const_exp) => const_exp.global_convert(ctx),
-            item::ConstInitVal::Array(const_exps) => {
+            items::ConstInitVal::Normal(const_exp) => const_exp.global_convert(ctx),
+            items::ConstInitVal::Array(const_exps) => {
                 for const_exp in const_exps {
                     const_exp.global_convert(ctx);
                 }
@@ -391,7 +392,7 @@ impl ToRaanaIR for items::VarDef {
             ctx.set_value_name(alloc_var, self.ident.clone());
             ctx.push_inst(alloc_var);
             if let Some(ref init_val) = self.init_val {
-                let item::InitVal::Normal(exp) = init_val else {
+                let items::InitVal::Normal(exp) = init_val else {
                     panic!("Invalid assign: array to a integer")
                 };
                 exp.convert(ctx);
@@ -433,7 +434,7 @@ impl ToRaanaIR for items::VarDef {
             // We handle the possible initial value.
             if let Some(ref init_val) = self.init_val {
                 // must be an array
-                if !matches!(init_val, item::InitVal::Array(_)) {
+                if !matches!(init_val, items::InitVal::Array(_)) {
                     panic!("Invalid assign: integer to an array")
                 };
 
@@ -516,7 +517,7 @@ impl ToRaanaIR for items::VarDef {
                 .rfold(ty, Type::get_array);
 
             let init = if let Some(ref init_val) = self.init_val {
-                if !matches!(init_val, item::InitVal::Array(_)) {
+                if !matches!(init_val, items::InitVal::Array(_)) {
                     panic!("Invalid assign: integer to an array")
                 }
                 let exps = init_val.init_val_shape(&array_shape);
@@ -555,8 +556,8 @@ impl ToRaanaIR for items::InitVal {
             return;
         }
         match self {
-            item::InitVal::Normal(exp) => exp.convert(ctx),
-            item::InitVal::Array(exps) => {
+            items::InitVal::Normal(exp) => exp.convert(ctx),
+            items::InitVal::Array(exps) => {
                 for exp in exps {
                     exp.convert(ctx);
                 }
@@ -567,8 +568,8 @@ impl ToRaanaIR for items::InitVal {
     #[inline]
     fn global_convert(&self, ctx: &mut AstGenContext) {
         match self {
-            item::InitVal::Normal(exp) => exp.global_convert(ctx),
-            item::InitVal::Array(exps) => {
+            items::InitVal::Normal(exp) => exp.global_convert(ctx),
+            items::InitVal::Array(exps) => {
                 for exp in exps {
                     exp.global_convert(ctx);
                 }
@@ -584,18 +585,18 @@ impl ToRaanaIR for items::Stmt {
             return;
         }
         match self {
-            item::Stmt::Assign(assign_stmt) => assign_stmt.convert(ctx),
-            item::Stmt::Return(return_stmt) => return_stmt.convert(ctx),
-            item::Stmt::Block(block) => block.convert(ctx),
-            item::Stmt::Single(exp) => {
+            items::Stmt::Assign(assign_stmt) => assign_stmt.convert(ctx),
+            items::Stmt::Return(return_stmt) => return_stmt.convert(ctx),
+            items::Stmt::Block(block) => block.convert(ctx),
+            items::Stmt::Single(exp) => {
                 if let Some(exp) = exp {
                     exp.convert(ctx);
                 }
             }
-            item::Stmt::IfStmt(if_stmt) => if_stmt.convert(ctx),
-            item::Stmt::WhileStmt(while_stmt) => while_stmt.convert(ctx),
-            item::Stmt::Break(break_stmt) => break_stmt.convert(ctx),
-            item::Stmt::Continue(continue_stmt) => continue_stmt.convert(ctx),
+            items::Stmt::IfStmt(if_stmt) => if_stmt.convert(ctx),
+            items::Stmt::WhileStmt(while_stmt) => while_stmt.convert(ctx),
+            items::Stmt::Break(break_stmt) => break_stmt.convert(ctx),
+            items::Stmt::Continue(continue_stmt) => continue_stmt.convert(ctx),
         }
     }
 
@@ -613,7 +614,7 @@ impl ToRaanaIR for items::Break {
             .curr_loop()
             .unwrap_or_else(|| panic!("Use break outside of loop"))
             .1;
-        let jump_to_loop_end = ctx.new_local_value().jump(loop_end);
+        let jump_to_loop_end = ctx.new_local_value().jump(loop_end, vec![]);
         ctx.push_inst(jump_to_loop_end);
     }
 
@@ -631,7 +632,7 @@ impl ToRaanaIR for items::Continue {
             .curr_loop()
             .unwrap_or_else(|| panic!("Use continue outside of loop"))
             .0;
-        let jump_to_loop_start = ctx.new_local_value().jump(loop_start);
+        let jump_to_loop_start = ctx.new_local_value().jump(loop_start, vec![]);
         ctx.push_inst(jump_to_loop_start);
     }
 
@@ -646,27 +647,29 @@ impl ToRaanaIR for items::WhileStmt {
             return;
         }
         // create 3 basic blocks for while loop
-        let entry = ctx.new_bb().basic_block(Some("%while_entry".into()));
+        let entry = ctx.new_bb().basic_block("while_entry".into(), vec![]);
         ctx.register_bb(entry);
-        let body = ctx.new_bb().basic_block(Some("%while_body".into()));
+        let body = ctx.new_bb().basic_block("while_body".into(), vec![]);
         ctx.register_bb(body);
-        let end = ctx.new_bb().basic_block(Some("%while_end".into()));
+        let end = ctx.new_bb().basic_block("while_end".into(), vec![]);
         ctx.register_bb(end);
         ctx.push_loop(entry, end);
 
         // jump into while entry block unconditionally
-        let jump_to_while_entry = ctx.new_local_value().jump(entry);
+        let jump_to_while_entry = ctx.new_local_value().jump(entry, vec![]);
         ctx.push_inst(jump_to_while_entry);
 
         ctx.set_curr_bb(entry);
         self.cond.convert(ctx);
         let cond_val = ctx.pop_val().unwrap();
-        let branch = ctx.new_local_value().branch(cond_val, body, end);
+        let branch = ctx
+            .new_local_value()
+            .branch(cond_val, body, vec![], end, vec![]);
         ctx.push_inst(branch);
 
         ctx.set_curr_bb(body);
         self.body.convert(ctx);
-        let jump = ctx.new_local_value().jump(entry);
+        let jump = ctx.new_local_value().jump(entry, vec![]);
         ctx.push_inst(jump);
 
         ctx.pop_loop();
@@ -690,7 +693,7 @@ impl ToRaanaIR for items::ReturnStmt {
             }
             None => None,
         };
-        let ret = ctx.curr_func_data_mut().dfg_mut().new_value().ret(v_ret);
+        let ret = ctx.new_local_value().ret(v_ret);
         ctx.push_inst(ret);
     }
 
@@ -707,29 +710,33 @@ impl ToRaanaIR for items::IfStmt {
         // Get condition exp value.
         self.cond.convert(ctx);
         let cond_val = ctx.pop_val().unwrap();
-        let then_bb = ctx.new_bb().basic_block(Some("%then".into()));
+        let then_bb = ctx.new_bb().basic_block("then".into(), vec![]);
         ctx.register_bb(then_bb);
         let else_bb = self.else_branch.as_ref().map(|_| {
-            let bb = ctx.new_bb().basic_block(Some("%else".into()));
+            let bb = ctx.new_bb().basic_block("else".into(), vec![]);
             ctx.register_bb(bb);
             bb
         });
-        let end_bb = ctx.new_bb().basic_block(Some("%end".into()));
+        let end_bb = ctx.new_bb().basic_block("end".into(), vec![]);
         ctx.register_bb(end_bb);
-        let br = ctx
-            .new_local_value()
-            .branch(cond_val, then_bb, else_bb.unwrap_or(end_bb));
+        let br = ctx.new_local_value().branch(
+            cond_val,
+            then_bb,
+            vec![],
+            else_bb.unwrap_or(end_bb),
+            vec![],
+        );
         ctx.push_inst(br);
 
         ctx.set_curr_bb(then_bb);
         self.then_branch.convert(ctx);
-        let then_jump = ctx.new_local_value().jump(end_bb);
+        let then_jump = ctx.new_local_value().jump(end_bb, vec![]);
         ctx.push_inst(then_jump);
 
         if let Some(else_bb) = else_bb {
             ctx.set_curr_bb(else_bb);
             self.else_branch.as_ref().unwrap().convert(ctx);
-            let else_jump = ctx.new_local_value().jump(end_bb);
+            let else_jump = ctx.new_local_value().jump(end_bb, vec![]);
             ctx.push_inst(else_jump);
         }
 
@@ -755,8 +762,8 @@ impl ToRaanaIR for items::AssignStmt {
         let rhs_exp = ctx.pop_val().unwrap();
 
         // Compile time type-check.
-        let lhs_ptr_type = ctx.new_local_value().value_type(lhs_l_val);
-        let rhs_exp_type = ctx.new_local_value().value_type(rhs_exp);
+        let lhs_ptr_type = ctx.new_local_value().inst_type(lhs_l_val);
+        let rhs_exp_type = ctx.new_local_value().inst_type(rhs_exp);
         assert!(
             Type::get_pointer(rhs_exp_type.clone()) == lhs_ptr_type.clone(),
             "Type not match. {rhs_exp_type} can't store in {lhs_ptr_type}"
@@ -791,8 +798,8 @@ impl ToRaanaIR for items::LOrExp {
             return;
         }
         match self {
-            item::LOrExp::LAndExp(land_exp) => land_exp.convert(ctx),
-            item::LOrExp::Comp(lor_exp, land_exp) => {
+            items::LOrExp::LAndExp(land_exp) => land_exp.convert(ctx),
+            items::LOrExp::Comp(lor_exp, land_exp) => {
                 // handle lhs
                 lor_exp.convert(ctx);
                 let lhs = ctx.pop_val().unwrap();
@@ -803,19 +810,19 @@ impl ToRaanaIR for items::LOrExp {
                 ctx.push_inst(lhs_ne_0);
 
                 // two basic block for short circuit logic
-                let rhs_bb = ctx.new_bb().basic_block(Some("%lor_rhs".into()));
+                let rhs_bb = ctx.new_bb().basic_block("lor_rhs".into(), vec![]);
                 ctx.register_bb(rhs_bb);
                 let merge_bb = ctx
                     .new_bb()
-                    .basic_block_with_params(Some("%lor_merge".into()), vec![Type::get_i32()]);
+                    .basic_block("lor_merge".into(), vec![Type::get_i32()]);
                 ctx.register_bb(merge_bb);
 
                 // short circuit logic
-                let br = ctx.new_local_value().branch_with_args(
+                let br = ctx.new_local_value().branch(
                     lhs_ne_0,
                     merge_bb,
-                    rhs_bb,
                     vec![lhs_ne_0],
+                    rhs_bb,
                     vec![],
                 );
                 ctx.push_inst(br);
@@ -827,10 +834,9 @@ impl ToRaanaIR for items::LOrExp {
                 let rhs = ctx.pop_val().unwrap();
 
                 // Constant folding
-                if let (InstKind::Integer(int_lhs), InstKind::Integer(int_rhs)) = (
-                    ctx.curr_func_data().dfg().value(lhs).kind(),
-                    ctx.curr_func_data().dfg().value(rhs).kind(),
-                ) {
+                if let (InstKind::Integer(int_lhs), InstKind::Integer(int_rhs)) =
+                    (ctx.inst_data(lhs).kind(), ctx.inst_data(rhs).kind())
+                {
                     // Get lhs and rhs value.
                     let int_lhs = int_lhs.value();
                     let int_rhs = int_rhs.value();
@@ -843,9 +849,7 @@ impl ToRaanaIR for items::LOrExp {
                     ctx.remove_bb(merge_bb);
 
                     let result = ctx
-                        .curr_func_data_mut()
-                        .dfg_mut()
-                        .new_value()
+                        .new_local_value()
                         .integer((int_lhs != 0 || int_rhs != 0) as _);
                     ctx.push_val(result);
 
@@ -855,9 +859,7 @@ impl ToRaanaIR for items::LOrExp {
                 ctx.push_inst(rhs_ne_0);
 
                 // jump to the merge block and pass the information
-                let jump = ctx
-                    .new_local_value()
-                    .jump_with_args(merge_bb, vec![rhs_ne_0]);
+                let jump = ctx.new_local_value().jump(merge_bb, vec![rhs_ne_0]);
                 ctx.push_inst(jump);
 
                 ctx.set_curr_bb(merge_bb);
@@ -869,8 +871,8 @@ impl ToRaanaIR for items::LOrExp {
 
     fn global_convert(&self, ctx: &mut AstGenContext) {
         match self {
-            item::LOrExp::LAndExp(land_exp) => land_exp.global_convert(ctx),
-            item::LOrExp::Comp(lor_exp, land_exp) => {
+            items::LOrExp::LAndExp(land_exp) => land_exp.global_convert(ctx),
+            items::LOrExp::Comp(lor_exp, land_exp) => {
                 lor_exp.global_convert(ctx);
                 let lhs_val = ctx.pop_val().unwrap();
                 let lhs_int = ctx.get_global_val(lhs_val).unwrap();
@@ -893,8 +895,8 @@ impl ToRaanaIR for items::LAndExp {
             return;
         }
         match self {
-            item::LAndExp::EqExp(eq_exp) => eq_exp.convert(ctx),
-            item::LAndExp::Comp(land_exp, eq_exp) => {
+            items::LAndExp::EqExp(eq_exp) => eq_exp.convert(ctx),
+            items::LAndExp::Comp(land_exp, eq_exp) => {
                 // handle lhs
                 land_exp.convert(ctx);
                 let lhs = ctx.pop_val().unwrap();
@@ -905,21 +907,17 @@ impl ToRaanaIR for items::LAndExp {
                 ctx.push_inst(lhs_eq_0);
 
                 // two basic block for short circuit logic
-                let rhs_bb = ctx.new_bb().basic_block(Some("%land_rhs".into()));
+                let rhs_bb = ctx.new_bb().basic_block("land_rhs".into(), vec![]);
                 ctx.register_bb(rhs_bb);
                 let merge_bb = ctx
                     .new_bb()
-                    .basic_block_with_params(Some("%land_merge".into()), vec![Type::get_i32()]);
+                    .basic_block("land_merge".into(), vec![Type::get_i32()]);
                 ctx.register_bb(merge_bb);
 
                 //short circuit logic
-                let br = ctx.new_local_value().branch_with_args(
-                    lhs_eq_0,
-                    merge_bb,
-                    rhs_bb,
-                    vec![zero],
-                    vec![],
-                );
+                let br =
+                    ctx.new_local_value()
+                        .branch(lhs_eq_0, merge_bb, vec![zero], rhs_bb, vec![]);
                 ctx.push_inst(br);
 
                 // check rhs
@@ -928,10 +926,9 @@ impl ToRaanaIR for items::LAndExp {
                 eq_exp.convert(ctx);
                 let rhs = ctx.pop_val().unwrap();
                 // Constant folding
-                if let (InstKind::Integer(int_lhs), InstKind::Integer(int_rhs)) = (
-                    ctx.curr_func_data().dfg().value(lhs).kind(),
-                    ctx.curr_func_data().dfg().value(rhs).kind(),
-                ) {
+                if let (InstKind::Integer(int_lhs), InstKind::Integer(int_rhs)) =
+                    (ctx.inst_data(lhs).kind(), ctx.inst_data(rhs).kind())
+                {
                     // Get lhs and rhs value.
                     let int_lhs = int_lhs.value();
                     let int_rhs = int_rhs.value();
@@ -944,9 +941,7 @@ impl ToRaanaIR for items::LAndExp {
                     ctx.remove_bb(merge_bb);
 
                     let result = ctx
-                        .curr_func_data_mut()
-                        .dfg_mut()
-                        .new_value()
+                        .new_local_value()
                         .integer((int_lhs != 0 && int_rhs != 0) as _);
                     ctx.push_val(result);
 
@@ -957,9 +952,7 @@ impl ToRaanaIR for items::LAndExp {
                 ctx.push_inst(rhs_ne_0);
 
                 // jump to merge block and pass the information
-                let jump = ctx
-                    .new_local_value()
-                    .jump_with_args(merge_bb, vec![rhs_ne_0]);
+                let jump = ctx.new_local_value().jump(merge_bb, vec![rhs_ne_0]);
                 ctx.push_inst(jump);
 
                 ctx.set_curr_bb(merge_bb);
@@ -972,8 +965,8 @@ impl ToRaanaIR for items::LAndExp {
     #[inline]
     fn global_convert(&self, ctx: &mut AstGenContext) {
         match self {
-            item::LAndExp::EqExp(eq_exp) => eq_exp.global_convert(ctx),
-            item::LAndExp::Comp(land_exp, eq_exp) => {
+            items::LAndExp::EqExp(eq_exp) => eq_exp.global_convert(ctx),
+            items::LAndExp::Comp(land_exp, eq_exp) => {
                 land_exp.global_convert(ctx);
                 let lhs_val = ctx.pop_val().unwrap();
                 let lhs_int = ctx.get_global_val(lhs_val).unwrap();
@@ -997,8 +990,8 @@ impl ToRaanaIR for items::EqExp {
             return;
         }
         match self {
-            item::EqExp::RelExp(rel_exp) => rel_exp.convert(ctx),
-            item::EqExp::Comp(lhs_eq, op, rhs_rel) => {
+            items::EqExp::RelExp(rel_exp) => rel_exp.convert(ctx),
+            items::EqExp::Comp(lhs_eq, op, rhs_rel) => {
                 lhs_eq.convert(ctx);
                 rhs_rel.convert(ctx);
                 op.convert(ctx)
@@ -1009,8 +1002,8 @@ impl ToRaanaIR for items::EqExp {
     #[inline]
     fn global_convert(&self, ctx: &mut AstGenContext) {
         match self {
-            item::EqExp::RelExp(rel_exp) => rel_exp.global_convert(ctx),
-            item::EqExp::Comp(eq_exp, binary_op, rel_exp) => {
+            items::EqExp::RelExp(rel_exp) => rel_exp.global_convert(ctx),
+            items::EqExp::Comp(eq_exp, binary_op, rel_exp) => {
                 eq_exp.global_convert(ctx);
                 rel_exp.global_convert(ctx);
                 binary_op.global_convert(ctx)
@@ -1026,8 +1019,8 @@ impl ToRaanaIR for items::RelExp {
             return;
         }
         match self {
-            item::RelExp::AddExp(add_exp) => add_exp.convert(ctx),
-            item::RelExp::Comp(lhs_rel, op, rhs_add) => {
+            items::RelExp::AddExp(add_exp) => add_exp.convert(ctx),
+            items::RelExp::Comp(lhs_rel, op, rhs_add) => {
                 lhs_rel.convert(ctx);
                 rhs_add.convert(ctx);
                 op.convert(ctx)
@@ -1038,8 +1031,8 @@ impl ToRaanaIR for items::RelExp {
     #[inline]
     fn global_convert(&self, ctx: &mut AstGenContext) {
         match self {
-            item::RelExp::AddExp(add_exp) => add_exp.global_convert(ctx),
-            item::RelExp::Comp(rel_exp, binary_op, add_exp) => {
+            items::RelExp::AddExp(add_exp) => add_exp.global_convert(ctx),
+            items::RelExp::Comp(rel_exp, binary_op, add_exp) => {
                 rel_exp.global_convert(ctx);
                 add_exp.global_convert(ctx);
                 binary_op.global_convert(ctx)
@@ -1055,8 +1048,8 @@ impl ToRaanaIR for items::AddExp {
             return;
         }
         match self {
-            item::AddExp::MulExp(mul_exp) => mul_exp.convert(ctx),
-            item::AddExp::Comp(lhs_add, op, rhs_mul) => {
+            items::AddExp::MulExp(mul_exp) => mul_exp.convert(ctx),
+            items::AddExp::Comp(lhs_add, op, rhs_mul) => {
                 lhs_add.convert(ctx);
                 rhs_mul.convert(ctx);
                 op.convert(ctx)
@@ -1067,8 +1060,8 @@ impl ToRaanaIR for items::AddExp {
     #[inline]
     fn global_convert(&self, ctx: &mut AstGenContext) {
         match self {
-            item::AddExp::MulExp(mul_exp) => mul_exp.global_convert(ctx),
-            item::AddExp::Comp(add_exp, binary_op, mul_exp) => {
+            items::AddExp::MulExp(mul_exp) => mul_exp.global_convert(ctx),
+            items::AddExp::Comp(add_exp, binary_op, mul_exp) => {
                 add_exp.global_convert(ctx);
                 mul_exp.global_convert(ctx);
                 binary_op.global_convert(ctx)
@@ -1084,8 +1077,8 @@ impl ToRaanaIR for items::MulExp {
             return;
         }
         match self {
-            item::MulExp::UnaryExp(unary_exp) => unary_exp.convert(ctx),
-            item::MulExp::Comp(lhs_mul, op, rhs_unary) => {
+            items::MulExp::UnaryExp(unary_exp) => unary_exp.convert(ctx),
+            items::MulExp::Comp(lhs_mul, op, rhs_unary) => {
                 lhs_mul.convert(ctx);
                 rhs_unary.convert(ctx);
                 op.convert(ctx)
@@ -1096,8 +1089,8 @@ impl ToRaanaIR for items::MulExp {
     #[inline]
     fn global_convert(&self, ctx: &mut AstGenContext) {
         match self {
-            item::MulExp::UnaryExp(unary_exp) => unary_exp.global_convert(ctx),
-            item::MulExp::Comp(mul_exp, binary_op, unary_exp) => {
+            items::MulExp::UnaryExp(unary_exp) => unary_exp.global_convert(ctx),
+            items::MulExp::Comp(mul_exp, binary_op, unary_exp) => {
                 mul_exp.global_convert(ctx);
                 unary_exp.global_convert(ctx);
                 binary_op.global_convert(ctx)
@@ -1113,24 +1106,24 @@ impl ToRaanaIR for items::UnaryExp {
             return;
         }
         match self {
-            item::UnaryExp::PrimaryExp(exp) => exp.convert(ctx),
-            item::UnaryExp::Unary(unary_op, unary_exp) => {
+            items::UnaryExp::PrimaryExp(exp) => exp.convert(ctx),
+            items::UnaryExp::Unary(unary_op, unary_exp) => {
                 unary_exp.convert(ctx);
                 unary_op.convert(ctx)
             }
-            item::UnaryExp::FuncCall(func_call) => func_call.convert(ctx),
+            items::UnaryExp::FuncCall(func_call) => func_call.convert(ctx),
         }
     }
 
     #[inline]
     fn global_convert(&self, ctx: &mut AstGenContext) {
         match self {
-            item::UnaryExp::PrimaryExp(primary_exp) => primary_exp.global_convert(ctx),
-            item::UnaryExp::Unary(unary_op, unary_exp) => {
+            items::UnaryExp::PrimaryExp(primary_exp) => primary_exp.global_convert(ctx),
+            items::UnaryExp::Unary(unary_op, unary_exp) => {
                 unary_exp.global_convert(ctx);
                 unary_op.global_convert(ctx)
             }
-            item::UnaryExp::FuncCall(_) => panic!("Const function is not supported"),
+            items::UnaryExp::FuncCall(_) => panic!("Const function is not supported"),
         }
     }
 }
@@ -1164,7 +1157,7 @@ impl ToRaanaIR for items::FuncCall {
         };
         let call = ctx.new_local_value().call(target_func, args);
         ctx.push_inst(call);
-        if !ctx.curr_func_data().dfg().value(call).ty().is_unit() {
+        if !ctx.inst_data(call).ty().is_unit() {
             ctx.push_val(call);
         }
     }
@@ -1180,16 +1173,15 @@ impl ToRaanaIR for items::PrimaryExp {
             return;
         }
         match self {
-            item::PrimaryExp::Exp(exp) => exp.convert(ctx),
-            item::PrimaryExp::Number(num) => {
-                let func_data = ctx.curr_func_data_mut();
-                let num = func_data.dfg_mut().new_value().integer(*num);
+            items::PrimaryExp::Exp(exp) => exp.convert(ctx),
+            items::PrimaryExp::Number(num) => {
+                let num = ctx.new_local_value().integer(*num);
                 ctx.push_val(num);
             }
             // LVal on the right side.
             // Meaning it's not defining but using a variable.
             // We take the value and push to value stack to use.
-            item::PrimaryExp::LVal(l_val) => {
+            items::PrimaryExp::LVal(l_val) => {
                 // not a array
                 if l_val.index.is_empty() {
                     match ctx.get_symbol(&l_val.ident).unwrap() {
@@ -1251,26 +1243,26 @@ impl ToRaanaIR for items::PrimaryExp {
 
     fn global_convert(&self, ctx: &mut AstGenContext) {
         match self {
-            item::PrimaryExp::Exp(exp) => exp.global_convert(ctx),
-            item::PrimaryExp::LVal(lval) => {
+            items::PrimaryExp::Exp(exp) => exp.global_convert(ctx),
+            items::PrimaryExp::LVal(lval) => {
                 let sym = ctx
                     .global_scope()
                     .get(&lval.ident)
                     .unwrap_or_else(|| panic!("{} not defined", &*lval.ident));
                 let int = match sym {
                     Symbol::Constant(int) => {
-                        let borrow_value = ctx.program.borrow_value(*int);
+                        let borrow_value = ctx.inst_data(*int);
                         let InstKind::Integer(int) = borrow_value.kind() else {
                             unreachable!();
                         };
                         int.value()
                     }
                     Symbol::Variable(var) => {
-                        let borrow_value = ctx.program.borrow_value(*var);
+                        let borrow_value = ctx.inst_data(*var);
                         let InstKind::GlobalAlloc(glob_alloc) = borrow_value.kind() else {
                             unreachable!();
                         };
-                        match ctx.program.borrow_value(glob_alloc.init()).kind() {
+                        match ctx.inst_data(glob_alloc.init()).kind() {
                             InstKind::Integer(int) => int.value(),
                             InstKind::ZeroInit => 0,
                             _ => unreachable!(),
@@ -1281,7 +1273,7 @@ impl ToRaanaIR for items::PrimaryExp {
                 let val = ctx.new_global_value().integer(int);
                 ctx.push_val(val);
             }
-            item::PrimaryExp::Number(num) => {
+            items::PrimaryExp::Number(num) => {
                 let num_lit = ctx.new_global_value().integer(*num);
                 ctx.push_val(num_lit);
             }
@@ -1363,7 +1355,7 @@ impl ToRaanaIR for BinaryOp {
                         int_lhs.wrapping_div(int_rhs)
                     }
                 }
-                BinaryOp::Mod => {
+                BinaryOp::Rem => {
                     if int_rhs == 0 {
                         panic!("Modulo by zero");
                     } else {
@@ -1391,16 +1383,9 @@ impl ToRaanaIR for BinaryOp {
     fn global_convert(&self, ctx: &mut AstGenContext) {
         let rhs = ctx.pop_val().unwrap();
         let lhs = ctx.pop_val().unwrap();
-        let res = if let (InstKind::Integer(lhs), InstKind::Integer(rhs)) = (
-            ctx.program.borrow_value(lhs).kind(),
-            ctx.program.borrow_value(rhs).kind(),
-        ) {
-            // let InstKind::Integer(lhs) = ctx.program.borrow_value(lhs).clone().kind() else {
-            //     unreachable!()
-            // };
-            // let InstKind::Integer(rhs) = ctx.program.borrow_value(rhs).clone().kind() else {
-            //     unreachable!()
-            // };
+        let res = if let (InstKind::Integer(lhs), InstKind::Integer(rhs)) =
+            (ctx.inst_data(lhs).kind(), ctx.inst_data(rhs).kind())
+        {
             let int_lhs = lhs.value();
             let int_rhs = rhs.value();
             match self {
@@ -1420,7 +1405,7 @@ impl ToRaanaIR for BinaryOp {
                         int_lhs.wrapping_div(int_rhs)
                     }
                 }
-                BinaryOp::Mod => {
+                BinaryOp::Rem => {
                     if int_rhs == 0 {
                         panic!("Modulo by zero");
                     } else {
@@ -1448,19 +1433,19 @@ impl ToRaanaIR for items::UnaryOp {
             return;
         }
         // if `+` is unary then it will do nothing.
-        if matches!(self, item::UnaryOp::Add) {
+        if matches!(self, items::UnaryOp::Add) {
             return;
         }
 
         let rhs = ctx.pop_val().unwrap();
 
         //Constant folding
-        let rhs_val = ctx.curr_func_data().dfg().value(rhs);
+        let rhs_val = ctx.inst_data(rhs);
         if let InstKind::Integer(integer) = rhs_val.kind().clone() {
             let operation = match self {
-                item::UnaryOp::Add => unreachable!(),
-                item::UnaryOp::Minus => ctx.new_local_value().integer(-integer.value()),
-                item::UnaryOp::Negation => {
+                items::UnaryOp::Add => unreachable!(),
+                items::UnaryOp::Minus => ctx.new_local_value().integer(-integer.value()),
+                items::UnaryOp::Negation => {
                     ctx.new_local_value().integer((integer.value() == 0) as _)
                 }
             };
@@ -1470,24 +1455,24 @@ impl ToRaanaIR for items::UnaryOp {
 
         let zero = ctx.new_local_value().integer(0);
         let operation = match self {
-            item::UnaryOp::Add => unreachable!(),
-            item::UnaryOp::Minus => ctx.new_local_value().binary(zero, rhs, BinaryOp::Sub),
-            item::UnaryOp::Negation => ctx.new_local_value().binary(zero, rhs, BinaryOp::Eq),
+            items::UnaryOp::Add => unreachable!(),
+            items::UnaryOp::Minus => ctx.new_local_value().binary(BinaryOp::Sub, zero, rhs),
+            items::UnaryOp::Negation => ctx.new_local_value().binary(BinaryOp::Eq, zero, rhs),
         };
         ctx.push_val(operation);
         ctx.push_inst(operation);
     }
 
     fn global_convert(&self, ctx: &mut AstGenContext) {
-        if matches!(self, item::UnaryOp::Add) {
+        if matches!(self, items::UnaryOp::Add) {
             return;
         }
         let rhs = ctx.pop_val().unwrap();
-        let res = if let InstKind::Integer(int) = ctx.program.borrow_value(rhs).kind() {
+        let res = if let InstKind::Integer(int) = ctx.inst_data(rhs).kind() {
             match self {
-                item::UnaryOp::Add => unreachable!(),
-                item::UnaryOp::Minus => -int.value(),
-                item::UnaryOp::Negation => (int.value() == 0) as i32,
+                items::UnaryOp::Add => unreachable!(),
+                items::UnaryOp::Minus => -int.value(),
+                items::UnaryOp::Negation => (int.value() == 0) as i32,
             }
         } else {
             unreachable!()

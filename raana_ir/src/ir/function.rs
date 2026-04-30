@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::ir::{
-    arena::{Arena, ArenaMut, LocalArena},
+    arena::{Arena, LocalArena},
     builder::{BasicBlockBuilders, LocalBuilder},
     inst_kind::FuncArgRef,
     instruction::Inst,
@@ -20,34 +20,41 @@ pub struct FunctionData {
     local_arena: LocalArena,
 }
 
+impl Arena for FunctionData {
+    fn local(&self) -> &LocalArena {
+        self.local_arena()
+    }
+
+    fn global(&self) -> &super::arena::GlobalArena {
+        unimplemented!()
+    }
+
+    fn local_mut(&mut self) -> &mut LocalArena {
+        self.local_arena_mut()
+    }
+
+    fn global_mut(&mut self) -> &mut super::arena::GlobalArena {
+        unimplemented!()
+    }
+}
+
 impl FunctionData {
     pub fn new(ret_ty: Type, name: String, params_ty: Vec<Type>) -> FunctionData {
-        let mut local_arena = LocalArena::new();
+        let local_arena = LocalArena::new();
+        let mut fd = FunctionData {
+            ret_ty,
+            name,
+            params: vec![],
+            layout: Layout::new(),
+            local_arena,
+        };
         let params = params_ty
             .iter()
             .enumerate()
-            .map(|(i, ty)| {
-                ArenaMut::new(Some(&mut local_arena), None)
-                    .alloc_local_inst(FuncArgRef::new_data(i, ty.clone()))
-            })
+            .map(|(i, ty)| fd.alloc_local_inst(FuncArgRef::new_data(i, ty.clone())))
             .collect();
-        FunctionData {
-            ret_ty,
-            name,
-            params,
-            layout: Layout::new(),
-            local_arena,
-        }
-    }
-
-    #[deprecated]
-    pub fn dfg(&self) -> Arena<'_> {
-        self.arena()
-    }
-
-    #[deprecated]
-    pub fn dfg_mut(&mut self) -> ArenaMut<'_> {
-        self.arena_mut()
+        fd.params = params;
+        fd
     }
 
     pub fn layout(&self) -> &Layout {
@@ -58,30 +65,12 @@ impl FunctionData {
         &mut self.layout
     }
 
-    pub fn arena(&self) -> Arena<'_> {
-        Arena::new(Some(&self.local_arena), None)
-    }
-
-    pub fn arena_mut(&mut self) -> ArenaMut<'_> {
-        ArenaMut::new(Some(&mut self.local_arena), None)
-    }
-
     pub fn new_local_inst(&mut self) -> LocalBuilder<'_> {
-        LocalBuilder {
-            arena: ArenaMut {
-                local: Some(&mut self.local_arena),
-                global: None,
-            },
-        }
+        LocalBuilder { arena: self }
     }
 
     pub fn new_basic_block(&mut self) -> BasicBlockBuilders<'_> {
-        BasicBlockBuilders {
-            arena: ArenaMut {
-                local: Some(&mut self.local_arena),
-                global: None,
-            },
-        }
+        BasicBlockBuilders { arena: self }
     }
 
     pub fn set_name(&mut self, name: String) {

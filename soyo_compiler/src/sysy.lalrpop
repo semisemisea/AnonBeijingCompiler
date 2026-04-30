@@ -1,4 +1,4 @@
-use crate::frontend::utils::item::*;
+use crate::frontend::items::*;
 use raana_ir::ir::BinaryOp;
 use raana_ir::ir::Type;
 
@@ -213,7 +213,7 @@ BinaryOp: BinaryOp = {
     "-" => BinaryOp::Sub,
     "*" => BinaryOp::Mul,
     "/" => BinaryOp::Div,
-    "%" => BinaryOp::Mod,
+    "%" => BinaryOp::Rem,
 };
 
 UnaryExp: UnaryExp = {
@@ -237,7 +237,7 @@ AddExp: AddExp = {
 MulExpOnlyOp: BinaryOp = {
     "*" => BinaryOp::Mul,
     "/" => BinaryOp::Div,
-    "%" => BinaryOp::Mod,
+    "%" => BinaryOp::Rem,
 };
 
 MulExp: MulExp = {

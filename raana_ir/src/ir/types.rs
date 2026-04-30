@@ -180,6 +180,6 @@ mod test {
             ],
             Type::get_f32(),
         );
-        assert_eq!("([i32, 5], *f32, i32) -> f32", f3.to_string());
+        assert_eq!("([i32; 5], *f32, i32) -> f32", f3.to_string());
     }
 }

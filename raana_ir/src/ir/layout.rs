@@ -60,6 +60,10 @@ impl Layout {
         BasicBlocksMut { layout: self }
     }
 
+    pub fn basicblocks_mut(&mut self) -> &mut IndexList<BasicBlockLayout> {
+        &mut self.bbs
+    }
+
     pub fn push_bb_back(&mut self, bb: BasicBlock) -> index_list::ListIndex {
         self.bbs.insert_last(BasicBlockLayout::new(bb))
     }

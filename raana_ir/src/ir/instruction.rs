@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     num::NonZeroU32,
     sync::atomic::{AtomicU32, Ordering},
 };
@@ -116,7 +116,7 @@ pub(in crate::ir) fn next_global_inst_id() -> Inst {
 
 #[derive(Debug, Clone)]
 pub struct LocalInstArena {
-    data: Vec<InstData>,
+    data: HashMap<Inst, InstData>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,23 +126,25 @@ pub struct GlobalInstArena {
 
 impl LocalInstArena {
     pub fn new() -> LocalInstArena {
-        LocalInstArena { data: Vec::new() }
+        LocalInstArena {
+            data: HashMap::new(),
+        }
     }
 
-    pub fn alloc(&mut self, data: InstData) {
-        self.data.push(data);
+    pub fn alloc(&mut self, inst: Inst, data: InstData) {
+        self.data.insert(inst, data);
     }
 
     pub fn data_of(&self, inst: Inst) -> &InstData {
-        &self.data[(inst.0.get() - LOCAL_ID_START_FROM) as usize]
+        self.data.get(&inst).unwrap()
     }
 
     pub fn mut_data_of(&mut self, inst: Inst) -> &mut InstData {
-        &mut self.data[(inst.0.get() - LOCAL_ID_START_FROM) as usize]
+        self.data.get_mut(&inst).unwrap()
     }
 
     pub fn datas(&self) -> impl Iterator<Item = &InstData> {
-        self.data.iter()
+        self.data.values()
     }
 }
 

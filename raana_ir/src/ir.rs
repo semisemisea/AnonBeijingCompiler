@@ -10,12 +10,13 @@ pub(crate) mod types;
 
 pub mod builder_trait {
     pub use super::builder::{
-        BasicBlockBuilder, BasicBlockBuilders, GlobalBuilder, GlobalInstBuilder, InstInsert,
-        LocalBuilder, LocalInstBuilder, ScalarInstBuilder,
+        BasicBlockBuilder, BasicBlockBuilders, GlobalBuilder, GlobalInstBuilder, InfoQuery,
+        InstInsert, LocalBuilder, LocalInstBuilder, ScalarInstBuilder,
     };
 }
 
 pub use basic_block::BasicBlock;
+pub use builder::{BasicBlockBuilders, GlobalBuilder, LocalBuilder};
 pub use function::{Function, FunctionData};
 pub use inst_kind::{
     Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, GetElemPtr, GetPtr, InstKind, Integer,

@@ -1,6 +1,6 @@
 use crate::ir::{
     Program,
-    arena::{Arena, ArenaMut},
+    arena::Arena,
     basic_block::{BasicBlock, BasicBlockData},
     function::Function,
     inst_kind::{
@@ -69,9 +69,7 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
             lhs_type == rhs_type,
             "only the same type is supported currently\ntype of lhs: {lhs_type}\ntype of rhs: {rhs_type}"
         );
-        // let ty = if lhs_type.is_i32() && rhs_type.is_i32() && !matches!(op ,BinaryOp::Div)
         self.insert_inst(Binary::new_data(lhs, rhs, op, lhs_type))
-        // add_used_by?
     }
 
     fn branch(
@@ -135,7 +133,15 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
 
 pub trait GlobalInstBuilder: ScalarInstBuilder {
     fn global_alloc(&mut self, init: Inst) -> Inst {
-        self.insert_inst(GlobalAlloc::new_data(init, self.inst_type(init)))
+        self.insert_inst(GlobalAlloc::new_data(
+            init,
+            Type::get_pointer(self.inst_type(init)),
+        ))
+    }
+
+    fn zero_init(&mut self, ty: Type) -> Inst {
+        // TODO: type check.
+        self.insert_inst(InstData::new(ty, InstKind::ZeroInit))
     }
 }
 
@@ -158,7 +164,7 @@ pub trait BasicBlockBuilder: Sized + InstInsert {
 }
 
 pub trait ArenaQuery {
-    fn arena(&self) -> Arena;
+    fn arena(&self) -> &dyn Arena;
 }
 
 impl<T: ArenaQuery> InfoQuery for T {
@@ -180,12 +186,12 @@ impl<T: ArenaQuery> InfoQuery for T {
 }
 
 pub struct LocalBuilder<'a> {
-    pub(crate) arena: ArenaMut<'a>,
+    pub arena: &'a mut dyn Arena,
 }
 
 impl ArenaQuery for LocalBuilder<'_> {
-    fn arena(&self) -> Arena {
-        self.arena.freeze()
+    fn arena(&self) -> &dyn Arena {
+        self.arena
     }
 }
 
@@ -204,15 +210,15 @@ pub struct GlobalBuilder<'a> {
 }
 
 impl ArenaQuery for GlobalBuilder<'_> {
-    fn arena(&self) -> Arena {
-        Arena::new(None, Some(self.program.global_arena()))
+    fn arena(&self) -> &dyn Arena {
+        self.program
     }
 }
 
 impl InstInsert for GlobalBuilder<'_> {
     fn insert_inst(&mut self, data: InstData) -> Inst {
         let is_global_alloc = matches!(data.kind(), InstKind::GlobalAlloc(..));
-        let id = ArenaMut::new(None, Some(self.program.global_arena_mut())).alloc_global_inst(data);
+        let id = self.program.alloc_global_inst(data);
         if is_global_alloc {
             self.program.inst_layout_push(id);
         }
@@ -225,12 +231,12 @@ impl ScalarInstBuilder for GlobalBuilder<'_> {}
 impl GlobalInstBuilder for GlobalBuilder<'_> {}
 
 pub struct BasicBlockBuilders<'a> {
-    pub(crate) arena: ArenaMut<'a>,
+    pub(crate) arena: &'a mut dyn Arena,
 }
 
 impl ArenaQuery for BasicBlockBuilders<'_> {
-    fn arena(&self) -> Arena {
-        self.arena.freeze()
+    fn arena(&self) -> &dyn Arena {
+        self.arena
     }
 }
 

@@ -35,25 +35,6 @@ impl Branch {
         &self.f_args
     }
 
-    #[deprecated]
-    pub fn false_bb(&self) -> BasicBlock {
-        self.f_target
-    }
-
-    #[deprecated]
-    pub fn true_bb(&self) -> BasicBlock {
-        self.t_target
-    }
-    #[deprecated]
-    pub fn false_args(&self) -> &[Inst] {
-        &self.f_args
-    }
-
-    #[deprecated]
-    pub fn true_args(&self) -> &[Inst] {
-        &self.t_args
-    }
-
     pub fn new_data(
         cond: Inst,
         t_target: BasicBlock,

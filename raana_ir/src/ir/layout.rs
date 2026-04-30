@@ -50,11 +50,6 @@ impl Layout {
         &self.bbs
     }
 
-    #[deprecated]
-    pub fn bbs(&self) -> BasicBlocks<'_> {
-        BasicBlocks { layout: self }
-    }
-
     pub fn basicblock(&self, bb: BasicBlock) -> &BasicBlockLayout {
         self.bbs.get(*self.back.get(&bb).unwrap()).unwrap()
     }
@@ -63,17 +58,14 @@ impl Layout {
         self.bbs.get_mut(*self.back.get(&bb).unwrap()).unwrap()
     }
 
-    #[deprecated]
-    pub fn bbs_mut(&mut self) -> BasicBlocksMut<'_> {
-        BasicBlocksMut { layout: self }
-    }
-
     pub fn basicblocks_mut(&mut self) -> &mut IndexList<BasicBlockLayout> {
         &mut self.bbs
     }
 
     pub fn push_bb_back(&mut self, bb: BasicBlock) -> index_list::ListIndex {
-        self.bbs.insert_last(BasicBlockLayout::new(bb))
+        let idx = self.bbs.insert_last(BasicBlockLayout::new(bb));
+        self.back.insert(bb, idx);
+        idx
     }
 
     pub fn entry_bb(&self) -> Option<&BasicBlockLayout> {
@@ -91,39 +83,17 @@ impl Layout {
         let idx = self.basicblock_mut(bb).back.remove(&inst).unwrap();
         self.basicblock_mut(bb).insts.remove(idx);
     }
-}
 
-pub struct BasicBlocks<'a> {
-    layout: &'a Layout,
-}
-
-// impl Iterator for BasicBlocks<'_> {
-//     fn next(&mut self) -> Option<Self::Item> {
-//
-//     }
-// }
-
-impl BasicBlocks<'_> {
-    #[deprecated]
-    pub fn keys(&self) -> impl Iterator<Item = BasicBlock> {
-        self.layout.bbs.iter().map(|bl| bl.bb)
+    pub fn remove_basicblock(&mut self, bb: BasicBlock) {
+        let idx = self.back.remove(&bb).unwrap();
+        let layout = self.bbs.remove(idx).unwrap();
+        for inst in layout.insts() {
+            self.parent.remove(inst);
+        }
     }
 
-    #[deprecated]
-    pub fn node(&self, bb: BasicBlock) -> &BasicBlockLayout {
-        self.layout.basicblock(bb)
-    }
-}
-
-pub struct BasicBlocksMut<'a> {
-    layout: &'a mut Layout,
-}
-
-impl BasicBlocksMut<'_> {
-    pub fn remove(&mut self, bb: BasicBlock) -> BasicBlockLayout {
-        self.layout
-            .bbs
-            .remove(*self.layout.back.get(&bb).unwrap())
-            .unwrap()
+    #[inline]
+    pub fn is_decl(&self) -> bool {
+        self.bbs.is_empty()
     }
 }

@@ -10,11 +10,7 @@ pub trait ToRaanaIR {
 }
 
 use super::items::*;
-use raana_ir::ir::{
-    arena::{Arena, ArenaMut},
-    builder_trait::*,
-    *,
-};
+use raana_ir::ir::{arena::Arena, builder_trait::*, *};
 use std::collections::{
     HashMap,
     hash_map::Entry::{Occupied, Vacant},
@@ -41,6 +37,24 @@ pub struct AstGenContext {
     loop_stack: Vec<(BasicBlock, BasicBlock)>,
 }
 
+impl Arena for AstGenContext {
+    fn local(&self) -> &arena::LocalArena {
+        self.curr_func_data().local_arena()
+    }
+
+    fn global(&self) -> &arena::GlobalArena {
+        self.program.global_arena()
+    }
+
+    fn local_mut(&mut self) -> &mut arena::LocalArena {
+        self.curr_func_data_mut().local_arena_mut()
+    }
+
+    fn global_mut(&mut self) -> &mut arena::GlobalArena {
+        self.program.global_arena_mut()
+    }
+}
+
 impl AstGenContext {
     pub fn new() -> AstGenContext {
         AstGenContext {
@@ -55,7 +69,7 @@ impl AstGenContext {
     }
 
     pub fn get_global_val(&self, inst: Inst) -> Option<Number> {
-        if let InstKind::Integer(int) = self.global_arena().inst_data(inst).kind() {
+        if let InstKind::Integer(int) = self.inst_data(inst).kind() {
             return Some(int.value());
         }
         None
@@ -65,17 +79,16 @@ impl AstGenContext {
         let sym = self.global_scope().get(ident);
         sym.map(|&x| match x {
             Symbol::Constant(int) => {
-                let InstKind::Integer(int) = self.global_arena().inst_data(int).kind() else {
+                let InstKind::Integer(int) = self.inst_data(int).kind() else {
                     unreachable!();
                 };
                 int.value()
             }
             Symbol::Variable(var) => {
-                let InstKind::GlobalAlloc(glob_alloc) = self.global_arena().inst_data(var).kind()
-                else {
+                let InstKind::GlobalAlloc(glob_alloc) = self.inst_data(var).kind() else {
                     unreachable!();
                 };
-                match self.global_arena().inst_data(glob_alloc.init()).kind() {
+                match self.inst_data(glob_alloc.init()).kind() {
                     InstKind::Integer(int) => int.value(),
                     InstKind::ZeroInit => 0,
                     _ => unreachable!(),
@@ -101,7 +114,7 @@ impl AstGenContext {
         let func_data = self.curr_func_data_mut();
         let entry_bb = func_data
             .new_basic_block()
-            .basic_block("%entry".into(), vec![]);
+            .basic_block("entry".into(), vec![]);
         func_data.layout_mut().push_bb_back(entry_bb);
         entry_bb
     }
@@ -187,11 +200,6 @@ impl AstGenContext {
     }
 
     #[inline]
-    pub fn end(self) -> Program {
-        self.program
-    }
-
-    #[inline]
     pub fn curr_func_data_mut(&mut self) -> &mut FunctionData {
         self.program.func_data_mut(*self.func_stack.last().unwrap())
     }
@@ -199,29 +207,6 @@ impl AstGenContext {
     #[inline]
     pub fn curr_func_data(&self) -> &FunctionData {
         self.program.func_data(*self.func_stack.last().unwrap())
-    }
-
-    pub fn full_arena(&self) -> Arena<'_> {
-        Arena::new(
-            Some(self.curr_func_data().local_arena()),
-            Some(self.program.global_arena()),
-        )
-    }
-
-    pub fn local_arena(&self) -> Arena<'_> {
-        self.curr_func_data().arena()
-    }
-
-    pub fn local_arena_mut(&mut self) -> ArenaMut<'_> {
-        self.curr_func_data_mut().arena_mut()
-    }
-
-    pub fn global_arena(&self) -> Arena<'_> {
-        self.program.arena()
-    }
-
-    pub fn global_arena_mut(&mut self) -> ArenaMut<'_> {
-        self.program.arena_mut()
     }
 
     #[inline]
@@ -236,7 +221,7 @@ impl AstGenContext {
             .get_last()
             .is_some_and(|&inst| {
                 matches!(
-                    self.local_arena().inst_data(inst).kind(),
+                    self.inst_data(inst).kind(),
                     InstKind::Branch(_) | InstKind::Jump(_) | InstKind::Return(_)
                 )
             })
@@ -255,8 +240,7 @@ impl AstGenContext {
 
     pub fn remove_inst(&mut self, inst: Inst) {
         let curr_basic_blcok = self.curr_bb.unwrap();
-        let _ = self
-            .curr_func_data_mut()
+        self.curr_func_data_mut()
             .layout_mut()
             .remove_inst(curr_basic_blcok, inst);
     }
@@ -271,11 +255,6 @@ impl AstGenContext {
         self.val_stack.pop()
     }
 
-    // #[inline]
-    // fn peek_val(&self) -> Option<&Inst> {
-    //     self.val_stack.last()
-    // }
-
     #[must_use]
     #[inline]
     pub fn new_bb(&mut self) -> BasicBlockBuilders<'_> {
@@ -286,16 +265,14 @@ impl AstGenContext {
         self.curr_func_data_mut().layout_mut().push_bb_back(bb);
     }
 
-    // TODO: pending for layout.
     pub fn remove_bb(&mut self, bb: BasicBlock) {
-        todo!()
-        // let _ = self.curr_func_data_mut().layout_mut().bbs_mut().remove(&bb);
+        self.curr_func_data_mut().layout_mut().remove_basicblock(bb);
     }
 
     #[must_use]
     #[inline]
     pub fn new_local_value(&mut self) -> LocalBuilder<'_> {
-        self.curr_func_data_mut().new_local_inst()
+        LocalBuilder { arena: self }
     }
 
     #[inline]
@@ -315,7 +292,7 @@ impl AstGenContext {
 
     #[inline]
     pub fn bb_params(&self, bb: BasicBlock) -> &[Inst] {
-        self.curr_func_data().arena().bb_data(bb).params()
+        self.bb_data(bb).params()
     }
 
     #[inline]
@@ -343,42 +320,42 @@ impl AstGenContext {
         self.insert_func(std::rc::Rc::from("getint"), getint);
         let getch = self
             .program
-            .new_function(Type::get_i32(), "@getch".into(), vec![]);
+            .new_function(Type::get_i32(), "getch".into(), vec![]);
         self.insert_func(std::rc::Rc::from("getch"), getch);
         let getarray = self.program.new_function(
             Type::get_i32(),
-            "@getarray".into(),
+            "getarray".into(),
             vec![Type::get_pointer(Type::get_i32())],
         );
         self.insert_func(std::rc::Rc::from("getarray"), getarray);
         let putint =
             self.program
-                .new_function(Type::get_unit(), "@putint".into(), vec![Type::get_i32()]);
+                .new_function(Type::get_unit(), "putint".into(), vec![Type::get_i32()]);
         self.insert_func(std::rc::Rc::from("putint"), putint);
         let putch =
             self.program
-                .new_function(Type::get_unit(), "@putch".into(), vec![Type::get_i32()]);
+                .new_function(Type::get_unit(), "putch".into(), vec![Type::get_i32()]);
         self.insert_func(std::rc::Rc::from("putch"), putch);
         let putarray = self.program.new_function(
             Type::get_unit(),
-            "@putarray".into(),
+            "putarray".into(),
             vec![Type::get_i32(), Type::get_pointer(Type::get_i32())],
         );
         self.insert_func(std::rc::Rc::from("putarray"), putarray);
         let starttime = self
             .program
-            .new_function(Type::get_unit(), "@starttime".into(), vec![]);
+            .new_function(Type::get_unit(), "starttime".into(), vec![]);
         self.insert_func(std::rc::Rc::from("starttime"), starttime);
         let stoptime = self
             .program
-            .new_function(Type::get_unit(), "@stoptime".into(), vec![]);
+            .new_function(Type::get_unit(), "stoptime".into(), vec![]);
         self.insert_func(std::rc::Rc::from("stoptime"), stoptime);
     }
 
     #[inline]
     fn local_val_as_i32(&self, inst: Inst) -> Option<i32> {
         debug_assert!(!inst.is_global());
-        match self.local_arena().inst_data(inst).kind() {
+        match self.inst_data(inst).kind() {
             InstKind::Integer(int) => Some(int.value()),
             _ => None,
         }
@@ -387,7 +364,7 @@ impl AstGenContext {
     #[inline]
     fn global_val_as_i32(&self, inst: Inst) -> Option<i32> {
         debug_assert!(inst.is_global());
-        match self.global_arena().inst_data(inst).kind() {
+        match self.inst_data(inst).kind() {
             InstKind::Integer(int) => Some(int.value()),
             _ => None,
         }
@@ -404,7 +381,7 @@ impl AstGenContext {
     #[inline]
     fn global_val_as_i32_val(&mut self, inst: Inst) -> Inst {
         assert!(inst.is_global());
-        let int = match self.global_arena().inst_data(inst).kind() {
+        let int = match self.inst_data(inst).kind() {
             InstKind::Integer(int) => int.value(),
             _ => unreachable!(),
         };
@@ -425,29 +402,20 @@ impl AstGenContext {
             .unwrap_or_else(|| panic!("Not an integer {:?}", val))
     }
 
-    pub fn set_value_name(&mut self, val: Inst, ident: Ident) {
-        if val.is_global() {
-            self.global_arena_mut()
-                .inst_data_mut(val)
+    pub fn set_value_name(&mut self, inst: Inst, ident: Ident) {
+        if inst.is_global() {
+            self.inst_data_mut(inst)
                 .set_name(format!("gv_{}", ident.clone()));
         } else {
-            self.local_arena_mut()
-                .inst_data_mut(inst)
-                .set_name(format!("%v_{}", ident.clone()));
+            self.inst_data_mut(inst)
+                .set_name(format!("v_{}", ident.clone()));
         }
     }
 
     pub fn is_pointer_to_array(&self, inst: Inst) -> bool {
-        if inst.is_global() {
-            match self.global_arena().inst_data(inst).ty().kind() {
-                TypeKind::Pointer(point_to) => matches!(point_to.kind(), TypeKind::Array(..)),
-                _ => false,
-            }
-        } else {
-            match self.local_arena().inst_data(inst).ty().kind() {
-                TypeKind::Pointer(point_to) => matches!(point_to.kind(), TypeKind::Array(..)),
-                _ => false,
-            }
+        match self.inst_data(inst).ty().kind() {
+            TypeKind::Pointer(point_to) => matches!(point_to.kind(), TypeKind::Array(..)),
+            _ => false,
         }
     }
 }

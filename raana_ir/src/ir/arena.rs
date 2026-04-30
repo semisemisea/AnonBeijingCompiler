@@ -58,97 +58,37 @@ impl LocalArena {
     }
 }
 
-pub struct Arena<'a> {
-    pub(crate) local: Option<&'a LocalArena>,
-    pub(crate) global: Option<&'a GlobalArena>,
-}
+pub trait Arena {
+    fn local(&self) -> &LocalArena;
+    fn global(&self) -> &GlobalArena;
+    fn local_mut(&mut self) -> &mut LocalArena;
+    fn global_mut(&mut self) -> &mut GlobalArena;
 
-impl<'a> Arena<'a> {
-    pub fn new(local: Option<&'a LocalArena>, global: Option<&'a GlobalArena>) -> Arena<'a> {
-        Arena { local, global }
-    }
-
-    pub fn new_local(local: &'a LocalArena) -> Arena<'a> {
-        Arena {
-            local: Some(local),
-            global: None,
-        }
-    }
-
-    pub fn new_global(global: &'a GlobalArena) -> Arena<'a> {
-        Arena {
-            local: None,
-            global: Some(global),
-        }
-    }
-
-    pub fn inst_data(&self, inst: Inst) -> &'a InstData {
+    fn inst_data(&self, inst: Inst) -> &InstData {
         if inst.is_global() {
-            self.global.unwrap().inst_arena.data_of(inst)
+            self.global().inst_arena.data_of(inst)
         } else {
-            self.local.unwrap().inst_arena.data_of(inst)
+            self.local().inst_arena.data_of(inst)
         }
     }
 
-    pub fn bb_data(&self, bb: BasicBlock) -> &'a BasicBlockData {
-        self.local.unwrap().bb_arena.data_of(bb)
+    fn bb_data(&self, bb: BasicBlock) -> &BasicBlockData {
+        self.local().bb_arena.data_of(bb)
     }
 
-    pub fn func_data(&self, func: Function) -> &'a FunctionData {
-        self.global.unwrap().func_arena.data_of(func)
+    fn func_data(&self, func: Function) -> &FunctionData {
+        self.global().func_arena.data_of(func)
     }
 
-    pub fn set_local(&mut self, local: Option<&'a LocalArena>) {
-        self.local = local;
-    }
-
-    #[deprecated]
-    pub fn value(&self, value: Inst) -> &InstData {
-        self.inst_data(value)
-    }
-
-    #[deprecated]
-    pub fn values(&self) -> impl Iterator<Item = &InstData> {
-        self.global
-            .unwrap()
-            .inst_arena
-            .datas()
-            .chain(self.local.unwrap().inst_arena.datas())
-    }
-    #[deprecated]
-    pub fn bb(&self, bb: BasicBlock) -> &BasicBlockData {
-        self.local.unwrap().bb_arena.data_of(bb)
-    }
-}
-
-pub struct ArenaMut<'a> {
-    pub(crate) local: Option<&'a mut LocalArena>,
-    pub(crate) global: Option<&'a mut GlobalArena>,
-}
-
-impl<'a> ArenaMut<'a> {
-    pub fn new(
-        local: Option<&'a mut LocalArena>,
-        global: Option<&'a mut GlobalArena>,
-    ) -> ArenaMut<'a> {
-        ArenaMut { local, global }
-    }
-
-    pub fn new_local(local: &'a mut LocalArena) -> ArenaMut<'a> {
-        ArenaMut {
-            local: Some(local),
-            global: None,
+    fn inst_data_mut(&mut self, inst: Inst) -> &mut InstData {
+        if inst.is_global() {
+            self.global_mut().inst_arena.mut_data_of(inst)
+        } else {
+            self.local_mut().inst_arena.mut_data_of(inst)
         }
     }
 
-    pub fn new_global(global: &'a mut GlobalArena) -> ArenaMut<'a> {
-        ArenaMut {
-            local: None,
-            global: Some(global),
-        }
-    }
-
-    pub fn alloc_local_inst(&mut self, data: InstData) -> Inst {
+    fn alloc_local_inst(&mut self, data: InstData) -> Inst {
         let id = next_local_inst_id();
         for used in data.inst_usage() {
             self.inst_data_mut(used).used_by_mut().insert(id);
@@ -156,48 +96,32 @@ impl<'a> ArenaMut<'a> {
         for bb in data.bb_usage() {
             self.bb_data_mut(bb).used_by_mut().insert(id);
         }
-        self.local.as_mut().unwrap().inst_arena.alloc(data);
+        self.local_mut().inst_arena.alloc(id, data);
         id
     }
 
-    pub fn inst_data_mut(&mut self, inst: Inst) -> &mut InstData {
-        if inst.is_global() {
-            self.global.as_mut().unwrap().inst_arena.mut_data_of(inst)
-        } else {
-            self.local.as_mut().unwrap().inst_arena.mut_data_of(inst)
-        }
+    fn bb_data_mut(&mut self, bb: BasicBlock) -> &mut BasicBlockData {
+        self.local_mut().bb_arena.mut_data_of(bb)
     }
 
-    pub fn bb_data_mut(&mut self, bb: BasicBlock) -> &mut BasicBlockData {
-        self.local.as_mut().unwrap().bb_arena.mut_data_of(bb)
-    }
-
-    pub fn alloc_global_inst(&mut self, data: InstData) -> Inst {
+    fn alloc_global_inst(&mut self, data: InstData) -> Inst {
         let id = next_global_inst_id();
         for used in data.inst_usage() {
             self.inst_data_mut(used).used_by_mut().insert(id);
         }
-        self.global.as_mut().unwrap().inst_arena.alloc(data);
+        self.global_mut().inst_arena.alloc(data);
         id
     }
 
-    pub fn alloc_function(&mut self, data: FunctionData) {
-        self.global.as_mut().unwrap().func_arena.alloc(data);
+    fn alloc_function(&mut self, data: FunctionData) {
+        self.global_mut().func_arena.alloc(data);
     }
 
-    pub fn alloc_basic_block(&mut self, data: BasicBlockData) -> BasicBlock {
-        self.local.as_mut().unwrap().bb_arena.alloc(data)
+    fn alloc_basic_block(&mut self, data: BasicBlockData) -> BasicBlock {
+        self.local_mut().bb_arena.alloc(data)
     }
 
-    pub fn freeze(&self) -> Arena {
-        Arena::new(self.local.as_deref(), self.global.as_deref())
-    }
-
-    pub fn func_data(&self, func: Function) -> &FunctionData {
-        self.global.as_ref().unwrap().func_arena.data_of(func)
-    }
-
-    pub fn func_data_mut(&mut self, func: Function) -> &mut FunctionData {
-        self.global.as_mut().unwrap().func_arena.mut_data_of(func)
+    fn func_data_mut(&mut self, func: Function) -> &mut FunctionData {
+        self.global_mut().func_arena.mut_data_of(func)
     }
 }

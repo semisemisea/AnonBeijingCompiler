@@ -36,6 +36,18 @@ pub enum BinaryOp {
     Mul,
     Div,
     Rem,
+    NotEq,
+    Eq,
+    Gt,
+    Lt,
+    Ge,
+    Le,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Sar,
 }
 
 impl std::fmt::Display for BinaryOp {
@@ -49,6 +61,18 @@ impl std::fmt::Display for BinaryOp {
                 BinaryOp::Mul => "mul",
                 BinaryOp::Div => "div",
                 BinaryOp::Rem => "rem",
+                BinaryOp::NotEq => "neq",
+                BinaryOp::Eq => "eq",
+                BinaryOp::Gt => "gt",
+                BinaryOp::Lt => "lt",
+                BinaryOp::Le => "le",
+                BinaryOp::Ge => "ge",
+                BinaryOp::And => "and",
+                BinaryOp::Or => "or",
+                BinaryOp::Xor => "xor",
+                BinaryOp::Shl => "shl",
+                BinaryOp::Shr => "shr",
+                BinaryOp::Sar => "sar",
             }
         )
     }

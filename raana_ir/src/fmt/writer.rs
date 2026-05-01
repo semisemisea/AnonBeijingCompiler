@@ -261,7 +261,7 @@ impl Writer<'_> {
         write!(self.buffer, "br {}, ", get_name!(self, branch.cond()))?;
         write!(
             self.buffer,
-            "@{}",
+            "{}",
             self.program.bb_data(branch.t_target()).name()
         )?;
         if let Some((&last, rest)) = branch.t_args().split_last() {
@@ -286,12 +286,7 @@ impl Writer<'_> {
             write!(self.buffer, "{}", get_name!(self, last))?;
             write!(self.buffer, ")")?;
         }
-        write!(
-            self.buffer,
-            " <type = {}, size = {}>",
-            Type::get_unit(),
-            Type::get_unit().size()
-        )
+        Ok(())
     }
 
     fn visit_call(&mut self, call: &Call) -> std::fmt::Result {
@@ -348,12 +343,7 @@ impl Writer<'_> {
             write!(self.buffer, "{}", get_name!(self, last))?;
             write!(self.buffer, ")")?;
         }
-        write!(
-            self.buffer,
-            " <type = {}, size = {}>",
-            Type::get_unit(),
-            Type::get_unit().size()
-        )
+        Ok(())
     }
 
     fn visit_load(&mut self, load: &Load) -> std::fmt::Result {
@@ -372,22 +362,15 @@ impl Writer<'_> {
         if let Some(inst) = ret.value() {
             write!(self.buffer, " {}", get_name!(self, inst))?;
         }
-        write!(
-            self.buffer,
-            " <type = {}, size = {}>",
-            Type::get_unit(),
-            Type::get_unit().size()
-        )
+        Ok(())
     }
 
     fn visit_store(&mut self, store: &Store) -> std::fmt::Result {
         write!(
             self.buffer,
-            "store {}, {} <type = {}, size = {}>",
+            "store {}, {}",
             get_name!(self, store.src()),
             get_name!(self, store.dest()),
-            Type::get_unit(),
-            Type::get_unit().size()
         )
     }
 }
@@ -445,7 +428,7 @@ global %1 = alloc <init = 5, type = *i32, size = 8>
 define func <name = main, ret_ty = ()>: {
 entry:
     %0 = add 1, 2 <type = i32, size = 4>
-    ret <type = (), size = 0>
+    ret
 }
 ",
         );

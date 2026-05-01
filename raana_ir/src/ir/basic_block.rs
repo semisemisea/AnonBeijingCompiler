@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     num::NonZeroU32,
     sync::atomic::{AtomicU32, Ordering},
 };
@@ -60,30 +60,37 @@ pub struct BasicBlock(NonZeroU32);
 
 static BBID: AtomicU32 = AtomicU32::new(1);
 
+pub(crate) fn reset() {
+    BBID.store(1, Ordering::Relaxed);
+}
+
 fn next_bbid() -> BasicBlock {
     BasicBlock(unsafe { NonZeroU32::new_unchecked(BBID.fetch_add(1, Ordering::Relaxed)) })
 }
 
 #[derive(Debug, Clone)]
 pub struct BasicBlockArena {
-    data: Vec<BasicBlockData>,
+    data: HashMap<BasicBlock, BasicBlockData>,
 }
 
 impl BasicBlockArena {
     pub fn new() -> BasicBlockArena {
-        BasicBlockArena { data: Vec::new() }
+        BasicBlockArena {
+            data: HashMap::new(),
+        }
     }
 
     pub fn data_of(&self, bb: BasicBlock) -> &BasicBlockData {
-        &self.data[(bb.0.get() - 1) as usize]
+        self.data.get(&bb).unwrap()
     }
 
     pub fn mut_data_of(&mut self, bb: BasicBlock) -> &mut BasicBlockData {
-        &mut self.data[(bb.0.get() - 1) as usize]
+        self.data.get_mut(&bb).unwrap()
     }
 
     pub fn alloc(&mut self, bb_data: BasicBlockData) -> BasicBlock {
-        self.data.push(bb_data);
-        next_bbid()
+        let id = next_bbid();
+        self.data.insert(id, bb_data);
+        id
     }
 }

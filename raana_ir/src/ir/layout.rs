@@ -58,7 +58,7 @@ impl Layout {
         self.bbs.get_mut(*self.back.get(&bb).unwrap()).unwrap()
     }
 
-    pub fn basicblocks_mut(&mut self) -> &mut IndexList<BasicBlockLayout> {
+    fn basicblocks_mut(&mut self) -> &mut IndexList<BasicBlockLayout> {
         &mut self.bbs
     }
 

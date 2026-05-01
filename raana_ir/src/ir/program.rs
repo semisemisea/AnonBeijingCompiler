@@ -1,8 +1,9 @@
 use crate::ir::{
     arena::{Arena, GlobalArena},
+    basic_block,
     builder::GlobalBuilder,
-    function::{Function, FunctionData, next_function_id},
-    instruction::Inst,
+    function::{self, Function, FunctionData, next_function_id},
+    instruction::{self, Inst},
     types::Type,
 };
 
@@ -32,6 +33,9 @@ impl Arena for Program {
 
 impl Program {
     pub fn new() -> Program {
+        function::reset();
+        basic_block::reset();
+        instruction::reset();
         Program {
             global_arena: GlobalArena::new(),
             function_layout: Vec::new(),

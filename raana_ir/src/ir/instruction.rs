@@ -106,6 +106,11 @@ static LOCAL_INST_ID: AtomicU32 = AtomicU32::new(LOCAL_ID_START_FROM);
 
 static GLOBAL_INST_ID: AtomicU32 = AtomicU32::new(GLOBAL_ID_START_FROM);
 
+pub(crate) fn reset() {
+    LOCAL_INST_ID.store(LOCAL_ID_START_FROM, Ordering::Relaxed);
+    GLOBAL_INST_ID.store(GLOBAL_ID_START_FROM, Ordering::Relaxed);
+}
+
 pub(in crate::ir) fn next_local_inst_id() -> Inst {
     Inst(unsafe { NonZeroU32::new_unchecked(LOCAL_INST_ID.fetch_add(1, Ordering::Relaxed)) })
 }

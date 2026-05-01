@@ -104,6 +104,10 @@ pub struct Function(NonZeroU32);
 
 static FUNCTION_ID: AtomicU32 = AtomicU32::new(1);
 
+pub(crate) fn reset() {
+    FUNCTION_ID.store(1, Ordering::Relaxed);
+}
+
 pub(in crate::ir) fn next_function_id() -> Function {
     Function(unsafe { NonZeroU32::new_unchecked(FUNCTION_ID.fetch_add(1, Ordering::Relaxed)) })
 }

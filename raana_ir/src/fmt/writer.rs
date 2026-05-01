@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::ir::{
-    Function, FunctionData, InstKind, Program, Type,
+    Aggregate, Function, FunctionData, InstKind, Program, Type,
     arena::Arena,
     inst_kind::{Binary, Branch, Call, GetElemPtr, GetPtr, Jump, Load, Return, Store},
     instruction::{Inst, InstData},
@@ -47,11 +47,18 @@ impl Arena for ProgramWrapper<'_> {
 
 macro_rules! put_name {
     ($self:expr, $inst:expr) => {
-        if let Some(name) = $self.program.inst_data($inst).name() {
-            $self.symbol.insert($inst, format!("%{}", name));
-        } else {
-            $self.symbol.insert($inst, format!("%{}", $self.counter));
-            $self.counter += 1;
+        'b: {
+            let data = $self.program.inst_data($inst);
+            match data.kind() {
+                InstKind::Integer(..) | InstKind::Float(..) | InstKind::ZeroInit => break 'b,
+                _ => {}
+            };
+            if let Some(name) = data.name() {
+                $self.symbol.insert($inst, format!("%{}", name));
+            } else {
+                $self.symbol.insert($inst, format!("%{}", $self.counter));
+                $self.counter += 1;
+            }
         }
     };
 }
@@ -62,6 +69,8 @@ macro_rules! get_name {
         match data.kind() {
             InstKind::Integer(i) => i.value().to_string(),
             InstKind::Float(i) => i.value().to_string(),
+            InstKind::ZeroInit => "zeroinit".to_string(),
+            InstKind::Aggregate(agg) => $self.visit_aggregate(agg),
             _ => $self.symbol.get(&$inst).unwrap().clone(),
         }
     }};
@@ -108,6 +117,20 @@ impl Writer<'_> {
             _ => panic!(),
         };
         writeln!(self.buffer)
+    }
+
+    fn visit_aggregate(&self, agg: &Aggregate) -> String {
+        let mut s = String::new();
+        if let Some((&last, rest)) = agg.value().split_last() {
+            s.push('[');
+            for &inst in rest {
+                s.push_str(&get_name!(self, inst));
+                s.push_str(", ");
+            }
+            s.push_str(&get_name!(self, last));
+            s.push(']');
+        }
+        s
     }
 
     fn visit_func(&mut self, data: &FunctionData) -> std::fmt::Result {
@@ -287,6 +310,7 @@ impl Writer<'_> {
             .program
             .inst_data(get_elem_ptr.base())
             .ty()
+            .derefernce()
             .get_array_elem_ty();
         write!(
             self.buffer,
@@ -394,8 +418,8 @@ mod test {
         is_same(
             &p,
             "\
-global %0 = alloc <init = 3, type = i32, size = 4>
-global %1 = alloc <init = 5, type = i32, size = 4>
+global %0 = alloc <init = 3, type = *i32, size = 8>
+global %1 = alloc <init = 5, type = *i32, size = 8>
 ",
         );
     }
@@ -412,19 +436,9 @@ global %1 = alloc <init = 5, type = i32, size = 4>
         let o = fd.new_local_inst().integer(1);
         let t = fd.new_local_inst().integer(2);
         let add = fd.new_local_inst().binary(BinaryOp::Add, o, t);
-        fd.layout_mut()
-            .basicblocks_mut()
-            .get_mut_last()
-            .unwrap()
-            .insts_mut()
-            .insert_last(add);
+        fd.layout_mut().insert_inst(b, add);
         let ret = fd.new_local_inst().ret(None);
-        fd.layout_mut()
-            .basicblocks_mut()
-            .get_mut_last()
-            .unwrap()
-            .insts_mut()
-            .insert_last(ret);
+        fd.layout_mut().insert_inst(b, ret);
         is_same(
             &p,
             "\

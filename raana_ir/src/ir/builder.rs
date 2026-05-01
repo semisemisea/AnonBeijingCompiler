@@ -55,7 +55,10 @@ pub trait ScalarInstBuilder: InstInsert + InfoQuery + Sized {
                 self.inst_type(elem)
             );
         }
-        self.insert_inst(Aggregate::new_data(self.inst_type(value[0]), value))
+        self.insert_inst(Aggregate::new_data(
+            Type::get_array(self.inst_type(value[0]), value.len()),
+            value,
+        ))
     }
 }
 
@@ -95,11 +98,7 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
 
     /// panic is base is not a pointer type.
     fn get_ptr(&mut self, base: Inst, offset: Inst) -> Inst {
-        self.insert_inst(GetPtr::new_data(
-            base,
-            offset,
-            self.inst_type(base).derefernce(),
-        ))
+        self.insert_inst(GetPtr::new_data(base, offset, self.inst_type(base)))
     }
 
     /// panic if base is not a array type.
@@ -107,7 +106,8 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
         self.insert_inst(GetElemPtr::new_data(
             base,
             offset,
-            self.inst_type(base).get_array_elem_ty(),
+            // must be a pointer to an array.
+            Type::get_pointer(self.inst_type(base).derefernce().get_array_elem_ty()),
         ))
     }
 

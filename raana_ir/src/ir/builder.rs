@@ -258,3 +258,51 @@ impl BasicBlockBuilder for BasicBlockBuilders<'_> {
         self.arena.alloc_basic_block(data)
     }
 }
+
+pub struct ReplaceBuilder<'a> {
+    pub(crate) arena: &'a mut dyn Arena,
+    pub(crate) inst: Inst,
+}
+
+impl ArenaQuery for ReplaceBuilder<'_> {
+    fn arena(&self) -> &dyn Arena {
+        self.arena
+    }
+}
+
+impl InstInsert for ReplaceBuilder<'_> {
+    fn insert_inst(&mut self, data: InstData) -> Inst {
+        let old_data = if self.inst.is_global() {
+            self.arena.global_mut().inst_arena.remove(self.inst)
+        } else {
+            self.arena.local_mut().inst_arena.remove(self.inst)
+        };
+        for used in old_data.inst_usage() {
+            self.arena
+                .inst_data_mut(used)
+                .used_by_mut()
+                .remove(&self.inst);
+        }
+        for bb in old_data.bb_usage() {
+            self.arena.bb_data_mut(bb).used_by_mut().remove(&self.inst);
+        }
+        for used in data.inst_usage() {
+            self.arena
+                .inst_data_mut(used)
+                .used_by_mut()
+                .insert(self.inst);
+        }
+        for bb in data.bb_usage() {
+            self.arena.bb_data_mut(bb).used_by_mut().insert(self.inst);
+        }
+        if self.inst.is_global() {
+            self.arena.global_mut().inst_arena.insert(self.inst, data);
+        } else {
+            self.arena.local_mut().inst_arena.insert(self.inst, data);
+        }
+        self.inst
+    }
+}
+
+impl ScalarInstBuilder for ReplaceBuilder<'_> {}
+impl LocalInstBuilder for ReplaceBuilder<'_> {}

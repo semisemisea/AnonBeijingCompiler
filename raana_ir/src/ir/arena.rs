@@ -1,5 +1,7 @@
 use crate::ir::{
+    BasicBlockBuilders, LocalBuilder,
     basic_block::{BasicBlock, BasicBlockArena, BasicBlockData},
+    builder::ReplaceBuilder,
     function::{Function, FunctionArena, FunctionData},
     instruction::{
         GlobalInstArena, Inst, InstData, LocalInstArena, next_global_inst_id, next_local_inst_id,
@@ -64,6 +66,8 @@ pub trait Arena {
     fn local_mut(&mut self) -> &mut LocalArena;
     fn global_mut(&mut self) -> &mut GlobalArena;
 
+    #[must_use]
+    #[inline]
     fn inst_data(&self, inst: Inst) -> &InstData {
         if inst.is_global() {
             self.global().inst_arena.data_of(inst)
@@ -72,14 +76,20 @@ pub trait Arena {
         }
     }
 
+    #[must_use]
+    #[inline]
     fn bb_data(&self, bb: BasicBlock) -> &BasicBlockData {
         self.local().bb_arena.data_of(bb)
     }
 
+    #[must_use]
+    #[inline]
     fn func_data(&self, func: Function) -> &FunctionData {
         self.global().func_arena.data_of(func)
     }
 
+    #[must_use]
+    #[inline]
     fn inst_data_mut(&mut self, inst: Inst) -> &mut InstData {
         if inst.is_global() {
             self.global_mut().inst_arena.mut_data_of(inst)
@@ -88,6 +98,7 @@ pub trait Arena {
         }
     }
 
+    #[inline]
     fn alloc_local_inst(&mut self, data: InstData) -> Inst {
         let id = next_local_inst_id();
         for used in data.inst_usage() {
@@ -104,6 +115,34 @@ pub trait Arena {
         self.local_mut().bb_arena.mut_data_of(bb)
     }
 
+    #[must_use]
+    #[inline]
+    fn replace_value_with(&mut self, inst: Inst) -> ReplaceBuilder<'_>
+    where
+        Self: std::marker::Sized,
+    {
+        ReplaceBuilder { arena: self, inst }
+    }
+
+    #[must_use]
+    #[inline]
+    fn new_local_value(&mut self) -> LocalBuilder<'_>
+    where
+        Self: std::marker::Sized,
+    {
+        LocalBuilder { arena: self }
+    }
+
+    #[must_use]
+    #[inline]
+    fn new_basic_block(&mut self) -> BasicBlockBuilders<'_>
+    where
+        Self: std::marker::Sized,
+    {
+        BasicBlockBuilders { arena: self }
+    }
+
+    #[inline]
     fn alloc_global_inst(&mut self, data: InstData) -> Inst {
         let id = next_global_inst_id();
         for used in data.inst_usage() {
@@ -113,14 +152,17 @@ pub trait Arena {
         id
     }
 
+    #[inline]
     fn alloc_function(&mut self, data: FunctionData) {
         self.global_mut().func_arena.alloc(data);
     }
 
+    #[inline]
     fn alloc_basic_block(&mut self, data: BasicBlockData) -> BasicBlock {
         self.local_mut().bb_arena.alloc(data)
     }
 
+    #[inline]
     fn func_data_mut(&mut self, func: Function) -> &mut FunctionData {
         self.global_mut().func_arena.mut_data_of(func)
     }

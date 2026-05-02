@@ -729,11 +729,17 @@ impl ToRaanaIR for items::WhileStmt {
             return;
         }
         // create 3 basic blocks for while loop
-        let entry = ctx.new_bb().basic_block("while_entry".into(), vec![]);
+        let entry = ctx
+            .new_basic_block()
+            .basic_block("while_entry".into(), vec![]);
         ctx.register_bb(entry);
-        let body = ctx.new_bb().basic_block("while_body".into(), vec![]);
+        let body = ctx
+            .new_basic_block()
+            .basic_block("while_body".into(), vec![]);
         ctx.register_bb(body);
-        let end = ctx.new_bb().basic_block("while_end".into(), vec![]);
+        let end = ctx
+            .new_basic_block()
+            .basic_block("while_end".into(), vec![]);
         ctx.register_bb(end);
         ctx.push_loop(entry, end);
 
@@ -796,14 +802,14 @@ impl ToRaanaIR for items::IfStmt {
         self.cond.convert(ctx);
         let cond_val = ctx.pop_val().unwrap();
         let cond_val = ctx.truthy_local(cond_val);
-        let then_bb = ctx.new_bb().basic_block("then".into(), vec![]);
+        let then_bb = ctx.new_basic_block().basic_block("then".into(), vec![]);
         ctx.register_bb(then_bb);
         let else_bb = self.else_branch.as_ref().map(|_| {
-            let bb = ctx.new_bb().basic_block("else".into(), vec![]);
+            let bb = ctx.new_basic_block().basic_block("else".into(), vec![]);
             ctx.register_bb(bb);
             bb
         });
-        let end_bb = ctx.new_bb().basic_block("end".into(), vec![]);
+        let end_bb = ctx.new_basic_block().basic_block("end".into(), vec![]);
         ctx.register_bb(end_bb);
         let br = ctx.new_local_value().branch(
             cond_val,
@@ -895,10 +901,10 @@ impl ToRaanaIR for items::LOrExp {
                 let lhs_ne_0 = ctx.truthy_local(lhs);
 
                 // two basic block for short circuit logic
-                let rhs_bb = ctx.new_bb().basic_block("lor_rhs".into(), vec![]);
+                let rhs_bb = ctx.new_basic_block().basic_block("lor_rhs".into(), vec![]);
                 ctx.register_bb(rhs_bb);
                 let merge_bb = ctx
-                    .new_bb()
+                    .new_basic_block()
                     .basic_block("lor_merge".into(), vec![Type::get_i32()]);
                 ctx.register_bb(merge_bb);
 
@@ -916,16 +922,24 @@ impl ToRaanaIR for items::LOrExp {
                 let original = ctx.set_curr_bb(rhs_bb).unwrap();
                 land_exp.convert(ctx);
                 let rhs = ctx.pop_val().unwrap();
-                
+
                 // Constant folding
-                let lhs_const_truthy = ctx.as_i32(lhs).map(|v| v != 0).or_else(|| ctx.as_f32(lhs).map(|v| v != 0.0));
-                let rhs_const_truthy = ctx.as_i32(rhs).map(|v| v != 0).or_else(|| ctx.as_f32(rhs).map(|v| v != 0.0));
+                let lhs_const_truthy = ctx
+                    .as_i32(lhs)
+                    .map(|v| v != 0)
+                    .or_else(|| ctx.as_f32(lhs).map(|v| v != 0.0));
+                let rhs_const_truthy = ctx
+                    .as_i32(rhs)
+                    .map(|v| v != 0)
+                    .or_else(|| ctx.as_f32(rhs).map(|v| v != 0.0));
                 if let (Some(lhs_truthy), Some(rhs_truthy)) = (lhs_const_truthy, rhs_const_truthy) {
                     ctx.set_curr_bb(original);
                     ctx.remove_inst(br);
                     ctx.remove_bb(rhs_bb);
                     ctx.remove_bb(merge_bb);
-                    let result = ctx.new_local_value().integer((lhs_truthy || rhs_truthy) as _);
+                    let result = ctx
+                        .new_local_value()
+                        .integer((lhs_truthy || rhs_truthy) as _);
                     ctx.push_val(result);
                     return;
                 }
@@ -983,10 +997,10 @@ impl ToRaanaIR for items::LAndExp {
                 let lhs_ne_0 = ctx.truthy_local(lhs);
 
                 // two basic block for short circuit logic
-                let rhs_bb = ctx.new_bb().basic_block("land_rhs".into(), vec![]);
+                let rhs_bb = ctx.new_basic_block().basic_block("land_rhs".into(), vec![]);
                 ctx.register_bb(rhs_bb);
                 let merge_bb = ctx
-                    .new_bb()
+                    .new_basic_block()
                     .basic_block("land_merge".into(), vec![Type::get_i32()]);
                 ctx.register_bb(merge_bb);
 
@@ -1000,16 +1014,24 @@ impl ToRaanaIR for items::LAndExp {
                 let original = ctx.set_curr_bb(rhs_bb).unwrap();
                 eq_exp.convert(ctx);
                 let rhs = ctx.pop_val().unwrap();
-                
+
                 // Constant folding
-                let lhs_const_truthy = ctx.as_i32(lhs).map(|v| v != 0).or_else(|| ctx.as_f32(lhs).map(|v| v != 0.0));
-                let rhs_const_truthy = ctx.as_i32(rhs).map(|v| v != 0).or_else(|| ctx.as_f32(rhs).map(|v| v != 0.0));
+                let lhs_const_truthy = ctx
+                    .as_i32(lhs)
+                    .map(|v| v != 0)
+                    .or_else(|| ctx.as_f32(lhs).map(|v| v != 0.0));
+                let rhs_const_truthy = ctx
+                    .as_i32(rhs)
+                    .map(|v| v != 0)
+                    .or_else(|| ctx.as_f32(rhs).map(|v| v != 0.0));
                 if let (Some(lhs_truthy), Some(rhs_truthy)) = (lhs_const_truthy, rhs_const_truthy) {
                     ctx.set_curr_bb(original);
                     ctx.remove_inst(br);
                     ctx.remove_bb(rhs_bb);
                     ctx.remove_bb(merge_bb);
-                    let result = ctx.new_local_value().integer((lhs_truthy && rhs_truthy) as _);
+                    let result = ctx
+                        .new_local_value()
+                        .integer((lhs_truthy && rhs_truthy) as _);
                     ctx.push_val(result);
                     return;
                 }

@@ -248,24 +248,12 @@ impl AstGenContext {
         self.val_stack.pop()
     }
 
-    #[must_use]
-    #[inline]
-    pub fn new_bb(&mut self) -> BasicBlockBuilders<'_> {
-        self.curr_func_data_mut().new_basic_block()
-    }
-
     pub fn register_bb(&mut self, bb: BasicBlock) {
         self.curr_func_data_mut().layout_mut().push_bb_back(bb);
     }
 
     pub fn remove_bb(&mut self, bb: BasicBlock) {
         self.curr_func_data_mut().layout_mut().remove_basicblock(bb);
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn new_local_value(&mut self) -> LocalBuilder<'_> {
-        LocalBuilder { arena: self }
     }
 
     #[inline]
@@ -306,6 +294,7 @@ impl AstGenContext {
         )
     }
 
+    #[inline]
     pub fn decl_library_functions(&mut self) {
         let getint = self
             .program

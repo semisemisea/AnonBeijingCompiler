@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::ir::arena::Arena;
-use crate::ir::builder_trait::*;
+use crate::ir::{Program, builder_trait::*};
+use crate::opt::pass::ArenaContext;
 use crate::opt::utils::{self, BId, CFGGraph, DomTree, IDAllocator, IDomMap, VId};
 
 const FUNC_ARG_OPT_ENABLE: bool = false;
@@ -31,14 +32,14 @@ type InsertTable = Vec<Vec<(VId, Index)>>;
 type ValStack = Vec<Vec<Inst>>;
 
 impl Pass for SSATransform {
-    fn run_on(&self, func: Function, data: &mut FunctionData) {
+    fn run_on(&self, data: &mut ArenaContext<'_>) {
         // function declaration. skip.
         if data.layout().entry_bb().is_none() {
             return;
         }
 
         eprintln!("----------------------------------");
-        eprintln!("function: {func:?}");
+        eprintln!("function: {:?}", data.curr_func.unwrap());
         eprintln!("name: {}", data.name());
 
         // Discretization. Assign each unique basic block with natural number 0..n
@@ -79,7 +80,7 @@ impl Pass for SSATransform {
         eprintln!("val_usage: {val_usage:?}");
 
         // variable(vid) is insert as basic block(bbid) at index(usize)
-        let insert_table = vec![vec![]; bb_id.cnt()];
+        let mut insert_table = vec![vec![]; bb_id.cnt()];
 
         let mut worked = vec![HashSet::new(); bb_id.cnt()];
 
@@ -102,10 +103,12 @@ impl Pass for SSATransform {
                 }
                 worked[front].insert(vid);
                 let bb = bb_id.search_id(front);
+                let index = data.bb_data(bb).params().len();
 
                 let var_ty = utils::alloc_ty(val_id.search_id(vid as _), data).clone();
 
                 let p = data.new_basic_block().add_param(bb, var_ty);
+                insert_table[front].push((vid, index));
                 data.inst_data_mut(p).set_name(format!("vid_{}", vid));
 
                 if let Some(sub_frontiers) = dom_frontier.get(&front) {
@@ -155,7 +158,7 @@ fn dfs(
     st: &mut ValStack,
     val_id: &IDAllocator<Inst, VId>,
     bb_id: &IDAllocator<BasicBlock, BId>,
-    data: &mut FunctionData,
+    data: &mut ArenaContext<'_>,
     insert_table: &InsertTable,
     remove_list: &mut Vec<(Inst, BasicBlock)>,
 ) {

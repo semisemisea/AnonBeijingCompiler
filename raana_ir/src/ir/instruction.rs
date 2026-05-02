@@ -126,7 +126,7 @@ pub struct LocalInstArena {
 
 #[derive(Debug, Clone)]
 pub struct GlobalInstArena {
-    data: Vec<InstData>,
+    data: HashMap<Inst, InstData>,
 }
 
 impl LocalInstArena {
@@ -156,39 +156,35 @@ impl LocalInstArena {
         self.data.insert(inst, new_data);
     }
 
-    pub fn datas(&self) -> impl Iterator<Item = &InstData> {
-        self.data.values()
+    pub fn datas(&self) -> std::collections::hash_map::Iter<'_, Inst, InstData> {
+        self.data.iter()
     }
 }
 
 impl GlobalInstArena {
     pub fn new() -> GlobalInstArena {
-        GlobalInstArena { data: Vec::new() }
+        GlobalInstArena {
+            data: HashMap::new(),
+        }
     }
 
-    pub fn alloc(&mut self, data: InstData) {
-        self.data.push(data);
+    pub fn alloc(&mut self, inst: Inst, data: InstData) {
+        self.data.insert(inst, data);
     }
 
     pub fn data_of(&self, inst: Inst) -> &InstData {
-        &self.data[(inst.0.get() - GLOBAL_ID_START_FROM) as usize]
+        self.data.get(&inst).unwrap()
     }
 
     pub fn mut_data_of(&mut self, inst: Inst) -> &mut InstData {
-        &mut self.data[(inst.0.get() - GLOBAL_ID_START_FROM) as usize]
+        self.data.get_mut(&inst).unwrap()
     }
 
     pub fn remove(&mut self, inst: Inst) -> InstData {
-        self.data
-            .remove((inst.0.get() - GLOBAL_ID_START_FROM) as usize)
+        self.data.remove(&inst).unwrap()
     }
 
-    pub fn insert(&mut self, inst: Inst, new_data: InstData) {
-        self.data
-            .insert((inst.0.get() - GLOBAL_ID_START_FROM) as usize, new_data);
-    }
-
-    pub fn datas(&self) -> impl Iterator<Item = &InstData> {
+    pub fn datas(&self) -> std::collections::hash_map::Iter<'_, Inst, InstData> {
         self.data.iter()
     }
 }

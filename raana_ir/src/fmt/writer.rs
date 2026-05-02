@@ -50,7 +50,11 @@ macro_rules! put_name {
         'b: {
             let data = $self.program.inst_data($inst);
             match data.kind() {
-                InstKind::Integer(..) | InstKind::Float(..) | InstKind::ZeroInit => break 'b,
+                InstKind::Integer(..)
+                | InstKind::Float(..)
+                | InstKind::ZeroInit
+                | InstKind::Aggregate(..)
+                | InstKind::Undef => break 'b,
                 _ => {}
             };
             if let Some(name) = data.name() {
@@ -71,6 +75,7 @@ macro_rules! get_name {
             InstKind::Float(i) => i.value().to_string(),
             InstKind::ZeroInit => "zeroinit".to_string(),
             InstKind::Aggregate(agg) => $self.visit_aggregate(agg),
+            InstKind::Undef => "undef".to_string(),
             _ => $self.symbol.get(&$inst).unwrap().clone(),
         }
     }};

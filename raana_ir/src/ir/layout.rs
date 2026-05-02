@@ -96,4 +96,8 @@ impl Layout {
     pub fn is_decl(&self) -> bool {
         self.bbs.is_empty()
     }
+
+    pub fn parent_bb(&self, inst: Inst) -> Option<BasicBlock> {
+        self.parent.get(&inst).copied()
+    }
 }

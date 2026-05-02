@@ -314,9 +314,9 @@ impl InstInsert for ReplaceBuilder<'_> {
             self.arena.bb_data_mut(bb).used_by_mut().insert(self.inst);
         }
         if self.inst.is_global() {
-            self.arena.global_mut().inst_arena.insert(self.inst, data);
+            self.arena.global_mut().inst_arena.alloc(self.inst, data);
         } else {
-            self.arena.local_mut().inst_arena.insert(self.inst, data);
+            self.arena.local_mut().inst_arena.alloc(self.inst, data);
         }
         self.inst
     }

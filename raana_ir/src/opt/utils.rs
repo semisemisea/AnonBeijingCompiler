@@ -1,10 +1,8 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
-use crate::{
-    ir::{
-        BasicBlock, FunctionData, Inst, InstKind, Type, TypeKind, builder_trait::LocalInstBuilder,
-    },
-    // opt::{FunctionPass, ModulePass},
+use crate::ir::{
+    BasicBlock, FunctionData, Inst, InstKind, Type, TypeKind, arena::Arena,
+    builder_trait::LocalInstBuilder,
 };
 
 use itertools::Itertools;
@@ -132,7 +130,7 @@ pub fn build_cfg_both(
         visited.insert(node);
         let id = bb_alloc.check_or_alloc_id_same(node);
         let val = get_terminator_inst(data, node);
-        match data.dfg().value(val).kind() {
+        match data.inst_data(val).kind() {
             InstKind::Jump(jump) => {
                 let target_id = bb_alloc.check_or_alloc_id_same(jump.target());
 
@@ -142,19 +140,19 @@ pub fn build_cfg_both(
                 dfs(jump.target(), data, bb_alloc, graph, prece, visited);
             }
             InstKind::Branch(branch) => {
-                let true_id = bb_alloc.check_or_alloc_id_same(branch.true_bb());
+                let true_id = bb_alloc.check_or_alloc_id_same(branch.t_target());
 
                 graph.entry(id).or_default().push(true_id);
                 prece.entry(true_id).or_default().push(id);
 
-                dfs(branch.true_bb(), data, bb_alloc, graph, prece, visited);
+                dfs(branch.t_target(), data, bb_alloc, graph, prece, visited);
 
-                let false_id = bb_alloc.check_or_alloc_id_same(branch.false_bb());
+                let false_id = bb_alloc.check_or_alloc_id_same(branch.f_target());
 
                 graph.entry(id).or_default().push(false_id);
                 prece.entry(false_id).or_default().push(id);
 
-                dfs(branch.false_bb(), data, bb_alloc, graph, prece, visited);
+                dfs(branch.f_target(), data, bb_alloc, graph, prece, visited);
             }
             InstKind::Return(..) => {
                 graph.entry(id).or_default();
@@ -169,7 +167,7 @@ pub fn build_cfg_both(
     prece.entry(0).or_default();
     let mut visited = HashSet::new();
     dfs(
-        data.layout().entry_bb().unwrap(),
+        data.layout().entry_bb().unwrap().bb(),
         data,
         bb_alloc,
         &mut graph,
@@ -202,19 +200,12 @@ pub fn rpo_path(g: &CFGGraph) -> GPath {
 
 #[inline]
 pub fn get_terminator_inst(data: &FunctionData, bb: BasicBlock) -> Inst {
-    *data
-        .layout()
-        .bbs()
-        .node(&bb)
-        .unwrap()
-        .insts()
-        .back_key()
-        .unwrap()
+    *data.layout().basicblock(bb).insts().get_last().unwrap()
 }
 
 pub fn alloc_ty(val: Inst, data: &FunctionData) -> &Type {
     use TypeKind;
-    let val_data = data.dfg().value(val);
+    let val_data = data.inst_data(val);
     assert!(matches!(val_data.kind(), InstKind::Alloc));
     // alloc should generate a pointer to its target type.
     let TypeKind::Pointer(pointee) = val_data.ty().kind() else {
@@ -224,20 +215,14 @@ pub fn alloc_ty(val: Inst, data: &FunctionData) -> &Type {
 }
 
 pub fn visit_and_replace(data: &mut FunctionData, rep: Inst, rep_with: Inst) {
-    let list = data
-        .dfg()
-        .value(rep)
-        .used_by()
-        .iter()
-        .copied()
-        .collect_vec();
+    let list = data.inst_data(rep).used_by().iter().copied().collect_vec();
     for used_by in list {
         visit_and_replace_single(data, used_by, rep, rep_with);
     }
 }
 
 fn visit_and_replace_single(data: &mut FunctionData, used_by: Inst, rep: Inst, rep_with: Inst) {
-    let rep_val_data = data.dfg().value(used_by);
+    let rep_val_data = data.inst_data(used_by);
     #[allow(unused_variables)]
     match rep_val_data.kind() {
         InstKind::Integer(..)
@@ -250,30 +235,24 @@ fn visit_and_replace_single(data: &mut FunctionData, used_by: Inst, rep: Inst, r
         | InstKind::GlobalAlloc(..) => unreachable!("Encountered kind: {:?}", rep_val_data.kind()),
         InstKind::Float(..) => todo!(),
         InstKind::Load(load) => {
-            data.dfg_mut().replace_value_with(used_by).load(rep_with);
+            data.replace_inst_with(used_by).load(rep_with);
         }
         InstKind::Store(store) => {
-            if store.value() == rep {
+            if store.src() == rep {
                 let dest = store.dest();
-                data.dfg_mut()
-                    .replace_value_with(used_by)
-                    .store(rep_with, dest);
+                data.replace_inst_with(used_by).store(rep_with, dest);
             }
         }
         InstKind::GetPtr(get_ptr) => {
-            if get_ptr.index() == rep {
-                let src = get_ptr.src();
-                data.dfg_mut()
-                    .replace_value_with(used_by)
-                    .get_ptr(src, rep_with);
+            if get_ptr.offset() == rep {
+                let src = get_ptr.base();
+                data.replace_inst_with(used_by).get_ptr(src, rep_with);
             }
         }
         InstKind::GetElemPtr(get_elem_ptr) => {
-            if get_elem_ptr.index() == rep {
-                let src = get_elem_ptr.src();
-                data.dfg_mut()
-                    .replace_value_with(used_by)
-                    .get_elem_ptr(src, rep_with);
+            if get_elem_ptr.offset() == rep {
+                let src = get_elem_ptr.base();
+                data.replace_inst_with(used_by).get_elem_ptr(src, rep_with);
             }
         }
         InstKind::Binary(binary) => {
@@ -290,9 +269,7 @@ fn visit_and_replace_single(data: &mut FunctionData, used_by: Inst, rep: Inst, r
             };
             eprintln!("rhs: {:?} {:?}", rhs, binary.rhs());
             let op = binary.op();
-            data.dfg_mut()
-                .replace_value_with(used_by)
-                .binary(op, lhs, rhs);
+            data.replace_inst_with(used_by).binary(op, lhs, rhs);
         }
         InstKind::Branch(branch) => {
             let cond = if branch.cond() == rep {
@@ -300,30 +277,27 @@ fn visit_and_replace_single(data: &mut FunctionData, used_by: Inst, rep: Inst, r
             } else {
                 branch.cond()
             };
-            if let InstKind::Integer(int) = data.dfg().value(cond).kind() {
+            if let InstKind::Integer(int) = data.inst_data(cond).kind() {
                 let (target, args) = if int.value() == 0 {
-                    (branch.false_bb(), branch.false_args().to_vec())
+                    (branch.f_target(), branch.f_args().to_vec())
                 } else {
-                    (branch.true_bb(), branch.true_args().to_vec())
+                    (branch.t_target(), branch.t_args().to_vec())
                 };
-                data.dfg_mut()
-                    .replace_value_with(used_by)
-                    .jump_with_args(target, args);
+                data.replace_inst_with(used_by).jump(target, args);
             } else {
-                let true_args = branch
-                    .true_args()
+                let t_args = branch
+                    .t_args()
                     .iter()
                     .map(|&val| if val == rep { rep_with } else { val })
                     .collect();
-                let false_args = branch
-                    .false_args()
+                let f_args = branch
+                    .f_args()
                     .iter()
                     .map(|&val| if val == rep { rep_with } else { val })
                     .collect();
-                let (true_bb, false_bb) = (branch.true_bb(), branch.false_bb());
-                data.dfg_mut()
-                    .replace_value_with(used_by)
-                    .branch_with_args(cond, true_bb, false_bb, true_args, false_args);
+                let (t_target, f_target) = (branch.t_target(), branch.f_target());
+                data.replace_inst_with(used_by)
+                    .branch(cond, t_target, t_args, f_target, f_args);
             }
         }
         InstKind::Jump(jump) => {
@@ -333,9 +307,7 @@ fn visit_and_replace_single(data: &mut FunctionData, used_by: Inst, rep: Inst, r
                 .map(|&val| if val == rep { rep_with } else { val })
                 .collect();
             let target = jump.target();
-            data.dfg_mut()
-                .replace_value_with(used_by)
-                .jump_with_args(target, args);
+            data.replace_inst_with(used_by).jump(target, args);
         }
         InstKind::Call(call) => {
             let args = call
@@ -344,15 +316,11 @@ fn visit_and_replace_single(data: &mut FunctionData, used_by: Inst, rep: Inst, r
                 .map(|&val| if val == rep { rep_with } else { val })
                 .collect();
             let callee = call.callee();
-            data.dfg_mut()
-                .replace_value_with(used_by)
-                .call(callee, args);
+            data.replace_inst_with(used_by).call(callee, args);
         }
         InstKind::Return(ret) => {
             if ret.value() == Some(rep) {
-                data.dfg_mut()
-                    .replace_value_with(used_by)
-                    .ret(Some(rep_with));
+                data.replace_inst_with(used_by).ret(Some(rep_with));
             }
         }
     }

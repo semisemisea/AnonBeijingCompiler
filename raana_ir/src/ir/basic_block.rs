@@ -53,6 +53,10 @@ impl BasicBlockData {
     pub fn set_name(&mut self, name: String) {
         self.name = name;
     }
+
+    pub(in crate::ir) fn params_mut(&mut self) -> &mut Vec<Inst> {
+        &mut self.params
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

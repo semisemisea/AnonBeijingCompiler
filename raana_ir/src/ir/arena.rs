@@ -1,5 +1,5 @@
 use crate::ir::{
-    BasicBlockBuilders, LocalBuilder,
+    BasicBlockBuilders, LocalBuilder, Type,
     basic_block::{BasicBlock, BasicBlockArena, BasicBlockData},
     builder::ReplaceBuilder,
     function::{Function, FunctionArena, FunctionData},
@@ -117,7 +117,7 @@ pub trait Arena {
 
     #[must_use]
     #[inline]
-    fn replace_value_with(&mut self, inst: Inst) -> ReplaceBuilder<'_>
+    fn replace_inst_with(&mut self, inst: Inst) -> ReplaceBuilder<'_>
     where
         Self: std::marker::Sized,
     {
@@ -150,6 +150,10 @@ pub trait Arena {
         }
         self.global_mut().inst_arena.alloc(data);
         id
+    }
+
+    fn remove_inst(&mut self, inst: Inst) -> InstData {
+        self.local_mut().inst_arena.remove(inst)
     }
 
     #[inline]

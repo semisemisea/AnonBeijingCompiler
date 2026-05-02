@@ -4,7 +4,7 @@ use std::fmt::Write;
 use crate::ir::{
     Aggregate, Function, FunctionData, InstKind, Program, Type,
     arena::Arena,
-    inst_kind::{Binary, Branch, Call, GetElemPtr, GetPtr, Jump, Load, Return, Store},
+    inst_kind::{Binary, Branch, Call, Cast, GetElemPtr, GetPtr, Jump, Load, Return, Store},
     instruction::{Inst, InstData},
     layout::BasicBlockLayout,
 };
@@ -225,6 +225,7 @@ impl Writer<'_> {
             InstKind::Alloc => self.visit_alloc(data.ty()),
             InstKind::Binary(binary) => self.visit_binary(binary, data.ty()),
             InstKind::Branch(branch) => self.visit_branch(branch),
+            InstKind::Cast(cast) => self.visit_cast(cast, data.ty()),
             InstKind::Call(call) => self.visit_call(call),
             InstKind::GetElemPtr(get_elem_ptr) => self.visit_get_elem_ptr(get_elem_ptr),
             InstKind::GetPtr(get_ptr) => self.visit_get_ptr(get_ptr),
@@ -252,6 +253,16 @@ impl Writer<'_> {
             binary.op(),
             get_name!(self, binary.lhs()),
             get_name!(self, binary.rhs()),
+            ty,
+            ty.size()
+        )
+    }
+
+    fn visit_cast(&mut self, cast: &Cast, ty: &Type) -> std::fmt::Result {
+        write!(
+            self.buffer,
+            "cast {} <type = {}, size = {}>",
+            get_name!(self, cast.src()),
             ty,
             ty.size()
         )

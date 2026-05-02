@@ -68,14 +68,7 @@ impl AstGenContext {
         }
     }
 
-    pub fn get_global_val(&self, inst: Inst) -> Option<Number> {
-        if let InstKind::Integer(int) = self.inst_data(inst).kind() {
-            return Some(int.value());
-        }
-        None
-    }
-
-    pub fn _get_val(&self, ident: &Ident) -> Option<Number> {
+    pub fn _get_val(&self, ident: &Ident) -> Option<i32> {
         let sym = self.global_scope().get(ident);
         sym.map(|&x| match x {
             Symbol::Constant(int) => {
@@ -328,6 +321,16 @@ impl AstGenContext {
             vec![Type::get_pointer(Type::get_i32())],
         );
         self.insert_func(std::rc::Rc::from("getarray"), getarray);
+        let getfloat = self
+            .program
+            .new_function(Type::get_f32(), "getfloat".into(), vec![]);
+        self.insert_func(std::rc::Rc::from("getfloat"), getfloat);
+        let getfarray = self.program.new_function(
+            Type::get_i32(),
+            "getfarray".into(),
+            vec![Type::get_pointer(Type::get_f32())],
+        );
+        self.insert_func(std::rc::Rc::from("getfarray"), getfarray);
         let putint =
             self.program
                 .new_function(Type::get_unit(), "putint".into(), vec![Type::get_i32()]);
@@ -336,12 +339,22 @@ impl AstGenContext {
             self.program
                 .new_function(Type::get_unit(), "putch".into(), vec![Type::get_i32()]);
         self.insert_func(std::rc::Rc::from("putch"), putch);
+        let putfloat =
+            self.program
+                .new_function(Type::get_unit(), "putfloat".into(), vec![Type::get_f32()]);
+        self.insert_func(std::rc::Rc::from("putfloat"), putfloat);
         let putarray = self.program.new_function(
             Type::get_unit(),
             "putarray".into(),
             vec![Type::get_i32(), Type::get_pointer(Type::get_i32())],
         );
         self.insert_func(std::rc::Rc::from("putarray"), putarray);
+        let putfarray = self.program.new_function(
+            Type::get_unit(),
+            "putfarray".into(),
+            vec![Type::get_i32(), Type::get_pointer(Type::get_f32())],
+        );
+        self.insert_func(std::rc::Rc::from("putfarray"), putfarray);
         let starttime = self
             .program
             .new_function(Type::get_unit(), "starttime".into(), vec![]);
@@ -370,11 +383,37 @@ impl AstGenContext {
         }
     }
 
+    #[inline]
+    fn local_val_as_f32(&self, inst: Inst) -> Option<f32> {
+        debug_assert!(!inst.is_global());
+        match self.inst_data(inst).kind() {
+            InstKind::Float(float) => Some(float.value()),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn global_val_as_f32(&self, inst: Inst) -> Option<f32> {
+        debug_assert!(inst.is_global());
+        match self.inst_data(inst).kind() {
+            InstKind::Float(float) => Some(float.value()),
+            _ => None,
+        }
+    }
+
     pub fn as_i32(&self, val: Inst) -> Option<i32> {
         if val.is_global() {
             self.global_val_as_i32(val)
         } else {
             self.local_val_as_i32(val)
+        }
+    }
+
+    pub fn as_f32(&self, val: Inst) -> Option<f32> {
+        if val.is_global() {
+            self.global_val_as_f32(val)
+        } else {
+            self.local_val_as_f32(val)
         }
     }
 
@@ -394,6 +433,130 @@ impl AstGenContext {
         } else {
             val
         }
+    }
+
+    #[inline]
+    fn global_val_as_local_val(&mut self, inst: Inst) -> Inst {
+        assert!(inst.is_global());
+        match self.inst_data(inst).kind().clone() {
+            InstKind::Integer(int) => self
+                .curr_func_data_mut()
+                .new_local_inst()
+                .integer(int.value()),
+            InstKind::Float(float) => self
+                .curr_func_data_mut()
+                .new_local_inst()
+                .float(float.value()),
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn as_local_const_val(&mut self, val: Inst) -> Inst {
+        if val.is_global() {
+            self.global_val_as_local_val(val)
+        } else {
+            val
+        }
+    }
+
+    pub fn zero_local(&mut self, ty: &Type) -> Inst {
+        if ty.is_f32() {
+            self.new_local_value().float(0.0)
+        } else {
+            self.new_local_value().integer(0)
+        }
+    }
+
+    pub fn zero_global(&mut self, ty: &Type) -> Inst {
+        if ty.is_f32() {
+            self.new_global_value().float(0.0)
+        } else {
+            self.new_global_value().integer(0)
+        }
+    }
+
+    pub fn coerce_local(&mut self, val: Inst, ty: &Type) -> Inst {
+        let from_ty = self.inst_data(val).ty().clone();
+        if from_ty == *ty {
+            return val;
+        }
+        assert!(
+            from_ty.is_scalar() && ty.is_scalar(),
+            "Cannot convert {from_ty} to {ty}"
+        );
+        if ty.is_i32() {
+            if let Some(int) = self.as_i32(val) {
+                return self.new_local_value().integer(int);
+            }
+            if let Some(float) = self.as_f32(val) {
+                return self.new_local_value().integer(float as i32);
+            }
+        }
+        if ty.is_f32() {
+            if let Some(float) = self.as_f32(val) {
+                return self.new_local_value().float(float);
+            }
+            if let Some(int) = self.as_i32(val) {
+                return self.new_local_value().float(int as f32);
+            }
+        }
+        let cast = self.new_local_value().cast(val, ty.clone());
+        self.push_inst(cast);
+        cast
+    }
+
+    pub fn coerce_global(&mut self, val: Inst, ty: &Type) -> Inst {
+        let from_ty = self.inst_data(val).ty().clone();
+        if from_ty == *ty {
+            return val;
+        }
+        assert!(
+            from_ty.is_scalar() && ty.is_scalar(),
+            "Cannot convert {from_ty} to {ty}"
+        );
+        if ty.is_i32() {
+            if let Some(int) = self.as_i32(val) {
+                return self.new_global_value().integer(int);
+            }
+            if let Some(float) = self.as_f32(val) {
+                return self.new_global_value().integer(float as i32);
+            }
+        }
+        if ty.is_f32() {
+            if let Some(float) = self.as_f32(val) {
+                return self.new_global_value().float(float);
+            }
+            if let Some(int) = self.as_i32(val) {
+                return self.new_global_value().float(int as f32);
+            }
+        }
+        unreachable!("global values must be compile-time constants")
+    }
+
+    pub fn truthy_local(&mut self, val: Inst) -> Inst {
+        let ty = self.inst_data(val).ty().clone();
+        if let Some(int) = self.as_i32(val) {
+            return self.new_local_value().integer((int != 0) as i32);
+        }
+        if let Some(float) = self.as_f32(val) {
+            return self.new_local_value().integer((float != 0.0) as i32);
+        }
+        let zero = self.zero_local(&ty);
+        let cond = self.new_local_value().binary(BinaryOp::NotEq, val, zero);
+        self.push_inst(cond);
+        cond
+    }
+
+    pub fn func_param_tys(&self, func: Function) -> Vec<Type> {
+        let data = self.program.func_data(func);
+        data.params()
+            .iter()
+            .map(|&param| data.inst_data(param).ty().clone())
+            .collect()
+    }
+
+    pub fn curr_func_ret_ty(&self) -> Type {
+        self.curr_func_data().ret_ty().clone()
     }
 
     pub fn pop_i32(&mut self) -> i32 {

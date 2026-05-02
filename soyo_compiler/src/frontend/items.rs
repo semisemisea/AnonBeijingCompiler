@@ -2,6 +2,8 @@ use crate::frontend::utils::{AstGenContext, ToRaanaIR};
 
 use super::utils::Ident;
 use raana_ir::ir::{BinaryOp, Type};
+use std::ffi::CString;
+use std::os::raw::{c_char, c_float};
 
 /// CompUnit ::= FuncDef;
 ///
@@ -417,7 +419,55 @@ pub enum RelExp {
     Comp(Box<RelExp>, BinaryOp, AddExp),
 }
 
-/// Number ::= INT_CONST;
+/// Number ::= INT_CONST | FLOAT_CONST;
 ///
-/// An integer constant literal.
-pub type Number = i32;
+/// A numeric constant literal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Number {
+    Int(i32),
+    Float(f32),
+}
+
+unsafe extern "C" {
+    fn strtof(nptr: *const c_char, endptr: *mut *mut c_char) -> c_float;
+}
+
+pub fn parse_float_const(src: &str) -> f32 {
+    let c_src = CString::new(src).expect("float constants cannot contain NUL bytes");
+    let mut end = std::ptr::null_mut();
+    let value = unsafe { strtof(c_src.as_ptr(), &mut end) };
+    let expected_end = unsafe { c_src.as_ptr().add(src.len()) as *mut c_char };
+    assert!(
+        end == expected_end,
+        "invalid float constant {src:?}: conversion stopped before the token ended"
+    );
+    assert!(
+        value.is_finite(),
+        "float constant {src:?} is outside the finite f32 range"
+    );
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_float_const;
+
+    #[test]
+    fn parses_c99_float_constants_as_f32() {
+        assert_eq!(parse_float_const("1.").to_bits(), 1.0f32.to_bits());
+        assert_eq!(parse_float_const(".5").to_bits(), 0.5f32.to_bits());
+        assert_eq!(parse_float_const("1e-6").to_bits(), 1e-6f32.to_bits());
+        assert_eq!(
+            parse_float_const("0x1.921fb6p+1").to_bits(),
+            std::f32::consts::PI.to_bits()
+        );
+        assert_eq!(
+            parse_float_const("0x.AP-3").to_bits(),
+            0.078125f32.to_bits()
+        );
+        assert_eq!(
+            parse_float_const("03.141592653589793").to_bits(),
+            (3.141592653589793f32).to_bits()
+        );
+    }
+}

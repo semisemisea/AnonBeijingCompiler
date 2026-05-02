@@ -2,6 +2,73 @@ use super::items;
 use crate::frontend::utils::{AstGenContext, Symbol, ToRaanaIR};
 use raana_ir::ir::{arena::Arena, builder_trait::*, *};
 
+fn binary_requires_int(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Rem
+            | BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Xor
+            | BinaryOp::Shl
+            | BinaryOp::Shr
+            | BinaryOp::Sar
+    )
+}
+
+fn eval_i32_binary(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
+    match op {
+        BinaryOp::NotEq => (lhs != rhs) as i32,
+        BinaryOp::Eq => (lhs == rhs) as i32,
+        BinaryOp::Gt => (lhs > rhs) as i32,
+        BinaryOp::Lt => (lhs < rhs) as i32,
+        BinaryOp::Ge => (lhs >= rhs) as i32,
+        BinaryOp::Le => (lhs <= rhs) as i32,
+        BinaryOp::Add => lhs.wrapping_add(rhs),
+        BinaryOp::Sub => lhs.wrapping_sub(rhs),
+        BinaryOp::Mul => lhs.wrapping_mul(rhs),
+        BinaryOp::Div => {
+            if rhs == 0 {
+                panic!("Division by zero");
+            }
+            lhs.wrapping_div(rhs)
+        }
+        BinaryOp::Rem => {
+            if rhs == 0 {
+                panic!("Modulo by zero");
+            }
+            lhs.wrapping_rem(rhs)
+        }
+        BinaryOp::And => lhs & rhs,
+        BinaryOp::Or => lhs | rhs,
+        BinaryOp::Xor => lhs ^ rhs,
+        BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
+        BinaryOp::Shr => (lhs as u32).wrapping_shr(rhs as u32) as i32,
+        BinaryOp::Sar => lhs.wrapping_shr(rhs as u32),
+    }
+}
+
+fn eval_f32_binary(op: BinaryOp, lhs: f32, rhs: f32) -> items::Number {
+    match op {
+        BinaryOp::NotEq => items::Number::Int((lhs != rhs) as i32),
+        BinaryOp::Eq => items::Number::Int((lhs == rhs) as i32),
+        BinaryOp::Gt => items::Number::Int((lhs > rhs) as i32),
+        BinaryOp::Lt => items::Number::Int((lhs < rhs) as i32),
+        BinaryOp::Ge => items::Number::Int((lhs >= rhs) as i32),
+        BinaryOp::Le => items::Number::Int((lhs <= rhs) as i32),
+        BinaryOp::Add => items::Number::Float(lhs + rhs),
+        BinaryOp::Sub => items::Number::Float(lhs - rhs),
+        BinaryOp::Mul => items::Number::Float(lhs * rhs),
+        BinaryOp::Div => items::Number::Float(lhs / rhs),
+        BinaryOp::Rem
+        | BinaryOp::And
+        | BinaryOp::Or
+        | BinaryOp::Xor
+        | BinaryOp::Shl
+        | BinaryOp::Shr
+        | BinaryOp::Sar => panic!("Integer-only binary operator used with float operand"),
+    }
+}
+
 impl ToRaanaIR for items::CompUnits {
     fn convert(&self, ctx: &mut AstGenContext) {
         ctx.decl_library_functions();
@@ -151,7 +218,7 @@ impl ToRaanaIR for items::ConstDecl {
             return;
         }
         assert!(
-            self.btype.is_i32(),
+            self.btype.is_scalar(),
             "Unknown type for constant declaration."
         );
         ctx.set_def_type(self.btype.clone());
@@ -163,7 +230,7 @@ impl ToRaanaIR for items::ConstDecl {
     #[inline]
     fn global_convert(&self, ctx: &mut AstGenContext) {
         assert!(
-            self.btype.is_i32(),
+            self.btype.is_scalar(),
             "Unknown type for constant declaration."
         );
         ctx.set_def_type(self.btype.clone());
@@ -187,6 +254,7 @@ impl ToRaanaIR for items::ConstDef {
             };
             self.const_init_val.convert(ctx);
             let init_val = ctx.pop_val().unwrap();
+            let init_val = ctx.coerce_local(init_val, &ty);
             // Not a constant val
             // if !ctx.curr_func_data().dfg().value(init_val).kind().is_const() {
             //     panic!("Inst can't be calculated at compile time.");
@@ -209,7 +277,7 @@ impl ToRaanaIR for items::ConstDef {
                 .iter()
                 .rev()
                 .map(|x| *x as usize)
-                .rfold(ty, Type::get_array);
+                .rfold(ty.clone(), Type::get_array);
             let alloc_var = ctx.new_local_value().alloc(arr_ty);
             ctx.set_value_name(alloc_var, self.ident.clone());
             ctx.push_inst(alloc_var);
@@ -219,13 +287,14 @@ impl ToRaanaIR for items::ConstDef {
             }
             let exps = self.const_init_val.init_val_shape(&array_shape);
 
-            let zero = ctx.new_local_value().integer(0);
+            let zero = ctx.zero_local(&ty);
             let const_init_vals = exps
                 .iter()
                 .map(|const_exp| match const_exp {
                     Some(exp) => {
                         exp.convert(ctx);
-                        ctx.pop_val().unwrap()
+                        let val = ctx.pop_val().unwrap();
+                        ctx.coerce_local(val, &ty)
                     }
                     None => zero,
                 })
@@ -267,10 +336,12 @@ impl ToRaanaIR for items::ConstDef {
     }
 
     fn global_convert(&self, ctx: &mut AstGenContext) {
+        let ty = ctx.curr_def_type().unwrap();
         // is array
         if self.arr_dim.is_empty() {
             self.const_init_val.global_convert(ctx);
             let init_val = ctx.pop_val().unwrap();
+            let init_val = ctx.coerce_global(init_val, &ty);
             // No more check
             ctx.insert_const(self.ident.clone(), init_val)
         }
@@ -289,13 +360,14 @@ impl ToRaanaIR for items::ConstDef {
                 panic!("Invalid assign: integer to an array")
             };
             let exps = self.const_init_val.init_val_shape(&array_shape);
-            let zero = ctx.new_global_value().integer(0);
+            let zero = ctx.zero_global(&ty);
             let elems = exps
                 .iter()
                 .map(|exp| match exp {
                     Some(exp) => {
                         exp.global_convert(ctx);
-                        ctx.pop_val().unwrap()
+                        let val = ctx.pop_val().unwrap();
+                        ctx.coerce_global(val, &ty)
                     }
                     None => zero,
                 })
@@ -363,7 +435,10 @@ impl ToRaanaIR for items::VarDecl {
         if ctx.is_complete_bb() {
             return;
         }
-        assert!(self.btype.is_i32(), "Unknown type for variable declaration");
+        assert!(
+            self.btype.is_scalar(),
+            "Unknown type for variable declaration"
+        );
         ctx.set_def_type(self.btype.clone());
         for var_def in &self.var_defs {
             var_def.convert(ctx);
@@ -371,7 +446,10 @@ impl ToRaanaIR for items::VarDecl {
     }
 
     fn global_convert(&self, ctx: &mut AstGenContext) {
-        assert!(self.btype.is_i32(), "Unknown type for variable declaration");
+        assert!(
+            self.btype.is_scalar(),
+            "Unknown type for variable declaration"
+        );
         ctx.set_def_type(self.btype.clone());
         for var_def in &self.var_defs {
             var_def.global_convert(ctx);
@@ -388,7 +466,7 @@ impl ToRaanaIR for items::VarDef {
         // Not an array
         if self.arr_dim.is_empty() {
             // Allocate a target type of variable.
-            let alloc_var = ctx.new_local_value().alloc(ty);
+            let alloc_var = ctx.new_local_value().alloc(ty.clone());
             ctx.set_value_name(alloc_var, self.ident.clone());
             ctx.push_inst(alloc_var);
             if let Some(ref init_val) = self.init_val {
@@ -398,6 +476,7 @@ impl ToRaanaIR for items::VarDef {
                 exp.convert(ctx);
                 // store the calculated value.
                 let val = ctx.pop_val().unwrap();
+                let val = ctx.coerce_local(val, &ty);
                 let store = ctx.new_local_value().store(val, alloc_var);
                 ctx.push_inst(store);
             }
@@ -426,7 +505,7 @@ impl ToRaanaIR for items::VarDef {
                 .iter()
                 .rev()
                 .map(|x| *x as usize)
-                .rfold(ty, Type::get_array);
+                .rfold(ty.clone(), Type::get_array);
             let alloc_var = ctx.new_local_value().alloc(arr_ty);
             ctx.set_value_name(alloc_var, self.ident.clone());
             ctx.push_inst(alloc_var);
@@ -445,13 +524,14 @@ impl ToRaanaIR for items::VarDef {
 
                 // Check every item, if `Some(exp)`, then calculate exp and take the value
                 // if None, then fill it with default value zero
-                let zero = ctx.new_local_value().integer(0);
+                let zero = ctx.zero_local(&ty);
                 let init_vals = exps
                     .iter()
                     .map(|exp| match exp {
                         Some(exp) => {
                             exp.convert(ctx);
-                            ctx.pop_val().unwrap()
+                            let val = ctx.pop_val().unwrap();
+                            ctx.coerce_local(val, &ty)
                         }
                         None => zero,
                     })
@@ -494,7 +574,8 @@ impl ToRaanaIR for items::VarDef {
         if self.arr_dim.is_empty() {
             let init_val = if let Some(ref init_val) = self.init_val {
                 init_val.global_convert(ctx);
-                ctx.pop_val().unwrap()
+                let val = ctx.pop_val().unwrap();
+                ctx.coerce_global(val, &ty)
             } else {
                 ctx.new_global_value().zero_init(ty.clone())
             };
@@ -514,20 +595,21 @@ impl ToRaanaIR for items::VarDef {
             let arr_ty = array_shape
                 .iter()
                 .map(|x| *x as usize)
-                .rfold(ty, Type::get_array);
+                .rfold(ty.clone(), Type::get_array);
 
             let init = if let Some(ref init_val) = self.init_val {
                 if !matches!(init_val, items::InitVal::Array(_)) {
                     panic!("Invalid assign: integer to an array")
                 }
                 let exps = init_val.init_val_shape(&array_shape);
-                let zero = ctx.new_global_value().integer(0);
+                let zero = ctx.zero_global(&ty);
                 let elems = exps
                     .iter()
                     .map(|exp| match exp {
                         Some(exp) => {
                             exp.global_convert(ctx);
-                            ctx.pop_val().unwrap()
+                            let val = ctx.pop_val().unwrap();
+                            ctx.coerce_global(val, &ty)
                         }
                         None => zero,
                     })
@@ -662,6 +744,7 @@ impl ToRaanaIR for items::WhileStmt {
         ctx.set_curr_bb(entry);
         self.cond.convert(ctx);
         let cond_val = ctx.pop_val().unwrap();
+        let cond_val = ctx.truthy_local(cond_val);
         let branch = ctx
             .new_local_value()
             .branch(cond_val, body, vec![], end, vec![]);
@@ -689,7 +772,9 @@ impl ToRaanaIR for items::ReturnStmt {
         let v_ret = match &self.exp {
             Some(ret_exp) => {
                 ret_exp.convert(ctx);
-                ctx.pop_val()
+                let ret = ctx.pop_val().unwrap();
+                let ret_ty = ctx.curr_func_ret_ty();
+                Some(ctx.coerce_local(ret, &ret_ty))
             }
             None => None,
         };
@@ -710,6 +795,7 @@ impl ToRaanaIR for items::IfStmt {
         // Get condition exp value.
         self.cond.convert(ctx);
         let cond_val = ctx.pop_val().unwrap();
+        let cond_val = ctx.truthy_local(cond_val);
         let then_bb = ctx.new_bb().basic_block("then".into(), vec![]);
         ctx.register_bb(then_bb);
         let else_bb = self.else_branch.as_ref().map(|_| {
@@ -763,6 +849,8 @@ impl ToRaanaIR for items::AssignStmt {
 
         // Compile time type-check.
         let lhs_ptr_type = ctx.new_local_value().inst_type(lhs_l_val);
+        let lhs_type = lhs_ptr_type.derefernce();
+        let rhs_exp = ctx.coerce_local(rhs_exp, &lhs_type);
         let rhs_exp_type = ctx.new_local_value().inst_type(rhs_exp);
         assert!(
             Type::get_pointer(rhs_exp_type.clone()) == lhs_ptr_type.clone(),
@@ -804,10 +892,7 @@ impl ToRaanaIR for items::LOrExp {
                 lor_exp.convert(ctx);
                 let lhs = ctx.pop_val().unwrap();
 
-                // check if lhs != 0
-                let zero = ctx.new_local_value().integer(0);
-                let lhs_ne_0 = ctx.new_local_value().binary(BinaryOp::NotEq, lhs, zero);
-                ctx.push_inst(lhs_ne_0);
+                let lhs_ne_0 = ctx.truthy_local(lhs);
 
                 // two basic block for short circuit logic
                 let rhs_bb = ctx.new_bb().basic_block("lor_rhs".into(), vec![]);
@@ -829,34 +914,23 @@ impl ToRaanaIR for items::LOrExp {
 
                 // check rhs
                 let original = ctx.set_curr_bb(rhs_bb).unwrap();
-                // ctx.set_curr_bb(rhs_bb).unwrap();
                 land_exp.convert(ctx);
                 let rhs = ctx.pop_val().unwrap();
-
+                
                 // Constant folding
-                if let (InstKind::Integer(int_lhs), InstKind::Integer(int_rhs)) =
-                    (ctx.inst_data(lhs).kind(), ctx.inst_data(rhs).kind())
-                {
-                    // Get lhs and rhs value.
-                    let int_lhs = int_lhs.value();
-                    let int_rhs = int_rhs.value();
-
-                    // remove the previous instruction
+                let lhs_const_truthy = ctx.as_i32(lhs).map(|v| v != 0).or_else(|| ctx.as_f32(lhs).map(|v| v != 0.0));
+                let rhs_const_truthy = ctx.as_i32(rhs).map(|v| v != 0).or_else(|| ctx.as_f32(rhs).map(|v| v != 0.0));
+                if let (Some(lhs_truthy), Some(rhs_truthy)) = (lhs_const_truthy, rhs_const_truthy) {
                     ctx.set_curr_bb(original);
-                    ctx.remove_inst(lhs_ne_0);
                     ctx.remove_inst(br);
                     ctx.remove_bb(rhs_bb);
                     ctx.remove_bb(merge_bb);
-
-                    let result = ctx
-                        .new_local_value()
-                        .integer((int_lhs != 0 || int_rhs != 0) as _);
+                    let result = ctx.new_local_value().integer((lhs_truthy || rhs_truthy) as _);
                     ctx.push_val(result);
-
                     return;
                 }
-                let rhs_ne_0 = ctx.new_local_value().binary(BinaryOp::NotEq, rhs, zero);
-                ctx.push_inst(rhs_ne_0);
+
+                let rhs_ne_0 = ctx.truthy_local(rhs);
 
                 // jump to the merge block and pass the information
                 let jump = ctx.new_local_value().jump(merge_bb, vec![rhs_ne_0]);
@@ -875,10 +949,14 @@ impl ToRaanaIR for items::LOrExp {
             items::LOrExp::Comp(lor_exp, land_exp) => {
                 lor_exp.global_convert(ctx);
                 let lhs_val = ctx.pop_val().unwrap();
-                let lhs_int = ctx.get_global_val(lhs_val).unwrap();
+                let lhs_int = ctx
+                    .as_i32(lhs_val)
+                    .unwrap_or_else(|| (ctx.as_f32(lhs_val).unwrap() != 0.0) as i32);
                 land_exp.global_convert(ctx);
                 let rhs_val = ctx.pop_val().unwrap();
-                let rhs_int = ctx.get_global_val(rhs_val).unwrap();
+                let rhs_int = ctx
+                    .as_i32(rhs_val)
+                    .unwrap_or_else(|| (ctx.as_f32(rhs_val).unwrap() != 0.0) as i32);
                 let or_result = ctx
                     .program
                     .new_value()
@@ -901,10 +979,8 @@ impl ToRaanaIR for items::LAndExp {
                 land_exp.convert(ctx);
                 let lhs = ctx.pop_val().unwrap();
 
-                // check if lhs == 0
                 let zero = ctx.new_local_value().integer(0);
-                let lhs_eq_0 = ctx.new_local_value().binary(BinaryOp::Eq, lhs, zero);
-                ctx.push_inst(lhs_eq_0);
+                let lhs_ne_0 = ctx.truthy_local(lhs);
 
                 // two basic block for short circuit logic
                 let rhs_bb = ctx.new_bb().basic_block("land_rhs".into(), vec![]);
@@ -917,39 +993,28 @@ impl ToRaanaIR for items::LAndExp {
                 //short circuit logic
                 let br =
                     ctx.new_local_value()
-                        .branch(lhs_eq_0, merge_bb, vec![zero], rhs_bb, vec![]);
+                        .branch(lhs_ne_0, rhs_bb, vec![], merge_bb, vec![zero]);
                 ctx.push_inst(br);
 
                 // check rhs
                 let original = ctx.set_curr_bb(rhs_bb).unwrap();
-                // ctx.set_curr_bb(rhs_bb).unwrap();
                 eq_exp.convert(ctx);
                 let rhs = ctx.pop_val().unwrap();
+                
                 // Constant folding
-                if let (InstKind::Integer(int_lhs), InstKind::Integer(int_rhs)) =
-                    (ctx.inst_data(lhs).kind(), ctx.inst_data(rhs).kind())
-                {
-                    // Get lhs and rhs value.
-                    let int_lhs = int_lhs.value();
-                    let int_rhs = int_rhs.value();
-
-                    // remove the previous instruction
+                let lhs_const_truthy = ctx.as_i32(lhs).map(|v| v != 0).or_else(|| ctx.as_f32(lhs).map(|v| v != 0.0));
+                let rhs_const_truthy = ctx.as_i32(rhs).map(|v| v != 0).or_else(|| ctx.as_f32(rhs).map(|v| v != 0.0));
+                if let (Some(lhs_truthy), Some(rhs_truthy)) = (lhs_const_truthy, rhs_const_truthy) {
                     ctx.set_curr_bb(original);
-                    ctx.remove_inst(lhs_eq_0);
                     ctx.remove_inst(br);
                     ctx.remove_bb(rhs_bb);
                     ctx.remove_bb(merge_bb);
-
-                    let result = ctx
-                        .new_local_value()
-                        .integer((int_lhs != 0 && int_rhs != 0) as _);
+                    let result = ctx.new_local_value().integer((lhs_truthy && rhs_truthy) as _);
                     ctx.push_val(result);
-
                     return;
                 }
 
-                let rhs_ne_0 = ctx.new_local_value().binary(BinaryOp::NotEq, rhs, zero);
-                ctx.push_inst(rhs_ne_0);
+                let rhs_ne_0 = ctx.truthy_local(rhs);
 
                 // jump to merge block and pass the information
                 let jump = ctx.new_local_value().jump(merge_bb, vec![rhs_ne_0]);
@@ -969,10 +1034,14 @@ impl ToRaanaIR for items::LAndExp {
             items::LAndExp::Comp(land_exp, eq_exp) => {
                 land_exp.global_convert(ctx);
                 let lhs_val = ctx.pop_val().unwrap();
-                let lhs_int = ctx.get_global_val(lhs_val).unwrap();
+                let lhs_int = ctx
+                    .as_i32(lhs_val)
+                    .unwrap_or_else(|| (ctx.as_f32(lhs_val).unwrap() != 0.0) as i32);
                 eq_exp.global_convert(ctx);
                 let rhs_val = ctx.pop_val().unwrap();
-                let rhs_int = ctx.get_global_val(rhs_val).unwrap();
+                let rhs_int = ctx
+                    .as_i32(rhs_val)
+                    .unwrap_or_else(|| (ctx.as_f32(rhs_val).unwrap() != 0.0) as i32);
                 let and_result = ctx
                     .program
                     .new_value()
@@ -1133,28 +1202,36 @@ impl ToRaanaIR for items::FuncCall {
         if ctx.is_complete_bb() {
             return;
         }
-        let args = self
-            .args
-            .iter()
-            .map(|exp| {
-                exp.convert(ctx);
-                let arg = ctx.pop_val().unwrap();
-                if ctx.is_pointer_to_array(arg) {
-                    let zero = ctx.new_local_value().integer(0);
-                    let get_elem_ptr = ctx.new_local_value().get_elem_ptr(arg, zero);
-                    ctx.push_inst(get_elem_ptr);
-                    get_elem_ptr
-                } else {
-                    arg
-                }
-            })
-            .collect::<Vec<_>>();
         let Symbol::Callable(target_func) = ctx
             .get_global(&self.ident)
             .unwrap_or_else(|| panic!("Can't find function {}", &*self.ident))
         else {
             panic!("Not a function {}", &*self.ident)
         };
+        let param_tys = ctx.func_param_tys(target_func);
+        let args = self
+            .args
+            .iter()
+            .zip(param_tys.iter())
+            .map(|(exp, param_ty)| {
+                exp.convert(ctx);
+                let arg = ctx.pop_val().unwrap();
+                let arg = if ctx.is_pointer_to_array(arg) {
+                    let zero = ctx.new_local_value().integer(0);
+                    let get_elem_ptr = ctx.new_local_value().get_elem_ptr(arg, zero);
+                    ctx.push_inst(get_elem_ptr);
+                    get_elem_ptr
+                } else {
+                    arg
+                };
+                let arg_ty = ctx.new_local_value().inst_type(arg);
+                if arg_ty.is_scalar() && param_ty.is_scalar() {
+                    ctx.coerce_local(arg, param_ty)
+                } else {
+                    arg
+                }
+            })
+            .collect::<Vec<_>>();
         let call = ctx.new_local_value().call(target_func, args);
         ctx.push_inst(call);
         if !ctx.inst_data(call).ty().is_unit() {
@@ -1175,8 +1252,11 @@ impl ToRaanaIR for items::PrimaryExp {
         match self {
             items::PrimaryExp::Exp(exp) => exp.convert(ctx),
             items::PrimaryExp::Number(num) => {
-                let num = ctx.new_local_value().integer(*num);
-                ctx.push_val(num);
+                let val = match num {
+                    items::Number::Int(num) => ctx.new_local_value().integer(*num),
+                    items::Number::Float(num) => ctx.new_local_value().float(*num),
+                };
+                ctx.push_val(val);
             }
             // LVal on the right side.
             // Meaning it's not defining but using a variable.
@@ -1186,8 +1266,8 @@ impl ToRaanaIR for items::PrimaryExp {
                 if l_val.index.is_empty() {
                     match ctx.get_symbol(&l_val.ident).unwrap() {
                         Symbol::Constant(const_val) => {
-                            let int = ctx.as_i32_val(const_val);
-                            ctx.push_val(int);
+                            let val = ctx.as_local_const_val(const_val);
+                            ctx.push_val(val);
                         }
                         Symbol::Variable(var_ptr) => {
                             if ctx.is_pointer_to_array(var_ptr) {
@@ -1245,36 +1325,36 @@ impl ToRaanaIR for items::PrimaryExp {
         match self {
             items::PrimaryExp::Exp(exp) => exp.global_convert(ctx),
             items::PrimaryExp::LVal(lval) => {
-                let sym = ctx
+                let sym = *ctx
                     .global_scope()
                     .get(&lval.ident)
                     .unwrap_or_else(|| panic!("{} not defined", &*lval.ident));
-                let int = match sym {
-                    Symbol::Constant(int) => {
-                        let borrow_value = ctx.inst_data(*int);
-                        let InstKind::Integer(int) = borrow_value.kind() else {
-                            unreachable!();
-                        };
-                        int.value()
-                    }
+                let val = match sym {
+                    Symbol::Constant(val) => val,
                     Symbol::Variable(var) => {
-                        let borrow_value = ctx.inst_data(*var);
+                        let borrow_value = ctx.inst_data(var);
                         let InstKind::GlobalAlloc(glob_alloc) = borrow_value.kind() else {
                             unreachable!();
                         };
-                        match ctx.inst_data(glob_alloc.init()).kind() {
-                            InstKind::Integer(int) => int.value(),
-                            InstKind::ZeroInit => 0,
+                        match ctx.inst_data(glob_alloc.init()).kind().clone() {
+                            InstKind::Integer(int) => ctx.new_global_value().integer(int.value()),
+                            InstKind::Float(float) => ctx.new_global_value().float(float.value()),
+                            InstKind::ZeroInit => {
+                                let ty = ctx.inst_data(glob_alloc.init()).ty().clone();
+                                ctx.zero_global(&ty)
+                            }
                             _ => unreachable!(),
                         }
                     }
                     Symbol::Callable(_) => unreachable!(),
                 };
-                let val = ctx.new_global_value().integer(int);
                 ctx.push_val(val);
             }
             items::PrimaryExp::Number(num) => {
-                let num_lit = ctx.new_global_value().integer(*num);
+                let num_lit = match num {
+                    items::Number::Int(num) => ctx.new_global_value().integer(*num),
+                    items::Number::Float(num) => ctx.new_global_value().float(*num),
+                };
                 ctx.push_val(num_lit);
             }
         }
@@ -1335,46 +1415,38 @@ impl ToRaanaIR for BinaryOp {
         }
         let rhs = ctx.pop_val().unwrap();
         let lhs = ctx.pop_val().unwrap();
+        let lhs_ty = ctx.inst_data(lhs).ty().clone();
+        let rhs_ty = ctx.inst_data(rhs).ty().clone();
+        let use_float = lhs_ty.is_f32() || rhs_ty.is_f32();
 
-        // Constant folding
-        if let (Some(int_lhs), Some(int_rhs)) = (ctx.as_i32(lhs), ctx.as_i32(rhs)) {
-            let res = match self {
-                BinaryOp::NotEq => (int_lhs != int_rhs) as i32,
-                BinaryOp::Eq => (int_lhs == int_rhs) as i32,
-                BinaryOp::Gt => (int_lhs > int_rhs) as i32,
-                BinaryOp::Lt => (int_lhs < int_rhs) as i32,
-                BinaryOp::Ge => (int_lhs >= int_rhs) as i32,
-                BinaryOp::Le => (int_lhs <= int_rhs) as i32,
-                BinaryOp::Add => int_lhs.wrapping_add(int_rhs),
-                BinaryOp::Sub => int_lhs.wrapping_sub(int_rhs),
-                BinaryOp::Mul => int_lhs.wrapping_mul(int_rhs),
-                BinaryOp::Div => {
-                    if int_rhs == 0 {
-                        panic!("Division by zero");
-                    } else {
-                        int_lhs.wrapping_div(int_rhs)
-                    }
-                }
-                BinaryOp::Rem => {
-                    if int_rhs == 0 {
-                        panic!("Modulo by zero");
-                    } else {
-                        int_lhs.wrapping_rem(int_rhs)
-                    }
-                }
-                BinaryOp::And => int_lhs & int_rhs,
-                BinaryOp::Or => int_lhs | int_rhs,
-                BinaryOp::Xor => int_lhs ^ int_rhs,
-                BinaryOp::Shl => int_lhs.wrapping_shl(int_rhs as u32),
-                BinaryOp::Shr => (int_lhs as u32).wrapping_shr(int_rhs as u32) as i32,
-                BinaryOp::Sar => int_lhs.wrapping_shr(int_rhs as u32),
-            };
-
-            let val = ctx.new_local_value().integer(res);
-            ctx.push_val(val);
+        if use_float {
+            assert!(
+                !binary_requires_int(*self),
+                "Integer-only binary operator used with float operand"
+            );
+            let lhs = ctx.coerce_local(lhs, &Type::get_f32());
+            let rhs = ctx.coerce_local(rhs, &Type::get_f32());
+            if let (Some(lhs), Some(rhs)) = (ctx.as_f32(lhs), ctx.as_f32(rhs)) {
+                let val = match eval_f32_binary(*self, lhs, rhs) {
+                    items::Number::Int(value) => ctx.new_local_value().integer(value),
+                    items::Number::Float(value) => ctx.new_local_value().float(value),
+                };
+                ctx.push_val(val);
+                return;
+            }
+            let operation = ctx.new_local_value().binary(*self, lhs, rhs);
+            ctx.push_val(operation);
+            ctx.push_inst(operation);
             return;
         }
 
+        if let (Some(lhs), Some(rhs)) = (ctx.as_i32(lhs), ctx.as_i32(rhs)) {
+            let val = ctx
+                .new_local_value()
+                .integer(eval_i32_binary(*self, lhs, rhs));
+            ctx.push_val(val);
+            return;
+        }
         let operation = ctx.new_local_value().binary(*self, lhs, rhs);
         ctx.push_val(operation);
         ctx.push_inst(operation);
@@ -1383,47 +1455,30 @@ impl ToRaanaIR for BinaryOp {
     fn global_convert(&self, ctx: &mut AstGenContext) {
         let rhs = ctx.pop_val().unwrap();
         let lhs = ctx.pop_val().unwrap();
-        let res = if let (InstKind::Integer(lhs), InstKind::Integer(rhs)) =
-            (ctx.inst_data(lhs).kind(), ctx.inst_data(rhs).kind())
-        {
-            let int_lhs = lhs.value();
-            let int_rhs = rhs.value();
-            match self {
-                BinaryOp::NotEq => (int_lhs != int_rhs) as i32,
-                BinaryOp::Eq => (int_lhs == int_rhs) as i32,
-                BinaryOp::Gt => (int_lhs > int_rhs) as i32,
-                BinaryOp::Lt => (int_lhs < int_rhs) as i32,
-                BinaryOp::Ge => (int_lhs >= int_rhs) as i32,
-                BinaryOp::Le => (int_lhs <= int_rhs) as i32,
-                BinaryOp::Add => int_lhs.wrapping_add(int_rhs),
-                BinaryOp::Sub => int_lhs.wrapping_sub(int_rhs),
-                BinaryOp::Mul => int_lhs.wrapping_mul(int_rhs),
-                BinaryOp::Div => {
-                    if int_rhs == 0 {
-                        panic!("Division by zero");
-                    } else {
-                        int_lhs.wrapping_div(int_rhs)
-                    }
-                }
-                BinaryOp::Rem => {
-                    if int_rhs == 0 {
-                        panic!("Modulo by zero");
-                    } else {
-                        int_lhs.wrapping_rem(int_rhs)
-                    }
-                }
-                BinaryOp::And => int_lhs & int_rhs,
-                BinaryOp::Or => int_lhs | int_rhs,
-                BinaryOp::Xor => int_lhs ^ int_rhs,
-                BinaryOp::Shl => int_lhs.wrapping_shl(int_rhs as u32),
-                BinaryOp::Shr => (int_lhs as u32).wrapping_shr(int_rhs as u32) as i32,
-                BinaryOp::Sar => int_lhs.wrapping_shr(int_rhs as u32),
-            }
+        let lhs_ty = ctx.inst_data(lhs).ty().clone();
+        let rhs_ty = ctx.inst_data(rhs).ty().clone();
+        if lhs_ty.is_f32() || rhs_ty.is_f32() {
+            assert!(
+                !binary_requires_int(*self),
+                "Integer-only binary operator used with float operand"
+            );
+            let lhs = ctx.coerce_global(lhs, &Type::get_f32());
+            let rhs = ctx.coerce_global(rhs, &Type::get_f32());
+            let lhs = ctx.as_f32(lhs).unwrap();
+            let rhs = ctx.as_f32(rhs).unwrap();
+            let val = match eval_f32_binary(*self, lhs, rhs) {
+                items::Number::Int(value) => ctx.new_global_value().integer(value),
+                items::Number::Float(value) => ctx.new_global_value().float(value),
+            };
+            ctx.push_val(val);
         } else {
-            unreachable!()
-        };
-        let val = ctx.new_global_value().integer(res);
-        ctx.push_val(val);
+            let lhs = ctx.as_i32(lhs).unwrap();
+            let rhs = ctx.as_i32(rhs).unwrap();
+            let val = ctx
+                .new_global_value()
+                .integer(eval_i32_binary(*self, lhs, rhs));
+            ctx.push_val(val);
+        }
     }
 }
 
@@ -1452,12 +1507,30 @@ impl ToRaanaIR for items::UnaryOp {
             ctx.push_val(operation);
             return;
         }
+        if let InstKind::Float(float) = rhs_val.kind().clone() {
+            let operation = match self {
+                items::UnaryOp::Add => unreachable!(),
+                items::UnaryOp::Minus => ctx.new_local_value().float(-float.value()),
+                items::UnaryOp::Negation => {
+                    ctx.new_local_value().integer((float.value() == 0.0) as _)
+                }
+            };
+            ctx.push_val(operation);
+            return;
+        }
 
-        let zero = ctx.new_local_value().integer(0);
         let operation = match self {
             items::UnaryOp::Add => unreachable!(),
-            items::UnaryOp::Minus => ctx.new_local_value().binary(BinaryOp::Sub, zero, rhs),
-            items::UnaryOp::Negation => ctx.new_local_value().binary(BinaryOp::Eq, zero, rhs),
+            items::UnaryOp::Minus => {
+                let ty = ctx.inst_data(rhs).ty().clone();
+                let zero = ctx.zero_local(&ty);
+                ctx.new_local_value().binary(BinaryOp::Sub, zero, rhs)
+            }
+            items::UnaryOp::Negation => {
+                let truthy = ctx.truthy_local(rhs);
+                let zero = ctx.new_local_value().integer(0);
+                ctx.new_local_value().binary(BinaryOp::Eq, zero, truthy)
+            }
         };
         ctx.push_val(operation);
         ctx.push_inst(operation);
@@ -1468,16 +1541,23 @@ impl ToRaanaIR for items::UnaryOp {
             return;
         }
         let rhs = ctx.pop_val().unwrap();
-        let res = if let InstKind::Integer(int) = ctx.inst_data(rhs).kind() {
-            match self {
+        let val = match ctx.inst_data(rhs).kind().clone() {
+            InstKind::Integer(int) => match self {
                 items::UnaryOp::Add => unreachable!(),
-                items::UnaryOp::Minus => -int.value(),
-                items::UnaryOp::Negation => (int.value() == 0) as i32,
-            }
-        } else {
-            unreachable!()
+                items::UnaryOp::Minus => ctx.new_global_value().integer(-int.value()),
+                items::UnaryOp::Negation => {
+                    ctx.new_global_value().integer((int.value() == 0) as i32)
+                }
+            },
+            InstKind::Float(float) => match self {
+                items::UnaryOp::Add => unreachable!(),
+                items::UnaryOp::Minus => ctx.new_global_value().float(-float.value()),
+                items::UnaryOp::Negation => ctx
+                    .new_global_value()
+                    .integer((float.value() == 0.0) as i32),
+            },
+            _ => unreachable!(),
         };
-        let val = ctx.new_global_value().integer(res);
         ctx.push_val(val);
     }
 }

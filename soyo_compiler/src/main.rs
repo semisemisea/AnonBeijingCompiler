@@ -1,9 +1,10 @@
-use raana_ir::{fmt::writer::Writer, ir::Program};
+use raana_ir::fmt::writer::Writer;
 
 use crate::frontend::utils::AstGenContext;
 use frontend::utils::ToRaanaIR;
 
 // mod backend;
+mod cli;
 mod context;
 mod frontend;
 
@@ -11,18 +12,15 @@ lalrpop_util::lalrpop_mod!(sysy);
 
 /// compiler -S -o testcase.s testcase.sy [-O1]
 fn main() {
-    let mut args = std::env::args();
-    // compiler
-    args.next();
-    // -S
-    args.next();
-    // -o
-    args.next();
-    let output_path = args.next().unwrap();
-    let input_path = args.next().unwrap();
-    let opt_flag = args.next().is_some();
+    let config = match cli::parse_env_config() {
+        Ok(config) => config,
+        Err(errors) => {
+            errors.write_to_stderr().unwrap();
+            std::process::exit(1);
+        }
+    };
 
-    let source_code = std::fs::read_to_string(input_path).unwrap();
+    let source_code = std::fs::read_to_string(&config.input_path).unwrap();
 
     let ast = sysy::CompUnitsParser::new().parse(&source_code).unwrap();
     let mut ctx = AstGenContext::new();
@@ -30,26 +28,54 @@ fn main() {
 
     let mut program = ctx.program;
 
-    let mut pass_manager = raana_ir::opt::pass::PassesManager::new();
-    pass_manager.run_passes(&mut program);
+    if config.optimize {
+        let mut pass_manager = raana_ir::opt::pass::PassesManager::new();
+        pass_manager.run_passes(&mut program);
+    }
 
     let mut writer = Writer::new(&program);
     writer.write().unwrap();
     let buf = writer.finish();
-    println!("{}", buf);
+    std::fs::write(&config.output_path, buf).unwrap();
 }
 
 #[cfg(test)]
 mod test {
     use raana_ir::fmt::writer::Writer;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
 
     use crate::{
         frontend::utils::{AstGenContext, ToRaanaIR},
         sysy,
     };
 
-    fn test(input_path: String) {
-        eprintln!("{input_path}");
+    fn sy_files(path: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                sy_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "sy") {
+                out.push(path);
+            }
+        }
+    }
+
+    fn print_progress(message: &str) {
+        #[cfg(unix)]
+        {
+            if let Ok(mut stderr) = std::fs::OpenOptions::new().write(true).open("/dev/stderr") {
+                let _ = writeln!(stderr, "{message}");
+                let _ = stderr.flush();
+                return;
+            }
+        }
+
+        eprintln!("{message}");
+    }
+
+    fn test(input_path: &Path) {
         let source_code = std::fs::read_to_string(input_path).unwrap();
 
         let ast = sysy::CompUnitsParser::new().parse(&source_code).unwrap();
@@ -69,21 +95,20 @@ mod test {
 
     #[test]
     fn functional() {
-        let path = "/Users/azureskye/Documents/Programs/rust/AnonBeijingCompiler/tests/functional";
-        let r = std::fs::read_dir(path).unwrap();
-        for f in r
-            .filter(|f| {
-                f.as_ref()
-                    .unwrap()
-                    .file_name()
-                    .to_str()
-                    .unwrap()
-                    .strip_suffix(".sy")
-                    .is_some()
-            })
-            .map(|f| f.unwrap())
-        {
-            test(format!("{}/{}", path, f.file_name().to_str().unwrap()));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests");
+        let mut files = Vec::new();
+        sy_files(&root, &mut files);
+        files.sort();
+        let total = files.len();
+        for (index, file) in files.iter().enumerate() {
+            test(&file);
+            let name = file.strip_prefix(&root).unwrap_or(file);
+            print_progress(&format!(
+                "[{}/{} passed] {}",
+                index + 1,
+                total,
+                name.display()
+            ));
         }
     }
 }

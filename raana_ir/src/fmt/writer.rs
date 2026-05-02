@@ -134,10 +134,6 @@ impl Writer<'_> {
     }
 
     fn visit_func(&mut self, data: &FunctionData) -> std::fmt::Result {
-        data.params()
-            .to_vec()
-            .iter()
-            .for_each(|&inst| put_name!(self, inst));
         let is_decl = data.layout().is_decl();
         if is_decl {
             write!(self.buffer, "declare")?;
@@ -150,6 +146,21 @@ impl Writer<'_> {
             data.name(),
             data.ret_ty()
         )?;
+        if is_decl {
+            if let Some((&last, rest)) = data.params().split_last() {
+                write!(self.buffer, ", param_ty = (")?;
+                for &inst in rest {
+                    write!(self.buffer, "{}, ", self.program.inst_data(inst).ty())?;
+                }
+                write!(self.buffer, "{})", self.program.inst_data(last).ty())?;
+            }
+            writeln!(self.buffer, ">")?;
+            return writeln!(self.buffer);
+        }
+        data.params()
+            .to_vec()
+            .iter()
+            .for_each(|&inst| put_name!(self, inst));
         if let Some((&last, rest)) = data.params().split_last() {
             write!(self.buffer, ", params = (")?;
             for &inst in rest {
@@ -166,10 +177,6 @@ impl Writer<'_> {
                 get_name!(self, last),
                 self.program.inst_data(last).ty()
             )?;
-        }
-        if is_decl {
-            writeln!(self.buffer, ">")?;
-            return writeln!(self.buffer);
         }
         writeln!(self.buffer, ">: {{")?;
         for bb_layout in data.layout().basicblocks() {

@@ -148,6 +148,14 @@ impl LocalInstArena {
         self.data.get_mut(&inst).unwrap()
     }
 
+    pub fn remove(&mut self, inst: Inst) -> InstData {
+        self.data.remove(&inst).unwrap()
+    }
+
+    pub fn insert(&mut self, inst: Inst, new_data: InstData) {
+        self.data.insert(inst, new_data);
+    }
+
     pub fn datas(&self) -> impl Iterator<Item = &InstData> {
         self.data.values()
     }
@@ -168,6 +176,16 @@ impl GlobalInstArena {
 
     pub fn mut_data_of(&mut self, inst: Inst) -> &mut InstData {
         &mut self.data[(inst.0.get() - GLOBAL_ID_START_FROM) as usize]
+    }
+
+    pub fn remove(&mut self, inst: Inst) -> InstData {
+        self.data
+            .remove((inst.0.get() - GLOBAL_ID_START_FROM) as usize)
+    }
+
+    pub fn insert(&mut self, inst: Inst, new_data: InstData) {
+        self.data
+            .insert((inst.0.get() - GLOBAL_ID_START_FROM) as usize, new_data);
     }
 
     pub fn datas(&self) -> impl Iterator<Item = &InstData> {

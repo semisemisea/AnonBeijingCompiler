@@ -120,8 +120,8 @@ InitVal: InitVal = {
 
 FuncFParam: FuncFParam = {
     <b_type: BType> <ident: Ident> => FuncFParam {b_type, ident, arr_ty: None},
-    <b_type: BType> <ident: Ident> "[]" => FuncFParam {b_type, ident, arr_ty: Some(vec![])},
-    <b_type: BType> <ident: Ident> "[]" <arr_ty: ("[" <ConstExp> "]")+> => FuncFParam {b_type, ident, arr_ty: Some(arr_ty)},
+    <b_type: BType> <ident: Ident> "[" "]" => FuncFParam {b_type, ident, arr_ty: Some(vec![])},
+    <b_type: BType> <ident: Ident> "[" "]" <arr_ty: ("[" <ConstExp> "]")+> => FuncFParam {b_type, ident, arr_ty: Some(arr_ty)},
 }
 
 FuncDef: FuncDef = {

@@ -311,10 +311,17 @@ impl AstGenContext {
             .program
             .new_function(Type::get_i32(), "getint".into(), vec![]);
         self.insert_func(std::rc::Rc::from("getint"), getint);
+
         let getch = self
             .program
             .new_function(Type::get_i32(), "getch".into(), vec![]);
         self.insert_func(std::rc::Rc::from("getch"), getch);
+
+        let getfloat = self
+            .program
+            .new_function(Type::get_f32(), "getfloat".into(), vec![]);
+        self.insert_func(std::rc::Rc::from("getfloat"), getfloat);
+
         let getarray = self.program.new_function(
             Type::get_i32(),
             "getarray".into(),
@@ -331,34 +338,48 @@ impl AstGenContext {
             vec![Type::get_pointer(Type::get_f32())],
         );
         self.insert_func(std::rc::Rc::from("getfarray"), getfarray);
+
         let putint =
             self.program
                 .new_function(Type::get_unit(), "putint".into(), vec![Type::get_i32()]);
         self.insert_func(std::rc::Rc::from("putint"), putint);
+
         let putch =
             self.program
                 .new_function(Type::get_unit(), "putch".into(), vec![Type::get_i32()]);
         self.insert_func(std::rc::Rc::from("putch"), putch);
+
         let putfloat =
             self.program
                 .new_function(Type::get_unit(), "putfloat".into(), vec![Type::get_f32()]);
         self.insert_func(std::rc::Rc::from("putfloat"), putfloat);
+
         let putarray = self.program.new_function(
             Type::get_unit(),
             "putarray".into(),
             vec![Type::get_i32(), Type::get_pointer(Type::get_i32())],
         );
         self.insert_func(std::rc::Rc::from("putarray"), putarray);
+
         let putfarray = self.program.new_function(
             Type::get_unit(),
             "putfarray".into(),
             vec![Type::get_i32(), Type::get_pointer(Type::get_f32())],
         );
         self.insert_func(std::rc::Rc::from("putfarray"), putfarray);
+
+        let putf = self.program.new_function(
+            Type::get_unit(),
+            "putf".into(),
+            vec![Type::get_string(), Type::get_arg_list()],
+        );
+        self.insert_func(std::rc::Rc::from("putf"), putf);
+
         let starttime = self
             .program
             .new_function(Type::get_unit(), "starttime".into(), vec![]);
         self.insert_func(std::rc::Rc::from("starttime"), starttime);
+
         let stoptime = self
             .program
             .new_function(Type::get_unit(), "stoptime".into(), vec![]);

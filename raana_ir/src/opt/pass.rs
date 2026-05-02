@@ -1,7 +1,9 @@
+use std::sync::OnceLock;
+
 use crate::ir::{Function, FunctionData, Program};
 
-pub trait Pass {
-    fn run(&mut self, program: &mut Program) {
+pub trait Pass: Send + Sync {
+    fn run(&self, program: &mut Program) {
         for (func, data) in program.global_arena_mut().func_arena_mut().functions_mut() {
             self.run_on(func, data);
         }
@@ -10,7 +12,7 @@ pub trait Pass {
     /// Compatibility for old code.
     /// Normally you should not !only! implement this function
     /// But you can implement both function at same time.
-    fn run_on(&mut self, func: Function, data: &mut FunctionData) {
+    fn run_on(&self, func: Function, data: &mut FunctionData) {
         unimplemented!()
     }
 }
@@ -28,7 +30,16 @@ impl PassesManager {
         self.passes.push(pass);
     }
 
-    pub fn run_passes(&mut self, program: &mut Program) {
-        self.passes.iter_mut().for_each(|p| p.run(program));
+    pub fn run_passes(&self, program: &mut Program) {
+        self.passes.iter().for_each(|p| p.run(program));
+    }
+
+    pub fn default_ref() -> &'static PassesManager {
+        DEFAULT_PASSES_LIST.get_or_init(|| {
+            let p = PassesManager::new();
+            p
+        })
     }
 }
+
+static DEFAULT_PASSES_LIST: OnceLock<PassesManager> = OnceLock::new();

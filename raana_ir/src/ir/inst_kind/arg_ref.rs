@@ -7,7 +7,10 @@ pub struct BlockArgRef {
 
 impl BlockArgRef {
     pub fn index(&self) -> usize {
-        self.index
+        panic!(
+            "If the TODO in src/ir/builder.rs in method `add_param` have not been fixed yet. You should not rely on this method"
+        );
+        // self.index
     }
 
     pub fn new_data(index: usize, ty: Type) -> InstData {

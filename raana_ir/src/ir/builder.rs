@@ -36,8 +36,8 @@ pub trait ScalarInstBuilder: InstInsert + InfoQuery + Sized {
     }
 
     /// Undef have type unit here.
-    fn undef(&mut self) -> Inst {
-        self.insert_inst(InstData::new(Type::get_unit(), InstKind::Undef))
+    fn undef(&mut self, ty: Type) -> Inst {
+        self.insert_inst(InstData::new(ty, InstKind::Undef))
     }
 
     fn aggregate(&mut self, value: Vec<Inst>) -> Inst {
@@ -152,8 +152,9 @@ pub trait GlobalInstBuilder: ScalarInstBuilder {
     }
 }
 
-pub trait BasicBlockBuilder: Sized + InstInsert {
+pub trait BasicBlockBuilder: Sized + InstInsert + ArenaQuery {
     fn insert_bb(&mut self, data: BasicBlockData) -> BasicBlock;
+    fn bb_data_mut(&mut self, bb: BasicBlock) -> &mut BasicBlockData;
 
     /// return all the instruction of parameter. Give it name if you want.
     fn basic_block(&mut self, name: String, params_ty: Vec<Type>) -> BasicBlock {
@@ -167,6 +168,19 @@ pub trait BasicBlockBuilder: Sized + InstInsert {
             .map(|(i, ty)| self.insert_inst(BlockArgRef::new_data(i, ty.clone())))
             .collect();
         self.insert_bb(BasicBlockData::new(name, params))
+    }
+
+    fn add_param(&mut self, bb: BasicBlock, ty: Type) -> Inst {
+        // TODO: This will work for now if you don't rely on method `BlockArgRef::index(&self) -> usize`
+        // The previous code didn't use the index.
+        let bar = self.insert_inst(BlockArgRef::new_data(self.bb_params(bb).len() + 1, ty));
+        self.bb_data_mut(bb).params_mut().push(bar);
+        bar
+    }
+
+    fn remove_param(&mut self, bb: BasicBlock, index: usize) {
+        let data = self.bb_data_mut(bb);
+        data.params_mut().remove(index);
     }
 }
 
@@ -256,6 +270,10 @@ impl InstInsert for BasicBlockBuilders<'_> {
 impl BasicBlockBuilder for BasicBlockBuilders<'_> {
     fn insert_bb(&mut self, data: BasicBlockData) -> BasicBlock {
         self.arena.alloc_basic_block(data)
+    }
+
+    fn bb_data_mut(&mut self, bb: BasicBlock) -> &mut BasicBlockData {
+        self.arena.bb_data_mut(bb)
     }
 }
 

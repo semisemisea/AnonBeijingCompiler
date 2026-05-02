@@ -12,8 +12,8 @@ pub struct Binary {
 }
 
 impl Binary {
-    pub fn op(&self) -> &BinaryOp {
-        &self.op
+    pub fn op(&self) -> BinaryOp {
+        self.op
     }
 
     pub fn lhs(&self) -> Inst {

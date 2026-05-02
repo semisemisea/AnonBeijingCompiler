@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::ir::arena::Arena;
+use crate::ir::builder_trait::*;
 use crate::opt::utils::{self, BId, CFGGraph, DomTree, IDAllocator, IDomMap, VId};
 
 const FUNC_ARG_OPT_ENABLE: bool = false;
 
 use crate::{
-    ir::{BasicBlock, BlockArgRef, Function, FunctionData, Inst, InstKind},
+    ir::{BasicBlock, Function, FunctionData, Inst, InstKind},
     opt::pass::Pass,
 };
 
@@ -29,7 +31,7 @@ type InsertTable = Vec<Vec<(VId, Index)>>;
 type ValStack = Vec<Vec<Inst>>;
 
 impl Pass for SSATransform {
-    fn run_on(&mut self, func: Function, data: &mut FunctionData) {
+    fn run_on(&self, func: Function, data: &mut FunctionData) {
         // function declaration. skip.
         if data.layout().entry_bb().is_none() {
             return;
@@ -50,7 +52,7 @@ impl Pass for SSATransform {
         eprintln!("prece: {prece:?}");
 
         // entry_bb must get 0 for id
-        assert!(bb_id.get_id(&data.layout().entry_bb().unwrap()) == 0);
+        assert!(bb_id.get_id(&data.layout().entry_bb().unwrap().bb()) == 0);
 
         let rpo_path = utils::rpo_path(&graph);
         // start from entry_bb so first element of RPO is zero
@@ -68,16 +70,16 @@ impl Pass for SSATransform {
         eprintln!("dominance_tree: {donimnace_tree:?}");
 
         // then we can do frontier analysis
-        let dom_frontier = dominance_analysis(&bb_id.bb(), &prece, &idom_map);
+        let dom_frontier = dominance_analysis(&bb_id, &prece, &idom_map);
         eprintln!("dominance_frontier: {dom_frontier:?}");
 
         // find out where are varaibles defined.
         let mut val_id = IDAllocator::new(1);
-        let val_usage = variable_analysis(&mut val_id, &mut bb_id.bb(), data);
+        let val_usage = variable_analysis(&mut val_id, &mut bb_id, data);
         eprintln!("val_usage: {val_usage:?}");
 
         // variable(vid) is insert as basic block(bbid) at index(usize)
-        let mut insert_table = vec![vec![]; bb_id.cnt()];
+        let insert_table = vec![vec![]; bb_id.cnt()];
 
         let mut worked = vec![HashSet::new(); bb_id.cnt()];
 
@@ -93,42 +95,23 @@ impl Pass for SSATransform {
                 work_queue.push_back(front);
             }
 
-            // eprintln!("default work_queue {work_queue:?}");
-
             while !work_queue.is_empty() {
                 let front = work_queue.pop_front().unwrap();
                 if worked[front].contains(&vid) {
                     continue;
                 }
                 worked[front].insert(vid);
-                // eprintln!("visited {front}");
                 let bb = bb_id.search_id(front);
-                let index = data.dfg().bb(bb).params().len();
 
                 let var_ty = utils::alloc_ty(val_id.search_id(vid as _), data).clone();
 
-                // TODO: Do it in another way.
-                let arg = BlockArgRef::new_data(index, var_ty);
-                insert_table[front].push((vid, index));
-                let new_block_arg_ref = data.dfg_mut().new_value().insert_value(arg);
-                data.dfg_mut()
-                    .set_value_name(new_block_arg_ref, Some(format!("%vid_{}", vid)));
-
-                data.dfg_mut()
-                    .bb_mut(bb)
-                    .params_mut()
-                    .push(new_block_arg_ref);
+                let p = data.new_basic_block().add_param(bb, var_ty);
+                data.inst_data_mut(p).set_name(format!("vid_{}", vid));
 
                 if let Some(sub_frontiers) = dom_frontier.get(&front) {
                     for &sub_front in sub_frontiers.iter() {
                         if !worked[sub_front].contains(&vid) {
-                            // if !worked.contains(sub_front) {
-                            //     worked.insert(*sub_front);
                             work_queue.push_back(sub_front);
-                        } else {
-                            eprintln!("detected loop and correctly stop.");
-                            // eprintln!("sub front {sub_front}");
-                            // eprintln!("worked {worked:?}");
                         }
                     }
                 }
@@ -143,24 +126,20 @@ impl Pass for SSATransform {
             &donimnace_tree,
             &mut val_stack,
             &val_id,
-            &bb_id.bb(),
+            &bb_id,
             data,
             &insert_table,
             &mut remove_list,
         );
 
-        // remove_list.into_iter().for_each(|(val, bb)| {
-        //     dfs_remove(val, data, bb);
-        // });
-        remove_list.into_iter().rev().for_each(|(val, bb)| {
-            let vd = data.dfg().value(val);
-            // eprintln!("delete check {:?} {:?}, {:?}", val, vd.kind(), vd.used_by());
+        remove_list.into_iter().rev().for_each(|(inst, bb)| {
+            let vd = data.inst_data(inst);
             let used_by = vd.used_by().iter().copied().collect::<Vec<_>>();
             for val in used_by.into_iter().rev() {
-                data.dfg_mut().remove_value(val);
+                data.remove_inst(val);
             }
-            data.layout_mut().bb_mut(bb).insts_mut().remove(&val);
-            data.dfg_mut().remove_value(val);
+            data.layout_mut().remove_inst(bb, inst);
+            data.remove_inst(inst);
         });
 
         eprintln!();
@@ -168,23 +147,6 @@ impl Pass for SSATransform {
         eprintln!();
     }
 }
-
-// fn dfs_remove(val: Inst, data: &mut FunctionData, bb: BasicBlock) {
-//     let mut remove_list = Vec::new();
-//     _dfs_remove(val, data, &mut remove_list);
-//     for val in remove_list.into_iter().rev() {
-//         data.layout_mut().bb_mut(bb).insts_mut().remove(&val);
-//         data.dfg_mut().remove_value(val);
-//     }
-// }
-//
-// fn _dfs_remove(val: Inst, data: &FunctionData, remove_list: &mut Vec<Inst>) {
-//     let vd = data.dfg().value(val);
-//     remove_list.push(val);
-//     for &child in vd.used_by().iter() {
-//         _dfs_remove(child, data, remove_list);
-//     }
-// }
 
 #[allow(clippy::too_many_arguments)]
 fn dfs(
@@ -200,17 +162,17 @@ fn dfs(
     let mut history = Vec::new();
     // Step 1:   Update `st` if block arguments update the value.
     let bb = bb_id.search_id(node);
-    let bb_data = data.dfg().bb(bb);
+    let bb_data = data.bb_data(bb);
     for &(vid, idx) in insert_table[node].iter() {
         st[vid].push(bb_data.params()[idx]);
         history.push(vid);
     }
 
     // Step 2:   Traverse the instruction list and find `alloc`, `store` and `load`.
-    let bb_data = data.layout().bbs().node(&bb_id.search_id(node)).unwrap();
-    let values = bb_data.insts().iter().map(|(&x, _)| x).collect::<Vec<_>>();
+    let bb_data = data.layout().basicblock(bb_id.search_id(node));
+    let values = bb_data.insts().iter().copied().collect::<Vec<_>>();
     for val in values {
-        let val_data = data.dfg().value(val);
+        let val_data = data.inst_data(val);
         // Step 2.3: Delete `load` and replace every use of `load` with value of variable.
         // Step 2.4: For `jump` and `branch`, update its arguments.
         match val_data.kind() {
@@ -224,7 +186,7 @@ fn dfs(
             // Step 2.2: Update the value in stack with corresponding variable if we met `store`.
             InstKind::Store(store) => {
                 if let Some(&dest_id) = val_id.get_id_safe(&store.dest()) {
-                    st[dest_id].push(store.value());
+                    st[dest_id].push(store.src());
                     history.push(dest_id);
 
                     remove_list.push((val, bb));
@@ -234,10 +196,6 @@ fn dfs(
                 if let Some(&load_id) = val_id.get_id_safe(&load.src()) {
                     let rep_with = *st[load_id].last().unwrap();
                     utils::visit_and_replace(data, val, rep_with);
-                    // let list = val_data.used_by().iter().copied().collect::<Vec<_>>();
-                    // for used_by in list {
-                    //     utils::visit_and_replace(data, used_by, val, rep_with);
-                    // }
                     remove_list.push((val, bb));
                 }
             }
@@ -249,50 +207,47 @@ fn dfs(
                     let item = match st[vid].last() {
                         Some(&val) => val,
                         None => {
-                            let v = data.dfg().bb(target).params()[i];
-                            let ty = data.dfg().value(v).ty().clone();
-                            data.dfg_mut().new_value().undef(ty)
+                            let v = data.bb_data(target).params()[i];
+                            let ty = data.inst_data(v).ty().clone();
+                            data.new_local_inst().undef(ty)
                         }
                     };
                     args.push(item);
                 }
-                data.dfg_mut()
-                    .replace_value_with(val)
-                    .jump_with_args(target, args);
+                data.replace_inst_with(val).jump(target, args);
             }
             InstKind::Branch(branch) => {
                 let cond = branch.cond();
-                let true_bb = branch.true_bb();
-                let true_bb_id = bb_id.get_id(&true_bb);
-                let false_bb = branch.false_bb();
-                let false_bb_id = bb_id.get_id(&false_bb);
-                let mut false_args = branch.false_args().to_vec();
-                let mut true_args = branch.true_args().to_vec();
-                for (i, &(vid, _)) in (false_args.len()..).zip(insert_table[false_bb_id].iter()) {
+                let t_target = branch.t_target();
+                let t_target_id = bb_id.get_id(&t_target);
+                let f_target = branch.f_target();
+                let f_target_id = bb_id.get_id(&f_target);
+                let mut f_args = branch.f_args().to_vec();
+                let mut t_args = branch.t_args().to_vec();
+                for (i, &(vid, _)) in (f_args.len()..).zip(insert_table[f_target_id].iter()) {
                     let item = match st[vid].last() {
                         Some(&val) => val,
                         None => {
-                            let v = data.dfg().bb(false_bb).params()[i];
-                            let ty = data.dfg().value(v).ty().clone();
-                            data.dfg_mut().new_value().undef(ty)
+                            let v = data.bb_data(f_target).params()[i];
+                            let ty = data.inst_data(v).ty().clone();
+                            data.new_local_inst().undef(ty)
                         }
                     };
-                    false_args.push(item);
+                    f_args.push(item);
                 }
-                for (i, &(vid, _)) in (true_args.len()..).zip(insert_table[true_bb_id].iter()) {
+                for (i, &(vid, _)) in (t_args.len()..).zip(insert_table[t_target_id].iter()) {
                     let item = match st[vid].last() {
                         Some(&val) => val,
                         None => {
-                            let v = data.dfg().bb(true_bb).params()[i];
-                            let ty = data.dfg().value(v).ty().clone();
-                            data.dfg_mut().new_value().undef(ty)
+                            let v = data.bb_data(t_target).params()[i];
+                            let ty = data.inst_data(v).ty().clone();
+                            data.new_local_inst().undef(ty)
                         }
                     };
-                    true_args.push(item);
+                    t_args.push(item);
                 }
-                data.dfg_mut()
-                    .replace_value_with(val)
-                    .branch_with_args(cond, true_bb, false_bb, true_args, false_args);
+                data.replace_inst_with(val)
+                    .branch(cond, t_target, t_args, f_target, f_args);
             }
             _ => {}
         }
@@ -327,7 +282,6 @@ pub fn variable_analysis(
     } else {
         0
     };
-    eprintln!("skip: {skip_func_para}");
     let mut val_usage = ValUsage::new();
 
     // use iterator to get rid of nested for-loop
@@ -337,10 +291,10 @@ pub fn variable_analysis(
     //  value handle     kind        which basic block it belongs to.
     for (val, val_kind, bb) in data
         .layout()
-        .bbs()
+        .basicblocks()
         .iter()
-        .flat_map(|(&bb, node)| node.insts().iter().zip(std::iter::repeat(bb)))
-        .map(|((&val, _), bb)| (val, data.dfg().value(val).kind(), bb))
+        .flat_map(|layout| layout.insts().iter().zip(std::iter::repeat(layout.bb())))
+        .map(|(&val, bb)| (val, data.inst_data(val).kind(), bb))
     {
         match val_kind {
             InstKind::Alloc => {

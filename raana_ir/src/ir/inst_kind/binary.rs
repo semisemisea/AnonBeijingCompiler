@@ -25,6 +25,7 @@ impl Binary {
     }
 
     pub fn new_data(lhs: Inst, rhs: Inst, op: BinaryOp, ty: Type) -> InstData {
+        let ty = if op.is_compare() { Type::get_i32() } else { ty };
         InstData::new(ty, InstKind::Binary(Binary { lhs, rhs, op }))
     }
 }
@@ -48,6 +49,20 @@ pub enum BinaryOp {
     Shl,
     Shr,
     Sar,
+}
+
+impl BinaryOp {
+    pub fn is_compare(&self) -> bool {
+        matches!(
+            self,
+            BinaryOp::NotEq
+                | BinaryOp::Eq
+                | BinaryOp::Gt
+                | BinaryOp::Lt
+                | BinaryOp::Ge
+                | BinaryOp::Le
+        )
+    }
 }
 
 impl std::fmt::Display for BinaryOp {

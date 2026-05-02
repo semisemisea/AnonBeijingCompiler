@@ -3,6 +3,7 @@ pub mod arg_ref;
 pub mod binary;
 pub mod branch;
 pub mod call;
+pub mod cast;
 pub mod global_alloc;
 pub mod jump;
 pub mod ptr;
@@ -17,6 +18,7 @@ pub use binary::Binary;
 pub use binary::BinaryOp;
 pub use branch::Branch;
 pub use call::Call;
+pub use cast::Cast;
 pub use global_alloc::GlobalAlloc;
 pub use jump::Jump;
 pub use ptr::GetElemPtr;
@@ -39,6 +41,7 @@ pub enum InstKind {
     Binary(Binary),
     Jump(Jump),
     Branch(Branch),
+    Cast(Cast),
     Return(Return),
     GetElemPtr(GetElemPtr),
     GetPtr(GetPtr),
@@ -124,6 +127,7 @@ impl Iterator for InstUsage<'_> {
             InstKind::GlobalAlloc(global_alloc) => field_use!(global_alloc.init()),
             InstKind::Store(store) => field_use!(store.src(), store.dest()),
             InstKind::Load(load) => field_use!(load.src()),
+            InstKind::Cast(cast) => field_use!(cast.src()),
             InstKind::Call(call) => call.args().get(cur_index).copied(),
             InstKind::Aggregate(aggregate) => aggregate.value().get(cur_index).copied(),
             InstKind::Binary(binary) => field_use!(binary.lhs(), binary.rhs()),

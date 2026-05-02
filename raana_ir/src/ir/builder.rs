@@ -4,7 +4,7 @@ use crate::ir::{
     basic_block::{BasicBlock, BasicBlockData},
     function::Function,
     inst_kind::{
-        Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Float, GetElemPtr, GetPtr,
+        Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Cast, Float, GetElemPtr, GetPtr,
         GlobalAlloc, InstKind, Integer, Jump, Load, Return, Store,
     },
     instruction::{Inst, InstData},
@@ -94,6 +94,13 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
 
     fn call(&mut self, callee: Function, args: Vec<Inst>) -> Inst {
         self.insert_inst(Call::new_data(callee, args, self.func_type(callee)))
+    }
+
+    fn cast(&mut self, src: Inst, ty: Type) -> Inst {
+        let src_ty = self.inst_type(src);
+        assert!(src_ty.is_scalar(), "cast source is not scalar");
+        assert!(ty.is_scalar(), "cast target is not scalar");
+        self.insert_inst(Cast::new_data(src, ty))
     }
 
     /// panic is base is not a pointer type.

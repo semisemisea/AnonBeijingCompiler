@@ -38,19 +38,19 @@ CompUnit: CompUnit = {
         })
     },
 
-    // 3. Int Start (有歧义: int Ident ...)
-    // 策略：解析 "int" 和 Ident，然后调用 IntSuffix 规则。
-    // IntSuffix 返回一个闭包，我们把 ident 传给它来构造结果。
-    "int" <ident: Ident> <builder: IntSuffix> => builder(ident),
+    // 3. Scalar Start (有歧义: BType Ident ...)
+    // 策略：解析 BType 和 Ident，然后调用 ScalarSuffix 规则。
+    // ScalarSuffix 返回一个闭包，我们把类型和 ident 传给它来构造结果。
+    <btype: BType> <ident: Ident> <builder: ScalarSuffix> => builder(btype, ident),
 }
 
-// 这是一个后缀规则，处理 int Ident 之后的部分
-// 返回类型是一个闭包，接收 Ident (Rc<str>)，返回 CompUnit
-IntSuffix: Box<dyn FnOnce(std::rc::Rc<str>) -> CompUnit> = {
+// 这是一个后缀规则，处理 BType Ident 之后的部分
+// 返回类型是一个闭包，接收 Type 和 Ident (Rc<str>)，返回 CompUnit
+ScalarSuffix: Box<dyn FnOnce(Type, std::rc::Rc<str>) -> CompUnit> = {
     // 分支 A: 遇到左括号 -> 函数定义
     "(" <params: Comma<FuncFParam>> ")" <block: Block> => {
-        Box::new(move |ident| CompUnit::FuncDef(FuncDef {
-            func_type: Type::get_i32(), // 既然进入了 IntSuffix，说明开头是 int
+        Box::new(move |func_type, ident| CompUnit::FuncDef(FuncDef {
+            func_type,
             ident,
             params,
             block,
@@ -60,14 +60,14 @@ IntSuffix: Box<dyn FnOnce(std::rc::Rc<str>) -> CompUnit> = {
     // 分支 B: 遇到赋值号或分号或逗号 -> 变量声明
     // 这里的逻辑是：解析可选的初始化值，以及后续可能的更多变量定义
     <arr_dim: ("[" <ConstExp> "]")*><init_val: ("=" <InitVal>)?> <mut rest: ("," <VarDef>)*> ";" => {
-        Box::new(move |ident| {
+        Box::new(move |btype, ident| {
             // 将第一个变量（前缀解析的 ident + 这里解析的 init）构建出来
             let first_def = VarDef { ident, arr_dim, init_val };
             // 插到列表最前面
             rest.insert(0, first_def);
             
             CompUnit::Decl(Decl::VarDecl(VarDecl {
-                btype: Type::get_i32(),
+                btype,
                 var_defs: rest,
             }))
         })
@@ -88,7 +88,10 @@ Decl: Decl = {
     <v_decl: VarDecl> => Decl::VarDecl(v_decl),
 };
 
-BType: Type = "int" => Type::get_i32();
+BType: Type = {
+    "int" => Type::get_i32(),
+    "float" => Type::get_f32(),
+};
 
 ConstDecl: ConstDecl = "const" <btype: BType> <const_defs: Comma<ConstDef>> ";" => ConstDecl { 
     btype,
@@ -132,6 +135,7 @@ FuncDef: FuncDef = {
 
 FuncType: Type = {
     "int" => Type::get_i32(),
+    "float" => Type::get_f32(),
     "void" => Type::get_unit(),
 }
 
@@ -184,7 +188,10 @@ OpenStmt: Stmt = {
 
 LVal: LVal = <ident: Ident> <index: ("[" <Exp> "]")*> => LVal {ident, index};
 
-Number: i32 = <num: IntConst> => <>;
+Number: Number = {
+  <num: IntConst> => Number::Int(num),
+  <num: FloatConst> => Number::Float(num),
+};
 
 Ident: std::rc::Rc<str> = r"[_a-zA-Z][_a-zA-Z0-9]*" =>  std::rc::Rc::from(<>);
 
@@ -192,6 +199,11 @@ IntConst: i32 = {
   r"[1-9][0-9]*" => i32::from_str_radix(<>, 10).unwrap(),
   r"0[0-7]*" => i32::from_str_radix(<>, 8).unwrap(),
   r"0[xX][0-9a-fA-F]+" => i32::from_str_radix(&<>[2..], 16).unwrap(),
+};
+
+FloatConst: f32 = {
+  r"(?:[0-9]*\.[0-9]+|[0-9]+\.)(?:[eE][+-]?[0-9]+)?|[0-9]+[eE][+-]?[0-9]+" => parse_float_const(<>),
+  r"0[xX](?:[0-9a-fA-F]*\.[0-9a-fA-F]+|[0-9a-fA-F]+\.?)[pP][+-]?[0-9]+" => parse_float_const(<>),
 };
 
 Exp: Exp = <lor_exp: LOrExp> => Exp {<>};

@@ -647,11 +647,17 @@ impl ToRaanaIR for items::WhileStmt {
             return;
         }
         // create 3 basic blocks for while loop
-        let entry = ctx.new_bb().basic_block("while_entry".into(), vec![]);
+        let entry = ctx
+            .new_basic_block()
+            .basic_block("while_entry".into(), vec![]);
         ctx.register_bb(entry);
-        let body = ctx.new_bb().basic_block("while_body".into(), vec![]);
+        let body = ctx
+            .new_basic_block()
+            .basic_block("while_body".into(), vec![]);
         ctx.register_bb(body);
-        let end = ctx.new_bb().basic_block("while_end".into(), vec![]);
+        let end = ctx
+            .new_basic_block()
+            .basic_block("while_end".into(), vec![]);
         ctx.register_bb(end);
         ctx.push_loop(entry, end);
 
@@ -710,14 +716,14 @@ impl ToRaanaIR for items::IfStmt {
         // Get condition exp value.
         self.cond.convert(ctx);
         let cond_val = ctx.pop_val().unwrap();
-        let then_bb = ctx.new_bb().basic_block("then".into(), vec![]);
+        let then_bb = ctx.new_basic_block().basic_block("then".into(), vec![]);
         ctx.register_bb(then_bb);
         let else_bb = self.else_branch.as_ref().map(|_| {
-            let bb = ctx.new_bb().basic_block("else".into(), vec![]);
+            let bb = ctx.new_basic_block().basic_block("else".into(), vec![]);
             ctx.register_bb(bb);
             bb
         });
-        let end_bb = ctx.new_bb().basic_block("end".into(), vec![]);
+        let end_bb = ctx.new_basic_block().basic_block("end".into(), vec![]);
         ctx.register_bb(end_bb);
         let br = ctx.new_local_value().branch(
             cond_val,
@@ -810,10 +816,10 @@ impl ToRaanaIR for items::LOrExp {
                 ctx.push_inst(lhs_ne_0);
 
                 // two basic block for short circuit logic
-                let rhs_bb = ctx.new_bb().basic_block("lor_rhs".into(), vec![]);
+                let rhs_bb = ctx.new_basic_block().basic_block("lor_rhs".into(), vec![]);
                 ctx.register_bb(rhs_bb);
                 let merge_bb = ctx
-                    .new_bb()
+                    .new_basic_block()
                     .basic_block("lor_merge".into(), vec![Type::get_i32()]);
                 ctx.register_bb(merge_bb);
 
@@ -907,10 +913,10 @@ impl ToRaanaIR for items::LAndExp {
                 ctx.push_inst(lhs_eq_0);
 
                 // two basic block for short circuit logic
-                let rhs_bb = ctx.new_bb().basic_block("land_rhs".into(), vec![]);
+                let rhs_bb = ctx.new_basic_block().basic_block("land_rhs".into(), vec![]);
                 ctx.register_bb(rhs_bb);
                 let merge_bb = ctx
-                    .new_bb()
+                    .new_basic_block()
                     .basic_block("land_merge".into(), vec![Type::get_i32()]);
                 ctx.register_bb(merge_bb);
 

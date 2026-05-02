@@ -8,12 +8,16 @@ pub enum TypeKind {
     Int32,
     /// f32
     Float32,
+    /// Special String Support [char; len]
+    String,
     /// An array like [base; len]
     Array(Type, usize),
     /// Pointer to the base type
     Pointer(Type),
     /// Function with parameters' type and return type.
     Function(Vec<Type>, Type),
+    /// Variadic function support
+    ArgList,
 }
 
 impl std::fmt::Display for TypeKind {
@@ -24,6 +28,7 @@ impl std::fmt::Display for TypeKind {
             TypeKind::Float32 => write!(f, "f32"),
             TypeKind::Array(base, len) => write!(f, "[{base}; {len}]"),
             TypeKind::Pointer(base) => write!(f, "*{base}"),
+            TypeKind::String => write!(f, "String"),
             TypeKind::Function(params, ret) => {
                 write!(f, "(")?;
                 if let Some((last, rest)) = params.split_last() {
@@ -36,6 +41,7 @@ impl std::fmt::Display for TypeKind {
                 write!(f, " -> ")?;
                 write!(f, "{ret}")
             }
+            TypeKind::ArgList => write!(f, "..."),
         }
     }
 }
@@ -96,6 +102,14 @@ impl Type {
         Type::get(TypeKind::Function(args, ret))
     }
 
+    pub fn get_string() -> Type {
+        Type::get(TypeKind::String)
+    }
+
+    pub fn get_arg_list() -> Type {
+        Type::get(TypeKind::ArgList)
+    }
+
     pub fn is_i32(&self) -> bool {
         matches!(self.0.as_ref(), TypeKind::Int32)
     }
@@ -114,10 +128,10 @@ impl Type {
 
     pub fn size(&self) -> usize {
         match self.0.as_ref() {
-            TypeKind::Unit => 0,
+            TypeKind::ArgList | TypeKind::Unit => 0,
             TypeKind::Int32 | TypeKind::Float32 => 4,
             TypeKind::Array(base, len) => base.size() * len,
-            TypeKind::Pointer(..) | TypeKind::Function(..) => POINTER_SIZE,
+            TypeKind::String | TypeKind::Pointer(..) | TypeKind::Function(..) => POINTER_SIZE,
         }
     }
 
@@ -181,5 +195,11 @@ mod test {
             Type::get_f32(),
         );
         assert_eq!("([i32; 5], *f32, i32) -> f32", f3.to_string());
+
+        let f4 = Type::get_function(
+            vec![Type::get_string(), Type::get_arg_list()],
+            Type::get_unit(),
+        );
+        assert_eq!("(String, ...) -> ()", f4.to_string());
     }
 }

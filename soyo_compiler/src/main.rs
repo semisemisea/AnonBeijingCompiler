@@ -82,7 +82,7 @@ mod test {
 
         let mut program = ctx.program;
 
-        let mut pass_manager = raana_ir::opt::pass::PassesManager::new();
+        let pass_manager = raana_ir::opt::pass::PassesManager::default_ref();
         pass_manager.run_passes(&mut program);
 
         let mut writer = Writer::new(&program);

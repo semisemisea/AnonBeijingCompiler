@@ -27,7 +27,7 @@ fn main() {
     let mut program = ctx.program;
 
     if args.opt_level > 0 {
-        let mut pass_manager = raana_ir::opt::pass::PassesManager::new();
+        let pass_manager = raana_ir::opt::pass::PassesManager::default_ref();
         pass_manager.run_passes(&mut program);
     }
 

@@ -317,10 +317,7 @@ impl AstGenContext {
             vec![Type::get_pointer(Type::get_i32())],
         );
         self.insert_func(std::rc::Rc::from("getarray"), getarray);
-        let getfloat = self
-            .program
-            .new_function(Type::get_f32(), "getfloat".into(), vec![]);
-        self.insert_func(std::rc::Rc::from("getfloat"), getfloat);
+
         let getfarray = self.program.new_function(
             Type::get_i32(),
             "getfarray".into(),

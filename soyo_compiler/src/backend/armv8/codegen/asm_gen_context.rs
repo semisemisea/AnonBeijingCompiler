@@ -14,7 +14,8 @@ use crate::backend::armv8::{
         register_manager::RegisterManager,
     },
     inst::{
-        AddSubImm, AddSubOperand, Inst, LoadSaveOffset, MovOperand, MoveWideImm, MoveWideImmShift,
+        AddSubImm, AddSubOperand, CsetCondition, Inst, LoadSaveOffset, LogicOperand, MovOperand,
+        MoveWideImm, MoveWideImmShift, ShiftSize,
     },
     register::{Bit, IReg, IntRegister, Register},
 };
@@ -259,6 +260,7 @@ impl AsmGenContext {
 
     pub fn load_to_para_register(&mut self, program: &Program, val: IrInst, reg: Register) {
         import_reg_and_inst!();
+        // FIXME: fix it when AsmGenContext impls Arena.
         let data = self.curr_func_data(program).dfg().value(val);
         match data.kind() {
             InstKind::Integer(int) => {
@@ -606,47 +608,67 @@ impl AsmGenContext {
         let lhs = self.reg_pool.take_register();
         let res = self.reg_pool.alloc_temp();
         match op {
+            // ARMv8 uses the sign bits of the result of a cmp instruction to determine
+            // the condition flags, so we can use cmp + cset to implement these comparisons.
             BinaryOp::NotEq => {
-                self.write_inst(sub {
-                    rd: res,
+                self.write_inst(cmp {
                     rs1: lhs,
                     rs2: AddSubOperand::Register(rhs),
                 });
-                self.write_inst(snez { rd: res, rs: res });
+                self.write_inst(cset {
+                    rd: res,
+                    condition: CsetCondition::NE,
+                });
             }
             BinaryOp::Eq => {
-                self.write_inst(sub {
-                    rd: res,
+                self.write_inst(cmp {
                     rs1: lhs,
                     rs2: AddSubOperand::Register(rhs),
                 });
-                self.write_inst(seqz { rd: res, rs: res });
-            }
-            BinaryOp::Gt => self.write_inst(sgt {
-                rd: res,
-                rs1: lhs,
-                rs2: rhs,
-            }),
-            BinaryOp::Lt => self.write_inst(slt {
-                rd: res,
-                rs1: lhs,
-                rs2: rhs,
-            }),
-            BinaryOp::Ge => {
-                self.write_inst(slt {
+                self.write_inst(cset {
                     rd: res,
-                    rs1: lhs,
-                    rs2: rhs,
+                    condition: CsetCondition::EQ,
                 });
-                self.write_inst(seqz { rd: res, rs: res });
+            }
+            BinaryOp::Gt => {
+                self.write_inst(cmp {
+                    rs1: lhs,
+                    rs2: AddSubOperand::Register(rhs),
+                });
+                self.write_inst(cset {
+                    rd: res,
+                    condition: CsetCondition::GT,
+                });
+            }
+            BinaryOp::Lt => {
+                self.write_inst(cmp {
+                    rs1: lhs,
+                    rs2: AddSubOperand::Register(rhs),
+                });
+                self.write_inst(cset {
+                    rd: res,
+                    condition: CsetCondition::LT,
+                });
+            }
+            BinaryOp::Ge => {
+                self.write_inst(cmp {
+                    rs1: lhs,
+                    rs2: AddSubOperand::Register(rhs),
+                });
+                self.write_inst(cset {
+                    rd: res,
+                    condition: CsetCondition::GE,
+                });
             }
             BinaryOp::Le => {
-                self.write_inst(sgt {
-                    rd: res,
+                self.write_inst(cmp {
                     rs1: lhs,
-                    rs2: rhs,
+                    rs2: AddSubOperand::Register(rhs),
                 });
-                self.write_inst(seqz { rd: res, rs: res });
+                self.write_inst(cset {
+                    rd: res,
+                    condition: CsetCondition::LE,
+                });
             }
             BinaryOp::Add => self.write_inst(add {
                 rd: res,
@@ -664,29 +686,57 @@ impl AsmGenContext {
                 rs1: lhs,
                 rs2: rhs,
             }),
-            BinaryOp::Div => self.write_inst(div {
+            BinaryOp::Div => self.write_inst(sdiv {
                 rd: res,
                 rs1: lhs,
                 rs2: rhs,
             }),
-            BinaryOp::Rem => self.write_inst(rem {
+            BinaryOp::Rem => {
+                self.write_inst(sdiv {
+                    rd: res,
+                    rs1: lhs,
+                    rs2: rhs,
+                });
+                self.write_inst(mul {
+                    rd: res,
+                    rs1: res,
+                    rs2: rhs,
+                });
+                self.write_inst(sub {
+                    rd: res,
+                    rs1: lhs,
+                    rs2: AddSubOperand::Register(res),
+                });
+            }
+            BinaryOp::And => self.write_inst(and {
                 rd: res,
                 rs1: lhs,
-                rs2: rhs,
+                rs2: LogicOperand::Register(rhs),
             }),
-            BinaryOp::And => todo!(),
-            BinaryOp::Or => todo!(),
-            BinaryOp::Xor => todo!(),
-            BinaryOp::Shl => self.write_inst(sll {
+            BinaryOp::Or => self.write_inst(orr {
                 rd: res,
                 rs1: lhs,
-                rs2: rhs,
+                rs2: LogicOperand::Register(rhs),
             }),
-            BinaryOp::Shr => todo!(),
-            BinaryOp::Sar => self.write_inst(sra {
+            BinaryOp::Xor => self.write_inst(eor {
                 rd: res,
                 rs1: lhs,
-                rs2: rhs,
+                rs2: LogicOperand::Register(rhs),
+            }),
+            BinaryOp::Shl => self.write_inst(lsl {
+                rd: res,
+                rs1: lhs,
+                rs2: ShiftSize::Register(rhs),
+            }),
+            BinaryOp::Shr => self.write_inst(lsr {
+                rd: res,
+                rs1: lhs,
+                rs2: ShiftSize::Register(rhs),
+            }),
+            BinaryOp::Sar => self.write_inst(asr {
+                rd: res,
+                rs1: lhs,
+                rs2: ShiftSize::Register(rhs),
             }),
         }
     }
@@ -726,7 +776,7 @@ impl AsmGenContext {
 
     pub fn jump(&mut self, bb: BasicBlock, program: &Program) {
         import_reg_and_inst!();
-        self.write_inst(j {
+        self.write_inst(b {
             label: self.get_bb_name(bb, program),
         });
     }
@@ -734,11 +784,11 @@ impl AsmGenContext {
     pub fn if_jump(&mut self, true_bb: BasicBlock, false_bb: BasicBlock, program: &Program) {
         import_reg_and_inst!();
         let cond_reg = self.reg_pool.take_register();
-        self.write_inst(bnez {
+        self.write_inst(cbnz {
             rs: cond_reg,
             label: self.get_bb_name(true_bb, program),
         });
-        self.write_inst(beqz {
+        self.write_inst(cbz {
             rs: cond_reg,
             label: self.get_bb_name(false_bb, program),
         });

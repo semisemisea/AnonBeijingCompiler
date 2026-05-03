@@ -467,7 +467,7 @@ mod tests {
         );
         assert_eq!(
             parse_float_const("03.141592653589793").to_bits(),
-            (3.141592653589793f32).to_bits()
+            std::f32::consts::PI.to_bits()
         );
     }
 }

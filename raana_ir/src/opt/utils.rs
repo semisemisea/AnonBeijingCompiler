@@ -214,7 +214,7 @@ pub fn alloc_ty(val: Inst, data: &FunctionData) -> &Type {
     let TypeKind::Pointer(pointee) = val_data.ty().kind() else {
         unreachable!()
     };
-    &pointee
+    pointee
 }
 
 pub fn visit_and_replace(data: &mut ArenaContext<'_>, rep: Inst, rep_with: Inst) {
@@ -229,6 +229,7 @@ fn visit_and_replace_single(data: &mut ArenaContext<'_>, used_by: Inst, rep: Ins
     #[allow(unused_variables)]
     match rep_val_data.kind() {
         InstKind::Integer(..)
+        | InstKind::Float(..)
         | InstKind::ZeroInit
         | InstKind::Undef
         | InstKind::Aggregate(..)
@@ -236,7 +237,10 @@ fn visit_and_replace_single(data: &mut ArenaContext<'_>, used_by: Inst, rep: Ins
         | InstKind::BlockArgRef(..)
         | InstKind::Alloc
         | InstKind::GlobalAlloc(..) => unreachable!("Encountered kind: {:?}", rep_val_data.kind()),
-        InstKind::Float(..) => todo!(),
+        InstKind::Cast(cast) => {
+            let ty = rep_val_data.ty().clone();
+            data.replace_inst_with(used_by).cast(rep_with, ty);
+        }
         InstKind::Load(load) => {
             data.replace_inst_with(used_by).load(rep_with);
         }

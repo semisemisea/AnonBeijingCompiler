@@ -7,6 +7,7 @@ edition = "2024"
 itertools = "0.14.0"
 raana_ir = { version = "0.1.0", path = "../raana_ir" }
 lalrpop-util = { version = "0.22.1", features = ["lexer"] }
+clap = { version = "4.6.1", features = ["derive"] }
 
 [build-dependencies]
 lalrpop = "0.22.1"

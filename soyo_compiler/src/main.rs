@@ -1,3 +1,4 @@
+use clap::Parser;
 use raana_ir::fmt::writer::Writer;
 
 use crate::frontend::utils::AstGenContext;
@@ -11,16 +12,13 @@ mod frontend;
 lalrpop_util::lalrpop_mod!(sysy);
 
 /// compiler -S -o testcase.s testcase.sy [-O1]
+/// extra support:
+///     --emit,  `ir` or `asm`
 fn main() {
-    let config = match cli::parse_env_config() {
-        Ok(config) => config,
-        Err(errors) => {
-            errors.write_to_stderr().unwrap();
-            std::process::exit(1);
-        }
-    };
+    let args = cli::Arg::parse();
+    assert!(args.assembly_only);
 
-    let source_code = std::fs::read_to_string(&config.input_path).unwrap();
+    let source_code = std::fs::read_to_string(&args.input_path).unwrap();
 
     let ast = sysy::CompUnitsParser::new().parse(&source_code).unwrap();
     let mut ctx = AstGenContext::new();
@@ -28,7 +26,7 @@ fn main() {
 
     let mut program = ctx.program;
 
-    if config.optimize {
+    if args.opt_level > 0 {
         let mut pass_manager = raana_ir::opt::pass::PassesManager::new();
         pass_manager.run_passes(&mut program);
     }
@@ -36,7 +34,7 @@ fn main() {
     let mut writer = Writer::new(&program);
     writer.write().unwrap();
     let buf = writer.finish();
-    std::fs::write(&config.output_path, buf).unwrap();
+    std::fs::write(&args.output_path, buf).unwrap();
 }
 
 #[cfg(test)]

@@ -55,11 +55,12 @@ pub struct ExtendedRegister {
     pub shift: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddSubOperand {
     Register(Register),
     Immediate(AddSubImm),
     ExtendedRegister(ExtendedRegister),
+    AddrLo12(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +79,24 @@ pub enum MovOperand {
 pub enum LoadSaveOffset {
     Imm12(i16),
     Register(Register),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsetCondition {
+    EQ, // equal
+    NE, // not equal
+    CS, // carry set (unsigned higher or same)
+    CC, // carry clear (unsigned lower)
+    MI, // minus/negative
+    PL, // plus/positive or zero
+    VS, // overflow
+    VC, // no overflow
+    HI, // unsigned higher
+    LS, // unsigned lower or same
+    GE, // signed greater than or equal
+    LT, // signed less than
+    GT, // signed greater than
+    LE, // signed less than or equal
 }
 
 #[allow(unused)]
@@ -188,6 +207,10 @@ pub enum Inst {
         rd: Register,
         label: String,
     },
+    cset {
+        rd: Register,
+        condition: CsetCondition,
+    },
     _string {
         indent_level: usize,
         str: String,
@@ -283,6 +306,7 @@ impl fmt::Display for AddSubOperand {
             AddSubOperand::Register(reg) => write!(f, "{reg:?}"),
             AddSubOperand::Immediate(imm) => write!(f, "{imm}"),
             AddSubOperand::ExtendedRegister(reg) => write!(f, "{reg}"),
+            AddSubOperand::AddrLo12(label) => write!(f, ":lo12:{label}"),
         }
     }
 }

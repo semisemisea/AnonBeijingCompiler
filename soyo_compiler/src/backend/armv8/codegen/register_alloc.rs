@@ -7,11 +7,9 @@ use std::{
 
 use itertools::Itertools;
 use raana_ir::ir::{FunctionData, Inst, InstKind};
+use raana_ir::opt::utils::{IDAllocator, VIDAlloc, get_terminator_inst};
 
-use crate::{
-    backend::armv8::register::Register,
-    opt::utils::{self, IDAllocator, VIDAlloc, get_terminator_inst},
-};
+use crate::backend::armv8::register::Register;
 
 type VRegister = Reverse<Register>;
 
@@ -32,7 +30,7 @@ impl VirtualRegister {
         let mut not_usable = Vec::new();
         while let Some(virtual_reg) = self.container.pop() {
             if self.check(virtual_reg, for_range) {
-                if virtual_reg.0.is_saved() {
+                if virtual_reg.0.is_callee_saved() {
                     self.callee_used.insert(virtual_reg.0);
                 }
                 return Some(virtual_reg);

@@ -15,6 +15,8 @@ lalrpop_util::lalrpop_mod!(sysy);
 /// extra support:
 ///     --emit,  `ir` or `asm`
 fn main() {
+    env_logger::init();
+
     let args = cli::Arg::parse();
     assert!(args.assembly_only);
 
@@ -39,14 +41,18 @@ fn main() {
 
 #[cfg(test)]
 mod test {
+    use log::{info, trace};
     use raana_ir::fmt::writer::Writer;
-    use std::io::Write;
     use std::path::{Path, PathBuf};
 
     use crate::{
         frontend::utils::{AstGenContext, ToRaanaIR},
         sysy,
     };
+
+    fn logger_init() {
+        let _ = env_logger::builder().is_test(true).try_init();
+    }
 
     fn sy_files(path: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(path).unwrap() {
@@ -64,6 +70,8 @@ mod test {
         #[cfg(unix)]
         {
             if let Ok(mut stderr) = std::fs::OpenOptions::new().write(true).open("/dev/stderr") {
+                use std::io::Write;
+
                 let _ = writeln!(stderr, "{message}");
                 let _ = stderr.flush();
                 return;
@@ -88,18 +96,19 @@ mod test {
         let mut writer = Writer::new(&program);
         writer.write().unwrap();
         let buf = writer.finish();
-        println!("{}", buf);
+        trace!("{}", buf);
     }
 
     #[test]
     fn functional() {
+        logger_init();
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests");
         let mut files = Vec::new();
         sy_files(&root, &mut files);
         files.sort();
         let total = files.len();
         for (index, file) in files.iter().enumerate() {
-            test(&file);
+            test(file);
             let name = file.strip_prefix(&root).unwrap_or(file);
             print_progress(&format!(
                 "[{}/{} passed] {}",

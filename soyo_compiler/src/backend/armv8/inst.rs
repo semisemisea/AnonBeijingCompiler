@@ -305,6 +305,18 @@ impl fmt::Display for MovOperand {
     }
 }
 
+impl fmt::Display for LoadSaveOffset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LoadSaveOffset::Imm12(value) => {
+                debug_assert!(*value <= 4095);
+                write!(f, "#{value}")
+            }
+            LoadSaveOffset::Register(reg) => write!(f, "{reg:?}"),
+        }
+    }
+}
+
 impl fmt::Display for Inst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -325,6 +337,9 @@ impl fmt::Display for Inst {
             Inst::lsl { rd, rs1, rs2 } => write!(f, "lsl {rd:?}, {rs1:?}, {rs2}"),
             Inst::lsr { rd, rs1, rs2 } => write!(f, "lsr {rd:?}, {rs1:?}, {rs2}"),
             Inst::asr { rd, rs1, rs2 } => write!(f, "asr {rd:?}, {rs1:?}, {rs2}"),
+            Inst::ldr { rd, rs, offset } => write!(f, "ldr {rd:?}, [{rs:?}, {offset}]"),
+            Inst::sdr { rs, rd, offset } => write!(f, "sdr {rs:?}, {rd:?}, {offset}"),
+            Inst::adrp { rd, label } => write!(f, "adrp {rd:?}, {label}"),
             Inst::ret => write!(f, "ret"),
             Inst::_string { indent_level, str } => write!(f, "{}{str}", "\t".repeat(*indent_level)),
         }

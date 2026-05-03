@@ -9,6 +9,7 @@ use crate::{
 };
 
 use itertools::Itertools;
+use log::{debug, info};
 
 #[derive(Debug)]
 pub struct IDAllocator<PKey, Id, NKey = PKey> {
@@ -197,7 +198,7 @@ pub fn rpo_path(g: &CFGGraph) -> GPath {
     }
     dfs(0, g, &mut path, &mut visited);
     path.reverse();
-    eprintln!("Graph/Path: {:?} {:?}", g, path);
+    debug!("Graph/Path: {:?} {:?}", g, path);
     path
 }
 
@@ -274,6 +275,10 @@ fn visit_and_replace_single(data: &mut ArenaContext<'_>, used_by: Inst, rep: Ins
                 binary.rhs()
             };
             let op = binary.op();
+            // info!("old data: {used_by} {:?}", data.inst_data(used_by));
+            // info!("to replace: {rep} {:?}", data.inst_data(rep));
+            // info!("replace with: {rep_with} {:?}", data.inst_data(rep_with));
+            // info!("");
             data.replace_inst_with(used_by).binary(op, lhs, rhs);
         }
         InstKind::Branch(branch) => {
@@ -371,7 +376,7 @@ pub fn idom(prede: &CFGGraph, rpo: &[BId]) -> IDomMap {
 
     let mut map = IDomMap::new();
     map.resize(rpo.len(), usize::MAX);
-    eprintln!("rpo before panic: {:?}", rpo);
+    debug!("rpo before panic: {:?}", rpo);
     let mut rpo_idx = vec![0; rpo.len()];
     for (i, &id) in rpo.iter().enumerate() {
         rpo_idx[id] = i;

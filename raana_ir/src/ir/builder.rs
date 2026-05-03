@@ -1,3 +1,5 @@
+use log::info;
+
 use crate::ir::{
     Program,
     arena::Arena,
@@ -289,7 +291,7 @@ impl ArenaQuery for ReplaceBuilder<'_> {
 }
 
 impl InstInsert for ReplaceBuilder<'_> {
-    fn insert_inst(&mut self, data: InstData) -> Inst {
+    fn insert_inst(&mut self, mut data: InstData) -> Inst {
         let old_data = if self.inst.is_global() {
             self.arena.global_mut().inst_arena.remove(self.inst)
         } else {
@@ -313,6 +315,7 @@ impl InstInsert for ReplaceBuilder<'_> {
         for bb in data.bb_usage() {
             self.arena.bb_data_mut(bb).used_by_mut().insert(self.inst);
         }
+        data.used_by = old_data.used_by;
         if self.inst.is_global() {
             self.arena.global_mut().inst_arena.alloc(self.inst, data);
         } else {

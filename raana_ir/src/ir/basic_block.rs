@@ -4,15 +4,12 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use index_list::IndexList;
-
 use crate::ir::instruction::Inst;
 
 #[derive(Debug, Clone)]
 pub struct BasicBlockData {
     name: String,
     params: Vec<Inst>,
-    insts: IndexList<Inst>,
     used_by: HashSet<Inst>,
 }
 
@@ -21,17 +18,8 @@ impl BasicBlockData {
         BasicBlockData {
             name,
             params,
-            insts: IndexList::new(),
             used_by: HashSet::new(),
         }
-    }
-
-    pub fn insts(&self) -> &IndexList<Inst> {
-        &self.insts
-    }
-
-    pub fn insts_mut(&mut self) -> &mut IndexList<Inst> {
-        &mut self.insts
     }
 
     pub fn params(&self) -> &Vec<Inst> {

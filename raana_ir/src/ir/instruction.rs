@@ -14,7 +14,7 @@ pub struct InstData {
     ty: Type,
     name: Option<String>,
     kind: InstKind,
-    used_by: HashSet<Inst>,
+    pub(crate) used_by: HashSet<Inst>,
 }
 
 impl Clone for InstData {

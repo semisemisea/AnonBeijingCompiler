@@ -1,12 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
+use itertools::Itertools;
 use raana_ir::ir::{
-    Aggregate, BasicBlock, Function, FunctionData, Inst as IrInst, InstKind, Program, Type,
+    Aggregate, BasicBlock, BinaryOp, Function, FunctionData, Inst as IrInst, InstKind, Program,
+    Type, arena::Arena,
 };
 
 use crate::backend::armv8::{
     codegen::{
         epilogue::Epilogue,
+        generate_asm::GenerateAsm,
         register_alloc::{AllocationState, RegisterAllocation},
         register_manager::RegisterManager,
     },
@@ -16,7 +19,7 @@ use crate::backend::armv8::{
     register::{Bit, IReg, IntRegister, Register},
 };
 
-type List = Vec<AsmInst>;
+type List = Vec<Inst>;
 
 pub struct AsmGenContext {
     // buffer: asm text.
@@ -24,19 +27,19 @@ pub struct AsmGenContext {
     inst_list: List,
     indent_level: usize,
     func_stack: Vec<Function>,
-    stack_slots: HashMap<Inst, usize>,
+    stack_slots: HashMap<IrInst, usize>,
     reg_pool: RegisterManager,
-    curr_inst: Option<Inst>,
+    curr_inst: Option<IrInst>,
     epilogue_stack: Vec<Epilogue>,
     allocation: RegisterAllocation,
 }
 
-macro_rules! push {
-    ($list: expr, $item: expr) => {
-        let len = $list.len();
-        $list.push_back(len, $item).unwrap();
-    };
-}
+// macro_rules! push {
+//     ($list: expr, $item: expr) => {
+//         let len = $list.len();
+//         $list.push_back(len, $item).unwrap();
+//     };
+// }
 
 macro_rules! import_reg_and_inst {
     () => {
@@ -62,25 +65,18 @@ impl AsmGenContext {
         }
     }
 
-    pub fn bb_params<'a>(&self, bb: BasicBlock, program: &'a Program) -> &'a [Inst] {
-        self.curr_func_data(program).dfg().bb(bb).params()
+    pub fn bb_params<'a>(&self, bb: BasicBlock, program: &'a Program) -> &'a [IrInst] {
+        self.curr_func_data(program).bb_data(bb).params()
     }
 
     pub fn get_bb_name(&self, bb: BasicBlock, program: &Program) -> String {
         let curr_func = self.curr_func_data(program);
         let func_name = curr_func.name().strip_prefix("@").unwrap();
-        let bb_name = curr_func
-            .dfg()
-            .bb(bb)
-            .name()
-            .as_ref()
-            .unwrap()
-            .strip_prefix("%")
-            .unwrap();
+        let bb_name = curr_func.bb_data(bb).name().strip_prefix("%").unwrap();
         format!(".L_{}_{}", func_name, bb_name)
     }
 
-    pub fn insert_inst(&mut self, val: Inst, offset: usize) {
+    pub fn insert_inst(&mut self, val: IrInst, offset: usize) {
         self.stack_slots.insert(val, offset);
     }
 
@@ -91,7 +87,7 @@ impl AsmGenContext {
     //     }
     // }
 
-    pub fn get_inst_offset(&self, val: Inst) -> Option<usize> {
+    pub fn get_inst_offset(&self, val: IrInst) -> Option<usize> {
         self.stack_slots.get(&val).copied()
     }
 
@@ -112,12 +108,13 @@ impl AsmGenContext {
     pub fn generate(mut self, program: &Program) -> List {
         // Target platform is 32bit.
         // So before actual generation we set the size of ptr.
-        Type::set_ptr_size(4);
+        // @Dustin-Jiang: Seems to be deprecated in raana::ir
+        // Type::set_ptr_size(4);
 
         self.incr_indent();
         self.writeln(".data");
-        for &glob_inst in program.inst_layout().iter() {
-            let glob_inst_data = program.borrow_value(glob_inst);
+        for &glob_inst in program.global_inst_layout() {
+            let glob_inst_data = program.inst_data(glob_inst);
             let name = glob_inst_data
                 .name()
                 .clone()
@@ -135,7 +132,7 @@ impl AsmGenContext {
                 unreachable!();
             };
             let init_val = glob_alloc.init();
-            let init_val_data = program.borrow_value(init_val);
+            let init_val_data = program.inst_data(init_val);
             match init_val_data.kind() {
                 InstKind::ZeroInit => {
                     self.writeln(&format!(".zero {}", init_val_data.ty().size()));
@@ -148,8 +145,8 @@ impl AsmGenContext {
 
                     // Create a recursive function to handle
                     fn recursive(agg: &Aggregate, ctx: &mut AsmGenContext, program: &Program) {
-                        for &elem in agg.elems() {
-                            let elem_data = program.borrow_value(elem);
+                        for &elem in agg.value() {
+                            let elem_data = program.inst_data(elem);
                             match elem_data.kind() {
                                 InstKind::Aggregate(agg) => {
                                     recursive(&agg, ctx, program);
@@ -171,20 +168,20 @@ impl AsmGenContext {
         self.decr_indent();
         self.writeln("");
 
-        for &func in program.func_layout().iter() {
+        for &func in program.function_layout() {
             // skip if it's declaration
-            if program.func(func).layout().entry_bb().is_none() {
+            if program.func_data(func).layout().entry_bb().is_none() {
                 continue;
             };
 
-            let name = program.func(func).name().strip_prefix("@").unwrap();
+            let name = program.func_data(func).name().strip_prefix("@").unwrap();
             self.incr_indent();
             self.writeln(".text");
             self.writeln(&format!(".globl {name}"));
             self.decr_indent();
 
             self.push_func(func);
-            let func_data = program.func(func);
+            let func_data = program.func_data(func);
             func_data.generate(program, &mut self);
             self.pop_func();
             self.writeln("");
@@ -198,17 +195,14 @@ impl AsmGenContext {
     }
 
     pub fn writeln(&mut self, string: &str) {
-        push!(
-            self.inst_list,
-            Inst::_string {
-                str: string.to_string(),
-                indent_level: self.indent_level,
-            }
-        );
+        self.inst_list.push(Inst::_string {
+            str: string.to_string(),
+            indent_level: self.indent_level,
+        });
     }
 
     pub fn write_inst(&mut self, inst: Inst) {
-        push!(self.inst_list, inst);
+        self.inst_list.push(inst);
     }
 
     pub fn prologue(&mut self, offset: usize, call_ra: bool, callee_usage: HashSet<Register>) {
@@ -260,7 +254,7 @@ impl AsmGenContext {
     }
 
     pub fn curr_func_data<'a>(&self, program: &'a Program) -> &'a FunctionData {
-        program.func(*self.curr_func_hanlde())
+        program.func_data(*self.curr_func_hanlde())
     }
 
     pub fn load_to_para_register(&mut self, program: &Program, val: IrInst, reg: Register) {
@@ -268,10 +262,7 @@ impl AsmGenContext {
         let data = self.curr_func_data(program).dfg().value(val);
         match data.kind() {
             InstKind::Integer(int) => {
-                self.write_inst(li {
-                    rd: reg,
-                    imm: int.value(),
-                });
+                self.load_imm(int.value());
             }
             // InstKind::FuncArgRef(arg_ref) if arg_ref.index() < 8 => {
             //     use Register::a0;
@@ -281,6 +272,7 @@ impl AsmGenContext {
             _ if !data.ty().is_unit() => match self.allocation.get(&val).unwrap() {
                 AllocationState::Register(register) => self.mv(*register, reg),
                 AllocationState::Stack(offset) => {
+                    let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
                     self.load_word(reg, *offset as _, sp);
                 }
             },
@@ -292,7 +284,7 @@ impl AsmGenContext {
         if val.is_global() {
             self.load_address(
                 program
-                    .borrow_value(val)
+                    .inst_data(val)
                     .name()
                     .clone()
                     .unwrap()
@@ -301,7 +293,8 @@ impl AsmGenContext {
                     .to_string(),
             );
         } else {
-            let data = self.curr_func_data(program).dfg().value(val);
+            // local values, use inst_data directly.
+            let data = self.curr_func_data(program).inst_data(val);
             match data.kind() {
                 InstKind::Integer(int) => {
                     self.load_imm(int.value());
@@ -336,7 +329,7 @@ impl AsmGenContext {
         }
     }
 
-    pub fn curr_inst_mut(&mut self) -> &mut Option<Inst> {
+    pub fn curr_inst_mut(&mut self) -> &mut Option<IrInst> {
         &mut self.curr_inst
     }
 
@@ -402,7 +395,7 @@ impl AsmGenContext {
         &mut self.allocation
     }
 
-    pub fn curr_inst(&self) -> Option<Inst> {
+    pub fn curr_inst(&self) -> Option<IrInst> {
         self.curr_inst
     }
 }
@@ -420,18 +413,27 @@ impl AsmGenContext {
         if (-32768..32768).contains(&imm) {
             self.write_inst(mov {
                 rd: temp_reg,
-                src: MovOperand::Immediate(MoveWideImm::Imm16(imm as u16, MoveWideImmShift::B0)),
+                src: MovOperand::Immediate(MoveWideImm::Imm16 {
+                    value: imm as u16,
+                    shift: MoveWideImmShift::B0,
+                }),
             });
         } else {
             let immz = (imm & 0xFFFF) as u16; // Low 16 bits
             let immk = ((imm >> 16) & 0xFFFF) as u16; // High 16 bits
             self.write_inst(movz {
                 rd: temp_reg,
-                imm: MoveWideImm::Imm16(immz, MoveWideImmShift::B0),
+                imm: MoveWideImm::Imm16 {
+                    value: immz,
+                    shift: MoveWideImmShift::B0,
+                },
             });
             self.write_inst(movk {
                 rd: temp_reg,
-                imm: MoveWideImm::Imm16(immk, MoveWideImmShift::B16),
+                imm: MoveWideImm::Imm16 {
+                    value: immk,
+                    shift: MoveWideImmShift::B16,
+                },
             });
         }
     }
@@ -440,7 +442,7 @@ impl AsmGenContext {
         self.save_word_at_inst(self.curr_inst.unwrap());
     }
 
-    pub fn save_word_at_inst(&mut self, val: Value) {
+    pub fn save_word_at_inst(&mut self, val: IrInst) {
         match self.allocation.get(&val).unwrap() {
             AllocationState::Register(register) => {
                 let source = self.reg_pool.take_register();
@@ -477,6 +479,7 @@ impl AsmGenContext {
         import_reg_and_inst!();
         if (-2048..2048).contains(&offset) {
             let temp_reg = self.reg_pool.take_register();
+            let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
             self.write_inst(sdr {
                 rd: temp_reg,
                 rs: sp,
@@ -500,10 +503,10 @@ impl AsmGenContext {
         import_reg_and_inst!();
         let val_reg = self.reg_pool.take_register();
         let address_reg = self.reg_pool.take_register();
-        self.write_inst(sw {
-            rs2: val_reg,
-            imm12: 0,
-            rs1: address_reg,
+        self.write_inst(sdr {
+            rd: val_reg,
+            rs: address_reg,
+            offset: LoadSaveOffset::Imm12(0),
         });
     }
 
@@ -549,8 +552,8 @@ impl AsmGenContext {
 
     #[inline]
     pub fn load_word_sp(&mut self, offset: i32) {
-        use Register::sp;
         import_reg_and_inst!();
+        let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
         if (-2048..2048).contains(&offset) {
             let temp_reg = self.reg_pool.alloc_temp();
             self.write_inst(ldr {
@@ -574,9 +577,15 @@ impl AsmGenContext {
     pub fn load_address(&mut self, label: String) {
         import_reg_and_inst!();
         let temp_reg = self.reg_pool.alloc_temp();
-        self.write_inst(la {
+        // use adrp + add to load address of global variable.
+        self.write_inst(adrp {
             rd: temp_reg,
-            label,
+            label: label.clone(),
+        });
+        self.write_inst(add {
+            rd: temp_reg,
+            rs1: temp_reg,
+            rs2: AddSubOperand::AddrLo12(label),
         });
     }
 
@@ -584,10 +593,10 @@ impl AsmGenContext {
         import_reg_and_inst!();
         let address_reg = self.reg_pool.take_register();
         let value_reg = self.reg_pool.alloc_temp();
-        self.write_inst(lw {
+        self.write_inst(ldr {
             rd: value_reg,
-            imm12: 0,
             rs: address_reg,
+            offset: LoadSaveOffset::Imm12(0),
         });
     }
 
@@ -660,7 +669,7 @@ impl AsmGenContext {
                 rs1: lhs,
                 rs2: rhs,
             }),
-            BinaryOp::Mod => self.write_inst(rem {
+            BinaryOp::Rem => self.write_inst(rem {
                 rd: res,
                 rs1: lhs,
                 rs2: rhs,
@@ -685,7 +694,11 @@ impl AsmGenContext {
     pub fn ret(&mut self) {
         import_reg_and_inst!();
         let source = self.reg_pool.take_register();
-        self.write_inst(mv { rd: a0, rs: source });
+        let x0 = Register::I(IReg(Bit::b64, IntRegister::x0));
+        self.write_inst(mov {
+            rd: x0,
+            src: MovOperand::Register(source),
+        });
         self.epilogue_stack
             .last_mut()
             .unwrap()
@@ -696,9 +709,9 @@ impl AsmGenContext {
 
     fn mv(&mut self, source: Register, dest: Register) {
         import_reg_and_inst!();
-        self.write_inst(mv {
+        self.write_inst(mov {
             rd: dest,
-            rs: source,
+            src: MovOperand::Register(source),
         });
     }
 

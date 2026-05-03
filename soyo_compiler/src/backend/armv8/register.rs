@@ -1,5 +1,7 @@
+use num_enum::{IntoPrimitive, TryFromPrimitive};
+
 #[allow(non_camel_case_types)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Bit {
     b128,
     b64,
@@ -19,7 +21,9 @@ impl Bit {
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, TryFromPrimitive, IntoPrimitive,
+)]
 #[repr(u8)]
 /// 64-bit integer registers.
 pub enum IntRegister {
@@ -61,7 +65,7 @@ pub enum IntRegister {
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 /// 128-bit floating-point registers.
 pub enum FloatRegister {
@@ -99,10 +103,10 @@ pub enum FloatRegister {
     v31,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct IReg(pub Bit, pub IntRegister);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FReg(pub Bit, pub FloatRegister);
 
 impl IReg {
@@ -140,7 +144,18 @@ impl IReg {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+impl FReg {
+    fn is_caller_saved(&self) -> bool {
+        return !self.is_callee_saved();
+    }
+
+    fn is_callee_saved(&self) -> bool {
+        use FloatRegister::*;
+        matches!(self.1, v8 | v9 | v10 | v11 | v12 | v13 | v14 | v15)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Register {
     I(IReg),
     F(FReg),
@@ -164,5 +179,28 @@ impl Register {
     pub fn temporary(id: usize) -> Register {
         assert!(id < 7, "too many temporary registers");
         Register::I(IReg::temporary(id))
+    }
+
+    pub fn is_arg(&self) -> bool {
+        match self {
+            Register::I(reg) => reg.is_arg(),
+            Register::F(_) => false,
+        }
+    }
+
+    /// Whether this register is callee-saved.
+    /// Previously called `is_saved`.
+    pub fn is_callee_saved(&self) -> bool {
+        match self {
+            Register::I(reg) => reg.is_callee_saved(),
+            Register::F(reg) => reg.is_callee_saved(),
+        }
+    }
+
+    pub fn is_caller_saved(&self) -> bool {
+        match self {
+            Register::I(reg) => reg.is_caller_saved(),
+            Register::F(reg) => reg.is_caller_saved(),
+        }
     }
 }

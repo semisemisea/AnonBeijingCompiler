@@ -6,7 +6,7 @@ mod register_manager;
 
 use raana_ir::ir::{
     Binary, BlockArgRef, Branch, Call, FunctionData, GetElemPtr, GetPtr, Inst, InstKind, Integer,
-    Jump, Load, Program, Return, Store, Type, TypeKind,
+    Jump, Load, Program, Return, Store, Type, TypeKind, arena::Arena,
 };
 
 use crate::backend::armv8::register::Register;
@@ -17,10 +17,10 @@ use register_alloc::RegisterAllocationResult;
 const AUTO_FUNC_ARG_ON_STACK: bool = true;
 
 #[inline]
-pub fn inst_size(func: &FunctionData, val: Inst) -> usize {
-    match func.dfg().value(val).kind() {
-        InstKind::Alloc => ptr_size(func.dfg().value(val).ty()),
-        _ => func.dfg().value(val).ty().size(),
+pub fn inst_size(func: &FunctionData, inst: Inst) -> usize {
+    match func.inst_data(inst).kind() {
+        InstKind::Alloc => ptr_size(func.inst_data(inst).ty()),
+        _ => func.inst_data(inst).ty().size(),
     }
 }
 
@@ -48,18 +48,20 @@ impl GenerateAsm for FunctionData {
                 .iter()
                 .take(8)
                 .fold(curr_offset, |acc_offset, &param| {
-                    use crate::riscv_utils::Register::a0;
+                    use crate::backend::armv8::register::*;
                     ctx.insert_inst(param, acc_offset);
                     // ctx.load_to_register(program, param);
                     let InstKind::FuncArgRef(arg_ref) =
-                        ctx.curr_func_data(program).dfg().value(param).kind()
+                        ctx.curr_func_data(program).inst_data(param).kind()
                     else {
                         unreachable!()
                     };
-                    let reg = (a0 as u8 + arg_ref.index() as u8).try_into().unwrap();
-                    ctx.alloc_para_reg(reg);
+                    let reg: IntRegister = (IntRegister::x0 as u8 + arg_ref.index() as u8)
+                        .try_into()
+                        .unwrap();
+                    ctx.alloc_para_reg(Register::I(IReg(Bit::b64, reg)));
                     ctx.save_word_at_inst(param);
-                    acc_offset + self.dfg().value(param).ty().size()
+                    acc_offset + self.inst_data(param).ty().size()
                 })
         } else {
             curr_offset
@@ -71,28 +73,29 @@ impl GenerateAsm for FunctionData {
             // TODO:
             .fold(offset, |acc_offset, &param| {
                 ctx.insert_inst(param, acc_offset);
-                acc_offset + self.dfg().value(param).ty().size()
+                acc_offset + self.inst_data(param).ty().size()
             });
 
         for &bb_param in self
             .layout()
-            .bbs()
+            .basicblocks()
             .iter()
-            .flat_map(|(&bb, _)| self.dfg().bb(bb).params())
+            .flat_map(|&bb| self.bb_data(bb.bb()).params())
         {
             ctx.insert_inst(bb_param, curr_offset);
             curr_offset += inst_size(self, bb_param);
         }
 
         // then handle each instruction.
-        for (&bb, node) in self.layout().bbs() {
-            if self.dfg().bb(bb).name().as_ref().unwrap() != "%entry" {
+        for &layout in self.layout().basicblocks() {
+            let bb = layout.bb();
+            let insts = layout.insts();
+            if self.bb_data(bb).name() != "%entry" {
                 ctx.decr_indent();
                 ctx.writeln(&format!("{}:", ctx.get_bb_name(bb, program)));
                 ctx.incr_indent();
             }
-            let insts_iter = node.insts().keys();
-            for &inst in insts_iter {
+            for &inst in insts {
                 // update the current instruction.
                 let single_inst_size = inst_size(self, inst);
                 if single_inst_size != 0 {
@@ -394,8 +397,7 @@ impl GenerateAsm for Alloc {
     /// alloc is marker instruction for IR representation, we have already allocate a stack(sp) to
     /// store the instruction, so it won't have counterpart in RISC-V instruction
     #[allow(unused)]
-    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
-    }
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {}
 }
 
 /// ```

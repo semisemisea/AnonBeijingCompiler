@@ -4,7 +4,7 @@ use raana_ir::fmt::writer::Writer;
 use crate::frontend::utils::AstGenContext;
 use frontend::utils::ToRaanaIR;
 
-// mod backend;
+mod backend;
 mod cli;
 mod context;
 mod frontend;

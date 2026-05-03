@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::ir::arena::Arena;
-use crate::ir::{Program, builder_trait::*};
+use crate::ir::builder_trait::*;
 use crate::opt::pass::ArenaContext;
 use crate::opt::utils::{self, BId, CFGGraph, DomTree, IDAllocator, IDomMap, VId};
 
+use log::{debug, info, trace};
 const FUNC_ARG_OPT_ENABLE: bool = false;
 
 use crate::{
@@ -38,19 +39,18 @@ impl Pass for SSATransform {
             return;
         }
 
-        eprintln!("----------------------------------");
-        eprintln!("function: {:?}", data.curr_func.unwrap());
-        eprintln!("name: {}", data.name());
+        debug!("----------------------------------");
+        debug!("function: {:?}", data.curr_func.unwrap());
+        debug!("name: {}", data.name());
 
         // Discretization. Assign each unique basic block with natural number 0..n
         let mut bb_id = IDAllocator::new(1);
 
-        eprintln!("showing");
-        eprintln!("finished");
+        debug!("showing");
         // get graph and reverse graph
         let (graph, prece) = utils::build_cfg_both(data, &mut bb_id);
-        eprintln!("graph: {graph:?}");
-        eprintln!("prece: {prece:?}");
+        debug!("graph: {graph:?}");
+        debug!("prece: {prece:?}");
 
         // entry_bb must get 0 for id
         assert!(bb_id.get_id(&data.layout().entry_bb().unwrap().bb()) == 0);
@@ -58,26 +58,26 @@ impl Pass for SSATransform {
         let rpo_path = utils::rpo_path(&graph);
         // start from entry_bb so first element of RPO is zero
         assert!(rpo_path[0] == 0);
-        eprintln!("rpo_path: {rpo_path:?}");
+        debug!("rpo_path: {rpo_path:?}");
 
         // get immediate dominator of each block
         // dominance is a partial order.
         // immediate dominance means partial order coverage
         let idom_map = utils::idom(&prece, &rpo_path);
-        eprintln!("idom_map: {idom_map:?}");
+        debug!("idom_map: {idom_map:?}");
 
         // for dominance, its hasse diagram is a tree
         let donimnace_tree = utils::build_dominance_tree(&idom_map, rpo_path.len());
-        eprintln!("dominance_tree: {donimnace_tree:?}");
+        debug!("dominance_tree: {donimnace_tree:?}");
 
         // then we can do frontier analysis
         let dom_frontier = dominance_analysis(&bb_id, &prece, &idom_map);
-        eprintln!("dominance_frontier: {dom_frontier:?}");
+        debug!("dominance_frontier: {dom_frontier:?}");
 
         // find out where are varaibles defined.
         let mut val_id = IDAllocator::new(1);
         let val_usage = variable_analysis(&mut val_id, &mut bb_id, data);
-        eprintln!("val_usage: {val_usage:?}");
+        debug!("val_usage: {val_usage:?}");
 
         // variable(vid) is insert as basic block(bbid) at index(usize)
         let mut insert_table = vec![vec![]; bb_id.cnt()];
@@ -145,9 +145,9 @@ impl Pass for SSATransform {
             data.remove_inst(inst);
         });
 
-        eprintln!();
-        eprintln!("----------------------------------");
-        eprintln!();
+        debug!("");
+        debug!("----------------------------------");
+        debug!("");
     }
 }
 

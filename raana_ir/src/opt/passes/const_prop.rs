@@ -6,7 +6,7 @@ use crate::ir::arena::Arena;
 use crate::opt::pass::{ArenaContext, Pass};
 
 use crate::ir::{
-    BasicBlock, BinaryOp, Function, FunctionData, Inst, InstKind,
+    BasicBlock, BinaryOp, FunctionData, Inst, InstKind,
     builder_trait::{LocalInstBuilder, ScalarInstBuilder},
 };
 
@@ -124,8 +124,14 @@ impl Pass for SparseConditionConstantPropagation {
         let mut value_status_map = InstStatusMap::new();
 
         for (&val, val_data) in data.inst_datas() {
-            if let InstKind::Integer(int) = val_data.kind() {
-                value_status_map.insert(val, VariableStatus::new_with_const(int.value()));
+            match val_data.kind() {
+                InstKind::Integer(int) => {
+                    value_status_map.insert(val, VariableStatus::new_with_const(int.value()));
+                }
+                InstKind::Float(..) => {
+                    value_status_map.insert(val, VariableStatus::Bottom);
+                }
+                _ => (),
             }
         }
 
@@ -144,9 +150,6 @@ impl Pass for SparseConditionConstantPropagation {
                 }
                 edge_visited.insert(edge);
                 let current_bb = bb_allocator.search_id(edge.1);
-                // for &param in data.dfg().bb(current_bb).params() {
-                //     belongs_to.insert(param, current_bb);
-                // }
 
                 if !vertex_visited.contains(&edge.1) {
                     vertex_visited.insert(edge.1);
@@ -167,10 +170,6 @@ impl Pass for SparseConditionConstantPropagation {
                 }
             }
         }
-
-        // eprintln!("showing");
-        // value_status_map.debug(data);
-        // eprintln!("showing");
 
         if REMOVE_FLAG {
             let replace_list = data
@@ -231,6 +230,9 @@ impl Pass for SparseConditionConstantPropagation {
                 // data.remove_bb(bb);
             }
 
+            let ubb = Box::new(super::dce::UnreachableBasicBlock);
+            ubb.run_on(data);
+
             let mut useless_phi_list = Vec::new();
             for layout in data.layout().basicblocks() {
                 let bb_data = data.bb_data(layout.bb());
@@ -270,16 +272,7 @@ impl Pass for SparseConditionConstantPropagation {
                 }
                 .to_vec();
                 for (arg, param) in args.into_iter().zip(params) {
-                    // let used_by = data
-                    //     .dfg()
-                    //     .value(param)
-                    //     .used_by()
-                    //     .iter()
-                    //     .copied()
-                    //     .collect::<Vec<_>>();
-                    // for param_used_by in used_by {
                     visit_and_replace(data, param, arg);
-                    // }
                     data.bb_data_mut(bb).params_mut().retain(|&x| x != param);
                 }
                 match data.inst_data(jump_inst).kind() {
@@ -437,9 +430,25 @@ fn process_instruction(
                 ));
                 Some(influenced)
             }
+            // TODO: Interprocedural SCCP.
             InstKind::Call(..) => value_status_map
                 .insert_or_merge(inst, VariableStatus::new_variable())
                 .then_some(ret_with!(inst)),
+            InstKind::Cast(cast) => {
+                if data.inst_data(inst).ty().is_i32() {
+                    if let InstKind::Float(float) = data.inst_data(cast.src()).kind() {
+                        return value_status_map
+                            .insert_or_merge(
+                                inst,
+                                VariableStatus::new_with_const(float.value() as i32),
+                            )
+                            .then_some(ret_with!(inst));
+                    }
+                }
+                value_status_map
+                    .insert_or_merge(inst, VariableStatus::Bottom)
+                    .then_some(ret_with!(inst))
+            }
             InstKind::Return(..) => None,
             _ => unreachable!(),
         },

@@ -23,8 +23,9 @@ pub enum MoveWideImm {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShiftImm {
+pub enum ShiftSize {
     Imm6(u8),
+    Register(Register),
 }
 
 #[allow(clippy::upper_case_acronyms)]
@@ -170,17 +171,17 @@ pub enum Inst {
     lsl {
         rd: Register,
         rs1: Register,
-        rs2: ShiftImm,
+        rs2: ShiftSize,
     },
     lsr {
         rd: Register,
         rs1: Register,
-        rs2: ShiftImm,
+        rs2: ShiftSize,
     },
     asr {
         rd: Register,
         rs1: Register,
-        rs2: ShiftImm,
+        rs2: ShiftSize,
     },
     ret,
     // memory ops
@@ -210,6 +211,17 @@ pub enum Inst {
     cset {
         rd: Register,
         condition: CsetCondition,
+    },
+    b {
+        label: String,
+    },
+    cbnz {
+        rs: Register,
+        label: String,
+    },
+    cbz {
+        rs: Register,
+        label: String,
     },
     _string {
         indent_level: usize,
@@ -263,13 +275,14 @@ impl fmt::Display for MoveWideImm {
     }
 }
 
-impl fmt::Display for ShiftImm {
+impl fmt::Display for ShiftSize {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ShiftImm::Imm6(value) => {
+            ShiftSize::Imm6(value) => {
                 debug_assert!(*value <= 63);
                 write!(f, "#{value}")
             }
+            ShiftSize::Register(reg) => write!(f, "{reg:?}"),
         }
     }
 }
@@ -341,6 +354,27 @@ impl fmt::Display for LoadSaveOffset {
     }
 }
 
+impl fmt::Display for CsetCondition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CsetCondition::EQ => write!(f, "eq"),
+            CsetCondition::NE => write!(f, "ne"),
+            CsetCondition::CS => write!(f, "cs"),
+            CsetCondition::CC => write!(f, "cc"),
+            CsetCondition::MI => write!(f, "mi"),
+            CsetCondition::PL => write!(f, "pl"),
+            CsetCondition::VS => write!(f, "vs"),
+            CsetCondition::VC => write!(f, "vc"),
+            CsetCondition::HI => write!(f, "hi"),
+            CsetCondition::LS => write!(f, "ls"),
+            CsetCondition::GE => write!(f, "ge"),
+            CsetCondition::LT => write!(f, "lt"),
+            CsetCondition::GT => write!(f, "gt"),
+            CsetCondition::LE => write!(f, "le"),
+        }
+    }
+}
+
 impl fmt::Display for Inst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -364,6 +398,10 @@ impl fmt::Display for Inst {
             Inst::ldr { rd, rs, offset } => write!(f, "ldr {rd:?}, [{rs:?}, {offset}]"),
             Inst::sdr { rs, rd, offset } => write!(f, "sdr {rs:?}, {rd:?}, {offset}"),
             Inst::adrp { rd, label } => write!(f, "adrp {rd:?}, {label}"),
+            Inst::cset { rd, condition } => write!(f, "cset {rd:?}, {condition}"),
+            Inst::b { label } => write!(f, "b {label}"),
+            Inst::cbnz { rs, label } => write!(f, "cbnz {rs:?}, {label}"),
+            Inst::cbz { rs, label } => write!(f, "cbz {rs:?}, {label}"),
             Inst::ret => write!(f, "ret"),
             Inst::_string { indent_level, str } => write!(f, "{}{str}", "\t".repeat(*indent_level)),
         }

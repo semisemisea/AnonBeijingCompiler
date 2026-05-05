@@ -206,26 +206,49 @@ impl AsmGenContext {
         self.inst_list.push(inst);
     }
 
+    /// Generate the prologue of a function.
+    ///
+    /// `offset` is the size of the stack frame, which must be 16-byte aligned.
+    ///
+    /// `call_ra` indicates whether the function will call other functions, which determines
+    /// whether we need to save the return address register `x30`.
+    ///
+    /// `callee_usage` is the set of callee-saved registers used in the function. Note that `x29`
+    /// and `x30` are also callee-saved registers, but should not be included.
+    ///
+    /// When `call_ra` is true, `offset` must includes the space for `x29` and `x30` registers.
     pub fn prologue(&mut self, offset: usize, call_ra: bool, callee_usage: HashSet<Register>) {
-        let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
-        let ra = Register::I(IReg(Bit::b64, IntRegister::x30));
+        // AArch64 要求 sp 始终保持 16 字节对齐
+        assert!(
+            offset % 16 == 0,
+            "AArch64 stack frame size must be 16-byte aligned"
+        );
 
+        let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
+        let x29 = Register::I(IReg(Bit::b64, IntRegister::x29));
+        let x30 = Register::I(IReg(Bit::b64, IntRegister::x30));
         let offset = offset as i32;
 
+        // 分配栈帧
         if offset != 0 {
             self.add_imm(sp, -offset, sp);
         }
 
-        let mut callee_start = if call_ra {
-            self.save_word(ra, offset - 4, sp);
-            8
-        } else {
-            4
-        };
+        // ARMv8中x29和x30储存在低地址端
+        // [sp]     : old x29
+        // [sp + 8] : old x30
+        if call_ra {
+            self.save_word(x29, 0, sp);
+            self.save_word(x30, 8, sp);
+            self.add_imm(x29, 0, sp);
+        }
 
+        // 保存寄存器
+        let mut stack_used: i32 = 0;
         for &reg in callee_usage.iter().sorted() {
-            self.save_word(reg, offset - callee_start, sp);
-            callee_start += 4;
+            // 依次向下填充：[sp + offset - 16], [sp + offset - 24] ...
+            self.save_word(reg, offset - (stack_used + 8), sp);
+            stack_used += 8;
         }
 
         self.epilogue_stack.push(Epilogue {
@@ -233,7 +256,7 @@ impl AsmGenContext {
             call_ra,
             callee_usage,
             finished_once: false,
-        })
+        });
     }
 
     #[inline]

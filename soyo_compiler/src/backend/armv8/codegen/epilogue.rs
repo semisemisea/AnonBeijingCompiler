@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use std::collections::HashSet;
 
 use crate::backend::armv8::codegen::asm_gen_context::AsmGenContext;
@@ -21,18 +22,22 @@ impl Epilogue {
     pub fn finish(&self, ctx: &mut AsmGenContext) {
         use Inst::*;
         use register::*;
+        let x29 = Register::I(IReg(Bit::b64, IntRegister::x29));
+        let x30 = Register::I(IReg(Bit::b64, IntRegister::x30));
         let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
         if self.offset != 0 {
-            let mut callee_start = if self.call_ra {
-                ctx.load_word(ra, self.offset - 4, sp);
-                8
-            } else {
-                4
-            };
+            // 恢复其他 callee-saved 寄存器
+            let mut stack_used = 0;
             for &reg in self.callee_usage.iter().sorted() {
-                ctx.load_word(reg, self.offset - callee_start, sp);
-                callee_start += 4;
+                ctx.load_word(reg, self.offset - (stack_used + 8), sp);
+                stack_used += 8;
             }
+            // 恢复x29和x30
+            if self.call_ra {
+                ctx.load_word(x29, 0, sp);
+                ctx.load_word(x30, 8, sp);
+            }
+            // 回收栈帧
             ctx.add_imm(sp, self.offset, sp);
         }
         ctx.write_inst(ret);

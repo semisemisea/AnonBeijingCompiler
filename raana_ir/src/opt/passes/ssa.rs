@@ -305,7 +305,7 @@ pub fn variable_analysis(
                     skip_func_para -= 1;
                 } else {
                     let ty = utils::alloc_ty(val, data);
-                    if ty.is_i32() {
+                    if ty.is_scalar() {
                         val_id.check_or_alloc_id_same(val);
                         val_usage.push(Vec::new());
                     }

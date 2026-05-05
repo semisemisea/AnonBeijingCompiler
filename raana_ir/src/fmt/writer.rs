@@ -201,7 +201,8 @@ impl Writer<'_> {
         for layout in data.layout().basicblocks() {
             self.visit_bb(layout)?;
         }
-        writeln!(self.buffer, "}}")
+        writeln!(self.buffer, "}}")?;
+        writeln!(self.buffer)
     }
 
     fn visit_bb(&mut self, layout: &BasicBlockLayout) -> std::fmt::Result {
@@ -333,11 +334,22 @@ impl Writer<'_> {
         let callee_data = self.arena.func_data(call.callee());
         write!(
             self.buffer,
-            "call <name = {}, type = {}, size = {}>",
+            "call <name = {}, type = {}, size = {}",
             callee_data.name(),
             callee_data.ret_ty(),
             callee_data.ret_ty().size()
-        )
+        )?;
+        if !call.args().is_empty() {
+            write!(self.buffer, ", args = (")?;
+            let Some((&last, rest)) = call.args().split_last() else {
+                unreachable!();
+            };
+            for &inst in rest {
+                write!(self.buffer, "{}, ", get_name!(self, inst))?;
+            }
+            write!(self.buffer, "{})", get_name!(self, last))?;
+        }
+        write!(self.buffer, ">")
     }
 
     fn visit_get_elem_ptr(&mut self, get_elem_ptr: &GetElemPtr) -> std::fmt::Result {
@@ -470,6 +482,7 @@ entry:
     %0 = add 1, 2 <type = i32, size = 4>
     ret
 }
+
 ",
         );
     }

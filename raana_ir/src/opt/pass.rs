@@ -4,7 +4,7 @@ use itertools::Itertools;
 
 use crate::{
     ir::{Function, FunctionData, Program, arena::Arena},
-    opt::{self, passes::ssa},
+    opt::passes::*,
 };
 
 pub struct ArenaContext<'a> {
@@ -95,8 +95,11 @@ impl PassesManager {
             let ssa = Box::new(ssa::SSATransform);
             p.register(ssa);
 
-            let sccp = Box::new(opt::passes::const_prop::SparseConditionConstantPropagation);
+            let sccp = Box::new(const_prop::SparseConditionConstantPropagation);
             p.register(sccp);
+
+            let gvn = Box::new(gvn::GlobalInstNumbering);
+            p.register(gvn);
             p
         })
     }

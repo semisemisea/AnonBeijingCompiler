@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 
-use crate::ir::{BinaryOp, Function, FunctionData, Inst, InstKind};
+use log::debug;
 
-use crate::opt::pass::Pass;
+use crate::ir::arena::Arena;
+use crate::ir::{BinaryOp, Inst, InstKind, Type};
+
+use crate::opt::pass::{ArenaContext, Pass};
 
 use crate::opt::utils::{self, BIDAlloc, BId, DomTree, IDAllocator, VIDAlloc};
 
@@ -12,10 +15,15 @@ type InstNumber = usize;
 
 #[derive(Debug, Hash, Clone, Copy, PartialEq, Eq)]
 enum InstType {
-    Const(i32),
+    Int(i32),
+    // Bit-representation of a f32 value.
+    Float(u32),
     // in the SSA-form, everything is constant.
-    // Here variable means: We don't know the value at comptime.
+    // Here variable means: We can't easily know the value at comptime.
     Var(InstNumber),
+    Cast {
+        src: InstNumber,
+    },
     Binary {
         op: BinaryOp,
         lhs: InstNumber,
@@ -41,7 +49,7 @@ enum InstType {
     // },
 }
 
-fn is_op_commutative(op: &BinaryOp) -> bool {
+fn is_op_commutative(op: BinaryOp) -> bool {
     matches!(
         op,
         BinaryOp::Add
@@ -56,13 +64,16 @@ fn is_op_commutative(op: &BinaryOp) -> bool {
 
 impl InstType {
     fn build_from_value(
-        data: &FunctionData,
+        data: &ArenaContext<'_>,
         value: Inst,
         val_id: &mut VIDAlloc,
     ) -> Option<InstType> {
-        match data.dfg().value(value).kind() {
-            InstKind::Integer(integer) => Some(Self::Const(integer.value())),
-            InstKind::Float(float) => todo!(),
+        match data.inst_data(value).kind() {
+            InstKind::Integer(integer) => Some(Self::Int(integer.value())),
+            InstKind::Float(float) => Some(Self::Float(float.value().to_bits())),
+            InstKind::Cast(cast) => Some(Self::Cast {
+                src: val_id.check_or_alloc_id_same(cast.src()),
+            }),
             InstKind::Load(..)
             | InstKind::Call(..)
             | InstKind::Alloc
@@ -74,25 +85,25 @@ impl InstType {
             InstKind::GlobalAlloc(_global_alloc) => unreachable!(),
             InstKind::Store(_store) => None,
             InstKind::GetPtr(get_ptr) => Some(Self::GetPtr {
-                source: val_id.check_or_alloc_id_same(get_ptr.src()),
-                index: val_id.check_or_alloc_id_same(get_ptr.index()),
+                source: val_id.check_or_alloc_id_same(get_ptr.base()),
+                index: val_id.check_or_alloc_id_same(get_ptr.offset()),
             }),
             InstKind::GetElemPtr(get_elem_ptr) => Some(Self::GetElemPtr {
-                source: val_id.check_or_alloc_id_same(get_elem_ptr.src()),
-                index: val_id.check_or_alloc_id_same(get_elem_ptr.index()),
+                source: val_id.check_or_alloc_id_same(get_elem_ptr.base()),
+                index: val_id.check_or_alloc_id_same(get_elem_ptr.offset()),
             }),
             InstKind::Binary(binary) => {
                 let lhs = val_id.check_or_alloc_id_same(binary.lhs());
                 let rhs = val_id.check_or_alloc_id_same(binary.rhs());
                 if is_op_commutative(binary.op()) {
                     Some(Self::Binary {
-                        op: binary.op().clone(),
+                        op: binary.op(),
                         lhs: lhs.min(rhs),
                         rhs: rhs.max(lhs),
                     })
                 } else {
                     Some(Self::Binary {
-                        op: binary.op().clone(),
+                        op: binary.op(),
                         lhs,
                         rhs,
                     })
@@ -136,13 +147,13 @@ impl LayeredMap {
 }
 
 impl Pass for GlobalInstNumbering {
-    fn run_on(&mut self, _func: Function, data: &mut FunctionData) {
+    fn run_on(&self, data: &mut ArenaContext<'_>) {
         // function declaration. we just have to skip it.
         if data.layout().entry_bb().is_none() {
             return;
         }
-        eprintln!("----------------------------------------------------");
-        eprintln!("gvn start: {:?}", data.name());
+        debug!("----------------------------------------------------");
+        debug!("gvn start: {:?}", data.name());
 
         let mut bb_alloc = IDAllocator::new(1);
         let mut val_alloc = IDAllocator::new(1);
@@ -162,23 +173,22 @@ impl Pass for GlobalInstNumbering {
             layered_type_map: &mut LayeredMap,
             val_alloc: &mut VIDAlloc,
             bb_alloc: &mut BIDAlloc,
-            data: &mut FunctionData,
+            data: &mut ArenaContext<'_>,
         ) {
             layered_type_map.new_scope();
             let bb = bb_alloc.search_id(bb_id);
 
             let mut to_replace = Vec::new();
             let iter = data
-                .dfg()
-                .bb(bb)
+                .bb_data(bb)
                 .params()
                 .iter()
-                .chain(data.layout().bbs().node(&bb).unwrap().insts().keys())
+                .chain(data.layout().basicblock(bb).insts().iter())
                 .copied();
 
             for val in iter {
                 if let Some(expr) = InstType::build_from_value(data, val, val_alloc) {
-                    eprintln!("epxr: {:?}", expr);
+                    debug!("epxr: {:?}", expr);
                     if let Some(rep_with) = layered_type_map.get(&expr) {
                         to_replace.push((val, rep_with))
                     } else {
@@ -206,6 +216,6 @@ impl Pass for GlobalInstNumbering {
             data,
         );
 
-        eprintln!("----------------------------------------------------");
+        debug!("----------------------------------------------------");
     }
 }

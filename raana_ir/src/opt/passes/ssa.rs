@@ -176,6 +176,7 @@ fn dfs(
     let values = bb_data.insts().iter().copied().collect::<Vec<_>>();
     for val in values {
         let val_data = data.inst_data(val);
+        let ty = val_data.ty().clone();
         // Step 2.3: Delete `load` and replace every use of `load` with value of variable.
         // Step 2.4: For `jump` and `branch`, update its arguments.
         match val_data.kind() {
@@ -197,7 +198,10 @@ fn dfs(
             }
             InstKind::Load(load) => {
                 if let Some(&load_id) = val_id.get_id_safe(&load.src()) {
-                    let rep_with = *st[load_id].last().unwrap();
+                    let rep_with = st[load_id]
+                        .last()
+                        .copied()
+                        .unwrap_or_else(|| data.new_local_inst().undef(ty));
                     utils::visit_and_replace(data, val, rep_with);
                     remove_list.push((val, bb));
                 }

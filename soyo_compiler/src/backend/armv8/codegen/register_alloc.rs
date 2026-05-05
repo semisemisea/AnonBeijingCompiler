@@ -396,9 +396,9 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
 
     let offset = {
         let unaligned = curr_inst_offset
-            + if call_ra { 4 } else { 0 }
-            + extra_args * 4
-            + register_manager.callee_used.len() * 4;
+            + if call_ra { 16 } else { 0 }
+            + extra_args * 8
+            + register_manager.callee_used.len() * 8;
         if unaligned & 0x0F != 0 {
             (unaligned | 0x0F) + 1
         } else {

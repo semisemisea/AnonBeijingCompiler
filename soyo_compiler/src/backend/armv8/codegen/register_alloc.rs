@@ -9,7 +9,7 @@ use itertools::Itertools;
 use raana_ir::ir::{FunctionData, Inst, InstKind};
 use raana_ir::opt::utils::{IDAllocator, VIDAlloc, get_terminator_inst};
 
-use crate::backend::armv8::register::Register;
+use crate::backend::armv8::register::{Bit, IReg, IntRegister, Register};
 
 type VRegister = Reverse<Register>;
 
@@ -64,9 +64,12 @@ impl VirtualRegister {
     #[inline]
     fn new(max_size: usize) -> VirtualRegister {
         Self {
-            container: BinaryHeap::from_iter(
-                (0..max_size as u8).map(|x| Reverse(x.try_into().unwrap())),
-            ),
+            container: BinaryHeap::from_iter((0..max_size as u8).map(|x| {
+                Reverse(Register::I(IReg(
+                    Bit::b64,
+                    IntRegister::try_from(x).unwrap(),
+                )))
+            })),
             rules: HashMap::new(),
             loops: Vec::new(),
             callee_used: HashSet::new(),
@@ -205,8 +208,8 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                 add_loop!(jump.target());
             }
             InstKind::Branch(branch) => {
-                add_loop!(branch.true_bb());
-                add_loop!(branch.false_bb());
+                add_loop!(branch.t_target());
+                add_loop!(branch.f_target());
             }
             InstKind::Return(..) => {}
             _ => unreachable!(),

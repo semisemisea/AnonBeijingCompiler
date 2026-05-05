@@ -177,6 +177,11 @@ impl Register {
         }
     }
 
+    pub fn arguments(idx: usize) -> Register {
+        assert!(idx < 8, "too many arguments");
+        Register::I(IReg(Bit::b64, IntRegister::try_from(idx as u8).unwrap()))
+    }
+
     pub fn temporary(id: usize) -> Register {
         assert!(id < 7, "too many temporary registers");
         Register::I(IReg::temporary(id))

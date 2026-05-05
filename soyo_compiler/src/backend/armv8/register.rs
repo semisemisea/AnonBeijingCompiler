@@ -57,10 +57,11 @@ pub enum IntRegister {
     x27,
     x28,
     x29,
+    /// LR, link register, equivalent to `ra` in RISC-V.
     x30,
-    // zero
+    /// zero
     xzr,
-    // stack pointer
+    /// stack pointer
     sp,
 }
 

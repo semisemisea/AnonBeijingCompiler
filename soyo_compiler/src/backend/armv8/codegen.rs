@@ -1,4 +1,4 @@
-mod asm_gen_context;
+pub(crate) mod asm_gen_context;
 mod epilogue;
 mod generate_asm;
 mod register_alloc;
@@ -27,7 +27,8 @@ pub fn inst_size(func: &FunctionData, inst: Inst) -> usize {
 
 impl GenerateAsm for FunctionData {
     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
-        ctx.writeln(&format!("{}:", self.name().strip_prefix("@").unwrap()));
+        // ctx.writeln(&format!("{}:", self.name().strip_prefix("@").unwrap()));
+        ctx.writeln(&format!("{}:", self.name()));
         ctx.incr_indent();
 
         let RegisterAllocationResult {
@@ -118,7 +119,7 @@ impl GenerateAsm for Inst {
         // FIXME: maybe incorrect use of curr_func_data
         match ctx.curr_func_data(program).inst_data(*self).kind() {
             InstKind::Integer(int) => int.generate(program, ctx),
-            InstKind::Alloc => todo!(),
+            InstKind::Alloc => {}
             InstKind::Store(store) => store.generate(program, ctx),
             InstKind::Load(load) => load.generate(program, ctx),
             InstKind::Branch(branch) => branch.generate(program, ctx),
@@ -362,7 +363,7 @@ impl GenerateAsm for Binary {
     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         ctx.load_to_register(program, self.lhs());
         ctx.load_to_register(program, self.rhs());
-        ctx.binary_op(*self.op());
+        ctx.binary_op(self.op());
         ctx.save_word_at_curr_inst();
     }
 }

@@ -211,3 +211,36 @@ impl Register {
         }
     }
 }
+
+impl core::fmt::Display for Register {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Register::I(IReg(sz, reg)) => {
+                if *reg == IntRegister::sp {
+                    return write!(f, "{}sp", if *sz == Bit::b64 { "" } else { "w" });
+                }
+                let prefix = match sz {
+                    Bit::b128 => unreachable!(),
+                    Bit::b64 => "x",
+                    Bit::b32 => "w",
+                    Bit::b16 => unreachable!(),
+                };
+                write!(
+                    f,
+                    "{}{}",
+                    prefix,
+                    format!("{reg:?}").strip_prefix('x').unwrap()
+                )
+            }
+            Register::F(FReg(sz, reg)) => {
+                let prefix = match sz {
+                    Bit::b128 => "v",
+                    Bit::b64 => "d",
+                    Bit::b32 => "h",
+                    Bit::b16 => "s",
+                };
+                write!(f, "{}", format!("{reg:?}").strip_prefix('v').unwrap())
+            }
+        }
+    }
+}

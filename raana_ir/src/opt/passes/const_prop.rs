@@ -153,12 +153,14 @@ impl Pass for SparseConditionConstantPropagation {
 
                 if !vertex_visited.contains(&edge.1) {
                     vertex_visited.insert(edge.1);
-                    for &inst in data.layout().basicblock(current_bb).insts() {
-                        ssa_worklist.push_back(inst);
-                    }
+                    ssa_worklist.extend(data.layout().basicblock(current_bb).insts());
+                    // for &inst in data.layout().basicblock(current_bb).insts() {
+                    //     ssa_worklist.push_back(inst);
+                    // }
                 }
             }
             if let Some(inst) = ssa_worklist.pop_front() {
+                assert!(data.layout().parent_bb(inst).is_some());
                 if let Some(ext) = process_instruction(
                     data,
                     &mut value_status_map,
@@ -273,8 +275,10 @@ impl Pass for SparseConditionConstantPropagation {
                 .to_vec();
                 for (arg, param) in args.into_iter().zip(params) {
                     visit_and_replace(data, param, arg);
-                    data.bb_data_mut(bb).params_mut().retain(|&x| x != param);
+                    // data.bb_data_mut(bb).params_mut().retain(|&x| x != param);
                 }
+                // TODO: Is this correct for used_by?
+                data.bb_data_mut(bb).params_mut().clear();
                 match data.inst_data(jump_inst).kind() {
                     InstKind::Jump(jump) => {
                         let target_bb = jump.target();
@@ -326,7 +330,7 @@ fn process_instruction(
                 .iter()
                 .filter(|&&val| {
                     let Some(parent_bb) = data.layout().parent_bb(val) else {
-                        return true;
+                        return false;
                     };
                     bb_allocator.get_id_safe(&parent_bb).is_some()
                 })
@@ -357,7 +361,15 @@ fn process_instruction(
                             int.value()
                         } else {
                             match value_status_map.get($e) {
-                                VariableStatus::Top => unreachable!(),
+                                VariableStatus::Top => {
+                                    unreachable!(
+                                        "{} as {:?} \n{}: {:?}",
+                                        inst,
+                                        data.inst_data(inst),
+                                        $e,
+                                        data.inst_data($e)
+                                    )
+                                }
                                 VariableStatus::Constant(constant) => *constant,
                                 VariableStatus::Bottom => {
                                     return value_status_map

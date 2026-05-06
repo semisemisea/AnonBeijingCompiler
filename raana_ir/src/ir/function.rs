@@ -150,4 +150,9 @@ impl FunctionArena {
             )
         })
     }
+
+    pub fn funcs(&self) -> impl Iterator<Item = Function> + use<> {
+        (1..FUNCTION_ID.load(Ordering::Relaxed))
+            .map(|n| Function(unsafe { NonZeroU32::new_unchecked(n) }))
+    }
 }

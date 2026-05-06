@@ -1,10 +1,13 @@
-use crate::ir::{
-    arena::{Arena, GlobalArena},
-    basic_block,
-    builder::GlobalBuilder,
-    function::{self, Function, FunctionData, next_function_id},
-    instruction::{self, Inst},
-    types::Type,
+use crate::{
+    fmt::writer::Writer,
+    ir::{
+        arena::{Arena, GlobalArena},
+        basic_block,
+        builder::GlobalBuilder,
+        function::{self, Function, FunctionData, next_function_id},
+        instruction::{self, Inst},
+        types::Type,
+    },
 };
 
 pub struct Program {
@@ -28,6 +31,14 @@ impl Arena for Program {
 
     fn global_mut(&mut self) -> &mut GlobalArena {
         self.global_arena_mut()
+    }
+}
+
+impl std::fmt::Display for Program {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut w = Writer::new(self);
+        w.write().unwrap();
+        write!(f, "{}", w.finish())
     }
 }
 

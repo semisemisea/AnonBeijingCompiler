@@ -86,11 +86,26 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
         f_args: Vec<Inst>,
     ) -> Inst {
         // TODO: Type check
+        let t_param = self.bb_params(t_target);
+        assert_eq!(t_param.len(), t_args.len());
+        for (&param, &arg) in t_param.iter().zip(t_args.iter()) {
+            assert_eq!(self.inst_type(param), self.inst_type(arg));
+        }
+        let f_param = self.bb_params(f_target);
+        assert_eq!(f_param.len(), f_args.len());
+        for (&param, &arg) in f_param.iter().zip(f_args.iter()) {
+            assert_eq!(self.inst_type(param), self.inst_type(arg));
+        }
         self.insert_inst(Branch::new_data(cond, t_target, t_args, f_target, f_args))
     }
 
     fn jump(&mut self, target: BasicBlock, args: Vec<Inst>) -> Inst {
         // TODO: Type check
+        let params = self.bb_params(target);
+        assert_eq!(params.len(), args.len());
+        for (&param, &arg) in params.iter().zip(args.iter()) {
+            assert_eq!(self.inst_type(param), self.inst_type(arg))
+        }
         self.insert_inst(Jump::new_data(target, args))
     }
 

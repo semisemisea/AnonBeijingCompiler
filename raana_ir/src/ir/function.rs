@@ -98,7 +98,7 @@ impl FunctionData {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Function(NonZeroU32);
 // pub type Function = NonZeroU32;
 

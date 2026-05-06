@@ -14,3 +14,6 @@ num_enum = "0.7.6"
 
 [build-dependencies]
 lalrpop = "0.22.1"
+
+[profile.release]
+debug = true

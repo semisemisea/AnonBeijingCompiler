@@ -1,10 +1,50 @@
-use crate::opt::prelude::*;
+use itertools::Itertools;
+
+use crate::opt::prelude::{pure_function::is_pure_function, *};
+use std::{
+    cell::RefCell,
+    collections::hash_map::Entry::{Occupied, Vacant},
+};
 
 pub struct GlobalInstNumbering;
 
 type InstNumber = usize;
 
-#[derive(Debug, Hash, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Hash, Clone, PartialEq, Eq)]
+pub enum Purity {
+    Pure,
+    Impure(u32),
+}
+
+impl Purity {
+    thread_local! {
+        static POOL: RefCell<HashMap<Function, u32>> = RefCell::new(HashMap::new());
+    }
+
+    fn new(program: &Program, func: Function) -> Purity {
+        Self::POOL.with(|pool| match pool.borrow_mut().entry(func) {
+            Vacant(e) => {
+                if is_pure_function(program, func) {
+                    e.insert(0);
+                    Purity::Pure
+                } else {
+                    e.insert(1);
+                    Purity::Impure(1)
+                }
+            }
+            Occupied(mut e) => {
+                if *e.get() > 0 {
+                    *e.get_mut() += 1;
+                    Purity::Impure(*e.get())
+                } else {
+                    Purity::Pure
+                }
+            }
+        })
+    }
+}
+
+#[derive(Debug, Hash, Clone, PartialEq, Eq)]
 enum InstType {
     Int(i32),
     // Bit-representation of a f32 value.
@@ -33,11 +73,11 @@ enum InstType {
     // - If the callee is pure function
     // - If the arguments are all the same.
     // But in simplified GVN pass, we will ingnore this
-
-    // Call {
-    //     callee: koopa::ir::Function,
-    //     args: Vec<InstNumber>,
-    // },
+    Call {
+        purity: Purity,
+        callee: Function,
+        args: Vec<InstNumber>,
+    },
 }
 
 fn is_op_commutative(op: BinaryOp) -> bool {
@@ -65,8 +105,17 @@ impl InstType {
             InstKind::Cast(cast) => Some(Self::Cast {
                 src: val_id.check_or_alloc_id_same(cast.src()),
             }),
+            InstKind::Call(call) => Some(Self::Call {
+                purity: Purity::new(data.program, call.callee()),
+                callee: call.callee(),
+                args: call
+                    .args()
+                    .iter()
+                    .copied()
+                    .map(|inst| val_id.check_or_alloc_id_same(inst))
+                    .collect_vec(),
+            }),
             InstKind::Load(..)
-            | InstKind::Call(..)
             | InstKind::Alloc
             | InstKind::BlockArgRef(..)
             | InstKind::FuncArgRef(..)

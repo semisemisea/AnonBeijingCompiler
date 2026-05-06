@@ -1,3 +1,6 @@
 [workspace]
 resolver = "2"
 members = ["raana_ir", "soyo_compiler"]
+
+[profile.release]
+debug = true

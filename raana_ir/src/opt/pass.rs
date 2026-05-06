@@ -88,9 +88,6 @@ impl PassesManager {
             let ssa = Box::new(ssa::SSATransform);
             p.register(ssa);
 
-            let ubb = dce::UnreachableBasicBlock;
-            p.register(Box::new(ubb));
-
             let sccp = Box::new(const_prop::SparseConditionConstantPropagation);
             p.register(sccp);
 

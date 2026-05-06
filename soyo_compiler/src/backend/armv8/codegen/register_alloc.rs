@@ -6,6 +6,7 @@ use std::{
 };
 
 use itertools::Itertools;
+use raana_ir::ir::{BasicBlock, arena::Arena};
 use raana_ir::ir::{FunctionData, Inst, InstKind};
 use raana_ir::opt::utils::{IDAllocator, VIDAlloc, get_terminator_inst};
 
@@ -125,14 +126,14 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
         val_alloc.check_or_alloc_id_same(fparam);
     }
     for &bb_id in rpo_path.iter() {
-        let bb = bb_alloc.search_id(bb_id);
-        let node = data.layout().bbs().node(&bb).unwrap();
-        let iter = data.dfg().bb(bb).params().iter().chain(node.insts().keys());
+        let bb: BasicBlock = bb_alloc.search_id(bb_id);
+        let insts = data.layout().basicblock(bb).insts();
+        let iter = data.bb_data(bb).params().iter().chain(insts);
 
         for &inst in iter {
             let id = val_alloc.check_or_alloc_id_same(inst);
 
-            if let InstKind::Call(call) = data.dfg().value(inst).kind() {
+            if let InstKind::Call(call) = data.inst_data(inst).kind() {
                 call_ra = true;
                 extra_args = extra_args.max(8.max(call.args().len()) - 8);
                 for index in 0..8 {
@@ -146,20 +147,18 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     }
 
     for &bb_id in rpo_path.iter() {
-        let bb = bb_alloc.search_id(bb_id);
+        let bb: BasicBlock = bb_alloc.search_id(bb_id);
         let terminator_inst = get_terminator_inst(data, bb);
 
         macro_rules! add_loop {
             ($backedge_goes_to: expr) => {
                 if let Some(id) = bb_alloc.get_id_safe(&$backedge_goes_to) {
                     let head_bb = bb_alloc.search_id(*id);
-                    let head_bb_first_inst = *data.dfg().bb(head_bb).params().first().unwrap_or(
+                    let head_bb_first_inst = *data.bb_data(head_bb).params().first().unwrap_or(
                         data.layout()
-                            .bbs()
-                            .node(&head_bb)
-                            .unwrap()
+                            .basicblock(head_bb)
                             .insts()
-                            .front_key()
+                            .get_first()
                             .unwrap(),
                     );
 
@@ -177,8 +176,8 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                             while let Some(curr_id) = worklist.pop() {
                                 let curr_bb = bb_alloc.search_id(curr_id);
 
-                                let curr_node = data.layout().bbs().node(&curr_bb).unwrap();
-                                if let Some(last_inst) = curr_node.insts().back_key() {
+                                let curr_insts = data.layout().basicblock(&curr_bb).insts();
+                                if let Some(last_inst) = curr_insts.get_last() {
                                     if let Some(inst_id) = val_alloc.get_id_safe(last_inst) {
                                         max_loop_id = max_loop_id.max(*inst_id);
                                     }
@@ -203,7 +202,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
             };
         }
 
-        match data.dfg().value(terminator_inst).kind() {
+        match data.inst_data(terminator_inst).kind() {
             InstKind::Jump(jump) => {
                 add_loop!(jump.target());
             }
@@ -283,8 +282,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     macro_rules! insert_range {
         ($inst:expr, $min_id: expr) => {
             let max_id = data
-                .dfg()
-                .value($inst)
+                .inst_data($inst)
                 .used_by()
                 .iter()
                 .filter_map(|&val| val_alloc.get_id_safe(&val))
@@ -302,27 +300,22 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
         insert_range!(fparam, val_alloc.get_id(&fparam));
     }
     for bb_id in rpo_path {
-        let bb = bb_alloc.search_id(bb_id);
-        let node = data.layout().bbs().node(&bb).unwrap();
-        eprintln!("params:{:?}", data.dfg().bb(bb).params());
+        let bb: BasicBlock = bb_alloc.search_id(bb_id);
+        let insts = data.layout().basicblock(bb).insts();
+        eprintln!("params:{:?}", data.bb_data(bb).params());
 
         if let Some(min_id) = data
-            .dfg()
-            .bb(bb)
+            .bb_data(bb)
             .used_by()
             .iter()
             .map(|&val| val_alloc.get_id(&val))
             .min()
         {
-            for &block_param in data.dfg().bb(bb).params() {
+            for &block_param in data.bb_data(bb).params() {
                 insert_range!(block_param, min_id);
             }
         }
-        for &inst in node
-            .insts()
-            .keys()
-            .filter(|&&val| can_produce_value(val, data))
-        {
+        for &inst in insts.iter().filter(|&&val| can_produce_value(val, data)) {
             insert_range!(inst, val_alloc.get_id(&inst));
         }
     }
@@ -357,11 +350,11 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
         macro_rules! alloc_stack {
             ($val: expr) => {
                 register_allocation.insert($val, AllocationState::Stack(curr_inst_offset));
-                curr_inst_offset += crate::ir2riscv::inst_size(data, $val);
+                curr_inst_offset += crate::backend::armv8::codegen::inst_size(data, $val);
             };
         }
 
-        if let InstKind::Alloc = data.dfg().value(val).kind() {
+        if let InstKind::Alloc = data.inst_data(val).kind() {
             alloc_stack!(val);
             continue;
         }
@@ -437,7 +430,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
 
 fn can_produce_value(val: Inst, data: &FunctionData) -> bool {
     matches!(
-        data.dfg().value(val).kind(),
+        data.inst_data(val).kind(),
         InstKind::FuncArgRef(..)
             | InstKind::BlockArgRef(..)
             | InstKind::Alloc

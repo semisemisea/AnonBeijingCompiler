@@ -56,6 +56,7 @@ pub enum IntRegister {
     x26,
     x27,
     x28,
+    // FP, frame pointer
     x29,
     /// LR, link register, equivalent to `ra` in RISC-V.
     x30,

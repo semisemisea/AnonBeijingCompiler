@@ -215,6 +215,9 @@ pub enum Inst {
     b {
         label: String,
     },
+    bl {
+        label: String,
+    },
     cbnz {
         rs: Register,
         label: String,
@@ -400,6 +403,7 @@ impl fmt::Display for Inst {
             Inst::adrp { rd, label } => write!(f, "adrp {rd:?}, {label}"),
             Inst::cset { rd, condition } => write!(f, "cset {rd:?}, {condition}"),
             Inst::b { label } => write!(f, "b {label}"),
+            Inst::bl { label } => write!(f, "bl {label}"),
             Inst::cbnz { rs, label } => write!(f, "cbnz {rs:?}, {label}"),
             Inst::cbz { rs, label } => write!(f, "cbz {rs:?}, {label}"),
             Inst::ret => write!(f, "ret"),

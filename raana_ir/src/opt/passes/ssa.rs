@@ -5,11 +5,11 @@ use crate::ir::builder_trait::*;
 use crate::opt::pass::ArenaContext;
 use crate::opt::utils::{self, BId, CFGGraph, DomTree, IDAllocator, IDomMap, VId};
 
-use log::{debug, info, trace};
+use log::debug;
 const FUNC_ARG_OPT_ENABLE: bool = false;
 
 use crate::{
-    ir::{BasicBlock, Function, FunctionData, Inst, InstKind},
+    ir::{BasicBlock, FunctionData, Inst, InstKind},
     opt::pass::Pass,
 };
 
@@ -33,11 +33,28 @@ type InsertTable = Vec<Vec<(VId, Index)>>;
 type ValStack = Vec<Vec<Inst>>;
 
 impl Pass for SSATransform {
+    fn run(&self, program: &mut crate::ir::Program) {
+        let funcs = program.global_arena().func_arena().funcs();
+        let mut arena_context = ArenaContext {
+            program,
+            curr_func: None,
+        };
+        for func in funcs {
+            arena_context.curr_func = Some(func);
+            self.run_on(&mut arena_context);
+        }
+        let dce = super::dce::DeadCodeElimination;
+        dce.run(program);
+    }
+
     fn run_on(&self, data: &mut ArenaContext<'_>) {
         // function declaration. skip.
         if data.layout().entry_bb().is_none() {
             return;
         }
+
+        let ubb = Box::new(super::dce::UnreachableBasicBlock);
+        ubb.run_on(data);
 
         debug!("----------------------------------");
         debug!("function: {:?}", data.curr_func.unwrap());

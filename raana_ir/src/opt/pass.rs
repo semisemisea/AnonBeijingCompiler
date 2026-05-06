@@ -1,7 +1,5 @@
 use std::sync::OnceLock;
 
-use itertools::Itertools;
-
 use crate::{
     ir::{Function, FunctionData, Program, arena::Arena},
     opt::passes::*,
@@ -48,12 +46,7 @@ impl Arena for ArenaContext<'_> {
 
 pub trait Pass: Send + Sync {
     fn run(&self, program: &mut Program) {
-        let funcs = program
-            .global_arena()
-            .func_arena()
-            .functions()
-            .map(|t| t.0)
-            .collect_vec();
+        let funcs = program.global_arena().func_arena().funcs();
         let mut arena_context = ArenaContext {
             program,
             curr_func: None,
@@ -95,11 +88,20 @@ impl PassesManager {
             let ssa = Box::new(ssa::SSATransform);
             p.register(ssa);
 
+            let ubb = dce::UnreachableBasicBlock;
+            p.register(Box::new(ubb));
+
             let sccp = Box::new(const_prop::SparseConditionConstantPropagation);
             p.register(sccp);
 
             let gvn = Box::new(gvn::GlobalInstNumbering);
             p.register(gvn);
+
+            let dpe = dce::DeadPhiElimination;
+            p.register(Box::new(dpe));
+            let dce = dce::DeadCodeElimination;
+            p.register(Box::new(dce));
+
             p
         })
     }

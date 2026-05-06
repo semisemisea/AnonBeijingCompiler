@@ -8,7 +8,7 @@ use std::{
 use itertools::Itertools;
 use raana_ir::ir::{BasicBlock, arena::Arena};
 use raana_ir::ir::{FunctionData, Inst, InstKind};
-use raana_ir::opt::utils::{IDAllocator, VIDAlloc, build_cfg_both, get_terminator_inst, rpo_path};
+use raana_ir::opt::prelude::*;
 
 use crate::backend::armv8::register::{Bit, IReg, IntRegister, Register};
 
@@ -115,8 +115,8 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     let mut bb_alloc = IDAllocator::new(1);
     let mut val_alloc: VIDAlloc = IDAllocator::new(4);
     // let graph = utils::build_cfg_forward(data, &mut bb_alloc);
-    let (graph, prece) = build_cfg_both(data, &mut bb_alloc);
-    let rpo_path = rpo_path(&graph);
+    let (graph, prece) = cfg::build_cfg_both(data, &mut bb_alloc);
+    let rpo_path = cfg::rpo_path(&graph);
     let mut register_manager = VirtualRegister::new(REGISTER_COUNT);
 
     let mut call_ra = false;
@@ -148,7 +148,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
 
     for &bb_id in rpo_path.iter() {
         let bb: BasicBlock = bb_alloc.search_id(bb_id);
-        let terminator_inst = get_terminator_inst(data, bb);
+        let terminator_inst = utils::get_terminator_inst(data, bb);
 
         macro_rules! add_loop {
             ($backedge_goes_to: expr) => {

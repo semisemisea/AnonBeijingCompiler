@@ -169,11 +169,16 @@ pub trait Arena {
     }
 
     fn remove_inst(&mut self, inst: Inst) -> InstData {
+        // INFO: Or you can choose to dfs wipe everything out.
         assert!(self.inst_data(inst).used_by().is_empty());
         for used in self.inst_data(inst).inst_usage().collect_vec() {
             self.inst_data_mut(used).used_by_mut().remove(&inst);
         }
-        self.local_mut().inst_arena.remove(inst)
+        if inst.is_global() {
+            self.global_mut().inst_arena.remove(inst)
+        } else {
+            self.local_mut().inst_arena.remove(inst)
+        }
     }
 
     #[inline]

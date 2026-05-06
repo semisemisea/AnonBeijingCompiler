@@ -4,6 +4,9 @@ use std::fmt::Write;
 
 use log::info;
 
+const VERBOSE: bool = false;
+
+use crate::ir::BasicBlock;
 use crate::ir::{
     Aggregate, Function, FunctionData, InstKind, Program, Type,
     arena::Arena,
@@ -16,6 +19,7 @@ pub struct Writer<'a> {
     buffer: String,
     arena: ProgramWrapper<'a>,
     symbol: HashMap<Inst, String>,
+    bb_name: HashMap<BasicBlock, String>,
     counter: u32,
 }
 struct ProgramWrapper<'a> {
@@ -64,16 +68,24 @@ macro_rules! put_name {
                 match $self.symbol.entry($inst) {
                     Occupied(..) => {}
                     Vacant(e) => {
-                        e.insert(format!("%{}", name));
-                        $self.counter += 1;
+                        if VERBOSE {
+                            e.insert($inst.to_string());
+                        } else {
+                            e.insert(format!("%{}", name));
+                            $self.counter += 1;
+                        }
                     }
                 };
             } else {
                 match $self.symbol.entry($inst) {
                     Occupied(..) => {}
                     Vacant(e) => {
-                        e.insert(format!("%{}", $self.counter));
-                        $self.counter += 1;
+                        if VERBOSE {
+                            e.insert($inst.to_string());
+                        } else {
+                            e.insert(format!("%{}", $self.counter));
+                            $self.counter += 1;
+                        }
                     }
                 };
             }
@@ -104,6 +116,7 @@ impl Writer<'_> {
                 curr_func: None,
             },
             symbol: HashMap::new(),
+            bb_name: HashMap::new(),
             counter: 0,
         }
     }
@@ -198,6 +211,12 @@ impl Writer<'_> {
             )?;
         }
         writeln!(self.buffer, ">: {{")?;
+        for (index, layout) in data.layout().basicblocks().iter().enumerate() {
+            self.bb_name.insert(
+                layout.bb(),
+                format!("{}_{}", data.bb_data(layout.bb()).name(), index),
+            );
+        }
         for layout in data.layout().basicblocks() {
             self.visit_bb(layout)?;
         }
@@ -210,7 +229,7 @@ impl Writer<'_> {
         for &inst in self.arena.bb_data(layout.bb()).params().iter() {
             put_name!(self, inst)
         }
-        write!(self.buffer, "{}", data.name())?;
+        write!(self.buffer, "{}", self.bb_name.get(&layout.bb()).unwrap())?;
         if let Some((&last, rest)) = data.params().split_last() {
             write!(self.buffer, "(")?;
             for &inst in rest {
@@ -303,7 +322,7 @@ impl Writer<'_> {
         write!(
             self.buffer,
             "{}",
-            self.arena.bb_data(branch.t_target()).name()
+            self.bb_name.get(&branch.t_target()).unwrap()
         )?;
         if let Some((&last, rest)) = branch.t_args().split_last() {
             write!(self.buffer, "(")?;
@@ -317,7 +336,7 @@ impl Writer<'_> {
         write!(
             self.buffer,
             "{}",
-            self.arena.bb_data(branch.f_target()).name()
+            self.bb_name.get(&branch.f_target()).unwrap()
         )?;
         if let Some((&last, rest)) = branch.f_args().split_last() {
             write!(self.buffer, "(")?;
@@ -385,7 +404,7 @@ impl Writer<'_> {
         write!(
             self.buffer,
             "jump {}",
-            self.arena.bb_data(jump.target()).name()
+            self.bb_name.get(&jump.target()).unwrap()
         )?;
         if let Some((&last, rest)) = jump.args().split_last() {
             write!(self.buffer, "(")?;
@@ -478,7 +497,7 @@ global %1 = alloc <init = 5, type = *i32, size = 8>
             &p,
             "\
 define func <name = main, ret_ty = ()>: {
-entry:
+entry_0:
     %0 = add 1, 2 <type = i32, size = 4>
     ret
 }

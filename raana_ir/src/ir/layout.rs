@@ -58,10 +58,6 @@ impl Layout {
         self.bbs.get_mut(*self.back.get(&bb).unwrap()).unwrap()
     }
 
-    fn basicblocks_mut(&mut self) -> &mut IndexList<BasicBlockLayout> {
-        &mut self.bbs
-    }
-
     pub fn push_bb_back(&mut self, bb: BasicBlock) -> index_list::ListIndex {
         let idx = self.bbs.insert_last(BasicBlockLayout::new(bb));
         self.back.insert(bb, idx);

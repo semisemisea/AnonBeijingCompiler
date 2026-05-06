@@ -10,7 +10,8 @@ use crate::ir::{
     builder_trait::{LocalInstBuilder, ScalarInstBuilder},
 };
 
-use crate::opt::utils::{BId, IDAllocator, VId, visit_and_replace};
+use crate::opt::utils::type_alias::*;
+use crate::opt::utils::{IDAllocator, visit_and_replace};
 
 pub struct SparseConditionConstantPropagation;
 

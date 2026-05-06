@@ -1,7 +1,4 @@
-use crate::{
-    ir::{BinaryOp, InstKind, arena::Arena, builder_trait::*},
-    opt::pass::{ArenaContext, Pass},
-};
+use crate::opt::prelude::*;
 
 pub struct StrengthReduction;
 

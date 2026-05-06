@@ -1,24 +1,8 @@
-use std::collections::{HashMap, HashSet, VecDeque};
-
-use crate::ir::arena::Arena;
-use crate::ir::builder_trait::*;
-use crate::opt::pass::ArenaContext;
-use crate::opt::utils::{self, BId, CFGGraph, DomTree, IDAllocator, IDomMap, VId};
-
-use log::debug;
-const FUNC_ARG_OPT_ENABLE: bool = false;
-
-use crate::{
-    ir::{BasicBlock, FunctionData, Inst, InstKind},
-    opt::pass::Pass,
-};
+use crate::opt::prelude::*;
 
 pub struct SSATransform;
 
-// you can replace hashset with more efficient bitset;
-type Set = HashSet<BId>;
-
-type GPath = Vec<BId>;
+const FUNC_ARG_OPT_ENABLE: bool = false;
 
 // not all basic block has it's frontier so we can use HashMap instead of Vec
 type Frontier = HashMap<BId, HashSet<BId>>;
@@ -65,14 +49,14 @@ impl Pass for SSATransform {
 
         debug!("showing");
         // get graph and reverse graph
-        let (graph, prece) = utils::build_cfg_both(data, &mut bb_id);
+        let (graph, prece) = cfg::build_cfg_both(data, &mut bb_id);
         debug!("graph: {graph:?}");
         debug!("prece: {prece:?}");
 
         // entry_bb must get 0 for id
         assert!(bb_id.get_id(&data.layout().entry_bb().unwrap().bb()) == 0);
 
-        let rpo_path = utils::rpo_path(&graph);
+        let rpo_path = cfg::rpo_path(&graph);
         // start from entry_bb so first element of RPO is zero
         assert!(rpo_path[0] == 0);
         debug!("rpo_path: {rpo_path:?}");
@@ -80,11 +64,11 @@ impl Pass for SSATransform {
         // get immediate dominator of each block
         // dominance is a partial order.
         // immediate dominance means partial order coverage
-        let idom_map = utils::idom(&prece, &rpo_path);
+        let idom_map = dom_tree::idom(&prece, &rpo_path);
         debug!("idom_map: {idom_map:?}");
 
         // for dominance, its hasse diagram is a tree
-        let donimnace_tree = utils::build_dominance_tree(&idom_map, rpo_path.len());
+        let donimnace_tree = dom_tree::build_dominance_tree(&idom_map, rpo_path.len());
         debug!("dominance_tree: {donimnace_tree:?}");
 
         // then we can do frontier analysis

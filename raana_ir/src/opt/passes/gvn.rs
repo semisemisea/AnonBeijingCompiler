@@ -1,13 +1,4 @@
-use std::collections::HashMap;
-
-use log::debug;
-
-use crate::ir::arena::Arena;
-use crate::ir::{BinaryOp, Inst, InstKind, Type};
-
-use crate::opt::pass::{ArenaContext, Pass};
-
-use crate::opt::utils::{self, BIDAlloc, BId, DomTree, IDAllocator, VIDAlloc};
+use crate::opt::prelude::*;
 
 pub struct GlobalInstNumbering;
 
@@ -158,14 +149,14 @@ impl Pass for GlobalInstNumbering {
         let mut bb_alloc = IDAllocator::new(1);
         let mut val_alloc = IDAllocator::new(1);
         let mut layered_type_map = LayeredMap::new();
-        let (graph, prece) = utils::build_cfg_both(data, &mut bb_alloc);
+        let (graph, prece) = cfg::build_cfg_both(data, &mut bb_alloc);
 
         // entry bb must be the first to be allocated.
         assert!(bb_alloc.get_id(&data.layout().entry_bb().unwrap().bb()) == 0);
 
-        let rpo_path = utils::rpo_path(&graph);
-        let idom_map = utils::idom(&prece, &rpo_path);
-        let donimnace_tree = utils::build_dominance_tree(&idom_map, rpo_path.len());
+        let rpo_path = cfg::rpo_path(&graph);
+        let idom_map = dom_tree::idom(&prece, &rpo_path);
+        let donimnace_tree = dom_tree::build_dominance_tree(&idom_map, rpo_path.len());
 
         fn dfs(
             bb_id: BId,

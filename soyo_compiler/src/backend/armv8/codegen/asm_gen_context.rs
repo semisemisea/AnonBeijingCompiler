@@ -283,8 +283,8 @@ impl AsmGenContext {
 
     pub fn load_to_para_register(&mut self, program: &Program, val: IrInst, reg: Register) {
         import_reg_and_inst!();
-        // FIXME: fix it when AsmGenContext impls Arena.
-        let data = self.curr_func_data(program).dfg().value(val);
+        // FIXME: maybe incorrect use of curr_func_data
+        let data = self.curr_func_data(program).inst_data(val);
         match data.kind() {
             InstKind::Integer(int) => {
                 self.load_imm(int.value());

@@ -8,7 +8,7 @@ pub struct RegisterManager {
 impl RegisterManager {
     pub(in crate::backend::armv8) fn new() -> RegisterManager {
         RegisterManager {
-            // only using t5 and t6
+            // only using x14 and x15
             temp_usage: 5,
             pool: Vec::with_capacity(16),
         }
@@ -21,7 +21,13 @@ impl RegisterManager {
 
     pub(in crate::backend) fn take_register(&mut self) -> Register {
         let ret = self.pool.pop().unwrap();
-        if matches!(ret, Register::t5 | Register::t6 | Register::zero) {
+        if matches!(
+            ret,
+            Register::I(IReg(
+                _,
+                IntRegister::x14 | IntRegister::x15 | IntRegister::xzr
+            ))
+        ) {
             self.temp_usage -= 1;
         }
         ret

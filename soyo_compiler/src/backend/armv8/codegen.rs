@@ -9,7 +9,8 @@ use raana_ir::ir::{
     Jump, Load, Program, Return, Store, Type, TypeKind, arena::Arena,
 };
 
-use crate::backend::armv8::register::Register;
+use crate::backend::armv8::inst::Inst::bl;
+use crate::backend::armv8::register::{Bit, IReg, IntRegister, Register};
 use asm_gen_context::AsmGenContext;
 use generate_asm::GenerateAsm;
 use register_alloc::RegisterAllocationResult;
@@ -80,14 +81,14 @@ impl GenerateAsm for FunctionData {
             .layout()
             .basicblocks()
             .iter()
-            .flat_map(|&bb| self.bb_data(bb.bb()).params())
+            .flat_map(|bb| self.bb_data(bb.bb()).params())
         {
             ctx.insert_inst(bb_param, curr_offset);
             curr_offset += inst_size(self, bb_param);
         }
 
         // then handle each instruction.
-        for &layout in self.layout().basicblocks() {
+        for layout in self.layout().basicblocks() {
             let bb = layout.bb();
             let insts = layout.insts();
             if self.bb_data(bb).name() != "%entry" {
@@ -114,7 +115,8 @@ impl GenerateAsm for FunctionData {
 
 impl GenerateAsm for Inst {
     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
-        match ctx.curr_func_data(program).dfg().value(*self).kind() {
+        // FIXME: maybe incorrect use of curr_func_data
+        match ctx.curr_func_data(program).inst_data(*self).kind() {
             InstKind::Integer(int) => int.generate(program, ctx),
             InstKind::Alloc => todo!(),
             InstKind::Store(store) => store.generate(program, ctx),
@@ -140,15 +142,16 @@ impl GenerateAsm for Inst {
 /// ```
 impl GenerateAsm for GetPtr {
     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
-        let global_flag = self.src().is_global();
+        let global_flag = self.base().is_global();
         // element type size
         let pointee_size = if global_flag {
-            ptr_size(program.borrow_value(self.src()).ty())
+            ptr_size(program.inst_data(self.base()).ty())
         } else {
-            ptr_size(ctx.curr_func_data(program).dfg().value(self.src()).ty())
+            // FIXME: maybe incorrect use of curr_func_data
+            ptr_size(ctx.curr_func_data(program).inst_data(self.base()).ty())
         };
         // load index to register
-        ctx.load_to_register(program, self.index());
+        ctx.load_to_register(program, self.offset());
         // load element type size to register
         ctx.load_imm(pointee_size as _);
         // do multipication
@@ -156,12 +159,12 @@ impl GenerateAsm for GetPtr {
 
         // get the base address of array
         if global_flag {
-            ctx.load_address(get_glob_var_name(self.src(), program));
+            ctx.load_address(get_glob_var_name(self.base(), program));
             // ctx.load_from_address();
             ctx.add_op();
         } else {
             // let pre_drifted_address = ctx.get_inst_offset(self.src()).unwrap();
-            if let Some(pre_drifted_address) = ctx.register_or_offset(self.src()) {
+            if let Some(pre_drifted_address) = ctx.register_or_offset(self.base()) {
                 ctx.load_word_sp(pre_drifted_address as _);
             }
             ctx.add_op()
@@ -180,21 +183,22 @@ impl GenerateAsm for GetPtr {
 impl GenerateAsm for GetElemPtr {
     // base_addr + elem_ty_size * index
     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
-        let global_flag = self.src().is_global();
+        let global_flag = self.base().is_global();
         let ptr_flag = if global_flag {
             false
         } else {
-            is_ptr(self.src(), ctx.curr_func_data(program))
+            is_ptr(self.base(), ctx.curr_func_data(program))
         };
         // let global_flag = is_get_elem_ptr_from_global(self, ctx.curr_func_data(program));
         // element type size
         let elem_ty_size = if global_flag {
-            ptr_elem_size(program.borrow_value(self.src()).ty())
+            ptr_elem_size(program.inst_data(self.base()).ty())
         } else {
-            ptr_elem_size(ctx.curr_func_data(program).dfg().value(self.src()).ty())
+            // FIXME: maybe incorrect use of curr_func_data
+            ptr_elem_size(ctx.curr_func_data(program).inst_data(self.base()).ty())
         };
         // load index to register
-        ctx.load_to_register(program, self.index());
+        ctx.load_to_register(program, self.offset());
         // load element type size to register
         ctx.load_imm(elem_ty_size as _);
         // do multipication
@@ -202,18 +206,18 @@ impl GenerateAsm for GetElemPtr {
 
         // get the base address of array
         if global_flag {
-            ctx.load_address(get_glob_var_name(self.src(), program));
+            ctx.load_address(get_glob_var_name(self.base(), program));
             // ctx.load_from_address();
             ctx.add_op();
         } else if ptr_flag {
             // let pre_drifted_address = ctx.get_inst_offset(self.src()).unwrap();
-            if let Some(pre_drifted_address) = ctx.register_or_offset(self.src()) {
+            if let Some(pre_drifted_address) = ctx.register_or_offset(self.base()) {
                 ctx.load_word_sp(pre_drifted_address as _);
             }
             ctx.add_op()
         } else {
             // let rel_base_address = ctx.get_inst_offset(self.src()).unwrap();
-            if let Some(rel_base_address) = ctx.register_or_offset(self.src()) {
+            if let Some(rel_base_address) = ctx.register_or_offset(self.base()) {
                 ctx.load_imm(rel_base_address as _);
             }
             // add to the base_address
@@ -241,31 +245,36 @@ impl GenerateAsm for Call {
         let args = self.args();
 
         // function data
-        let func_data = program.func(self.callee());
+        let func_data = program.func_data(self.callee());
 
         // name of the function
         let name = func_data.name().strip_prefix('@').unwrap();
 
         // move the 1st-8th parameters to the register
         for (i, &arg) in args[..8.min(arity)].iter().enumerate() {
-            use Register::*;
-            let rd = (a0 as u8 + i as u8).try_into().unwrap();
+            use IntRegister::*;
+            let rd = Register::I(IReg(
+                Bit::b64,
+                IntRegister::try_from(x0 as u8 + i as u8).unwrap(),
+            ));
             ctx.load_to_para_register(program, arg, rd);
         }
 
         // move the 8th and more parameters to the stack
         for (i, &arg) in args.iter().skip(8).enumerate() {
             ctx.load_to_register(program, arg);
-            ctx.save_word_with_offset(4 * i as i32);
+            // TODO: validate the implementation follows ABI design.
+            // the extra args should be stored at caller's [sp, 8 * i],
+            // so the current code should be correct.
+            ctx.save_word_with_offset(8 * i as i32);
         }
 
         // write the call instruction
-        use crate::riscv_utils::RiscvInst::call;
-        ctx.write_inst(call {
-            callee: name.to_string(),
+        ctx.write_inst(bl {
+            label: name.to_string(),
         });
 
-        let TypeKind::Function(_param_ty, ret_ty) = func_data.ty().kind() else {
+        let TypeKind::Function(_param_ty, ret_ty) = func_data.ret_ty().kind() else {
             unreachable!()
         };
         if !ret_ty.is_unit() {
@@ -300,13 +309,13 @@ impl GenerateAsm for Branch {
     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         ctx.load_to_register(program, self.cond());
         let true_args_and_params = self
-            .true_args()
+            .t_args()
             .iter()
-            .zip(ctx.bb_params(self.true_bb(), program));
+            .zip(ctx.bb_params(self.t_target(), program));
         let false_args_and_params = self
-            .false_args()
+            .f_args()
             .iter()
-            .zip(ctx.bb_params(self.false_bb(), program));
+            .zip(ctx.bb_params(self.f_target(), program));
         true_args_and_params
             .chain(false_args_and_params)
             .for_each(|(&arg, &param)| {
@@ -314,7 +323,7 @@ impl GenerateAsm for Branch {
                 ctx.load_to_register(program, arg);
                 ctx.save_word_at_inst(param);
             });
-        ctx.if_jump(self.true_bb(), self.false_bb(), program);
+        ctx.if_jump(self.t_target(), self.f_target(), program);
     }
 }
 
@@ -353,7 +362,7 @@ impl GenerateAsm for Binary {
     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         ctx.load_to_register(program, self.lhs());
         ctx.load_to_register(program, self.rhs());
-        ctx.binary_op(self.op());
+        ctx.binary_op(*self.op());
         ctx.save_word_at_curr_inst();
     }
 }
@@ -393,12 +402,12 @@ impl GenerateAsm for Load {
     }
 }
 
-impl GenerateAsm for Alloc {
-    /// alloc is marker instruction for IR representation, we have already allocate a stack(sp) to
-    /// store the instruction, so it won't have counterpart in RISC-V instruction
-    #[allow(unused)]
-    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {}
-}
+// impl GenerateAsm for Alloc {
+//     /// alloc is marker instruction for IR representation, we have already allocate a stack(sp) to
+//     /// store the instruction, so it won't have counterpart in RISC-V instruction
+//     #[allow(unused)]
+//     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {}
+// }
 
 /// ```
 /// Store {
@@ -410,18 +419,19 @@ impl GenerateAsm for Store {
     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         if self.dest().is_global() {
             ctx.load_address(get_glob_var_name(self.dest(), program));
-            ctx.load_to_register(program, self.value());
+            ctx.load_to_register(program, self.src());
             ctx.save_word_at_address();
         } else {
-            match ctx.curr_func_data(program).dfg().value(self.dest()).kind() {
+            // FIXME: maybe incorrect use of curr_func_data
+            match ctx.curr_func_data(program).inst_data(self.dest()).kind() {
                 InstKind::GetElemPtr(..) | InstKind::GetPtr(..) => {
                     ctx.load_to_register(program, self.dest());
-                    ctx.load_to_register(program, self.value());
+                    ctx.load_to_register(program, self.src());
                     ctx.save_word_at_address();
                 }
                 _ => {
                     // store the value where it's located.
-                    ctx.load_to_register(program, self.value());
+                    ctx.load_to_register(program, self.src());
                     ctx.save_word_at_inst(self.dest());
                 }
             };
@@ -447,7 +457,7 @@ impl GenerateAsm for Integer {
 fn get_glob_var_name(var: Inst, program: &Program) -> String {
     assert!(var.is_global());
     program
-        .borrow_value(var)
+        .inst_data(var)
         .name()
         .clone()
         .unwrap()
@@ -496,7 +506,7 @@ fn ptr_size(ty: &Type) -> usize {
 #[inline]
 fn is_ptr(val: Inst, func_data: &FunctionData) -> bool {
     matches!(
-        func_data.dfg().value(val).kind(),
+        func_data.inst_data(val).kind(),
         InstKind::GetElemPtr(..) | InstKind::GetPtr(..)
     )
 }

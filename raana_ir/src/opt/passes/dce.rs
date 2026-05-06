@@ -1,26 +1,4 @@
-#![allow(unused)]
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    io::Write,
-    num::NonZeroU32,
-};
-
-use log::{debug, info};
-
-use crate::{
-    ir::{
-        BasicBlock, BinaryOp, Function, FunctionData, Inst, InstData, InstKind, Program,
-        arena::Arena,
-        builder_trait::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
-    },
-    opt::pass::ArenaContext,
-    // opt::{FunctionPass, ModulePass},
-};
-
-use crate::opt::{
-    pass::Pass,
-    utils::{BId, IDAllocator, VId, build_cfg_both},
-};
+use crate::opt::prelude::*;
 
 pub struct DeadPhiElimination;
 pub struct DeadCodeElimination;
@@ -36,7 +14,6 @@ const REMOVE_FLAG: bool = true;
 /// Branches and Return
 impl Pass for DeadCodeElimination {
     fn run(&self, program: &mut Program) {
-        let mut val_id = IDAllocator::new(1);
         let funcs = program.global_arena().func_arena().funcs();
         let mut arena_context = ArenaContext {
             program,
@@ -44,7 +21,7 @@ impl Pass for DeadCodeElimination {
         };
         for func in funcs {
             arena_context.curr_func = Some(func);
-            self.run_on_func(&mut arena_context, &mut val_id);
+            self.run_on_func(&mut arena_context);
         }
     }
 }
@@ -79,25 +56,8 @@ fn is_critical(value: Inst, data: &FunctionData) -> bool {
     }
 }
 
-#[inline]
-fn exists_in_layout(value: Inst, data: &FunctionData) -> bool {
-    matches!(
-        data.inst_data(value).kind(),
-        InstKind::Binary(..)
-            | InstKind::Load(..)
-            | InstKind::GetPtr(..)
-            | InstKind::GetElemPtr(..)
-            | InstKind::Alloc
-            | InstKind::Call(..)
-    )
-}
-
 impl DeadCodeElimination {
-    pub(crate) fn run_on_func(
-        &self,
-        data: &mut ArenaContext<'_>,
-        val_id: &mut IDAllocator<Inst, VId>,
-    ) {
+    pub(crate) fn run_on_func(&self, data: &mut ArenaContext<'_>) {
         let mut worklist = VecDeque::new();
         let mut live_inst = HashSet::new();
 
@@ -267,7 +227,7 @@ impl Pass for UnreachableBasicBlock {
         }
         loop {
             let mut id_allocator = IDAllocator::new(1);
-            let (g, prece) = build_cfg_both(data, &mut id_allocator);
+            let (g, prece) = cfg::build_cfg_both(data, &mut id_allocator);
 
             let unreachable_bb = (1..id_allocator.cnt())
                 // in-degree is zero.
@@ -324,6 +284,8 @@ impl Pass for UnreachableBasicBlock {
 // fn is_jump_inst(val: Inst, data: &FunctionData) -> bool {
 //     matches!(data.dfg().value(val).kind(), InstKind::Jump(..))
 // }
+
+// TODO: This is SimplifyCFG. Please move to a single pass file.
 //
 // impl Pass for JumpOnlyElimination {
 //     fn run_on(&mut self, func: Function, data: &mut FunctionData) {

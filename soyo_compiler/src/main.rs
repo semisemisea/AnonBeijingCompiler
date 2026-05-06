@@ -1,6 +1,7 @@
 use clap::Parser;
 use raana_ir::fmt::writer::Writer;
 
+use crate::backend::armv8::codegen::asm_gen_context::AsmGenContext;
 use crate::frontend::utils::AstGenContext;
 use frontend::utils::ToRaanaIR;
 
@@ -18,7 +19,6 @@ fn main() {
     env_logger::init();
 
     let args = cli::Arg::parse();
-    assert!(args.assembly_only);
 
     let source_code = std::fs::read_to_string(&args.input_path).unwrap();
 
@@ -33,10 +33,21 @@ fn main() {
         pass_manager.run_passes(&mut program);
     }
 
-    let mut writer = Writer::new(&program);
-    writer.write().unwrap();
-    let buf = writer.finish();
-    std::fs::write(&args.output_path, buf).unwrap();
+    if !args.assembly_only {
+        let mut writer = Writer::new(&program);
+        writer.write().unwrap();
+        let buf = writer.finish();
+        std::fs::write(&args.output_path, buf).unwrap();
+    } else {
+        let codegen_ctx = AsmGenContext::new();
+        let insts = codegen_ctx.generate(&program);
+        let buf = insts
+            .iter()
+            .map(|inst| inst.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&args.output_path, buf).unwrap();
+    }
 }
 
 #[cfg(test)]

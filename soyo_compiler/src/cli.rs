@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, clap::Parser)]
 pub(crate) struct Arg {
-    #[arg(short = 'S', default_value_t = true)]
+    #[arg(short = 'S', default_value_t = false)]
     pub(crate) assembly_only: bool,
     #[arg(value_name = "INPUT")]
     pub(crate) input_path: PathBuf,

@@ -191,8 +191,8 @@ pub enum Inst {
         rs: Register,
         offset: LoadSaveOffset,
     },
-    /// Save word: `sdr rs, [rd, offset]`
-    sdr {
+    /// Save word: `str rs, [rd, offset]`
+    str {
         rs: Register,
         rd: Register,
         offset: LoadSaveOffset,
@@ -285,7 +285,7 @@ impl fmt::Display for ShiftSize {
                 debug_assert!(*value <= 63);
                 write!(f, "#{value}")
             }
-            ShiftSize::Register(reg) => write!(f, "{reg:?}"),
+            ShiftSize::Register(reg) => write!(f, "{reg}"),
         }
     }
 }
@@ -308,7 +308,7 @@ impl fmt::Display for Extend {
 impl fmt::Display for ExtendedRegister {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         debug_assert!(self.shift <= 4);
-        write!(f, "{:?}, {}", self.reg, self.extend)?;
+        write!(f, "{}, {}", self.reg, self.extend)?;
         if self.shift != 0 {
             write!(f, " #{}", self.shift)?;
         }
@@ -319,7 +319,7 @@ impl fmt::Display for ExtendedRegister {
 impl fmt::Display for AddSubOperand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AddSubOperand::Register(reg) => write!(f, "{reg:?}"),
+            AddSubOperand::Register(reg) => write!(f, "{reg}"),
             AddSubOperand::Immediate(imm) => write!(f, "{imm}"),
             AddSubOperand::ExtendedRegister(reg) => write!(f, "{reg}"),
             AddSubOperand::AddrLo12(label) => write!(f, ":lo12:{label}"),
@@ -330,7 +330,7 @@ impl fmt::Display for AddSubOperand {
 impl fmt::Display for LogicOperand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LogicOperand::Register(reg) => write!(f, "{reg:?}"),
+            LogicOperand::Register(reg) => write!(f, "{reg}"),
             LogicOperand::BitmaskImmediate(value) => write!(f, "#{value}"),
         }
     }
@@ -339,7 +339,7 @@ impl fmt::Display for LogicOperand {
 impl fmt::Display for MovOperand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MovOperand::Register(reg) => write!(f, "{reg:?}"),
+            MovOperand::Register(reg) => write!(f, "{reg}"),
             MovOperand::Immediate(imm) => write!(f, "{imm}"),
         }
     }
@@ -352,7 +352,7 @@ impl fmt::Display for LoadSaveOffset {
                 debug_assert!(*value <= 4095);
                 write!(f, "#{value}")
             }
-            LoadSaveOffset::Register(reg) => write!(f, "{reg:?}"),
+            LoadSaveOffset::Register(reg) => write!(f, "{reg}"),
         }
     }
 }
@@ -381,32 +381,32 @@ impl fmt::Display for CsetCondition {
 impl fmt::Display for Inst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Inst::mov { rd, src } => write!(f, "mov {rd:?}, {src}"),
-            Inst::movz { rd, imm } => write!(f, "movz {rd:?}, {imm}"),
-            Inst::movn { rd, imm } => write!(f, "movn {rd:?}, {imm}"),
-            Inst::movk { rd, imm } => write!(f, "movk {rd:?}, {imm}"),
-            Inst::add { rd, rs1, rs2 } => write!(f, "add {rd:?}, {rs1:?}, {rs2}"),
-            Inst::sub { rd, rs1, rs2 } => write!(f, "sub {rd:?}, {rs1:?}, {rs2}"),
-            Inst::mul { rd, rs1, rs2 } => write!(f, "mul {rd:?}, {rs1:?}, {rs2:?}"),
-            Inst::sdiv { rd, rs1, rs2 } => write!(f, "sdiv {rd:?}, {rs1:?}, {rs2:?}"),
-            Inst::udiv { rd, rs1, rs2 } => write!(f, "udiv {rd:?}, {rs1:?}, {rs2:?}"),
-            Inst::neg { rd, src } => write!(f, "neg {rd:?}, {src:?}"),
-            Inst::cmp { rs1, rs2 } => write!(f, "cmp {rs1:?}, {rs2}"),
-            Inst::and { rd, rs1, rs2 } => write!(f, "and {rd:?}, {rs1:?}, {rs2}"),
-            Inst::orr { rd, rs1, rs2 } => write!(f, "orr {rd:?}, {rs1:?}, {rs2}"),
-            Inst::eor { rd, rs1, rs2 } => write!(f, "eor {rd:?}, {rs1:?}, {rs2}"),
-            Inst::lsl { rd, rs1, rs2 } => write!(f, "lsl {rd:?}, {rs1:?}, {rs2}"),
-            Inst::lsr { rd, rs1, rs2 } => write!(f, "lsr {rd:?}, {rs1:?}, {rs2}"),
-            Inst::asr { rd, rs1, rs2 } => write!(f, "asr {rd:?}, {rs1:?}, {rs2}"),
-            Inst::ldr { rd, rs, offset } => write!(f, "ldr {rd:?}, [{rs:?}, {offset}]"),
-            Inst::sdr { rs, rd, offset } => write!(f, "sdr {rs:?}, {rd:?}, {offset}"),
-            Inst::adrp { rd, label } => write!(f, "adrp {rd:?}, {label}"),
-            Inst::cset { rd, condition } => write!(f, "cset {rd:?}, {condition}"),
-            Inst::b { label } => write!(f, "b {label}"),
-            Inst::bl { label } => write!(f, "bl {label}"),
-            Inst::cbnz { rs, label } => write!(f, "cbnz {rs:?}, {label}"),
-            Inst::cbz { rs, label } => write!(f, "cbz {rs:?}, {label}"),
-            Inst::ret => write!(f, "ret"),
+            Inst::mov { rd, src } => write!(f, "  mov {rd}, {src}"),
+            Inst::movz { rd, imm } => write!(f, "  movz {rd}, {imm}"),
+            Inst::movn { rd, imm } => write!(f, "  movn {rd}, {imm}"),
+            Inst::movk { rd, imm } => write!(f, "  movk {rd}, {imm}"),
+            Inst::add { rd, rs1, rs2 } => write!(f, "  add {rd}, {rs1}, {rs2}"),
+            Inst::sub { rd, rs1, rs2 } => write!(f, "  sub {rd}, {rs1}, {rs2}"),
+            Inst::mul { rd, rs1, rs2 } => write!(f, "  mul {rd}, {rs1}, {rs2}"),
+            Inst::sdiv { rd, rs1, rs2 } => write!(f, "  sdiv {rd}, {rs1}, {rs2}"),
+            Inst::udiv { rd, rs1, rs2 } => write!(f, "  udiv {rd}, {rs1}, {rs2}"),
+            Inst::neg { rd, src } => write!(f, "  neg {rd}, {src}"),
+            Inst::cmp { rs1, rs2 } => write!(f, "  cmp {rs1}, {rs2}"),
+            Inst::and { rd, rs1, rs2 } => write!(f, "  and {rd}, {rs1}, {rs2}"),
+            Inst::orr { rd, rs1, rs2 } => write!(f, "  orr {rd}, {rs1}, {rs2}"),
+            Inst::eor { rd, rs1, rs2 } => write!(f, "  eor {rd}, {rs1}, {rs2}"),
+            Inst::lsl { rd, rs1, rs2 } => write!(f, "  lsl {rd}, {rs1}, {rs2}"),
+            Inst::lsr { rd, rs1, rs2 } => write!(f, "  lsr {rd}, {rs1}, {rs2}"),
+            Inst::asr { rd, rs1, rs2 } => write!(f, "  asr {rd}, {rs1}, {rs2}"),
+            Inst::ldr { rd, rs, offset } => write!(f, "  ldr {rd}, [{rs}, {offset}]"),
+            Inst::str { rs, rd, offset } => write!(f, "  str {rs}, [{rd}, {offset}]"),
+            Inst::adrp { rd, label } => write!(f, "  adrp {rd}, {label}"),
+            Inst::cset { rd, condition } => write!(f, "  cset {rd}, {condition}"),
+            Inst::b { label } => write!(f, "  b {label}"),
+            Inst::bl { label } => write!(f, "  bl {label}"),
+            Inst::cbnz { rs, label } => write!(f, "  cbnz {rs}, {label}"),
+            Inst::cbz { rs, label } => write!(f, "  cbz {rs}, {label}"),
+            Inst::ret => write!(f, "  ret"),
             Inst::_string { indent_level, str } => write!(f, "{}{str}", "\t".repeat(*indent_level)),
         }
     }

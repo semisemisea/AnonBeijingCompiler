@@ -72,8 +72,10 @@ impl AsmGenContext {
 
     pub fn get_bb_name(&self, bb: BasicBlock, program: &Program) -> String {
         let curr_func = self.curr_func_data(program);
-        let func_name = curr_func.name().strip_prefix("@").unwrap();
-        let bb_name = curr_func.bb_data(bb).name().strip_prefix("%").unwrap();
+        // let func_name = curr_func.name().strip_prefix("@").unwrap();
+        // let bb_name = curr_func.bb_data(bb).name().strip_prefix("%").unwrap();
+        let func_name = curr_func.name();
+        let bb_name = curr_func.bb_data(bb).name();
         format!(".L_{}_{}", func_name, bb_name)
     }
 
@@ -175,7 +177,8 @@ impl AsmGenContext {
                 continue;
             };
 
-            let name = program.func_data(func).name().strip_prefix("@").unwrap();
+            // let name = program.func_data(func).name().strip_prefix("@").unwrap();
+            let name = program.func_data(func).name();
             self.incr_indent();
             self.writeln(".text");
             self.writeln(&format!(".globl {name}"));
@@ -479,21 +482,22 @@ impl AsmGenContext {
         }
     }
 
+    // Save the value in rs2 to the address [rs1 + imm].
     pub fn save_word(&mut self, rs2: Register, imm: i32, rs1: Register) {
         import_reg_and_inst!();
         if (-2048..2048).contains(&imm) {
-            self.write_inst(sdr {
-                rd: rs2,
-                rs: rs1,
+            self.write_inst(str {
+                rs: rs2,
+                rd: rs1,
                 offset: LoadSaveOffset::Imm12(imm as i16),
             });
         } else {
             self.load_imm(imm);
             let imm_reg = self.reg_pool.take_register();
             self.add(imm_reg, rs1, imm_reg);
-            self.write_inst(sdr {
-                rd: rs2,
-                rs: imm_reg,
+            self.write_inst(str {
+                rs: rs2,
+                rd: imm_reg,
                 offset: LoadSaveOffset::Imm12(0),
             });
         }
@@ -505,9 +509,9 @@ impl AsmGenContext {
         if (-2048..2048).contains(&offset) {
             let temp_reg = self.reg_pool.take_register();
             let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
-            self.write_inst(sdr {
-                rd: temp_reg,
-                rs: sp,
+            self.write_inst(str {
+                rs: temp_reg,
+                rd: sp,
                 offset: LoadSaveOffset::Imm12(offset as i16),
             });
         } else {
@@ -515,9 +519,9 @@ impl AsmGenContext {
             self.add_sp();
             let add_temp = self.reg_pool.take_register();
             let temp_reg = self.reg_pool.take_register();
-            self.write_inst(sdr {
-                rd: temp_reg,
-                rs: add_temp,
+            self.write_inst(str {
+                rs: temp_reg,
+                rd: add_temp,
                 offset: LoadSaveOffset::Imm12(0),
             });
         }
@@ -528,9 +532,9 @@ impl AsmGenContext {
         import_reg_and_inst!();
         let val_reg = self.reg_pool.take_register();
         let address_reg = self.reg_pool.take_register();
-        self.write_inst(sdr {
-            rd: val_reg,
-            rs: address_reg,
+        self.write_inst(str {
+            rs: val_reg,
+            rd: address_reg,
             offset: LoadSaveOffset::Imm12(0),
         });
     }

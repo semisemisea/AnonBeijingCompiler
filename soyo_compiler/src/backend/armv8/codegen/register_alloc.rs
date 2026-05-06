@@ -8,7 +8,7 @@ use std::{
 use itertools::Itertools;
 use raana_ir::ir::{BasicBlock, arena::Arena};
 use raana_ir::ir::{FunctionData, Inst, InstKind};
-use raana_ir::opt::utils::{IDAllocator, VIDAlloc, get_terminator_inst};
+use raana_ir::opt::utils::{IDAllocator, VIDAlloc, build_cfg_both, get_terminator_inst, rpo_path};
 
 use crate::backend::armv8::register::{Bit, IReg, IntRegister, Register};
 
@@ -115,8 +115,8 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     let mut bb_alloc = IDAllocator::new(1);
     let mut val_alloc: VIDAlloc = IDAllocator::new(4);
     // let graph = utils::build_cfg_forward(data, &mut bb_alloc);
-    let (graph, prece) = utils::build_cfg_both(data, &mut bb_alloc);
-    let rpo_path = utils::rpo_path(&graph);
+    let (graph, prece) = build_cfg_both(data, &mut bb_alloc);
+    let rpo_path = rpo_path(&graph);
     let mut register_manager = VirtualRegister::new(REGISTER_COUNT);
 
     let mut call_ra = false;
@@ -176,7 +176,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                             while let Some(curr_id) = worklist.pop() {
                                 let curr_bb = bb_alloc.search_id(curr_id);
 
-                                let curr_insts = data.layout().basicblock(&curr_bb).insts();
+                                let curr_insts = data.layout().basicblock(curr_bb).insts();
                                 if let Some(last_inst) = curr_insts.get_last() {
                                     if let Some(inst_id) = val_alloc.get_id_safe(last_inst) {
                                         max_loop_id = max_loop_id.max(*inst_id);

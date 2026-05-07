@@ -33,10 +33,12 @@ pub fn is_pure_function(program: &Program, func: Function) -> bool {
                         return false;
                     }
                 }
-                InstKind::Call(call) => {
-                    if !is_pure_function(program, call.callee()) {
-                        return false;
-                    }
+                InstKind::Call(_call) => {
+                    // TODO: Use graph algorithm to get better result.
+                    // if !is_pure_function(program, call.callee()) {
+                    //     return false;
+                    // }
+                    return false;
                 }
                 InstKind::GetElemPtr(gep) => {
                     if gep.base().is_global() {

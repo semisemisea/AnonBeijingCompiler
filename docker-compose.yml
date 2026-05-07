@@ -1,16 +1,28 @@
 services:
   compiler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ubuntu:24.04
+        INSTALL_RUST: "true"
     image: sysy-compiler-x86
     platform: linux/amd64
+    working_dir: /app
+    command: sleep infinity
     volumes:
       - .:/app
-    stdin_open: true
-    tty: true
 
   runtime:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ubuntu:22.04
+        INSTALL_RUST: "false"
     image: sysy-runtime-arm
     platform: linux/arm64
+    working_dir: /app
+    command: sleep infinity
     volumes:
       - .:/app
-    stdin_open: true
-    tty: true

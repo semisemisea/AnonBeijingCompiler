@@ -1,5 +1,6 @@
 use super::items;
 use crate::frontend::utils::{AstGenContext, Symbol, ToRaanaIR};
+use log::info;
 use raana_ir::ir::{arena::Arena, builder_trait::*, *};
 
 fn binary_requires_int(op: BinaryOp) -> bool {
@@ -266,7 +267,7 @@ impl ToRaanaIR for items::ConstDef {
             let array_shape = self
                 .arr_dim
                 .iter()
-                .rev()
+                // .rev()
                 .map(|const_exp| {
                     const_exp.convert(ctx);
                     ctx.pop_i32()
@@ -275,7 +276,6 @@ impl ToRaanaIR for items::ConstDef {
 
             let arr_ty = array_shape
                 .iter()
-                .rev()
                 .map(|x| *x as usize)
                 .rfold(ty.clone(), Type::get_array);
             let alloc_var = ctx.new_local_value().alloc(arr_ty);
@@ -313,16 +313,11 @@ impl ToRaanaIR for items::ConstDef {
                     ctx.push_inst(store);
                     return;
                 }
-                for offset in 0..*array_shape.last().unwrap() {
+                for offset in 0..*array_shape.first().unwrap() {
                     let index = ctx.new_local_value().integer(offset);
                     let get_elem_ptr = ctx.new_local_value().get_elem_ptr(get_from, index);
                     ctx.push_inst(get_elem_ptr);
-                    initializer(
-                        &array_shape[..array_shape.len() - 1],
-                        init_val,
-                        get_elem_ptr,
-                        ctx,
-                    );
+                    initializer(&array_shape[1..], init_val, get_elem_ptr, ctx);
                 }
             }
             initializer(
@@ -491,7 +486,6 @@ impl ToRaanaIR for items::VarDef {
             let array_shape = self
                 .arr_dim
                 .iter()
-                .rev()
                 .map(|const_exp| {
                     const_exp.convert(ctx);
                     ctx.pop_i32()
@@ -503,7 +497,6 @@ impl ToRaanaIR for items::VarDef {
             // at the end we can allocate that type and give it a name.
             let arr_ty = array_shape
                 .iter()
-                .rev()
                 .map(|x| *x as usize)
                 .rfold(ty.clone(), Type::get_array);
             let alloc_var = ctx.new_local_value().alloc(arr_ty);
@@ -551,16 +544,11 @@ impl ToRaanaIR for items::VarDef {
                         ctx.push_inst(store);
                         return;
                     }
-                    for offset in 0..*array_shape.last().unwrap() {
+                    for offset in 0..*array_shape.first().unwrap() {
                         let index = ctx.new_local_value().integer(offset);
                         let get_elem_ptr = ctx.new_local_value().get_elem_ptr(get_from, index);
                         ctx.push_inst(get_elem_ptr);
-                        initializer(
-                            &array_shape[..array_shape.len() - 1],
-                            init_val,
-                            get_elem_ptr,
-                            ctx,
-                        );
+                        initializer(&array_shape[1..], init_val, get_elem_ptr, ctx);
                     }
                 }
                 initializer(&array_shape, &mut init_vals.into_iter(), alloc_var, ctx);

@@ -144,34 +144,26 @@ impl ConstInitVal {
             }
             match init_val {
                 Self::Normal(exp) => v.push(Some(exp)),
-                Self::Array(nested) => {
-                    // WARNING: Brace around scalar. Caused by over-nested, specifically,
-                    // when braces is more than dimension.
-                    // assert!(
-                    //     array_shape.len() > 1,
-                    //     "Invalid initialization value: Brace around scalar, maybe because you nested too deep"
-                    // );
-                    let count = array_shape
-                        .iter()
-                        .skip(1)
-                        .rev()
-                        .scan(1, |stride, &dim| {
-                            *stride *= dim as usize;
-                            (v.len() % *stride == 0).then_some(())
-                        })
-                        .count();
+                Self::Array(..) => {
+                    let mut stride = 1;
+                    let mut sub_shape_idx = array_shape.len();
 
-                    // WARNING: Brace around scalar. Caused when unaligned brace appear. Need
-                    // more demonstation.
-                    // assert!(
-                    //     count > 0,
-                    //     "Invalid initialization value: Brace around scalar. This is a warning in C but compile error in SysY."
-                    // );
-                    v.extend(
-                        init_val
-                            .init_val_shape(&array_shape[array_shape.len() - count..])
-                            .into_iter(),
-                    );
+                    for (i, &dim) in array_shape.iter().enumerate().rev() {
+                        stride *= dim as usize;
+                        if v.len() % stride == 0 {
+                            sub_shape_idx = i;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // 如果是 {} 这种嵌套，强制至少下降一级
+                    if sub_shape_idx == 0 && !array_shape.is_empty() {
+                        sub_shape_idx = 1;
+                    }
+
+                    let sub_vals = init_val.init_val_shape(&array_shape[sub_shape_idx..]);
+                    v.extend(sub_vals);
                 }
             }
         }
@@ -222,34 +214,26 @@ impl InitVal {
             }
             match init_val {
                 Self::Normal(exp) => v.push(Some(exp)),
-                Self::Array(nested) => {
-                    // WARNING: Brace around scalar. Caused by over-nested, specifically,
-                    // when braces is more than dimension.
-                    // assert!(
-                    //     array_shape.len() > 1,
-                    //     "Invalid initialization value: Brace around scalar, maybe because you nested too deep"
-                    // );
-                    let count = array_shape
-                        .iter()
-                        .skip(1)
-                        .rev()
-                        .scan(1, |stride, &dim| {
-                            *stride *= dim as usize;
-                            (v.len() % *stride == 0).then_some(())
-                        })
-                        .count();
+                Self::Array(..) => {
+                    let mut stride = 1;
+                    let mut sub_shape_idx = array_shape.len();
 
-                    // WARNING: Brace around scalar. Caused when unaligned brace appear. Need
-                    // more demonstation.
-                    // assert!(
-                    //     count > 0,
-                    //     "Invalid initialization value: Brace around scalar. This is a warning in C but compile error in SysY."
-                    // );
-                    v.extend(
-                        init_val
-                            .init_val_shape(&array_shape[array_shape.len() - count..])
-                            .into_iter(),
-                    );
+                    for (i, &dim) in array_shape.iter().enumerate().rev() {
+                        stride *= dim as usize;
+                        if v.len() % stride == 0 {
+                            sub_shape_idx = i;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // 如果是 {} 这种嵌套，强制至少下降一级
+                    if sub_shape_idx == 0 && !array_shape.is_empty() {
+                        sub_shape_idx = 1;
+                    }
+
+                    let sub_vals = init_val.init_val_shape(&array_shape[sub_shape_idx..]);
+                    v.extend(sub_vals);
                 }
             }
         }

@@ -17,3 +17,4 @@ lalrpop = "0.22.1"
 
 [profile.release]
 debug = true
+incremental = true

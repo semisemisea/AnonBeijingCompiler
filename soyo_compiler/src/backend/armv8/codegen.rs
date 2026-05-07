@@ -20,14 +20,13 @@ const AUTO_FUNC_ARG_ON_STACK: bool = true;
 #[inline]
 pub fn inst_size(func: &FunctionData, inst: Inst) -> usize {
     match func.inst_data(inst).kind() {
-        InstKind::Alloc => ptr_size(func.inst_data(inst).ty()),
+        InstKind::Alloc => ptr_base_size(func.inst_data(inst).ty()),
         _ => func.inst_data(inst).ty().size(),
     }
 }
 
 impl GenerateAsm for FunctionData {
     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
-        // ctx.writeln(&format!("{}:", self.name().strip_prefix("@").unwrap()));
         ctx.writeln(&format!("{}:", self.name()));
         ctx.incr_indent();
 
@@ -146,10 +145,10 @@ impl GenerateAsm for GetPtr {
         let global_flag = self.base().is_global();
         // element type size
         let pointee_size = if global_flag {
-            ptr_size(program.inst_data(self.base()).ty())
+            ptr_base_size(program.inst_data(self.base()).ty())
         } else {
             // FIXME: maybe incorrect use of curr_func_data
-            ptr_size(ctx.curr_func_data(program).inst_data(self.base()).ty())
+            ptr_base_size(ctx.curr_func_data(program).inst_data(self.base()).ty())
         };
         // load index to register
         ctx.load_to_register(program, self.offset());
@@ -193,10 +192,10 @@ impl GenerateAsm for GetElemPtr {
         // let global_flag = is_get_elem_ptr_from_global(self, ctx.curr_func_data(program));
         // element type size
         let elem_ty_size = if global_flag {
-            ptr_elem_size(program.inst_data(self.base()).ty())
+            ptr_base_elem_size(program.inst_data(self.base()).ty())
         } else {
             // FIXME: maybe incorrect use of curr_func_data
-            ptr_elem_size(ctx.curr_func_data(program).inst_data(self.base()).ty())
+            ptr_base_elem_size(ctx.curr_func_data(program).inst_data(self.base()).ty())
         };
         // load index to register
         ctx.load_to_register(program, self.offset());
@@ -249,7 +248,7 @@ impl GenerateAsm for Call {
         let func_data = program.func_data(self.callee());
 
         // name of the function
-        let name = func_data.name().strip_prefix('@').unwrap();
+        let name = func_data.name();
 
         // move the 1st-8th parameters to the register
         for (i, &arg) in args[..8.min(arity)].iter().enumerate() {
@@ -453,42 +452,15 @@ impl GenerateAsm for Integer {
     }
 }
 
-/// also we remove the prefix '%'
 #[inline]
 fn get_glob_var_name(var: Inst, program: &Program) -> String {
     assert!(var.is_global());
-    program
-        .inst_data(var)
-        .name()
-        .clone()
-        .unwrap()
-        .strip_prefix('%')
-        .unwrap()
-        .to_string()
+    program.inst_data(var).name().unwrap().to_string()
 }
 
-// fn is_get_elem_ptr_from_global(inst: &values::GetElemPtr, func_data: &FunctionData) -> bool {
-//     if inst.src().is_global() {
-//         true
-//     } else if let InstKind::GetElemPtr(child_inst) = func_data.dfg().value(inst.src()).kind() {
-//         is_get_elem_ptr_from_global(child_inst, func_data)
-//     } else {
-//         false
-//     }
-// }
-
-fn dereference(ty: &Type) -> &Type {
+fn ptr_base_elem_size(ty: &Type) -> usize {
     use TypeKind::*;
-    if let Pointer(point_to) = ty.kind() {
-        dereference(point_to)
-    } else {
-        ty
-    }
-}
-
-fn ptr_elem_size(ty: &Type) -> usize {
-    use TypeKind::*;
-    let point_to = dereference(ty);
+    let point_to = ty.derefernce();
     match point_to.kind() {
         Array(elem_ty, _len) => elem_ty.size(),
         Int32 => 4,
@@ -496,7 +468,7 @@ fn ptr_elem_size(ty: &Type) -> usize {
     }
 }
 
-fn ptr_size(ty: &Type) -> usize {
+fn ptr_base_size(ty: &Type) -> usize {
     use TypeKind::*;
     let Pointer(point_to) = ty.kind() else {
         unreachable!();

@@ -152,10 +152,6 @@ impl LocalInstArena {
         self.data.remove(&inst).unwrap()
     }
 
-    pub fn insert(&mut self, inst: Inst, new_data: InstData) {
-        self.data.insert(inst, new_data);
-    }
-
     pub fn datas(&self) -> std::collections::hash_map::Iter<'_, Inst, InstData> {
         self.data.iter()
     }

@@ -1,0 +1,16 @@
+services:
+  compiler:
+    image: sysy-compiler-x86
+    platform: linux/amd64
+    volumes:
+      - .:/app
+    stdin_open: true
+    tty: true
+
+  runtime:
+    image: sysy-runtime-arm
+    platform: linux/arm64
+    volumes:
+      - .:/app
+    stdin_open: true
+    tty: true

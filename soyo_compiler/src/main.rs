@@ -1,6 +1,5 @@
 use clap::Parser;
 use raana_ir::fmt::writer::Writer;
-use std::path::Path;
 
 use crate::backend::armv8::codegen::asm_gen_context::AsmGenContext;
 use crate::frontend::utils::AstGenContext;
@@ -13,10 +12,9 @@ mod frontend;
 
 lalrpop_util::lalrpop_mod!(sysy);
 
-/// compiler --emit asm -o testcase.s testcase.sy [-O1]
+/// compiler -S -o testcase.s testcase.sy [-O1]
 /// extra support:
-///     -S is a compatibility alias for `--emit asm`
-///     --emit ir,asm writes both outputs under the folder passed to `-o`
+///     --emit,  `ir` or `asm`
 fn main() {
     env_logger::init();
 
@@ -35,71 +33,21 @@ fn main() {
         pass_manager.run_passes(&mut program);
     }
 
-    let emit = if args.emit.is_empty() {
-        vec![if args.assembly_only {
-            cli::EmitOption::Asm
-        } else {
-            cli::EmitOption::Ir
-        }]
+    if !args.assembly_only {
+        let mut writer = Writer::new(&program);
+        writer.write().unwrap();
+        let buf = writer.finish();
+        std::fs::write(&args.output_path, buf).unwrap();
     } else {
-        args.emit
-    };
-    let needs_ir = emit.contains(&cli::EmitOption::Ir);
-    let needs_asm = emit.contains(&cli::EmitOption::Asm);
-    let ir = if needs_ir {
-        Some(dump_ir(&program))
-    } else {
-        None
-    };
-    let asm = if needs_asm {
-        Some(dump_asm(&program))
-    } else {
-        None
-    };
-
-    if emit.len() == 1 {
-        match emit[0] {
-            cli::EmitOption::Ir => write_file(&args.output_path, ir.unwrap()),
-            cli::EmitOption::Asm => write_file(&args.output_path, asm.unwrap()),
-        }
-    } else {
-        let stem = args
-            .input_path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("out");
-        if let Some(ir) = ir {
-            write_file(&args.output_path.join(format!("{stem}.ir")), ir);
-        }
-        if let Some(asm) = asm {
-            write_file(&args.output_path.join(format!("{stem}.s")), asm);
-        }
+        let codegen_ctx = AsmGenContext::new();
+        let insts = codegen_ctx.generate(&program);
+        let buf = insts
+            .iter()
+            .map(|inst| inst.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&args.output_path, buf).unwrap();
     }
-}
-
-fn dump_ir(program: &raana_ir::ir::Program) -> String {
-    let mut writer = Writer::new(program);
-    writer.write().unwrap();
-    writer.finish()
-}
-
-fn dump_asm(program: &raana_ir::ir::Program) -> String {
-    let codegen_ctx = AsmGenContext::new();
-    let insts = codegen_ctx.generate(program);
-    insts
-        .iter()
-        .map(|inst| inst.to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn write_file(path: &Path, buf: impl AsRef<[u8]>) {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-    }
-    std::fs::write(path, buf).unwrap();
 }
 
 #[cfg(test)]

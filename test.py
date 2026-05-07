@@ -309,7 +309,7 @@ def close_workers():
         worker.close()
 
 
-def run_test(src, out_dir, opt_level, dump_dir):
+def run_test(src, out_dir, opt_level):
     start = time.perf_counter()
     base, src_rel = src.with_suffix(""), rel(src)
     asm = out_dir / src_rel.with_suffix(".s")
@@ -326,10 +326,7 @@ def run_test(src, out_dir, opt_level, dump_dir):
     ]
     if opt_level:
         compile_args.append(f"-O{opt_level}")
-    if dump_dir:
-        compile_args += ["--emit", "ir,asm", "-o", container(asm.parent), container(src)]
-    else:
-        compile_args += ["--emit", "asm", "-o", container(asm), container(src)]
+    compile_args += ["-S", "-o", container(asm), container(src)]
 
     worker = get_worker()
     compile_status, compile_out, compile_err = worker.compiler.run(
@@ -391,7 +388,6 @@ def parse_args(argv):
         action="store_true",
         help="show test case output details",
     )
-    parser.add_argument("--dump", type=Path, help="save useful intermediate files under DIR")
     parser.add_argument(
         "paths", nargs="*", help="optional .sy files or directories (default: tests/)"
     )
@@ -400,18 +396,7 @@ def parse_args(argv):
         parser.error("--jobs must be at least 1")
     if args.opt_level < 0:
         parser.error("--opt-level must be non-negative")
-    if args.dump:
-        args.dump = resolve_output_dir(args.dump, parser)
     return args
-
-
-def resolve_output_dir(path, parser):
-    path = path if path.is_absolute() else ROOT / path
-    try:
-        path.resolve().relative_to(ROOT)
-    except ValueError:
-        parser.error(f"{path} must be under {ROOT}")
-    return path
 
 
 def run_tests(args, out_dir):
@@ -474,14 +459,7 @@ def run_tests(args, out_dir):
     futures = {}
     try:
         futures = {
-            pool.submit(
-                run_test,
-                src,
-                out_dir,
-                args.opt_level,
-                args.dump,
-            ): src
-            for src in files
+            pool.submit(run_test, src, out_dir, args.opt_level): src for src in files
         }
         set_status(0, rel(files[0]))
         for done, future in enumerate(as_completed(futures), 1):
@@ -535,12 +513,8 @@ def main():
     try:
         if not ensure_containers(args.rebuild) or not build_compiler():
             return 1
-        if args.dump:
-            args.dump.mkdir(parents=True, exist_ok=True)
-            return run_tests(args, args.dump)
-        else:
-            with tempfile.TemporaryDirectory(prefix=".soyo_test_", dir=ROOT) as tmp:
-                return run_tests(args, Path(tmp))
+        with tempfile.TemporaryDirectory(prefix=".soyo_test_", dir=ROOT) as tmp:
+            return run_tests(args, Path(tmp))
     finally:
         restore_input()
 

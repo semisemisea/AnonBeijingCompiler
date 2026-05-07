@@ -15,7 +15,8 @@ import time
 ROOT = Path(__file__).resolve().parent
 TESTS_ROOT = ROOT / "tests"
 COMPOSE = ("docker", "compose")
-COLOR = sys.stdout.isatty()
+INTERACTIVE = sys.stdout.isatty()
+COLOR = INTERACTIVE
 CODES = {
     "reset": "\x1b[0m",
     "bold": "\x1b[1m",
@@ -411,6 +412,8 @@ def run_tests(args, out_dir):
 
     def set_status(done, path):
         nonlocal statusline
+        if not INTERACTIVE:
+            return
         if path is None:
             clear_status()
             return
@@ -422,12 +425,17 @@ def run_tests(args, out_dir):
 
     def clear_status():
         nonlocal statusline
+        if not INTERACTIVE:
+            return
         if statusline:
             print("\x1b[2K\r", end="", flush=True)
             statusline = ""
 
     def log(line, keep_status):
         nonlocal statusline
+        if not INTERACTIVE:
+            print(line)
+            return
         old_status = statusline
         if old_status:
             print("\x1b[2K\r", end="", flush=True)

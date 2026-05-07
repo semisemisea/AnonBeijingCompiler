@@ -1,35 +1,42 @@
 #!/usr/bin/env python3
 
-import os
-import sys
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import tempfile
 from pathlib import Path
 import subprocess
+import sys
 import time
 
 
-def get_root() -> Path:
-    env_root = os.environ.get("CARGO_MANIFEST_DIR")
-    if env_root:
-        return (Path(env_root) / ".." / "tests").resolve()
-    return (Path(__file__).resolve().parent / "tests").resolve()
+ROOT = Path(__file__).resolve().parent
+TESTS_ROOT = ROOT / "tests"
+COMPILER = ROOT / "target" / "release" / "soyo_compiler"
 
 
-def iter_sy_files(root: Path):
-    return sorted(root.rglob("*.sy"))
-
-
-def run_one(file_path: Path, output_dir: Path):
-    output_path = output_dir / (file_path.stem + ".s")
+def build_compiler() -> bool:
     cmd = [
         "cargo",
-        "run",
+        "build",
         "-p",
         "soyo_compiler",
         "--release",
         "--quiet",
-        "--",
-        "-S",
+    ]
+    print("Building soyo_compiler release binary...", file=sys.stderr)
+    result = subprocess.run(cmd, cwd=ROOT)
+    if result.returncode != 0:
+        print("Build failed. Aborting.", file=sys.stderr)
+        return False
+    return True
+
+
+def run_one(compiler: Path, file_path: Path, tests_root: Path, output_dir: Path):
+    rel = file_path.relative_to(tests_root)
+    output_path = output_dir / rel.with_suffix(".ir")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(compiler),
         "-o",
         str(output_path),
         str(file_path),
@@ -40,20 +47,66 @@ def run_one(file_path: Path, output_dir: Path):
     return end - start
 
 
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description="Test runner for soyo_compiler")
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=1,
+        help="number of parallel jobs (default: 1)",
+    )
+    args = parser.parse_args(argv)
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
+    return args
+
+
 def main() -> int:
-    tests_root = get_root()
-    files = iter_sy_files(tests_root)
+    args = parse_args(sys.argv[1:])
+    files = sorted(TESTS_ROOT.rglob("*.sy"))
     total = len(files)
+    timings = []
+
+    if not build_compiler():
+        return 1
 
     with tempfile.TemporaryDirectory() as tmpdir:
         out_dir = Path(tmpdir)
-        for index, file_path in enumerate(files, start=1):
-            elapsed = run_one(file_path, out_dir)
-            rel = file_path.relative_to(tests_root)
-            print(
-                f"[{index:03}/{total} passed] ({elapsed:.5f}s) {rel}",
-                file=sys.stderr,
-            )
+        print(
+            f"Running {total} tests with {args.jobs} parallel jobs...",
+            file=sys.stderr,
+        )
+        with ThreadPoolExecutor(max_workers=args.jobs) as executor:
+            futures = {
+                executor.submit(run_one, COMPILER, file_path, TESTS_ROOT, out_dir): file_path
+                for file_path in files
+            }
+            for done, future in enumerate(as_completed(futures), start=1):
+                file_path = futures[future]
+                rel = file_path.relative_to(ROOT)
+                prefix = f"[{done:03}/{total}]"
+                try:
+                    elapsed = future.result()
+                except subprocess.CalledProcessError as err:
+                    print(
+                        f"\x1b[2K\r{prefix} failed {rel} (exit {err.returncode})",
+                        file=sys.stderr,
+                    )
+                    return 1
+
+                timings.append((elapsed, rel))
+                elapsed_ms = elapsed * 1000
+                print(
+                    f"\x1b[2K\r{prefix} {elapsed_ms:.3f}ms {rel}",
+                    file=sys.stderr,
+                )
+
+    print("\n  Top 5 slowest tests", file=sys.stderr)
+    print("-" * 40, file=sys.stderr)
+    for _, (elapsed, rel) in enumerate(sorted(timings, reverse=True)[:5], start=1):
+        elapsed_ms = elapsed * 1000
+        print(f"{elapsed_ms:>8.3f}ms - {rel}", file=sys.stderr)
 
     return 0
 

@@ -94,6 +94,9 @@ impl PassesManager {
             let gvn = Box::new(gvn::GlobalInstNumbering);
             p.register(gvn);
 
+            let sr = Box::new(sr::StrengthReduction);
+            p.register(sr);
+
             let dpe = dce::DeadPhiElimination;
             p.register(Box::new(dpe));
             let dce = dce::DeadCodeElimination;

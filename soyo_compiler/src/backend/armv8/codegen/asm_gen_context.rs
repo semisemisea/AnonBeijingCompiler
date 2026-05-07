@@ -50,7 +50,6 @@ macro_rules! import_reg_and_inst {
         use Register::*;
     };
 }
-const SHIFT_WIDTH: usize = 2;
 
 impl AsmGenContext {
     pub fn new() -> AsmGenContext {
@@ -72,8 +71,6 @@ impl AsmGenContext {
 
     pub fn get_bb_name(&self, bb: BasicBlock, program: &Program) -> String {
         let curr_func = self.curr_func_data(program);
-        // let func_name = curr_func.name().strip_prefix("@").unwrap();
-        // let bb_name = curr_func.bb_data(bb).name().strip_prefix("%").unwrap();
         let func_name = curr_func.name();
         let bb_name = curr_func.bb_data(bb).name();
         format!(".L_{}_{}", func_name, bb_name)
@@ -81,17 +78,6 @@ impl AsmGenContext {
 
     pub fn insert_inst(&mut self, val: IrInst, offset: usize) {
         self.stack_slots.insert(val, offset);
-    }
-
-    // pub fn stack_slots_debug(&self, func: &FunctionData) {
-    //     for (&k, &v) in self.stack_slots.iter() {
-    //         let kind = func.dfg().value(k);
-    //         eprintln!("{:?} {} {}", k, kind.ty(), v);
-    //     }
-    // }
-
-    pub fn get_inst_offset(&self, val: IrInst) -> Option<usize> {
-        self.stack_slots.get(&val).copied()
     }
 
     pub fn register_or_offset(&mut self, val: IrInst) -> Option<usize> {
@@ -118,13 +104,7 @@ impl AsmGenContext {
         self.writeln(".data");
         for &glob_inst in program.global_inst_layout() {
             let glob_inst_data = program.inst_data(glob_inst);
-            let name = glob_inst_data
-                .name()
-                .clone()
-                .unwrap()
-                .strip_prefix('%')
-                .unwrap()
-                .to_string();
+            let name = glob_inst_data.name().unwrap().to_string();
             self.writeln(&format!(".globl {name}",));
 
             self.decr_indent();
@@ -152,7 +132,7 @@ impl AsmGenContext {
                             let elem_data = program.inst_data(elem);
                             match elem_data.kind() {
                                 InstKind::Aggregate(agg) => {
-                                    recursive(&agg, ctx, program);
+                                    recursive(agg, ctx, program);
                                 }
                                 InstKind::Integer(int) => {
                                     ctx.writeln(&format!(".word {}", int.value()))
@@ -177,7 +157,6 @@ impl AsmGenContext {
                 continue;
             };
 
-            // let name = program.func_data(func).name().strip_prefix("@").unwrap();
             let name = program.func_data(func).name();
             self.incr_indent();
             self.writeln(".text");
@@ -310,16 +289,7 @@ impl AsmGenContext {
 
     pub fn load_to_register(&mut self, program: &Program, val: IrInst) {
         if val.is_global() {
-            self.load_address(
-                program
-                    .inst_data(val)
-                    .name()
-                    .clone()
-                    .unwrap()
-                    .strip_prefix('%')
-                    .unwrap()
-                    .to_string(),
-            );
+            self.load_address(program.inst_data(val).name().unwrap().to_string());
         } else {
             // local values, use inst_data directly.
             let data = self.curr_func_data(program).inst_data(val);

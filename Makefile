@@ -1,4 +1,5 @@
 IMAGE ?= soyo-test-tools
+CONTAINER ?= soyo-test
 RESULTS ?= results
 ARGS ?=
 TESTS ?=
@@ -32,7 +33,10 @@ COMPILER := /work/target/$(MUSL_TARGET)/release/soyo_compiler
 
 test: test-compiler .docker-image
 	mkdir -p "$(RESULTS)"
-	$(DOCKER) run -t --rm --network none \
+	@cleanup() { $(DOCKER) rm -f "$(CONTAINER)" >/dev/null 2>&1 || true; }; \
+	trap cleanup EXIT INT TERM; \
+	cleanup; \
+	$(DOCKER) run -t --name "$(CONTAINER)" --network none \
 		-e SOYO_COMPILER="$(COMPILER)" \
 		-v "$(HOST_TARGET_DIR):/work/target:ro" \
 		-v "$(CURDIR)/tests:/work/tests:ro" \

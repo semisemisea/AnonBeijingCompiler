@@ -3,6 +3,11 @@ RESULTS ?= results
 ARGS ?=
 TESTS ?=
 
+ifeq ($(firstword $(MAKECMDGOALS)),test)
+TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+$(eval $(TEST_ARGS):;@:)
+endif
+
 HOST_ARCH := $(shell uname -m)
 ifeq ($(HOST_ARCH),x86_64)
 MUSL_TARGET := x86_64-unknown-linux-musl
@@ -32,7 +37,7 @@ test: test-compiler .docker-image
 		-v "$(CURDIR)/tests:/work/tests:ro" \
 		-v "$(CURDIR)/sysylib:/work/sysylib:ro" \
 		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
-		"$(IMAGE)" $(ARGS) $(TESTS)
+		"$(IMAGE)" $(ARGS) $(TESTS) $(TEST_ARGS)
 
 # Build the test image if it doesn't exist or if Dockerfile/tests/test.py have changed
 test-image: .docker-image

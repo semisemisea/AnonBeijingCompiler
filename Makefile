@@ -2,6 +2,7 @@ IMAGE ?= soyo-test-tools
 RESULTS ?= results
 ARGS ?=
 TESTS ?=
+TZ ?= Asia/Shanghai
 
 HOST_ARCH := $(shell uname -m)
 ifeq ($(HOST_ARCH),x86_64)
@@ -22,7 +23,9 @@ COMPILER := /work/target/$(MUSL_TARGET)/release/soyo_compiler
 test: test-compiler .docker-image
 	mkdir -p "$(RESULTS)"
 	docker run -t --rm --network none \
+		-e TZ="$(TZ)" \
 		-e SOYO_COMPILER="$(COMPILER)" \
+		-v /etc/localtime:/etc/localtime:ro \
 		-v "$(HOST_TARGET_DIR):/work/target:ro" \
 		-v "$(CURDIR)/tests:/work/tests:ro" \
 		-v "$(CURDIR)/sysylib:/work/sysylib:ro" \

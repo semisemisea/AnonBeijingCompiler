@@ -2,7 +2,6 @@ IMAGE ?= soyo-test-tools
 RESULTS ?= results
 ARGS ?=
 TESTS ?=
-TZ ?= Asia/Shanghai
 
 HOST_ARCH := $(shell uname -m)
 ifeq ($(HOST_ARCH),x86_64)
@@ -15,6 +14,11 @@ else
 $(error unsupported host arch: $(HOST_ARCH))
 endif
 
+HOST_OS := $(shell uname -s)
+ifeq ($(HOST_OS),Darwin)
+CARGO_TARGET_LINKER := CARGO_TARGET_$(shell echo $(MUSL_TARGET) | tr 'a-z-' 'A-Z_')_LINKER=ld.lld
+endif
+
 HOST_TARGET_DIR := $(CURDIR)/target/host-musl
 COMPILER := /work/target/$(MUSL_TARGET)/release/soyo_compiler
 
@@ -23,9 +27,7 @@ COMPILER := /work/target/$(MUSL_TARGET)/release/soyo_compiler
 test: test-compiler .docker-image
 	mkdir -p "$(RESULTS)"
 	docker run -t --rm --network none \
-		-e TZ="$(TZ)" \
 		-e SOYO_COMPILER="$(COMPILER)" \
-		-v /etc/localtime:/etc/localtime:ro \
 		-v "$(HOST_TARGET_DIR):/work/target:ro" \
 		-v "$(CURDIR)/tests:/work/tests:ro" \
 		-v "$(CURDIR)/sysylib:/work/sysylib:ro" \
@@ -40,7 +42,7 @@ test-image: .docker-image
 	date --iso-8601=minutes > .docker-image
 
 test-compiler:
-	cargo build -p soyo_compiler --release --target "$(MUSL_TARGET)" --target-dir "$(HOST_TARGET_DIR)" --quiet
+	$(CARGO_TARGET_LINKER) cargo build -p soyo_compiler --release --target "$(MUSL_TARGET)" --target-dir "$(HOST_TARGET_DIR)" --quiet
 
 clean-results:
 	rm -rf "$(RESULTS)"

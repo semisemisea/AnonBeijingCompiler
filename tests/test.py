@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -105,22 +106,35 @@ def combined_output(stdout, returncode):
     return stdout + f"{returncode}\n".encode()
 
 
-def write_process_output(proc, stdout_path, stderr_path):
+def write_process_output(proc, stdout_path, stderr_path, returncode_path):
     stdout_path.write_bytes(proc.stdout or b"")
     stderr_path.write_bytes(proc.stderr or b"")
+    returncode_path.write_text(f"{proc.returncode}\n")
+
+
+def copy_testcase_files(src, out_dir):
+    src_rel = rel_test(src)
+    dst_base = (out_dir / src_rel).with_suffix("")
+    dst_base.parent.mkdir(parents=True, exist_ok=True)
+    for path in (src, src.with_suffix(".in"), src.with_suffix(".out")):
+        if path.exists():
+            shutil.copy2(path, dst_base.with_suffix(path.suffix))
 
 
 def run_test(src, out_dir, opt_level, compiler):
     start = time.perf_counter()
     src_rel = rel_test(src)
     base = src.with_suffix("")
+    copy_testcase_files(src, out_dir)
 
     asm = out_dir / src_rel.with_suffix(".s")
     elf = out_dir / src_rel.with_suffix(".elf")
     compile_stdout = out_dir / src_rel.with_suffix(".compile.stdout")
     compile_stderr = out_dir / src_rel.with_suffix(".compile.stderr")
+    compile_returncode = out_dir / src_rel.with_suffix(".compile.return")
     runtime_stdout = out_dir / src_rel.with_suffix(".runtime.stdout")
     runtime_stderr = out_dir / src_rel.with_suffix(".runtime.stderr")
+    runtime_returncode = out_dir / src_rel.with_suffix(".runtime.return")
     asm.parent.mkdir(parents=True, exist_ok=True)
 
     compile_args = [str(compiler)]
@@ -129,7 +143,7 @@ def run_test(src, out_dir, opt_level, compiler):
     compile_args += ["-S", "-o", str(asm), str(src)]
 
     compile_proc = subprocess.run(compile_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    write_process_output(compile_proc, compile_stdout, compile_stderr)
+    write_process_output(compile_proc, compile_stdout, compile_stderr, compile_returncode)
     if compile_proc.returncode:
         output = (compile_proc.stdout + compile_proc.stderr).decode("utf-8", "replace").strip()
         return (
@@ -155,7 +169,7 @@ def run_test(src, out_dir, opt_level, compiler):
         stderr=subprocess.PIPE,
     )
     if link_proc.returncode:
-        write_process_output(link_proc, runtime_stdout, runtime_stderr)
+        write_process_output(link_proc, runtime_stdout, runtime_stderr, runtime_returncode)
         return (
             time.perf_counter() - start,
             " RE ",
@@ -175,7 +189,7 @@ def run_test(src, out_dir, opt_level, compiler):
         if stdin_file is not None:
             stdin_file.close()
 
-    write_process_output(run_proc, runtime_stdout, runtime_stderr)
+    write_process_output(run_proc, runtime_stdout, runtime_stderr, runtime_returncode)
     actual = combined_output(run_proc.stdout, run_proc.returncode)
     status, msg = compare_output(actual, base.with_suffix(".out"), run_proc.stderr)
     if status == "PASS":

@@ -1,26 +1,21 @@
-ARG BASE_IMAGE=ubuntu:22.04
-FROM ${BASE_IMAGE}
+FROM ubuntu:24.04
 
-ARG DEBIAN_FRONTEND=noninteractive
-ARG INSTALL_RUST=false
+ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    binutils \
-    build-essential \
-    ca-certificates \
-    curl \
-    file \
-    gdb \
-    time \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 \
+        clang \
+        lld \
+        llvm \
+        gcc-aarch64-linux-gnu \
+        qemu-user-static \
+        libc6-dev-arm64-cross \
     && rm -rf /var/lib/apt/lists/*
 
-RUN if [ "${INSTALL_RUST}" = "true" ]; then \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain 1.85.0; \
-    fi
+WORKDIR /work
 
-ENV PATH="/root/.cargo/bin:${PATH}"
+COPY ./tests/test.py /usr/local/bin/soyo-test
+RUN chmod +x /usr/local/bin/soyo-test
 
-WORKDIR /app
-
-CMD ["/bin/bash"]
+ENTRYPOINT ["/usr/local/bin/soyo-test"]

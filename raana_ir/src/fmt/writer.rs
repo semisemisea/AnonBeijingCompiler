@@ -211,10 +211,10 @@ impl Writer<'_> {
             )?;
         }
         writeln!(self.buffer, ">: {{")?;
-        for (index, layout) in data.layout().basicblocks().iter().enumerate() {
+        for layout in data.layout().basicblocks() {
             self.bb_name.insert(
                 layout.bb(),
-                format!("{}_{}", data.bb_data(layout.bb()).name(), index),
+                data.bb_data(layout.bb()).name().to_string(),
             );
         }
         for layout in data.layout().basicblocks() {

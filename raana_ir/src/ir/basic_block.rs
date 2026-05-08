@@ -80,8 +80,9 @@ impl BasicBlockArena {
         self.data.get_mut(&bb).unwrap()
     }
 
-    pub fn alloc(&mut self, bb_data: BasicBlockData) -> BasicBlock {
+    pub fn alloc(&mut self, mut bb_data: BasicBlockData) -> BasicBlock {
         let id = next_bbid();
+        bb_data.set_name(format!("{}_{}", bb_data.name(), id.0.get()));
         self.data.insert(id, bb_data);
         id
     }

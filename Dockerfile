@@ -10,6 +10,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3 \
         clang \
+        gdb-multiarch \
         lld \
         llvm \
         gcc-aarch64-linux-gnu \

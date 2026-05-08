@@ -10,6 +10,18 @@ TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
 $(eval $(TEST_ARGS):;@:)
 endif
 
+ifeq ($(firstword $(MAKECMDGOALS)),run-elf)
+RUN_ELF := $(word 2,$(MAKECMDGOALS))
+RUN_ELF_PATH := $(abspath $(RUN_ELF))
+$(eval $(RUN_ELF):;@:)
+endif
+
+ifeq ($(firstword $(MAKECMDGOALS)),debug-elf)
+DEBUG_ELF := $(word 2,$(MAKECMDGOALS))
+DEBUG_ELF_PATH := $(abspath $(DEBUG_ELF))
+$(eval $(DEBUG_ELF):;@:)
+endif
+
 HOST_ARCH := $(shell uname -m)
 ifeq ($(HOST_ARCH),x86_64)
 MUSL_TARGET := x86_64-unknown-linux-musl
@@ -29,7 +41,7 @@ endif
 HOST_TARGET_DIR := $(CURDIR)/target/host-musl
 COMPILER := /work/target/$(MUSL_TARGET)/release/soyo_compiler
 
-.PHONY: test test-image test-compiler clean-results
+.PHONY: test run-elf debug-elf test-image test-compiler clean-results
 
 test: test-compiler .docker-image
 	mkdir -p "$(RESULTS)"
@@ -43,6 +55,37 @@ test: test-compiler .docker-image
 		-v "$(CURDIR)/sysylib:/work/sysylib:ro" \
 		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
 		"$(IMAGE)" $(ARGS) $(TESTS) $(TEST_ARGS)
+
+run-elf: .docker-image
+	@if [ -z "$(RUN_ELF)" ]; then \
+		printf 'usage: make run-elf path/to/program.elf\n' >&2; \
+		exit 2; \
+	fi; \
+	if [ ! -f "$(RUN_ELF_PATH)" ]; then \
+		printf 'ELF not found: %s\n' "$(RUN_ELF)" >&2; \
+		exit 2; \
+	fi
+	$(DOCKER) run --rm -t --network none \
+		-v "$(RUN_ELF_PATH):/work/program.elf:ro" \
+		--entrypoint qemu-aarch64-static \
+		"$(IMAGE)" "/work/program.elf"
+
+debug-elf: .docker-image
+	@if [ -z "$(DEBUG_ELF)" ]; then \
+		printf 'usage: make debug-elf path/to/program.elf\n' >&2; \
+		exit 2; \
+	fi; \
+	if [ ! -f "$(DEBUG_ELF_PATH)" ]; then \
+		printf 'ELF not found: %s\n' "$(DEBUG_ELF)" >&2; \
+		exit 2; \
+	fi
+	$(DOCKER) run --rm -it --network none \
+		-v "$(DEBUG_ELF_PATH):/work/program.elf:ro" \
+		--entrypoint /bin/sh \
+		"$(IMAGE)" -c 'qemu-aarch64-static -g 1234 /work/program.elf & gdb-multiarch /work/program.elf -ex "target remote localhost:1234" \
+			-ex "break main" \
+			-ex "layout asm" \
+			-ex "focus cmd"'
 
 # Build the test image if it doesn't exist or if Dockerfile/tests/test.py have changed
 test-image: .docker-image

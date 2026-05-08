@@ -1,3 +1,5 @@
 /target
+/results
+/.docker-image
 .DS_Store
 __pycache__

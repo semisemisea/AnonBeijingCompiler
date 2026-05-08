@@ -39,7 +39,7 @@ test-image: .docker-image
 
 .docker-image: Dockerfile tests/test.py
 	docker build -f Dockerfile -t "$(IMAGE)" .
-	date --iso-8601=minutes > .docker-image
+	date '+%Y-%m-%dT%H:%M%z' > .docker-image
 
 test-compiler:
 	$(CARGO_TARGET_LINKER) cargo build -p soyo_compiler --release --target "$(MUSL_TARGET)" --target-dir "$(HOST_TARGET_DIR)" --quiet

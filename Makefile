@@ -2,6 +2,7 @@ IMAGE ?= soyo-test-tools
 RESULTS ?= results
 ARGS ?=
 TESTS ?=
+DOCKER ?= docker
 
 ifeq ($(firstword $(MAKECMDGOALS)),test)
 TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
@@ -31,7 +32,7 @@ COMPILER := /work/target/$(MUSL_TARGET)/release/soyo_compiler
 
 test: test-compiler .docker-image
 	mkdir -p "$(RESULTS)"
-	docker run -t --rm --network none \
+	$(DOCKER) run -t --rm --network none \
 		-e SOYO_COMPILER="$(COMPILER)" \
 		-v "$(HOST_TARGET_DIR):/work/target:ro" \
 		-v "$(CURDIR)/tests:/work/tests:ro" \
@@ -43,7 +44,7 @@ test: test-compiler .docker-image
 test-image: .docker-image
 
 .docker-image: Dockerfile tests/test.py
-	docker build -f Dockerfile -t "$(IMAGE)" .
+	$(DOCKER) build -f Dockerfile -t "$(IMAGE)" .
 	date '+%Y-%m-%dT%H:%M%z' > .docker-image
 
 test-compiler:

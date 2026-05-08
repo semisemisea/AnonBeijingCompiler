@@ -274,9 +274,7 @@ impl GenerateAsm for Call {
             label: name.to_string(),
         });
 
-        let TypeKind::Function(_param_ty, ret_ty) = func_data.ret_ty().kind() else {
-            unreachable!()
-        };
+        let ret_ty = func_data.ret_ty();
         if !ret_ty.is_unit() {
             ctx.alloc_ret_reg();
             ctx.save_word_at_curr_inst();

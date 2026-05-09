@@ -349,7 +349,8 @@ impl GenerateAsm for Return {
     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         if let Some(ret_val) = self.value() {
             ctx.load_to_register(program, ret_val);
-            ctx.ret();
+            let ret_sz = Bit::try_from(ctx.curr_func_data(program).ret_ty().size()).unwrap();
+            ctx.ret(ret_sz);
         } else {
             ctx.void_ret();
         }
@@ -379,16 +380,28 @@ impl GenerateAsm for Load {
         } else {
             is_ptr(self.src(), ctx.curr_func_data(program))
         };
+
+        let size = if global_flag {
+            let inst_data = program.inst_data(self.src());
+            eprintln!("Loading global variable {:?} <{:?}> of size {}", self.src(), inst_data.ty(), inst_data.ty().size());
+            inst_data.ty().size()
+        } else {
+            let inst_data = ctx.curr_func_data(program).inst_data(self.src());
+            eprintln!("Loading local variable {:?} <{:?}> of size {}", self.src(), inst_data.ty(), inst_data.ty().size());
+            inst_data.ty().size()
+        };
+        let size = Bit::try_from(size).unwrap();
+
         if global_flag {
             ctx.load_address(get_glob_var_name(self.src(), program));
-            ctx.load_from_address();
+            ctx.load_from_address(size);
             ctx.save_word_at_curr_inst();
         } else if ptr_flag {
             // let offset = ctx.get_inst_offset(self.src()).unwrap() as i32;
             if let Some(offset) = ctx.register_or_offset(self.src()) {
                 ctx.load_word_sp(offset as _);
             }
-            ctx.load_from_address();
+            ctx.load_from_address(size);
             ctx.save_word_at_curr_inst();
         } else {
             // let offset = ctx.get_inst_offset(self.src()).unwrap() as i32;

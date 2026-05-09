@@ -140,7 +140,8 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                     register_manager.add_rule(Reverse(Register::arguments(index)), id..=id);
                 }
                 for index in 0..7 {
-                    register_manager.add_rule(Reverse(Register::temporary(index)), id..=id);
+                    // FIXME: we should also consider the size of temporary register.
+                    register_manager.add_rule(Reverse(Register::temporary(index, Bit::b64)), id..=id);
                 }
             }
         }

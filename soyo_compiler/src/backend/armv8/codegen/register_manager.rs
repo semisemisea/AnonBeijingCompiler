@@ -34,8 +34,8 @@ impl RegisterManager {
     }
 
     #[inline]
-    pub(in crate::backend) fn alloc_temp(&mut self) -> Register {
-        let ret = Register::temporary(self.temp_usage);
+    pub(in crate::backend) fn alloc_temp(&mut self, size: Bit) -> Register {
+        let ret = Register::temporary(self.temp_usage, size);
         self.temp_incr();
         self.pool.push(ret);
         ret

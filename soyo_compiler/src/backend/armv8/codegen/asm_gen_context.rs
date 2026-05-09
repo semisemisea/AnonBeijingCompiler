@@ -14,8 +14,7 @@ use crate::backend::armv8::{
         register_manager::RegisterManager,
     },
     inst::{
-        AddSubImm, AddSubOperand, CsetCondition, Inst, LoadSaveOffset, LogicOperand, MovOperand,
-        MoveWideImm, MoveWideImmShift, ShiftSize,
+        AddSubImm, AddSubOperand, CsetCondition, Extend, ExtendedRegister, Inst, LoadSaveOffset, LogicOperand, MovOperand, MoveWideImm, MoveWideImmShift, ShiftSize
     },
     register::{Bit, IReg, IntRegister, Register},
 };
@@ -306,11 +305,11 @@ impl AsmGenContext {
                     self.undef_take_temp();
                 }
                 _ if !data.ty().is_unit() => {
-                    // eprintln!(
-                    //     "{:?} {:?}",
-                    //     val,
-                    //     self.curr_func_data(program).dfg().value(val).kind()
-                    // );
+                    eprintln!(
+                        "{:?} {:?}",
+                        val,
+                        self.curr_func_data(program).inst_data(val).kind()
+                    );
                     match self.allocation.get(&val).unwrap() {
                         AllocationState::Register(register) => {
                             self.reg_pool.push_register(*register)
@@ -348,7 +347,8 @@ impl AsmGenContext {
         import_reg_and_inst!();
         let rhs = self.reg_pool.take_register();
         let lhs = self.reg_pool.take_register();
-        let ans = self.reg_pool.alloc_temp();
+        assert_eq!(lhs.sz(), rhs.sz());
+        let ans = self.reg_pool.alloc_temp(lhs.sz());
         self.write_inst(mul {
             rd: ans,
             rs1: lhs,
@@ -360,7 +360,8 @@ impl AsmGenContext {
         import_reg_and_inst!();
         let rhs = self.reg_pool.take_register();
         let lhs = self.reg_pool.take_register();
-        let ans = self.reg_pool.alloc_temp();
+        assert_eq!(lhs.sz(), rhs.sz());
+        let ans = self.reg_pool.alloc_temp(lhs.sz());
         self.write_inst(add {
             rd: ans,
             rs1: lhs,
@@ -370,13 +371,24 @@ impl AsmGenContext {
 
     pub fn add_sp(&mut self) {
         import_reg_and_inst!();
-        let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
         let rhs = self.reg_pool.take_register();
-        let ans = self.reg_pool.alloc_temp();
+        let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
+        let ans = self.reg_pool.alloc_temp(rhs.sz());
+        let rs2 = match rhs.sz() {
+            Bit::b64 => AddSubOperand::Register(rhs),
+            Bit::b32 => {
+                AddSubOperand::ExtendedRegister(ExtendedRegister {
+                    reg: rhs,
+                    extend: Extend::SXTW,
+                    shift: 0,
+                })
+            },
+            _ => unreachable!(),
+        };
         self.write_inst(add {
             rd: ans,
             rs1: sp,
-            rs2: AddSubOperand::Register(rhs),
+            rs2,
         });
     }
 
@@ -401,13 +413,15 @@ impl AsmGenContext {
 impl AsmGenContext {
     // undef should not have any memory moves when being efficiency.
     pub fn undef_take_temp(&mut self) {
-        self.reg_pool.alloc_temp();
+        self.reg_pool.alloc_temp(Bit::b64);
     }
 
+    /// Load an immediate value into a register.
+    /// TODO: currently only supports 32-bit immediate values. 
     #[inline]
     pub fn load_imm(&mut self, imm: i32) {
         import_reg_and_inst!();
-        let temp_reg = self.reg_pool.alloc_temp();
+        let temp_reg = self.reg_pool.alloc_temp(Bit::b32);
         if (-32768..32768).contains(&imm) {
             self.write_inst(mov {
                 rd: temp_reg,
@@ -554,7 +568,7 @@ impl AsmGenContext {
         import_reg_and_inst!();
         let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
         if (-2048..2048).contains(&offset) {
-            let temp_reg = self.reg_pool.alloc_temp();
+            let temp_reg = self.reg_pool.alloc_temp(Bit::b32);
             self.write_inst(ldr {
                 rd: temp_reg,
                 rs: sp,
@@ -564,7 +578,7 @@ impl AsmGenContext {
             self.load_imm(offset);
             self.add_sp();
             let add_temp = self.reg_pool.take_register();
-            let temp_reg = self.reg_pool.alloc_temp();
+            let temp_reg = self.reg_pool.alloc_temp(Bit::b32);
             self.write_inst(ldr {
                 rd: temp_reg,
                 rs: add_temp,
@@ -575,7 +589,7 @@ impl AsmGenContext {
 
     pub fn load_address(&mut self, label: String) {
         import_reg_and_inst!();
-        let temp_reg = self.reg_pool.alloc_temp();
+        let temp_reg = self.reg_pool.alloc_temp(Bit::b64);
         // use adrp + add to load address of global variable.
         self.write_inst(adrp {
             rd: temp_reg,
@@ -588,10 +602,10 @@ impl AsmGenContext {
         });
     }
 
-    pub fn load_from_address(&mut self) {
+    pub fn load_from_address(&mut self, size: Bit) {
         import_reg_and_inst!();
         let address_reg = self.reg_pool.take_register();
-        let value_reg = self.reg_pool.alloc_temp();
+        let value_reg = self.reg_pool.alloc_temp(size);
         self.write_inst(ldr {
             rd: value_reg,
             rs: address_reg,
@@ -603,7 +617,8 @@ impl AsmGenContext {
         import_reg_and_inst!();
         let rhs = self.reg_pool.take_register();
         let lhs = self.reg_pool.take_register();
-        let res = self.reg_pool.alloc_temp();
+        assert_eq!(lhs.sz(), rhs.sz());
+        let res = self.reg_pool.alloc_temp(lhs.sz());
         match op {
             // ARMv8 uses the sign bits of the result of a cmp instruction to determine
             // the condition flags, so we can use cmp + cset to implement these comparisons.
@@ -738,10 +753,11 @@ impl AsmGenContext {
         }
     }
 
-    pub fn ret(&mut self) {
+    pub fn ret(&mut self, ret_sz: Bit) {
         import_reg_and_inst!();
         let source = self.reg_pool.take_register();
-        let x0 = Register::I(IReg(Bit::b64, IntRegister::x0));
+        assert_eq!(source.sz(), ret_sz);
+        let x0 = Register::I(IReg(ret_sz, IntRegister::x0));
         self.write_inst(mov {
             rd: x0,
             src: MovOperand::Register(source),

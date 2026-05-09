@@ -20,6 +20,20 @@ impl Bit {
     }
 }
 
+impl TryFrom<usize> for Bit {
+    type Error = ();
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        match value {
+            16 => Ok(Bit::b128),
+            8 => Ok(Bit::b64),
+            4 => Ok(Bit::b32),
+            2 => Ok(Bit::b16),
+            _ => Err(()),
+        }
+    }
+}
+
 #[allow(non_camel_case_types)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, TryFromPrimitive, IntoPrimitive,
@@ -138,11 +152,11 @@ impl IReg {
         )
     }
 
-    pub fn temporary(id: usize) -> IReg {
+    pub fn temporary(id: usize, size: Bit) -> IReg {
         assert!(id < 7, "too many temporary registers");
         use IntRegister::*;
         let reg = [x9, x10, x11, x12, x13, x14, x15][id];
-        IReg(Bit::b64, reg)
+        IReg(size, reg)
     }
 }
 
@@ -171,10 +185,10 @@ impl Register {
         }
     }
 
-    pub fn width(&self) -> u8 {
+    pub fn sz(&self) -> Bit {
         match self {
-            Register::I(reg) => reg.0.width(),
-            Register::F(reg) => reg.0.width(),
+            Register::I(reg) => reg.0,
+            Register::F(reg) => reg.0,
         }
     }
 
@@ -183,9 +197,9 @@ impl Register {
         Register::I(IReg(Bit::b64, IntRegister::try_from(idx as u8).unwrap()))
     }
 
-    pub fn temporary(id: usize) -> Register {
+    pub fn temporary(id: usize, size: Bit) -> Register {
         assert!(id < 7, "too many temporary registers");
-        Register::I(IReg::temporary(id))
+        Register::I(IReg::temporary(id, size))
     }
 
     pub fn is_arg(&self) -> bool {

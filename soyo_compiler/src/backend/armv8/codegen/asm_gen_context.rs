@@ -358,11 +358,6 @@ impl AsmGenContext {
                     self.undef_take_temp();
                 }
                 _ if !data.ty().is_unit() => {
-                    eprintln!(
-                        "{:?} {:?}",
-                        val,
-                        self.curr_func_data(program).inst_data(val).kind()
-                    );
                     match *self.allocation.get(&val).unwrap() {
                         AllocationState::Register(register) => {
                             self.push_register(self.value_register(program, val, register))

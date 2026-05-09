@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 use log::info;
 
-const VERBOSE: bool = false;
+const VERBOSE: bool = true;
 
 use crate::ir::BasicBlock;
 use crate::ir::{

@@ -83,7 +83,7 @@ where
         match self.id_pos.entry(pkey) {
             Entry::Occupied(e) => *e.get(),
             Entry::Vacant(..) => {
-                println!("Allocating new ID for key: {:?} with nkey: {:?}", pkey, nkey);
+                debug!("Allocating new ID for key: {:?} with nkey: {:?}", pkey, nkey);
                 self.id_pos.insert(pkey, self.cnt);
                 self.id_neg.insert(self.cnt, nkey);
                 let ret = self.cnt;

@@ -6,6 +6,7 @@ use std::{
 };
 
 use itertools::Itertools;
+use log::debug;
 use raana_ir::ir::{BasicBlock, arena::Arena};
 use raana_ir::ir::{FunctionData, Inst, InstKind};
 use raana_ir::opt::prelude::*;
@@ -227,7 +228,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                 .copied()
                 .unwrap_or($min_id);
             let range = vregs.extent_by_loop($min_id..=max_id);
-            eprintln!("insert range:{:?} {:?}", $inst, range);
+            debug!("insert range:{:?} {:?}", $inst, range);
             liveness_ranges.insert($inst, range);
         };
     }
@@ -239,7 +240,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     for bb_id in rpo_path {
         let bb: BasicBlock = bb_alloc.search_id(bb_id);
         let insts = data.layout().basicblock(bb).insts();
-        eprintln!("params:{:?}", data.bb_data(bb).params());
+        debug!("params:{:?}", data.bb_data(bb).params());
 
         if let Some(min_id) = data
             .bb_data(bb)
@@ -303,7 +304,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                 AllocationState::Register(sized_register(data, val, alloc.0)),
             );
         } else {
-            eprintln!("Spill!");
+            debug!("Spill!");
             if let Some((index, (occupied_range, occupied_reg, occupied_val))) = active
                 .iter()
                 .rev()
@@ -348,19 +349,9 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     for (index, &fparam) in data.params().iter().skip(8).enumerate() {
         register_allocation.insert(fparam, AllocationState::Stack(offset + 4 * index));
     }
-    eprintln!("function name:{:?}", data.name());
-
-    eprintln!("--------------------------------");
-
-    for (k, v) in liveness_ranges.iter() {
-        eprintln!("{:?} {:?}", k, v);
-    }
-
-    for (k, v) in register_allocation.iter() {
-        eprintln!("{:?} {:?}", k, v);
-    }
-
-    eprintln!("--------------------------------");
+    debug!("function name:{:?}", data.name());
+    debug!("liveness ranges:{:?}", liveness_ranges);
+    debug!("register allocation:{:?}", register_allocation);
 
     RegisterAllocationResult {
         allocation: register_allocation,
@@ -372,6 +363,10 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
 }
 
 fn can_produce_value(val: Inst, data: &FunctionData) -> bool {
+    if data.inst_data(val).ty().size() == 0 {
+        return false;
+    }
+
     matches!(
         data.inst_data(val).kind(),
         InstKind::FuncArgRef(..)

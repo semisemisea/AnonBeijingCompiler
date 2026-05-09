@@ -71,18 +71,13 @@ impl InstStatusMap {
     }
 
     #[must_use]
-    fn merge(&mut self, val: Inst, status: VariableStatus) -> bool {
-        let id = self.var_allocator.get_id(&val);
-        self.status[id].update(status)
-    }
-
-    #[must_use]
     fn insert_or_merge(&mut self, val: Inst, status: VariableStatus) -> bool {
         let id = self.var_allocator.check_or_alloc_id_same(val);
         if id < self.status.len() {
-            self.merge(val, status)
+            self.status[id].update(status)
         } else {
-            self.insert(val, status);
+            assert_eq!(id, self.status.len());
+            self.status.push(status);
             false
         }
     }
@@ -190,7 +185,7 @@ impl Pass for SparseConditionConstantPropagation {
                 };
                 data.replace_inst_with(inst).integer(constant);
                 let parent_bb = data.layout().parent_bb(inst).unwrap();
-                data.layout_mut().remove_inst(parent_bb, inst);
+                data.detach_layout_inst(parent_bb, inst);
             }
 
             let mut useless_unconditional_list = Vec::new();
@@ -229,7 +224,7 @@ impl Pass for SparseConditionConstantPropagation {
                 })
                 .collect::<Vec<_>>();
             for bb in remove_list {
-                data.layout_mut().remove_basicblock(bb);
+                data.remove_layout_basicblock(bb);
                 // data.remove_bb(bb);
             }
 

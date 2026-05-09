@@ -228,14 +228,14 @@ impl AstGenContext {
             self.curr_func_data_mut()
                 .layout_mut()
                 .insert_inst(curr_bb, inst);
+        } else {
+            self.curr_func_data_mut().remove_orphan_inst(inst);
         }
     }
 
     pub fn remove_inst(&mut self, inst: Inst) {
         let curr_basic_blcok = self.curr_bb.unwrap();
-        self.curr_func_data_mut()
-            .layout_mut()
-            .remove_inst(curr_basic_blcok, inst);
+        self.curr_func_data_mut().remove_layout_inst(curr_basic_blcok, inst);
     }
 
     #[inline]
@@ -253,7 +253,7 @@ impl AstGenContext {
     }
 
     pub fn remove_bb(&mut self, bb: BasicBlock) {
-        self.curr_func_data_mut().layout_mut().remove_basicblock(bb);
+        self.curr_func_data_mut().remove_layout_basicblock(bb);
     }
 
     #[inline]

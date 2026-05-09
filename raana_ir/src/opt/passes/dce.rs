@@ -151,7 +151,7 @@ impl DeadCodeElimination {
             );
         }
         for (inst, bb) in rename_list {
-            data.layout_mut().remove_inst(bb, inst);
+            data.remove_layout_inst(bb, inst);
         }
     }
 }
@@ -251,12 +251,12 @@ impl Pass for UnreachableBasicBlock {
             }
 
             for bb in island {
-                data.layout_mut().remove_basicblock(bb);
+                data.remove_layout_basicblock(bb);
             }
 
             for id in unreachable_bb {
                 let bb = id_allocator.search_id(id);
-                data.layout_mut().remove_basicblock(bb);
+                data.remove_layout_basicblock(bb);
             }
         }
     }

@@ -128,6 +128,7 @@ def run_test(src, out_dir, opt_level, compiler):
     copy_testcase_files(src, out_dir)
 
     asm = out_dir / src_rel.with_suffix(".s")
+    ir = out_dir / src_rel.with_suffix(".raana")
     elf = out_dir / src_rel.with_suffix(".elf")
     compile_stdout = out_dir / src_rel.with_suffix(".compile.stdout")
     compile_stderr = out_dir / src_rel.with_suffix(".compile.stderr")
@@ -150,6 +151,20 @@ def run_test(src, out_dir, opt_level, compiler):
             time.perf_counter() - start,
             " CE ",
             f"exit {compile_proc.returncode}\n{output or '(no output)'}",
+        )
+
+    ir_args = [str(compiler)]
+    if opt_level:
+        ir_args.append(f"-O{opt_level}")
+    ir_args += ["--emit", "ir", "-o", str(ir), str(src)]
+
+    ir_proc = subprocess.run(ir_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if ir_proc.returncode:
+        output = (ir_proc.stdout + ir_proc.stderr).decode("utf-8", "replace").strip()
+        return (
+            time.perf_counter() - start,
+            " CE ",
+            f"ir exit {ir_proc.returncode}\n{output or '(no output)'}",
         )
 
     link_proc = subprocess.run(

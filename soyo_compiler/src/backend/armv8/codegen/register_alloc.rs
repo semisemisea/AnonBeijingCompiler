@@ -64,12 +64,11 @@ impl VirtualRegister {
 
     #[inline]
     fn new(max_size: usize) -> VirtualRegister {
+        let scratch = [IntRegister::x16, IntRegister::x17];
         Self {
-            container: BinaryHeap::from_iter((0..max_size as u8).map(|x| {
-                Reverse(Register::I(IReg(
-                    Bit::b64,
-                    IntRegister::try_from(x).unwrap(),
-                )))
+            container: BinaryHeap::from_iter((0..max_size as u8).filter_map(|x| {
+                let reg = IntRegister::try_from(x).unwrap();
+                (!scratch.contains(&reg)).then_some(Reverse(Register::I(IReg(Bit::b64, reg))))
             })),
             rules: HashMap::new(),
             loops: Vec::new(),
@@ -117,7 +116,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     // let graph = utils::build_cfg_forward(data, &mut bb_alloc);
     let (graph, prece) = cfg::build_cfg_both(data, &mut bb_alloc);
     let rpo_path = cfg::rpo_path(&graph);
-    let mut register_manager = VirtualRegister::new(REGISTER_COUNT);
+    let mut vregs = VirtualRegister::new(REGISTER_COUNT);
 
     let mut call_ra = false;
     let mut extra_args = 0usize;
@@ -137,11 +136,11 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                 call_ra = true;
                 extra_args = extra_args.max(8.max(call.args().len()) - 8);
                 for index in 0..8 {
-                    register_manager.add_rule(Reverse(Register::arguments(index)), id..=id);
+                    vregs.add_rule(Reverse(Register::arguments(index)), id..=id);
                 }
                 for index in 0..7 {
                     // FIXME: we should also consider the size of temporary register.
-                    register_manager.add_rule(Reverse(Register::temporary(index, Bit::b64)), id..=id);
+                    vregs.add_rule(Reverse(Register::temporary(index, Bit::b64)), id..=id);
                 }
             }
         }
@@ -196,7 +195,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                                 }
                             }
 
-                            register_manager.add_loop(*header_id..=max_loop_id);
+                            vregs.add_loop(*header_id..=max_loop_id);
                         }
                     }
                 }
@@ -215,69 +214,6 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
             _ => unreachable!(),
         }
     }
-    // for &bb_id in rpo_path.iter() {
-    //     let bb = bb_alloc.search_id(bb_id);
-    //     let node = data.layout().bbs().node(&bb).unwrap();
-    //     let iter = data
-    //         .dfg()
-    //         .bb(bb)
-    //         .params()
-    //         .iter()
-    //         .chain(node.insts().iter().map(|(val, _)| val));
-    //     for &inst in iter {
-    //         let id = val_alloc.check_or_alloc(inst);
-    //
-    //         if let InstKind::Call(call) = data.dfg().value(inst).kind() {
-    //             call_ra = true;
-    //             extra_args = extra_args.max(8.max(call.args().len()) - 8);
-    //             for index in 0..8 {
-    //                 register_manager.add_rule(Reverse(Register::arguments(index)), id..=id);
-    //             }
-    //             for index in 0..7 {
-    //                 register_manager.add_rule(Reverse(Register::temporary(index)), id..=id);
-    //             }
-    //         }
-    //     }
-    //
-    //     let terminator_inst = get_terminator_inst(data, bb);
-    //
-    //     // TODO:
-    //     macro_rules! add_loop {
-    //         ($backedge_goes_to: expr) => {
-    //             if let Some(id) = bb_alloc.get_id_safe($backedge_goes_to) {
-    //                 let head_bb = bb_alloc.search_id(*id);
-    //                 let head_bb_first_inst = *data.dfg().bb(head_bb).params().first().unwrap_or(
-    //                     data.layout()
-    //                         .bbs()
-    //                         .node(&head_bb)
-    //                         .unwrap()
-    //                         .insts()
-    //                         .front_key()
-    //                         .unwrap(),
-    //                 );
-    //                 if let (Some(header_id), Some(latch_id)) = (
-    //                     val_alloc.get_id_safe(head_bb_first_inst),
-    //                     val_alloc.get_id_safe(terminator_inst),
-    //                 ) && header_id < latch_id
-    //                 {
-    //                     register_manager.add_loop(*header_id..=*latch_id);
-    //                 }
-    //             }
-    //         };
-    //     }
-    //     match data.dfg().value(terminator_inst).kind() {
-    //         InstKind::Jump(jump) => {
-    //             add_loop!(jump.target());
-    //         }
-    //         InstKind::Branch(branch) => {
-    //             add_loop!(branch.true_bb());
-    //             add_loop!(branch.false_bb());
-    //         }
-    //         InstKind::Return(..) => {}
-    //         _ => unreachable!(),
-    //     }
-    // }
-
     let mut liveness_ranges = HashMap::new();
 
     macro_rules! insert_range {
@@ -290,7 +226,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                 .max()
                 .copied()
                 .unwrap_or($min_id);
-            let range = register_manager.extent_by_loop($min_id..=max_id);
+            let range = vregs.extent_by_loop($min_id..=max_id);
             eprintln!("insert range:{:?} {:?}", $inst, range);
             liveness_ranges.insert($inst, range);
         };
@@ -337,7 +273,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
         let remove_partition =
             active.partition_point(|(range, _reg, _val)| range.end() < new_range.start());
         for (_, reg, _) in active.drain(0..remove_partition) {
-            register_manager.free(reg);
+            vregs.free(reg);
         }
 
         macro_rules! active_insert {
@@ -360,20 +296,26 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
             continue;
         }
 
-        if let Some(alloc) = register_manager.alloc(new_range) {
+        if let Some(alloc) = vregs.alloc(new_range) {
             active_insert!(new_range, alloc, val);
-            register_allocation.insert(val, AllocationState::Register(alloc.0));
+            register_allocation.insert(
+                val,
+                AllocationState::Register(sized_register(data, val, alloc.0)),
+            );
         } else {
             eprintln!("Spill!");
             if let Some((index, (occupied_range, occupied_reg, occupied_val))) = active
                 .iter()
                 .rev()
-                .find_position(|&&(_, reg, _)| register_manager.check(reg, new_range))
+                .find_position(|&&(_, reg, _)| vregs.check(reg, new_range))
             {
                 if occupied_range.end() > new_range.end() {
                     // spill the occupied one
                     alloc_stack!(*occupied_val);
-                    register_allocation.insert(val, AllocationState::Register(occupied_reg.0));
+                    register_allocation.insert(
+                        val,
+                        AllocationState::Register(sized_register(data, val, occupied_reg.0)),
+                    );
                     let alloc_reg = *occupied_reg;
                     let actual_index = active.len() - index - 1;
                     active.remove(actual_index);
@@ -395,7 +337,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
         let unaligned = curr_inst_offset
             + if call_ra { 16 } else { 0 }
             + extra_args * 8
-            + register_manager.callee_used.len() * 8;
+            + vregs.callee_used.len() * 8;
         if unaligned & 0x0F != 0 {
             (unaligned | 0x0F) + 1
         } else {
@@ -425,7 +367,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
         offset,
         call_ra,
         extra_args,
-        callee_usage: register_manager.callee_used,
+        callee_usage: vregs.callee_used,
     }
 }
 
@@ -441,6 +383,10 @@ fn can_produce_value(val: Inst, data: &FunctionData) -> bool {
             | InstKind::Binary(..)
             | InstKind::Call(..)
     )
+}
+
+fn sized_register(data: &FunctionData, val: Inst, register: Register) -> Register {
+    register.with_size(Bit::try_from(crate::backend::armv8::codegen::inst_size(data, val)).unwrap())
 }
 
 // TODO:

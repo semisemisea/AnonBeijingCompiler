@@ -192,6 +192,13 @@ impl Register {
         }
     }
 
+    pub fn with_size(self, size: Bit) -> Register {
+        match self {
+            Register::I(IReg(_, reg)) => Register::I(IReg(size, reg)),
+            Register::F(FReg(_, reg)) => Register::F(FReg(size, reg)),
+        }
+    }
+
     pub fn arguments(idx: usize) -> Register {
         assert!(idx < 8, "too many arguments");
         Register::I(IReg(Bit::b64, IntRegister::try_from(idx as u8).unwrap()))

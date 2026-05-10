@@ -68,11 +68,11 @@ __attribute((destructor)) void after_main(){
   }
   fprintf(stderr,"TOTAL: %dH-%dM-%dS-%dus\n",_sysy_h[0],_sysy_m[0],_sysy_s[0],_sysy_us[0]);
 }  
-void _sysy_starttime(int lineno){
+void starttime(int lineno){
   _sysy_l1[_sysy_idx] = lineno;
   gettimeofday(&_sysy_start,NULL);
 }
-void _sysy_stoptime(int lineno){
+void stoptime(int lineno){
   gettimeofday(&_sysy_end,NULL);
   _sysy_l2[_sysy_idx] = lineno;
   _sysy_us[_sysy_idx] += 1000000 * ( _sysy_end.tv_sec - _sysy_start.tv_sec ) + _sysy_end.tv_usec - _sysy_start.tv_usec;

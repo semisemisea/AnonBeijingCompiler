@@ -322,7 +322,6 @@ impl GenerateAsm for Branch {
         true_args_and_params
             .chain(false_args_and_params)
             .for_each(|(&arg, &param)| {
-                eprint!("params:");
                 ctx.load_to_register(program, arg);
                 ctx.save_word_at_inst(program, param);
             });

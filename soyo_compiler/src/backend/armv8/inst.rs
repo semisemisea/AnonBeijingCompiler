@@ -73,7 +73,7 @@ pub enum LogicOperand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MovOperand {
     Register(Register),
-    Immediate(MoveWideImm),
+    Immediate(i32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,7 +340,7 @@ impl fmt::Display for MovOperand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MovOperand::Register(reg) => write!(f, "{reg}"),
-            MovOperand::Immediate(imm) => write!(f, "{imm}"),
+            MovOperand::Immediate(imm) => write!(f, "#{imm}"),
         }
     }
 }

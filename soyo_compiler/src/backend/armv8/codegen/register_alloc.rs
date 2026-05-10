@@ -11,7 +11,9 @@ use raana_ir::ir::{BasicBlock, arena::Arena};
 use raana_ir::ir::{FunctionData, Inst, InstKind};
 use raana_ir::opt::prelude::*;
 
-use crate::backend::armv8::register::{Bit, IReg, IntRegister, Register};
+use crate::backend::armv8::register::{
+    Bit, FReg, FloatRegister, IReg, IntRegister, Register, RegisterType,
+};
 
 type VRegister = Reverse<Register>;
 
@@ -64,13 +66,48 @@ impl VirtualRegister {
     }
 
     #[inline]
-    fn new(max_size: usize) -> VirtualRegister {
-        let scratch = [IntRegister::x16, IntRegister::x17];
-        Self {
-            container: BinaryHeap::from_iter((0..max_size as u8).filter_map(|x| {
+    fn new(max_size: usize, ty: RegisterType) -> VirtualRegister {
+        let int_scratch = [IntRegister::x16, IntRegister::x17];
+        let float_regs = [
+            FloatRegister::v0,
+            FloatRegister::v1,
+            FloatRegister::v2,
+            FloatRegister::v3,
+            FloatRegister::v4,
+            FloatRegister::v5,
+            FloatRegister::v6,
+            FloatRegister::v7,
+            FloatRegister::v8,
+            FloatRegister::v9,
+            FloatRegister::v10,
+            FloatRegister::v11,
+            FloatRegister::v12,
+            FloatRegister::v13,
+            FloatRegister::v14,
+            FloatRegister::v15,
+            FloatRegister::v18,
+            FloatRegister::v19,
+            FloatRegister::v20,
+            FloatRegister::v21,
+            FloatRegister::v22,
+            FloatRegister::v23,
+            FloatRegister::v24,
+            FloatRegister::v25,
+        ];
+        let container = match ty {
+            RegisterType::Int => BinaryHeap::from_iter((0..max_size as u8).filter_map(|x| {
                 let reg = IntRegister::try_from(x).unwrap();
-                (!scratch.contains(&reg)).then_some(Reverse(Register::I(IReg(Bit::b64, reg))))
+                (!int_scratch.contains(&reg)).then_some(Reverse(Register::I(IReg(Bit::b64, reg))))
             })),
+            RegisterType::Float => BinaryHeap::from_iter(
+                float_regs
+                    .into_iter()
+                    .take(max_size)
+                    .map(|reg| Reverse(Register::F(FReg(Bit::b32, reg)))),
+            ),
+        };
+        Self {
+            container,
             rules: HashMap::new(),
             loops: Vec::new(),
             callee_used: HashSet::new(),
@@ -117,7 +154,8 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     // let graph = utils::build_cfg_forward(data, &mut bb_alloc);
     let (graph, prece) = cfg::build_cfg_both(data, &mut bb_alloc);
     let rpo_path = cfg::rpo_path(&graph);
-    let mut vregs = VirtualRegister::new(REGISTER_COUNT);
+    let mut int_vregs = VirtualRegister::new(REGISTER_COUNT, RegisterType::Int);
+    let mut float_vregs = VirtualRegister::new(REGISTER_COUNT, RegisterType::Float);
 
     let mut call_ra = false;
     let mut extra_args = 0usize;
@@ -137,19 +175,20 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                 call_ra = true;
                 extra_args = extra_args.max(8.max(call.args().len()) - 8);
                 for index in 0..8 {
-                    vregs.add_rule(Reverse(Register::arguments(index)), id..=id);
+                    int_vregs.add_rule(Reverse(Register::arguments(index)), id..=id);
+                    float_vregs.add_rule(Reverse(Register::float_arguments(index)), id..=id);
                 }
-                vregs.add_rule(
+                int_vregs.add_rule(
                     Reverse(Register::I(IReg(Bit::b64, IntRegister::x8))),
                     id..=id,
                 );
-                vregs.add_rule(
+                int_vregs.add_rule(
                     Reverse(Register::I(IReg(Bit::b64, IntRegister::x18))),
                     id..=id,
                 );
                 for index in 0..7 {
                     // FIXME: we should also consider the size of temporary register.
-                    vregs.add_rule(Reverse(Register::temporary(index, Bit::b64)), id..=id);
+                    int_vregs.add_rule(Reverse(Register::temporary(index, Bit::b64)), id..=id);
                 }
             }
         }
@@ -204,7 +243,8 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                                 }
                             }
 
-                            vregs.add_loop(*header_id..=max_loop_id);
+                            int_vregs.add_loop(*header_id..=max_loop_id);
+                            float_vregs.add_loop(*header_id..=max_loop_id);
                         }
                     }
                 }
@@ -235,7 +275,11 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                 .max()
                 .copied()
                 .unwrap_or($min_id);
-            let range = vregs.extent_by_loop($min_id..=max_id);
+            let register_type = register_type(data, $inst);
+            let range = match register_type {
+                RegisterType::Int => int_vregs.extent_by_loop($min_id..=max_id),
+                RegisterType::Float => float_vregs.extent_by_loop($min_id..=max_id),
+            };
             liveness_ranges.insert($inst, range);
         };
     }
@@ -277,10 +321,16 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     // start from beyond LR.
     let mut acc_inst_offset = extra_args * 8 + if call_ra { 16 } else { 0 };
 
-    let mut active: Vec<(std::ops::RangeInclusive<usize>, VRegister, Inst)> =
+    let mut int_active: Vec<(std::ops::RangeInclusive<usize>, VRegister, Inst)> =
+        Vec::with_capacity(REGISTER_COUNT);
+    let mut float_active: Vec<(std::ops::RangeInclusive<usize>, VRegister, Inst)> =
         Vec::with_capacity(REGISTER_COUNT);
     for val in unhandled {
         let new_range = liveness_ranges.get(&val).unwrap();
+        let (vregs, active) = match register_type(data, val) {
+            RegisterType::Int => (&mut int_vregs, &mut int_active),
+            RegisterType::Float => (&mut float_vregs, &mut float_active),
+        };
         let remove_partition =
             active.partition_point(|(range, _reg, _val)| range.end() < new_range.start());
         for (_, reg, _) in active.drain(0..remove_partition) {
@@ -348,7 +398,8 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
         let unaligned = acc_inst_offset
             + if call_ra { 16 } else { 0 }
             + extra_args * 8
-            + vregs.callee_used.len() * 8;
+            + int_vregs.callee_used.len() * 8
+            + float_vregs.callee_used.len() * 8;
         if unaligned & 0x0F != 0 {
             (unaligned | 0x0F) + 1
         } else {
@@ -369,7 +420,19 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
         offset,
         call_ra,
         extra_args,
-        callee_usage: vregs.callee_used,
+        callee_usage: int_vregs
+            .callee_used
+            .into_iter()
+            .chain(float_vregs.callee_used)
+            .collect(),
+    }
+}
+
+fn register_type(data: &FunctionData, val: Inst) -> RegisterType {
+    if data.inst_data(val).ty().is_f32() {
+        RegisterType::Float
+    } else {
+        RegisterType::Int
     }
 }
 
@@ -387,6 +450,7 @@ fn can_produce_value(val: Inst, data: &FunctionData) -> bool {
             | InstKind::GetPtr(..)
             | InstKind::GetElemPtr(..)
             | InstKind::Binary(..)
+            | InstKind::Cast(..)
             | InstKind::Call(..)
     )
 }

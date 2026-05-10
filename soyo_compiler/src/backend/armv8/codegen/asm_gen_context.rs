@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use itertools::Itertools;
 use raana_ir::ir::{
     Aggregate, BasicBlock, BinaryOp, Function, FunctionData, Inst as IrInst, InstKind, Program,
-    arena::Arena,
+    Type, arena::Arena,
 };
 
 use crate::backend::armv8::{
@@ -13,10 +13,10 @@ use crate::backend::armv8::{
         register_alloc::{AllocationState, RegisterAllocation},
     },
     inst::{
-        AddSubImm, AddSubOperand, CsetCondition, Extend, ExtendedRegister, Inst, LoadSaveOffset,
-        LogicOperand, MovOperand, MoveWideImm, MoveWideImmShift, ShiftSize,
+        AddSubImm, AddSubOperand, CsetCondition, Extend, ExtendedRegister, FcmpOperand, Inst,
+        LoadSaveOffset, LogicOperand, MovOperand, MoveWideImm, MoveWideImmShift, ShiftSize,
     },
-    register::{Bit, IReg, IntRegister, Register},
+    register::{Bit, FReg, FloatRegister, IReg, IntRegister, Register, RegisterType},
 };
 
 type List = Vec<Inst>;
@@ -91,7 +91,7 @@ impl AsmGenContext {
         }
     }
 
-    pub fn value_bit(&self, program: &Program, val: IrInst) -> Bit {
+    pub fn value_sz(&self, program: &Program, val: IrInst) -> Bit {
         let size = if val.is_global() {
             program.inst_data(val).ty().size()
         } else {
@@ -100,8 +100,16 @@ impl AsmGenContext {
         Bit::try_from(size).unwrap()
     }
 
+    pub fn value_ty<'a>(&self, program: &'a Program, val: IrInst) -> &'a Type {
+        if val.is_global() {
+            program.inst_data(val).ty()
+        } else {
+            self.curr_func_data(program).inst_data(val).ty()
+        }
+    }
+
     fn value_register(&self, program: &Program, val: IrInst, register: Register) -> Register {
-        register.with_size(self.value_bit(program, val))
+        register.with_size(self.value_sz(program, val))
     }
 
     #[inline]
@@ -117,13 +125,25 @@ impl AsmGenContext {
         reg
     }
 
-    fn alloc_scratch(&mut self, size: Bit) -> Register {
-        let regs = [IntRegister::x16, IntRegister::x17];
-        assert!(
-            self.scratch_usage < regs.len(),
-            "run out of scratch registers"
-        );
-        let reg = Register::I(IReg(size, regs[self.scratch_usage]));
+    fn alloc_scratch(&mut self, size: Bit, ty: RegisterType) -> Register {
+        let reg = match ty {
+            RegisterType::Int => {
+                let regs = [IntRegister::x16, IntRegister::x17];
+                assert!(
+                    self.scratch_usage < regs.len(),
+                    "run out of scratch registers"
+                );
+                Register::I(IReg(size, regs[self.scratch_usage]))
+            }
+            RegisterType::Float => {
+                let regs = [FloatRegister::v16, FloatRegister::v17];
+                assert!(
+                    self.scratch_usage < regs.len(),
+                    "run out of scratch registers"
+                );
+                Register::F(FReg(size, regs[self.scratch_usage]))
+            }
+        };
         self.scratch_usage += 1;
         self.push_register(reg);
         reg
@@ -134,6 +154,7 @@ impl AsmGenContext {
         matches!(
             reg,
             Register::I(IReg(_, IntRegister::x16 | IntRegister::x17))
+                | Register::F(FReg(_, FloatRegister::v16 | FloatRegister::v17))
         )
     }
 
@@ -321,21 +342,25 @@ impl AsmGenContext {
         import_reg_and_inst!();
         // FIXME: maybe incorrect use of curr_func_data
         let data = self.curr_func_data(program).inst_data(val);
-        let reg = reg.with_size(self.value_bit(program, val));
+        let reg = reg.with_size(self.value_sz(program, val));
         match data.kind() {
             InstKind::Integer(int) => {
                 self.load_imm(int.value(), reg.sz());
                 let source = self.take_register();
                 self.mv(source, reg);
             }
-            // InstKind::FuncArgRef(arg_ref) if arg_ref.index() < 8 => {
-            //     use Register::a0;
-            //     let reg = (a0 as u8 + arg_ref.index() as u8).try_into().unwrap();
-            //     self.alloc_para_reg(reg);
-            // }
+            InstKind::Float(float) => {
+                self.load_float_imm(float.value());
+                let source = self.take_register();
+                self.fmv(source, reg);
+            }
             _ if !data.ty().is_unit() => match *self.allocation.get(&val).unwrap() {
                 AllocationState::Register(register) => {
-                    self.mv(self.value_register(program, val, register), reg)
+                    let source = self.value_register(program, val, register);
+                    match source.ty() {
+                        RegisterType::Int => self.mv(source, reg),
+                        RegisterType::Float => self.fmv(source, reg),
+                    }
                 }
                 AllocationState::Stack(offset) => {
                     let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
@@ -354,7 +379,10 @@ impl AsmGenContext {
             let data = self.curr_func_data(program).inst_data(val);
             match data.kind() {
                 InstKind::Integer(int) => {
-                    self.load_imm(int.value(), self.value_bit(program, val));
+                    self.load_imm(int.value(), self.value_sz(program, val));
+                }
+                InstKind::Float(float) => {
+                    self.load_float_imm(float.value());
                 }
                 // InstKind::FuncArgRef(arg_ref) if arg_ref.index() < 8 => {
                 //     use Register::a0;
@@ -362,7 +390,7 @@ impl AsmGenContext {
                 //     self.alloc_para_reg(reg);
                 // }
                 InstKind::Undef => {
-                    self.undef_take_temp(self.value_bit(program, val));
+                    self.undef_take_temp(self.value_sz(program, val));
                 }
                 _ if !data.ty().is_unit() => {
                     match *self.allocation.get(&val).unwrap() {
@@ -370,7 +398,11 @@ impl AsmGenContext {
                             self.push_register(self.value_register(program, val, register))
                         }
                         AllocationState::Stack(offset) => {
-                            self.load_word_sp(offset as _, self.value_bit(program, val));
+                            self.load_word_sp(
+                                offset as _,
+                                self.value_sz(program, val),
+                                data.ty().try_into().unwrap(),
+                            );
                         }
                     }
                     // let offset = self.get_inst_offset(val).unwrap() as i32;
@@ -385,8 +417,12 @@ impl AsmGenContext {
         &mut self.curr_inst
     }
 
-    pub fn alloc_ret_reg(&mut self, size: Bit) {
-        self.push_register(Register::I(IReg(size, IntRegister::x0)));
+    pub fn alloc_ret_reg(&mut self, size: Bit, ty: RegisterType) {
+        let reg = match ty {
+            RegisterType::Int => Register::I(IReg(size, IntRegister::x0)),
+            RegisterType::Float => Register::F(FReg(size, FloatRegister::v0)),
+        };
+        self.push_register(reg);
     }
 
     pub fn alloc_para_reg(&mut self, reg: Register) {
@@ -403,49 +439,77 @@ impl AsmGenContext {
         let rhs = self.take_register();
         let lhs = self.take_register();
         assert_eq!(lhs.sz(), rhs.sz());
-        let ans = self.alloc_scratch(lhs.sz());
-        self.write_inst(mul {
-            rd: ans,
-            rs1: lhs,
-            rs2: rhs,
-        });
+        assert_eq!(lhs.ty(), rhs.ty());
+        match lhs.ty() {
+            RegisterType::Int => {
+                let ans = self.alloc_scratch(lhs.sz(), RegisterType::Int);
+                self.write_inst(mul {
+                    rd: ans,
+                    rs1: lhs,
+                    rs2: rhs,
+                });
+            }
+            RegisterType::Float => {
+                let ans = self.alloc_scratch(lhs.sz(), RegisterType::Float);
+                self.write_inst(fmul {
+                    rd: ans,
+                    rs1: lhs,
+                    rs2: rhs,
+                });
+            }
+        }
     }
 
     pub fn add_op(&mut self) {
         import_reg_and_inst!();
         let rhs = self.take_register();
         let lhs = self.take_register();
-        if lhs.sz() == rhs.sz() {
-            let ans = self.alloc_scratch(lhs.sz());
-            self.write_inst(add {
-                rd: ans,
-                rs1: lhs,
-                rs2: AddSubOperand::Register(rhs),
-            });
-        } else if lhs.sz() == Bit::b64 && rhs.sz() == Bit::b32 {
-            let ans = self.alloc_scratch(Bit::b64);
-            self.write_inst(add {
-                rd: ans,
-                rs1: lhs,
-                rs2: AddSubOperand::ExtendedRegister(ExtendedRegister {
-                    reg: rhs,
-                    extend: Extend::SXTW,
-                    shift: 0,
-                }),
-            });
-        } else if lhs.sz() == Bit::b32 && rhs.sz() == Bit::b64 {
-            let ans = self.alloc_scratch(Bit::b64);
-            self.write_inst(add {
-                rd: ans,
-                rs1: rhs,
-                rs2: AddSubOperand::ExtendedRegister(ExtendedRegister {
-                    reg: lhs,
-                    extend: Extend::SXTW,
-                    shift: 0,
-                }),
-            });
-        } else {
-            unreachable!()
+        assert_eq!(lhs.ty(), rhs.ty());
+        match lhs.ty() {
+            RegisterType::Int => {
+                if lhs.sz() == rhs.sz() {
+                    let ans = self.alloc_scratch(lhs.sz(), RegisterType::Int);
+                    self.write_inst(add {
+                        rd: ans,
+                        rs1: lhs,
+                        rs2: AddSubOperand::Register(rhs),
+                    });
+                } else if lhs.sz() == Bit::b64 && rhs.sz() == Bit::b32 {
+                    let ans = self.alloc_scratch(Bit::b64, RegisterType::Int);
+                    self.write_inst(add {
+                        rd: ans,
+                        rs1: lhs,
+                        rs2: AddSubOperand::ExtendedRegister(ExtendedRegister {
+                            reg: rhs,
+                            extend: Extend::SXTW,
+                            shift: 0,
+                        }),
+                    });
+                } else if lhs.sz() == Bit::b32 && rhs.sz() == Bit::b64 {
+                    let ans = self.alloc_scratch(Bit::b64, RegisterType::Int);
+                    self.write_inst(add {
+                        rd: ans,
+                        rs1: rhs,
+                        rs2: AddSubOperand::ExtendedRegister(ExtendedRegister {
+                            reg: lhs,
+                            extend: Extend::SXTW,
+                            shift: 0,
+                        }),
+                    });
+                } else {
+                    unreachable!()
+                }
+            }
+            RegisterType::Float => {
+                // TODO: handle different sizes of float registers, currently we assume they are the same.
+                assert_eq!(lhs.sz(), rhs.sz());
+                let ans = self.alloc_scratch(lhs.sz(), RegisterType::Float);
+                self.write_inst(fadd {
+                    rd: ans,
+                    rs1: lhs,
+                    rs2: rhs,
+                });
+            }
         }
     }
 
@@ -453,7 +517,7 @@ impl AsmGenContext {
         import_reg_and_inst!();
         let rhs = self.take_register();
         let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
-        let ans = self.alloc_scratch(rhs.sz());
+        let ans = self.alloc_scratch(rhs.sz(), RegisterType::Int);
         let rs2 = match rhs.sz() {
             Bit::b64 => AddSubOperand::Register(rhs),
             Bit::b32 => AddSubOperand::ExtendedRegister(ExtendedRegister {
@@ -472,6 +536,8 @@ impl AsmGenContext {
 
     pub fn add(&mut self, rd: Register, rs1: Register, rs2: Register) {
         import_reg_and_inst!();
+        assert_eq!(rd.ty(), rs1.ty());
+        assert_eq!(rd.ty(), rs2.ty());
         self.write_inst(add {
             rd,
             rs1,
@@ -489,13 +555,9 @@ impl AsmGenContext {
 }
 
 impl AsmGenContext {
-    fn can_encode_unscaled_mem_offset(offset: i32) -> bool {
-        (-256..256).contains(&offset)
-    }
-
     // undef should not have any memory moves when being efficiency.
     pub fn undef_take_temp(&mut self, size: Bit) {
-        self.alloc_scratch(size);
+        self.alloc_scratch(size, RegisterType::Int);
     }
 
     /// Load an immediate value into a register.
@@ -503,7 +565,7 @@ impl AsmGenContext {
     #[inline]
     pub fn load_imm(&mut self, imm: i32, size: Bit) {
         import_reg_and_inst!();
-        let temp_reg = self.alloc_scratch(size);
+        let temp_reg = self.alloc_scratch(size, RegisterType::Int);
         if (-32768..32768).contains(&imm) {
             self.write_inst(mov {
                 rd: temp_reg,
@@ -539,6 +601,17 @@ impl AsmGenContext {
         }
     }
 
+    pub fn load_float_imm(&mut self, imm: f32) {
+        import_reg_and_inst!();
+        self.load_imm(imm.to_bits() as i32, Bit::b32);
+        let int_reg = self.take_register();
+        let float_reg = self.alloc_scratch(Bit::b32, RegisterType::Float);
+        self.write_inst(fmov {
+            rd: float_reg,
+            src: int_reg,
+        });
+    }
+
     pub fn save_word_at_curr_inst(&mut self, program: &Program) {
         self.save_word_at_inst(program, self.curr_inst.unwrap());
     }
@@ -547,7 +620,12 @@ impl AsmGenContext {
         match *self.allocation.get(&val).unwrap() {
             AllocationState::Register(register) => {
                 let source = self.take_register();
-                self.mv(source, self.value_register(program, val, register))
+                let dest = self.value_register(program, val, register);
+                if source.ty() == RegisterType::Float || dest.ty() == RegisterType::Float {
+                    self.fmv(source, dest)
+                } else {
+                    self.mv(source, dest)
+                }
             }
             AllocationState::Stack(offset) => {
                 self.save_word_with_offset(offset as _);
@@ -558,7 +636,7 @@ impl AsmGenContext {
     // Save the value in rs2 to the address [rs1 + imm].
     pub fn save_word(&mut self, rs2: Register, imm: i32, rs1: Register) {
         import_reg_and_inst!();
-        if Self::can_encode_unscaled_mem_offset(imm) {
+        if (-256..256).contains(&imm) {
             self.write_inst(str {
                 rs: rs2,
                 rd: rs1,
@@ -579,7 +657,7 @@ impl AsmGenContext {
     #[inline]
     pub fn save_word_with_offset(&mut self, offset: i32) {
         import_reg_and_inst!();
-        if Self::can_encode_unscaled_mem_offset(offset) {
+        if (-256..256).contains(&offset) {
             let temp_reg = self.take_register();
             let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
             self.write_inst(str {
@@ -614,7 +692,7 @@ impl AsmGenContext {
 
     pub fn load_word(&mut self, rd: Register, offset: i32, rs: Register) {
         import_reg_and_inst!();
-        if Self::can_encode_unscaled_mem_offset(offset) {
+        if (-256..256).contains(&offset) {
             self.write_inst(ldr {
                 rd,
                 rs,
@@ -653,11 +731,11 @@ impl AsmGenContext {
     }
 
     #[inline]
-    pub fn load_word_sp(&mut self, offset: i32, size: Bit) {
+    pub fn load_word_sp(&mut self, offset: i32, size: Bit, ty: RegisterType) {
         import_reg_and_inst!();
         let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
-        if Self::can_encode_unscaled_mem_offset(offset) {
-            let temp_reg = self.alloc_scratch(size);
+        if (-256..256).contains(&offset) {
+            let temp_reg = self.alloc_scratch(size, ty);
             self.write_inst(ldr {
                 rd: temp_reg,
                 rs: sp,
@@ -667,7 +745,7 @@ impl AsmGenContext {
             self.load_imm(offset, Bit::b64);
             self.add_sp();
             let add_temp = self.take_register();
-            let temp_reg = self.alloc_scratch(size);
+            let temp_reg = self.alloc_scratch(size, ty);
             self.write_inst(ldr {
                 rd: temp_reg,
                 rs: add_temp,
@@ -678,7 +756,7 @@ impl AsmGenContext {
 
     pub fn load_address(&mut self, label: String) {
         import_reg_and_inst!();
-        let temp_reg = self.alloc_scratch(Bit::b64);
+        let temp_reg = self.alloc_scratch(Bit::b64, RegisterType::Int);
         // use adrp + add to load address of global variable.
         self.write_inst(adrp {
             rd: temp_reg,
@@ -691,10 +769,10 @@ impl AsmGenContext {
         });
     }
 
-    pub fn load_from_address(&mut self, size: Bit) {
+    pub fn load_from_address(&mut self, size: Bit, ty: RegisterType) {
         import_reg_and_inst!();
         let address_reg = self.take_register();
-        let value_reg = self.alloc_scratch(size);
+        let value_reg = self.alloc_scratch(size, ty);
         self.write_inst(ldr {
             rd: value_reg,
             rs: address_reg,
@@ -703,11 +781,19 @@ impl AsmGenContext {
     }
 
     pub fn binary_op(&mut self, op: BinaryOp) {
+        let ty = self.reg_pool.last().unwrap().ty();
+        match ty {
+            RegisterType::Int => self.binary_op_int(op),
+            RegisterType::Float => self.binary_op_float(op),
+        }
+    }
+
+    fn binary_op_int(&mut self, op: BinaryOp) {
         import_reg_and_inst!();
         let rhs = self.take_register();
         let lhs = self.take_register();
         assert_eq!(lhs.sz(), rhs.sz());
-        let res = self.alloc_scratch(lhs.sz());
+        let res = self.alloc_scratch(lhs.sz(), RegisterType::Int);
         match op {
             // ARMv8 uses the sign bits of the result of a cmp instruction to determine
             // the condition flags, so we can use cmp + cset to implement these comparisons.
@@ -843,15 +929,139 @@ impl AsmGenContext {
         }
     }
 
-    pub fn ret(&mut self, ret_sz: Bit) {
+    fn binary_op_float(&mut self, op: BinaryOp) {
+        import_reg_and_inst!();
+        let rhs = self.take_register();
+        let lhs = self.take_register();
+        assert_eq!(lhs.sz(), rhs.sz());
+        match op {
+            BinaryOp::NotEq => {
+                let res = self.alloc_scratch(Bit::b32, RegisterType::Int);
+                self.write_inst(fcmp {
+                    rs1: lhs,
+                    rs2: FcmpOperand::Register(rhs),
+                });
+                self.write_inst(cset {
+                    rd: res,
+                    condition: CsetCondition::NE,
+                });
+            }
+            BinaryOp::Eq => {
+                let res = self.alloc_scratch(Bit::b32, RegisterType::Int);
+                self.write_inst(fcmp {
+                    rs1: lhs,
+                    rs2: FcmpOperand::Register(rhs),
+                });
+                self.write_inst(cset {
+                    rd: res,
+                    condition: CsetCondition::EQ,
+                });
+            }
+            BinaryOp::Gt => {
+                let res = self.alloc_scratch(Bit::b32, RegisterType::Int);
+                self.write_inst(fcmp {
+                    rs1: lhs,
+                    rs2: FcmpOperand::Register(rhs),
+                });
+                self.write_inst(cset {
+                    rd: res,
+                    condition: CsetCondition::GT,
+                });
+            }
+            BinaryOp::Lt => {
+                let res = self.alloc_scratch(Bit::b32, RegisterType::Int);
+                self.write_inst(fcmp {
+                    rs1: lhs,
+                    rs2: FcmpOperand::Register(rhs),
+                });
+                self.write_inst(cset {
+                    rd: res,
+                    condition: CsetCondition::MI,
+                });
+            }
+            BinaryOp::Ge => {
+                let res = self.alloc_scratch(Bit::b32, RegisterType::Int);
+                self.write_inst(fcmp {
+                    rs1: lhs,
+                    rs2: FcmpOperand::Register(rhs),
+                });
+                self.write_inst(cset {
+                    rd: res,
+                    condition: CsetCondition::GE,
+                });
+            }
+            BinaryOp::Le => {
+                let res = self.alloc_scratch(Bit::b32, RegisterType::Int);
+                self.write_inst(fcmp {
+                    rs1: lhs,
+                    rs2: FcmpOperand::Register(rhs),
+                });
+                self.write_inst(cset {
+                    rd: res,
+                    condition: CsetCondition::LS,
+                });
+            }
+            BinaryOp::Add => {
+                let res = self.alloc_scratch(lhs.sz(), RegisterType::Float);
+                self.write_inst(fadd {
+                    rd: res,
+                    rs1: lhs,
+                    rs2: rhs,
+                });
+            }
+
+            BinaryOp::Sub => {
+                let res = self.alloc_scratch(lhs.sz(), RegisterType::Float);
+                self.write_inst(fsub {
+                    rd: res,
+                    rs1: lhs,
+                    rs2: rhs,
+                });
+            }
+            BinaryOp::Mul => {
+                let res = self.alloc_scratch(lhs.sz(), RegisterType::Float);
+                self.write_inst(fmul {
+                    rd: res,
+                    rs1: lhs,
+                    rs2: rhs,
+                });
+            }
+            BinaryOp::Div => {
+                let res = self.alloc_scratch(lhs.sz(), RegisterType::Float);
+                self.write_inst(fdiv {
+                    rd: res,
+                    rs1: lhs,
+                    rs2: rhs,
+                });
+            }
+            BinaryOp::Rem
+            | BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Xor
+            | BinaryOp::Shl
+            | BinaryOp::Shr
+            | BinaryOp::Sar => unreachable!("unsupported float binary op: {op:?}"),
+        }
+    }
+
+    pub fn ret(&mut self, ret_sz: Bit, ret_ty: RegisterType) {
         import_reg_and_inst!();
         let source = self.take_register();
         assert_eq!(source.sz(), ret_sz);
-        let x0 = Register::I(IReg(ret_sz, IntRegister::x0));
-        self.write_inst(mov {
-            rd: x0,
-            src: MovOperand::Register(source),
-        });
+        let ret_reg = match ret_ty {
+            RegisterType::Int => Register::I(IReg(ret_sz, IntRegister::x0)),
+            RegisterType::Float => Register::F(FReg(ret_sz, FloatRegister::v0)),
+        };
+        match ret_ty {
+            RegisterType::Int => self.write_inst(mov {
+                rd: ret_reg,
+                src: MovOperand::Register(source),
+            }),
+            RegisterType::Float => self.write_inst(fmov {
+                rd: ret_reg,
+                src: source,
+            }),
+        }
         self.epilogue_stack
             .last_mut()
             .unwrap()
@@ -865,6 +1075,14 @@ impl AsmGenContext {
         self.write_inst(mov {
             rd: dest,
             src: MovOperand::Register(source),
+        });
+    }
+
+    fn fmv(&mut self, source: Register, dest: Register) {
+        import_reg_and_inst!();
+        self.write_inst(fmov {
+            rd: dest,
+            src: source,
         });
     }
 
@@ -895,5 +1113,27 @@ impl AsmGenContext {
             rs: cond_reg,
             label: self.get_bb_name(false_bb, program),
         });
+    }
+
+    pub fn cast(&mut self, inst: IrInst, program: &Program) {
+        import_reg_and_inst!();
+        let src = self.take_register();
+        let src_ty = src.ty();
+        let to_ty = if src_ty == RegisterType::Int {
+            RegisterType::Float
+        } else {
+            RegisterType::Int
+        };
+        match (src_ty, to_ty) {
+            (RegisterType::Int, RegisterType::Float) => {
+                let dest = self.alloc_scratch(Bit::b32, RegisterType::Float);
+                self.write_inst(scvtf { rd: dest, rs: src });
+            }
+            (RegisterType::Float, RegisterType::Int) => {
+                let dest = self.alloc_scratch(Bit::b32, RegisterType::Int);
+                self.write_inst(fcvtzs { rd: dest, rs: src });
+            }
+            _ => unreachable!("unsupported cast from {src_ty:?} to {to_ty:?}"),
+        }
     }
 }

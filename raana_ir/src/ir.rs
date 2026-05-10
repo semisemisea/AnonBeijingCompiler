@@ -19,8 +19,8 @@ pub use basic_block::BasicBlock;
 pub use builder::{BasicBlockBuilders, GlobalBuilder, LocalBuilder};
 pub use function::{Function, FunctionData};
 pub use inst_kind::{
-    Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, GetElemPtr, GetPtr, InstKind, Integer,
-    Jump, Load, Return, Store,
+    Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Cast, GetElemPtr, GetPtr, InstKind,
+    Integer, Jump, Load, Return, Store,
 };
 pub use instruction::{Inst, InstData};
 pub use program::Program;

@@ -189,7 +189,10 @@ impl GenerateAsm for GetElemPtr {
         let ptr_flag = if global_flag {
             false
         } else {
-            is_ptr(self.base(), ctx.curr_func_data(program))
+            !matches!(
+                ctx.curr_func_data(program).inst_data(self.base()).kind(),
+                InstKind::Alloc
+            )
         };
         // let global_flag = is_get_elem_ptr_from_global(self, ctx.curr_func_data(program));
         // element type size

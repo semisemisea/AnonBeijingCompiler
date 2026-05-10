@@ -512,13 +512,23 @@ impl AsmGenContext {
         } else {
             let immz = (imm & 0xFFFF) as u16; // Low 16 bits
             let immk = ((imm >> 16) & 0xFFFF) as u16; // High 16 bits
-            self.write_inst(movz {
-                rd: temp_reg,
-                imm: MoveWideImm::Imm16 {
-                    value: immz,
-                    shift: MoveWideImmShift::B0,
-                },
-            });
+            if imm < 0 {
+                self.write_inst(movn {
+                    rd: temp_reg,
+                    imm: MoveWideImm::Imm16 {
+                        value: !immz,
+                        shift: MoveWideImmShift::B0,
+                    },
+                });
+            } else {
+                self.write_inst(movz {
+                    rd: temp_reg,
+                    imm: MoveWideImm::Imm16 {
+                        value: immz,
+                        shift: MoveWideImmShift::B0,
+                    },
+                });
+            }
             self.write_inst(movk {
                 rd: temp_reg,
                 imm: MoveWideImm::Imm16 {

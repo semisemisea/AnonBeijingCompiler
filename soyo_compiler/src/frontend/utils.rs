@@ -235,7 +235,8 @@ impl AstGenContext {
 
     pub fn remove_inst(&mut self, inst: Inst) {
         let curr_basic_blcok = self.curr_bb.unwrap();
-        self.curr_func_data_mut().remove_layout_inst(curr_basic_blcok, inst);
+        self.curr_func_data_mut()
+            .remove_layout_inst(curr_basic_blcok, inst);
     }
 
     #[inline]

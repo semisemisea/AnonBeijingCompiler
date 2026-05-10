@@ -134,11 +134,16 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
             let id = val_alloc.check_or_alloc_id_same(inst);
 
             if let InstKind::Call(call) = data.inst_data(inst).kind() {
+                eprintln!("id: {}, call:{:?}", id, data.inst_data(inst));
                 call_ra = true;
                 extra_args = extra_args.max(8.max(call.args().len()) - 8);
                 for index in 0..8 {
                     vregs.add_rule(Reverse(Register::arguments(index)), id..=id);
                 }
+                vregs.add_rule(
+                    Reverse(Register::I(IReg(Bit::b64, IntRegister::x8))),
+                    id..=id,
+                );
                 for index in 0..7 {
                     // FIXME: we should also consider the size of temporary register.
                     vregs.add_rule(Reverse(Register::temporary(index, Bit::b64)), id..=id);
@@ -228,7 +233,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                 .copied()
                 .unwrap_or($min_id);
             let range = vregs.extent_by_loop($min_id..=max_id);
-            debug!("insert range:{:?} {:?}", $inst, range);
+            eprintln!("insert range:{:?} {:?}", $inst, range);
             liveness_ranges.insert($inst, range);
         };
     }
@@ -265,7 +270,10 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     };
 
     let mut register_allocation = HashMap::new();
-    let mut curr_inst_offset = extra_args * 4;
+    // FIXME: we should also consider the size of parameter and temporary register.
+    // if call_ra, we need to reserve 16 bits for x29 and x30.
+    // start from beyond LR.
+    let mut acc_inst_offset = extra_args * 4 + if call_ra { 16 } else { 0 };
 
     let mut active: Vec<(std::ops::RangeInclusive<usize>, VRegister, Inst)> =
         Vec::with_capacity(REGISTER_COUNT);
@@ -287,8 +295,8 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
 
         macro_rules! alloc_stack {
             ($val: expr) => {
-                register_allocation.insert($val, AllocationState::Stack(curr_inst_offset));
-                curr_inst_offset += crate::backend::armv8::codegen::inst_size(data, $val);
+                register_allocation.insert($val, AllocationState::Stack(acc_inst_offset));
+                acc_inst_offset += crate::backend::armv8::codegen::inst_size(data, $val);
             };
         }
 
@@ -332,10 +340,10 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
         }
     }
 
-    curr_inst_offset -= extra_args * 4;
+    acc_inst_offset -= extra_args * 4;
 
     let offset = {
-        let unaligned = curr_inst_offset
+        let unaligned = acc_inst_offset
             + if call_ra { 16 } else { 0 }
             + extra_args * 8
             + vregs.callee_used.len() * 8;
@@ -347,11 +355,16 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     };
 
     for (index, &fparam) in data.params().iter().skip(8).enumerate() {
+        // FIXME: we should also consider the size of parameter.
         register_allocation.insert(fparam, AllocationState::Stack(offset + 4 * index));
     }
     debug!("function name:{:?}", data.name());
     debug!("liveness ranges:{:?}", liveness_ranges);
     debug!("register allocation:{:?}", register_allocation);
+
+    for (k, v) in register_allocation.iter() {
+        eprintln!("{:?} {:?}", k, v);
+    }
 
     RegisterAllocationResult {
         allocation: register_allocation,

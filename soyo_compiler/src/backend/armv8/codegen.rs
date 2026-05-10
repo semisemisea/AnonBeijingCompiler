@@ -4,8 +4,8 @@ mod generate_asm;
 mod register_alloc;
 
 use raana_ir::ir::{
-    Binary, BlockArgRef, Branch, Call, FunctionData, GetElemPtr, GetPtr, Inst, InstKind, Integer,
-    Jump, Load, Program, Return, Store, Type, TypeKind, arena::Arena,
+    Binary, BlockArgRef, Branch, Call, Cast, FunctionData, GetElemPtr, GetPtr, Inst, InstKind,
+    Integer, Jump, Load, Program, Return, Store, Type, TypeKind, arena::Arena,
 };
 
 use crate::backend::armv8::inst::Inst::bl;
@@ -44,25 +44,29 @@ impl GenerateAsm for FunctionData {
         let curr_offset = (extra_args.max(8) - 8) * 4;
 
         let mut curr_offset = if AUTO_FUNC_ARG_ON_STACK {
-            self.params()
-                .iter()
-                .take(8)
-                .fold(curr_offset, |acc_offset, &param| {
-                    use crate::backend::armv8::register::*;
-                    ctx.insert_inst(param, acc_offset);
-                    // ctx.load_to_register(program, param);
-                    let InstKind::FuncArgRef(arg_ref) =
-                        ctx.curr_func_data(program).inst_data(param).kind()
-                    else {
-                        unreachable!()
-                    };
-                    let reg: IntRegister = (IntRegister::x0 as u8 + arg_ref.index() as u8)
-                        .try_into()
-                        .unwrap();
-                    ctx.alloc_para_reg(Register::I(IReg(ctx.value_bit(program, param), reg)));
-                    ctx.save_word_at_inst(program, param);
-                    acc_offset + self.inst_data(param).ty().size()
-                })
+            let mut acc_offset = curr_offset;
+            for &param in self.params().iter().take(8) {
+                ctx.insert_inst(param, acc_offset);
+                let InstKind::FuncArgRef(arg_ref) =
+                    ctx.curr_func_data(program).inst_data(param).kind()
+                else {
+                    unreachable!()
+                };
+                let reg = if self.inst_data(param).ty().is_f32() {
+                    Register::float_arguments(arg_ref.index())
+                        .with_size(ctx.value_sz(program, param))
+                } else {
+                    Register::I(IReg(
+                        ctx.value_sz(program, param),
+                        IntRegister::try_from(IntRegister::x0 as u8 + arg_ref.index() as u8)
+                            .unwrap(),
+                    ))
+                };
+                ctx.alloc_para_reg(reg);
+                ctx.save_word_at_inst(program, param);
+                acc_offset += self.inst_data(param).ty().size();
+            }
+            acc_offset
         } else {
             curr_offset
         };
@@ -124,6 +128,7 @@ impl GenerateAsm for Inst {
             InstKind::Jump(jump) => jump.generate(program, ctx),
             InstKind::Return(ret) => ret.generate(program, ctx),
             InstKind::Binary(op) => op.generate(program, ctx),
+            InstKind::Cast(cast) => cast.generate(program, ctx),
             InstKind::BlockArgRef(block_arg_ref) => block_arg_ref.generate(program, ctx),
             InstKind::Call(call) => call.generate(program, ctx),
             InstKind::GetElemPtr(get_elem_ptr) => get_elem_ptr.generate(program, ctx),
@@ -152,7 +157,7 @@ impl GenerateAsm for GetPtr {
         // load index to register
         ctx.load_to_register(program, self.offset());
         // load element type size to register
-        ctx.load_imm(pointee_size as _, ctx.value_bit(program, self.offset()));
+        ctx.load_imm(pointee_size as _, ctx.value_sz(program, self.offset()));
         // do multipication
         ctx.multiply();
 
@@ -166,7 +171,8 @@ impl GenerateAsm for GetPtr {
             if let Some(pre_drifted_address) = ctx.register_or_offset(program, self.base()) {
                 ctx.load_word_sp(
                     pre_drifted_address as _,
-                    ctx.value_bit(program, self.base()),
+                    ctx.value_sz(program, self.base()),
+                    ctx.value_ty(program, self.base()).try_into().unwrap(),
                 );
             }
             ctx.add_op()
@@ -205,7 +211,7 @@ impl GenerateAsm for GetElemPtr {
         // load index to register
         ctx.load_to_register(program, self.offset());
         // load element type size to register
-        ctx.load_imm(elem_ty_size as _, ctx.value_bit(program, self.offset()));
+        ctx.load_imm(elem_ty_size as _, ctx.value_sz(program, self.offset()));
         // do multipication
         ctx.multiply();
 
@@ -219,7 +225,8 @@ impl GenerateAsm for GetElemPtr {
             if let Some(pre_drifted_address) = ctx.register_or_offset(program, self.base()) {
                 ctx.load_word_sp(
                     pre_drifted_address as _,
-                    ctx.value_bit(program, self.base()),
+                    ctx.value_sz(program, self.base()),
+                    ctx.value_ty(program, self.base()).try_into().unwrap(),
                 );
             }
             ctx.add_op()
@@ -260,11 +267,14 @@ impl GenerateAsm for Call {
 
         // move the 1st-8th parameters to the register
         for (i, &arg) in args[..8.min(arity)].iter().enumerate() {
-            use IntRegister::*;
-            let rd = Register::I(IReg(
-                ctx.value_bit(program, arg),
-                IntRegister::try_from(x0 as u8 + i as u8).unwrap(),
-            ));
+            let rd = if ctx.value_ty(program, arg).is_f32() {
+                Register::float_arguments(i).with_size(ctx.value_sz(program, arg))
+            } else {
+                Register::I(IReg(
+                    ctx.value_sz(program, arg),
+                    IntRegister::try_from(IntRegister::x0 as u8 + i as u8).unwrap(),
+                ))
+            };
             ctx.load_to_para_register(program, arg, rd);
         }
 
@@ -284,7 +294,10 @@ impl GenerateAsm for Call {
 
         let ret_ty = func_data.ret_ty();
         if !ret_ty.is_unit() {
-            ctx.alloc_ret_reg(Bit::try_from(ret_ty.size()).unwrap());
+            ctx.alloc_ret_reg(
+                Bit::try_from(ret_ty.size()).unwrap(),
+                ret_ty.try_into().unwrap(),
+            );
             ctx.save_word_at_curr_inst(program);
         }
     }
@@ -356,8 +369,9 @@ impl GenerateAsm for Return {
     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         if let Some(ret_val) = self.value() {
             ctx.load_to_register(program, ret_val);
-            let ret_sz = Bit::try_from(ctx.curr_func_data(program).ret_ty().size()).unwrap();
-            ctx.ret(ret_sz);
+            let ret_ty = ctx.curr_func_data(program).ret_ty();
+            let ret_sz = Bit::try_from(ret_ty.size()).unwrap();
+            ctx.ret(ret_sz, ret_ty.try_into().unwrap());
         } else {
             ctx.void_ret();
         }
@@ -369,6 +383,15 @@ impl GenerateAsm for Binary {
         ctx.load_to_register(program, self.lhs());
         ctx.load_to_register(program, self.rhs());
         ctx.binary_op(self.op());
+        ctx.save_word_at_curr_inst(program);
+    }
+}
+
+impl GenerateAsm for Cast {
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
+        let curr = ctx.curr_inst().unwrap();
+        ctx.load_to_register(program, self.src());
+        ctx.cast(curr, program);
         ctx.save_word_at_curr_inst(program);
     }
 }
@@ -388,23 +411,49 @@ impl GenerateAsm for Load {
             is_ptr(self.src(), ctx.curr_func_data(program))
         };
 
-        let size = ctx.value_bit(program, ctx.curr_inst().unwrap());
+        let size = ctx.value_sz(program, ctx.curr_inst().unwrap());
 
         if global_flag {
             ctx.load_address(get_glob_var_name(self.src(), program));
-            ctx.load_from_address(size);
+            ctx.load_from_address(
+                size,
+                ctx.curr_func_data(program)
+                    .inst_data(ctx.curr_inst().unwrap())
+                    .ty()
+                    .try_into()
+                    .unwrap(),
+            );
             ctx.save_word_at_curr_inst(program);
         } else if ptr_flag {
             // let offset = ctx.get_inst_offset(self.src()).unwrap() as i32;
             if let Some(offset) = ctx.register_or_offset(program, self.src()) {
-                ctx.load_word_sp(offset as _, ctx.value_bit(program, self.src()));
+                ctx.load_word_sp(
+                    offset as _,
+                    ctx.value_sz(program, self.src()),
+                    ctx.value_ty(program, self.src()).try_into().unwrap(),
+                );
             }
-            ctx.load_from_address(size);
+            ctx.load_from_address(
+                size,
+                ctx.curr_func_data(program)
+                    .inst_data(ctx.curr_inst().unwrap())
+                    .ty()
+                    .try_into()
+                    .unwrap(),
+            );
             ctx.save_word_at_curr_inst(program);
         } else {
             // let offset = ctx.get_inst_offset(self.src()).unwrap() as i32;
             if let Some(offset) = ctx.register_or_offset(program, self.src()) {
-                ctx.load_word_sp(offset as _, size);
+                ctx.load_word_sp(
+                    offset as _,
+                    size,
+                    ctx.curr_func_data(program)
+                        .inst_data(ctx.curr_inst().unwrap())
+                        .ty()
+                        .try_into()
+                        .unwrap(),
+                );
             }
             ctx.save_word_at_curr_inst(program);
         }
@@ -458,7 +507,7 @@ impl GenerateAsm for Integer {
     /// Load a ingeter immediate to a register.
     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         let curr_inst = ctx.curr_inst().unwrap();
-        ctx.load_imm(self.value(), ctx.value_bit(program, curr_inst));
+        ctx.load_imm(self.value(), ctx.value_sz(program, curr_inst));
     }
 }
 

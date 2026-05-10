@@ -1,4 +1,5 @@
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use raana_ir::ir::Type;
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -81,7 +82,9 @@ pub enum IntRegister {
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, TryFromPrimitive, IntoPrimitive,
+)]
 #[repr(u8)]
 /// 128-bit floating-point registers.
 pub enum FloatRegister {
@@ -161,6 +164,11 @@ impl IReg {
 }
 
 impl FReg {
+    fn is_arg(&self) -> bool {
+        use FloatRegister::*;
+        matches!(self.1, v0 | v1 | v2 | v3 | v4 | v5 | v6 | v7)
+    }
+
     fn is_caller_saved(&self) -> bool {
         return !self.is_callee_saved();
     }
@@ -175,6 +183,35 @@ impl FReg {
 pub enum Register {
     I(IReg),
     F(FReg),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterType {
+    Int,
+    Float,
+}
+
+impl TryInto<RegisterType> for Type {
+    type Error = ();
+
+    fn try_into(self) -> Result<RegisterType, Self::Error> {
+        match self {
+            t if t.is_f32() => Ok(RegisterType::Float),
+            t if t.is_i32() => Ok(RegisterType::Int),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryInto<RegisterType> for &Type {
+    type Error = ();
+
+    fn try_into(self) -> Result<RegisterType, ()> {
+        match self {
+            t if t.is_f32() => Ok(RegisterType::Float),
+            _ => Ok(RegisterType::Int),
+        }
+    }
 }
 
 impl Register {
@@ -192,6 +229,13 @@ impl Register {
         }
     }
 
+    pub fn ty(&self) -> RegisterType {
+        match self {
+            Register::I(_) => RegisterType::Int,
+            Register::F(_) => RegisterType::Float,
+        }
+    }
+
     pub fn with_size(self, size: Bit) -> Register {
         match self {
             Register::I(IReg(_, reg)) => Register::I(IReg(size, reg)),
@@ -204,6 +248,13 @@ impl Register {
         Register::I(IReg(Bit::b64, IntRegister::try_from(idx as u8).unwrap()))
     }
 
+    pub fn float_arguments(idx: usize) -> Register {
+        assert!(idx < 8, "too many arguments");
+        use FloatRegister::*;
+        let reg = [v0, v1, v2, v3, v4, v5, v6, v7][idx];
+        Register::F(FReg(Bit::b32, reg))
+    }
+
     pub fn temporary(id: usize, size: Bit) -> Register {
         assert!(id < 7, "too many temporary registers");
         Register::I(IReg::temporary(id, size))
@@ -212,7 +263,7 @@ impl Register {
     pub fn is_arg(&self) -> bool {
         match self {
             Register::I(reg) => reg.is_arg(),
-            Register::F(_) => false,
+            Register::F(reg) => reg.is_arg(),
         }
     }
 
@@ -257,10 +308,15 @@ impl core::fmt::Display for Register {
                 let prefix = match sz {
                     Bit::b128 => "v",
                     Bit::b64 => "d",
-                    Bit::b32 => "h",
-                    Bit::b16 => "s",
+                    Bit::b32 => "s",
+                    Bit::b16 => "h",
                 };
-                write!(f, "{}", format!("{reg:?}").strip_prefix('v').unwrap())
+                write!(
+                    f,
+                    "{}{}",
+                    prefix,
+                    format!("{reg:?}").strip_prefix('v').unwrap()
+                )
             }
         }
     }

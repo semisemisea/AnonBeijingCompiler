@@ -39,7 +39,7 @@ impl GenerateAsm for FunctionData {
 
         *ctx.allocation_mut() = allocation;
 
-        ctx.prologue(offset, call_ra, callee_usage);
+        ctx.prologue(offset, call_ra, extra_args, callee_usage);
 
         let curr_offset = (extra_args.max(8) - 8) * 4;
 

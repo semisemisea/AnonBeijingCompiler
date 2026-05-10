@@ -246,7 +246,13 @@ impl AsmGenContext {
     /// and `x30` are also callee-saved registers, but should not be included.
     ///
     /// When `call_ra` is true, `offset` must includes the space for `x29` and `x30` registers.
-    pub fn prologue(&mut self, offset: usize, call_ra: bool, callee_usage: HashSet<Register>) {
+    pub fn prologue(
+        &mut self,
+        offset: usize,
+        call_ra: bool,
+        extra_args: usize,
+        callee_usage: HashSet<Register>,
+    ) {
         // AArch64 要求 sp 始终保持 16 字节对齐
         assert!(
             offset % 16 == 0,
@@ -257,6 +263,7 @@ impl AsmGenContext {
         let x29 = Register::I(IReg(Bit::b64, IntRegister::x29));
         let x30 = Register::I(IReg(Bit::b64, IntRegister::x30));
         let offset = offset as i32;
+        let stack_args_size = (extra_args * 8) as i32;
 
         // 分配栈帧
         if offset != 0 {
@@ -264,12 +271,11 @@ impl AsmGenContext {
         }
 
         // ARMv8中x29和x30储存在低地址端
-        // [sp]     : old x29
-        // [sp + 8] : old x30
+        // [sp] starts with the outgoing call-argument area when this function calls with >8 args.
         if call_ra {
-            self.save_word(x29, 0, sp);
-            self.save_word(x30, 8, sp);
-            self.add_imm(x29, 0, sp);
+            self.save_word(x29, stack_args_size, sp);
+            self.save_word(x30, stack_args_size + 8, sp);
+            self.add_imm(x29, stack_args_size, sp);
         }
 
         // 保存寄存器
@@ -283,6 +289,7 @@ impl AsmGenContext {
         self.epilogue_stack.push(Epilogue {
             offset,
             call_ra,
+            stack_args_size,
             callee_usage,
             finished_once: false,
         });
@@ -482,6 +489,10 @@ impl AsmGenContext {
 }
 
 impl AsmGenContext {
+    fn can_encode_unscaled_mem_offset(offset: i32) -> bool {
+        (-256..256).contains(&offset)
+    }
+
     // undef should not have any memory moves when being efficiency.
     pub fn undef_take_temp(&mut self, size: Bit) {
         self.alloc_scratch(size);
@@ -537,7 +548,7 @@ impl AsmGenContext {
     // Save the value in rs2 to the address [rs1 + imm].
     pub fn save_word(&mut self, rs2: Register, imm: i32, rs1: Register) {
         import_reg_and_inst!();
-        if (-2048..2048).contains(&imm) {
+        if Self::can_encode_unscaled_mem_offset(imm) {
             self.write_inst(str {
                 rs: rs2,
                 rd: rs1,
@@ -558,7 +569,7 @@ impl AsmGenContext {
     #[inline]
     pub fn save_word_with_offset(&mut self, offset: i32) {
         import_reg_and_inst!();
-        if (-2048..2048).contains(&offset) {
+        if Self::can_encode_unscaled_mem_offset(offset) {
             let temp_reg = self.take_register();
             let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
             self.write_inst(str {
@@ -593,7 +604,7 @@ impl AsmGenContext {
 
     pub fn load_word(&mut self, rd: Register, offset: i32, rs: Register) {
         import_reg_and_inst!();
-        if (-2048..2048).contains(&offset) {
+        if Self::can_encode_unscaled_mem_offset(offset) {
             self.write_inst(ldr {
                 rd,
                 rs,
@@ -635,7 +646,7 @@ impl AsmGenContext {
     pub fn load_word_sp(&mut self, offset: i32, size: Bit) {
         import_reg_and_inst!();
         let sp = Register::I(IReg(Bit::b64, IntRegister::sp));
-        if (-2048..2048).contains(&offset) {
+        if Self::can_encode_unscaled_mem_offset(offset) {
             let temp_reg = self.alloc_scratch(size);
             self.write_inst(ldr {
                 rd: temp_reg,
@@ -772,21 +783,23 @@ impl AsmGenContext {
                 rs2: rhs,
             }),
             BinaryOp::Rem => {
+                let tmp = self.alloc_scratch(lhs.sz());
                 self.write_inst(sdiv {
-                    rd: res,
+                    rd: tmp,
                     rs1: lhs,
                     rs2: rhs,
                 });
                 self.write_inst(mul {
-                    rd: res,
-                    rs1: res,
+                    rd: tmp,
+                    rs1: tmp,
                     rs2: rhs,
                 });
                 self.write_inst(sub {
                     rd: res,
                     rs1: lhs,
-                    rs2: AddSubOperand::Register(res),
+                    rs2: AddSubOperand::Register(tmp),
                 });
+                self.take_register(); // free the tmp register
             }
             BinaryOp::And => self.write_inst(and {
                 rd: res,

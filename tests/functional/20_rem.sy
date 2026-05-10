@@ -1,6 +1,6 @@
 //test rem
 int main(){
     int a;
-    a = 10;
+    a = 16;
     return a % 3;
 }

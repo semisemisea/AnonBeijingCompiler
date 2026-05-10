@@ -9,6 +9,7 @@ use crate::backend::armv8::register;
 pub struct Epilogue {
     pub(crate) offset: i32,
     pub(crate) call_ra: bool,
+    pub(crate) stack_args_size: i32,
     pub(crate) callee_usage: HashSet<register::Register>,
     pub(crate) finished_once: bool,
 }
@@ -34,8 +35,8 @@ impl Epilogue {
             }
             // 恢复x29和x30
             if self.call_ra {
-                ctx.load_word(x29, 0, sp);
-                ctx.load_word(x30, 8, sp);
+                ctx.load_word(x29, self.stack_args_size, sp);
+                ctx.load_word(x30, self.stack_args_size + 8, sp);
             }
             // 回收栈帧
             ctx.add_imm(sp, self.offset, sp);

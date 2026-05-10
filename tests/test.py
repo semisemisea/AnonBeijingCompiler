@@ -26,12 +26,15 @@ CODES = {
     "yellow": "\x1b[33m",
     "magenta": "\x1b[35m",
 }
-STATUSES = ("PASS", "FAIL", " CE ", " RE ")
+TEST_TIMEOUT = 30
+
+STATUSES = ("PASS", "FAIL", " CE ", " RE ", " TLE")
 STATUS_STYLES = {
     "PASS": ("green", "bold"),
     "FAIL": ("red",),
     " CE ": ("dim",),
     " RE ": ("magenta",),
+    " TLE": ("yellow", "bold"),
 }
 
 
@@ -112,6 +115,19 @@ def write_process_output(proc, stdout_path, stderr_path, returncode_path):
     returncode_path.write_text(f"{proc.returncode}\n")
 
 
+def write_timeout_output(err, stdout_path, stderr_path, returncode_path):
+    stdout_path.write_bytes(err.stdout or b"")
+    stderr_path.write_bytes(err.stderr or b"")
+    returncode_path.write_text("timeout\n")
+
+
+def remaining_timeout(start):
+    remaining = TEST_TIMEOUT - (time.perf_counter() - start)
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired("test case", TEST_TIMEOUT)
+    return remaining
+
+
 def copy_testcase_files(src, out_dir):
     src_rel = rel_test(src)
     dst_base = (out_dir / src_rel).with_suffix("")
@@ -143,7 +159,16 @@ def run_test(src, out_dir, opt_level, compiler):
         compile_args.append(f"-O{opt_level}")
     compile_args += ["-S", "-o", str(asm), str(src)]
 
-    compile_proc = subprocess.run(compile_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        compile_proc = subprocess.run(
+            compile_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=remaining_timeout(start),
+        )
+    except subprocess.TimeoutExpired as err:
+        write_timeout_output(err, compile_stdout, compile_stderr, compile_returncode)
+        return time.perf_counter() - start, " TLE", f"compile timeout after {TEST_TIMEOUT}s"
     write_process_output(compile_proc, compile_stdout, compile_stderr, compile_returncode)
     if compile_proc.returncode:
         output = (compile_proc.stdout + compile_proc.stderr).decode("utf-8", "replace").strip()
@@ -158,7 +183,16 @@ def run_test(src, out_dir, opt_level, compiler):
         ir_args.append(f"-O{opt_level}")
     ir_args += ["--emit", "ir", "-o", str(ir), str(src)]
 
-    ir_proc = subprocess.run(ir_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        ir_proc = subprocess.run(
+            ir_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=remaining_timeout(start),
+        )
+    except subprocess.TimeoutExpired as err:
+        write_timeout_output(err, compile_stdout, compile_stderr, compile_returncode)
+        return time.perf_counter() - start, " TLE", f"ir timeout after {TEST_TIMEOUT}s"
     if ir_proc.returncode:
         output = (ir_proc.stdout + ir_proc.stderr).decode("utf-8", "replace").strip()
         return (
@@ -167,22 +201,27 @@ def run_test(src, out_dir, opt_level, compiler):
             f"ir exit {ir_proc.returncode}\n{output or '(no output)'}",
         )
 
-    link_proc = subprocess.run(
-        [
-            "clang",
-            "--target=aarch64-linux-gnu",
-            "--gcc-toolchain=/usr",
-            "--sysroot=/usr/aarch64-linux-gnu",
-            "-fuse-ld=lld",
-            "-static",
-            str(asm),
-            str(SYSYLIB),
-            "-o",
-            str(elf),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        link_proc = subprocess.run(
+            [
+                "clang",
+                "--target=aarch64-linux-gnu",
+                "--gcc-toolchain=/usr",
+                "--sysroot=/usr/aarch64-linux-gnu",
+                "-fuse-ld=lld",
+                "-static",
+                str(asm),
+                str(SYSYLIB),
+                "-o",
+                str(elf),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=remaining_timeout(start),
+        )
+    except subprocess.TimeoutExpired as err:
+        write_timeout_output(err, runtime_stdout, runtime_stderr, runtime_returncode)
+        return time.perf_counter() - start, " TLE", f"link timeout after {TEST_TIMEOUT}s"
     if link_proc.returncode:
         write_process_output(link_proc, runtime_stdout, runtime_stderr, runtime_returncode)
         return (
@@ -194,12 +233,17 @@ def run_test(src, out_dir, opt_level, compiler):
     stdin = base.with_suffix(".in")
     stdin_file = stdin.open("rb") if stdin.exists() else None
     try:
-        run_proc = subprocess.run(
-            ["qemu-aarch64-static", str(elf)],
-            stdin=stdin_file,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        try:
+            run_proc = subprocess.run(
+                ["qemu-aarch64-static", str(elf)],
+                stdin=stdin_file,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=remaining_timeout(start),
+            )
+        except subprocess.TimeoutExpired as err:
+            write_timeout_output(err, runtime_stdout, runtime_stderr, runtime_returncode)
+            return time.perf_counter() - start, " TLE", f"runtime timeout after {TEST_TIMEOUT}s"
     finally:
         if stdin_file is not None:
             stdin_file.close()
@@ -366,6 +410,7 @@ def run_tests(args):
         paint(f"\n{counts['FAIL']:>5} failed (wrong answer)", "red"),
         paint(f"\n{counts[' CE ']:>5} CE (compile error)", "dim"),
         paint(f"\n{counts[' RE ']:>5} RE (runtime error)", "magenta"),
+        paint(f"\n{counts[' TLE']:>5} TLE (timeout error)", "yellow", "bold"),
     )
     print("\nTop 5 slowest tests:")
     for elapsed, path in sorted(timings, reverse=True)[:5]:

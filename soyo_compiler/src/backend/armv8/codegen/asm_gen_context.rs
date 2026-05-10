@@ -355,7 +355,7 @@ impl AsmGenContext {
                 //     self.alloc_para_reg(reg);
                 // }
                 InstKind::Undef => {
-                    self.undef_take_temp();
+                    self.undef_take_temp(self.value_bit(program, val));
                 }
                 _ if !data.ty().is_unit() => {
                     match *self.allocation.get(&val).unwrap() {
@@ -483,8 +483,8 @@ impl AsmGenContext {
 
 impl AsmGenContext {
     // undef should not have any memory moves when being efficiency.
-    pub fn undef_take_temp(&mut self) {
-        self.alloc_scratch(Bit::b64);
+    pub fn undef_take_temp(&mut self, size: Bit) {
+        self.alloc_scratch(size);
     }
 
     /// Load an immediate value into a register.
@@ -496,10 +496,7 @@ impl AsmGenContext {
         if (-32768..32768).contains(&imm) {
             self.write_inst(mov {
                 rd: temp_reg,
-                src: MovOperand::Immediate(MoveWideImm::Imm16 {
-                    value: imm as u16,
-                    shift: MoveWideImmShift::B0,
-                }),
+                src: MovOperand::Immediate(imm),
             });
         } else {
             let immz = (imm & 0xFFFF) as u16; // Low 16 bits

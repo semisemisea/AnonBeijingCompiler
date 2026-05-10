@@ -793,7 +793,7 @@ impl AsmGenContext {
                 rs2: rhs,
             }),
             BinaryOp::Rem => {
-                let tmp = self.alloc_scratch(lhs.sz());
+                let tmp = Register::I(IReg(lhs.sz(), IntRegister::x18));
                 self.write_inst(sdiv {
                     rd: tmp,
                     rs1: lhs,
@@ -809,7 +809,6 @@ impl AsmGenContext {
                     rs1: lhs,
                     rs2: AddSubOperand::Register(tmp),
                 });
-                self.take_register(); // free the tmp register
             }
             BinaryOp::And => self.write_inst(and {
                 rd: res,

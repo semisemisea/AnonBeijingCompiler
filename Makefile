@@ -41,9 +41,9 @@ endif
 HOST_TARGET_DIR := $(CURDIR)/target/host-musl
 COMPILER := /work/target/$(MUSL_TARGET)/release/soyo_compiler
 
-.PHONY: test run-elf debug-elf test-image test-compiler clean-results
+.PHONY: test run-elf debug-elf test-image test-compiler build-lib clean-results
 
-test: test-compiler .docker-image
+test: test-compiler build-lib .docker-image
 	mkdir -p "$(RESULTS)"
 	@cleanup() { $(DOCKER) rm -f "$(CONTAINER)" >/dev/null 2>&1 || true; }; \
 	trap cleanup EXIT INT TERM; \
@@ -96,6 +96,13 @@ test-image: .docker-image
 
 test-compiler:
 	$(CARGO_TARGET_LINKER) cargo build -p soyo_compiler --release --target "$(MUSL_TARGET)" --target-dir "$(HOST_TARGET_DIR)" --quiet
+
+build-lib: .docker-image
+	$(DOCKER) run --rm -u "$$(id -u):$$(id -g)" \
+		-v "$(CURDIR)/sysylib:/work/sysylib" \
+		-w /work/sysylib \
+		--entrypoint /bin/sh \
+		"$(IMAGE)" -c 'aarch64-linux-gnu-gcc -c sylib.c -o sylib.o && aarch64-linux-gnu-ar rcs libsysy_arm.a sylib.o'
 
 clean-results:
 	rm -rf "$(RESULTS)"

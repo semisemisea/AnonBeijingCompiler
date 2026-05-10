@@ -4,8 +4,8 @@ use std::{
 };
 
 use crate::ir::{
-    basic_block::BasicBlock,
     arena::{Arena, LocalArena},
+    basic_block::BasicBlock,
     builder::{BasicBlockBuilders, LocalBuilder},
     inst_kind::FuncArgRef,
     instruction::Inst,
@@ -115,7 +115,13 @@ impl FunctionData {
     }
 
     pub fn remove_layout_basicblock(&mut self, bb: BasicBlock) {
-        let insts = self.layout().basicblock(bb).insts().iter().copied().collect::<Vec<_>>();
+        let insts = self
+            .layout()
+            .basicblock(bb)
+            .insts()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
         for inst in insts {
             self.detach_inst_usage(inst);
             self.remove_inst_data(inst);
@@ -140,11 +146,19 @@ impl FunctionData {
     }
 
     fn has_inst_data(&self, inst: Inst) -> bool {
-        !inst.is_global() && self.local_arena().inst_arena().datas().any(|(&key, _)| key == inst)
+        !inst.is_global()
+            && self
+                .local_arena()
+                .inst_arena()
+                .datas()
+                .any(|(&key, _)| key == inst)
     }
 
     fn has_layout_bb(&self, bb: BasicBlock) -> bool {
-        self.layout().basicblocks().iter().any(|layout| layout.bb() == bb)
+        self.layout()
+            .basicblocks()
+            .iter()
+            .any(|layout| layout.bb() == bb)
     }
 }
 

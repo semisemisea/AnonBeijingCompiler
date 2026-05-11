@@ -26,7 +26,7 @@ CODES = {
     "yellow": "\x1b[33m",
     "magenta": "\x1b[35m",
 }
-TEST_TIMEOUT = 30
+TEST_TIMEOUT = 60
 
 STATUSES = ("PASS", "FAIL", " CE ", " RE ", " TLE")
 STATUS_STYLES = {

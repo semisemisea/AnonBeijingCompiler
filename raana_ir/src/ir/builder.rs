@@ -1,5 +1,3 @@
-use log::info;
-
 use crate::ir::{
     Program,
     arena::Arena,

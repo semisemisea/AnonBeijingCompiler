@@ -389,9 +389,8 @@ impl GenerateAsm for Binary {
 
 impl GenerateAsm for Cast {
     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
-        let curr = ctx.curr_inst().unwrap();
         ctx.load_to_register(program, self.src());
-        ctx.cast(curr, program);
+        ctx.cast();
         ctx.save_word_at_curr_inst(program);
     }
 }

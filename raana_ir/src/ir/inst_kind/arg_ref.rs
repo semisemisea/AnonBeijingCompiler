@@ -1,6 +1,7 @@
 use crate::ir::{inst_kind::InstKind, instruction::InstData, types::Type};
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BlockArgRef {
     index: usize,
 }

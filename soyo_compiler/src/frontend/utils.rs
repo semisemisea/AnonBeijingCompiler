@@ -426,6 +426,7 @@ impl AstGenContext {
     }
 
     #[inline]
+    #[allow(unused)]
     fn global_val_as_i32_val(&mut self, inst: Inst) -> Inst {
         assert!(inst.is_global());
         let int = match self.inst_data(inst).kind() {
@@ -435,6 +436,7 @@ impl AstGenContext {
         self.curr_func_data_mut().new_local_inst().integer(int)
     }
 
+    #[allow(unused)]
     pub fn as_i32_val(&mut self, val: Inst) -> Inst {
         if val.is_global() {
             self.global_val_as_i32_val(val)

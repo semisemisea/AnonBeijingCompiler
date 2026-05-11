@@ -3,6 +3,7 @@ use std::fmt;
 use crate::backend::armv8::register::Register;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum AddSubImm {
     Imm12(i16),
     Imm12Lsl12(u16),
@@ -10,6 +11,7 @@ pub enum AddSubImm {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[allow(dead_code)]
 pub enum MoveWideImmShift {
     B0 = 0,
     B16 = 16,
@@ -23,12 +25,14 @@ pub enum MoveWideImm {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ShiftSize {
     Imm6(u8),
     Register(Register),
 }
 
 #[allow(clippy::upper_case_acronyms)]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Extend {
     /// Unsigned extend byte
@@ -64,6 +68,7 @@ pub enum AddSubOperand {
     AddrLo12(String),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogicOperand {
     Register(Register),
@@ -76,12 +81,14 @@ pub enum MovOperand {
     Immediate(i32),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadSaveOffset {
     Imm12(i16),
     Register(Register),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CsetCondition {
     EQ, // equal
@@ -100,6 +107,7 @@ pub enum CsetCondition {
     LE, // signed less than or equal
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FcmpOperand {
     Register(Register),
@@ -275,6 +283,7 @@ pub enum Inst {
 }
 
 impl Inst {
+    #[allow(dead_code)]
     fn is_real_inst(&self) -> bool {
         !matches!(self, Inst::_string { .. })
     }

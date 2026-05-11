@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{HashMap, hash_map::Entry};
 
 use crate::{
     ir::{
@@ -38,8 +38,6 @@ pub mod type_alias {
     // TODO: Could be replace to bit set.
     pub type Set = HashSet<BId>;
 }
-
-use type_alias::*;
 
 #[derive(Debug)]
 pub struct IDAllocator<PKey, Id, NKey = PKey> {

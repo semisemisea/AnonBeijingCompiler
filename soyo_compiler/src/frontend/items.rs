@@ -52,6 +52,7 @@ impl FuncFParam {
             .unwrap_or(self.b_type.clone())
     }
 
+    #[allow(unused)]
     pub fn ty(&self, ctx: &mut AstGenContext) -> Type {
         self.arr_ty
             .as_ref()

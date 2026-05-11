@@ -633,6 +633,50 @@ impl AsmGenContext {
         }
     }
 
+    pub fn save_aggregate_at_inst(&mut self, program: &Program, src: IrInst, dest: IrInst) {
+        let AllocationState::Stack(base_offset) = *self.allocation.get(&dest).unwrap() else {
+            unreachable!("aggregate destination must be stack allocated");
+        };
+        let mut offset = 0;
+        self.save_aggregate_elements(program, src, base_offset as i32, &mut offset);
+    }
+
+    fn save_aggregate_elements(
+        &mut self,
+        program: &Program,
+        src: IrInst,
+        base_offset: i32,
+        offset: &mut i32,
+    ) {
+        let src_data = if src.is_global() {
+            program.inst_data(src)
+        } else {
+            self.curr_func_data(program).inst_data(src)
+        };
+        match src_data.kind() {
+            InstKind::Aggregate(agg) => {
+                for &elem in agg.value() {
+                    self.save_aggregate_elements(program, elem, base_offset, offset);
+                }
+            }
+            InstKind::Integer(int) => {
+                self.load_imm(int.value(), self.value_sz(program, src));
+                self.save_word_with_offset(base_offset + *offset);
+                *offset += self.value_ty(program, src).size() as i32;
+            }
+            InstKind::Float(float) => {
+                self.load_float_imm(float.value());
+                self.save_word_with_offset(base_offset + *offset);
+                *offset += self.value_ty(program, src).size() as i32;
+            }
+            _ => {
+                self.load_to_register(program, src);
+                self.save_word_with_offset(base_offset + *offset);
+                *offset += self.value_ty(program, src).size() as i32;
+            }
+        }
+    }
+
     // Save the value in rs2 to the address [rs1 + imm].
     pub fn save_word(&mut self, rs2: Register, imm: i32, rs1: Register) {
         import_reg_and_inst!();

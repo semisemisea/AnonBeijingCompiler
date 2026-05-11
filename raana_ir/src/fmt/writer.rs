@@ -1,5 +1,5 @@
+use std::collections::HashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
-use std::collections::{HashMap};
 use std::fmt::Write;
 
 const VERBOSE: bool = true;

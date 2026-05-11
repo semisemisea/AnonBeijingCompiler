@@ -43,10 +43,6 @@ pub trait ScalarInstBuilder: InstInsert + InfoQuery + Sized {
     fn aggregate(&mut self, value: Vec<Inst>) -> Inst {
         assert!(!value.is_empty(), "aggregate elements cannot be empty");
         for (index, &elem) in value.iter().enumerate() {
-            assert!(
-                self.is_const(elem),
-                "each elements should be constant but index {index}: {elem} is not"
-            );
             assert_eq!(
                 self.inst_type(elem),
                 self.inst_type(value[0]),
@@ -209,7 +205,10 @@ impl<T: ArenaQuery> InfoQuery for T {
     }
 
     fn is_const(&self, inst: Inst) -> bool {
-        self.arena().inst_data(inst).kind().is_const()
+        match self.arena().inst_data(inst).kind() {
+            InstKind::Aggregate(agg) => agg.value().iter().all(|&elem| self.is_const(elem)),
+            kind => kind.is_const(),
+        }
     }
 
     fn bb_params(&self, bb: BasicBlock) -> &[Inst] {

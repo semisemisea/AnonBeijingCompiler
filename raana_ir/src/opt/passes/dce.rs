@@ -87,11 +87,15 @@ impl DeadCodeElimination {
                 | InstKind::Alloc
                 | InstKind::BlockArgRef(..)
                 | InstKind::FuncArgRef(..)
-                | InstKind::Aggregate(..)
                 | InstKind::Undef
                 | InstKind::ZeroInit
                 | InstKind::Float(..)
                 | InstKind::Integer(..) => continue,
+                InstKind::Aggregate(agg) => {
+                    for &elem in agg.value() {
+                        mark_live!(elem);
+                    }
+                }
                 InstKind::Cast(cast) => mark_live!(cast.src()),
                 InstKind::Return(ret) => {
                     if let Some(inst) = ret.value() {

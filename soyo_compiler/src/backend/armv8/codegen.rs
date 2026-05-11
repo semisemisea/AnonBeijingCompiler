@@ -479,6 +479,13 @@ impl GenerateAsm for Store {
             ctx.load_to_register(program, self.src());
             ctx.save_word_at_address();
         } else {
+            if matches!(
+                ctx.curr_func_data(program).inst_data(self.src()).kind(),
+                InstKind::Aggregate(_)
+            ) {
+                ctx.save_aggregate_at_inst(program, self.src(), self.dest());
+                return;
+            }
             // FIXME: maybe incorrect use of curr_func_data
             match ctx.curr_func_data(program).inst_data(self.dest()).kind() {
                 InstKind::GetElemPtr(..) | InstKind::GetPtr(..) => {

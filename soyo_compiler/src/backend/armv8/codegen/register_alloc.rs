@@ -265,15 +265,31 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     }
     let mut liveness_ranges = HashMap::new();
 
+    // Aggregate中可能包含的Inst不一定会被分配寄存器，但它们的使用者可能会被分配寄存器，
+    // 所以我们需要递归地找到所有使用者中被分配寄存器的Inst的ID，并以此来确定Aggregate中Inst的活跃范围。
+    fn max_use_id(data: &FunctionData, val: Inst, val_alloc: &VIDAlloc) -> Option<usize> {
+        if let Some(id) = val_alloc.get_id_safe(&val) {
+            return Some(*id);
+        }
+        if let InstKind::Aggregate(..) = data.inst_data(val).kind() {
+            return data
+                .inst_data(val)
+                .used_by()
+                .iter()
+                .filter_map(|&used_by| max_use_id(data, used_by, val_alloc))
+                .max();
+        }
+        None
+    }
+
     macro_rules! insert_range {
         ($inst:expr, $min_id: expr) => {
             let max_id = data
                 .inst_data($inst)
                 .used_by()
                 .iter()
-                .filter_map(|&val| val_alloc.get_id_safe(&val))
+                .filter_map(|&val| max_use_id(data, val, &val_alloc))
                 .max()
-                .copied()
                 .unwrap_or($min_id);
             let register_type = register_type(data, $inst);
             let range = match register_type {

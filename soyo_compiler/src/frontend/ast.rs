@@ -287,7 +287,7 @@ impl ToRaanaIR for items::ConstDef {
             let exps = self.const_init_val.init_val_shape(&array_shape);
 
             let zero = ctx.zero_local(&ty);
-            let const_init_vals = exps
+            let elems = exps
                 .iter()
                 .map(|const_exp| match const_exp {
                     Some(exp) => {
@@ -297,34 +297,16 @@ impl ToRaanaIR for items::ConstDef {
                     }
                     None => zero,
                 })
-                // TODO: We can change it to for loop to avoid `.collect()`
                 .collect::<Vec<_>>();
-            fn initializer(
-                array_shape: &[i32],
-                init_val: &mut impl Iterator<Item = Inst>,
-                get_from: Inst,
-                ctx: &mut AstGenContext,
-            ) {
-                if array_shape.is_empty() {
-                    let store = ctx
-                        .new_local_value()
-                        .store(init_val.next().unwrap(), get_from);
-                    ctx.push_inst(store);
-                    return;
-                }
-                for offset in 0..*array_shape.first().unwrap() {
-                    let index = ctx.new_local_value().integer(offset);
-                    let get_elem_ptr = ctx.new_local_value().get_elem_ptr(get_from, index);
-                    ctx.push_inst(get_elem_ptr);
-                    initializer(&array_shape[1..], init_val, get_elem_ptr, ctx);
-                }
-            }
-            initializer(
-                &array_shape,
-                &mut const_init_vals.into_iter(),
-                alloc_var,
-                ctx,
-            );
+            let agg = array_shape.iter().rev().fold(elems, |elems, &dim_l| {
+                elems
+                    .chunks(dim_l as _)
+                    .map(|chunk| ctx.new_local_value().aggregate(chunk.to_owned()))
+                    .collect::<Vec<_>>()
+            });
+            let init = *agg.first().unwrap();
+            let store = ctx.new_local_value().store(init, alloc_var);
+            ctx.push_inst(store);
             ctx.insert_const(self.ident.clone(), alloc_var)
         }
     }
@@ -517,7 +499,7 @@ impl ToRaanaIR for items::VarDef {
                 // Check every item, if `Some(exp)`, then calculate exp and take the value
                 // if None, then fill it with default value zero
                 let zero = ctx.zero_local(&ty);
-                let init_vals = exps
+                let elems = exps
                     .iter()
                     .map(|exp| match exp {
                         Some(exp) => {
@@ -529,28 +511,15 @@ impl ToRaanaIR for items::VarDef {
                     })
                     .collect::<Vec<_>>();
 
-                // Now store the initial value
-                fn initializer(
-                    array_shape: &[i32],
-                    init_val: &mut impl Iterator<Item = Inst>,
-                    get_from: Inst,
-                    ctx: &mut AstGenContext,
-                ) {
-                    if array_shape.is_empty() {
-                        let store = ctx
-                            .new_local_value()
-                            .store(init_val.next().unwrap(), get_from);
-                        ctx.push_inst(store);
-                        return;
-                    }
-                    for offset in 0..*array_shape.first().unwrap() {
-                        let index = ctx.new_local_value().integer(offset);
-                        let get_elem_ptr = ctx.new_local_value().get_elem_ptr(get_from, index);
-                        ctx.push_inst(get_elem_ptr);
-                        initializer(&array_shape[1..], init_val, get_elem_ptr, ctx);
-                    }
-                }
-                initializer(&array_shape, &mut init_vals.into_iter(), alloc_var, ctx);
+                let agg = array_shape.iter().rev().fold(elems, |elems, &dim_l| {
+                    elems
+                        .chunks(dim_l as _)
+                        .map(|chunk| ctx.new_local_value().aggregate(chunk.to_owned()))
+                        .collect::<Vec<_>>()
+                });
+                let init = *agg.first().unwrap();
+                let store = ctx.new_local_value().store(init, alloc_var);
+                ctx.push_inst(store);
             }
             ctx.insert_var(self.ident.clone(), alloc_var)
         }

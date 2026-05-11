@@ -59,10 +59,7 @@ impl InstKind {
     pub fn is_const(&self) -> bool {
         matches!(
             self,
-            InstKind::ZeroInit
-                | InstKind::Aggregate(..)
-                | InstKind::Integer(..)
-                | InstKind::Float(..)
+            InstKind::ZeroInit | InstKind::Integer(..) | InstKind::Float(..)
         )
     }
 }

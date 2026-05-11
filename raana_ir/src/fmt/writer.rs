@@ -1,10 +1,8 @@
 use std::collections::hash_map::Entry::{Occupied, Vacant};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap};
 use std::fmt::Write;
 
-use log::info;
-
-const VERBOSE: bool = false;
+const VERBOSE: bool = true;
 
 use crate::ir::BasicBlock;
 use crate::ir::{
@@ -211,11 +209,9 @@ impl Writer<'_> {
             )?;
         }
         writeln!(self.buffer, ">: {{")?;
-        for (index, layout) in data.layout().basicblocks().iter().enumerate() {
-            self.bb_name.insert(
-                layout.bb(),
-                format!("{}_{}", data.bb_data(layout.bb()).name(), index),
-            );
+        for layout in data.layout().basicblocks() {
+            self.bb_name
+                .insert(layout.bb(), data.bb_data(layout.bb()).name().to_string());
         }
         for layout in data.layout().basicblocks() {
             self.visit_bb(layout)?;

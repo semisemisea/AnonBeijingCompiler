@@ -1,9 +1,7 @@
-use std::num::NonZeroU32;
-
 use itertools::Itertools;
 
 use crate::ir::{
-    BasicBlockBuilders, LocalBuilder, Type,
+    BasicBlockBuilders, LocalBuilder,
     basic_block::{BasicBlock, BasicBlockArena, BasicBlockData},
     builder::ReplaceBuilder,
     function::{Function, FunctionArena, FunctionData},
@@ -174,6 +172,13 @@ pub trait Arena {
         for used in self.inst_data(inst).inst_usage().collect_vec() {
             self.inst_data_mut(used).used_by_mut().remove(&inst);
         }
+        for bb in self.inst_data(inst).bb_usage().collect_vec() {
+            self.bb_data_mut(bb).used_by_mut().remove(&inst);
+        }
+        self.remove_inst_data(inst)
+    }
+
+    fn remove_inst_data(&mut self, inst: Inst) -> InstData {
         if inst.is_global() {
             self.global_mut().inst_arena.remove(inst)
         } else {

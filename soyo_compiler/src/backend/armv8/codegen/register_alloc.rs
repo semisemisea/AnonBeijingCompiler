@@ -6,11 +6,14 @@ use std::{
 };
 
 use itertools::Itertools;
+use log::debug;
 use raana_ir::ir::{BasicBlock, arena::Arena};
 use raana_ir::ir::{FunctionData, Inst, InstKind};
 use raana_ir::opt::prelude::*;
 
-use crate::backend::armv8::register::{Bit, IReg, IntRegister, Register};
+use crate::backend::armv8::register::{
+    Bit, FReg, FloatRegister, IReg, IntRegister, Register, RegisterType,
+};
 
 type VRegister = Reverse<Register>;
 
@@ -63,14 +66,48 @@ impl VirtualRegister {
     }
 
     #[inline]
-    fn new(max_size: usize) -> VirtualRegister {
-        Self {
-            container: BinaryHeap::from_iter((0..max_size as u8).map(|x| {
-                Reverse(Register::I(IReg(
-                    Bit::b64,
-                    IntRegister::try_from(x).unwrap(),
-                )))
+    fn new(max_size: usize, ty: RegisterType) -> VirtualRegister {
+        let int_scratch = [IntRegister::x16, IntRegister::x17];
+        let float_regs = [
+            FloatRegister::v0,
+            FloatRegister::v1,
+            FloatRegister::v2,
+            FloatRegister::v3,
+            FloatRegister::v4,
+            FloatRegister::v5,
+            FloatRegister::v6,
+            FloatRegister::v7,
+            FloatRegister::v8,
+            FloatRegister::v9,
+            FloatRegister::v10,
+            FloatRegister::v11,
+            FloatRegister::v12,
+            FloatRegister::v13,
+            FloatRegister::v14,
+            FloatRegister::v15,
+            FloatRegister::v18,
+            FloatRegister::v19,
+            FloatRegister::v20,
+            FloatRegister::v21,
+            FloatRegister::v22,
+            FloatRegister::v23,
+            FloatRegister::v24,
+            FloatRegister::v25,
+        ];
+        let container = match ty {
+            RegisterType::Int => BinaryHeap::from_iter((0..max_size as u8).filter_map(|x| {
+                let reg = IntRegister::try_from(x).unwrap();
+                (!int_scratch.contains(&reg)).then_some(Reverse(Register::I(IReg(Bit::b64, reg))))
             })),
+            RegisterType::Float => BinaryHeap::from_iter(
+                float_regs
+                    .into_iter()
+                    .take(max_size)
+                    .map(|reg| Reverse(Register::F(FReg(Bit::b32, reg)))),
+            ),
+        };
+        Self {
+            container,
             rules: HashMap::new(),
             loops: Vec::new(),
             callee_used: HashSet::new(),
@@ -117,7 +154,8 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     // let graph = utils::build_cfg_forward(data, &mut bb_alloc);
     let (graph, prece) = cfg::build_cfg_both(data, &mut bb_alloc);
     let rpo_path = cfg::rpo_path(&graph);
-    let mut register_manager = VirtualRegister::new(REGISTER_COUNT);
+    let mut int_vregs = VirtualRegister::new(REGISTER_COUNT, RegisterType::Int);
+    let mut float_vregs = VirtualRegister::new(REGISTER_COUNT, RegisterType::Float);
 
     let mut call_ra = false;
     let mut extra_args = 0usize;
@@ -137,10 +175,20 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                 call_ra = true;
                 extra_args = extra_args.max(8.max(call.args().len()) - 8);
                 for index in 0..8 {
-                    register_manager.add_rule(Reverse(Register::arguments(index)), id..=id);
+                    int_vregs.add_rule(Reverse(Register::arguments(index)), id..=id);
+                    float_vregs.add_rule(Reverse(Register::float_arguments(index)), id..=id);
                 }
+                int_vregs.add_rule(
+                    Reverse(Register::I(IReg(Bit::b64, IntRegister::x8))),
+                    id..=id,
+                );
+                int_vregs.add_rule(
+                    Reverse(Register::I(IReg(Bit::b64, IntRegister::x18))),
+                    id..=id,
+                );
                 for index in 0..7 {
-                    register_manager.add_rule(Reverse(Register::temporary(index)), id..=id);
+                    // FIXME: we should also consider the size of temporary register.
+                    int_vregs.add_rule(Reverse(Register::temporary(index, Bit::b64)), id..=id);
                 }
             }
         }
@@ -195,7 +243,8 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                                 }
                             }
 
-                            register_manager.add_loop(*header_id..=max_loop_id);
+                            int_vregs.add_loop(*header_id..=max_loop_id);
+                            float_vregs.add_loop(*header_id..=max_loop_id);
                         }
                     }
                 }
@@ -214,69 +263,6 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
             _ => unreachable!(),
         }
     }
-    // for &bb_id in rpo_path.iter() {
-    //     let bb = bb_alloc.search_id(bb_id);
-    //     let node = data.layout().bbs().node(&bb).unwrap();
-    //     let iter = data
-    //         .dfg()
-    //         .bb(bb)
-    //         .params()
-    //         .iter()
-    //         .chain(node.insts().iter().map(|(val, _)| val));
-    //     for &inst in iter {
-    //         let id = val_alloc.check_or_alloc(inst);
-    //
-    //         if let InstKind::Call(call) = data.dfg().value(inst).kind() {
-    //             call_ra = true;
-    //             extra_args = extra_args.max(8.max(call.args().len()) - 8);
-    //             for index in 0..8 {
-    //                 register_manager.add_rule(Reverse(Register::arguments(index)), id..=id);
-    //             }
-    //             for index in 0..7 {
-    //                 register_manager.add_rule(Reverse(Register::temporary(index)), id..=id);
-    //             }
-    //         }
-    //     }
-    //
-    //     let terminator_inst = get_terminator_inst(data, bb);
-    //
-    //     // TODO:
-    //     macro_rules! add_loop {
-    //         ($backedge_goes_to: expr) => {
-    //             if let Some(id) = bb_alloc.get_id_safe($backedge_goes_to) {
-    //                 let head_bb = bb_alloc.search_id(*id);
-    //                 let head_bb_first_inst = *data.dfg().bb(head_bb).params().first().unwrap_or(
-    //                     data.layout()
-    //                         .bbs()
-    //                         .node(&head_bb)
-    //                         .unwrap()
-    //                         .insts()
-    //                         .front_key()
-    //                         .unwrap(),
-    //                 );
-    //                 if let (Some(header_id), Some(latch_id)) = (
-    //                     val_alloc.get_id_safe(head_bb_first_inst),
-    //                     val_alloc.get_id_safe(terminator_inst),
-    //                 ) && header_id < latch_id
-    //                 {
-    //                     register_manager.add_loop(*header_id..=*latch_id);
-    //                 }
-    //             }
-    //         };
-    //     }
-    //     match data.dfg().value(terminator_inst).kind() {
-    //         InstKind::Jump(jump) => {
-    //             add_loop!(jump.target());
-    //         }
-    //         InstKind::Branch(branch) => {
-    //             add_loop!(branch.true_bb());
-    //             add_loop!(branch.false_bb());
-    //         }
-    //         InstKind::Return(..) => {}
-    //         _ => unreachable!(),
-    //     }
-    // }
-
     let mut liveness_ranges = HashMap::new();
 
     macro_rules! insert_range {
@@ -289,8 +275,11 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
                 .max()
                 .copied()
                 .unwrap_or($min_id);
-            let range = register_manager.extent_by_loop($min_id..=max_id);
-            eprintln!("insert range:{:?} {:?}", $inst, range);
+            let register_type = register_type(data, $inst);
+            let range = match register_type {
+                RegisterType::Int => int_vregs.extent_by_loop($min_id..=max_id),
+                RegisterType::Float => float_vregs.extent_by_loop($min_id..=max_id),
+            };
             liveness_ranges.insert($inst, range);
         };
     }
@@ -302,7 +291,7 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     for bb_id in rpo_path {
         let bb: BasicBlock = bb_alloc.search_id(bb_id);
         let insts = data.layout().basicblock(bb).insts();
-        eprintln!("params:{:?}", data.bb_data(bb).params());
+        debug!("params:{:?}", data.bb_data(bb).params());
 
         if let Some(min_id) = data
             .bb_data(bb)
@@ -327,16 +316,25 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     };
 
     let mut register_allocation = HashMap::new();
-    let mut curr_inst_offset = extra_args * 4;
+    // FIXME: we should also consider the size of parameter and temporary register.
+    // if call_ra, we need to reserve 16 bits for x29 and x30.
+    // start from beyond LR.
+    let mut acc_inst_offset = extra_args * 8 + if call_ra { 16 } else { 0 };
 
-    let mut active: Vec<(std::ops::RangeInclusive<usize>, VRegister, Inst)> =
+    let mut int_active: Vec<(std::ops::RangeInclusive<usize>, VRegister, Inst)> =
+        Vec::with_capacity(REGISTER_COUNT);
+    let mut float_active: Vec<(std::ops::RangeInclusive<usize>, VRegister, Inst)> =
         Vec::with_capacity(REGISTER_COUNT);
     for val in unhandled {
         let new_range = liveness_ranges.get(&val).unwrap();
+        let (vregs, active) = match register_type(data, val) {
+            RegisterType::Int => (&mut int_vregs, &mut int_active),
+            RegisterType::Float => (&mut float_vregs, &mut float_active),
+        };
         let remove_partition =
             active.partition_point(|(range, _reg, _val)| range.end() < new_range.start());
         for (_, reg, _) in active.drain(0..remove_partition) {
-            register_manager.free(reg);
+            vregs.free(reg);
         }
 
         macro_rules! active_insert {
@@ -349,8 +347,8 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
 
         macro_rules! alloc_stack {
             ($val: expr) => {
-                register_allocation.insert($val, AllocationState::Stack(curr_inst_offset));
-                curr_inst_offset += crate::backend::armv8::codegen::inst_size(data, $val);
+                register_allocation.insert($val, AllocationState::Stack(acc_inst_offset));
+                acc_inst_offset += crate::backend::armv8::codegen::inst_size(data, $val);
             };
         }
 
@@ -359,20 +357,26 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
             continue;
         }
 
-        if let Some(alloc) = register_manager.alloc(new_range) {
+        if let Some(alloc) = vregs.alloc(new_range) {
             active_insert!(new_range, alloc, val);
-            register_allocation.insert(val, AllocationState::Register(alloc.0));
+            register_allocation.insert(
+                val,
+                AllocationState::Register(sized_register(data, val, alloc.0)),
+            );
         } else {
-            eprintln!("Spill!");
+            debug!("Spill!");
             if let Some((index, (occupied_range, occupied_reg, occupied_val))) = active
                 .iter()
                 .rev()
-                .find_position(|&&(_, reg, _)| register_manager.check(reg, new_range))
+                .find_position(|&&(_, reg, _)| vregs.check(reg, new_range))
             {
                 if occupied_range.end() > new_range.end() {
                     // spill the occupied one
                     alloc_stack!(*occupied_val);
-                    register_allocation.insert(val, AllocationState::Register(occupied_reg.0));
+                    register_allocation.insert(
+                        val,
+                        AllocationState::Register(sized_register(data, val, occupied_reg.0)),
+                    );
                     let alloc_reg = *occupied_reg;
                     let actual_index = active.len() - index - 1;
                     active.remove(actual_index);
@@ -388,13 +392,14 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
         }
     }
 
-    curr_inst_offset -= extra_args * 4;
+    acc_inst_offset -= extra_args * 8;
 
     let offset = {
-        let unaligned = curr_inst_offset
+        let unaligned = acc_inst_offset
             + if call_ra { 16 } else { 0 }
             + extra_args * 8
-            + register_manager.callee_used.len() * 8;
+            + int_vregs.callee_used.len() * 8
+            + float_vregs.callee_used.len() * 8;
         if unaligned & 0x0F != 0 {
             (unaligned | 0x0F) + 1
         } else {
@@ -403,32 +408,39 @@ pub fn liveness_analysis(data: &FunctionData) -> RegisterAllocationResult {
     };
 
     for (index, &fparam) in data.params().iter().skip(8).enumerate() {
-        register_allocation.insert(fparam, AllocationState::Stack(offset + 4 * index));
+        // FIXME: we should also consider the size of parameter.
+        register_allocation.insert(fparam, AllocationState::Stack(offset + 8 * index));
     }
-    eprintln!("function name:{:?}", data.name());
-
-    eprintln!("--------------------------------");
-
-    for (k, v) in liveness_ranges.iter() {
-        eprintln!("{:?} {:?}", k, v);
-    }
-
-    for (k, v) in register_allocation.iter() {
-        eprintln!("{:?} {:?}", k, v);
-    }
-
-    eprintln!("--------------------------------");
+    debug!("function name:{:?}", data.name());
+    debug!("liveness ranges:{:?}", liveness_ranges);
+    debug!("register allocation:{:?}", register_allocation);
 
     RegisterAllocationResult {
         allocation: register_allocation,
         offset,
         call_ra,
         extra_args,
-        callee_usage: register_manager.callee_used,
+        callee_usage: int_vregs
+            .callee_used
+            .into_iter()
+            .chain(float_vregs.callee_used)
+            .collect(),
+    }
+}
+
+fn register_type(data: &FunctionData, val: Inst) -> RegisterType {
+    if data.inst_data(val).ty().is_f32() {
+        RegisterType::Float
+    } else {
+        RegisterType::Int
     }
 }
 
 fn can_produce_value(val: Inst, data: &FunctionData) -> bool {
+    if data.inst_data(val).ty().size() == 0 {
+        return false;
+    }
+
     matches!(
         data.inst_data(val).kind(),
         InstKind::FuncArgRef(..)
@@ -438,8 +450,13 @@ fn can_produce_value(val: Inst, data: &FunctionData) -> bool {
             | InstKind::GetPtr(..)
             | InstKind::GetElemPtr(..)
             | InstKind::Binary(..)
+            | InstKind::Cast(..)
             | InstKind::Call(..)
     )
+}
+
+fn sized_register(data: &FunctionData, val: Inst, register: Register) -> Register {
+    register.with_size(Bit::try_from(crate::backend::armv8::codegen::inst_size(data, val)).unwrap())
 }
 
 // TODO:

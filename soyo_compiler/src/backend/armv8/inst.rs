@@ -3,6 +3,7 @@ use std::fmt;
 use crate::backend::armv8::register::Register;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum AddSubImm {
     Imm12(i16),
     Imm12Lsl12(u16),
@@ -10,6 +11,7 @@ pub enum AddSubImm {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[allow(dead_code)]
 pub enum MoveWideImmShift {
     B0 = 0,
     B16 = 16,
@@ -23,12 +25,14 @@ pub enum MoveWideImm {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ShiftSize {
     Imm6(u8),
     Register(Register),
 }
 
 #[allow(clippy::upper_case_acronyms)]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Extend {
     /// Unsigned extend byte
@@ -64,6 +68,7 @@ pub enum AddSubOperand {
     AddrLo12(String),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogicOperand {
     Register(Register),
@@ -73,15 +78,17 @@ pub enum LogicOperand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MovOperand {
     Register(Register),
-    Immediate(MoveWideImm),
+    Immediate(i32),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadSaveOffset {
     Imm12(i16),
     Register(Register),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CsetCondition {
     EQ, // equal
@@ -98,6 +105,13 @@ pub enum CsetCondition {
     LT, // signed less than
     GT, // signed greater than
     LE, // signed less than or equal
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FcmpOperand {
+    Register(Register),
+    Fzero,
 }
 
 #[allow(unused)]
@@ -226,6 +240,42 @@ pub enum Inst {
         rs: Register,
         label: String,
     },
+    fmov {
+        rd: Register,
+        src: Register,
+    },
+    fadd {
+        rd: Register,
+        rs1: Register,
+        rs2: Register,
+    },
+    fsub {
+        rd: Register,
+        rs1: Register,
+        rs2: Register,
+    },
+    fmul {
+        rd: Register,
+        rs1: Register,
+        rs2: Register,
+    },
+    fdiv {
+        rd: Register,
+        rs1: Register,
+        rs2: Register,
+    },
+    scvtf {
+        rd: Register,
+        rs: Register,
+    },
+    fcvtzs {
+        rd: Register,
+        rs: Register,
+    },
+    fcmp {
+        rs1: Register,
+        rs2: FcmpOperand,
+    },
     _string {
         indent_level: usize,
         str: String,
@@ -233,6 +283,7 @@ pub enum Inst {
 }
 
 impl Inst {
+    #[allow(dead_code)]
     fn is_real_inst(&self) -> bool {
         !matches!(self, Inst::_string { .. })
     }
@@ -340,7 +391,7 @@ impl fmt::Display for MovOperand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MovOperand::Register(reg) => write!(f, "{reg}"),
-            MovOperand::Immediate(imm) => write!(f, "{imm}"),
+            MovOperand::Immediate(imm) => write!(f, "#{imm}"),
         }
     }
 }
@@ -378,10 +429,20 @@ impl fmt::Display for CsetCondition {
     }
 }
 
+impl fmt::Display for FcmpOperand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FcmpOperand::Register(reg) => write!(f, "{reg}"),
+            FcmpOperand::Fzero => write!(f, "#0.0"),
+        }
+    }
+}
+
 impl fmt::Display for Inst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Inst::mov { rd, src } => write!(f, "  mov {rd}, {src}"),
+            Inst::fmov { rd, src } => write!(f, "  fmov {rd}, {src}"),
             Inst::movz { rd, imm } => write!(f, "  movz {rd}, {imm}"),
             Inst::movn { rd, imm } => write!(f, "  movn {rd}, {imm}"),
             Inst::movk { rd, imm } => write!(f, "  movk {rd}, {imm}"),
@@ -406,6 +467,13 @@ impl fmt::Display for Inst {
             Inst::bl { label } => write!(f, "  bl {label}"),
             Inst::cbnz { rs, label } => write!(f, "  cbnz {rs}, {label}"),
             Inst::cbz { rs, label } => write!(f, "  cbz {rs}, {label}"),
+            Inst::fadd { rd, rs1, rs2 } => write!(f, "  fadd {rd}, {rs1}, {rs2}"),
+            Inst::fsub { rd, rs1, rs2 } => write!(f, "  fsub {rd}, {rs1}, {rs2}"),
+            Inst::fmul { rd, rs1, rs2 } => write!(f, "  fmul {rd}, {rs1}, {rs2}"),
+            Inst::fdiv { rd, rs1, rs2 } => write!(f, "  fdiv {rd}, {rs1}, {rs2}"),
+            Inst::scvtf { rd, rs } => write!(f, "  scvtf {rd}, {rs}"),
+            Inst::fcvtzs { rd, rs } => write!(f, "  fcvtzs {rd}, {rs}"),
+            Inst::fcmp { rs1, rs2 } => write!(f, "  fcmp {rs1}, {rs2}"),
             Inst::ret => write!(f, "  ret"),
             Inst::_string { indent_level, str } => write!(f, "{}{str}", "\t".repeat(*indent_level)),
         }

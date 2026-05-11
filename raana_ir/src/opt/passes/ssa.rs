@@ -142,8 +142,7 @@ impl Pass for SSATransform {
             for val in used_by.into_iter().rev() {
                 data.remove_inst(val);
             }
-            data.layout_mut().remove_inst(bb, inst);
-            data.remove_inst(inst);
+            data.remove_layout_inst(bb, inst);
         });
 
         debug!("");

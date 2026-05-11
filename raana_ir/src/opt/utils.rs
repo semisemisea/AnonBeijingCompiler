@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{HashMap, hash_map::Entry};
 
 use crate::{
     ir::{
@@ -39,8 +39,6 @@ pub mod type_alias {
     pub type Set = HashSet<BId>;
 }
 
-use type_alias::*;
-
 #[derive(Debug)]
 pub struct IDAllocator<PKey, Id, NKey = PKey> {
     id_pos: HashMap<PKey, Id>,
@@ -74,15 +72,19 @@ where
 
 impl<PK, I, NK> IDAllocator<PK, I, NK>
 where
-    PK: Eq + std::hash::Hash + Copy,
+    PK: Eq + std::hash::Hash + Copy + std::fmt::Debug,
     I: std::ops::AddAssign<I> + Default + Copy + Eq + std::hash::Hash,
-    NK: Eq + std::hash::Hash + Copy,
+    NK: Eq + std::hash::Hash + Copy + std::fmt::Debug,
 {
     #[inline]
     pub fn check_or_alloc_id(&mut self, pkey: PK, nkey: NK) -> I {
         match self.id_pos.entry(pkey) {
             Entry::Occupied(e) => *e.get(),
             Entry::Vacant(..) => {
+                debug!(
+                    "Allocating new ID for key: {:?} with nkey: {:?}",
+                    pkey, nkey
+                );
                 self.id_pos.insert(pkey, self.cnt);
                 self.id_neg.insert(self.cnt, nkey);
                 let ret = self.cnt;
@@ -97,6 +99,7 @@ where
     }
 
     pub fn get_id(&self, key: &PK) -> I {
+        assert!(self.id_pos.contains_key(key), "Key not found: {:?}", key);
         *self.id_pos.get(key).unwrap()
     }
 
@@ -107,7 +110,7 @@ where
 
 impl<K, I> IDAllocator<K, I>
 where
-    K: Eq + std::hash::Hash + Copy,
+    K: Eq + std::hash::Hash + Copy + std::fmt::Debug,
     I: std::ops::AddAssign<I> + Default + Copy + Eq + std::hash::Hash,
 {
     #[inline]

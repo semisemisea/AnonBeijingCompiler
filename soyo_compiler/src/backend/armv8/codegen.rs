@@ -2,11 +2,10 @@ pub(crate) mod asm_gen_context;
 mod epilogue;
 mod generate_asm;
 mod register_alloc;
-mod register_manager;
 
 use raana_ir::ir::{
-    Binary, BlockArgRef, Branch, Call, FunctionData, GetElemPtr, GetPtr, Inst, InstKind, Integer,
-    Jump, Load, Program, Return, Store, Type, TypeKind, arena::Arena,
+    Binary, BlockArgRef, Branch, Call, Cast, FunctionData, GetElemPtr, GetPtr, Inst, InstKind,
+    Integer, Jump, Load, Program, Return, Store, Type, TypeKind, arena::Arena,
 };
 
 use crate::backend::armv8::inst::Inst::bl;
@@ -20,14 +19,13 @@ const AUTO_FUNC_ARG_ON_STACK: bool = true;
 #[inline]
 pub fn inst_size(func: &FunctionData, inst: Inst) -> usize {
     match func.inst_data(inst).kind() {
-        InstKind::Alloc => ptr_size(func.inst_data(inst).ty()),
+        InstKind::Alloc => ptr_base_size(func.inst_data(inst).ty()),
         _ => func.inst_data(inst).ty().size(),
     }
 }
 
 impl GenerateAsm for FunctionData {
     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
-        // ctx.writeln(&format!("{}:", self.name().strip_prefix("@").unwrap()));
         ctx.writeln(&format!("{}:", self.name()));
         ctx.incr_indent();
 
@@ -41,30 +39,34 @@ impl GenerateAsm for FunctionData {
 
         *ctx.allocation_mut() = allocation;
 
-        ctx.prologue(offset, call_ra, callee_usage);
+        ctx.prologue(offset, call_ra, extra_args, callee_usage);
 
         let curr_offset = (extra_args.max(8) - 8) * 4;
 
         let mut curr_offset = if AUTO_FUNC_ARG_ON_STACK {
-            self.params()
-                .iter()
-                .take(8)
-                .fold(curr_offset, |acc_offset, &param| {
-                    use crate::backend::armv8::register::*;
-                    ctx.insert_inst(param, acc_offset);
-                    // ctx.load_to_register(program, param);
-                    let InstKind::FuncArgRef(arg_ref) =
-                        ctx.curr_func_data(program).inst_data(param).kind()
-                    else {
-                        unreachable!()
-                    };
-                    let reg: IntRegister = (IntRegister::x0 as u8 + arg_ref.index() as u8)
-                        .try_into()
-                        .unwrap();
-                    ctx.alloc_para_reg(Register::I(IReg(Bit::b64, reg)));
-                    ctx.save_word_at_inst(param);
-                    acc_offset + self.inst_data(param).ty().size()
-                })
+            let mut acc_offset = curr_offset;
+            for &param in self.params().iter().take(8) {
+                ctx.insert_inst(param, acc_offset);
+                let InstKind::FuncArgRef(arg_ref) =
+                    ctx.curr_func_data(program).inst_data(param).kind()
+                else {
+                    unreachable!()
+                };
+                let reg = if self.inst_data(param).ty().is_f32() {
+                    Register::float_arguments(arg_ref.index())
+                        .with_size(ctx.value_sz(program, param))
+                } else {
+                    Register::I(IReg(
+                        ctx.value_sz(program, param),
+                        IntRegister::try_from(IntRegister::x0 as u8 + arg_ref.index() as u8)
+                            .unwrap(),
+                    ))
+                };
+                ctx.alloc_para_reg(reg);
+                ctx.save_word_at_inst(program, param);
+                acc_offset += self.inst_data(param).ty().size();
+            }
+            acc_offset
         } else {
             curr_offset
         };
@@ -126,6 +128,7 @@ impl GenerateAsm for Inst {
             InstKind::Jump(jump) => jump.generate(program, ctx),
             InstKind::Return(ret) => ret.generate(program, ctx),
             InstKind::Binary(op) => op.generate(program, ctx),
+            InstKind::Cast(cast) => cast.generate(program, ctx),
             InstKind::BlockArgRef(block_arg_ref) => block_arg_ref.generate(program, ctx),
             InstKind::Call(call) => call.generate(program, ctx),
             InstKind::GetElemPtr(get_elem_ptr) => get_elem_ptr.generate(program, ctx),
@@ -146,15 +149,15 @@ impl GenerateAsm for GetPtr {
         let global_flag = self.base().is_global();
         // element type size
         let pointee_size = if global_flag {
-            ptr_size(program.inst_data(self.base()).ty())
+            ptr_base_size(program.inst_data(self.base()).ty())
         } else {
             // FIXME: maybe incorrect use of curr_func_data
-            ptr_size(ctx.curr_func_data(program).inst_data(self.base()).ty())
+            ptr_base_size(ctx.curr_func_data(program).inst_data(self.base()).ty())
         };
         // load index to register
         ctx.load_to_register(program, self.offset());
         // load element type size to register
-        ctx.load_imm(pointee_size as _);
+        ctx.load_imm(pointee_size as _, ctx.value_sz(program, self.offset()));
         // do multipication
         ctx.multiply();
 
@@ -165,13 +168,17 @@ impl GenerateAsm for GetPtr {
             ctx.add_op();
         } else {
             // let pre_drifted_address = ctx.get_inst_offset(self.src()).unwrap();
-            if let Some(pre_drifted_address) = ctx.register_or_offset(self.base()) {
-                ctx.load_word_sp(pre_drifted_address as _);
+            if let Some(pre_drifted_address) = ctx.register_or_offset(program, self.base()) {
+                ctx.load_word_sp(
+                    pre_drifted_address as _,
+                    ctx.value_sz(program, self.base()),
+                    ctx.value_ty(program, self.base()).try_into().unwrap(),
+                );
             }
             ctx.add_op()
         }
 
-        ctx.save_word_at_curr_inst();
+        ctx.save_word_at_curr_inst(program);
     }
 }
 
@@ -188,20 +195,23 @@ impl GenerateAsm for GetElemPtr {
         let ptr_flag = if global_flag {
             false
         } else {
-            is_ptr(self.base(), ctx.curr_func_data(program))
+            !matches!(
+                ctx.curr_func_data(program).inst_data(self.base()).kind(),
+                InstKind::Alloc
+            )
         };
         // let global_flag = is_get_elem_ptr_from_global(self, ctx.curr_func_data(program));
         // element type size
         let elem_ty_size = if global_flag {
-            ptr_elem_size(program.inst_data(self.base()).ty())
+            ptr_base_elem_size(program.inst_data(self.base()).ty())
         } else {
             // FIXME: maybe incorrect use of curr_func_data
-            ptr_elem_size(ctx.curr_func_data(program).inst_data(self.base()).ty())
+            ptr_base_elem_size(ctx.curr_func_data(program).inst_data(self.base()).ty())
         };
         // load index to register
         ctx.load_to_register(program, self.offset());
         // load element type size to register
-        ctx.load_imm(elem_ty_size as _);
+        ctx.load_imm(elem_ty_size as _, ctx.value_sz(program, self.offset()));
         // do multipication
         ctx.multiply();
 
@@ -212,14 +222,18 @@ impl GenerateAsm for GetElemPtr {
             ctx.add_op();
         } else if ptr_flag {
             // let pre_drifted_address = ctx.get_inst_offset(self.src()).unwrap();
-            if let Some(pre_drifted_address) = ctx.register_or_offset(self.base()) {
-                ctx.load_word_sp(pre_drifted_address as _);
+            if let Some(pre_drifted_address) = ctx.register_or_offset(program, self.base()) {
+                ctx.load_word_sp(
+                    pre_drifted_address as _,
+                    ctx.value_sz(program, self.base()),
+                    ctx.value_ty(program, self.base()).try_into().unwrap(),
+                );
             }
             ctx.add_op()
         } else {
             // let rel_base_address = ctx.get_inst_offset(self.src()).unwrap();
-            if let Some(rel_base_address) = ctx.register_or_offset(self.base()) {
-                ctx.load_imm(rel_base_address as _);
+            if let Some(rel_base_address) = ctx.register_or_offset(program, self.base()) {
+                ctx.load_imm(rel_base_address as _, Bit::b64);
             }
             // add to the base_address
             ctx.add_op();
@@ -227,7 +241,7 @@ impl GenerateAsm for GetElemPtr {
             ctx.add_sp();
         }
 
-        ctx.save_word_at_curr_inst();
+        ctx.save_word_at_curr_inst(program);
     }
 }
 
@@ -249,15 +263,18 @@ impl GenerateAsm for Call {
         let func_data = program.func_data(self.callee());
 
         // name of the function
-        let name = func_data.name().strip_prefix('@').unwrap();
+        let name = func_data.name();
 
         // move the 1st-8th parameters to the register
         for (i, &arg) in args[..8.min(arity)].iter().enumerate() {
-            use IntRegister::*;
-            let rd = Register::I(IReg(
-                Bit::b64,
-                IntRegister::try_from(x0 as u8 + i as u8).unwrap(),
-            ));
+            let rd = if ctx.value_ty(program, arg).is_f32() {
+                Register::float_arguments(i).with_size(ctx.value_sz(program, arg))
+            } else {
+                Register::I(IReg(
+                    ctx.value_sz(program, arg),
+                    IntRegister::try_from(IntRegister::x0 as u8 + i as u8).unwrap(),
+                ))
+            };
             ctx.load_to_para_register(program, arg, rd);
         }
 
@@ -275,12 +292,13 @@ impl GenerateAsm for Call {
             label: name.to_string(),
         });
 
-        let TypeKind::Function(_param_ty, ret_ty) = func_data.ret_ty().kind() else {
-            unreachable!()
-        };
+        let ret_ty = func_data.ret_ty();
         if !ret_ty.is_unit() {
-            ctx.alloc_ret_reg();
-            ctx.save_word_at_curr_inst();
+            ctx.alloc_ret_reg(
+                Bit::try_from(ret_ty.size()).unwrap(),
+                ret_ty.try_into().unwrap(),
+            );
+            ctx.save_word_at_curr_inst(program);
         }
     }
 }
@@ -320,9 +338,8 @@ impl GenerateAsm for Branch {
         true_args_and_params
             .chain(false_args_and_params)
             .for_each(|(&arg, &param)| {
-                eprint!("params:");
                 ctx.load_to_register(program, arg);
-                ctx.save_word_at_inst(param);
+                ctx.save_word_at_inst(program, param);
             });
         ctx.if_jump(self.t_target(), self.f_target(), program);
     }
@@ -342,7 +359,7 @@ impl GenerateAsm for Jump {
             .zip(ctx.bb_params(self.target(), program));
         args_and_params.for_each(|(&arg, &param)| {
             ctx.load_to_register(program, arg);
-            ctx.save_word_at_inst(param);
+            ctx.save_word_at_inst(program, param);
         });
         ctx.jump(self.target(), program);
     }
@@ -352,7 +369,9 @@ impl GenerateAsm for Return {
     fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
         if let Some(ret_val) = self.value() {
             ctx.load_to_register(program, ret_val);
-            ctx.ret();
+            let ret_ty = ctx.curr_func_data(program).ret_ty();
+            let ret_sz = Bit::try_from(ret_ty.size()).unwrap();
+            ctx.ret(ret_sz, ret_ty.try_into().unwrap());
         } else {
             ctx.void_ret();
         }
@@ -364,7 +383,15 @@ impl GenerateAsm for Binary {
         ctx.load_to_register(program, self.lhs());
         ctx.load_to_register(program, self.rhs());
         ctx.binary_op(self.op());
-        ctx.save_word_at_curr_inst();
+        ctx.save_word_at_curr_inst(program);
+    }
+}
+
+impl GenerateAsm for Cast {
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
+        ctx.load_to_register(program, self.src());
+        ctx.cast();
+        ctx.save_word_at_curr_inst(program);
     }
 }
 
@@ -382,23 +409,52 @@ impl GenerateAsm for Load {
         } else {
             is_ptr(self.src(), ctx.curr_func_data(program))
         };
+
+        let size = ctx.value_sz(program, ctx.curr_inst().unwrap());
+
         if global_flag {
             ctx.load_address(get_glob_var_name(self.src(), program));
-            ctx.load_from_address();
-            ctx.save_word_at_curr_inst();
+            ctx.load_from_address(
+                size,
+                ctx.curr_func_data(program)
+                    .inst_data(ctx.curr_inst().unwrap())
+                    .ty()
+                    .try_into()
+                    .unwrap(),
+            );
+            ctx.save_word_at_curr_inst(program);
         } else if ptr_flag {
             // let offset = ctx.get_inst_offset(self.src()).unwrap() as i32;
-            if let Some(offset) = ctx.register_or_offset(self.src()) {
-                ctx.load_word_sp(offset as _);
+            if let Some(offset) = ctx.register_or_offset(program, self.src()) {
+                ctx.load_word_sp(
+                    offset as _,
+                    ctx.value_sz(program, self.src()),
+                    ctx.value_ty(program, self.src()).try_into().unwrap(),
+                );
             }
-            ctx.load_from_address();
-            ctx.save_word_at_curr_inst();
+            ctx.load_from_address(
+                size,
+                ctx.curr_func_data(program)
+                    .inst_data(ctx.curr_inst().unwrap())
+                    .ty()
+                    .try_into()
+                    .unwrap(),
+            );
+            ctx.save_word_at_curr_inst(program);
         } else {
             // let offset = ctx.get_inst_offset(self.src()).unwrap() as i32;
-            if let Some(offset) = ctx.register_or_offset(self.src()) {
-                ctx.load_word_sp(offset as _);
+            if let Some(offset) = ctx.register_or_offset(program, self.src()) {
+                ctx.load_word_sp(
+                    offset as _,
+                    size,
+                    ctx.curr_func_data(program)
+                        .inst_data(ctx.curr_inst().unwrap())
+                        .ty()
+                        .try_into()
+                        .unwrap(),
+                );
             }
-            ctx.save_word_at_curr_inst();
+            ctx.save_word_at_curr_inst(program);
         }
     }
 }
@@ -433,7 +489,7 @@ impl GenerateAsm for Store {
                 _ => {
                     // store the value where it's located.
                     ctx.load_to_register(program, self.src());
-                    ctx.save_word_at_inst(self.dest());
+                    ctx.save_word_at_inst(program, self.dest());
                 }
             };
         }
@@ -448,47 +504,21 @@ impl GenerateAsm for Store {
 /// This instruction produce a i32 as instruction return value.
 impl GenerateAsm for Integer {
     /// Load a ingeter immediate to a register.
-    fn generate(&self, _program: &Program, ctx: &mut AsmGenContext) {
-        ctx.load_imm(self.value());
+    fn generate(&self, program: &Program, ctx: &mut AsmGenContext) {
+        let curr_inst = ctx.curr_inst().unwrap();
+        ctx.load_imm(self.value(), ctx.value_sz(program, curr_inst));
     }
 }
 
-/// also we remove the prefix '%'
 #[inline]
 fn get_glob_var_name(var: Inst, program: &Program) -> String {
     assert!(var.is_global());
-    program
-        .inst_data(var)
-        .name()
-        .clone()
-        .unwrap()
-        .strip_prefix('%')
-        .unwrap()
-        .to_string()
+    program.inst_data(var).name().unwrap().to_string()
 }
 
-// fn is_get_elem_ptr_from_global(inst: &values::GetElemPtr, func_data: &FunctionData) -> bool {
-//     if inst.src().is_global() {
-//         true
-//     } else if let InstKind::GetElemPtr(child_inst) = func_data.dfg().value(inst.src()).kind() {
-//         is_get_elem_ptr_from_global(child_inst, func_data)
-//     } else {
-//         false
-//     }
-// }
-
-fn dereference(ty: &Type) -> &Type {
+fn ptr_base_elem_size(ty: &Type) -> usize {
     use TypeKind::*;
-    if let Pointer(point_to) = ty.kind() {
-        dereference(point_to)
-    } else {
-        ty
-    }
-}
-
-fn ptr_elem_size(ty: &Type) -> usize {
-    use TypeKind::*;
-    let point_to = dereference(ty);
+    let point_to = ty.derefernce();
     match point_to.kind() {
         Array(elem_ty, _len) => elem_ty.size(),
         Int32 => 4,
@@ -496,7 +526,7 @@ fn ptr_elem_size(ty: &Type) -> usize {
     }
 }
 
-fn ptr_size(ty: &Type) -> usize {
+fn ptr_base_size(ty: &Type) -> usize {
     use TypeKind::*;
     let Pointer(point_to) = ty.kind() else {
         unreachable!();

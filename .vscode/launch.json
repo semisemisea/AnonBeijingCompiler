@@ -1,0 +1,36 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug executable 'soyo_compiler'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=soyo_compiler",
+                    "--package=soyo_compiler"
+                ]
+            },
+            "args": [
+                "-S",
+                "${input:pickDumpFile}",
+                "-o",
+                "temp.s"
+            ]
+        },
+    ],
+    "inputs": [
+        {
+            "id": "pickDumpFile",
+            "type": "command",
+            "command": "extension.commandvariable.file.pickFile",
+            "args": {
+                "description": "Pick a test case source file",
+            }
+        }
+    ]
+}

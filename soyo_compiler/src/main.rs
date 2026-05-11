@@ -104,7 +104,7 @@ fn write_file(path: &Path, buf: impl AsRef<[u8]>) {
 
 #[cfg(test)]
 mod test {
-    use log::{info, trace};
+    use log::{trace};
     use raana_ir::fmt::writer::Writer;
     use std::path::{Path, PathBuf};
 

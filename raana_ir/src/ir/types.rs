@@ -152,6 +152,24 @@ impl Type {
             _ => panic!("{self} is not an array"),
         }
     }
+
+    /// Return i32/f32 based on array type.
+    pub fn array_base_scalar_type(&self) -> Type {
+        match self.0.as_ref() {
+            TypeKind::Array(ty, _len) => return ty.array_base_scalar_type(),
+            TypeKind::Int32 | TypeKind::Float32 => return self.clone(),
+            _ => panic!("{self} is not an array"),
+        }
+    }
+
+    // total length of a flattened array.
+    pub fn array_flatten_length(&self) -> usize {
+        match self.0.as_ref() {
+            TypeKind::Array(ty, len) => len * ty.array_flatten_length(),
+            TypeKind::Int32 | TypeKind::Float32 => 1,
+            _ => panic!("{self} is not an array"),
+        }
+    }
 }
 
 #[cfg(test)]

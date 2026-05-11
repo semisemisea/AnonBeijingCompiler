@@ -1,9 +1,7 @@
-use std::num::NonZeroU32;
-
 use itertools::Itertools;
 
 use crate::ir::{
-    BasicBlockBuilders, LocalBuilder, Type,
+    BasicBlockBuilders, LocalBuilder,
     basic_block::{BasicBlock, BasicBlockArena, BasicBlockData},
     builder::ReplaceBuilder,
     function::{Function, FunctionArena, FunctionData},

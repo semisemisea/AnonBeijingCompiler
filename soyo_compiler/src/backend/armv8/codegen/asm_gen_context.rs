@@ -1115,7 +1115,7 @@ impl AsmGenContext {
         });
     }
 
-    pub fn cast(&mut self, inst: IrInst, program: &Program) {
+    pub fn cast(&mut self) {
         import_reg_and_inst!();
         let src = self.take_register();
         let src_ty = src.ty();

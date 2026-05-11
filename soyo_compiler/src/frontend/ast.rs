@@ -1,6 +1,5 @@
 use super::items;
 use crate::frontend::utils::{AstGenContext, Symbol, ToRaanaIR};
-use log::info;
 use raana_ir::ir::{arena::Arena, builder_trait::*, *};
 
 fn binary_requires_int(op: BinaryOp) -> bool {

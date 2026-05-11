@@ -5,6 +5,7 @@ pub struct DeadCodeElimination;
 pub struct UnreachableBasicBlock;
 pub struct JumpOnlyElimination;
 
+#[allow(dead_code)]
 const REMOVE_FLAG: bool = true;
 
 /// Mark and sweep algorithm
@@ -27,7 +28,7 @@ impl Pass for DeadCodeElimination {
 }
 
 // TODO: side-effet function rules.
-fn has_side_effect(func: Function) -> bool {
+fn has_side_effect(_func: Function) -> bool {
     true
 }
 
@@ -174,7 +175,7 @@ impl Pass for DeadPhiElimination {
             let bb = bb_allocator.search_id(i);
 
             for &index in unused_params_index.iter() {
-                let val = data.bb_data_mut(bb).params_mut().swap_remove(index);
+                let _val = data.bb_data_mut(bb).params_mut().swap_remove(index);
             }
 
             let jump_inst = data

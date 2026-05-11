@@ -60,7 +60,7 @@ pub trait Pass: Send + Sync {
     /// Compatibility for old code.
     /// Normally you should not !only! implement this function
     /// But you can implement both function at same time.
-    fn run_on(&self, data: &mut ArenaContext<'_>) {
+    fn run_on(&self, _data: &mut ArenaContext<'_>) {
         unimplemented!()
     }
 }

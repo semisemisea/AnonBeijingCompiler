@@ -11,6 +11,7 @@ pub enum Bit {
 }
 
 impl Bit {
+    #[allow(unused)]
     pub fn width(&self) -> u8 {
         match self {
             Bit::b128 => 128,
@@ -134,6 +135,7 @@ impl IReg {
         matches!(self.1, x0 | x1 | x2 | x3 | x4 | x5 | x6 | x7)
     }
 
+    #[allow(unused)]
     fn is_temp(&self) -> bool {
         use IntRegister::*;
         matches!(self.1, x9 | x10 | x11 | x12 | x13 | x14 | x15)
@@ -215,6 +217,7 @@ impl TryInto<RegisterType> for &Type {
 }
 
 impl Register {
+    #[allow(dead_code)]
     pub fn is_actual(&self) -> bool {
         match self {
             Register::I(reg) => reg.0 == Bit::b64,
@@ -276,6 +279,7 @@ impl Register {
         }
     }
 
+    #[allow(unused)]
     pub fn is_caller_saved(&self) -> bool {
         match self {
             Register::I(reg) => reg.is_caller_saved(),

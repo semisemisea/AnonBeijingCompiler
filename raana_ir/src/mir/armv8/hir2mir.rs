@@ -1,10 +1,10 @@
-use std::{collections::HashMap, sync::atomic::AtomicU32};
+use std::collections::HashMap;
 
-use super::{operand::Inst, prelude::*};
-use crate::mir::{
+use crate::mir::armv8::{
     instruction::{BasicBlock, Function, Program},
-    operand::{MemAddr, MirRegister},
+    operand::{Inst, MemAddr, Register, Size, Value},
 };
+use crate::mir::prelude::*;
 
 pub struct ArenaContext<'a> {
     program: &'a HirProgram,
@@ -33,29 +33,50 @@ impl Arena for ArenaContext<'_> {
 
 struct Query {
     vreg: u32,
-    map: HashMap<HirInst, MemAddr>,
+    value_map: HashMap<HirInst, Value>,
+    addr_map: HashMap<HirInst, MemAddr>,
 }
 
 impl Query {
     fn new() -> Query {
         Query {
-            vreg: 0,
-            map: HashMap::new(),
+            vreg: 65,
+            value_map: HashMap::new(),
+            addr_map: HashMap::new(),
         }
     }
 
-    fn new_vreg(&mut self) -> MirRegister {
-        let ret = MirRegister::Virtual(self.vreg);
+    fn new_vreg(&mut self) -> Register {
+        let ret = Register::new_virtual(self.vreg);
         self.vreg += 1;
         ret
     }
 
-    fn insert(&mut self, inst: HirInst, vreg: MemAddr) {
-        self.map.insert(inst, vreg);
+    fn bind_value(&mut self, hir_inst: HirInst, value: Value) {
+        self.value_map.insert(hir_inst, value);
     }
 
-    pub fn get(&self, k: &HirInst) -> MemAddr {
-        *self.map.get(k).unwrap()
+    fn bind_addr(&mut self, hir_inst: HirInst, addr: MemAddr) {
+        self.addr_map.insert(hir_inst, addr);
+    }
+
+    fn register(&mut self, inst: HirInst, data: &ArenaContext<'_>) {
+        if !can_produce_value(inst, data) {
+            return;
+        }
+        let ty_size = data.inst_data(inst).ty().size();
+        let vreg = self.new_vreg();
+        let addr = MemAddr::Base(vreg, Size::from(ty_size));
+
+        self.addr_map.insert(inst, addr);
+    }
+
+    pub fn get_addr(&self, hir_inst: HirInst) -> MemAddr {
+        *self.addr_map.get(&hir_inst).unwrap()
+    }
+
+    pub fn get_value(&self, hir_inst: HirInst) -> Value {
+        *self.value_map.get(&hir_inst).unwrap()
     }
 }
 
@@ -74,7 +95,7 @@ pub fn convert_program(p: &HirProgram) -> Program {
     }
     for &func in p.function_layout() {
         context.curr_func.replace(func);
-        convert_function(func, &context, &mut result);
+        convert_function(func, &context, &mut result, &mut q);
     }
     result
 }
@@ -151,33 +172,41 @@ fn convert_global_inst(inst: HirInst, ctx: &ArenaContext<'_>, p: &mut Program, q
     }
 }
 
-pub fn convert_function(func: HirFunction, ctx: &ArenaContext<'_>, p: &mut Program) {
+fn convert_function(func: HirFunction, ctx: &ArenaContext<'_>, p: &mut Program, q: &mut Query) {
     let mut mir_function = Function {
         name: ctx.func_data(func).name().to_string(),
         blocks: vec![],
         stack_size: 0,
     };
     for bb in ctx.program.func_data(func).layout().basicblocks() {
-        convert_basic_block(bb, ctx, &mut mir_function);
+        convert_basic_block(bb, ctx, &mut mir_function, q);
     }
     p.funcs.push(mir_function);
 }
 
-pub fn convert_basic_block(
+fn convert_basic_block(
     layout: &HirBasicBlockLayout,
     ctx: &ArenaContext<'_>,
     func: &mut Function,
+    q: &mut Query,
 ) {
     let mut bb = BasicBlock {
         name: ctx.bb_data(layout.bb()).name().to_string(),
         insts: vec![],
     };
     for &inst in layout.insts() {
-        convert_local_inst(inst, ctx, &mut bb);
+        convert_local_inst(inst, ctx, &mut bb, q);
     }
+    func.blocks.push(bb);
 }
 
-pub fn convert_local_inst(inst: HirInst, ctx: &ArenaContext<'_>, bb: &mut BasicBlock) {
+pub fn convert_local_inst(
+    inst: HirInst,
+    ctx: &ArenaContext<'_>,
+    bb: &mut BasicBlock,
+    q: &mut Query,
+) {
+    q.register(inst, ctx);
     match ctx.inst_data(inst).kind() {
         HirInstKind::Aggregate(..)
         | HirInstKind::BlockArgRef(..)
@@ -190,7 +219,7 @@ pub fn convert_local_inst(inst: HirInst, ctx: &ArenaContext<'_>, bb: &mut BasicB
         // For Alloc instruction, we don't have to do anything.
         HirInstKind::Alloc => {}
         // Generate Binary Instruction
-        HirInstKind::Binary(binary) => convert_binary(binary, ctx, bb),
+        HirInstKind::Binary(binary) => convert_binary(binary, ctx, bb, q, q.get(inst)),
         HirInstKind::Jump(jump) => todo!(),
         HirInstKind::Branch(branch) => todo!(),
         HirInstKind::Cast(cast) => todo!(),
@@ -203,13 +232,27 @@ pub fn convert_local_inst(inst: HirInst, ctx: &ArenaContext<'_>, bb: &mut BasicB
     }
 }
 
-fn convert_binary(binary: &Binary, ctx: &ArenaContext<'_>, bb: &mut BasicBlock) {
+fn convert_binary(
+    binary: &Binary,
+    ctx: &ArenaContext<'_>,
+    bb: &mut BasicBlock,
+    q: &mut Query,
+    dst: MemAddr,
+) {
+    // INFO: Binary could only accept scalar type.
+    // So we hardcode 32bit here.
+    let lhs = Register(q.get(binary.lhs()));
+    let rhs = Register(q.get(binary.rhs()));
+    let dst = Register(dst);
     match binary.op() {
-        BinaryOp::Add => todo!(),
-        BinaryOp::Sub => todo!(),
-        BinaryOp::Mul => todo!(),
-        BinaryOp::Div => todo!(),
-        BinaryOp::Rem => todo!(),
+        BinaryOp::Add => bb.insts.push(Inst::add { dst, lhs, rhs }),
+        BinaryOp::Sub => bb.insts.push(Inst::sub { dst, lhs, rhs }),
+        BinaryOp::Mul => bb.insts.push(Inst::mul { dst, lhs, rhs }),
+        BinaryOp::Div => bb.insts.push(Inst::sdiv { dst, lhs, rhs }),
+        BinaryOp::Rem => {
+            let tmp = Memory(MemAddr::Base(q.new_vreg()));
+            bb.insts.push(Inst::sdiv { dst, lhs, rhs });
+        }
         BinaryOp::NotEq => todo!(),
         BinaryOp::Eq => todo!(),
         BinaryOp::Gt => todo!(),
@@ -223,4 +266,22 @@ fn convert_binary(binary: &Binary, ctx: &ArenaContext<'_>, bb: &mut BasicBlock) 
         BinaryOp::Shr => todo!(),
         BinaryOp::Sar => todo!(),
     }
+}
+
+fn can_produce_value(val: HirInst, data: &ArenaContext<'_>) -> bool {
+    if data.inst_data(val).ty().size() == 0 {
+        return false;
+    }
+
+    matches!(
+        data.inst_data(val).kind(),
+        InstKind::FuncArgRef(..)
+            | InstKind::BlockArgRef(..)
+            | InstKind::Alloc
+            | InstKind::Load(..)
+            | InstKind::GetPtr(..)
+            | InstKind::GetElemPtr(..)
+            | InstKind::Binary(..)
+            | InstKind::Call(..)
+    )
 }

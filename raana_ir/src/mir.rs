@@ -1,6 +1,4 @@
-mod hir2mir;
-mod instruction;
-mod operand;
+mod armv8;
 
 pub mod prelude {
     pub use crate::ir::Program as HirProgram;

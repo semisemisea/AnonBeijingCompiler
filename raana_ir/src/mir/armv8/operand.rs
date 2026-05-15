@@ -1,25 +1,29 @@
-pub enum Operand {
-    Register(MirRegister, Size),
-    ImmInt(i32),
-    Memory(MemAddr),
+use crate::mir::prelude::*;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Register(u32);
+
+impl Register {
+    pub fn new_virtual(id: u32) -> Register {
+        assert!(id > 64);
+        Register(id)
+    }
+
+    pub fn new_physics(id: u32) -> Register {
+        assert!(id <= 64);
+        Register(id)
+    }
+
+    pub fn is_virtual(&self) -> bool {
+        self.0 > 64
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum RegisterType {
-    Int,
-    Float,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct PhysRegister {
-    rtype: RegisterType,
-    id: u8,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum MirRegister {
-    Virtual(u32),
-    Physics(PhysRegister),
+pub enum Value {
+    Register(Register, Size),
+    I32(i32),
+    F32(f32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -28,12 +32,23 @@ pub enum Size {
     B64,
 }
 
-#[derive(Debug, Clone, Copy)]
+impl From<usize> for Size {
+    fn from(t: usize) -> Size {
+        match t {
+            32 => Self::B32,
+            64 => Self::B64,
+            _ => panic!("Not supported bit!"),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
 pub enum MemAddr {
-    Base(MirRegister, Size),
-    BaseOffset(MirRegister, i32),
-    BaseIndexShift(MirRegister, MirRegister, u8),
+    Base(Register, Size),
+    BaseOffset(Register, i32),
+    BaseIndexShift(Register, Register, u8),
     StackSlot(u32),
+    Global(HirInst),
 }
 
 pub enum Cond {
@@ -50,130 +65,130 @@ pub enum Cond {
 #[allow(non_camel_case_types)]
 pub enum Inst {
     mov {
-        src: Operand,
-        dst: Operand,
+        src: Register,
+        dst: Value,
     },
     fmov {
-        src: Operand,
-        dst: Operand,
+        src: Value,
+        dst: Value,
     },
     itf {
-        dst: Operand,
-        src: Operand,
+        dst: Value,
+        src: Value,
     },
     fti {
-        dst: Operand,
-        src: Operand,
+        dst: Value,
+        src: Value,
     },
 
     /// add dst, lhs, rhs
     add {
-        dst: Operand,
-        lhs: Operand,
-        rhs: Operand,
+        dst: Register,
+        lhs: Register,
+        rhs: Value,
     },
     /// sub dst, lhs, rhs
     sub {
-        dst: Operand,
-        lhs: Operand,
-        rhs: Operand,
+        dst: Value,
+        lhs: Value,
+        rhs: Value,
     },
     /// mul dst, lhs, rhs
     mul {
-        dst: Operand,
-        lhs: Operand,
-        rhs: Operand,
+        dst: Value,
+        lhs: Value,
+        rhs: Value,
     },
     /// sdiv dst, lhs, rhs
     sdiv {
-        dst: Operand,
-        lhs: Operand,
-        rhs: Operand,
+        dst: Value,
+        lhs: Value,
+        rhs: Value,
     },
 
     /// msub dst, sub, lhs, rhs  dst = sub - (lhs * rhs)
     msub {
-        dst: Operand,
-        sub: Operand,
-        lhs: Operand,
-        rhs: Operand,
+        dst: Value,
+        sub: Value,
+        lhs: Value,
+        rhs: Value,
     },
 
     fadd {
-        dst: Operand,
-        lhs: Operand,
-        rhs: Operand,
+        dst: Value,
+        lhs: Value,
+        rhs: Value,
     },
     fsub {
-        dst: Operand,
-        lhs: Operand,
-        rhs: Operand,
+        dst: Value,
+        lhs: Value,
+        rhs: Value,
     },
     fmul {
-        dst: Operand,
-        lhs: Operand,
-        rhs: Operand,
+        dst: Value,
+        lhs: Value,
+        rhs: Value,
     },
     fdiv {
-        dst: Operand,
-        lhs: Operand,
-        rhs: Operand,
+        dst: Value,
+        lhs: Value,
+        rhs: Value,
     },
 
     /// and dst, lhs, rhs
     and {
-        dst: Operand,
-        lhs: Operand,
-        rhs: Operand,
+        dst: Value,
+        lhs: Value,
+        rhs: Value,
     },
 
     /// orr dst, lhs, rhs
     orr {
-        dst: Operand,
-        lhs: Operand,
-        rhs: Operand,
+        dst: Value,
+        lhs: Value,
+        rhs: Value,
     },
     eor {
-        dst: Operand,
-        lhs: Operand,
-        rhs: Operand,
+        dst: Value,
+        lhs: Value,
+        rhs: Value,
     },
     lsl {
-        dst: Operand,
-        lhs: Operand,
-        rhs: Operand,
+        dst: Value,
+        lhs: Value,
+        rhs: Value,
     },
     asr {
-        dst: Operand,
-        lhs: Operand,
-        rhs: Operand,
+        dst: Value,
+        lhs: Value,
+        rhs: Value,
     },
 
     /// 比较指令 (cmp lhs, rhs) - 影响全局 NZCV 标志位，没有 dst！
     cmp {
-        lhs: Operand,
-        rhs: Operand,
+        lhs: Value,
+        rhs: Value,
     },
     /// 浮点比较指令 (fcmp lhs, rhs)
     fcmp {
-        lhs: Operand,
-        rhs: Operand,
+        lhs: Value,
+        rhs: Value,
     },
     /// 根据刚刚的比较结果，设置 dst 为 1 或 0 (cset dst, cond)
     /// SysY 常见模式: a < b -> Cmp(a, b), Cset(dst, Lt)
     cset {
-        dst: Operand,
+        dst: Value,
         cond: Cond,
     },
 
     /// 加载 (ldr dst, addr) -> 如果 dst 是 float 就是 ldr sX，否则 ldr wX/xX
     ldr {
-        dst: Operand,
+        dst: Value,
         addr: MemAddr,
     },
     /// 存储 (str src, addr)
     str {
-        src: Operand,
+        src: Value,
         addr: MemAddr,
     },
 
@@ -190,7 +205,7 @@ pub enum Inst {
     /// 以便寄存器分配器知道它们会被覆盖！
     call {
         func: String,
-        arg_regs: Vec<PhysRegister>,
+        arg_regs: Vec<Register>,
     },
     /// ret
     ret,
@@ -200,19 +215,19 @@ pub enum Inst {
     // ==========================================
     /// 解决 Phi 节点和带参数 Jump 的相互覆盖问题！
     /// 寄存器分配器结束后，将其通过“拓扑排序”展开为安全的单步 Mov。
-    ParallelCopy(Vec<(Operand, Operand)>),
+    ParallelCopy(Vec<(Value, Value)>),
 
     /// 加载全局变量的绝对地址 (adrp + add)
     /// ARMv8 要求分两步加载全局变量地址，在 MIR 中可以先用一条 Pseudo 指令表示，
     /// 等到最后生成汇编时再展开成两句。
     LoadGlobalAddr {
-        dst: Operand,
+        dst: Value,
         symbol: String,
     },
 
     /// 加载超过 12 bit 限制的大立即数 (movz + movk... 或 ldr =, 等)
     LoadLargeImm {
-        dst: Operand,
+        dst: Value,
         imm: i32,
     },
     GlobalInitI32 {

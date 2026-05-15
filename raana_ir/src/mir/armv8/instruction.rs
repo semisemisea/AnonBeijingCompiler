@@ -1,4 +1,4 @@
-use crate::mir::operand::Inst;
+use crate::mir::armv8::operand::Inst;
 
 pub struct BasicBlock {
     pub name: String,

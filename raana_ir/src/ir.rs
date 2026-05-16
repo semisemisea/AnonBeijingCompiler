@@ -1,10 +1,10 @@
 pub mod arena;
-pub(crate) mod basic_block;
+pub mod basic_block;
 pub(crate) mod builder;
 pub(crate) mod function;
-pub(crate) mod inst_kind;
+pub mod inst_kind;
 pub(crate) mod instruction;
-pub(crate) mod layout;
+pub mod layout;
 pub(crate) mod program;
 pub(crate) mod types;
 

@@ -2,3 +2,7 @@
 name = "anon_armv8"
 version = "0.1.0"
 edition = "2024"
+
+[dependencies]
+num_enum = "0.7.6"
+raana_ir = { path = "../raana_ir/" }

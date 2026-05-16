@@ -1,4 +1,4 @@
-use crate::mir::armv8::operand::Inst;
+use crate::armv8::operand::{Inst, InstKind};
 
 pub struct BasicBlock {
     pub name: String,
@@ -12,6 +12,6 @@ pub struct Function {
 }
 
 pub struct Program {
-    pub global: Vec<Inst>,
+    pub global: Vec<InstKind>,
     pub funcs: Vec<Function>,
 }

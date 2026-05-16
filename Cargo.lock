@@ -14,6 +14,10 @@ dependencies = [
 [[package]]
 name = "anon_armv8"
 version = "0.1.0"
+dependencies = [
+ "num_enum",
+ "raana_ir",
+]
 
 [[package]]
 name = "anstream"
@@ -649,6 +653,7 @@ dependencies = [
  "log",
  "num_enum",
  "raana_ir",
+ "taki_mir",
 ]
 
 [[package]]
@@ -683,6 +688,9 @@ dependencies = [
 [[package]]
 name = "taki_mir"
 version = "0.1.0"
+dependencies = [
+ "raana_ir",
+]
 
 [[package]]
 name = "term"

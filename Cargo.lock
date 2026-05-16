@@ -12,6 +12,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "anon_armv8"
+version = "0.1.0"
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -675,6 +679,10 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "taki_mir"
+version = "0.1.0"
 
 [[package]]
 name = "term"

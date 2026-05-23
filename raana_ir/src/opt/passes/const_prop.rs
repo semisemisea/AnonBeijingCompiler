@@ -344,10 +344,7 @@ fn process_instruction(
         | InstKind::GlobalAlloc(..) => unreachable!(),
         InstKind::Store(..) => None,
         left => match left {
-            InstKind::GetPtr(..)
-            | InstKind::GetElemPtr(..)
-            | InstKind::Load(..)
-            | InstKind::Alloc => value_status_map
+            InstKind::GetElemPtr(..) | InstKind::Load(..) | InstKind::Alloc => value_status_map
                 .insert_or_merge(inst, VariableStatus::new_variable())
                 .then_some(ret_with!(inst)),
             InstKind::Binary(binary) => {

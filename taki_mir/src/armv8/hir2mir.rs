@@ -230,7 +230,6 @@ fn convert_local_inst(inst: HirInst, ctx: &ArenaContext<'_>, bb: &mut BasicBlock
         }
         HirInstKind::Return(ret) => todo!(),
         HirInstKind::GetElemPtr(get_elem_ptr) => todo!(),
-        HirInstKind::GetPtr(get_ptr) => todo!(),
         HirInstKind::Store(store) => todo!(),
         HirInstKind::Load(load) => todo!(),
         HirInstKind::Call(call) => todo!(),
@@ -311,7 +310,6 @@ fn can_produce_value(val: HirInst, data: &ArenaContext<'_>) -> bool {
             | HirInstKind::Cast(..)
             | HirInstKind::Alloc
             | HirInstKind::Load(..)
-            | HirInstKind::GetPtr(..)
             | HirInstKind::GetElemPtr(..)
             | HirInstKind::Binary(..)
             | HirInstKind::Call(..)

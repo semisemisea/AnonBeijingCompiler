@@ -2,11 +2,9 @@ use clap::Parser;
 use raana_ir::fmt::writer::Writer;
 use std::path::Path;
 
-use crate::backend::armv8::codegen::asm_gen_context::AsmGenContext;
 use crate::frontend::utils::AstGenContext;
 use frontend::utils::ToRaanaIR;
 
-mod backend;
 mod cli;
 mod context;
 mod frontend;
@@ -86,14 +84,8 @@ fn dump_ir(program: &raana_ir::ir::Program) -> String {
     writer.finish()
 }
 
-fn dump_asm(program: &raana_ir::ir::Program) -> String {
-    let codegen_ctx = AsmGenContext::new();
-    let insts = codegen_ctx.generate(program);
-    insts
-        .iter()
-        .map(|inst| inst.to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
+fn dump_asm(_program: &raana_ir::ir::Program) -> String {
+    todo!()
 }
 
 fn write_file(path: &Path, buf: impl AsRef<[u8]>) {

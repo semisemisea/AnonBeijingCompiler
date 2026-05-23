@@ -1196,7 +1196,7 @@ impl ToRaanaIR for items::FuncCall {
                 let arg = ctx.pop_val().unwrap();
                 let arg = if ctx.is_pointer_to_array(arg) {
                     let zero = ctx.new_local_value().integer(0);
-                    let get_elem_ptr = ctx.new_local_value().get_elem_ptr(arg, zero);
+                    let get_elem_ptr = ctx.new_local_value().get_elem_ptr(arg, vec![zero]);
                     ctx.push_inst(get_elem_ptr);
                     get_elem_ptr
                 } else {
@@ -1263,7 +1263,7 @@ impl ToRaanaIR for items::PrimaryExp {
                 }
                 // visiting an array
                 else {
-                    let offset = l_val
+                    let offsets = l_val
                         .index
                         .iter()
                         .map(|x| {
@@ -1273,17 +1273,14 @@ impl ToRaanaIR for items::PrimaryExp {
                         .collect::<Vec<_>>();
                     match ctx.get_symbol(&l_val.ident).unwrap() {
                         Symbol::Constant(array) | Symbol::Variable(array) => {
-                            let get_from = offset.iter().fold(array, |get_from, &index| {
-                                let inst = if ctx.is_pointer_to_array(get_from) {
-                                    ctx.new_local_value().get_elem_ptr(get_from, index)
-                                } else {
-                                    let load = ctx.new_local_value().load(get_from);
-                                    ctx.push_inst(load);
-                                    ctx.new_local_value().get_ptr(load, index)
-                                };
-                                ctx.push_inst(inst);
-                                inst
-                            });
+                            let get_from = if ctx.is_pointer_to_array(array) {
+                                let mut gep_offset = vec![ctx.new_local_value().integer(0)];
+                                gep_offset.extend(offsets);
+                                ctx.new_local_value().get_elem_ptr(array, gep_offset)
+                            } else {
+                                ctx.new_local_value().get_elem_ptr(array, offsets)
+                            };
+                            ctx.push_inst(get_from);
                             if ctx.is_pointer_to_array(get_from) {
                                 ctx.push_val(get_from);
                             } else {
@@ -1361,17 +1358,15 @@ impl ToRaanaIR for items::LVal {
                             ctx.pop_val().unwrap()
                         })
                         .collect::<Vec<_>>();
-                    indices.iter().fold(p_val, |get_from, &offset| {
-                        let p = if ctx.is_pointer_to_array(get_from) {
-                            ctx.new_local_value().get_elem_ptr(get_from, offset)
-                        } else {
-                            let n_get_from = ctx.new_local_value().load(get_from);
-                            ctx.push_inst(n_get_from);
-                            ctx.new_local_value().get_ptr(n_get_from, offset)
-                        };
-                        ctx.push_inst(p);
-                        p
-                    })
+                    let get = if ctx.is_pointer_to_array(p_val) {
+                        let mut gep_offsets = vec![ctx.new_local_value().integer(0)];
+                        gep_offsets.extend(indices);
+                        ctx.new_local_value().get_elem_ptr(p_val, gep_offsets)
+                    } else {
+                        ctx.new_local_value().get_elem_ptr(p_val, indices)
+                    };
+                    ctx.push_inst(get);
+                    get
                 }
             }
             Symbol::Callable(func_handle) => {

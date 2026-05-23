@@ -122,6 +122,21 @@ impl Type {
         self.is_i32() || self.is_f32()
     }
 
+    pub fn is_pointer(&self) -> bool {
+        matches!(self.0.as_ref(), TypeKind::Pointer(..))
+    }
+
+    pub fn is_array(&self) -> bool {
+        matches!(self.0.as_ref(), TypeKind::Array(..))
+    }
+
+    pub fn get_array_info(&self) -> (Type, usize) {
+        match self.0.as_ref() {
+            TypeKind::Array(base, len) => (base.clone(), *len),
+            _ => panic!("{self} is not an array"),
+        }
+    }
+
     pub fn is_unit(&self) -> bool {
         matches!(self.0.as_ref(), TypeKind::Unit)
     }
@@ -142,6 +157,10 @@ impl Type {
             TypeKind::Pointer(base) => base.clone(),
             _ => panic!("{self} is not a pointer."),
         }
+    }
+
+    pub fn reference(&self) -> Type {
+        Type::get_pointer(self.clone())
     }
 
     /// If it is an array, then return its element's type.

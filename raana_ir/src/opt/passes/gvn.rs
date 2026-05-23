@@ -60,13 +60,9 @@ enum InstType {
         lhs: InstNumber,
         rhs: InstNumber,
     },
-    GetPtr {
-        source: InstNumber,
-        index: InstNumber,
-    },
     GetElemPtr {
         source: InstNumber,
-        index: InstNumber,
+        index: Vec<InstNumber>,
     },
     // Call can also be seen as the same in certain condition.
     // This can be identified through:
@@ -124,13 +120,13 @@ impl InstType {
             | InstKind::ZeroInit => Some(Self::Var(val_id.check_or_alloc_id_same(value))),
             InstKind::GlobalAlloc(_global_alloc) => unreachable!(),
             InstKind::Store(_store) => None,
-            InstKind::GetPtr(get_ptr) => Some(Self::GetPtr {
-                source: val_id.check_or_alloc_id_same(get_ptr.base()),
-                index: val_id.check_or_alloc_id_same(get_ptr.offset()),
-            }),
             InstKind::GetElemPtr(get_elem_ptr) => Some(Self::GetElemPtr {
                 source: val_id.check_or_alloc_id_same(get_elem_ptr.base()),
-                index: val_id.check_or_alloc_id_same(get_elem_ptr.offset()),
+                index: get_elem_ptr
+                    .offsets()
+                    .iter()
+                    .map(|&inst| val_id.check_or_alloc_id_same(inst))
+                    .collect(),
             }),
             InstKind::Binary(binary) => {
                 let lhs = val_id.check_or_alloc_id_same(binary.lhs());

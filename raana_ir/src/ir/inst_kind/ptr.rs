@@ -7,7 +7,7 @@ use crate::ir::{
 #[derive(Debug, Clone)]
 pub struct GetElemPtr {
     base: Inst,
-    offset: Inst,
+    offsets: Vec<Inst>,
 }
 
 impl GetElemPtr {
@@ -15,31 +15,11 @@ impl GetElemPtr {
         self.base
     }
 
-    pub fn offset(&self) -> Inst {
-        self.offset
+    pub fn offsets(&self) -> &[Inst] {
+        &self.offsets
     }
 
-    pub fn new_data(base: Inst, offset: Inst, ty: Type) -> InstData {
-        InstData::new(ty, InstKind::GetElemPtr(GetElemPtr { base, offset }))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct GetPtr {
-    base: Inst,
-    offset: Inst,
-}
-
-impl GetPtr {
-    pub fn base(&self) -> Inst {
-        self.base
-    }
-
-    pub fn offset(&self) -> Inst {
-        self.offset
-    }
-
-    pub fn new_data(base: Inst, offset: Inst, ty: Type) -> InstData {
-        InstData::new(ty, InstKind::GetPtr(GetPtr { base, offset }))
+    pub fn new_data(base: Inst, offsets: Vec<Inst>, ty: Type) -> InstData {
+        InstData::new(ty, InstKind::GetElemPtr(GetElemPtr { base, offsets }))
     }
 }

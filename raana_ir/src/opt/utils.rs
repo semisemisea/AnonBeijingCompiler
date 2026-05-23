@@ -180,16 +180,19 @@ fn visit_and_replace_single(data: &mut ArenaContext<'_>, used_by: Inst, rep: Ins
                 data.replace_inst_with(used_by).store(rep_with, dest);
             }
         }
-        InstKind::GetPtr(get_ptr) => {
-            if get_ptr.offset() == rep {
-                let src = get_ptr.base();
-                data.replace_inst_with(used_by).get_ptr(src, rep_with);
-            }
-        }
         InstKind::GetElemPtr(get_elem_ptr) => {
-            if get_elem_ptr.offset() == rep {
-                let src = get_elem_ptr.base();
-                data.replace_inst_with(used_by).get_elem_ptr(src, rep_with);
+            if get_elem_ptr.offsets().contains(&rep) {
+                let mut rep_with_vec = Vec::with_capacity(get_elem_ptr.offsets().len());
+                for &offset in get_elem_ptr.offsets() {
+                    if offset == rep {
+                        rep_with_vec.push(rep_with);
+                    } else {
+                        rep_with_vec.push(offset);
+                    }
+                }
+                let base = get_elem_ptr.base();
+                data.replace_inst_with(used_by)
+                    .get_elem_ptr(base, rep_with_vec);
             }
         }
         InstKind::Binary(binary) => {

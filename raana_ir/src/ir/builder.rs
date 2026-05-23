@@ -4,7 +4,7 @@ use crate::ir::{
     basic_block::{BasicBlock, BasicBlockData},
     function::Function,
     inst_kind::{
-        Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Cast, Float, GetElemPtr, GetPtr,
+        Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Cast, Float, GetElemPtr,
         GlobalAlloc, InstKind, Integer, Jump, Load, Return, Store,
     },
     instruction::{Inst, InstData},
@@ -114,19 +114,27 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
         self.insert_inst(Cast::new_data(src, ty))
     }
 
-    /// panic is base is not a pointer type.
-    fn get_ptr(&mut self, base: Inst, offset: Inst) -> Inst {
-        self.insert_inst(GetPtr::new_data(base, offset, self.inst_type(base)))
-    }
-
     /// panic if base is not a array type.
-    fn get_elem_ptr(&mut self, base: Inst, offset: Inst) -> Inst {
-        self.insert_inst(GetElemPtr::new_data(
-            base,
-            offset,
-            // must be a pointer to an array.
-            Type::get_pointer(self.inst_type(base).derefernce().get_array_elem_ty()),
-        ))
+    fn get_elem_ptr(&mut self, base: Inst, offsets: Vec<Inst>) -> Inst {
+        offsets.iter().enumerate().for_each(|(i, &inst)| {
+            assert!(
+                self.inst_type(inst).is_i32(),
+                "`offsets[{i}]`: {inst} should all be integer but receive {}",
+                self.inst_type(inst)
+            )
+        });
+        // Each offset traverses one level in the type tree:
+        // pointer → deref, array → get elem. After all offsets, wrap in pointer.
+        let result_ty = (0..offsets.len())
+            .fold(self.inst_type(base), |ty, _i| {
+                if ty.is_pointer() {
+                    ty.derefernce()
+                } else {
+                    ty.get_array_info().0
+                }
+            })
+            .reference();
+        self.insert_inst(GetElemPtr::new_data(base, offsets, result_ty))
     }
 
     fn ret(&mut self, value: Option<Inst>) -> Inst {

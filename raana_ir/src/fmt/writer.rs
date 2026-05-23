@@ -8,7 +8,7 @@ use crate::ir::BasicBlock;
 use crate::ir::{
     Aggregate, Function, FunctionData, InstKind, Program, Type,
     arena::Arena,
-    inst_kind::{Binary, Branch, Call, Cast, GetElemPtr, GetPtr, Jump, Load, Return, Store},
+    inst_kind::{Binary, Branch, Call, Cast, GetElemPtr, Jump, Load, Return, Store},
     instruction::{Inst, InstData},
     layout::BasicBlockLayout,
 };
@@ -272,8 +272,9 @@ impl Writer<'_> {
             InstKind::Branch(branch) => self.visit_branch(branch),
             InstKind::Cast(cast) => self.visit_cast(cast, data.ty()),
             InstKind::Call(call) => self.visit_call(call),
-            InstKind::GetElemPtr(get_elem_ptr) => self.visit_get_elem_ptr(get_elem_ptr),
-            InstKind::GetPtr(get_ptr) => self.visit_get_ptr(get_ptr),
+            InstKind::GetElemPtr(get_elem_ptr) => {
+                self.visit_get_elem_ptr(get_elem_ptr, data.ty().clone())
+            }
             InstKind::Jump(jump) => self.visit_jump(jump),
             InstKind::Load(load) => self.visit_load(load),
             InstKind::Return(ret) => self.visit_return(ret),
@@ -367,33 +368,26 @@ impl Writer<'_> {
         write!(self.buffer, ">")
     }
 
-    fn visit_get_elem_ptr(&mut self, get_elem_ptr: &GetElemPtr) -> std::fmt::Result {
-        let base_ty = self
-            .arena
-            .inst_data(get_elem_ptr.base())
-            .ty()
-            .derefernce()
-            .get_array_elem_ty();
+    fn visit_get_elem_ptr(&mut self, get_elem_ptr: &GetElemPtr, ty: Type) -> std::fmt::Result {
         write!(
             self.buffer,
-            "getelemptr {}, {} <type = {}, size = {}>",
-            get_name!(self, get_elem_ptr.base()),
-            get_name!(self, get_elem_ptr.offset()),
-            base_ty,
-            base_ty.size()
-        )
-    }
-
-    fn visit_get_ptr(&mut self, get_ptr: &GetPtr) -> std::fmt::Result {
-        let base_ty = self.arena.inst_data(get_ptr.base()).ty().derefernce();
-        write!(
-            self.buffer,
-            "getptr {}, {} <type = {}, size = {}>",
-            get_name!(self, get_ptr.base()),
-            get_name!(self, get_ptr.offset()),
-            base_ty,
-            base_ty.size()
-        )
+            "getelemptr {}, ",
+            get_name!(self, get_elem_ptr.base())
+        )?;
+        let Some((&last, rest)) = get_elem_ptr.offsets().split_last() else {
+            unreachable!()
+        };
+        if !rest.is_empty() {
+            write!(self.buffer, "(")?;
+        }
+        for &inst in rest {
+            write!(self.buffer, "{}, ", get_name!(self, inst))?;
+        }
+        write!(self.buffer, "{}", get_name!(self, last))?;
+        if !rest.is_empty() {
+            write!(self.buffer, ")")?;
+        }
+        write!(self.buffer, " <type = {}, size = {}>", ty, ty.size())
     }
 
     fn visit_jump(&mut self, jump: &Jump) -> std::fmt::Result {

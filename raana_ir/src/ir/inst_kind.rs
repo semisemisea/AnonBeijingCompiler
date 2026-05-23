@@ -22,7 +22,6 @@ pub use cast::Cast;
 pub use global_alloc::GlobalAlloc;
 pub use jump::Jump;
 pub use ptr::GetElemPtr;
-pub use ptr::GetPtr;
 pub use r3turn::Return;
 pub use scalar::Float;
 pub use scalar::Integer;
@@ -44,7 +43,6 @@ pub enum InstKind {
     Cast(Cast),
     Return(Return),
     GetElemPtr(GetElemPtr),
-    GetPtr(GetPtr),
     Alloc,
     GlobalAlloc(GlobalAlloc),
     Store(Store),
@@ -118,9 +116,12 @@ impl Iterator for InstUsage<'_> {
                 }
             }
             InstKind::GetElemPtr(get_elem_ptr) => {
-                field_use!(get_elem_ptr.base(), get_elem_ptr.offset())
+                if cur_index == 0 {
+                    Some(get_elem_ptr.base())
+                } else {
+                    get_elem_ptr.offsets().get(cur_index - 1).copied()
+                }
             }
-            InstKind::GetPtr(get_ptr) => field_use!(get_ptr.base(), get_ptr.offset()),
             InstKind::GlobalAlloc(global_alloc) => field_use!(global_alloc.init()),
             InstKind::Store(store) => field_use!(store.src(), store.dest()),
             InstKind::Load(load) => field_use!(load.src()),

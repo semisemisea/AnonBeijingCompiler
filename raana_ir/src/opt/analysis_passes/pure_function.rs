@@ -45,11 +45,6 @@ pub fn is_pure_function(program: &Program, func: Function) -> bool {
                         return false;
                     }
                 }
-                InstKind::GetPtr(gp) => {
-                    if gp.base().is_global() {
-                        return false;
-                    }
-                }
                 _ => {}
             }
         }

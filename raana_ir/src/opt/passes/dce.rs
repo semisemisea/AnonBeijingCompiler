@@ -49,7 +49,6 @@ fn is_critical(value: Inst, data: &FunctionData) -> bool {
         | InstKind::Float(..)
         | InstKind::Alloc
         | InstKind::Load(..)
-        | InstKind::GetPtr(..)
         | InstKind::GetElemPtr(..)
         | InstKind::Binary(..) => false,
         // rdf is not ready
@@ -109,13 +108,12 @@ impl DeadCodeElimination {
                 InstKind::Load(load) => {
                     mark_live!(load.src());
                 }
-                InstKind::GetPtr(get_ptr) => {
-                    mark_live!(get_ptr.base());
-                    mark_live!(get_ptr.offset());
-                }
                 InstKind::GetElemPtr(get_elem_ptr) => {
                     mark_live!(get_elem_ptr.base());
-                    mark_live!(get_elem_ptr.offset());
+                    get_elem_ptr
+                        .offsets()
+                        .iter()
+                        .for_each(|&inst| mark_live!(inst));
                 }
                 InstKind::Binary(binary) => {
                     mark_live!(binary.lhs());

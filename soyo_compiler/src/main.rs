@@ -33,9 +33,6 @@ fn main() {
         pass_manager.run_passes(&mut program);
     }
 
-    let mir_program = taki_mir::armv8::hir2mir::convert_program(&program);
-    let _ = mir_program;
-
     let emit = if args.emit.is_empty() {
         vec![if args.assembly_only {
             cli::EmitOption::Asm
@@ -46,9 +43,15 @@ fn main() {
         args.emit
     };
     let needs_ir = emit.contains(&cli::EmitOption::Ir);
+    let needs_llvm = emit.contains(&cli::EmitOption::Llvm);
     let needs_asm = emit.contains(&cli::EmitOption::Asm);
     let ir = if needs_ir {
         Some(dump_ir(&program))
+    } else {
+        None
+    };
+    let llvm = if needs_llvm {
+        Some(dump_llvm(&program))
     } else {
         None
     };
@@ -61,6 +64,7 @@ fn main() {
     if emit.len() == 1 {
         match emit[0] {
             cli::EmitOption::Ir => write_file(&args.output_path, ir.unwrap()),
+            cli::EmitOption::Llvm => write_file(&args.output_path, llvm.unwrap()),
             cli::EmitOption::Asm => write_file(&args.output_path, asm.unwrap()),
         }
     } else {
@@ -72,6 +76,9 @@ fn main() {
         if let Some(ir) = ir {
             write_file(&args.output_path.join(format!("{stem}.ir")), ir);
         }
+        if let Some(llvm) = llvm {
+            write_file(&args.output_path.join(format!("{stem}.ll")), llvm);
+        }
         if let Some(asm) = asm {
             write_file(&args.output_path.join(format!("{stem}.s")), asm);
         }
@@ -82,6 +89,10 @@ fn dump_ir(program: &raana_ir::ir::Program) -> String {
     let mut writer = Writer::new(program);
     writer.write().unwrap();
     writer.finish()
+}
+
+fn dump_llvm(program: &raana_ir::ir::Program) -> String {
+    raana_ir::llvm::write_llvm_ir(program)
 }
 
 fn dump_asm(_program: &raana_ir::ir::Program) -> String {

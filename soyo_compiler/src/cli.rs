@@ -23,5 +23,6 @@ pub(crate) struct Arg {
 #[clap(rename_all = "lower")]
 pub enum EmitOption {
     Ir,
+    Llvm,
     Asm,
 }

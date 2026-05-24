@@ -19,6 +19,7 @@ pub struct LlvmWriter<'a> {
     phi_incoming: HashMap<BasicBlock, Vec<(BasicBlock, Vec<Inst>)>>,
     name_counter: usize,
     bb_counter: usize,
+    used_memset: bool,
 }
 
 struct ProgramWrapper<'a> {
@@ -162,6 +163,7 @@ impl<'a> LlvmWriter<'a> {
             phi_incoming: HashMap::new(),
             name_counter: 0,
             bb_counter: 0,
+            used_memset: false,
         }
     }
 
@@ -178,6 +180,10 @@ impl<'a> LlvmWriter<'a> {
         if !global_insts.is_empty() {
             writeln!(self.buffer)?;
         }
+        writeln!(
+            self.buffer,
+            "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)"
+        )?;
 
         let funcs: Vec<Function> = self.arena.function_layout().to_vec();
         for &func in &funcs {
@@ -607,6 +613,17 @@ impl<'a> LlvmWriter<'a> {
                     }
                 };
                 if let Some((agg, src_ty)) = maybe_agg {
+                    if self.is_all_zeroinit(&agg) {
+                        let size = self.type_size_bytes(&src_ty);
+                        writeln!(
+                            self.buffer,
+                            "call void @llvm.memset.p0.i64(ptr {}, i8 0, i64 {}, i1 false)",
+                            get_name!(self, store.dest()),
+                            size
+                        )?;
+                        self.used_memset = true;
+                        return Ok(());
+                    }
                     self.emit_aggregate_store(&agg, store.dest(), &src_ty, &[])?;
                     return Ok(());
                 } else {
@@ -791,6 +808,28 @@ impl<'a> LlvmWriter<'a> {
             "getelementptr inbounds {}, ptr {}, {}",
             src_elem_ty, base, indices
         )
+    }
+
+    fn type_size_bytes(&self, ty: &Type) -> usize {
+        match ty.kind() {
+            TypeKind::Int32 | TypeKind::Float32 => 4,
+            TypeKind::Pointer(_) | TypeKind::String => 8,
+            TypeKind::Array(elem, len) => (*len as usize) * self.type_size_bytes(elem),
+            _ => 0,
+        }
+    }
+
+    fn is_all_zeroinit(&self, agg: &crate::ir::Aggregate) -> bool {
+        agg.value().iter().all(|&v| {
+            let data = self.arena.inst_data(v);
+            match data.kind() {
+                InstKind::ZeroInit => true,
+                InstKind::Integer(i) => i.value() == 0,
+                InstKind::Float(f) => f.value() == 0.0,
+                InstKind::Aggregate(inner) => self.is_all_zeroinit(inner),
+                _ => false,
+            }
+        })
     }
 
     /// Recursively decompose an Aggregate store into individual GEP+store pairs.

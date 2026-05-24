@@ -93,9 +93,12 @@ macro_rules! get_name {
             InstKind::Float(f) => {
                 let v = f.value();
                 if v == 0.0 {
-                    "0.0".into()
+                    "0.0".to_string()
                 } else {
-                    format!("{:.6}", v).parse::<f64>().unwrap().to_string()
+                    // LLVM 18 rejects plain decimal constants (interpreted as double) in
+                    // float context.  Emit the exact f64 bit pattern of the f32→f64 promotion.
+                    let bits = (v as f64).to_bits();
+                    format!("0x{:016X}", bits)
                 }
             }
             InstKind::ZeroInit => {
@@ -335,9 +338,14 @@ impl<'a> LlvmWriter<'a> {
             params_str.join(", ")
         )?;
 
-        // Phase 5: emit blocks
+        // Phase 5: emit blocks (skip unreachable ones — they may have ret void in i32 functions)
+        let entry_bb = all_bbs_and_insts.first().map(|(bb, ..)| *bb);
         for (bb, _params, _insts) in &all_bbs_and_insts {
-            self.visit_block(*bb)?;
+            let has_preds = self.phi_incoming.contains_key(bb)
+                || Some(*bb) == entry_bb;
+            if has_preds {
+                self.visit_block(*bb)?;
+            }
         }
 
         writeln!(self.buffer, "}}")
@@ -498,13 +506,27 @@ impl<'a> LlvmWriter<'a> {
                 }
             }
             InstKind::Store(store) => {
-                writeln!(
-                    self.buffer,
-                    "store {} {}, ptr {}",
-                    self.type_to_llvm(self.arena.inst_data(store.src()).ty()),
-                    get_name!(self, store.src()),
-                    get_name!(self, store.dest())
-                )
+                let maybe_agg: Option<(crate::ir::Aggregate, Type)> = {
+                    let src_data = self.arena.inst_data(store.src());
+                    if let InstKind::Aggregate(agg) = src_data.kind() {
+                        Some((agg.clone(), src_data.ty().clone()))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((agg, src_ty)) = maybe_agg {
+                    self.emit_aggregate_store(&agg, store.dest(), &src_ty, &[])?;
+                    return Ok(());
+                } else {
+                    let src_data = self.arena.inst_data(store.src());
+                    writeln!(
+                        self.buffer,
+                        "store {} {}, ptr {}",
+                        self.type_to_llvm(src_data.ty()),
+                        get_name!(self, store.src()),
+                        get_name!(self, store.dest())
+                    )
+                }
             }
             InstKind::Integer(_)
             | InstKind::Float(_)
@@ -526,7 +548,9 @@ impl<'a> LlvmWriter<'a> {
         let lhs = get_name!(self, binary.lhs());
         let rhs = get_name!(self, binary.rhs());
         let llvm_ty = self.type_to_llvm(ty);
-        let is_float = ty.is_f32();
+        // For comparisons, the result type is always i32, but operands may be float.
+        // Use the lhs operand type to determine int vs float dispatch.
+        let is_float = self.arena.inst_data(binary.lhs()).ty().is_f32();
 
         if binary.op().is_compare() {
             // LLVM icmp/fcmp produce i1; RaanaIR comparisons produce i32.
@@ -675,5 +699,84 @@ impl<'a> LlvmWriter<'a> {
             "getelementptr inbounds {}, ptr {}, {}",
             src_elem_ty, base, indices
         )
+    }
+
+    /// Recursively decompose an Aggregate store into individual GEP+store pairs.
+    /// Needed because LLVM does not allow runtime values inside aggregate store constants.
+    fn emit_aggregate_store(
+        &mut self,
+        agg: &crate::ir::Aggregate,
+        dest: Inst,
+        agg_ty: &Type,
+        indices: &[u32],
+    ) -> std::fmt::Result {
+        match agg_ty.kind() {
+            TypeKind::Array(elem_ty, _len) => {
+                for (i, &elem_val) in agg.value().iter().enumerate() {
+                    let mut new_indices = indices.to_vec();
+                    new_indices.push(i as u32);
+                    let inner_agg: Option<crate::ir::Aggregate> = {
+                        let elem_data = self.arena.inst_data(elem_val);
+                        if let InstKind::Aggregate(inner) = elem_data.kind() {
+                            Some(inner.clone())
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(inner) = inner_agg {
+                        self.emit_aggregate_store(&inner, dest, elem_ty, &new_indices)?;
+                    } else {
+                        // Emit GEP to this element, then store
+                        let gep_name = format!("%gep{}", self.name_counter);
+                        self.name_counter += 1;
+                        let elem_llvm_ty = self.type_to_llvm(elem_ty);
+                        let dest_name = get_name!(self, dest);
+                        let base_ty = self.type_to_llvm(&self.arena.inst_data(dest).ty().derefernce());
+                        let idx_strs: Vec<String> = std::iter::once("i32 0".to_string())
+                            .chain(new_indices.iter().map(|idx| format!("i32 {idx}")))
+                            .collect();
+                        writeln!(
+                            self.buffer,
+                            "  {} = getelementptr inbounds {}, ptr {}, {}",
+                            gep_name, base_ty, dest_name, idx_strs.join(", ")
+                        )?;
+                        writeln!(
+                            self.buffer,
+                            "  store {} {}, ptr {}",
+                            elem_llvm_ty,
+                            get_name!(self, elem_val),
+                            gep_name
+                        )?;
+                    }
+                }
+            }
+            _ => {
+                // Scalar type — single element store
+                // GEP to the single element
+                let gep_name = format!("%gep{}", self.name_counter);
+                self.name_counter += 1;
+                let dest_ty = self.arena.inst_data(dest).ty();
+                let base_ty = self.type_to_llvm(&dest_ty.derefernce());
+                let dest_name = get_name!(self, dest);
+                let idx_strs: Vec<String> = std::iter::once("i32 0".to_string())
+                    .chain(indices.iter().map(|idx| format!("i32 {idx}")))
+                    .collect();
+                writeln!(
+                    self.buffer,
+                    "  {} = getelementptr inbounds {}, ptr {}, {}",
+                    gep_name, base_ty, dest_name, idx_strs.join(", ")
+                )?;
+                let elem_val = agg.value()[0];
+                let elem_ty = self.type_to_llvm(self.arena.inst_data(elem_val).ty());
+                writeln!(
+                    self.buffer,
+                    "  store {} {}, ptr {}",
+                    elem_ty,
+                    get_name!(self, elem_val),
+                    gep_name
+                )?;
+            }
+        }
+        Ok(())
     }
 }

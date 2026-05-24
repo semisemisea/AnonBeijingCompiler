@@ -4,7 +4,6 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 from pathlib import Path
-import shlex
 import shutil
 import subprocess
 import sys
@@ -14,7 +13,9 @@ ROOT = Path("/work")
 TESTS_ROOT = ROOT / "tests"
 RESULTS_ROOT = ROOT / "results"
 SYSYLIB = ROOT / "sysylib" / "libsysy_arm.a"
-DEFAULT_COMPILER = Path(os.environ.get("SOYO_COMPILER", "/work/target/release/soyo_compiler"))
+DEFAULT_COMPILER = Path(
+    os.environ.get("SOYO_COMPILER", "/work/target/release/soyo_compiler")
+)
 
 COLOR = sys.stdout.isatty()
 CODES = {
@@ -26,16 +27,12 @@ CODES = {
     "yellow": "\x1b[33m",
     "magenta": "\x1b[35m",
 }
-TEST_TIMEOUT = 360
+TEST_TIMEOUT = 120
 
 STATUSES = ("PASS", "FAIL", " CE ", " RE ", " TLE", "SKIP")
 
-SKIP_TESTS = {
-    # missing .in files — getarray blocks on stdin
-    "perf/h-8-01.sy",
-    "perf/h-8-02.sy",
-    "perf/h-8-03.sy",
-}
+SKIP_TESTS = {}
+
 STATUS_STYLES = {
     "PASS": ("green", "bold"),
     "FAIL": ("red",),
@@ -183,10 +180,20 @@ def run_test(src, out_dir, opt_level, compiler, backend):
         )
     except subprocess.TimeoutExpired as err:
         write_timeout_output(err, compile_stdout, compile_stderr, compile_returncode)
-        return time.perf_counter() - start, " TLE", f"compile timeout after {TEST_TIMEOUT}s"
-    write_process_output(compile_proc, compile_stdout, compile_stderr, compile_returncode)
+        return (
+            time.perf_counter() - start,
+            " TLE",
+            f"compile timeout after {TEST_TIMEOUT}s",
+        )
+    write_process_output(
+        compile_proc, compile_stdout, compile_stderr, compile_returncode
+    )
     if compile_proc.returncode:
-        output = (compile_proc.stdout + compile_proc.stderr).decode("utf-8", "replace").strip()
+        output = (
+            (compile_proc.stdout + compile_proc.stderr)
+            .decode("utf-8", "replace")
+            .strip()
+        )
         return (
             time.perf_counter() - start,
             " CE ",
@@ -234,11 +241,21 @@ def run_test(src, out_dir, opt_level, compiler, backend):
                 timeout=remaining_timeout(start),
             )
         except subprocess.TimeoutExpired as err:
-            write_timeout_output(err, runtime_stdout, runtime_stderr, runtime_returncode)
-            return time.perf_counter() - start, " TLE", f"llc timeout after {TEST_TIMEOUT}s"
+            write_timeout_output(
+                err, runtime_stdout, runtime_stderr, runtime_returncode
+            )
+            return (
+                time.perf_counter() - start,
+                " TLE",
+                f"llc timeout after {TEST_TIMEOUT}s",
+            )
         if llc_proc.returncode:
-            output = (llc_proc.stdout + llc_proc.stderr).decode("utf-8", "replace").strip()
-            write_process_output(llc_proc, runtime_stdout, runtime_stderr, runtime_returncode)
+            output = (
+                (llc_proc.stdout + llc_proc.stderr).decode("utf-8", "replace").strip()
+            )
+            write_process_output(
+                llc_proc, runtime_stdout, runtime_stderr, runtime_returncode
+            )
             return (
                 time.perf_counter() - start,
                 " CE ",
@@ -268,9 +285,15 @@ def run_test(src, out_dir, opt_level, compiler, backend):
         )
     except subprocess.TimeoutExpired as err:
         write_timeout_output(err, runtime_stdout, runtime_stderr, runtime_returncode)
-        return time.perf_counter() - start, " TLE", f"link timeout after {TEST_TIMEOUT}s"
+        return (
+            time.perf_counter() - start,
+            " TLE",
+            f"link timeout after {TEST_TIMEOUT}s",
+        )
     if link_proc.returncode:
-        write_process_output(link_proc, runtime_stdout, runtime_stderr, runtime_returncode)
+        write_process_output(
+            link_proc, runtime_stdout, runtime_stderr, runtime_returncode
+        )
         return (
             time.perf_counter() - start,
             " RE ",
@@ -289,8 +312,14 @@ def run_test(src, out_dir, opt_level, compiler, backend):
                 timeout=remaining_timeout(start),
             )
         except subprocess.TimeoutExpired as err:
-            write_timeout_output(err, runtime_stdout, runtime_stderr, runtime_returncode)
-            return time.perf_counter() - start, " TLE", f"runtime timeout after {TEST_TIMEOUT}s"
+            write_timeout_output(
+                err, runtime_stdout, runtime_stderr, runtime_returncode
+            )
+            return (
+                time.perf_counter() - start,
+                " TLE",
+                f"runtime timeout after {TEST_TIMEOUT}s",
+            )
     finally:
         if stdin_file is not None:
             stdin_file.close()
@@ -314,7 +343,9 @@ def run_test(src, out_dir, opt_level, compiler, backend):
 
 def parse_args(argv):
     default_jobs = max(1, (os.cpu_count() or 1) // 2)
-    parser = argparse.ArgumentParser(description="container test runner for soyo_compiler")
+    parser = argparse.ArgumentParser(
+        description="container test runner for soyo_compiler"
+    )
     parser.add_argument(
         "-j",
         "--jobs",
@@ -343,7 +374,9 @@ def parse_args(argv):
         help="show test case output details",
     )
     parser.add_argument(
-        "paths", nargs="*", help="optional .sy files or directories (default: /work/tests)"
+        "paths",
+        nargs="*",
+        help="optional .sy files or directories (default: /work/tests)",
     )
     args = parser.parse_args(argv)
     if args.jobs < 1:
@@ -427,7 +460,12 @@ def run_tests(args):
     interrupted = False
     futures = {}
     try:
-        futures = {pool.submit(run_test, src, RESULTS_ROOT, args.opt_level, compiler, args.backend): src for src in files}
+        futures = {
+            pool.submit(
+                run_test, src, RESULTS_ROOT, args.opt_level, compiler, args.backend
+            ): src
+            for src in files
+        }
         set_status(0, rel_test(files[0]))
         for done, future in enumerate(as_completed(futures), 1):
             src = futures[future]
@@ -436,7 +474,9 @@ def run_tests(args):
             timings.append((elapsed, path))
             counts[status] += 1
 
-            running = next((rel_test(futures[item]) for item in futures if not item.done()), None)
+            running = next(
+                (rel_test(futures[item]) for item in futures if not item.done()), None
+            )
             log(
                 f"{paint_status(status)} {elapsed * 1000:.2f}ms {paint(str(path), 'dim')}",
                 running is not None,

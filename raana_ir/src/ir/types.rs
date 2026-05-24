@@ -150,6 +150,15 @@ impl Type {
         }
     }
 
+    pub fn alignment(&self) -> usize {
+        match self.0.as_ref() {
+            TypeKind::Int32 | TypeKind::Float32 => 4,
+            TypeKind::Array(base, _) => base.alignment(),
+            TypeKind::Pointer(_) | TypeKind::Function(..) => POINTER_SIZE,
+            _ => 1,
+        }
+    }
+
     /// If it is a pointer, then return its base.
     /// Otherwise panic.
     pub fn derefernce(&self) -> Type {

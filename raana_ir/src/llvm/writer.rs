@@ -290,7 +290,7 @@ impl<'a> LlvmWriter<'a> {
         // Phase 2: collect phi incoming values and pre-assign instruction/param names
         self.collect_phi_incoming(func);
 
-        // Phase 3: pre-assign block labels and inst names
+        // Phase 3: pre-assign block labels and inst names, collect all Alloc insts
         let all_bbs_and_insts: Vec<(BasicBlock, Vec<Inst>, Vec<Inst>)> = {
             let data = self.arena.func_data(func);
             data.layout()
@@ -315,6 +315,67 @@ impl<'a> LlvmWriter<'a> {
                 .collect()
         };
 
+        // Collect all Alloc insts from all blocks (must be hoisted to entry).
+        // Preserve block order; each inst appears at most once.
+        let alloca_insts: Vec<Inst> = {
+            let mut seen = std::collections::HashSet::new();
+            all_bbs_and_insts
+                .iter()
+                .flat_map(|(_, _, insts)| insts.iter().copied())
+                .filter(|&inst| {
+                    matches!(self.arena.inst_data(inst).kind(), InstKind::Alloc)
+                        && seen.insert(inst)
+                })
+                .collect()
+        };
+
+        // Renumber: func params then allocas then everything else, so names stay
+        // monotonic when allocas are hoisted to the entry block.
+        self.local_names.clear();
+        self.name_counter = 0;
+        let alloca_set: std::collections::HashSet<Inst> = alloca_insts.iter().copied().collect();
+        // Pass 0: function parameters (appear before allocas in the signature)
+        for &p in &params {
+            self.local_names
+                .insert(p, format!("%{}", self.name_counter));
+            self.name_counter += 1;
+        }
+        // Pass 1: allocas (block order)
+        for &inst in &alloca_insts {
+            self.local_names
+                .insert(inst, format!("%{}", self.name_counter));
+            self.name_counter += 1;
+        }
+        // Pass 2: block params then non-alloca insts (block order)
+        for (_, bb_params, insts) in &all_bbs_and_insts {
+            for &param in bb_params {
+                if !self.local_names.contains_key(&param) {
+                    self.local_names
+                        .insert(param, format!("%{}", self.name_counter));
+                    self.name_counter += 1;
+                }
+            }
+            for &inst in insts {
+                if !alloca_set.contains(&inst) && !self.local_names.contains_key(&inst) {
+                    self.local_names
+                        .insert(inst, format!("%{}", self.name_counter));
+                    self.name_counter += 1;
+                }
+            }
+        }
+        // Renumber bb labels too
+        self.bb_labels.clear();
+        self.bb_counter = 0;
+        for (bb, _, _) in &all_bbs_and_insts {
+            self.bb_labels
+                .entry(*bb)
+                .or_insert_with(|| {
+                    let label = format!("%L{}", self.bb_counter);
+                    self.bb_counter += 1;
+                    label
+                });
+        }
+
         // Phase 4: emit function header
         let (ret_ty, name) = {
             let data = self.arena.func_data(func);
@@ -338,13 +399,14 @@ impl<'a> LlvmWriter<'a> {
             params_str.join(", ")
         )?;
 
-        // Phase 5: emit blocks (skip unreachable ones — they may have ret void in i32 functions)
+        // Phase 5: emit blocks (skip unreachable ones).
+        // Alloca insts are hoisted to the entry block.
         let entry_bb = all_bbs_and_insts.first().map(|(bb, ..)| *bb);
         for (bb, _params, _insts) in &all_bbs_and_insts {
             let has_preds = self.phi_incoming.contains_key(bb)
                 || Some(*bb) == entry_bb;
             if has_preds {
-                self.visit_block(*bb)?;
+                self.visit_block(*bb, Some(*bb) == entry_bb, &alloca_insts)?;
             }
         }
 
@@ -384,7 +446,12 @@ impl<'a> LlvmWriter<'a> {
 
     // ─── Block ───
 
-    fn visit_block(&mut self, bb: BasicBlock) -> std::fmt::Result {
+    fn visit_block(
+        &mut self,
+        bb: BasicBlock,
+        is_entry: bool,
+        alloca_insts: &[Inst],
+    ) -> std::fmt::Result {
         let label = bb_label!(self, bb);
         let label_def = &label[1..]; // strip '%'
 
@@ -410,6 +477,15 @@ impl<'a> LlvmWriter<'a> {
             }
         }
 
+        // Hoist all allocas into the entry block (LLVM requires this to avoid
+        // stack growth on loops / non-entry allocas).
+        if is_entry {
+            for &inst in alloca_insts {
+                self.visit_inst(inst)?;
+            }
+        }
+
+        let alloca_set: std::collections::HashSet<Inst> = alloca_insts.iter().copied().collect();
         let func = self.arena.curr_func.unwrap();
         let insts: Vec<Inst> = self
             .arena
@@ -421,7 +497,9 @@ impl<'a> LlvmWriter<'a> {
             .copied()
             .collect();
         for inst in insts {
-            self.visit_inst(inst)?;
+            if !alloca_set.contains(&inst) {
+                self.visit_inst(inst)?;
+            }
         }
         Ok(())
     }
@@ -453,8 +531,9 @@ impl<'a> LlvmWriter<'a> {
                 let pointee_ty = ty.derefernce();
                 writeln!(
                     self.buffer,
-                    "alloca {}, align 4",
-                    self.type_to_llvm(&pointee_ty)
+                    "alloca {}, align {}",
+                    self.type_to_llvm(&pointee_ty),
+                    pointee_ty.alignment()
                 )
             }
             InstKind::Binary(binary) => self.visit_binary(binary, inst, &ty),
@@ -502,7 +581,20 @@ impl<'a> LlvmWriter<'a> {
                         get_name!(self, val)
                     )
                 } else {
-                    writeln!(self.buffer, "ret void")
+                    let func_ret_ty = self
+                        .arena
+                        .func_data(self.arena.curr_func.unwrap())
+                        .ret_ty()
+                        .clone();
+                    if func_ret_ty.is_unit() {
+                        writeln!(self.buffer, "ret void")
+                    } else {
+                        writeln!(
+                            self.buffer,
+                            "ret {} undef",
+                            self.type_to_llvm(&func_ret_ty)
+                        )
+                    }
                 }
             }
             InstKind::Store(store) => {

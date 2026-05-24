@@ -137,27 +137,32 @@ def copy_testcase_files(src, out_dir):
             shutil.copy2(path, dst_base.with_suffix(path.suffix))
 
 
-def run_test(src, out_dir, opt_level, compiler):
+def run_test(src, out_dir, opt_level, compiler, backend):
     start = time.perf_counter()
     src_rel = rel_test(src)
     base = src.with_suffix("")
     copy_testcase_files(src, out_dir)
 
-    asm = out_dir / src_rel.with_suffix(".s")
+    ext = {"asm": ".s", "llvm": ".ll"}[backend]
+    compile_artifact = out_dir / src_rel.with_suffix(ext)
     ir = out_dir / src_rel.with_suffix(".raana")
     elf = out_dir / src_rel.with_suffix(".elf")
+    obj = out_dir / src_rel.with_suffix(".o")
     compile_stdout = out_dir / src_rel.with_suffix(".compile.stdout")
     compile_stderr = out_dir / src_rel.with_suffix(".compile.stderr")
     compile_returncode = out_dir / src_rel.with_suffix(".compile.return")
     runtime_stdout = out_dir / src_rel.with_suffix(".runtime.stdout")
     runtime_stderr = out_dir / src_rel.with_suffix(".runtime.stderr")
     runtime_returncode = out_dir / src_rel.with_suffix(".runtime.return")
-    asm.parent.mkdir(parents=True, exist_ok=True)
+    compile_artifact.parent.mkdir(parents=True, exist_ok=True)
 
     compile_args = [str(compiler)]
     if opt_level:
         compile_args.append(f"-O{opt_level}")
-    compile_args += ["-S", "-o", str(asm), str(src)]
+    if backend == "asm":
+        compile_args += ["-S", "-o", str(compile_artifact), str(src)]
+    else:
+        compile_args += ["--emit", "llvm", "-o", str(compile_artifact), str(src)]
 
     try:
         compile_proc = subprocess.run(
@@ -201,6 +206,37 @@ def run_test(src, out_dir, opt_level, compiler):
             f"ir exit {ir_proc.returncode}\n{output or '(no output)'}",
         )
 
+    # LLVM backend: lower .ll to .o via llc before linking
+    if backend == "llvm":
+        try:
+            llc_proc = subprocess.run(
+                [
+                    "llc",
+                    "--mtriple=aarch64-linux-gnu",
+                    "-filetype=obj",
+                    str(compile_artifact),
+                    "-o",
+                    str(obj),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=remaining_timeout(start),
+            )
+        except subprocess.TimeoutExpired as err:
+            write_timeout_output(err, runtime_stdout, runtime_stderr, runtime_returncode)
+            return time.perf_counter() - start, " TLE", f"llc timeout after {TEST_TIMEOUT}s"
+        if llc_proc.returncode:
+            output = (llc_proc.stdout + llc_proc.stderr).decode("utf-8", "replace").strip()
+            write_process_output(llc_proc, runtime_stdout, runtime_stderr, runtime_returncode)
+            return (
+                time.perf_counter() - start,
+                " CE ",
+                f"llc exit {llc_proc.returncode}\n{output or '(no output)'}",
+            )
+        link_input = str(obj)
+    else:
+        link_input = str(compile_artifact)
+
     try:
         link_proc = subprocess.run(
             [
@@ -210,7 +246,7 @@ def run_test(src, out_dir, opt_level, compiler):
                 "--sysroot=/usr/aarch64-linux-gnu",
                 "-fuse-ld=lld",
                 "-static",
-                str(asm),
+                link_input,
                 str(SYSYLIB),
                 "-o",
                 str(elf),
@@ -277,6 +313,12 @@ def parse_args(argv):
     )
     parser.add_argument(
         "-O", "--opt-level", type=int, default=0, help="compiler optimization level"
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["asm", "llvm"],
+        default="asm",
+        help="compiler backend: asm (ARMv8 assembly) or llvm (LLVM IR)",
     )
     parser.add_argument(
         "--compiler",
@@ -374,7 +416,7 @@ def run_tests(args):
     interrupted = False
     futures = {}
     try:
-        futures = {pool.submit(run_test, src, RESULTS_ROOT, args.opt_level, compiler): src for src in files}
+        futures = {pool.submit(run_test, src, RESULTS_ROOT, args.opt_level, compiler, args.backend): src for src in files}
         set_status(0, rel_test(files[0]))
         for done, future in enumerate(as_completed(futures), 1):
             src = futures[future]

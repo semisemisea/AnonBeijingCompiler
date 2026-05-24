@@ -137,13 +137,16 @@ impl ToRaanaIR for items::FuncDef {
         }
         ctx.del_scope();
 
-        // Epilogue at the end:
-        // For all function we explicitly add return None at the end, equivalent to `return ;`
-        // This is because non-void function must have return statement at the end, a.k.a completed
-        // When a function is completed, any return statement added later is abandoned.
-        // But void function can have implicit return statement, a.k.a incompleted
-        // So we add extra return to fix it.
-        let ret = ctx.new_local_value().ret(None);
+        // Epilogue: ensure the final block has a terminator.
+        // Unreachable join blocks (all branches return) still get a valid ret
+        // for the function's declared type.
+        let ret_val = match ctx.curr_func_data().ret_ty().kind() {
+            TypeKind::Unit => None,
+            TypeKind::Int32 => Some(ctx.new_local_value().integer(0)),
+            TypeKind::Float32 => Some(ctx.new_local_value().float(0.0)),
+            _ => unreachable!(),
+        };
+        let ret = ctx.new_local_value().ret(ret_val);
         ctx.push_inst(ret);
 
         ctx.reset_curr_bb();

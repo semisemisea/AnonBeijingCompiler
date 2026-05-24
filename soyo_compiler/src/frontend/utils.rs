@@ -261,7 +261,13 @@ impl AstGenContext {
     /// Return the original basic_block handle
     pub fn set_curr_bb(&mut self, bb: BasicBlock) -> Option<BasicBlock> {
         if self.curr_bb.is_some() && !self.is_complete_bb() {
-            let ret = self.new_local_value().ret(None);
+            let ret_val = match self.curr_func_data().ret_ty().kind() {
+                TypeKind::Unit => None,
+                TypeKind::Int32 => Some(self.new_local_value().integer(0)),
+                TypeKind::Float32 => Some(self.new_local_value().float(0.0)),
+                _ => unreachable!(),
+            };
+            let ret = self.new_local_value().ret(ret_val);
             self.push_inst(ret);
         }
         self.curr_bb.replace(bb)

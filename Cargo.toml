@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["raana_ir", "soyo_compiler", "anon_armv8", "taki_mir"]
+members = ["raana_ir", "soyo_compiler", "anon_armv8", "taki_mir", "tomori_utils"]
 
 [profile.release]
 debug = true

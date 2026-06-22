@@ -6,7 +6,7 @@ Entry for CSC Compiler Implementation Competition. A SysY to Arm/RISC-V compiler
 
 ### Overall
 
-The AnonBeijingCompiler project consists of two parts: `RaanaIR` and `SoyoCompiler`.
+The AnonBeijingCompiler project now consists of multiple parts: `RaanaIR` and `SoyoCompiler`.
 Both projects are heavily influenced by the `pku-minic` course.
 Specifically, although we built `RaanaIR` from scratch, it was designed while we were reading the source code of `KoopaIR`.
 `SoyoCompiler` was migrated from the `s2r` repository (see Reference for more information).
@@ -21,62 +21,17 @@ With so many nested structs, AST itself store the information of expression orde
 
 ### IR
 
-`RaanaIR` is a linear IR form backed by instructions, basicblocks and functions.
+RaanaIR is a statically strong typed high-level intermediate representation(HLIR).
+It's also SSA-based to enable more aggressive/precise optimization.
 
-```RaanaIR
-declare func <name = getint, ret_ty = i32>
-
-declare func <name = getch, ret_ty = i32>
-
-declare func <name = getarray, ret_ty = i32, params = (%0: *i32)>
-
-declare func <name = putint, ret_ty = (), params = (%1: i32)>
-
-declare func <name = putch, ret_ty = (), params = (%2: i32)>
-
-declare func <name = putarray, ret_ty = (), params = (%3: i32, %4: *i32)>
-
-declare func <name = starttime, ret_ty = ()>
-
-declare func <name = stoptime, ret_ty = ()>
-
-define func <name = main, ret_ty = i32>: {
-entry:
-    %v_a = alloc <type = *i32, size = 8>
-    store 10, %v_a
-    %6 = load %v_a <type = i32, size = 4>
-    %7 = eq 0, %6 <type = i32, size = 4>
-    %8 = eq 0, %7 <type = i32, size = 4>
-    %9 = eq 0, %8 <type = i32, size = 4>
-    %10 = sub 0, %9 <type = i32, size = 4>
-    br %10, then, else
-then:
-    store -1, %v_a
-    jump end
-else:
-    store 0, %v_a
-    jump end
-end:
-    %16 = load %v_a <type = i32, size = 4>
-    ret %16
-}
-```
-
-Each line between the basic block is an instruction. It will a have a return type and value. (`unit/()/void` type is omitted as output.)
-It looks similar to 3AC(3 Address code) in most of time, except branch/jump instruction.
-
-Basicblock is a set of instruction, which must start execution from beginning and return/jump to other basicblock at the end.
-Learned from `KoopaIR`, we also represent `phi` function as basicblock parameter.
+For more information please go to the crate `raana_ir`
 
 ### Backend
 
-#### Arm
+Backend is built around machine-specific intermediate representation(MIR).
+This part is influenced by the **VCode** from *Cranelift* and **GlobalISel** from **LLVM**.
 
-To be written
-
-#### RISC-V
-
-To be written
+For more information please go to the crate `taki_mir`
 
 #### Register Allocation
 
@@ -135,8 +90,7 @@ Each pass will be introduced with a simple description. For more information, pl
 
 ### SSA/mem2reg
 
-Static single assignment.
-Transform the original IR to SSA form.
+Transform the original IR to static single assignment(SSA) form.
 
 ### ADCE
 

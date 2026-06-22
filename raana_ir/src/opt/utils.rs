@@ -158,15 +158,14 @@ fn visit_and_replace_single(data: &mut ArenaContext<'_>, used_by: Inst, rep: Ins
     let rep_val_data = data.inst_data(used_by);
     #[allow(unused_variables)]
     match rep_val_data.kind() {
-        InstKind::Integer(..)
-        | InstKind::Float(..)
-        | InstKind::ZeroInit
+        InstKind::ZeroInit
         | InstKind::Undef
-        | InstKind::Aggregate(..)
         | InstKind::FuncArgRef(..)
         | InstKind::BlockArgRef(..)
         | InstKind::Alloc
         | InstKind::GlobalAlloc(..) => unreachable!("Encountered kind: {:?}", rep_val_data.kind()),
+        InstKind::Integer(..) | InstKind::Float(..) => {}
+        InstKind::Aggregate(agg) => {}
         InstKind::Cast(cast) => {
             let ty = rep_val_data.ty().clone();
             data.replace_inst_with(used_by).cast(rep_with, ty);

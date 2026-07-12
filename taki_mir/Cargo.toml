@@ -5,3 +5,8 @@ edition = "2024"
 
 [dependencies]
 raana_ir = { path = "../raana_ir/" }
+smallvec = { path = "../dependencies/rust-smallvec/" }
+tomori_utils = { path = "../tomori_utils/" }
+rustc-hash = { path = "../dependencies/rustc-hash/" }
+log = { version = "0.4.29" }
+env_logger = { version = "0.11.10" }

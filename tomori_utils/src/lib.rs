@@ -1,5 +1,7 @@
 pub mod entity;
 pub mod iter;
+pub mod list;
+pub mod packed_option;
 pub mod primary_map;
 pub mod ranges;
 pub mod secondary_map;
@@ -8,3 +10,5 @@ pub use entity::EntityRef;
 pub use primary_map::PrimaryMap;
 pub use ranges::Ranges;
 pub use secondary_map::SecondaryMap;
+
+pub extern crate core as __core;

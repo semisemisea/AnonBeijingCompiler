@@ -67,6 +67,7 @@ test-llvm: test-compiler build-lib .docker-image
 	trap cleanup EXIT INT TERM; \
 	cleanup; \
 	$(DOCKER) run -t --name "$(CONTAINER)" --network none \
+        -e RUST_BACKTRACE=1 \
 		-e SOYO_COMPILER="$(COMPILER)" \
 		-v "$(HOST_TARGET_DIR):/work/target:ro" \
 		-v "$(CURDIR)/tests:/work/tests:ro" \

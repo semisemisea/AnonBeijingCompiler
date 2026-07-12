@@ -127,6 +127,10 @@ where
         k
     }
 
+    pub fn replace(&mut self, k: K, v: V) -> V {
+        core::mem::replace(&mut self[k], v)
+    }
+
     /// Returns the last element that was inserted in the map.
     pub fn last(&self) -> Option<(K, &V)> {
         let len = self.elems.len();

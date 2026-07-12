@@ -60,6 +60,29 @@ impl InstKind {
             InstKind::ZeroInit | InstKind::Integer(..) | InstKind::Float(..)
         )
     }
+
+    pub fn is_call(&self) -> bool {
+        matches!(self, InstKind::Call(..))
+    }
+
+    pub fn is_load(&self) -> bool {
+        matches!(self, InstKind::Load(..))
+    }
+
+    pub fn is_store(&self) -> bool {
+        matches!(self, InstKind::Store(..))
+    }
+
+    pub fn is_terminator(&self) -> bool {
+        matches!(
+            self,
+            InstKind::Jump(..) | InstKind::Branch(..) | InstKind::Return(..)
+        )
+    }
+
+    pub fn is_branch(&self) -> bool {
+        matches!(self, InstKind::Jump(..) | InstKind::Branch(..))
+    }
 }
 
 pub struct InstUsage<'a> {

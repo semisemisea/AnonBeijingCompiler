@@ -1281,9 +1281,7 @@ impl ToRaanaIR for items::PrimaryExp {
                                 let mut gep_offset = vec![ctx.new_local_value().integer(0)];
                                 gep_offset.extend(offsets);
                                 (array, gep_offset)
-                            } else if array_ty.is_pointer()
-                                && array_ty.derefernce().is_pointer()
-                            {
+                            } else if array_ty.is_pointer() && array_ty.derefernce().is_pointer() {
                                 let load = ctx.new_local_value().load(array);
                                 ctx.push_inst(load);
                                 (load, offsets)
@@ -1374,9 +1372,7 @@ impl ToRaanaIR for items::LVal {
                         let mut gep_offsets = vec![ctx.new_local_value().integer(0)];
                         gep_offsets.extend(indices);
                         (p_val, gep_offsets)
-                    } else if var_ty.is_pointer()
-                        && var_ty.derefernce().is_pointer()
-                    {
+                    } else if var_ty.is_pointer() && var_ty.derefernce().is_pointer() {
                         let load = ctx.new_local_value().load(p_val);
                         ctx.push_inst(load);
                         (load, indices)

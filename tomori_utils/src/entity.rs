@@ -11,7 +11,7 @@ macro_rules! entity_impl {
         impl $crate::EntityRef for $entity {
             #[inline]
             fn new(index: usize) -> Self {
-                debug_assert!(index < ($crate::__core::u32::MAX as usize));
+                debug_assert!(index < (::core::u32::MAX as usize));
                 $entity(index as u32)
             }
 
@@ -24,12 +24,12 @@ macro_rules! entity_impl {
         impl $crate::packed_option::ReservedValue for $entity {
             #[inline]
             fn reserved_value() -> $entity {
-                $entity($crate::__core::u32::MAX)
+                $entity(::core::u32::MAX)
             }
 
             #[inline]
             fn is_reserved_value(&self) -> bool {
-                self.0 == $crate::__core::u32::MAX
+                self.0 == ::core::u32::MAX
             }
         }
 
@@ -38,7 +38,7 @@ macro_rules! entity_impl {
             #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn from_u32(x: u32) -> Self {
-                debug_assert!(x < $crate::__core::u32::MAX);
+                debug_assert!(x < ::core::u32::MAX);
                 $entity(x)
             }
 
@@ -50,12 +50,6 @@ macro_rules! entity_impl {
             }
 
             /// Return the raw bit encoding for this instance.
-            ///
-            /// __Warning__: the raw bit encoding is opaque and has no
-            /// guaranteed correspondence to the entity's index. It encodes the
-            /// entire state of this index value: either a valid index or an
-            /// invalid-index sentinel. The value returned by this method should
-            /// only be passed to `from_bits`.
             #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn as_bits(self) -> u32 {
@@ -63,12 +57,6 @@ macro_rules! entity_impl {
             }
 
             /// Create a new instance from the raw bit encoding.
-            ///
-            /// __Warning__: the raw bit encoding is opaque and has no
-            /// guaranteed correspondence to the entity's index. It encodes the
-            /// entire state of this index value: either a valid index or an
-            /// invalid-index sentinel. The value returned by this method should
-            /// only be given bits from `as_bits`.
             #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn from_bits(x: u32) -> Self {
@@ -78,19 +66,18 @@ macro_rules! entity_impl {
     };
 
     // Include basic `Display` impl using the given display prefix.
-    // Display a `Block` reference as "block12".
     ($entity:ident, $display_prefix:expr) => {
         $crate::entity_impl!($entity);
 
-        impl $crate::__core::fmt::Display for $entity {
-            fn fmt(&self, f: &mut $crate::__core::fmt::Formatter) -> $crate::__core::fmt::Result {
+        impl ::core::fmt::Display for $entity {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
                 write!(f, concat!($display_prefix, "{}"), self.0)
             }
         }
 
-        impl $crate::__core::fmt::Debug for $entity {
-            fn fmt(&self, f: &mut $crate::__core::fmt::Formatter) -> $crate::__core::fmt::Result {
-                (self as &dyn $crate::__core::fmt::Display).fmt(f)
+        impl ::core::fmt::Debug for $entity {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                (self as &dyn ::core::fmt::Display).fmt(f)
             }
         }
     };
@@ -101,7 +88,7 @@ macro_rules! entity_impl {
         impl $crate::EntityRef for $entity {
             #[inline]
             fn new(index: usize) -> Self {
-                debug_assert!(index < ($crate::__core::u32::MAX as usize));
+                debug_assert!(index < (::core::u32::MAX as usize));
                 let $arg = index as u32;
                 $to_expr
             }
@@ -116,12 +103,12 @@ macro_rules! entity_impl {
         impl $crate::packed_option::ReservedValue for $entity {
             #[inline]
             fn reserved_value() -> $entity {
-                $entity::from_u32($crate::__core::u32::MAX)
+                $entity::from_u32(::core::u32::MAX)
             }
 
             #[inline]
             fn is_reserved_value(&self) -> bool {
-                self.as_u32() == $crate::__core::u32::MAX
+                self.as_u32() == ::core::u32::MAX
             }
         }
 
@@ -130,7 +117,7 @@ macro_rules! entity_impl {
             #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn from_u32(x: u32) -> Self {
-                debug_assert!(x < $crate::__core::u32::MAX);
+                debug_assert!(x < ::core::u32::MAX);
                 let $arg = x;
                 $to_expr
             }
@@ -144,15 +131,15 @@ macro_rules! entity_impl {
             }
         }
 
-        impl $crate::__core::fmt::Display for $entity {
-            fn fmt(&self, f: &mut $crate::__core::fmt::Formatter) -> $crate::__core::fmt::Result {
+        impl ::core::fmt::Display for $entity {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
                 write!(f, concat!($display_prefix, "{}"), self.as_u32())
             }
         }
 
-        impl $crate::__core::fmt::Debug for $entity {
-            fn fmt(&self, f: &mut $crate::__core::fmt::Formatter) -> $crate::__core::fmt::Result {
-                (self as &dyn $crate::__core::fmt::Display).fmt(f)
+        impl ::core::fmt::Debug for $entity {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                (self as &dyn ::core::fmt::Display).fmt(f)
             }
         }
     };

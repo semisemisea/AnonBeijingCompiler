@@ -9,6 +9,9 @@ itertools = "0.14.0"
 num-traits = "0.2.19"
 log = { version = "0.4.29" }
 env_logger = { version = "0.11.10" }
+tomori_utils = { path = "../tomori_utils/" }
+rustc-hash = { path = "../dependencies/rustc-hash/" }
+smallvec = { path = "../dependencies/rust-smallvec/" }
 
 [profile.release]
 incremental = true

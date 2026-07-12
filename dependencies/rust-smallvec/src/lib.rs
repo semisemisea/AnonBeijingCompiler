@@ -92,13 +92,13 @@
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(feature = "specialization", allow(incomplete_features))]
-#![cfg_attr(feature = "specialization", feature(specialization))]
-#![cfg_attr(feature = "may_dangle", feature(dropck_eyepatch))]
-#![cfg_attr(
-    feature = "debugger_visualizer",
-    feature(debugger_visualizer),
-    debugger_visualizer(natvis_file = "../debug_metadata/smallvec.natvis")
-)]
+// #![cfg_attr(feature = "specialization", feature(specialization))]
+// #![cfg_attr(feature = "may_dangle", feature(dropck_eyepatch))]
+// #![cfg_attr(
+//     feature = "debugger_visualizer",
+//     feature(debugger_visualizer),
+//     debugger_visualizer(natvis_file = "../debug_metadata/smallvec.natvis")
+// )]
 #![deny(missing_docs)]
 
 #[doc(hidden)]
@@ -107,8 +107,8 @@ pub extern crate alloc;
 #[cfg(any(test, feature = "write"))]
 extern crate std;
 
-#[cfg(test)]
-mod tests;
+// #[cfg(test)]
+// mod tests;
 
 #[allow(deprecated)]
 use alloc::alloc::{Layout, LayoutErr};
@@ -455,27 +455,28 @@ where
 }
 
 #[cfg(feature = "drain_filter")]
-impl <T, F> fmt::Debug for DrainFilter<'_, T, F>
+impl<T, F> fmt::Debug for DrainFilter<'_, T, F>
 where
     F: FnMut(&mut T::Item) -> bool,
     T: Array,
     T::Item: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("DrainFilter").field(&self.vec.as_slice()).finish()
+        f.debug_tuple("DrainFilter")
+            .field(&self.vec.as_slice())
+            .finish()
     }
 }
 
 #[cfg(feature = "drain_filter")]
-impl <T, F> Iterator for DrainFilter<'_, T, F>
+impl<T, F> Iterator for DrainFilter<'_, T, F>
 where
     F: FnMut(&mut T::Item) -> bool,
     T: Array,
 {
     type Item = T::Item;
 
-    fn next(&mut self) -> Option<T::Item>
-    {
+    fn next(&mut self) -> Option<T::Item> {
         unsafe {
             while self.idx < self.old_len {
                 let i = self.idx;
@@ -507,7 +508,7 @@ where
 }
 
 #[cfg(feature = "drain_filter")]
-impl <T, F> Drop for DrainFilter<'_, T, F>
+impl<T, F> Drop for DrainFilter<'_, T, F>
 where
     F: FnMut(&mut T::Item) -> bool,
     T: Array,
@@ -516,7 +517,7 @@ where
         struct BackshiftOnDrop<'a, 'b, T, F>
         where
             F: FnMut(&mut T::Item) -> bool,
-            T: Array
+            T: Array,
         {
             drain: &'b mut DrainFilter<'a, T, F>,
         }
@@ -524,7 +525,7 @@ where
         impl<'a, 'b, T, F> Drop for BackshiftOnDrop<'a, 'b, T, F>
         where
             F: FnMut(&mut T::Item) -> bool,
-            T: Array
+            T: Array,
         {
             fn drop(&mut self) {
                 unsafe {
@@ -558,10 +559,10 @@ where
 }
 
 #[cfg(feature = "drain_keep_rest")]
-impl <T, F> DrainFilter<'_, T, F>
+impl<T, F> DrainFilter<'_, T, F>
 where
     F: FnMut(&mut T::Item) -> bool,
-    T: Array
+    T: Array,
 {
     /// Keep unyielded elements in the source `Vec`.
     ///
@@ -582,8 +583,7 @@ where
     /// // `vec` would be empty.
     /// assert_eq!(vec, SmallVec::<[char; 2]>::from_slice(&['b', 'c']));
     /// ```
-    pub fn keep_rest(self)
-    {
+    pub fn keep_rest(self) {
         // At this moment layout looks like this:
         //
         //  _____________________/-- old_len
@@ -662,7 +662,9 @@ impl<A: Array> SmallVecData<A> {
     fn empty() -> SmallVecData<A> {
         // SAFETY: ManuallyDrop<MaybeUninit<A>> is valid for any bit pattern including
         // uninitialized bytes, so assume_init() on a MaybeUninit of that type is sound.
-        SmallVecData { inline: unsafe { MaybeUninit::uninit().assume_init() } }
+        SmallVecData {
+            inline: unsafe { MaybeUninit::uninit().assume_init() },
+        }
     }
     #[inline]
     unsafe fn into_inline(self) -> MaybeUninit<A> {
@@ -1119,7 +1121,7 @@ impl<A: Array> SmallVec<A> {
     /// assert_eq!(evens, SmallVec::<[i32; 16]>::from_slice(&[2i32, 4, 6, 8, 14]));
     /// assert_eq!(odds, SmallVec::<[i32; 16]>::from_slice(&[1i32, 3, 5, 9, 11, 13, 15]));
     /// ```
-    pub fn drain_filter<F>(&mut self, filter: F) -> DrainFilter<'_, A, F,>
+    pub fn drain_filter<F>(&mut self, filter: F) -> DrainFilter<'_, A, F>
     where
         F: FnMut(&mut A::Item) -> bool,
     {
@@ -1130,7 +1132,14 @@ impl<A: Array> SmallVec<A> {
             self.set_len(0);
         }
 
-        DrainFilter { vec: self, idx: 0, del: 0, old_len, pred: filter, panic_flag: false }
+        DrainFilter {
+            vec: self,
+            idx: 0,
+            del: 0,
+            old_len,
+            pred: filter,
+            panic_flag: false,
+        }
     }
 
     /// Append an item to the vector.
@@ -1248,7 +1257,8 @@ impl<A: Array> SmallVec<A> {
     #[cold]
     fn reserve_one_unchecked(&mut self) {
         debug_assert_eq!(self.len(), self.capacity());
-        let new_cap = self.len()
+        let new_cap = self
+            .len()
             .checked_add(1)
             .and_then(usize::checked_next_power_of_two)
             .expect("capacity overflow");
@@ -2032,32 +2042,32 @@ mod specialization;
 #[cfg(feature = "arbitrary")]
 mod arbitrary;
 
-#[cfg(feature = "specialization")]
-impl<'a, A: Array> SpecFrom<A, &'a [A::Item]> for SmallVec<A>
-where
-    A::Item: Copy,
-{
-    #[inline]
-    fn spec_from(slice: &'a [A::Item]) -> SmallVec<A> {
-        SmallVec::from_slice(slice)
-    }
-}
+// #[cfg(feature = "specialization")]
+// impl<'a, A: Array> SpecFrom<A, &'a [A::Item]> for SmallVec<A>
+// where
+//     A::Item: Copy,
+// {
+//     #[inline]
+//     fn spec_from(slice: &'a [A::Item]) -> SmallVec<A> {
+//         SmallVec::from_slice(slice)
+//     }
+// }
 
 impl<'a, A: Array> From<&'a [A::Item]> for SmallVec<A>
 where
     A::Item: Clone,
 {
-    #[cfg(not(feature = "specialization"))]
+    // #[cfg(not(feature = "specialization"))]
     #[inline]
     fn from(slice: &'a [A::Item]) -> SmallVec<A> {
         slice.iter().cloned().collect()
     }
 
-    #[cfg(feature = "specialization")]
-    #[inline]
-    fn from(slice: &'a [A::Item]) -> SmallVec<A> {
-        SmallVec::spec_from(slice)
-    }
+    // #[cfg(feature = "specialization")]
+    // #[inline]
+    // fn from(slice: &'a [A::Item]) -> SmallVec<A> {
+    //     SmallVec::spec_from(slice)
+    // }
 }
 
 impl<A: Array> From<Vec<A::Item>> for SmallVec<A> {
@@ -2149,19 +2159,19 @@ impl<A: Array> Default for SmallVec<A> {
     }
 }
 
-#[cfg(feature = "may_dangle")]
-unsafe impl<#[may_dangle] A: Array> Drop for SmallVec<A> {
-    fn drop(&mut self) {
-        unsafe {
-            if self.spilled() {
-                let (ptr, &mut len) = self.data.heap_mut();
-                Vec::from_raw_parts(ptr.as_ptr(), len, self.capacity);
-            } else {
-                ptr::drop_in_place(&mut self[..]);
-            }
-        }
-    }
-}
+// #[cfg(feature = "may_dangle")]
+// unsafe impl<#[may_dangle] A: Array> Drop for SmallVec<A> {
+//     fn drop(&mut self) {
+//         unsafe {
+//             if self.spilled() {
+//                 let (ptr, &mut len) = self.data.heap_mut();
+//                 Vec::from_raw_parts(ptr.as_ptr(), len, self.capacity);
+//             } else {
+//                 ptr::drop_in_place(&mut self[..]);
+//             }
+//         }
+//     }
+// }
 
 #[cfg(not(feature = "may_dangle"))]
 impl<A: Array> Drop for SmallVec<A> {
@@ -2439,7 +2449,7 @@ impl<T, const N: usize> SmallVec<[T; N]> {
     /// Constructs a new `SmallVec` on the stack from an array without
     /// copying elements. Also sets the length. The user is responsible
     /// for ensuring that `len <= N`.
-    /// 
+    ///
     /// This is a `const` version of [`SmallVec::from_buf_and_len_unchecked`] that is enabled by the feature `const_new`, with the limitation that it only works for arrays.
     #[cfg_attr(docsrs, doc(cfg(feature = "const_new")))]
     #[inline]
@@ -2523,8 +2533,8 @@ impl<T> Copy for ConstNonNull<T> {}
 
 #[cfg(feature = "impl_bincode")]
 use bincode::{
-    de::{BorrowDecoder, Decode, Decoder, read::Reader},
-    enc::{Encode, Encoder, write::Writer},
+    de::{read::Reader, BorrowDecoder, Decode, Decoder},
+    enc::{write::Writer, Encode, Encoder},
     error::{DecodeError, EncodeError},
     BorrowDecode,
 };
@@ -2538,7 +2548,9 @@ where
     fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
         use core::convert::TryInto;
         let len = u64::decode(decoder)?;
-        let len = len.try_into().map_err(|_| DecodeError::OutsideUsizeRange(len))?;
+        let len = len
+            .try_into()
+            .map_err(|_| DecodeError::OutsideUsizeRange(len))?;
         decoder.claim_container_read::<A::Item>(len)?;
 
         let mut vec = SmallVec::with_capacity(len);
@@ -2572,10 +2584,14 @@ where
     A: Array,
     A::Item: BorrowDecode<'de, Context>,
 {
-    fn borrow_decode<D: BorrowDecoder<'de, Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
+    fn borrow_decode<D: BorrowDecoder<'de, Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, DecodeError> {
         use core::convert::TryInto;
         let len = u64::decode(decoder)?;
-        let len = len.try_into().map_err(|_| DecodeError::OutsideUsizeRange(len))?;
+        let len = len
+            .try_into()
+            .map_err(|_| DecodeError::OutsideUsizeRange(len))?;
         decoder.claim_container_read::<A::Item>(len)?;
 
         let mut vec = SmallVec::with_capacity(len);

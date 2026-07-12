@@ -1,6 +1,7 @@
 pub mod arena;
 pub mod basic_block;
 pub(crate) mod builder;
+// pub mod entities;
 pub(crate) mod function;
 pub mod inst_kind;
 pub(crate) mod instruction;

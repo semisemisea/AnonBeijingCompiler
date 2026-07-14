@@ -10,7 +10,6 @@ use crate::{
 };
 
 pub mod abi;
-pub mod armv8;
 pub mod block_order;
 pub mod emit;
 pub mod inst_predicate;

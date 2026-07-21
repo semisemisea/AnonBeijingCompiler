@@ -135,12 +135,52 @@ It currently validates HIR -> VCode -> RA -> post-RA assembly for:
 
 ## Priority-Ordered Milestones
 
+### Milestone Definition Of Done
+
+Every milestone must be executable and testable with the capabilities available
+at that point in the migration. Do not defer semantic validation until the
+default backend changes: doing so lets selector, RA, ABI, and frame defects
+accumulate without a reproducible failing fixture.
+
+- A milestone may close only after each claimed behavior has a focused test at
+  its implementation layer. MInst additions need operand, constraint, rewrite,
+  validation, and formatting coverage; RA changes need allocator coverage; HIR
+  selection changes need selected-instruction assertions.
+- Once M1 is complete, every executable behavior also needs a focused VCode
+  Clang/link/QEMU fixture through the opt-in driver mode. A passing test must
+  prove that the VCode path was selected, not fall back to the direct backend.
+- Semantic changes need LLVM differential fixtures where LLVM provides a useful
+  reference, especially signed arithmetic, shifts, overflow-sensitive rewrites,
+  pointer arithmetic, and floating-point NaN behavior.
+- Every milestone must retain the direct backend as the default and run its
+  focused smoke coverage. Only M8 may change the default backend.
+- Before a milestone commit, run the applicable focused tests plus:
+
+  ```bash
+  cargo test -p taki_mir
+  cargo test -p anon_armv8
+  cargo build -p soyo_compiler
+  git diff --check
+  ```
+
+- After M1, also run the focused VCode QEMU cases with the Makefile entry point:
+
+  ```bash
+  make DOCKER=podman RESULTS=results-opencode test-vcode <fixtures>
+  ```
+
+- Record commands, case names, and independent failures in the milestone's
+  documentation update. Commit implementation, tests, and roadmap status as
+  separate reviewable changes when they are independently useful.
+
 ## M0: VCode Contract And RA Safety
 
 **Priority: P0.** Complete this before broadening the instruction set. Current
 instruction fields, operand collection, post-RA rewriting, and formatting are
-coupled by anonymous allocation positions. Adding complex MInst forms before
-fixing that contract will create fragile, untestable spill failures.
+coupled by anonymous allocation positions. M0 is deliberately a static
+contract milestone: it proves mechanical RA and post-RA correctness with unit
+tests and assembler validation. End-to-end execution begins in M1, when an
+opt-in VCode test path exists.
 
 ### Goals
 
@@ -182,13 +222,20 @@ fixing that contract will create fragile, untestable spill failures.
 
 ### Required Regressions
 
-- [ ] Three spilled integer inputs to `MSub` assemble and execute correctly.
+- [x] Three spilled integer inputs to `MSub` are rewritten through distinct
+  reserved scratch registers and Clang accepts the resulting assembly.
 - [x] Three spilled f32 inputs to a future three-source float form are either
   correctly legalized or rejected before invalid assembly is emitted.
 - [x] Multiple spilled defs are stored to distinct slots in correct order.
-- [ ] Tied input/output allocation preserves values under register pressure.
-- [ ] Fixed ABI operands, physical SP/ZR operands, and call clobbers coexist.
+- [x] Tied input/output allocation has the same location for the `MovK` use and
+  def, including a spill rewrite contract test.
 - [x] Spill-to-spill copies work with large offsets and no untracked stack slot.
+
+### Deferred Runtime Regressions
+
+- M1 owns executing the three-spilled-input `MSub` fixture through QEMU.
+- M2 owns executing tied `MovK` under allocator pressure and testing explicit
+  SP/ZR operands, because the typed `Gpr` representation does not exist in M0.
 
 ### Exit Gate
 
@@ -199,7 +246,75 @@ fixing that contract will create fragile, untestable spill failures.
 - [x] `cargo test -p taki_mir`, `cargo test -p anon_armv8`, and `git diff
   --check` pass.
 
-## M1: Encoding-Shaped AArch64 MInst
+## M1: Opt-In VCode Execution And Differential Harness
+
+**Priority: P0.** Establish an explicit, default-off path from SysY input to
+VCode assembly, Clang/linking, and QEMU before broadening MInst or selector
+coverage. This is test infrastructure, not production migration: the direct
+backend remains the default semantic reference. It removes the circular
+dependency where a milestone requires runtime proof but cannot be run until the
+final driver-replacement milestone.
+
+### Driver Boundary And Capability Contract
+
+- [ ] Add a program-level VCode assembly entry point that emits all defined
+  functions in deterministic order and rejects unsupported program-level data
+  such as globals instead of omitting it.
+- [ ] Add a temporary explicit `--asm-backend vcode` CLI mode. Keep the default
+  as `direct`; do not overload the harness's existing `--backend asm|llvm`
+  artifact selector.
+- [ ] Preserve `-S`, `--emit asm`, `--emit llvm`, multi-emit naming, and direct
+  backend behavior when the new mode is absent.
+- [ ] Validate the VCode-supported HIR subset before lowering and return a
+  concise `Err` with function and instruction context. No unsupported source
+  construct may reach a driver-visible `panic!`.
+- [ ] Reject unsupported globals, memory operations, pointers, aggregate
+  values, stack arguments, indirect calls, and unsupported float operations
+  explicitly until their owning milestones implement them.
+- [ ] Keep the one-function VCode API for unit tests, but make the program API
+  own assembly section/program formatting so repeated `.text` directives and
+  duplicate symbols cannot hide integration errors.
+
+### Harness Integration
+
+- [ ] Teach `tests/test.py` to accept `--asm-backend direct|vcode` and forward
+  the selected value only to assembly compiler invocations.
+- [ ] Add a `test-vcode` Makefile target or documented `ARGS` invocation that
+  uses the existing container image, cross-linker, QEMU, timeout, and output
+  comparison behavior.
+- [ ] Keep `make test` and `make test-llvm` unchanged by default.
+- [ ] Make generated artifacts identify the selected assembly backend so a
+  fixture cannot accidentally exercise the direct lowerer.
+- [ ] Add a small, dedicated VCode fixture directory. Fixtures must state the
+  required subset and avoid memory/global/stack-argument features until their
+  milestones are complete.
+
+### Initial Executable Corpus
+
+- [ ] Constant i32 return and integer arithmetic execute through VCode.
+- [ ] Signed division and remainder execute, including an `MSub` fixture with
+  all three inputs allocated to spill slots under the post-RA contract.
+- [ ] Integer comparisons, branches, and one-successor block-parameter transfer
+  execute with expected output.
+- [ ] Direct scalar i32 and f32 calls execute, including void calls and values
+  live across a call.
+- [ ] Integer and f32 register-pressure fixtures execute and demonstrate the
+  expected spill/reload behavior without corrupting the result.
+- [ ] Each fixture has an assembly-shape assertion confirming the VCode MInst
+  sequence that it intends to validate.
+
+### Exit Gate
+
+- [ ] A focused SysY fixture runs through `SysY -> HIR -> VCode -> RA -> GNU
+  assembly -> Clang/linker -> QEMU` with `--asm-backend vcode`.
+- [ ] Direct remains the default backend, and the corresponding direct fixture
+  still passes unchanged.
+- [ ] Unsupported VCode input exits with a diagnostic rather than panic or
+  silently using the direct backend.
+- [ ] The M0 three-spilled-input `MSub` regression assembles and executes under
+  QEMU.
+
+## M2: Encoding-Shaped AArch64 MInst
 
 **Priority: P0.** Replace the current register-only instruction surface with a
 small, typed instruction architecture modeled after the reusable part of
@@ -251,12 +366,17 @@ Cranelift `inst.isle`.
 - [ ] Every new MInst variant has operand, fixed-register, reuse, clobber,
   validation, rewrite, and formatting tests.
 - [ ] Clang accepts hand-constructed MInst sequences for every ALU shape.
+- [ ] The M1 VCode QEMU harness executes selected immediate, ALU, move-wide,
+  and physical-register forms; each fixture checks the selected assembly.
+- [ ] A tied `MovK` value survives allocator pressure and executes correctly.
+- [ ] Fixed ABI operands, explicit `Gpr::Sp`/`Gpr::Zr` operands, and call
+  clobbers coexist without making SP/ZR allocatable registers.
 - [ ] Constant planner chooses legal minimal sequences for boundary and random
   i32/i64 values.
 
-## M2: Scalar And Condition Selection
+## M3: Scalar And Condition Selection
 
-**Priority: P1.** Use the M1 instruction forms for immediate folding and flag
+**Priority: P1.** Use the M2 instruction forms for immediate folding and flag
 preservation before adding broad memory coverage. These optimizations are local,
 high-frequency, and reduce register pressure for later memory lowering.
 
@@ -304,11 +424,12 @@ high-frequency, and reduce register pressure for later memory lowering.
 
 - [ ] HIR -> VCode -> RA -> assembly fixtures cover immediate, shifted,
   extended, compare-branch, f32 arithmetic, casts, and NaN comparison cases.
-- [ ] Clang accepts every fixture and QEMU checks semantic output.
+- [ ] Clang accepts every fixture and the M1 VCode QEMU harness checks semantic
+  output.
 - [ ] LLVM differential tests verify selected behavior for integer overflow,
   signed shifts/division, extensions, and float NaN semantics.
 
-## M3: Memory, Frame Objects, And Address Modes
+## M4: Memory, Frame Objects, And Address Modes
 
 **Priority: P1.** Add memory as typed MInst rather than recreating the direct
 backend's address temporary and stack round-trip behavior.
@@ -364,13 +485,13 @@ backend's address temporary and stack round-trip behavior.
 
 ### Exit Gate
 
-- [ ] VCode QEMU fixtures pass for local scalar variables, arrays, nested
+- [ ] M1 VCode QEMU fixtures pass for local scalar variables, arrays, nested
   arrays, globals, dynamic indexing, and large frame offsets.
 - [ ] Load/store address selection tests cover scaled, unscaled, extended-index,
   register-index, pair, and scratch-address fallback forms.
 - [ ] Mixed local-array, spill, and call tests preserve 16-byte stack alignment.
 
-## M4: Complete AAPCS64 ABI And Calls
+## M5: Complete AAPCS64 ABI And Calls
 
 **Priority: P1.** Complete ABI behavior once memory/frame locations are
 available. Do not make stack argument support a special direct-emission path.
@@ -407,14 +528,14 @@ available. Do not make stack argument support a special direct-emission path.
 
 ### Exit Gate
 
-- [ ] QEMU ABI fixtures cover 0, 1, 8, and 9 i32 arguments.
-- [ ] QEMU ABI fixtures cover 0, 1, 8, and 9 f32 arguments.
-- [ ] QEMU ABI fixtures cover mixed i32/pointer/f32 signatures, nested calls,
+- [ ] M1 VCode QEMU fixtures cover 0, 1, 8, and 9 i32 arguments.
+- [ ] M1 VCode QEMU fixtures cover 0, 1, 8, and 9 f32 arguments.
+- [ ] M1 VCode QEMU fixtures cover mixed i32/pointer/f32 signatures, nested calls,
   recursion, void calls, and stack alignment.
 - [ ] Values live across calls survive caller-save clobbers under forced integer,
   float, and pointer pressure.
 
-## M5: CFG, Edge Copies, And Block Layout Safety
+## M6: CFG, Edge Copies, And Block Layout Safety
 
 **Priority: P1.** Complete edge-specific semantics before applying general
 branch inversion, `csel`, or aggressive block placement.
@@ -451,11 +572,11 @@ branch inversion, `csel`, or aggressive block placement.
 
 ### Exit Gate
 
-- [ ] QEMU fixtures cover diamonds, loops, `break`, `continue`, critical edges,
-  edge-specific block parameters, and parallel-copy cycles.
+- [ ] M1 VCode QEMU fixtures cover diamonds, loops, `break`, `continue`,
+  critical edges, edge-specific block parameters, and parallel-copy cycles.
 - [ ] Branch layout changes preserve assembly labels, copies, and runtime output.
 
-## M6: Performance Selection And Measurement
+## M7: Performance Selection And Measurement
 
 **Priority: P2.** Optimize only after representative programs can use VCode
 correctly. The largest expected win is eliminating direct-backend stack traffic,
@@ -504,21 +625,23 @@ not generic post-RA peepholes.
 
 ### Exit Gate
 
-- [ ] Every claimed optimization has correctness fixtures, LLVM differential
-  coverage, static selection checks, and benchmark evidence.
+- [ ] Every claimed optimization has M1 VCode correctness fixtures, LLVM
+  differential coverage, static selection checks, and benchmark evidence.
 - [ ] Performance reports distinguish QEMU results from native AArch64 results.
 - [ ] `perf/h-1-01.sy` timeout is either resolved or documented with a measured
   root cause and a scoped follow-up task.
 
-## M7: Driver Integration And Release Gates
+## M8: Production Driver Migration And Release Gates
 
-**Priority: P0 only after M0-M5 exit gates pass.** Driver replacement is the
-last migration step, not a mechanism for testing incomplete VCode coverage.
+**Priority: P0 only after M0-M6 semantic exit gates pass.** Default-backend
+replacement is the last migration step, not a mechanism for testing incomplete
+VCode coverage. M1 already provides the explicit opt-in test mode; M8 decides
+whether that tested path is complete enough to become production default.
 
 ### Driver And Diagnostics
 
-- [ ] Add a temporary explicit VCode backend mode for end-to-end differential
-  testing before changing the default native backend.
+- [ ] Keep the M1 `--asm-backend vcode` mode available as an explicit fallback
+  and differential-testing control after the default changes.
 - [ ] Keep `-S`, `--emit asm`, `--emit llvm`, and multi-emit naming stable.
 - [ ] Replace direct production lowering only when VCode compiles the complete
   supported SysY HIR surface and passes all release gates.
@@ -534,8 +657,9 @@ last migration step, not a mechanism for testing incomplete VCode coverage.
 - [ ] Run `cargo test -p anon_armv8`.
 - [ ] Run `cargo test --workspace`, documenting any independent failures.
 - [ ] Run `cargo build -p soyo_compiler`.
-- [ ] Run focused QEMU VCode fixtures before each broader suite.
-- [ ] Run `make test` with VCode-backed native assembly.
+- [ ] Run focused `make test-vcode` QEMU fixtures before each broader suite.
+- [ ] Run `make test ARGS="--asm-backend vcode"` with VCode-backed native
+  assembly.
 - [ ] Run `make test-llvm` unchanged.
 - [ ] Run `git diff --check` before every milestone commit.
 

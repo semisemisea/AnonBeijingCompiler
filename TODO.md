@@ -652,6 +652,9 @@ sequences that save and restore those integer callee-saves, including legal
 large-frame stack adjustment; they are not yet used by the native compiler path.
 The post-RA float scratch pair is `v30`/`v31`, both excluded from allocation, so
 spill rewriting does not clobber AAPCS64 callee-saved `v8..v15` state.
+Finalized VCode now exposes each block's global instruction range, matching the
+index space used by allocator allocations and edit program points for upcoming
+block-labelled function emission.
 
 ### 6.1 Post-allocation Instruction Stream
 

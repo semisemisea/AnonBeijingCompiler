@@ -221,6 +221,17 @@ fn format_inst(function: &str, inst: &Inst) -> String {
         ),
         Inst::Jump { target } => format!("b {}", label(function, *target)),
         Inst::Branch { cond, target } => format!("b.{} {}", cond.asm(), label(function, *target)),
+        Inst::Args { args } => args
+            .iter()
+            .map(|arg| {
+                format!(
+                    "mov {}, {}",
+                    regs::format_reg(arg.vreg, arg.ty),
+                    regs::format_reg(arg.preg, arg.ty)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n    "),
         Inst::Call { symbol } => format!("bl {symbol}"),
         Inst::RetI32 { src } => format!("mov w0, {}", regs::format_reg(*src, Type::new_i32())),
         Inst::Ret => "ret".to_string(),
@@ -363,6 +374,17 @@ pub fn emit_post_ra_inst(
             let (reg, spill) = resolve_def(allocs[0], Type::new_i32(), 0)?;
             *dst = reg;
             spill
+        }
+        Inst::Args { args } => {
+            expect_alloc_count(inst, allocs, args.len())?;
+            for (arg, allocation) in args.iter_mut().zip(allocs) {
+                let (reg, spill) = resolve_def(*allocation, arg.ty, 0)?;
+                if spill.is_some() {
+                    return Err("entry argument cannot be assigned to a spill slot".into());
+                }
+                arg.vreg = reg;
+            }
+            None
         }
         Inst::RetI32 { src } => {
             expect_alloc_count(inst, allocs, 1)?;

@@ -120,8 +120,8 @@ impl ABIMachineSpec for AArch64Abi {
         panic!("stack argument lowering is implemented with AAPCS64 frame lowering")
     }
 
-    fn gen_args(_: Vec<ArgPair>) -> Inst {
-        panic!("argument copies are emitted by AArch64 ABI lowering")
+    fn gen_args(args: Vec<ArgPair>) -> Inst {
+        Inst::Args { args }
     }
 
     fn gen_ret() -> Inst {

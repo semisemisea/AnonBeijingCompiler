@@ -2,6 +2,7 @@ use raana_ir::ir::{
     inst_kind::{BinaryOp, InstKind},
     Function as HirFunction, Program,
 };
+use taki_mir::prelude::Arena;
 use taki_mir::{
     block_order::MirBlockIndex,
     lower::{LowerBackend, LowerContext},
@@ -21,9 +22,14 @@ use crate::{
 /// remains the production backend until this selector covers full SysY HIR.
 pub fn compile_function_vcode(program: &Program, func: HirFunction) -> Result<String, String> {
     let data = program.func_data(func);
-    if !data.params().is_empty() {
+    if data.params().len() > 8
+        || data
+            .params()
+            .iter()
+            .any(|param| !data.inst_data(*param).ty().is_i32())
+    {
         return Err(format!(
-            "VCode AArch64 lowering for {} does not support function parameters yet",
+            "VCode AArch64 lowering for {} supports at most eight i32 register parameters",
             data.name()
         ));
     }
@@ -344,6 +350,58 @@ mod tests {
                 "missing {opcode} in:\n{assembly}"
             );
         }
+
+        let mut clang = Command::new("clang")
+            .args([
+                "--target=aarch64-linux-gnu",
+                "-x",
+                "assembler",
+                "-c",
+                "-",
+                "-o",
+                "/dev/null",
+            ])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("clang must be available for AArch64 assembly validation");
+        clang
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(assembly.as_bytes())
+            .unwrap();
+        let output = clang.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "clang rejected generated assembly: {}\n{assembly}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn lowers_and_assembles_i32_register_parameters() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "sum".into(),
+            vec![Type::get_i32(), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let params = data.params().to_vec();
+        let sum = data
+            .new_local_inst()
+            .binary(BinaryOp::Add, params[0], params[1]);
+        let ret = data.new_local_inst().ret(Some(sum));
+        data.layout_mut().insert_inst(entry, sum);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let assembly = compile_function_vcode(&program, function).unwrap();
+        assert!(assembly.contains("mov w0, w0"), "{assembly}");
+        assert!(assembly.contains("mov w1, w1"), "{assembly}");
+        assert!(assembly.contains("add w"), "{assembly}");
 
         let mut clang = Command::new("clang")
             .args([

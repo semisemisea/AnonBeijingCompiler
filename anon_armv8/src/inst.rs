@@ -1,4 +1,5 @@
 use taki_mir::{
+    abi::ArgPair,
     block_order::MirBlockIndex,
     reg_alloc::reg::{OperandVisitor, OperandVisitorImpl},
     register::{Reg, Writable},
@@ -129,6 +130,9 @@ pub enum Inst {
         cond: Cond,
         target: MirBlockIndex,
     },
+    Args {
+        args: Vec<ArgPair>,
+    },
     Call {
         symbol: String,
     },
@@ -186,6 +190,11 @@ impl MachInst for Inst {
             }
             Self::CmpZero { src, .. } => collector.reg_use(src),
             Self::CSet { dst, .. } => collector.reg_def(&mut Writable::from_reg(*dst)),
+            Self::Args { args } => {
+                for arg in args {
+                    collector.reg_fixed_def(&mut Writable::from_reg(arg.vreg), arg.preg);
+                }
+            }
             Self::Call { .. } => {
                 let mut clobbers = taki_mir::reg_alloc::reg::PRegSet::empty();
                 for index in 0..=18 {

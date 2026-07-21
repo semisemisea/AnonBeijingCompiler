@@ -174,7 +174,7 @@ impl LowerBackend for IntegerBackend {
             }
             InstKind::Call(call) => {
                 let callee = ctx.program().func_data(call.callee());
-                if !callee.ret_ty().is_i32()
+                if (!callee.ret_ty().is_i32() && !callee.ret_ty().is_unit())
                     || call.args().len() > 8
                     || call
                         .args()
@@ -182,7 +182,7 @@ impl LowerBackend for IntegerBackend {
                         .any(|arg| !ctx.inst_data(*arg).ty().is_i32())
                 {
                     panic!(
-                        "VCode AArch64 lowering only supports direct calls with at most eight i32 arguments and an i32 result"
+                        "VCode AArch64 lowering only supports direct calls with at most eight i32 arguments and an i32 or void result"
                     );
                 }
                 let args = call
@@ -198,7 +198,10 @@ impl LowerBackend for IntegerBackend {
                 ctx.emit_inst(Inst::Call {
                     symbol: callee.name().to_owned(),
                     args,
-                    result: Some((ctx.result_reg(inst), Type::new_i32())),
+                    result: callee
+                        .ret_ty()
+                        .is_i32()
+                        .then(|| (ctx.result_reg(inst), Type::new_i32())),
                 });
             }
             InstKind::Return(ret) => match ret.value() {
@@ -486,6 +489,64 @@ mod tests {
         assert!(assembly.contains("bl add"), "{assembly}");
         assert!(assembly.contains("movz w0, #40"), "{assembly}");
         assert!(assembly.contains("movz w1, #2"), "{assembly}");
+
+        let mut clang = Command::new("clang")
+            .args([
+                "--target=aarch64-linux-gnu",
+                "-x",
+                "assembler",
+                "-c",
+                "-",
+                "-o",
+                "/dev/null",
+            ])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("clang must be available for AArch64 assembly validation");
+        clang
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(assembly.as_bytes())
+            .unwrap();
+        let output = clang.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "clang rejected generated assembly: {}\n{assembly}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn lowers_and_assembles_void_i32_direct_call() {
+        let mut program = Program::new();
+        let callee = program.new_function(
+            Type::get_unit(),
+            "sink".into(),
+            vec![Type::get_i32(), Type::get_i32()],
+        );
+        let caller = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let data = program.func_data_mut(caller);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let lhs = data.new_local_inst().integer(40);
+        let rhs = data.new_local_inst().integer(2);
+        let call = data
+            .new_local_inst()
+            .call_with_type(callee, vec![lhs, rhs], Type::get_unit());
+        let result = data.new_local_inst().integer(7);
+        let ret = data.new_local_inst().ret(Some(result));
+        for inst in [call, ret] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+
+        let assembly = compile_function_vcode(&program, caller).unwrap();
+        assert!(assembly.contains("bl sink"), "{assembly}");
+        assert!(assembly.contains("movz w0, #40"), "{assembly}");
+        assert!(assembly.contains("movz w1, #2"), "{assembly}");
+        let call = assembly.find("    bl sink").unwrap();
+        assert!(assembly[call..].contains("ldr w0"), "{assembly}");
 
         let mut clang = Command::new("clang")
             .args([

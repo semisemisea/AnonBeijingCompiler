@@ -325,6 +325,13 @@ renaming unless escaping becomes necessary.
 
 ## Milestone 2: Linux AAPCS64 ABI And Stack Frames
 
+**Status: In progress (2026-07-21).** The target now assigns i32/pointer and
+f32 parameters through their independent eight-register AAPCS64 windows,
+assigns overflow scalar arguments to eight-byte stack slots, exposes scalar
+return locations, and computes 16-byte-aligned fixed frame sizes. The remaining
+M2 work is emitting prologues/epilogues and applying these locations to lowered
+calls; it depends on M3's function/body lowering.
+
 ### 2.1 ABI Scope
 
 Support only the normal Linux AAPCS64 calling convention used by the test

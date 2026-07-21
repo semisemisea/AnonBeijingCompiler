@@ -107,6 +107,12 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
         self.insert_inst(Call::new_data(callee, args, self.func_type(callee)))
     }
 
+    /// Constructs a cross-function call when the local builder cannot inspect
+    /// the Program-owned callee arena.
+    fn call_with_type(&mut self, callee: Function, args: Vec<Inst>, ret_ty: Type) -> Inst {
+        self.insert_inst(Call::new_data(callee, args, ret_ty))
+    }
+
     fn cast(&mut self, src: Inst, ty: Type) -> Inst {
         let src_ty = self.inst_type(src);
         assert!(src_ty.is_scalar(), "cast source is not scalar");

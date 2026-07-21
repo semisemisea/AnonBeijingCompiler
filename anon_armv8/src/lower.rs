@@ -10,11 +10,19 @@ use raana_ir::ir::{
 use crate::abi::Signature;
 
 pub fn compile_program_to_asm(program: &Program) -> Result<String, String> {
-    let mut output = String::from("    .text\n");
+    let globals = program
+        .global_inst_layout()
+        .iter()
+        .enumerate()
+        .map(|(index, &inst)| (inst, format!(".LG{index}")))
+        .collect::<HashMap<_, _>>();
+    let mut output = String::new();
+    emit_globals(program, &globals, &mut output)?;
+    writeln!(output, "    .text").unwrap();
     for &func in program.function_layout() {
         let data = program.func_data(func);
         if !data.layout().is_decl() {
-            FunctionLowerer::new(program, func)?.emit(&mut output)?;
+            FunctionLowerer::new(program, func, &globals)?.emit(&mut output)?;
         }
     }
     Ok(output)
@@ -26,13 +34,18 @@ struct FunctionLowerer<'a> {
     name: &'a str,
     slots: HashMap<HirInst, u32>,
     allocs: HashMap<HirInst, u32>,
+    globals: &'a HashMap<HirInst, String>,
     block_labels: HashMap<BasicBlock, usize>,
     outgoing_size: u32,
     local_size: u32,
 }
 
 impl<'a> FunctionLowerer<'a> {
-    fn new(program: &'a Program, func: HirFunction) -> Result<Self, String> {
+    fn new(
+        program: &'a Program,
+        func: HirFunction,
+        globals: &'a HashMap<HirInst, String>,
+    ) -> Result<Self, String> {
         let data = program.func_data(func);
         let mut slots = HashMap::new();
         let mut allocs = HashMap::new();
@@ -97,6 +110,7 @@ impl<'a> FunctionLowerer<'a> {
             name: data.name(),
             slots,
             allocs,
+            globals,
             block_labels,
             outgoing_size,
             local_size,
@@ -275,11 +289,30 @@ impl<'a> FunctionLowerer<'a> {
                 Ok(())
             }
             InstKind::Alloc => Ok(()),
-            InstKind::Store(store) if data.inst_data(store.src()).ty().is_i32() => {
-                self.value_into(output, store.src(), "w9")?;
+            InstKind::GetElemPtr(gep) => {
+                self.address_into(output, gep.base(), "x10")?;
+                let mut current = data.inst_data(gep.base()).ty().clone();
+                for &offset in gep.offsets() {
+                    let (next, stride) = gep_step(&current)?;
+                    self.value_into(output, offset, "w9")?;
+                    if stride.is_power_of_two() && stride.trailing_zeros() <= 4 {
+                        writeln!(
+                            output,
+                            "    add x10, x10, w9, sxtw #{}",
+                            stride.trailing_zeros()
+                        )
+                        .unwrap();
+                    } else {
+                        writeln!(output, "    mov w11, #{stride}").unwrap();
+                        writeln!(output, "    smaddl x10, w9, w11, x10").unwrap();
+                    }
+                    current = next;
+                }
+                self.store_pointer(output, inst, "x10")
+            }
+            InstKind::Store(store) => {
                 self.address_into(output, store.dest(), "x10")?;
-                writeln!(output, "    str w9, [x10]").unwrap();
-                Ok(())
+                self.store_initializer(output, store.src(), data.inst_data(store.src()).ty(), 0)
             }
             InstKind::Load(load) if inst_data.ty().is_i32() => {
                 self.address_into(output, load.src(), "x10")?;
@@ -319,6 +352,24 @@ impl<'a> FunctionLowerer<'a> {
         if let Some(offset) = self.allocs.get(&inst) {
             writeln!(output, "    add {reg}, sp, #{}", self.local_base() + offset).unwrap();
             Ok(())
+        } else if let Some(symbol) = self.globals.get(&inst) {
+            writeln!(output, "    adrp {reg}, {symbol}").unwrap();
+            writeln!(output, "    add {reg}, {reg}, :lo12:{symbol}").unwrap();
+            Ok(())
+        } else if self
+            .program
+            .func_data(self.func)
+            .inst_data(inst)
+            .ty()
+            .is_pointer()
+        {
+            writeln!(
+                output,
+                "    ldr {reg}, [sp, #{}]",
+                self.local_base() + self.slot(inst)?
+            )
+            .unwrap();
+            Ok(())
         } else {
             Err(format!("{}: unsupported pointer value {}", self.name, inst))
         }
@@ -354,6 +405,74 @@ impl<'a> FunctionLowerer<'a> {
         Ok(())
     }
 
+    fn store_pointer(&self, output: &mut String, inst: HirInst, reg: &str) -> Result<(), String> {
+        writeln!(
+            output,
+            "    str {reg}, [sp, #{}]",
+            self.local_base() + self.slot(inst)?
+        )
+        .unwrap();
+        Ok(())
+    }
+
+    fn store_initializer(
+        &self,
+        output: &mut String,
+        value: HirInst,
+        ty: &HirType,
+        offset: u32,
+    ) -> Result<(), String> {
+        let data = self.program.func_data(self.func).inst_data(value);
+        match data.kind() {
+            InstKind::Aggregate(aggregate) => {
+                let TypeKind::Array(element, _) = ty.kind() else {
+                    return Err(format!(
+                        "{}: aggregate value has non-array type {ty}",
+                        self.name
+                    ));
+                };
+                let stride = target_size(element)?;
+                for (index, &element_value) in aggregate.value().iter().enumerate() {
+                    self.store_initializer(
+                        output,
+                        element_value,
+                        element,
+                        offset + (index as u32) * stride,
+                    )?;
+                }
+                Ok(())
+            }
+            InstKind::ZeroInit => self.zero_memory(output, ty, offset),
+            _ if ty.is_i32() => {
+                self.value_into(output, value, "w9")?;
+                if offset == 0 {
+                    writeln!(output, "    str w9, [x10]").unwrap();
+                } else {
+                    writeln!(output, "    str w9, [x10, #{offset}]").unwrap();
+                }
+                Ok(())
+            }
+            _ => Err(format!(
+                "{}: unsupported aggregate element type {ty}",
+                self.name
+            )),
+        }
+    }
+
+    fn zero_memory(&self, output: &mut String, ty: &HirType, offset: u32) -> Result<(), String> {
+        let size = target_size(ty)?;
+        writeln!(output, "    mov w9, wzr").unwrap();
+        for byte_offset in (0..size).step_by(4) {
+            let at = offset + byte_offset;
+            if at == 0 {
+                writeln!(output, "    str w9, [x10]").unwrap();
+            } else {
+                writeln!(output, "    str w9, [x10, #{at}]").unwrap();
+            }
+        }
+        Ok(())
+    }
+
     fn slot(&self, inst: HirInst) -> Result<u32, String> {
         self.slots
             .get(&inst)
@@ -378,6 +497,60 @@ impl<'a> FunctionLowerer<'a> {
 
     fn local_base(&self) -> u32 {
         self.outgoing_size
+    }
+}
+
+fn emit_globals(
+    program: &Program,
+    globals: &HashMap<HirInst, String>,
+    output: &mut String,
+) -> Result<(), String> {
+    if globals.is_empty() {
+        return Ok(());
+    }
+    writeln!(output, "    .data").unwrap();
+    for &inst in program.global_inst_layout() {
+        let symbol = &globals[&inst];
+        let data = program.global_arena().inst_arena().data_of(inst);
+        let InstKind::GlobalAlloc(global) = data.kind() else {
+            return Err("global layout contains a non-global allocation".into());
+        };
+        writeln!(
+            output,
+            "    .p2align {}",
+            target_align(&data.ty().derefernce())?.trailing_zeros()
+        )
+        .unwrap();
+        writeln!(output, "{symbol}:").unwrap();
+        emit_global_initializer(program, global.init(), output)?;
+    }
+    Ok(())
+}
+
+fn emit_global_initializer(
+    program: &Program,
+    inst: HirInst,
+    output: &mut String,
+) -> Result<(), String> {
+    let data = program.global_arena().inst_arena().data_of(inst);
+    match data.kind() {
+        InstKind::Integer(value) => writeln!(output, "    .word {}", value.value()).unwrap(),
+        InstKind::ZeroInit => writeln!(output, "    .zero {}", target_size(data.ty())?).unwrap(),
+        InstKind::Aggregate(aggregate) => {
+            for &value in aggregate.value() {
+                emit_global_initializer(program, value, output)?;
+            }
+        }
+        _ => return Err(format!("unsupported global initializer: {:?}", data.kind())),
+    }
+    Ok(())
+}
+
+fn gep_step(ty: &HirType) -> Result<(HirType, u32), String> {
+    match ty.kind() {
+        TypeKind::Pointer(pointee) => Ok((pointee.clone(), target_size(pointee)?)),
+        TypeKind::Array(element, _) => Ok((element.clone(), target_size(element)?)),
+        _ => Err(format!("GEP on non-address type: {ty}")),
     }
 }
 

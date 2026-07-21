@@ -487,6 +487,9 @@ appropriate `cset` condition code.
 
 ## Milestone 4: Memory, Arrays, And Global Data
 
+**Status: In progress (2026-07-21).** The native backend now uses explicit
+AArch64 target size/alignment rules for scalar and nested-array frame objects,
+
 ### 4.1 Local Allocation, Load, And Store
 
 - Pre-scan every defined function for `Alloc` instructions and create fixed

@@ -671,11 +671,12 @@ considered. This integration
 exposed and fixed three generic allocator issues: the invalid VReg sentinel was
 unconstructable, register-only operand demand was not decremented after a fresh
 allocation, and reverse liveness retained values after their definitions. The
-selector is not connected to the native driver: function parameters, calls,
-memory, floats, and block parameters still require VCode instruction selection
-and ABI coverage before M6 can be completed. Signed remainder selects `sdiv`
-followed by `msub`; all remaining integer binary operations are validated through
-the post-RA assembler path.
+selector is not connected to the native driver: calls, memory, floats, stack
+parameters, and block parameters still require VCode instruction selection and
+ABI coverage before M6 can be completed. Up to eight i32 entry parameters are
+defined in their fixed AAPCS64 `w0..w7` locations and validated through the
+post-RA assembler path. Signed remainder selects `sdiv` followed by `msub`; all
+remaining integer binary operations are likewise validated through that path.
 The selector now verifies a single-successor i32 block-parameter transfer through
 the allocator's spill-oriented edge edits. Conditional block-parameter edges,
 loop-carried values, and critical-edge copy cycles remain excluded because the

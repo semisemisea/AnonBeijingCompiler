@@ -159,7 +159,7 @@ fixing that contract will create fragile, untestable spill failures.
   to flattened allocation order.
 - [x] Ensure alias resolution updates the actual instruction fields for both
   uses and defs rather than only temporary `Writable<Reg>` wrappers.
-- [ ] Add test coverage for VReg aliases through use operands, def operands,
+- [x] Add test coverage for VReg aliases through use operands, def operands,
   block parameters, and branch arguments.
 - [x] Implement and test `OperandConstraint::Limit`; allocator candidate
   selection must honor the encoded physical-register subset.
@@ -192,7 +192,7 @@ fixing that contract will create fragile, untestable spill failures.
 
 ### Exit Gate
 
-- [ ] `taki_mir` unit tests cover aliases, Limit, reuse, clobbers, edge edits,
+- [x] `taki_mir` unit tests cover aliases, Limit, reuse, clobbers, edge edits,
   and allocation output mapping.
 - [x] `anon_armv8` tests cover post-RA instructions with all supported spilled
   operand shapes and no scratch-register overflow.

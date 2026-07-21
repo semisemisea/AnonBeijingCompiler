@@ -1344,6 +1344,11 @@ pub trait OperandVisitorImpl: OperandVisitor {
         self.reg_maybe_fixed(reg.reg.as_mut(), OperandKind::Def, OperandPos::Late);
     }
 
+    /// Add a definition held directly in an instruction register field.
+    fn reg_def_reg(&mut self, reg: &mut Reg) {
+        self.reg_maybe_fixed(reg, OperandKind::Def, OperandPos::Late);
+    }
+
     /// Add a register "early def", which logically occurs at the
     /// beginning of the instruction, alongside all uses. Use this
     /// when the def may be written before all uses are read; the
@@ -1368,6 +1373,11 @@ pub trait OperandVisitorImpl: OperandVisitor {
     /// RealReg at this point.
     fn reg_fixed_def(&mut self, reg: &mut Writable<impl AsMut<Reg>>, rreg: Reg) {
         self.reg_fixed(reg.reg.as_mut(), rreg, OperandKind::Def, OperandPos::Late);
+    }
+
+    /// Add a fixed definition held directly in an instruction register field.
+    fn reg_fixed_def_reg(&mut self, reg: &mut Reg, rreg: Reg) {
+        self.reg_fixed(reg, rreg, OperandKind::Def, OperandPos::Late);
     }
 
     /// Add an operand tying a virtual register to a physical register.
@@ -1407,6 +1417,21 @@ pub trait OperandVisitorImpl: OperandVisitor {
             // virtual register.
             let constraint = OperandConstraint::Reuse(idx);
             self.add_operand(reg, constraint, OperandKind::Def, OperandPos::Late);
+        }
+    }
+
+    /// Add a tied definition held directly in an instruction register field.
+    fn reg_reuse_def_reg(&mut self, reg: &mut Reg, idx: usize) {
+        if let Some(rreg) = reg.to_real_reg() {
+            self.reg_fixed_nonallocatable(rreg.into());
+        } else {
+            debug_assert!(reg.is_virtual());
+            self.add_operand(
+                reg,
+                OperandConstraint::Reuse(idx),
+                OperandKind::Def,
+                OperandPos::Late,
+            );
         }
     }
 

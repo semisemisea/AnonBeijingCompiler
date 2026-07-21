@@ -168,24 +168,24 @@ impl MachInst for Inst {
 
     fn get_operands(&mut self, collector: &mut impl OperandVisitor) {
         match self {
-            Self::MovImm { dst, .. } => collector.reg_def(&mut Writable::from_reg(*dst)),
+            Self::MovImm { dst, .. } => collector.reg_def_reg(dst),
             Self::Mov { dst, src, .. } => {
                 collector.reg_use(src);
-                collector.reg_def(&mut Writable::from_reg(*dst));
+                collector.reg_def_reg(dst);
             }
             Self::MovK { dst, src, .. } => {
                 collector.reg_use(src);
-                collector.reg_reuse_def(&mut Writable::from_reg(*dst), 0);
+                collector.reg_reuse_def_reg(dst, 0);
             }
             Self::FAdd { dst, lhs, rhs } => {
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
-                collector.reg_def(&mut Writable::from_reg(*dst));
+                collector.reg_def_reg(dst);
             }
             Self::Add { dst, lhs, rhs, .. } => {
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
-                collector.reg_def(&mut Writable::from_reg(*dst));
+                collector.reg_def_reg(dst);
             }
             Self::Sub { dst, lhs, rhs, .. }
             | Self::Mul { dst, lhs, rhs, .. }
@@ -198,7 +198,7 @@ impl MachInst for Inst {
             | Self::Asr { dst, lhs, rhs, .. } => {
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
-                collector.reg_def(&mut Writable::from_reg(*dst));
+                collector.reg_def_reg(dst);
             }
             Self::MSub {
                 dst,
@@ -210,17 +210,17 @@ impl MachInst for Inst {
                 collector.reg_use(mul_lhs);
                 collector.reg_use(mul_rhs);
                 collector.reg_use(sub);
-                collector.reg_def(&mut Writable::from_reg(*dst));
+                collector.reg_def_reg(dst);
             }
             Self::Cmp { lhs, rhs, .. } => {
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
             }
             Self::CmpZero { src, .. } => collector.reg_use(src),
-            Self::CSet { dst, .. } => collector.reg_def(&mut Writable::from_reg(*dst)),
+            Self::CSet { dst, .. } => collector.reg_def_reg(dst),
             Self::Args { args } => {
                 for arg in args {
-                    collector.reg_fixed_def(&mut Writable::from_reg(arg.vreg), arg.preg);
+                    collector.reg_fixed_def_reg(&mut arg.vreg, arg.preg);
                 }
             }
             Self::Call { args, result, .. } => {
@@ -233,7 +233,7 @@ impl MachInst for Inst {
                     } else {
                         regs::int_reg(0)
                     };
-                    collector.reg_fixed_def(&mut Writable::from_reg(*result), preg);
+                    collector.reg_fixed_def_reg(result, preg);
                 }
                 let mut clobbers = taki_mir::reg_alloc::reg::PRegSet::empty();
                 for index in 0..=18 {

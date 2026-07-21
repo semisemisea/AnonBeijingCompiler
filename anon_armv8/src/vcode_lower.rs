@@ -300,9 +300,60 @@ mod tests {
     };
 
     use raana_ir::ir::{BinaryOp, Program, Type};
-    use taki_mir::prelude::{Arena, BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder};
+    use taki_mir::{
+        abi::CalleeABI,
+        block_order::BlockLoweringOrder,
+        prelude::{Arena, BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
+        register::VRegAllocator,
+        vcode::VCodeBuilder,
+    };
 
-    use super::compile_function_vcode;
+    use super::{compile_function_vcode, Inst};
+    use crate::abi::AArch64Abi;
+
+    #[test]
+    fn normalizes_aliases_in_instruction_and_cfg_fields() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let abi = CalleeABI::<AArch64Abi>::new(program.func_data(function));
+        let order = BlockLoweringOrder::for_function(&program, function);
+        let mut vregs = VRegAllocator::<Inst>::with_capaticy(5);
+        let canonical = vregs.alloc(taki_mir::types::Type::new_i32());
+        let use_alias = vregs.alloc(taki_mir::types::Type::new_i32());
+        let def_alias = vregs.alloc(taki_mir::types::Type::new_i32());
+        let param_alias = vregs.alloc(taki_mir::types::Type::new_i32());
+        let branch_alias = vregs.alloc(taki_mir::types::Type::new_i32());
+        for alias in [use_alias, def_alias, param_alias, branch_alias] {
+            vregs.set_reg_alias(alias, canonical);
+        }
+
+        let mut builder = VCodeBuilder::new(abi, order);
+        builder.push(Inst::Mov {
+            dst: def_alias,
+            src: use_alias,
+            ty: taki_mir::types::Type::new_i32(),
+        });
+        builder.add_block_param(param_alias.to_virtual_reg().unwrap());
+        builder.add_block_args_for_succ(&[branch_alias]);
+        builder.end_bb();
+        let vcode = builder.build(vregs);
+
+        assert!(matches!(
+            vcode.insts()[0],
+            Inst::Mov { dst, src, .. } if dst == canonical && src == canonical
+        ));
+        assert_eq!(vcode.block_params(), &[canonical.to_virtual_reg().unwrap()]);
+        assert_eq!(
+            vcode.branch_block_args(),
+            &[canonical.to_virtual_reg().unwrap()]
+        );
+    }
 
     #[test]
     fn lowers_and_assembles_integer_arithmetic_return() {

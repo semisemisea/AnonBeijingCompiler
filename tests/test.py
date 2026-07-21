@@ -234,6 +234,19 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, asm_backend):
                 " CE ",
                 "VCode assembly marker missing; direct backend fallback is forbidden",
             )
+        shape_path = base.with_suffix(".asm")
+        if shape_path.exists():
+            missing = [
+                line
+                for line in shape_path.read_text().splitlines()
+                if line and line not in artifact
+            ]
+            if missing:
+                return (
+                    time.perf_counter() - start,
+                    " CE ",
+                    f"VCode assembly missing required shapes: {', '.join(missing)}",
+                )
 
     ir_args = [str(compiler)]
     if opt_level:

@@ -617,6 +617,7 @@ fn scratch_reg(ty: Type, scratch_index: usize) -> Result<Reg, String> {
     match (ty.is_f32(), scratch_index) {
         (false, 0) => Ok(regs::int_reg(regs::INT_SCRATCH0)),
         (false, 1) => Ok(regs::int_reg(regs::INT_SCRATCH1)),
+        (false, 2) => Ok(regs::int_reg(regs::INT_SCRATCH2)),
         (true, 0) => Ok(regs::float_reg(regs::FP_SCRATCH)),
         (true, 1) => Ok(regs::float_reg(regs::FP_SCRATCH1)),
         _ => Err("instruction needs more post-RA scratch registers than AArch64 reserves".into()),
@@ -657,12 +658,36 @@ fn emit_spill_access(
         return Ok(());
     }
 
-    writeln!(output, "    movz x17, #{}", offset & 0xffff).unwrap();
+    writeln!(
+        output,
+        "    movz x{}, #{}",
+        regs::INT_ADDR_SCRATCH,
+        offset & 0xffff
+    )
+    .unwrap();
     if offset >> 16 != 0 {
-        writeln!(output, "    movk x17, #{}, lsl #16", offset >> 16).unwrap();
+        writeln!(
+            output,
+            "    movk x{}, #{}, lsl #16",
+            regs::INT_ADDR_SCRATCH,
+            offset >> 16
+        )
+        .unwrap();
     }
-    writeln!(output, "    add x17, sp, x17").unwrap();
-    writeln!(output, "    {opcode} {}, [x17]", regs::format_reg(reg, ty)).unwrap();
+    writeln!(
+        output,
+        "    add x{}, sp, x{}",
+        regs::INT_ADDR_SCRATCH,
+        regs::INT_ADDR_SCRATCH
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "    {opcode} {}, [x{}]",
+        regs::format_reg(reg, ty),
+        regs::INT_ADDR_SCRATCH
+    )
+    .unwrap();
     Ok(())
 }
 
@@ -797,7 +822,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "    ldr x16, [sp, #0]\n    movz x17, #40000\n    add x17, sp, x17\n    str x16, [x17]\n"
+            "    ldr x16, [sp, #0]\n    movz x15, #40000\n    add x15, sp, x15\n    str x16, [x15]\n"
         );
     }
 
@@ -892,6 +917,53 @@ mod tests {
         assert_eq!(
             output,
             "    ldr w16, [sp, #32]\n    ldr w17, [sp, #40]\n    add w16, w16, w17\n    str w16, [sp, #48]\n    ldr w16, [sp, #0]\n    ldr w17, [sp, #8]\n    cmp w16, w17\n"
+        );
+    }
+
+    #[test]
+    fn rewrites_three_spilled_msub_inputs() {
+        let mut output = String::new();
+        emit_post_ra_inst(
+            &mut output,
+            "main",
+            &Inst::MSub {
+                dst: regs::int_reg(0),
+                mul_lhs: regs::int_reg(1),
+                mul_rhs: regs::int_reg(2),
+                sub: regs::int_reg(3),
+                ty: Type::new_i32(),
+            },
+            &[
+                Allocation::stack(SpillSlot::new(0)),
+                Allocation::stack(SpillSlot::new(8)),
+                Allocation::stack(SpillSlot::new(16)),
+                Allocation::stack(SpillSlot::new(24)),
+            ],
+            32,
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            "    ldr w16, [sp, #32]\n    ldr w17, [sp, #40]\n    ldr w14, [sp, #48]\n    msub w16, w16, w17, w14\n    str w16, [sp, #56]\n"
+        );
+    }
+
+    #[test]
+    fn preserves_second_operand_scratch_for_large_spill_offsets() {
+        let mut output = String::new();
+        emit_spill_access(
+            &mut output,
+            "str",
+            regs::int_reg(regs::INT_SCRATCH1),
+            Type::new_i32(),
+            16_384,
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            "    movz x15, #16384\n    add x15, sp, x15\n    str w17, [x15]\n"
         );
     }
 

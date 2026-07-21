@@ -8,8 +8,10 @@ use taki_mir::{
 
 pub const FP: u8 = 29;
 pub const LR: u8 = 30;
+pub const INT_SCRATCH2: u8 = 14;
 pub const INT_SCRATCH0: u8 = 16;
 pub const INT_SCRATCH1: u8 = 17;
+pub const INT_ADDR_SCRATCH: u8 = 15;
 pub const FP_SCRATCH: u8 = 31;
 pub const FP_SCRATCH1: u8 = 30;
 
@@ -63,7 +65,7 @@ pub fn machine_env() -> &'static MachineEnv {
     static ENV: OnceLock<MachineEnv> = OnceLock::new();
     ENV.get_or_init(|| {
         let mut preferred_int = PRegSet::empty();
-        for index in 0..=15 {
+        for index in 0..=13 {
             preferred_int.add(int_preg(index));
         }
         let mut non_preferred_int = PRegSet::empty();
@@ -108,6 +110,9 @@ mod tests {
         let env = machine_env();
         let allocatable = PRegSet::from(env);
         assert!(!allocatable.contains(int_preg(INT_SCRATCH0)));
+        assert!(!allocatable.contains(int_preg(INT_SCRATCH1)));
+        assert!(!allocatable.contains(int_preg(INT_SCRATCH2)));
+        assert!(!allocatable.contains(int_preg(INT_ADDR_SCRATCH)));
         assert!(!allocatable.contains(int_preg(FP)));
         assert!(!allocatable.contains(int_preg(LR)));
         assert!(!allocatable.contains(float_preg(FP_SCRATCH)));

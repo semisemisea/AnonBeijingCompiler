@@ -34,7 +34,7 @@ pub const PINNED_PREG: usize = 192;
 /// are converted to `Operand`s.
 /// It seems to be a glue type for connecting `PReg`, `VReg` or a
 /// named `SpillSlot`
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Reg(pub(crate) u32);
 
 #[doc(hidden)]

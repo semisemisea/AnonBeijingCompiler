@@ -19,6 +19,7 @@ use crate::{
     types::LoweredType,
 };
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum MachTerminator {
     /// Not a terminator
     None,
@@ -30,6 +31,7 @@ pub enum MachTerminator {
     Branch,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum CallType {
     /// Not a call
     None,

@@ -227,6 +227,14 @@ addressing forms.
 
 ## Milestone 1: AArch64 Register Model And Assembly Skeleton
 
+**Status: Completed (2026-07-21).** `anon_armv8` now defines Linux AArch64
+physical-register identities, an initial allocator environment with ABI/scratch
+register reservations, a machine-instruction contract for moves, arithmetic,
+control flow, calls, and returns, plus a GNU assembly program emitter with
+stable function/block labels. Unit tests cover register views, allocator
+reservations, exact emitted skeleton text, and invoke
+`clang --target=aarch64-linux-gnu` to assemble generated output.
+
 ### 1.1 Register Definitions
 
 Define physical registers and assembler names:

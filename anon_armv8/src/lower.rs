@@ -1,5 +1,6 @@
 use std::{collections::HashMap, fmt::Write};
 
+use log::debug;
 use raana_ir::ir::{
     arena::Arena,
     basic_block::BasicBlock,
@@ -130,6 +131,10 @@ impl<'a> FunctionLowerer<'a> {
 
     fn emit(&self, output: &mut String) -> Result<(), String> {
         let frame_size = align_to(self.outgoing_size + self.local_size, 16);
+        debug!(
+            "lowering {}: frame={} outgoing={} locals={} blocks={:?}",
+            self.name, frame_size, self.outgoing_size, self.local_size, self.block_labels
+        );
         writeln!(output, "    .p2align 2").unwrap();
         writeln!(output, "    .globl {}", self.name).unwrap();
         writeln!(output, "    .type {}, %function", self.name).unwrap();
@@ -639,7 +644,7 @@ impl<'a> FunctionLowerer<'a> {
         match self.inst_data(inst).kind() {
             InstKind::ZeroInit => true,
             InstKind::Integer(value) => value.value() == 0,
-            InstKind::Float(value) => value.value() == 0.0,
+            InstKind::Float(value) => value.value().to_bits() == 0,
             InstKind::Aggregate(aggregate) => aggregate
                 .value()
                 .iter()
@@ -729,7 +734,7 @@ fn is_zero_global_initializer(program: &Program, inst: HirInst) -> bool {
     match program.global_arena().inst_arena().data_of(inst).kind() {
         InstKind::ZeroInit => true,
         InstKind::Integer(value) => value.value() == 0,
-        InstKind::Float(value) => value.value() == 0.0,
+        InstKind::Float(value) => value.value().to_bits() == 0,
         InstKind::Aggregate(aggregate) => aggregate
             .value()
             .iter()

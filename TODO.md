@@ -702,7 +702,12 @@ paths remain verified. Remaining M7 work is debug observability and final suite
 cleanup after M6's VCode-to-post-RA integration. QEMU validation passes all
 100 `tests/functional` cases and all 40 `tests/h_functional` cases; aggregate
 zero initialization uses compact loops and `.zero` directives so large local
-and global arrays remain assembleable.
+and global arrays remain assembleable. `RUST_LOG=anon_armv8=debug` reports
+each function's frame, outgoing area, local size, and block-label map without
+altering generated assembly. The independent LLVM path also passes all 100
+functional cases. The direct stack-slot emitter is correct but unoptimized:
+the serial performance run passed 35 of its first 36 cases, with
+`perf/h-1-01.sy` exceeding the 120-second harness limit.
 
 ### 7.1 Compiler Driver
 

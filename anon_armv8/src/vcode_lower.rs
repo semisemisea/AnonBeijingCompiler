@@ -176,7 +176,7 @@ mod tests {
     };
 
     use raana_ir::ir::{BinaryOp, Program, Type};
-    use taki_mir::prelude::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder};
+    use taki_mir::prelude::{Arena, BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder};
 
     use super::compile_function_vcode;
 
@@ -304,6 +304,64 @@ mod tests {
             assembly.matches("    b .Lmain_bb").count() >= 2,
             "{assembly}"
         );
+
+        let mut clang = Command::new("clang")
+            .args([
+                "--target=aarch64-linux-gnu",
+                "-x",
+                "assembler",
+                "-c",
+                "-",
+                "-o",
+                "/dev/null",
+            ])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("clang must be available for AArch64 assembly validation");
+        clang
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(assembly.as_bytes())
+            .unwrap();
+        let output = clang.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "clang rejected generated assembly: {}\n{assembly}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn lowers_and_assembles_jump_block_parameter() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        let join = data
+            .new_basic_block()
+            .basic_block("join".into(), vec![Type::get_i32()]);
+        let param = data.bb_data(join).params()[0];
+        data.layout_mut().push_bb_back(entry);
+        data.layout_mut().push_bb_back(join);
+
+        let value = data.new_local_inst().integer(42);
+        let jump = data.new_local_inst().jump(join, vec![value]);
+        data.layout_mut().insert_inst(entry, jump);
+        let ret = data.new_local_inst().ret(Some(param));
+        data.layout_mut().insert_inst(join, ret);
+
+        let assembly = compile_function_vcode(&program, function).unwrap();
+        let transfer = assembly
+            .find("    str w")
+            .expect("missing edge spill store");
+        let jump = assembly.find("    b .Lmain_bb1").expect("missing jump");
+        let reload = assembly[jump..]
+            .find("    ldr w")
+            .map(|offset| jump + offset)
+            .expect("missing block-parameter reload");
+        assert!(transfer < jump && jump < reload, "{assembly}");
 
         let mut clang = Command::new("clang")
             .args([

@@ -673,9 +673,10 @@ allocation, and reverse liveness retained values after their definitions. The
 selector is not connected to the native driver: function parameters, calls,
 memory, floats, block parameters, and the remaining integer operations still
 require VCode instruction selection and ABI coverage before M6 can be completed.
-The current control-flow coverage intentionally excludes block-parameter edge
-copies, loop-carried values, and critical-edge cycles; those require a separate
-allocator-edit correctness slice.
+The selector now verifies a single-successor i32 block-parameter transfer through
+the allocator's spill-oriented edge edits. Conditional block-parameter edges,
+loop-carried values, and critical-edge copy cycles remain excluded because the
+current conditional branch sequence needs per-edge edit placement.
 
 ### 6.1 Post-allocation Instruction Stream
 

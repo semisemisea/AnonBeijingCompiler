@@ -141,6 +141,24 @@ fn format_inst(function: &str, inst: &Inst) -> String {
             regs::format_reg(*lhs, *ty),
             regs::format_reg(*rhs, *ty)
         ),
+        Inst::Sub { dst, lhs, rhs, ty } => format!(
+            "sub {}, {}, {}",
+            regs::format_reg(*dst, *ty),
+            regs::format_reg(*lhs, *ty),
+            regs::format_reg(*rhs, *ty)
+        ),
+        Inst::Mul { dst, lhs, rhs, ty } => format!(
+            "mul {}, {}, {}",
+            regs::format_reg(*dst, *ty),
+            regs::format_reg(*lhs, *ty),
+            regs::format_reg(*rhs, *ty)
+        ),
+        Inst::SDiv { dst, lhs, rhs, ty } => format!(
+            "sdiv {}, {}, {}",
+            regs::format_reg(*dst, *ty),
+            regs::format_reg(*lhs, *ty),
+            regs::format_reg(*rhs, *ty)
+        ),
         Inst::Cmp { lhs, rhs, ty } => format!(
             "cmp {}, {}",
             regs::format_reg(*lhs, *ty),
@@ -235,6 +253,16 @@ pub fn emit_post_ra_inst(
             spill
         }
         Inst::Add { dst, lhs, rhs, ty } => {
+            expect_alloc_count(inst, allocs, 3)?;
+            *lhs = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
+            *rhs = resolve_use(output, allocs[1], *ty, 1, spill_base)?;
+            let (reg, spill) = resolve_def(allocs[2], *ty, 0)?;
+            *dst = reg;
+            spill
+        }
+        Inst::Sub { dst, lhs, rhs, ty }
+        | Inst::Mul { dst, lhs, rhs, ty }
+        | Inst::SDiv { dst, lhs, rhs, ty } => {
             expect_alloc_count(inst, allocs, 3)?;
             *lhs = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
             *rhs = resolve_use(output, allocs[1], *ty, 1, spill_base)?;

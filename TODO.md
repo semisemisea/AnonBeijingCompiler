@@ -659,8 +659,10 @@ path for constructed VCode blocks: it emits directives, finalized frame state,
 globally indexed edits/allocations, block labels, and a shared epilogue. A
 deliberately opt-in HIR selector now drives the complete
 `HIR -> VCode -> RA -> post-RA` path for zero-parameter i32 functions containing
-integer constants, `Add`, and i32 return. Its focused test constructs HIR, runs
-real allocation, and validates the emitted assembly with Clang. This integration
+integer constants, `Add`, `Sub`, `Mul`, signed `Div`, and i32 return. Its focused
+test constructs a chained HIR arithmetic expression, runs real allocation, and
+validates the emitted assembly with Clang. Selecting HIR blocks in reverse order
+ensures each consumer records its uses before the producer is considered. This integration
 exposed and fixed three generic allocator issues: the invalid VReg sentinel was
 unconstructable, register-only operand demand was not decremented after a fresh
 allocation, and reverse liveness retained values after their definitions. The

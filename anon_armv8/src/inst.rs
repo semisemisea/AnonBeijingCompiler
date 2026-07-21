@@ -48,6 +48,24 @@ pub enum Inst {
         rhs: Reg,
         ty: Type,
     },
+    Sub {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+        ty: Type,
+    },
+    Mul {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+        ty: Type,
+    },
+    SDiv {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+        ty: Type,
+    },
     Cmp {
         lhs: Reg,
         rhs: Reg,
@@ -86,6 +104,13 @@ impl MachInst for Inst {
                 collector.reg_def(&mut Writable::from_reg(*dst));
             }
             Self::Add { dst, lhs, rhs, .. } => {
+                collector.reg_use(lhs);
+                collector.reg_use(rhs);
+                collector.reg_def(&mut Writable::from_reg(*dst));
+            }
+            Self::Sub { dst, lhs, rhs, .. }
+            | Self::Mul { dst, lhs, rhs, .. }
+            | Self::SDiv { dst, lhs, rhs, .. } => {
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
                 collector.reg_def(&mut Writable::from_reg(*dst));

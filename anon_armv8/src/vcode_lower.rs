@@ -81,6 +81,24 @@ impl LowerBackend for IntegerBackend {
                         rhs,
                         ty: Type::new_i32(),
                     }),
+                    BinaryOp::Sub => ctx.emit_inst(Inst::Sub {
+                        dst,
+                        lhs,
+                        rhs,
+                        ty: Type::new_i32(),
+                    }),
+                    BinaryOp::Mul => ctx.emit_inst(Inst::Mul {
+                        dst,
+                        lhs,
+                        rhs,
+                        ty: Type::new_i32(),
+                    }),
+                    BinaryOp::Div => ctx.emit_inst(Inst::SDiv {
+                        dst,
+                        lhs,
+                        rhs,
+                        ty: Type::new_i32(),
+                    }),
                     op if op.is_compare() => {
                         ctx.emit_inst(Inst::Cmp {
                             lhs,
@@ -142,7 +160,7 @@ mod tests {
     use super::compile_function_vcode;
 
     #[test]
-    fn lowers_and_assembles_integer_add_return() {
+    fn lowers_and_assembles_integer_arithmetic_return() {
         let mut program = Program::new();
         let function = program.new_function(Type::get_i32(), "main".into(), vec![]);
         let data = program.func_data_mut(function);
@@ -150,15 +168,21 @@ mod tests {
         data.layout_mut().push_bb_back(entry);
         let lhs = data.new_local_inst().integer(40_000);
         let rhs = data.new_local_inst().integer(-2);
-        let sum = data.new_local_inst().binary(BinaryOp::Add, lhs, rhs);
-        let ret = data.new_local_inst().ret(Some(sum));
-        data.layout_mut().insert_inst(entry, sum);
+        let sub = data.new_local_inst().binary(BinaryOp::Sub, lhs, rhs);
+        let mul = data.new_local_inst().binary(BinaryOp::Mul, sub, rhs);
+        let div = data.new_local_inst().binary(BinaryOp::Div, mul, rhs);
+        let ret = data.new_local_inst().ret(Some(div));
+        data.layout_mut().insert_inst(entry, sub);
+        data.layout_mut().insert_inst(entry, mul);
+        data.layout_mut().insert_inst(entry, div);
         data.layout_mut().insert_inst(entry, ret);
 
         let assembly = compile_function_vcode(&program, function).unwrap();
         assert!(assembly.contains("movz"));
         assert!(assembly.contains("movk"));
-        assert!(assembly.contains("add"));
+        assert!(assembly.contains("sub"), "{assembly}");
+        assert!(assembly.contains("mul"), "{assembly}");
+        assert!(assembly.contains("sdiv"), "{assembly}");
         assert!(assembly.contains(".Lmain_epilogue:"));
 
         let mut clang = Command::new("clang")

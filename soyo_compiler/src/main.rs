@@ -17,7 +17,13 @@ lalrpop_util::lalrpop_mod!(sysy);
 ///     --emit ir,asm writes both outputs under the folder passed to `-o`
 fn main() {
     env_logger::init();
+    if let Err(error) = run() {
+        eprintln!("soyo_compiler: {error}");
+        std::process::exit(1);
+    }
+}
 
+fn run() -> Result<(), String> {
     let args = cli::Arg::parse();
 
     let source_code = std::fs::read_to_string(&args.input_path).unwrap();
@@ -56,7 +62,11 @@ fn main() {
         None
     };
     let asm = if needs_asm {
+<<<<<<< HEAD
         Some(dump_asm(&program, args.target))
+=======
+        Some(dump_asm(&program)?)
+>>>>>>> 4ec5a63 (Fix(driver): report AArch64 codegen failures)
     } else {
         None
     };
@@ -83,6 +93,7 @@ fn main() {
             write_file(&args.output_path.join(format!("{stem}.s")), asm);
         }
     }
+    Ok(())
 }
 
 fn dump_ir(program: &raana_ir::ir::Program) -> String {
@@ -95,11 +106,10 @@ fn dump_llvm(program: &raana_ir::ir::Program) -> String {
     raana_ir::llvm::write_llvm_ir(program)
 }
 
-fn dump_asm(program: &raana_ir::ir::Program, target: cli::Target) -> String {
+fn dump_asm(program: &raana_ir::ir::Program, target: cli::Target) -> Result<String, String> {
     match target {
-        cli::Target::Riscv64 => taki_mir::compile::<Riscv64Backend>(program),
-        cli::Target::Aarch64 => anon_armv8::compile_program_to_asm(program)
-            .unwrap_or_else(|error| panic!("AArch64 code generation failed: {error}")),
+        cli::Target::Riscv64 => Ok(taki_mir::compile::<Riscv64Backend>(program)),
+        cli::Target::Aarch64 => anon_armv8::compile_program_to_asm(program),
     }
 }
 

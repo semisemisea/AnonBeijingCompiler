@@ -694,6 +694,12 @@ provisional stack offsets in pre-allocation instructions.
 
 ## Milestone 7: Driver Integration And Diagnostics
 
+**Status: In progress (2026-07-21).** The driver now reports native AArch64
+code-generation failures as a concise `soyo_compiler:` diagnostic with a
+nonzero exit status instead of panicking. Existing `-S` and multi-emit output
+paths remain verified. Remaining M7 work is debug observability and final suite
+cleanup after M6's VCode-to-post-RA integration.
+
 ### 7.1 Compiler Driver
 
 - Add `anon_armv8` as a `soyo_compiler` dependency.

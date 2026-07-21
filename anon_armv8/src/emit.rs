@@ -2,7 +2,7 @@ use std::fmt::Write;
 
 use taki_mir::{
     block_order::MirBlockIndex,
-    reg_alloc::reg::{Allocation, Edit},
+    reg_alloc::reg::{Allocation, Edit, Output as RegAllocOutput},
     register::Reg,
     types::Type,
 };
@@ -188,6 +188,49 @@ pub fn emit_post_ra_inst(
     Ok(())
 }
 
+/// Emits a finalized VCode instruction stream without changing allocator edit
+/// order. Each program point is emitted around its corresponding instruction.
+pub fn emit_post_ra_stream(
+    output: &mut String,
+    function: &str,
+    insts: &[Inst],
+    allocations: &RegAllocOutput,
+    spill_base: u32,
+) -> Result<(), String> {
+    if allocations.inst_alloc_offsets.len() != insts.len() {
+        return Err(format!(
+            "register allocation has {} instruction allocation ranges for {} instructions",
+            allocations.inst_alloc_offsets.len(),
+            insts.len()
+        ));
+    }
+
+    for (index, inst) in insts.iter().enumerate() {
+        let index = index as u32;
+        for (point, edit) in &allocations.edits {
+            if point.inst() == index
+                && point.pos() == taki_mir::reg_alloc::reg::InstPosition::Before
+            {
+                emit_post_ra_move(output, edit, spill_base)?;
+            }
+        }
+        emit_post_ra_inst(
+            output,
+            function,
+            inst,
+            allocations.inst_allocs(index),
+            spill_base,
+        )?;
+        for (point, edit) in &allocations.edits {
+            if point.inst() == index && point.pos() == taki_mir::reg_alloc::reg::InstPosition::After
+            {
+                emit_post_ra_move(output, edit, spill_base)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn expect_alloc_count(inst: &Inst, allocs: &[Allocation], expected: usize) -> Result<(), String> {
     if allocs.len() == expected {
         Ok(())
@@ -293,7 +336,9 @@ mod tests {
         io::Write as _,
         process::{Command, Stdio},
     };
-    use taki_mir::reg_alloc::reg::{Allocation, Edit, SpillSlot};
+    use taki_mir::reg_alloc::reg::{
+        Allocation, Edit, Output as RegAllocOutput, ProgPoint, SpillSlot,
+    };
 
     #[test]
     fn emits_assembleable_function_skeleton() {
@@ -528,5 +573,46 @@ mod tests {
             }],
         };
         assert!(program.emit().contains("    fmov s0, s1\n"));
+    }
+
+    #[test]
+    fn preserves_before_instruction_after_edit_order() {
+        let mut output = String::new();
+        let allocations = RegAllocOutput {
+            num_spillslots: 0,
+            edits: vec![
+                (
+                    ProgPoint::before(0),
+                    Edit::Move {
+                        from: Allocation::reg(regs::int_preg(0)),
+                        to: Allocation::reg(regs::int_preg(1)),
+                        ty: Type::new_i32(),
+                    },
+                ),
+                (
+                    ProgPoint::after(0),
+                    Edit::Move {
+                        from: Allocation::reg(regs::int_preg(1)),
+                        to: Allocation::reg(regs::int_preg(2)),
+                        ty: Type::new_i32(),
+                    },
+                ),
+            ],
+            allocs: vec![Allocation::reg(regs::int_preg(3))],
+            inst_alloc_offsets: vec![0],
+        };
+        emit_post_ra_stream(
+            &mut output,
+            "main",
+            &[Inst::CSet {
+                dst: regs::int_reg(0),
+                cond: crate::inst::Cond::Eq,
+            }],
+            &allocations,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(output, "    mov w1, w0\n    cset w3, eq\n    mov w2, w1\n");
     }
 }

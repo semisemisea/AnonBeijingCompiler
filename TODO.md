@@ -642,7 +642,9 @@ and large-offset scratch-address formation. It is not yet wired into full VCode
 instruction rewriting or the native compiler path. The same emitter can now
 rewrite the current `Mov`/`Add`/`Cmp`/`CSet` VCode subset from operand
 allocations, inserting typed reloads and spill stores around physical
-instructions; full block/edit stream consumption remains pending.
+instructions. A stream emitter now preserves the allocator's exact
+`Before -> instruction -> After` edit order; integration still requires full
+instruction selection coverage and RA-dependent frame finalization.
 
 ### 6.1 Post-allocation Instruction Stream
 

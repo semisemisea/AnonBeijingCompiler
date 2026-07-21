@@ -141,17 +141,44 @@ impl<'a> FunctionLowerer<'a> {
             let offset = self.slot(param)?;
             match location {
                 crate::abi::ValueLocation::Reg(reg) => {
-                    writeln!(
-                        output,
-                        "    str w{}, [sp, #{}]",
-                        reg.to_physical_reg().unwrap().hw_enc(),
-                        self.local_base() + offset
-                    )
-                    .unwrap();
+                    let number = reg.to_physical_reg().unwrap().hw_enc();
+                    if data.inst_data(param).ty().is_f32() {
+                        writeln!(
+                            output,
+                            "    str s{number}, [sp, #{}]",
+                            self.local_base() + offset
+                        )
+                        .unwrap();
+                    } else if data.inst_data(param).ty().is_pointer() {
+                        writeln!(
+                            output,
+                            "    str x{number}, [sp, #{}]",
+                            self.local_base() + offset
+                        )
+                        .unwrap();
+                    } else {
+                        writeln!(
+                            output,
+                            "    str w{number}, [sp, #{}]",
+                            self.local_base() + offset
+                        )
+                        .unwrap();
+                    }
                 }
                 crate::abi::ValueLocation::Stack { offset: incoming } => {
-                    writeln!(output, "    ldr w9, [x29, #{}]", 16 + incoming).unwrap();
-                    writeln!(output, "    str w9, [sp, #{}]", self.local_base() + offset).unwrap();
+                    if data.inst_data(param).ty().is_f32() {
+                        writeln!(output, "    ldr s9, [x29, #{}]", 16 + incoming).unwrap();
+                        writeln!(output, "    str s9, [sp, #{}]", self.local_base() + offset)
+                            .unwrap();
+                    } else if data.inst_data(param).ty().is_pointer() {
+                        writeln!(output, "    ldr x9, [x29, #{}]", 16 + incoming).unwrap();
+                        writeln!(output, "    str x9, [sp, #{}]", self.local_base() + offset)
+                            .unwrap();
+                    } else {
+                        writeln!(output, "    ldr w9, [x29, #{}]", 16 + incoming).unwrap();
+                        writeln!(output, "    str w9, [sp, #{}]", self.local_base() + offset)
+                            .unwrap();
+                    }
                 }
             }
         }
@@ -182,6 +209,38 @@ impl<'a> FunctionLowerer<'a> {
         match inst_data.kind() {
             InstKind::Integer(_) | InstKind::FuncArgRef(_) | InstKind::BlockArgRef(_) => Ok(()),
             InstKind::ZeroInit if inst_data.ty().is_i32() => Ok(()),
+            InstKind::Binary(binary)
+                if data.inst_data(binary.lhs()).ty().is_f32() && binary.op().is_compare() =>
+            {
+                self.float_value_into(output, binary.lhs(), "s9")?;
+                self.float_value_into(output, binary.rhs(), "s10")?;
+                writeln!(output, "    fcmp s9, s10").unwrap();
+                writeln!(output, "    cset w9, {}", cond_for(binary.op())?).unwrap();
+                // AArch64 condition codes alone treat some unordered comparisons
+                // as true. SysY's LLVM lowering uses ordered floating predicates.
+                writeln!(output, "    cset w10, vc").unwrap();
+                writeln!(output, "    and w9, w9, w10").unwrap();
+                self.store_value(output, inst, "w9")
+            }
+            InstKind::Binary(binary) if data.inst_data(binary.lhs()).ty().is_f32() => {
+                self.float_value_into(output, binary.lhs(), "s9")?;
+                self.float_value_into(output, binary.rhs(), "s10")?;
+                let opcode = match binary.op() {
+                    BinaryOp::Add => "fadd",
+                    BinaryOp::Sub => "fsub",
+                    BinaryOp::Mul => "fmul",
+                    BinaryOp::Div => "fdiv",
+                    _ => {
+                        return Err(format!(
+                            "{}: unsupported float binary operation {:?}",
+                            self.name,
+                            binary.op()
+                        ))
+                    }
+                };
+                writeln!(output, "    {opcode} s9, s9, s10").unwrap();
+                self.store_float(output, inst, "s9")
+            }
             InstKind::Binary(binary) if inst_data.ty().is_i32() => {
                 self.value_into(output, binary.lhs(), "w9")?;
                 self.value_into(output, binary.rhs(), "w10")?;
@@ -225,13 +284,20 @@ impl<'a> FunctionLowerer<'a> {
                 Ok(())
             }
             InstKind::Branch(branch) => {
-                self.value_into(output, branch.cond(), "w9")?;
+                let cond_ty = data.inst_data(branch.cond()).ty();
                 let true_copy = format!(
                     ".L{}_branch_true_{}",
                     self.name,
                     self.block_label(self.parent_block(inst)?)?
                 );
-                writeln!(output, "    cbnz w9, {true_copy}").unwrap();
+                if cond_ty.is_f32() {
+                    self.float_value_into(output, branch.cond(), "s9")?;
+                    writeln!(output, "    fcmp s9, #0.0").unwrap();
+                    writeln!(output, "    b.ne {true_copy}").unwrap();
+                } else {
+                    self.value_into(output, branch.cond(), "w9")?;
+                    writeln!(output, "    cbnz w9, {true_copy}").unwrap();
+                }
                 self.copy_block_args(output, branch.f_target(), branch.f_args())?;
                 writeln!(
                     output,
@@ -253,12 +319,23 @@ impl<'a> FunctionLowerer<'a> {
             }
             InstKind::Return(ret) => {
                 if let Some(value) = ret.value() {
-                    self.value_into(output, value, "w0")?;
+                    if data.inst_data(value).ty().is_f32() {
+                        self.float_value_into(output, value, "s0")?;
+                    } else if data.inst_data(value).ty().is_pointer() {
+                        self.address_into(output, value, "x0")?;
+                    } else {
+                        self.value_into(output, value, "w0")?;
+                    }
                 }
                 writeln!(output, "    b .L{}_epilogue", self.name).unwrap();
                 Ok(())
             }
-            InstKind::Call(call) if inst_data.ty().is_i32() || inst_data.ty().is_unit() => {
+            InstKind::Call(call)
+                if inst_data.ty().is_i32()
+                    || inst_data.ty().is_f32()
+                    || inst_data.ty().is_pointer()
+                    || inst_data.ty().is_unit() =>
+            {
                 let signature = Signature::new(
                     &call
                         .args()
@@ -269,26 +346,51 @@ impl<'a> FunctionLowerer<'a> {
                 for (&arg, location) in call.args().iter().zip(signature.args) {
                     match location {
                         crate::abi::ValueLocation::Reg(reg) => {
-                            self.value_into(
-                                output,
-                                arg,
-                                &format!("w{}", reg.to_physical_reg().unwrap().hw_enc()),
-                            )?;
+                            let number = reg.to_physical_reg().unwrap().hw_enc();
+                            if data.inst_data(arg).ty().is_f32() {
+                                self.float_value_into(output, arg, &format!("s{number}"))?;
+                            } else if data.inst_data(arg).ty().is_pointer() {
+                                self.address_into(output, arg, &format!("x{number}"))?;
+                            } else {
+                                self.value_into(output, arg, &format!("w{number}"))?;
+                            }
                         }
                         crate::abi::ValueLocation::Stack { offset } => {
-                            self.value_into(output, arg, "w9")?;
-                            writeln!(output, "    str w9, [sp, #{offset}]").unwrap();
+                            if data.inst_data(arg).ty().is_f32() {
+                                self.float_value_into(output, arg, "s9")?;
+                                writeln!(output, "    str s9, [sp, #{offset}]").unwrap();
+                            } else if data.inst_data(arg).ty().is_pointer() {
+                                self.address_into(output, arg, "x9")?;
+                                writeln!(output, "    str x9, [sp, #{offset}]").unwrap();
+                            } else {
+                                self.value_into(output, arg, "w9")?;
+                                writeln!(output, "    str w9, [sp, #{offset}]").unwrap();
+                            }
                         }
                     }
                 }
                 let callee = self.program.func_data(call.callee()).name();
                 writeln!(output, "    bl {callee}").unwrap();
-                if !inst_data.ty().is_unit() {
+                if inst_data.ty().is_f32() {
+                    self.store_float(output, inst, "s0")?;
+                } else if inst_data.ty().is_pointer() {
+                    self.store_pointer(output, inst, "x0")?;
+                } else if !inst_data.ty().is_unit() {
                     self.store_value(output, inst, "w0")?;
                 }
                 Ok(())
             }
             InstKind::Alloc => Ok(()),
+            InstKind::Cast(cast) if inst_data.ty().is_f32() => {
+                self.value_into(output, cast.src(), "w9")?;
+                writeln!(output, "    scvtf s9, w9").unwrap();
+                self.store_float(output, inst, "s9")
+            }
+            InstKind::Cast(cast) if inst_data.ty().is_i32() => {
+                self.float_value_into(output, cast.src(), "s9")?;
+                writeln!(output, "    fcvtzs w9, s9").unwrap();
+                self.store_value(output, inst, "w9")
+            }
             InstKind::GetElemPtr(gep) => {
                 self.address_into(output, gep.base(), "x10")?;
                 let mut current = data.inst_data(gep.base()).ty().clone();
@@ -319,6 +421,16 @@ impl<'a> FunctionLowerer<'a> {
                 writeln!(output, "    ldr w9, [x10]").unwrap();
                 self.store_value(output, inst, "w9")
             }
+            InstKind::Load(load) if inst_data.ty().is_f32() => {
+                self.address_into(output, load.src(), "x10")?;
+                writeln!(output, "    ldr s9, [x10]").unwrap();
+                self.store_float(output, inst, "s9")
+            }
+            InstKind::Load(load) if inst_data.ty().is_pointer() => {
+                self.address_into(output, load.src(), "x10")?;
+                writeln!(output, "    ldr x9, [x10]").unwrap();
+                self.store_pointer(output, inst, "x9")
+            }
             _ => Err(format!(
                 "{}: unsupported instruction {:?}",
                 self.name,
@@ -348,9 +460,39 @@ impl<'a> FunctionLowerer<'a> {
         }
     }
 
+    fn float_value_into(
+        &self,
+        output: &mut String,
+        inst: HirInst,
+        reg: &str,
+    ) -> Result<(), String> {
+        let data = self.program.func_data(self.func).inst_data(inst);
+        match data.kind() {
+            InstKind::Float(value) => {
+                emit_i32(output, "w11", value.value().to_bits() as i32)?;
+                writeln!(output, "    fmov {reg}, w11").unwrap();
+                Ok(())
+            }
+            InstKind::ZeroInit if data.ty().is_f32() => {
+                writeln!(output, "    fmov {reg}, wzr").unwrap();
+                Ok(())
+            }
+            _ if data.ty().is_f32() => {
+                writeln!(
+                    output,
+                    "    ldr {reg}, [sp, #{}]",
+                    self.local_base() + self.slot(inst)?
+                )
+                .unwrap();
+                Ok(())
+            }
+            _ => Err(format!("{}: expected f32 value for {}", self.name, inst)),
+        }
+    }
+
     fn address_into(&self, output: &mut String, inst: HirInst, reg: &str) -> Result<(), String> {
         if let Some(offset) = self.allocs.get(&inst) {
-            writeln!(output, "    add {reg}, sp, #{}", self.local_base() + offset).unwrap();
+            emit_sp_address(output, reg, self.local_base() + offset)?;
             Ok(())
         } else if let Some(symbol) = self.globals.get(&inst) {
             writeln!(output, "    adrp {reg}, {symbol}").unwrap();
@@ -385,12 +527,30 @@ impl<'a> FunctionLowerer<'a> {
         // Stage every edge argument before overwriting destination block
         // parameters so a parallel-copy cycle cannot corrupt a source value.
         for (index, &arg) in args.iter().enumerate() {
-            self.value_into(output, arg, "w9")?;
-            writeln!(output, "    str w9, [sp, #{}]", index * 8).unwrap();
+            let ty = self.program.func_data(self.func).inst_data(arg).ty();
+            if ty.is_f32() {
+                self.float_value_into(output, arg, "s9")?;
+                writeln!(output, "    str s9, [sp, #{}]", index * 8).unwrap();
+            } else if ty.is_pointer() {
+                self.address_into(output, arg, "x9")?;
+                writeln!(output, "    str x9, [sp, #{}]", index * 8).unwrap();
+            } else {
+                self.value_into(output, arg, "w9")?;
+                writeln!(output, "    str w9, [sp, #{}]", index * 8).unwrap();
+            }
         }
         for (index, &param) in params.iter().enumerate() {
-            writeln!(output, "    ldr w9, [sp, #{}]", index * 8).unwrap();
-            self.store_value(output, param, "w9")?;
+            let ty = self.program.func_data(self.func).inst_data(param).ty();
+            if ty.is_f32() {
+                writeln!(output, "    ldr s9, [sp, #{}]", index * 8).unwrap();
+                self.store_float(output, param, "s9")?;
+            } else if ty.is_pointer() {
+                writeln!(output, "    ldr x9, [sp, #{}]", index * 8).unwrap();
+                self.store_pointer(output, param, "x9")?;
+            } else {
+                writeln!(output, "    ldr w9, [sp, #{}]", index * 8).unwrap();
+                self.store_value(output, param, "w9")?;
+            }
         }
         Ok(())
     }
@@ -406,6 +566,16 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn store_pointer(&self, output: &mut String, inst: HirInst, reg: &str) -> Result<(), String> {
+        writeln!(
+            output,
+            "    str {reg}, [sp, #{}]",
+            self.local_base() + self.slot(inst)?
+        )
+        .unwrap();
+        Ok(())
+    }
+
+    fn store_float(&self, output: &mut String, inst: HirInst, reg: &str) -> Result<(), String> {
         writeln!(
             output,
             "    str {reg}, [sp, #{}]",
@@ -449,6 +619,24 @@ impl<'a> FunctionLowerer<'a> {
                     writeln!(output, "    str w9, [x10]").unwrap();
                 } else {
                     writeln!(output, "    str w9, [x10, #{offset}]").unwrap();
+                }
+                Ok(())
+            }
+            _ if ty.is_f32() => {
+                self.float_value_into(output, value, "s9")?;
+                if offset == 0 {
+                    writeln!(output, "    str s9, [x10]").unwrap();
+                } else {
+                    writeln!(output, "    str s9, [x10, #{offset}]").unwrap();
+                }
+                Ok(())
+            }
+            _ if ty.is_pointer() => {
+                self.address_into(output, value, "x9")?;
+                if offset == 0 {
+                    writeln!(output, "    str x9, [x10]").unwrap();
+                } else {
+                    writeln!(output, "    str x9, [x10, #{offset}]").unwrap();
                 }
                 Ok(())
             }
@@ -535,6 +723,9 @@ fn emit_global_initializer(
     let data = program.global_arena().inst_arena().data_of(inst);
     match data.kind() {
         InstKind::Integer(value) => writeln!(output, "    .word {}", value.value()).unwrap(),
+        InstKind::Float(value) => {
+            writeln!(output, "    .word {}", value.value().to_bits()).unwrap()
+        }
         InstKind::ZeroInit => writeln!(output, "    .zero {}", target_size(data.ty())?).unwrap(),
         InstKind::Aggregate(aggregate) => {
             for &value in aggregate.value() {
@@ -606,11 +797,22 @@ fn emit_i32(output: &mut String, reg: &str, value: i32) -> Result<(), String> {
 }
 
 fn emit_sp_adjust(output: &mut String, op: &str, amount: u32) -> Result<(), String> {
-    if amount > 4095 {
-        return Err(format!(
-            "stack frame exceeds initial AArch64 immediate range: {amount}"
-        ));
+    let mut remaining = amount;
+    while remaining != 0 {
+        let chunk = remaining.min(4095);
+        writeln!(output, "    {op} sp, sp, #{chunk}").unwrap();
+        remaining -= chunk;
     }
-    writeln!(output, "    {op} sp, sp, #{amount}").unwrap();
+    Ok(())
+}
+
+fn emit_sp_address(output: &mut String, reg: &str, offset: u32) -> Result<(), String> {
+    writeln!(output, "    mov {reg}, sp").unwrap();
+    let mut remaining = offset;
+    while remaining != 0 {
+        let chunk = remaining.min(4095);
+        writeln!(output, "    add {reg}, {reg}, #{chunk}").unwrap();
+        remaining -= chunk;
+    }
     Ok(())
 }

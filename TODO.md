@@ -558,6 +558,15 @@ Leave relocation selection to the assembler/linker.
 
 ## Milestone 5: Floating Point And Conversion Lowering
 
+**Status: Completed (2026-07-21).** The native backend now lowers f32
+constants, arithmetic, ordered comparisons, conversions, scalar memory access,
+aggregate initialization, function arguments/results, and float truthiness.
+Pointer values now preserve their 64-bit ABI representation across calls,
+returns, block-parameter transfers, and aggregate initialization. Large fixed
+frames use legal chunked stack adjustments and address formation. QEMU runtime
+validation passes for `tests/functional/95_float.sy` and
+`tests/h_functional/39_fp_params.sy`.
+
 ### 5.1 f32 Constants
 
 Do not rely on the limited AArch64 FP-immediate encoding for arbitrary literals.

@@ -1,0 +1,11 @@
+int numerator() {
+    return 31;
+}
+
+int divisor() {
+    return 6;
+}
+
+int main() {
+    return numerator() % divisor() + numerator() - divisor();
+}

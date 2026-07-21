@@ -1,0 +1,10 @@
+int condition() {
+    return 1;
+}
+
+int main() {
+    if (condition()) {
+        return 7;
+    }
+    return 9;
+}

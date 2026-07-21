@@ -1,0 +1,8 @@
+void sink() {
+    return;
+}
+
+int main() {
+    sink();
+    return 5;
+}

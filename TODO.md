@@ -161,7 +161,7 @@ fixing that contract will create fragile, untestable spill failures.
   uses and defs rather than only temporary `Writable<Reg>` wrappers.
 - [ ] Add test coverage for VReg aliases through use operands, def operands,
   block parameters, and branch arguments.
-- [ ] Implement and test `OperandConstraint::Limit`; allocator candidate
+- [x] Implement and test `OperandConstraint::Limit`; allocator candidate
   selection must honor the encoded physical-register subset.
 - [ ] Add and test tied use/def (`Reuse`) constraints, including a real AArch64
   `movk`-style input/output reuse fixture.
@@ -173,7 +173,7 @@ fixing that contract will create fragile, untestable spill failures.
   them before post-RA rewrite into forms requiring no more simultaneously live
   scratch registers than the target reserves.
 - [ ] Unify allocator and emitter scratch-register contracts by register class.
-- [ ] Remove or replace fabricated untracked spill-slot fallback behavior when
+- [x] Remove or replace fabricated untracked spill-slot fallback behavior when
   no move scratch register is available.
 - [ ] Add a vector-class failure path or implementation; no vector operand may
   be silently dropped during branch-copy handling.

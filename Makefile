@@ -68,7 +68,7 @@ endif
 HOST_TARGET_DIR := $(CURDIR)/target/host-musl
 COMPILER := /work/target/$(MUSL_TARGET)/release/soyo_compiler
 
-.PHONY: test test-llvm test-riscv test-vcode run-elf run-elf-riscv debug-elf debug-elf-riscv test-image test-compiler build-lib build-lib-riscv clean-results
+.PHONY: test test-llvm test-riscv test-vcode test-vcode-m0-msub run-elf run-elf-riscv debug-elf debug-elf-riscv test-image test-compiler build-lib build-lib-riscv clean-results
 
 test: test-compiler build-lib .docker-image
 	mkdir -p "$(RESULTS)"
@@ -123,6 +123,21 @@ test-vcode: test-compiler build-lib .docker-image
 		-v "$(CURDIR)/sysylib:/work/sysylib:ro" \
 		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
 		"$(IMAGE)" --asm-backend vcode $(ARGS) $(TESTS) $(TEST_ARGS)
+
+# Executes the M0 three-spill post-RA MSub contract without changing the
+# production driver or claiming that current SysY lowering can create it.
+test-vcode-m0-msub: .docker-image
+	mkdir -p "$(RESULTS)"
+	cargo run -p anon_armv8 --quiet --bin vcode_msub_spills > "$(RESULTS)/vcode_msub_spills.s"
+	$(DOCKER) run --rm --network none \
+		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
+		-v "$(CURDIR)/tests/vcode_msub_spills_start.s:/work/start.s:ro" \
+		--entrypoint /bin/sh \
+		"$(IMAGE)" -c 'aarch64-linux-gnu-gcc -nostdlib -static -o /work/results/vcode_msub_spills.elf /work/start.s /work/results/vcode_msub_spills.s'
+	$(DOCKER) run --rm -t --network none \
+		-v "$(CURDIR)/$(RESULTS)/vcode_msub_spills.elf:/work/program.elf:ro" \
+		--entrypoint qemu-aarch64-static \
+		"$(IMAGE)" /work/program.elf
 
 run-elf: .docker-image
 	@if [ -z "$(RUN_ELF)" ]; then \

@@ -493,9 +493,10 @@ local allocation, scalar and aggregate memory initialization, global data, and
 dynamic multidimensional GEP. Scalar value slots and local addresses support
 large offsets using `x16` scratch-address formation. QEMU validation passes for
 array/global programs as well as the large-frame cases `74_kmp.sy`,
-`83_long_array.sy`, and `88_many_params2.sy`. The full functional suite now has
-no native assembly or runtime failures; its remaining 16 compile errors are
-the pre-existing `raana_ir` `not implemented` panic.
+`83_long_array.sy`, and `88_many_params2.sy`. Global constants are resolved
+through the correct arena when used by function operands, and large dynamic GEP
+strides use full i32 materialization. `make test tests/functional` passes all
+100 cases under QEMU.
 
 ### 4.1 Local Allocation, Load, And Store
 

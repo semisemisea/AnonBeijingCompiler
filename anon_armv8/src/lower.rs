@@ -4,7 +4,7 @@ use raana_ir::ir::{
     arena::Arena,
     basic_block::BasicBlock,
     inst_kind::{BinaryOp, InstKind},
-    Function as HirFunction, Inst as HirInst, Program, Type as HirType, TypeKind,
+    Function as HirFunction, Inst as HirInst, InstData, Program, Type as HirType, TypeKind,
 };
 
 use crate::abi::Signature;
@@ -84,7 +84,18 @@ impl<'a> FunctionLowerer<'a> {
                             &call
                                 .args()
                                 .iter()
-                                .map(|arg| data.inst_data(*arg).ty().clone())
+                                .map(|arg| {
+                                    if arg.is_global() {
+                                        program
+                                            .global_arena()
+                                            .inst_arena()
+                                            .data_of(*arg)
+                                            .ty()
+                                            .clone()
+                                    } else {
+                                        data.inst_data(*arg).ty().clone()
+                                    }
+                                })
                                 .collect::<Vec<_>>(),
                         )
                         .stack_size,
@@ -207,7 +218,7 @@ impl<'a> FunctionLowerer<'a> {
             InstKind::Integer(_) | InstKind::FuncArgRef(_) | InstKind::BlockArgRef(_) => Ok(()),
             InstKind::ZeroInit if inst_data.ty().is_i32() => Ok(()),
             InstKind::Binary(binary)
-                if data.inst_data(binary.lhs()).ty().is_f32() && binary.op().is_compare() =>
+                if self.inst_data(binary.lhs()).ty().is_f32() && binary.op().is_compare() =>
             {
                 self.float_value_into(output, binary.lhs(), "s9")?;
                 self.float_value_into(output, binary.rhs(), "s10")?;
@@ -219,7 +230,7 @@ impl<'a> FunctionLowerer<'a> {
                 writeln!(output, "    and w9, w9, w10").unwrap();
                 self.store_value(output, inst, "w9")
             }
-            InstKind::Binary(binary) if data.inst_data(binary.lhs()).ty().is_f32() => {
+            InstKind::Binary(binary) if self.inst_data(binary.lhs()).ty().is_f32() => {
                 self.float_value_into(output, binary.lhs(), "s9")?;
                 self.float_value_into(output, binary.rhs(), "s10")?;
                 let opcode = match binary.op() {
@@ -281,7 +292,7 @@ impl<'a> FunctionLowerer<'a> {
                 Ok(())
             }
             InstKind::Branch(branch) => {
-                let cond_ty = data.inst_data(branch.cond()).ty();
+                let cond_ty = self.inst_data(branch.cond()).ty();
                 let true_copy = format!(
                     ".L{}_branch_true_{}",
                     self.name,
@@ -316,9 +327,9 @@ impl<'a> FunctionLowerer<'a> {
             }
             InstKind::Return(ret) => {
                 if let Some(value) = ret.value() {
-                    if data.inst_data(value).ty().is_f32() {
+                    if self.inst_data(value).ty().is_f32() {
                         self.float_value_into(output, value, "s0")?;
-                    } else if data.inst_data(value).ty().is_pointer() {
+                    } else if self.inst_data(value).ty().is_pointer() {
                         self.address_into(output, value, "x0")?;
                     } else {
                         self.value_into(output, value, "w0")?;
@@ -337,26 +348,26 @@ impl<'a> FunctionLowerer<'a> {
                     &call
                         .args()
                         .iter()
-                        .map(|arg| data.inst_data(*arg).ty().clone())
+                        .map(|arg| self.inst_data(*arg).ty().clone())
                         .collect::<Vec<_>>(),
                 );
                 for (&arg, location) in call.args().iter().zip(signature.args) {
                     match location {
                         crate::abi::ValueLocation::Reg(reg) => {
                             let number = reg.to_physical_reg().unwrap().hw_enc();
-                            if data.inst_data(arg).ty().is_f32() {
+                            if self.inst_data(arg).ty().is_f32() {
                                 self.float_value_into(output, arg, &format!("s{number}"))?;
-                            } else if data.inst_data(arg).ty().is_pointer() {
+                            } else if self.inst_data(arg).ty().is_pointer() {
                                 self.address_into(output, arg, &format!("x{number}"))?;
                             } else {
                                 self.value_into(output, arg, &format!("w{number}"))?;
                             }
                         }
                         crate::abi::ValueLocation::Stack { offset } => {
-                            if data.inst_data(arg).ty().is_f32() {
+                            if self.inst_data(arg).ty().is_f32() {
                                 self.float_value_into(output, arg, "s9")?;
                                 writeln!(output, "    str s9, [sp, #{offset}]").unwrap();
-                            } else if data.inst_data(arg).ty().is_pointer() {
+                            } else if self.inst_data(arg).ty().is_pointer() {
                                 self.address_into(output, arg, "x9")?;
                                 writeln!(output, "    str x9, [sp, #{offset}]").unwrap();
                             } else {
@@ -390,7 +401,7 @@ impl<'a> FunctionLowerer<'a> {
             }
             InstKind::GetElemPtr(gep) => {
                 self.address_into(output, gep.base(), "x10")?;
-                let mut current = data.inst_data(gep.base()).ty().clone();
+                let mut current = self.inst_data(gep.base()).ty().clone();
                 for &offset in gep.offsets() {
                     let (next, stride) = gep_step(&current)?;
                     self.value_into(output, offset, "w9")?;
@@ -402,7 +413,7 @@ impl<'a> FunctionLowerer<'a> {
                         )
                         .unwrap();
                     } else {
-                        writeln!(output, "    mov w11, #{stride}").unwrap();
+                        emit_i32(output, "w11", stride as i32)?;
                         writeln!(output, "    smaddl x10, w9, w11, x10").unwrap();
                     }
                     current = next;
@@ -411,7 +422,7 @@ impl<'a> FunctionLowerer<'a> {
             }
             InstKind::Store(store) => {
                 self.address_into(output, store.dest(), "x10")?;
-                self.store_initializer(output, store.src(), data.inst_data(store.src()).ty(), 0)
+                self.store_initializer(output, store.src(), self.inst_data(store.src()).ty(), 0)
             }
             InstKind::Load(load) if inst_data.ty().is_i32() => {
                 self.address_into(output, load.src(), "x10")?;
@@ -437,7 +448,7 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn value_into(&self, output: &mut String, inst: HirInst, reg: &str) -> Result<(), String> {
-        let data = self.program.func_data(self.func).inst_data(inst);
+        let data = self.inst_data(inst);
         match data.kind() {
             InstKind::Integer(value) => emit_i32(output, reg, value.value()),
             InstKind::ZeroInit if data.ty().is_i32() => {
@@ -458,7 +469,7 @@ impl<'a> FunctionLowerer<'a> {
         inst: HirInst,
         reg: &str,
     ) -> Result<(), String> {
-        let data = self.program.func_data(self.func).inst_data(inst);
+        let data = self.inst_data(inst);
         match data.kind() {
             InstKind::Float(value) => {
                 emit_i32(output, "w11", value.value().to_bits() as i32)?;
@@ -485,13 +496,7 @@ impl<'a> FunctionLowerer<'a> {
             writeln!(output, "    adrp {reg}, {symbol}").unwrap();
             writeln!(output, "    add {reg}, {reg}, :lo12:{symbol}").unwrap();
             Ok(())
-        } else if self
-            .program
-            .func_data(self.func)
-            .inst_data(inst)
-            .ty()
-            .is_pointer()
-        {
+        } else if self.inst_data(inst).ty().is_pointer() {
             emit_memory_load(output, reg, "sp", self.local_base() + self.slot(inst)?)?;
             Ok(())
         } else {
@@ -509,7 +514,7 @@ impl<'a> FunctionLowerer<'a> {
         // Stage every edge argument before overwriting destination block
         // parameters so a parallel-copy cycle cannot corrupt a source value.
         for (index, &arg) in args.iter().enumerate() {
-            let ty = self.program.func_data(self.func).inst_data(arg).ty();
+            let ty = self.inst_data(arg).ty();
             if ty.is_f32() {
                 self.float_value_into(output, arg, "s9")?;
                 writeln!(output, "    str s9, [sp, #{}]", index * 8).unwrap();
@@ -522,7 +527,7 @@ impl<'a> FunctionLowerer<'a> {
             }
         }
         for (index, &param) in params.iter().enumerate() {
-            let ty = self.program.func_data(self.func).inst_data(param).ty();
+            let ty = self.inst_data(param).ty();
             if ty.is_f32() {
                 writeln!(output, "    ldr s9, [sp, #{}]", index * 8).unwrap();
                 self.store_float(output, param, "s9")?;
@@ -556,7 +561,7 @@ impl<'a> FunctionLowerer<'a> {
         ty: &HirType,
         offset: u32,
     ) -> Result<(), String> {
-        let data = self.program.func_data(self.func).inst_data(value);
+        let data = self.inst_data(value);
         match data.kind() {
             InstKind::Aggregate(aggregate) => {
                 let TypeKind::Array(element, _) = ty.kind() else {
@@ -630,6 +635,14 @@ impl<'a> FunctionLowerer<'a> {
             .get(&inst)
             .copied()
             .ok_or_else(|| format!("{}: no scalar slot for {}", self.name, inst))
+    }
+
+    fn inst_data(&self, inst: HirInst) -> &InstData {
+        if inst.is_global() {
+            self.program.global_arena().inst_arena().data_of(inst)
+        } else {
+            self.program.func_data(self.func).inst_data(inst)
+        }
     }
 
     fn block_label(&self, block: BasicBlock) -> Result<usize, String> {

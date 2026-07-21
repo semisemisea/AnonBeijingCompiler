@@ -1,8 +1,10 @@
+use std::collections::HashSet;
+
 use raana_ir::ir::{
+    arena::Arena,
     inst_kind::{BinaryOp, InstKind},
-    Function as HirFunction, Program,
+    Function as HirFunction, Inst as HirInst, Program,
 };
-use taki_mir::prelude::Arena;
 use taki_mir::{
     abi::ArgPair,
     block_order::MirBlockIndex,
@@ -22,25 +24,8 @@ use crate::{
 /// [`Inst`] through VCode and register allocation. The direct lowering path
 /// remains the production backend until this selector covers full SysY HIR.
 pub fn compile_function_vcode(program: &Program, func: HirFunction) -> Result<String, String> {
+    validate_function(program, func)?;
     let data = program.func_data(func);
-    if data.params().len() > 8
-        || data.params().iter().any(|param| {
-            let ty = data.inst_data(*param).ty();
-            !ty.is_i32() && !ty.is_f32()
-        })
-    {
-        return Err(format!(
-            "VCode AArch64 lowering for {} supports at most eight i32 or f32 register parameters",
-            data.name()
-        ));
-    }
-    if !data.ret_ty().is_i32() && !data.ret_ty().is_f32() {
-        return Err(format!(
-            "VCode AArch64 lowering for {} only supports i32 or f32 returns",
-            data.name()
-        ));
-    }
-
     let vcode = lower_function(program, func, &IntegerBackend);
     let allocations = vcode.run_regalloc()?;
     let layout = FrameLayout::from_regalloc(0, 0, &allocations);
@@ -49,6 +34,226 @@ pub fn compile_function_vcode(program: &Program, func: HirFunction) -> Result<St
     emit_post_ra_function(&mut output, data.name(), &blocks, &allocations, &layout)
         .map_err(|error| format!("{error}; register allocation output: {allocations:?}"))?;
     Ok(output)
+}
+
+/// Compiles the M1 scalar VCode subset without changing the default backend.
+/// Program-level data and unsupported HIR are rejected before selector lowering.
+pub fn compile_program_vcode(program: &Program) -> Result<String, String> {
+    if !program.global_inst_layout().is_empty() {
+        return Err("VCode AArch64 lowering does not yet support program globals".into());
+    }
+
+    let mut output = String::from("    .text\n    .ident \"soyo-vcode\"\n");
+    for &func in program.function_layout() {
+        if program.func_data(func).layout().is_decl() {
+            continue;
+        }
+        let function = compile_function_vcode(program, func)?;
+        output.push_str(
+            function
+                .strip_prefix("    .text\n")
+                .expect("VCode function output must begin with its text section"),
+        );
+    }
+    Ok(output)
+}
+
+fn validate_function(program: &Program, func: HirFunction) -> Result<(), String> {
+    let data = program.func_data(func);
+    let name = data.name();
+    if data.layout().is_decl() {
+        return Err(format!(
+            "VCode AArch64 lowering cannot compile declaration {name}"
+        ));
+    }
+    if data.params().len() > 8
+        || data
+            .params()
+            .iter()
+            .any(|param| !is_scalar(data.inst_data(*param).ty()))
+    {
+        return Err(format!(
+            "VCode AArch64 lowering for {name} supports at most eight i32 or f32 register parameters"
+        ));
+    }
+    if !data.ret_ty().is_unit() && !is_scalar(data.ret_ty()) {
+        return Err(format!(
+            "VCode AArch64 lowering for {name} only supports i32, f32, or void returns"
+        ));
+    }
+
+    let blocks = data.layout().basicblocks().iter().collect::<Vec<_>>();
+    let block_set = blocks
+        .iter()
+        .map(|block| block.bb())
+        .collect::<HashSet<_>>();
+    let mut visited = HashSet::new();
+    for block in blocks {
+        for &param in data.bb_data(block.bb()).params() {
+            validate_value(program, func, param, &mut visited, name)?;
+        }
+        let insts = block.insts().iter().copied().collect::<Vec<_>>();
+        let Some((&terminator, body)) = insts.split_last() else {
+            return Err(format!(
+                "VCode AArch64 lowering for {name} found an empty basic block"
+            ));
+        };
+        if !data.inst_data(terminator).kind().is_terminator() {
+            return Err(format!(
+                "VCode AArch64 lowering for {name} requires every basic block to end in a terminator"
+            ));
+        }
+        if body
+            .iter()
+            .any(|inst| data.inst_data(*inst).kind().is_terminator())
+        {
+            return Err(format!(
+                "VCode AArch64 lowering for {name} found a non-final terminator"
+            ));
+        }
+        for inst in insts {
+            validate_value(program, func, inst, &mut visited, name)?;
+            match data.inst_data(inst).kind() {
+                InstKind::Jump(jump) => {
+                    validate_edge(data, &block_set, jump.target(), jump.args(), name)?
+                }
+                InstKind::Branch(branch) => {
+                    if !data.inst_data(branch.cond()).ty().is_i32() {
+                        return Err(format!(
+                            "VCode AArch64 lowering for {name} only supports i32 branch conditions"
+                        ));
+                    }
+                    validate_edge(data, &block_set, branch.t_target(), branch.t_args(), name)?;
+                    validate_edge(data, &block_set, branch.f_target(), branch.f_args(), name)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_edge(
+    data: &raana_ir::ir::FunctionData,
+    blocks: &HashSet<raana_ir::ir::BasicBlock>,
+    target: raana_ir::ir::BasicBlock,
+    args: &[HirInst],
+    name: &str,
+) -> Result<(), String> {
+    if !blocks.contains(&target) {
+        return Err(format!(
+            "VCode AArch64 lowering for {name} branches to an unknown block"
+        ));
+    }
+    let params = data.bb_data(target).params();
+    if args.len() != params.len()
+        || args
+            .iter()
+            .zip(params)
+            .any(|(arg, param)| data.inst_data(*arg).ty() != data.inst_data(*param).ty())
+    {
+        return Err(format!(
+            "VCode AArch64 lowering for {name} has incompatible block arguments"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_value(
+    program: &Program,
+    func: HirFunction,
+    inst: HirInst,
+    visited: &mut HashSet<HirInst>,
+    name: &str,
+) -> Result<(), String> {
+    if !visited.insert(inst) {
+        return Ok(());
+    }
+    if inst.is_global() {
+        return Err(format!(
+            "VCode AArch64 lowering for {name} does not support global values"
+        ));
+    }
+    let data = program.func_data(func);
+    let inst_data = data.inst_data(inst);
+    if !inst_data.ty().is_unit() && !is_scalar(inst_data.ty()) {
+        return Err(format!(
+            "VCode AArch64 lowering for {name} does not support {} values",
+            inst_data.ty()
+        ));
+    }
+    match inst_data.kind() {
+        InstKind::Integer(_) | InstKind::FuncArgRef(_) | InstKind::BlockArgRef(_) => {}
+        InstKind::Binary(binary) if inst_data.ty().is_i32() => {
+            if !matches!(
+                binary.op(),
+                BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Rem
+                    | BinaryOp::And
+                    | BinaryOp::Or
+                    | BinaryOp::Xor
+                    | BinaryOp::Shl
+                    | BinaryOp::Shr
+                    | BinaryOp::Sar
+                    | BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+            ) {
+                return Err(format!("VCode AArch64 lowering for {name} does not support this integer binary operation"));
+            }
+        }
+        InstKind::Binary(binary) if inst_data.ty().is_f32() && binary.op() == BinaryOp::Add => {}
+        InstKind::Call(call) => {
+            let callee = program.func_data(call.callee());
+            if call.args().len() > 8
+                || call
+                    .args()
+                    .iter()
+                    .any(|arg| !is_scalar(data.inst_data(*arg).ty()))
+                || (!callee.ret_ty().is_unit() && !is_scalar(callee.ret_ty()))
+                || callee.params().len() > 8
+                || callee
+                    .params()
+                    .iter()
+                    .any(|param| !is_scalar(callee.inst_data(*param).ty()))
+            {
+                return Err(format!(
+                    "VCode AArch64 lowering for {name} only supports direct calls with at most eight i32/f32 arguments and an i32, f32, or void result"
+                ));
+            }
+        }
+        InstKind::Return(ret) => {
+            if ret
+                .value()
+                .is_some_and(|value| !is_scalar(data.inst_data(value).ty()))
+            {
+                return Err(format!(
+                    "VCode AArch64 lowering for {name} has an unsupported return value"
+                ));
+            }
+        }
+        InstKind::Jump(_) | InstKind::Branch(_) => {}
+        _ => {
+            return Err(format!(
+                "VCode AArch64 lowering for {name} does not support {:?}",
+                inst_data.kind()
+            ));
+        }
+    }
+    for operand in inst_data.inst_usage() {
+        validate_value(program, func, operand, visited, name)?;
+    }
+    Ok(())
+}
+
+fn is_scalar(ty: &raana_ir::ir::Type) -> bool {
+    ty.is_i32() || ty.is_f32()
 }
 
 fn post_ra_blocks(vcode: &VCodeContainer<Inst>) -> Vec<PostRaBlock<'_>> {
@@ -308,7 +513,7 @@ mod tests {
         vcode::VCodeBuilder,
     };
 
-    use super::{compile_function_vcode, Inst};
+    use super::{compile_function_vcode, compile_program_vcode, Inst};
     use crate::abi::AArch64Abi;
 
     #[test]
@@ -353,6 +558,40 @@ mod tests {
             vcode.branch_block_args(),
             &[canonical.to_virtual_reg().unwrap()]
         );
+    }
+
+    #[test]
+    fn program_vcode_emits_definitions_once_and_rejects_memory() {
+        let mut program = Program::new();
+        let declaration = program.new_function(Type::get_i32(), "decl".into(), vec![]);
+        let function = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let value = data.new_local_inst().integer(3);
+        let ret = data.new_local_inst().ret(Some(value));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let assembly = compile_program_vcode(&program).unwrap();
+        assert!(assembly.starts_with("    .text\n    .ident \"soyo-vcode\"\n"));
+        assert_eq!(assembly.matches("    .text\n").count(), 1);
+        assert!(assembly.contains("main:"));
+        assert!(!assembly.contains("decl:"));
+        assert!(program.func_data(declaration).layout().is_decl());
+
+        let mut unsupported = Program::new();
+        let function = unsupported.new_function(Type::get_i32(), "main".into(), vec![]);
+        let data = unsupported.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let local = data.new_local_inst().alloc(Type::get_i32());
+        let value = data.new_local_inst().integer(3);
+        let ret = data.new_local_inst().ret(Some(value));
+        for inst in [local, ret] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let error = compile_program_vcode(&unsupported).unwrap_err();
+        assert!(error.contains("does not support"), "{error}");
     }
 
     #[test]

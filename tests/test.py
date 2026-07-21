@@ -158,7 +158,7 @@ def copy_testcase_files(src, out_dir):
             shutil.copy2(path, dst_base.with_suffix(path.suffix))
 
 
-def run_test(src, out_dir, opt_level, compiler, backend, target):
+def run_test(src, out_dir, opt_level, compiler, backend, target, asm_backend):
     start = time.perf_counter()
     src_rel = rel_test(src)
     arch_config = TARGET_CONFIG[target]
@@ -185,7 +185,16 @@ def run_test(src, out_dir, opt_level, compiler, backend, target):
     if opt_level:
         compile_args.append(f"-O{opt_level}")
     if backend == "asm":
-        compile_args += ["-S", "-o", str(compile_artifact), str(src)]
+        compile_args += [
+            "-S",
+            "--target",
+            target,
+            "--asm-backend",
+            asm_backend,
+            "-o",
+            str(compile_artifact),
+            str(src),
+        ]
     else:
         compile_args += ["--emit", "llvm", "-o", str(compile_artifact), str(src)]
 
@@ -217,6 +226,14 @@ def run_test(src, out_dir, opt_level, compiler, backend, target):
             " CE ",
             f"exit {compile_proc.returncode}\n{output or '(no output)'}",
         )
+    if backend == "asm" and asm_backend == "vcode":
+        artifact = compile_artifact.read_text()
+        if '    .ident "soyo-vcode"' not in artifact:
+            return (
+                time.perf_counter() - start,
+                " CE ",
+                "VCode assembly marker missing; direct backend fallback is forbidden",
+            )
 
     ir_args = [str(compiler)]
     if opt_level:
@@ -388,6 +405,12 @@ def parse_args(argv):
         help="target architecture (default: aarch64)",
     )
     parser.add_argument(
+        "--asm-backend",
+        choices=["direct", "vcode"],
+        default="direct",
+        help="assembly lowering backend when --backend=asm (default: direct)",
+    )
+    parser.add_argument(
         "--compiler",
         type=Path,
         default=DEFAULT_COMPILER,
@@ -489,7 +512,14 @@ def run_tests(args):
     try:
         futures = {
             pool.submit(
-                run_test, src, RESULTS_ROOT, args.opt_level, compiler, args.backend, args.target
+                run_test,
+                src,
+                RESULTS_ROOT,
+                args.opt_level,
+                compiler,
+                args.backend,
+                args.target,
+                args.asm_backend,
             ): src
             for src in files
         }

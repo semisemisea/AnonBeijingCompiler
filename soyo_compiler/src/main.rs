@@ -62,11 +62,7 @@ fn run() -> Result<(), String> {
         None
     };
     let asm = if needs_asm {
-<<<<<<< HEAD
-        Some(dump_asm(&program, args.target))
-=======
-        Some(dump_asm(&program)?)
->>>>>>> 4ec5a63 (Fix(driver): report AArch64 codegen failures)
+        Some(dump_asm(&program, args.target, args.asm_backend)?)
     } else {
         None
     };
@@ -106,10 +102,17 @@ fn dump_llvm(program: &raana_ir::ir::Program) -> String {
     raana_ir::llvm::write_llvm_ir(program)
 }
 
-fn dump_asm(program: &raana_ir::ir::Program, target: cli::Target) -> Result<String, String> {
+fn dump_asm(
+    program: &raana_ir::ir::Program,
+    target: cli::Target,
+    backend: cli::AsmBackend,
+) -> Result<String, String> {
     match target {
         cli::Target::Riscv64 => Ok(taki_mir::compile::<Riscv64Backend>(program)),
-        cli::Target::Aarch64 => anon_armv8::compile_program_to_asm(program),
+        cli::Target::Aarch64 => match backend {
+            cli::AsmBackend::Direct => anon_armv8::compile_program_to_asm(program),
+            cli::AsmBackend::Vcode => anon_armv8::compile_program_vcode(program),
+        },
     }
 }
 

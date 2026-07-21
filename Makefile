@@ -20,6 +20,11 @@ TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
 $(eval $(TEST_ARGS):;@:)
 endif
 
+ifeq ($(firstword $(MAKECMDGOALS)),test-vcode)
+TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+$(eval $(TEST_ARGS):;@:)
+endif
+
 ifeq ($(firstword $(MAKECMDGOALS)),run-elf)
 RUN_ELF := $(word 2,$(MAKECMDGOALS))
 RUN_ELF_PATH := $(abspath $(RUN_ELF))
@@ -63,7 +68,7 @@ endif
 HOST_TARGET_DIR := $(CURDIR)/target/host-musl
 COMPILER := /work/target/$(MUSL_TARGET)/release/soyo_compiler
 
-.PHONY: test test-llvm test-riscv run-elf run-elf-riscv debug-elf debug-elf-riscv test-image test-compiler build-lib build-lib-riscv clean-results
+.PHONY: test test-llvm test-riscv test-vcode run-elf run-elf-riscv debug-elf debug-elf-riscv test-image test-compiler build-lib build-lib-riscv clean-results
 
 test: test-compiler build-lib .docker-image
 	mkdir -p "$(RESULTS)"
@@ -104,6 +109,20 @@ test-riscv: test-compiler build-lib-riscv .docker-image
 		-v "$(CURDIR)/sysylib:/work/sysylib:ro" \
 		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
 		"$(IMAGE)" --target riscv64 $(ARGS) $(TESTS) $(TEST_ARGS)
+
+# The VCode driver is opt-in. Production `make test` remains direct by default.
+test-vcode: test-compiler build-lib .docker-image
+	mkdir -p "$(RESULTS)"
+	@cleanup() { $(DOCKER) rm -f "$(CONTAINER)" >/dev/null 2>&1 || true; }; \
+	trap cleanup EXIT INT TERM; \
+	cleanup; \
+	$(DOCKER) run -t --name "$(CONTAINER)" --network none \
+		-e SOYO_COMPILER="$(COMPILER)" \
+		-v "$(HOST_TARGET_DIR):/work/target:ro" \
+		-v "$(CURDIR)/tests:/work/tests:ro" \
+		-v "$(CURDIR)/sysylib:/work/sysylib:ro" \
+		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
+		"$(IMAGE)" --asm-backend vcode $(ARGS) $(TESTS) $(TEST_ARGS)
 
 run-elf: .docker-image
 	@if [ -z "$(RUN_ELF)" ]; then \

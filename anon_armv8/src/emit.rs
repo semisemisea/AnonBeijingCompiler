@@ -86,7 +86,7 @@ pub fn emit_post_ra_function(
                 taki_mir::reg_alloc::reg::InstPosition::Before,
                 layout.outgoing_args + layout.locals,
             )?;
-            if matches!(inst, Inst::Ret) {
+            if matches!(inst, Inst::Ret | Inst::RetI32 { .. }) {
                 writeln!(output, "    b .L{name}_epilogue").unwrap();
             } else {
                 emit_post_ra_inst(
@@ -118,6 +118,17 @@ fn label(function: &str, block: MirBlockIndex) -> String {
 
 fn format_inst(function: &str, inst: &Inst) -> String {
     match inst {
+        Inst::MovImm { dst, value } => {
+            let value = *value as u32;
+            let dst = regs::format_reg(*dst, Type::new_i32());
+            let low = value & 0xffff;
+            let high = value >> 16;
+            if high == 0 {
+                format!("movz {dst}, #{low}")
+            } else {
+                format!("movz {dst}, #{low}\n    movk {dst}, #{high}, lsl #16")
+            }
+        }
         Inst::Mov { dst, src, ty } => format!(
             "{} {}, {}",
             if ty.is_f32() { "fmov" } else { "mov" },
@@ -143,6 +154,7 @@ fn format_inst(function: &str, inst: &Inst) -> String {
         Inst::Jump { target } => format!("b {}", label(function, *target)),
         Inst::Branch { cond, target } => format!("b.{} {}", cond.asm(), label(function, *target)),
         Inst::Call { symbol } => format!("bl {symbol}"),
+        Inst::RetI32 { src } => format!("mov w0, {}", regs::format_reg(*src, Type::new_i32())),
         Inst::Ret => "ret".to_string(),
         Inst::Nop => "nop".to_string(),
     }
@@ -153,7 +165,9 @@ fn format_inst(function: &str, inst: &Inst) -> String {
 pub fn emit_post_ra_move(output: &mut String, edit: &Edit, spill_base: u32) -> Result<(), String> {
     let Edit::Move { from, to, ty } = edit;
     if from.is_none() || to.is_none() {
-        return Err("register allocation produced a move with no location".into());
+        return Err(format!(
+            "register allocation produced a move with no location: {edit:?}"
+        ));
     }
 
     match (from.is_reg(), to.is_reg()) {
@@ -207,6 +221,12 @@ pub fn emit_post_ra_inst(
 ) -> Result<(), String> {
     let mut rewritten = inst.clone();
     let spill_def = match &mut rewritten {
+        Inst::MovImm { dst, .. } => {
+            expect_alloc_count(inst, allocs, 1)?;
+            let (reg, spill) = resolve_def(allocs[0], Type::new_i32(), 0)?;
+            *dst = reg;
+            spill
+        }
         Inst::Mov { dst, src, ty } => {
             expect_alloc_count(inst, allocs, 2)?;
             *src = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
@@ -236,6 +256,11 @@ pub fn emit_post_ra_inst(
             let (reg, spill) = resolve_def(allocs[0], Type::new_i32(), 0)?;
             *dst = reg;
             spill
+        }
+        Inst::RetI32 { src } => {
+            expect_alloc_count(inst, allocs, 1)?;
+            *src = resolve_use(output, allocs[0], Type::new_i32(), 0, spill_base)?;
+            None
         }
         Inst::Jump { .. } | Inst::Branch { .. } | Inst::Call { .. } | Inst::Ret | Inst::Nop => {
             expect_alloc_count(inst, allocs, 0)?;

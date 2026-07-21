@@ -656,8 +656,18 @@ Finalized VCode now exposes each block's global instruction range, matching the
 index space used by allocator allocations and edit program points for upcoming
 block-labelled function emission. The post-RA emitter now has a function-level
 path for constructed VCode blocks: it emits directives, finalized frame state,
-globally indexed edits/allocations, block labels, and a shared epilogue. No HIR
-selector invokes this path yet.
+globally indexed edits/allocations, block labels, and a shared epilogue. A
+deliberately opt-in HIR selector now drives the complete
+`HIR -> VCode -> RA -> post-RA` path for zero-parameter i32 functions containing
+integer constants, `Add`, and i32 return. Its focused test constructs HIR, runs
+real allocation, and validates the emitted assembly with Clang. This integration
+exposed and fixed three generic allocator issues: the invalid VReg sentinel was
+unconstructable, register-only operand demand was not decremented after a fresh
+allocation, and reverse liveness retained values after their definitions. The
+selector is not connected to the native driver: function parameters, calls,
+memory, floats, branches, block parameters, and the remaining integer operations
+still require VCode instruction selection and ABI coverage before M6 can be
+completed.
 
 ### 6.1 Post-allocation Instruction Stream
 

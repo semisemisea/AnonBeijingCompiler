@@ -33,6 +33,10 @@ impl Cond {
 
 #[derive(Clone, Debug)]
 pub enum Inst {
+    MovImm {
+        dst: Reg,
+        value: i32,
+    },
     Mov {
         dst: Reg,
         src: Reg,
@@ -63,6 +67,10 @@ pub enum Inst {
     Call {
         symbol: String,
     },
+    /// Return an i32 value through the AAPCS64 w0 register.
+    RetI32 {
+        src: Reg,
+    },
     Ret,
     Nop,
 }
@@ -72,6 +80,7 @@ impl MachInst for Inst {
 
     fn get_operands(&mut self, collector: &mut impl OperandVisitor) {
         match self {
+            Self::MovImm { dst, .. } => collector.reg_def(&mut Writable::from_reg(*dst)),
             Self::Mov { dst, src, .. } => {
                 collector.reg_use(src);
                 collector.reg_def(&mut Writable::from_reg(*dst));
@@ -99,6 +108,7 @@ impl MachInst for Inst {
                 }
                 collector.reg_clobbers(clobbers);
             }
+            Self::RetI32 { src } => collector.reg_fixed_use(src, regs::int_reg(0)),
             Self::Jump { .. } | Self::Branch { .. } | Self::Ret | Self::Nop => {}
         }
     }
@@ -112,7 +122,7 @@ impl MachInst for Inst {
 
     fn is_term(&self) -> MachTerminator {
         match self {
-            Self::Ret => MachTerminator::Return,
+            Self::RetI32 { .. } | Self::Ret => MachTerminator::Return,
             Self::Jump { .. } | Self::Branch { .. } => MachTerminator::Branch,
             _ => MachTerminator::None,
         }

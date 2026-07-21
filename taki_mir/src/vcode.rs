@@ -306,7 +306,6 @@ impl<I: VCodeInst> VCodeBuilder<I> {
         // Note: can't easily check vcode.insts, resolved in collect_operands.
         // Operands are resolved in collect_operands.
         vregs.assert_no_vreg_aliases(self.vcode.operands.iter().map(|op| op.vreg()));
-        // Currently block params are never aliased to another vreg.
         vregs.assert_no_vreg_aliases(self.vcode.block_params.iter().copied());
         // Branch block args are resolved in collect_operands.
         vregs.assert_no_vreg_aliases(self.vcode.branch_block_args.iter().copied());
@@ -350,6 +349,10 @@ impl<I: VCodeInst> VCodeBuilder<I> {
         for arg in self.vcode.branch_block_args.iter_mut() {
             let new_arg = vregs.resolve_alias(*arg);
             *arg = new_arg;
+        }
+        for param in self.vcode.block_params.iter_mut() {
+            let new_param = vregs.resolve_alias(*param);
+            *param = new_param;
         }
     }
 

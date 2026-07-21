@@ -61,6 +61,7 @@ pub fn emit_post_ra_function(
     allocations: &RegAllocOutput,
     layout: &FrameLayout,
 ) -> Result<(), String> {
+    validate_post_ra_blocks(blocks, allocations)?;
     writeln!(output, "    .p2align 2").unwrap();
     writeln!(output, "    .globl {name}").unwrap();
     writeln!(output, "    .type {name}, %function").unwrap();
@@ -68,17 +69,10 @@ pub fn emit_post_ra_function(
     emit_post_ra_prologue(output, layout)?;
 
     for block in blocks {
-        if block.inst_range.len() != block.insts.len() {
-            return Err(format!(
-                "block {} has {} instructions but range {:?}",
-                block.index.raw_u32(),
-                block.insts.len(),
-                block.inst_range
-            ));
-        }
         writeln!(output, "{}:", label(name, block.index)).unwrap();
         for (offset, inst) in block.insts.iter().enumerate() {
-            let index = (block.inst_range.start + offset) as u32;
+            let index = u32::try_from(block.inst_range.start + offset)
+                .map_err(|_| "post-RA instruction index exceeds u32".to_string())?;
             emit_edits_at(
                 output,
                 allocations,
@@ -109,6 +103,51 @@ pub fn emit_post_ra_function(
     writeln!(output, ".L{name}_epilogue:").unwrap();
     emit_post_ra_epilogue(output, layout)?;
     writeln!(output, "    .size {name}, .-{name}").unwrap();
+    Ok(())
+}
+
+fn validate_post_ra_blocks(
+    blocks: &[PostRaBlock<'_>],
+    allocations: &RegAllocOutput,
+) -> Result<(), String> {
+    let mut ranges = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let end = block
+            .inst_range
+            .start
+            .checked_add(block.insts.len())
+            .ok_or_else(|| "post-RA instruction range overflows usize".to_string())?;
+        if end != block.inst_range.end {
+            return Err(format!(
+                "block {} has {} instructions but range {:?}",
+                block.index.raw_u32(),
+                block.insts.len(),
+                block.inst_range
+            ));
+        }
+        if u32::try_from(block.inst_range.start).is_err() || u32::try_from(end).is_err() {
+            return Err("post-RA instruction index exceeds u32".into());
+        }
+        if end > allocations.inst_alloc_offsets.len() {
+            return Err(format!(
+                "block {} range {:?} exceeds {} allocation entries",
+                block.index.raw_u32(),
+                block.inst_range,
+                allocations.inst_alloc_offsets.len()
+            ));
+        }
+        ranges.push((block.inst_range.start, end, block.index));
+    }
+    ranges.sort_unstable_by_key(|(start, _, _)| *start);
+    for pair in ranges.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err(format!(
+                "post-RA block ranges overlap: block {} and block {}",
+                pair[0].2.raw_u32(),
+                pair[1].2.raw_u32()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1173,5 +1212,36 @@ mod tests {
             "clang rejected post-RA function: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn rejects_invalid_post_ra_block_ranges_before_emission() {
+        let allocations = RegAllocOutput {
+            num_spillslots: 0,
+            edits: vec![],
+            allocs: vec![Allocation::reg(regs::int_preg(0))],
+            inst_alloc_offsets: vec![0],
+        };
+        let insts = [Inst::Ret];
+        let out_of_bounds = [PostRaBlock {
+            index: MirBlockIndex::new(0),
+            inst_range: 1..2,
+            insts: &insts,
+        }];
+        assert!(validate_post_ra_blocks(&out_of_bounds, &allocations).is_err());
+
+        let overlapping = [
+            PostRaBlock {
+                index: MirBlockIndex::new(0),
+                inst_range: 0..1,
+                insts: &insts,
+            },
+            PostRaBlock {
+                index: MirBlockIndex::new(1),
+                inst_range: 0..1,
+                insts: &insts,
+            },
+        ];
+        assert!(validate_post_ra_blocks(&overlapping, &allocations).is_err());
     }
 }

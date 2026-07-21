@@ -152,51 +152,51 @@ fixing that contract will create fragile, untestable spill failures.
 
 ### Tasks
 
-- [ ] Add a target-neutral register-mapping or operand-location interface so
+- [x] Add a target-neutral register-mapping or operand-location interface so
   post-RA rewriting does not hand-index `allocs[0]`, `allocs[1]`, and so on in
   every AArch64 instruction arm.
-- [ ] Retain operand identity or a target-provided rewrite callback in addition
+- [x] Retain operand identity or a target-provided rewrite callback in addition
   to flattened allocation order.
-- [ ] Ensure alias resolution updates the actual instruction fields for both
+- [x] Ensure alias resolution updates the actual instruction fields for both
   uses and defs rather than only temporary `Writable<Reg>` wrappers.
 - [ ] Add test coverage for VReg aliases through use operands, def operands,
   block parameters, and branch arguments.
 - [x] Implement and test `OperandConstraint::Limit`; allocator candidate
   selection must honor the encoded physical-register subset.
-- [ ] Add and test tied use/def (`Reuse`) constraints, including a real AArch64
+- [x] Add and test tied use/def (`Reuse`) constraints, including a real AArch64
   `movk`-style input/output reuse fixture.
-- [ ] Define explicit behavior for nonallocatable fixed architectural registers
+- [x] Define explicit behavior for nonallocatable fixed architectural registers
   such as SP, ZR, FP, LR, and reserved scratch registers.
-- [ ] Support multiple spilled defs and emit every required post-instruction
+- [x] Support multiple spilled defs and emit every required post-instruction
   store in deterministic order.
-- [ ] Support instructions with three or more spilled use operands, or legalize
+- [x] Support instructions with three or more spilled use operands, or legalize
   them before post-RA rewrite into forms requiring no more simultaneously live
   scratch registers than the target reserves.
-- [ ] Unify allocator and emitter scratch-register contracts by register class.
+- [x] Unify allocator and emitter scratch-register contracts by register class.
 - [x] Remove or replace fabricated untracked spill-slot fallback behavior when
   no move scratch register is available.
-- [ ] Add a vector-class failure path or implementation; no vector operand may
+- [x] Add a vector-class failure path or implementation; no vector operand may
   be silently dropped during branch-copy handling.
-- [ ] Make `MachInst` classification useful to consumers: terminator, call,
+- [x] Make `MachInst` classification useful to consumers: terminator, call,
   memory, move, flags, and side-effect metadata must not be dead interfaces.
 
 ### Required Regressions
 
 - [ ] Three spilled integer inputs to `MSub` assemble and execute correctly.
-- [ ] Three spilled f32 inputs to a future three-source float form are either
+- [x] Three spilled f32 inputs to a future three-source float form are either
   correctly legalized or rejected before invalid assembly is emitted.
-- [ ] Multiple spilled defs are stored to distinct slots in correct order.
+- [x] Multiple spilled defs are stored to distinct slots in correct order.
 - [ ] Tied input/output allocation preserves values under register pressure.
 - [ ] Fixed ABI operands, physical SP/ZR operands, and call clobbers coexist.
-- [ ] Spill-to-spill copies work with large offsets and no untracked stack slot.
+- [x] Spill-to-spill copies work with large offsets and no untracked stack slot.
 
 ### Exit Gate
 
 - [ ] `taki_mir` unit tests cover aliases, Limit, reuse, clobbers, edge edits,
   and allocation output mapping.
-- [ ] `anon_armv8` tests cover post-RA instructions with all supported spilled
+- [x] `anon_armv8` tests cover post-RA instructions with all supported spilled
   operand shapes and no scratch-register overflow.
-- [ ] `cargo test -p taki_mir`, `cargo test -p anon_armv8`, and `git diff
+- [x] `cargo test -p taki_mir`, `cargo test -p anon_armv8`, and `git diff
   --check` pass.
 
 ## M1: Encoding-Shaped AArch64 MInst

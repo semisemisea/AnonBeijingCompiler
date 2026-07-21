@@ -529,7 +529,16 @@ pub fn emit_post_ra_inst(
     locations.finish(&format!("{inst:?}"))?;
 
     writeln!(output, "    {}", format_inst(function, &rewritten)).unwrap();
-    for (reg, allocation, ty) in spill_def.into_iter() {
+    emit_spill_defs(output, spill_def, spill_base)?;
+    Ok(())
+}
+
+fn emit_spill_defs(
+    output: &mut String,
+    spill_defs: Vec<(Reg, Allocation, Type)>,
+    spill_base: u32,
+) -> Result<(), String> {
+    for (reg, allocation, ty) in spill_defs {
         emit_spill_access(
             output,
             "str",
@@ -1048,6 +1057,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, "    movk w3, #43981, lsl #16\n");
+    }
+
+    #[test]
+    fn writes_multiple_spilled_defs_in_declaration_order() {
+        let mut output = String::new();
+        emit_spill_defs(
+            &mut output,
+            vec![
+                (
+                    regs::int_reg(0),
+                    Allocation::stack(SpillSlot::new(0)),
+                    Type::new_i32(),
+                ),
+                (
+                    regs::int_reg(1),
+                    Allocation::stack(SpillSlot::new(8)),
+                    Type::new_i32(),
+                ),
+            ],
+            32,
+        )
+        .unwrap();
+
+        assert_eq!(output, "    str w0, [sp, #32]\n    str w1, [sp, #40]\n");
+    }
+
+    #[test]
+    fn rejects_unsupported_third_float_spill_scratch() {
+        assert!(scratch_reg(Type::new_f32(), 2).is_err());
     }
 
     #[test]

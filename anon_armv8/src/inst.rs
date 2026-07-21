@@ -305,4 +305,59 @@ impl MachInst for Inst {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingVisitor {
+        operands: Vec<(Reg, taki_mir::reg_alloc::reg::OperandConstraint)>,
+        clobbers: taki_mir::reg_alloc::reg::PRegSet,
+    }
+
+    impl OperandVisitor for RecordingVisitor {
+        fn add_operand(
+            &mut self,
+            reg: &mut Reg,
+            constraint: taki_mir::reg_alloc::reg::OperandConstraint,
+            _: taki_mir::reg_alloc::reg::OperandKind,
+            _: taki_mir::reg_alloc::reg::OperandPos,
+        ) {
+            self.operands.push((*reg, constraint));
+        }
+
+        fn reg_clobbers(&mut self, regs: taki_mir::reg_alloc::reg::PRegSet) {
+            self.clobbers.union_from(regs);
+        }
+    }
+
+    #[test]
+    fn fixed_abi_operands_and_call_clobbers_are_collected() {
+        let mut inst = Inst::Call {
+            symbol: "callee".into(),
+            args: vec![ArgPair {
+                vreg: Reg::from_virtual_reg(taki_mir::reg_alloc::reg::VReg::new(
+                    192,
+                    taki_mir::reg_alloc::reg::RegClass::Int,
+                )),
+                preg: regs::int_reg(0),
+                ty: Type::new_i32(),
+            }],
+            result: Some((
+                Reg::from_virtual_reg(taki_mir::reg_alloc::reg::VReg::new(
+                    193,
+                    taki_mir::reg_alloc::reg::RegClass::Int,
+                )),
+                Type::new_i32(),
+            )),
+        };
+        let mut visitor = RecordingVisitor::default();
+        inst.get_operands(&mut visitor);
+
+        assert_eq!(visitor.operands.len(), 2);
+        assert!(visitor.clobbers.contains(regs::int_preg(0)));
+        assert!(visitor.clobbers.contains(regs::float_preg(0)));
+    }
+}
+
 impl MachInstEmit for Inst {}

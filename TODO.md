@@ -678,9 +678,12 @@ calls are defined in their fixed AAPCS64 `w0..w7` locations, with call results
 defined in `w0` and caller-save clobbers recorded for RA; this path is validated
 through post-RA assembly. A focused regression verifies an i32 value live across
 a direct call is placed in a saved callee-save register and remains available to
-a post-call use. Stack-passed, float, pointer, void, and indirect calls remain
-unsupported. Signed remainder selects `sdiv` followed by `msub`; all remaining
-integer binary operations are likewise validated through that path.
+a post-call use. A separate 32-value pressure fixture forces i32 spills across a
+direct call and validates spill stores before the call, reloads after it, and the
+post-call accumulation sequence. Stack-passed, float, pointer, void, and
+indirect calls remain unsupported. Signed remainder selects `sdiv` followed by
+`msub`; all remaining integer binary operations are likewise validated through
+that path.
 The selector now verifies a single-successor i32 block-parameter transfer through
 the allocator's spill-oriented edge edits. Conditional block-parameter edges,
 loop-carried values, and critical-edge copy cycles remain excluded because the

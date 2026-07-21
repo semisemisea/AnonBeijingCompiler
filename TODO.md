@@ -681,9 +681,9 @@ a direct call is placed in a saved callee-save register and remains available to
 a post-call use. A separate 32-value pressure fixture forces i32 spills across a
 direct call and validates spill stores before the call, reloads after it, and the
 post-call accumulation sequence. Stack-passed, float, pointer, void, and
-indirect calls remain unsupported. Signed remainder selects `sdiv` followed by
-`msub`; all remaining integer binary operations are likewise validated through
-that path.
+indirect calls remain unsupported, except direct void calls with up to eight i32
+register arguments. Signed remainder selects `sdiv` followed by `msub`; all
+remaining integer binary operations are likewise validated through that path.
 The selector now verifies a single-successor i32 block-parameter transfer through
 the allocator's spill-oriented edge edits. Conditional block-parameter edges,
 loop-carried values, and critical-edge copy cycles remain excluded because the

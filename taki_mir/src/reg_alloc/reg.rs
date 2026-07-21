@@ -384,6 +384,45 @@ pub struct Output {
     pub inst_alloc_offsets: Vec<u32>,
 }
 
+/// Checked, ordered access to the locations allocated for one instruction.
+/// Machine backends name each consumed operand, avoiding unchecked positional
+/// indexing while retaining the operand order declared by `get_operands()`.
+pub struct AllocationCursor<'a> {
+    allocations: &'a [Allocation],
+    next: usize,
+}
+
+impl<'a> AllocationCursor<'a> {
+    pub fn new(allocations: &'a [Allocation]) -> Self {
+        Self {
+            allocations,
+            next: 0,
+        }
+    }
+
+    pub fn next(&mut self, operand: &str) -> Result<Allocation, String> {
+        let allocation = self.allocations.get(self.next).copied().ok_or_else(|| {
+            format!(
+                "register allocation omitted location {} for operand {operand}",
+                self.next
+            )
+        })?;
+        self.next += 1;
+        Ok(allocation)
+    }
+
+    pub fn finish(self, inst: &str) -> Result<(), String> {
+        if self.next == self.allocations.len() {
+            Ok(())
+        } else {
+            Err(format!(
+                "register allocation returned {} unused locations for {inst}",
+                self.allocations.len() - self.next
+            ))
+        }
+    }
+}
+
 impl Output {
     pub fn inst_allocs(&self, inst: u32) -> &[Allocation] {
         let start = self.inst_alloc_offsets[inst as usize] as usize;
@@ -1466,5 +1505,18 @@ impl OperandVisitor for OperandWriter<'_> {
             }
             _ => {}
         }
+    }
+
+    #[test]
+    fn allocation_cursor_checks_location_consumption() {
+        let allocation = Allocation::reg(PReg::new(0, RegClass::Int));
+        let allocations = [allocation];
+        let mut cursor = AllocationCursor::new(&allocations);
+        assert_eq!(cursor.next("input").unwrap(), allocation);
+        assert!(cursor.next("output").is_err());
+        assert!(cursor.finish("test instruction").is_ok());
+
+        let cursor = AllocationCursor::new(&allocations);
+        assert!(cursor.finish("test instruction").is_err());
     }
 }

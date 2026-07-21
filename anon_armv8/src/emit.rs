@@ -2,7 +2,7 @@ use std::{fmt::Write, ops::Range};
 
 use taki_mir::{
     block_order::MirBlockIndex,
-    reg_alloc::reg::{Allocation, Edit, Output as RegAllocOutput},
+    reg_alloc::reg::{Allocation, AllocationCursor, Edit, Output as RegAllocOutput},
     register::Reg,
     types::Type,
 };
@@ -346,33 +346,42 @@ pub fn emit_post_ra_inst(
     spill_base: u32,
 ) -> Result<(), String> {
     let mut rewritten = inst.clone();
+    let mut locations = AllocationCursor::new(allocs);
     let spill_def = match &mut rewritten {
         Inst::MovImm { dst, .. } => {
-            expect_alloc_count(inst, allocs, 1)?;
-            let (reg, spill) = resolve_def(allocs[0], Type::new_i32(), 0)?;
+            let (reg, spill) = resolve_def(locations.next("destination")?, Type::new_i32(), 0)?;
             *dst = reg;
             spill
         }
         Inst::Mov { dst, src, ty } => {
-            expect_alloc_count(inst, allocs, 2)?;
-            *src = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
-            let (reg, spill) = resolve_def(allocs[1], *ty, 0)?;
+            *src = resolve_use(output, locations.next("source")?, *ty, 0, spill_base)?;
+            let (reg, spill) = resolve_def(locations.next("destination")?, *ty, 0)?;
             *dst = reg;
             spill
         }
         Inst::FAdd { dst, lhs, rhs } => {
-            expect_alloc_count(inst, allocs, 3)?;
-            *lhs = resolve_use(output, allocs[0], Type::new_f32(), 0, spill_base)?;
-            *rhs = resolve_use(output, allocs[1], Type::new_f32(), 1, spill_base)?;
-            let (reg, spill) = resolve_def(allocs[2], Type::new_f32(), 0)?;
+            *lhs = resolve_use(
+                output,
+                locations.next("left input")?,
+                Type::new_f32(),
+                0,
+                spill_base,
+            )?;
+            *rhs = resolve_use(
+                output,
+                locations.next("right input")?,
+                Type::new_f32(),
+                1,
+                spill_base,
+            )?;
+            let (reg, spill) = resolve_def(locations.next("destination")?, Type::new_f32(), 0)?;
             *dst = reg;
             spill
         }
         Inst::Add { dst, lhs, rhs, ty } => {
-            expect_alloc_count(inst, allocs, 3)?;
-            *lhs = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
-            *rhs = resolve_use(output, allocs[1], *ty, 1, spill_base)?;
-            let (reg, spill) = resolve_def(allocs[2], *ty, 0)?;
+            *lhs = resolve_use(output, locations.next("left input")?, *ty, 0, spill_base)?;
+            *rhs = resolve_use(output, locations.next("right input")?, *ty, 1, spill_base)?;
+            let (reg, spill) = resolve_def(locations.next("destination")?, *ty, 0)?;
             *dst = reg;
             spill
         }
@@ -385,10 +394,9 @@ pub fn emit_post_ra_inst(
         | Inst::Lsl { dst, lhs, rhs, ty }
         | Inst::Lsr { dst, lhs, rhs, ty }
         | Inst::Asr { dst, lhs, rhs, ty } => {
-            expect_alloc_count(inst, allocs, 3)?;
-            *lhs = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
-            *rhs = resolve_use(output, allocs[1], *ty, 1, spill_base)?;
-            let (reg, spill) = resolve_def(allocs[2], *ty, 0)?;
+            *lhs = resolve_use(output, locations.next("left input")?, *ty, 0, spill_base)?;
+            *rhs = resolve_use(output, locations.next("right input")?, *ty, 1, spill_base)?;
+            let (reg, spill) = resolve_def(locations.next("destination")?, *ty, 0)?;
             *dst = reg;
             spill
         }
@@ -399,41 +407,54 @@ pub fn emit_post_ra_inst(
             sub,
             ty,
         } => {
-            expect_alloc_count(inst, allocs, 4)?;
-            *mul_lhs = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
-            *mul_rhs = resolve_use(output, allocs[1], *ty, 1, spill_base)?;
-            *sub = resolve_use(output, allocs[2], *ty, 2, spill_base)?;
-            let (reg, spill) = resolve_def(allocs[3], *ty, 0)?;
+            *mul_lhs = resolve_use(
+                output,
+                locations.next("multiply left input")?,
+                *ty,
+                0,
+                spill_base,
+            )?;
+            *mul_rhs = resolve_use(
+                output,
+                locations.next("multiply right input")?,
+                *ty,
+                1,
+                spill_base,
+            )?;
+            *sub = resolve_use(
+                output,
+                locations.next("subtraction input")?,
+                *ty,
+                2,
+                spill_base,
+            )?;
+            let (reg, spill) = resolve_def(locations.next("destination")?, *ty, 0)?;
             *dst = reg;
             spill
         }
         Inst::Cmp { lhs, rhs, ty } => {
-            expect_alloc_count(inst, allocs, 2)?;
             if ty.is_f32() {
                 return Err("f32 comparison requires an FCmp instruction".into());
             }
-            *lhs = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
-            *rhs = resolve_use(output, allocs[1], *ty, 1, spill_base)?;
+            *lhs = resolve_use(output, locations.next("left input")?, *ty, 0, spill_base)?;
+            *rhs = resolve_use(output, locations.next("right input")?, *ty, 1, spill_base)?;
             None
         }
         Inst::CmpZero { src, ty } => {
-            expect_alloc_count(inst, allocs, 1)?;
             if ty.is_f32() {
                 return Err("f32 comparison requires an FCmp instruction".into());
             }
-            *src = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
+            *src = resolve_use(output, locations.next("input")?, *ty, 0, spill_base)?;
             None
         }
         Inst::CSet { dst, .. } => {
-            expect_alloc_count(inst, allocs, 1)?;
-            let (reg, spill) = resolve_def(allocs[0], Type::new_i32(), 0)?;
+            let (reg, spill) = resolve_def(locations.next("destination")?, Type::new_i32(), 0)?;
             *dst = reg;
             spill
         }
         Inst::Args { args } => {
-            expect_alloc_count(inst, allocs, args.len())?;
-            for (arg, allocation) in args.iter_mut().zip(allocs) {
-                let (reg, spill) = resolve_def(*allocation, arg.ty, 0)?;
+            for arg in args {
+                let (reg, spill) = resolve_def(locations.next("entry argument")?, arg.ty, 0)?;
                 if spill.is_some() {
                     return Err("entry argument cannot be assigned to a spill slot".into());
                 }
@@ -442,24 +463,34 @@ pub fn emit_post_ra_inst(
             None
         }
         Inst::RetI32 { src } => {
-            expect_alloc_count(inst, allocs, 1)?;
-            *src = resolve_use(output, allocs[0], Type::new_i32(), 0, spill_base)?;
+            *src = resolve_use(
+                output,
+                locations.next("return value")?,
+                Type::new_i32(),
+                0,
+                spill_base,
+            )?;
             None
         }
         Inst::RetF32 { src } => {
-            expect_alloc_count(inst, allocs, 1)?;
-            *src = resolve_use(output, allocs[0], Type::new_f32(), 0, spill_base)?;
+            *src = resolve_use(
+                output,
+                locations.next("return value")?,
+                Type::new_f32(),
+                0,
+                spill_base,
+            )?;
             None
         }
         Inst::Call { args, result, .. } => {
-            expect_alloc_count(inst, allocs, args.len() + usize::from(result.is_some()))?;
-            for (arg, allocation) in args.iter().zip(allocs) {
+            for arg in args {
+                let allocation = locations.next("call argument")?;
                 if allocation.as_reg() != arg.preg.to_physical_reg() {
                     return Err("call argument was not assigned to its ABI register".into());
                 }
             }
             if let Some((_, ty)) = result {
-                let allocation = allocs[args.len()];
+                let allocation = locations.next("call result")?;
                 let result_reg = if ty.is_f32() {
                     regs::float_reg(0)
                 } else {
@@ -473,11 +504,10 @@ pub fn emit_post_ra_inst(
             }
             None
         }
-        Inst::Jump { .. } | Inst::Branch { .. } | Inst::Ret | Inst::Nop => {
-            expect_alloc_count(inst, allocs, 0)?;
-            None
-        }
+        Inst::Jump { .. } | Inst::Branch { .. } | Inst::Ret | Inst::Nop => None,
     };
+
+    locations.finish(&format!("{inst:?}"))?;
 
     writeln!(output, "    {}", format_inst(function, &rewritten)).unwrap();
     if let Some((reg, allocation, ty)) = spill_def {
@@ -606,17 +636,6 @@ fn emit_sp_adjust(output: &mut String, opcode: &str, amount: u32) -> Result<(), 
     }
     writeln!(output, "    {opcode} sp, sp, x17").unwrap();
     Ok(())
-}
-
-fn expect_alloc_count(inst: &Inst, allocs: &[Allocation], expected: usize) -> Result<(), String> {
-    if allocs.len() == expected {
-        Ok(())
-    } else {
-        Err(format!(
-            "register allocation returned {} locations for {inst:?}; expected {expected}",
-            allocs.len()
-        ))
-    }
 }
 
 fn resolve_use(

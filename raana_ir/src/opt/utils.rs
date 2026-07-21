@@ -3,7 +3,7 @@ use std::collections::{HashMap, hash_map::Entry};
 use crate::{
     ir::{
         BasicBlock, FunctionData, Inst, InstKind, Type, TypeKind, arena::Arena,
-        builder_trait::LocalInstBuilder,
+        builder_trait::{LocalInstBuilder, ScalarInstBuilder},
     },
     opt::pass::ArenaContext,
 };
@@ -165,7 +165,14 @@ fn visit_and_replace_single(data: &mut ArenaContext<'_>, used_by: Inst, rep: Ins
         | InstKind::Alloc
         | InstKind::GlobalAlloc(..) => unreachable!("Encountered kind: {:?}", rep_val_data.kind()),
         InstKind::Integer(..) | InstKind::Float(..) => {}
-        InstKind::Aggregate(agg) => {}
+        InstKind::Aggregate(agg) => {
+            let value = agg
+                .value()
+                .iter()
+                .map(|&val| if val == rep { rep_with } else { val })
+                .collect();
+            data.replace_inst_with(used_by).aggregate(value);
+        }
         InstKind::Cast(cast) => {
             let ty = rep_val_data.ty().clone();
             data.replace_inst_with(used_by).cast(rep_with, ty);
@@ -180,7 +187,7 @@ fn visit_and_replace_single(data: &mut ArenaContext<'_>, used_by: Inst, rep: Ins
             }
         }
         InstKind::GetElemPtr(get_elem_ptr) => {
-            if get_elem_ptr.offsets().contains(&rep) {
+            if get_elem_ptr.base() == rep || get_elem_ptr.offsets().contains(&rep) {
                 let mut rep_with_vec = Vec::with_capacity(get_elem_ptr.offsets().len());
                 for &offset in get_elem_ptr.offsets() {
                     if offset == rep {
@@ -189,7 +196,11 @@ fn visit_and_replace_single(data: &mut ArenaContext<'_>, used_by: Inst, rep: Ins
                         rep_with_vec.push(offset);
                     }
                 }
-                let base = get_elem_ptr.base();
+                let base = if get_elem_ptr.base() == rep {
+                    rep_with
+                } else {
+                    get_elem_ptr.base()
+                };
                 data.replace_inst_with(used_by)
                     .get_elem_ptr(base, rep_with_vec);
             }

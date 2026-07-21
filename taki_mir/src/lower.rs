@@ -1,12 +1,15 @@
 use log::trace;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 
-use crate::abi::CalleeABI;
+use crate::abi::{ABIMachineSpec, CalleeABI};
 use crate::block_order::{BlockLoweringOrder, LoweredBlock, MirBlockIndex};
 use crate::prelude::*;
-use crate::register::{Reg, VRegAllocator};
+use crate::reg_alloc::reg::PReg;
+use crate::register::{Reg, VRegAllocator, Writable};
+use crate::types::F32;
 use crate::vcode::{VCodeBuilder, VCodeContainer, VCodeInst};
+use raana_ir::ir::TypeKind as HirTypeKind;
 
 pub enum ValueUseCount {
     Unused = 0,
@@ -17,10 +20,10 @@ pub enum ValueUseCount {
 /// A lowering context for a single function
 pub struct LowerContext<'prog, I: VCodeInst> {
     /// Arena to get everything you need about HirFunction
-    arena: ArenaContext<'prog>,
+    pub arena: ArenaContext<'prog>,
 
     /// The VCode Container we currently building.
-    vcode: VCodeBuilder<I>,
+    pub vcode: VCodeBuilder<I>,
 
     /// A virtural register allocator.
     /// Allocate each instruction a register.
@@ -29,7 +32,7 @@ pub struct LowerContext<'prog, I: VCodeInst> {
     /// A map for instruction and register.
     /// INFO: Currently should be fixed map,
     /// since we allocate all the register in `new` function
-    reg_map: FxHashMap<HirInst, Reg>,
+    pub reg_map: FxHashMap<HirInst, Reg>,
 
     /// Current HirInstruction about to lower
     cur_inst: Option<HirInst>,
@@ -80,14 +83,29 @@ pub struct LowerContext<'prog, I: VCodeInst> {
 pub trait LowerBackend {
     type MInst: VCodeInst;
 
-    fn lower(&self, ctx: &mut LowerContext<Self::MInst>, inst: HirInst);
+    fn lower(ctx: &mut LowerContext<Self::MInst>, inst: HirInst);
 
     fn lower_branch(
-        &self,
         ctx: &mut LowerContext<Self::MInst>,
         inst: HirInst,
         target: &[MirBlockIndex],
     );
+
+    fn data_section_directive() -> &'static str;
+
+    fn text_section_directive() -> &'static str;
+
+    fn global_directive() -> &'static str;
+
+    fn word_directive() -> &'static str;
+
+    fn zero_directive() -> &'static str;
+
+    fn preg_name(preg: PReg) -> &'static str;
+
+    fn format_block_label(lb: &LoweredBlock, func_data: &HirFunctionData) -> String;
+
+    fn emit_long_jump(ctx: &mut LowerContext<Self::MInst>, target: MirBlockIndex);
 }
 
 /// impl block for all backend specified operation
@@ -102,6 +120,8 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             program,
             curr_func: Some(func),
         };
+        let mut abi = abi;
+        abi.set_outgoing_arg_size(Self::precompute_outgoing_arg_size(arena));
         let vcode = VCodeBuilder::new(abi, block_order);
         let mut vregs_alloc = VRegAllocator::with_capaticy(0);
         let mut reg_map = FxHashMap::default();
@@ -165,7 +185,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 // TODO: 2. If we have constant pool or something maybe we can remove it.
                 // if it produce a value, we allocate a virtual register to it.
                 for used in inst_data.inst_usage() {
-                    let used_inst_data = data.inst_data(used);
+                    let used_inst_data = arena.inst_data(used);
                     match used_inst_data.kind() {
                         InstKind::Integer(..) | InstKind::Float(..) => match reg_map.entry(used) {
                             std::collections::hash_map::Entry::Occupied(_) => {}
@@ -196,8 +216,44 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         }
     }
 
+    fn precompute_outgoing_arg_size(arena: ArenaContext<'_>) -> usize {
+        let mut max_size = 0usize;
+        for bb_layout in arena.f().layout().basicblocks() {
+            for &inst in bb_layout.insts() {
+                let InstKind::Call(call) = arena.inst_data(inst).kind() else {
+                    continue;
+                };
+                let mut int_arg_idx = 0usize;
+                let mut float_arg_idx = 0usize;
+                let mut outgoing_size = 0usize;
+                for &arg in call.args() {
+                    let ty = arena.inst_data(arg).ty();
+                    match ty.kind() {
+                        HirTypeKind::Int32 | HirTypeKind::Pointer(_) => {
+                            if int_arg_idx < 8 {
+                                int_arg_idx += 1;
+                            } else {
+                                outgoing_size += ty.size();
+                            }
+                        }
+                        HirTypeKind::Float32 => {
+                            if float_arg_idx < 8 {
+                                float_arg_idx += 1;
+                            } else {
+                                outgoing_size += ty.size();
+                            }
+                        }
+                        _ => unreachable!("unexpected call argument type: {:?}", ty.kind()),
+                    }
+                }
+                max_size = max_size.max(outgoing_size);
+            }
+        }
+        max_size
+    }
+
     /// Lower the function.
-    fn lower<B: LowerBackend<MInst = I>>(mut self, backend: &B) -> VCodeContainer<I> {
+    pub fn lower<B: LowerBackend<MInst = I>>(mut self) -> VCodeContainer<I> {
         let mut targets_buffer = smallvec![];
         let lowered_order: SmallVec<[LoweredBlock; 64]> = self
             .vcode
@@ -214,18 +270,26 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 if let Some(branch_inst) =
                     self.collect_branch_and_targets(block_index, &mut targets_buffer)
                 {
-                    self.lower_branch(backend, branch_inst, block_index, &targets_buffer);
+                    self.lower_branch::<B>(branch_inst, block_index, &targets_buffer);
                     self.finish_ir_inst();
                 } else {
                     let succ = self.vcode.block_order().succ_indices(block_index).1[0];
-                    self.emit(I::gen_jump(succ));
+                    B::emit_long_jump(&mut self, succ);
                     self.finish_ir_inst();
                     self.lower_branch_blockparam_args_move(block_index);
                 }
+            } else {
+                let &[succ] = self.vcode.block_order().succ_indices(block_index).1 else {
+                    unreachable!("edge blocks must have exactly one successor")
+                };
+                B::emit_long_jump(&mut self, succ);
+                self.finish_ir_inst();
+                self.lower_branch_blockparam_args_move(block_index);
             }
 
             if let Some(bb) = lb.orig_block() {
-                self.lower_block(backend, bb);
+                self.lower_block::<B>(bb);
+                self.process_block_param(bb);
             }
 
             // Entry block
@@ -244,17 +308,25 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
 
     fn gen_arg_setup(&mut self) {
         let Some(_entry_bb) = self.arena.f().layout().entry_bb() else {
-            // INFO: Since we treat function without entry block as declaration
             panic!("function declaration should not be lowered");
         };
-        for (i, &param) in self
+
+        let params: Vec<_> = self
             .arena
             .program
             .func_data(self.arena.curr_func.unwrap())
             .params()
             .iter()
+            .copied()
             .enumerate()
-        {
+            .collect();
+
+        // Pre-allocate spill slots so gen_copy_arg_to_reg emits only loads.
+        self.vcode.vcode.abi.prealloc_reg_arg_spills();
+
+        // Phase 1: Emit loads for all parameters (in .rev() order so that
+        // register loads come last in VCode, first after reverse_and_finalize).
+        for &(i, param) in params.iter().rev() {
             if self.arena.inst_data(param).used_by().is_empty() {
                 continue;
             }
@@ -267,13 +339,20 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             {
                 self.emit(inst);
             }
-
             self.finish_ir_inst();
 
-            for inst in self.vcode.vcode.abi.take_args() {
+            if let Some(inst) = self.vcode.vcode.abi.take_args() {
                 self.emit(inst);
             }
         }
+
+        // Phase 2: Emit register-arg stores at the END of the VCode block.
+        // After reverse_and_finalize they become the FIRST instructions,
+        // saving arg registers before any loads can clobber them.
+        for inst in self.vcode.vcode.abi.gen_store_reg_args_to_stack() {
+            self.emit(inst);
+        }
+        self.finish_ir_inst();
     }
 
     /// Lower the branch instruction at the end of each basic block.
@@ -282,7 +361,6 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     /// - Copy the block parameter
     fn lower_branch<B: LowerBackend<MInst = I>>(
         &mut self,
-        backend: &B,
         branch: HirInst,
         block: MirBlockIndex,
         target: &[MirBlockIndex],
@@ -290,7 +368,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         trace!("to lower the branch: {:?}, block: {:?}", branch, block);
         self.cur_inst = Some(branch);
 
-        backend.lower_branch(self, branch, target);
+        B::lower_branch(self, branch, target);
 
         self.finish_ir_inst();
 
@@ -364,25 +442,31 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
 
         let block_param = self.arena.inst_data(branch_inst);
         // Magic match
-        let args = match block_param.kind() {
+        let args: SmallVec<[HirInst; 16]> = match block_param.kind() {
             InstKind::Branch(branch) => match succ_idx {
-                0 => branch.t_args(),
-                1 => branch.f_args(),
+                0 => branch.t_args().iter().copied().collect(),
+                1 => branch.f_args().iter().copied().collect(),
                 _ => unreachable!(),
             },
-            InstKind::Jump(jump) => jump.args(),
+            InstKind::Jump(jump) => jump.args().iter().copied().collect(),
             _ => unreachable!(),
         };
 
-        for &arg in args {
+        for arg in args {
             // INFO: inline method of [put_value_in_reg]
             // I don't know what the fuck the borrow checker is doing.
             // Partial borrow when?
             let reg = {
                 let inst = arg;
-                *self.value_lowered_use.get_mut(&inst).unwrap() += 1;
+                let uses = self.value_lowered_use.entry(inst).or_insert(0);
+                *uses += 1;
+                let use_count = *uses;
                 assert!(!self.inst_sunk.contains(&inst));
-                let reg = self.reg_map[&inst];
+                let reg = *self
+                    .reg_map
+                    .entry(inst)
+                    .or_insert_with(|| self.vregs_alloc.alloc(self.arena.inst_data(inst).ty().into()));
+                self.rematerialize_if_needed(inst, reg, use_count);
                 reg
             };
             buffer.push(reg);
@@ -390,7 +474,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         (succ, &buffer[..])
     }
 
-    fn lower_block<B: LowerBackend<MInst = I>>(&mut self, backend: &B, block: HirBasicBlock) {
+    fn lower_block<B: LowerBackend<MInst = I>>(&mut self, block: HirBasicBlock) {
         self.cur_color = Some(self.bb_end_color[&block]);
         for &inst in self
             .arena
@@ -399,6 +483,8 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             .layout()
             .basicblock(block)
             .insts()
+            .iter()
+            .rev()
         {
             if self.is_inst_sunk(inst) {
                 continue;
@@ -426,7 +512,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             );
 
             if side_effect || value_needed {
-                backend.lower(self, inst);
+                B::lower(self, inst);
             }
 
             self.finish_ir_inst();
@@ -440,7 +526,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     }
 
     fn is_value_needed(&self, inst: HirInst) -> bool {
-        self.value_lowered_use[&inst] > 0
+        self.value_lowered_use.get(&inst).copied().unwrap_or(0) > 0
     }
 
     fn finish_ir_inst(&mut self) {
@@ -456,15 +542,67 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         }
     }
 
-    fn put_value_in_reg(&mut self, inst: HirInst) -> Reg {
-        *self.value_lowered_use.get_mut(&inst).unwrap() += 1;
+    pub fn put_value_in_reg(&mut self, inst: HirInst) -> Reg {
+        let uses = self.value_lowered_use.entry(inst).or_insert(0);
+        *uses += 1;
+        let use_count = *uses;
         assert!(!self.inst_sunk.contains(&inst));
-        let reg = self.reg_map[&inst];
-        // TODO: trace!("put_value_in_regs: inst {:?} -> reg {:?}",inst, reg);
+        let reg = *self
+            .reg_map
+            .entry(inst)
+            .or_insert_with(|| self.vregs_alloc.alloc(self.arena.inst_data(inst).ty().into()));
+        self.rematerialize_if_needed(inst, reg, use_count);
         reg
     }
 
-    fn emit(&mut self, mach_inst: I) {
+    fn rematerialize_if_needed(&mut self, inst: HirInst, reg: Reg, use_count: u32) {
+        enum Remat {
+            Int(i32),
+            Float(u32),
+            Global,
+        }
+
+        let remat = match self.arena.inst_data(inst).kind() {
+            InstKind::Integer(i) => Some(Remat::Int(i.value())),
+            InstKind::Float(f) => Some(Remat::Float(f.value().to_bits())),
+            InstKind::GlobalAlloc(..) => Some(Remat::Global),
+            _ => None,
+        };
+        let is_rematerializable = remat.is_some();
+        if use_count != 1 && !is_rematerializable {
+            return;
+        }
+
+        match remat {
+            Some(Remat::Int(value)) => {
+                self.emit(<I::ABISpec as ABIMachineSpec>::gen_load_imm(
+                    Writable::from_reg(reg),
+                    value,
+                ));
+            }
+            Some(Remat::Float(bits)) => {
+                let tmp = self.alloc_tmp(HirType::get_i32());
+                self.emit(<I::ABISpec as ABIMachineSpec>::gen_load_imm(
+                    Writable::from_reg(tmp),
+                    bits as i32,
+                ));
+                self.emit(<I::ABISpec as ABIMachineSpec>::gen_move(tmp, reg, F32));
+            }
+            Some(Remat::Global) => {
+                self.emit(<I::ABISpec as ABIMachineSpec>::gen_load_addr(
+                    Writable::from_reg(reg),
+                    inst,
+                ));
+            }
+            None => {}
+        }
+    }
+
+    pub fn alloc_tmp(&mut self, ty: HirType) -> Reg {
+        self.vregs_alloc.alloc(ty.into())
+    }
+
+    pub fn emit(&mut self, mach_inst: I) {
         trace!("emit mach inst {:?}", mach_inst);
         self.ir_inst.push(mach_inst);
     }

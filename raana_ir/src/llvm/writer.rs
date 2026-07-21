@@ -373,13 +373,11 @@ impl<'a> LlvmWriter<'a> {
         self.bb_labels.clear();
         self.bb_counter = 0;
         for (bb, _, _) in &all_bbs_and_insts {
-            self.bb_labels
-                .entry(*bb)
-                .or_insert_with(|| {
-                    let label = format!("%L{}", self.bb_counter);
-                    self.bb_counter += 1;
-                    label
-                });
+            self.bb_labels.entry(*bb).or_insert_with(|| {
+                let label = format!("%L{}", self.bb_counter);
+                self.bb_counter += 1;
+                label
+            });
         }
 
         // Phase 4: emit function header
@@ -409,8 +407,7 @@ impl<'a> LlvmWriter<'a> {
         // Alloca insts are hoisted to the entry block.
         let entry_bb = all_bbs_and_insts.first().map(|(bb, ..)| *bb);
         for (bb, _params, _insts) in &all_bbs_and_insts {
-            let has_preds = self.phi_incoming.contains_key(bb)
-                || Some(*bb) == entry_bb;
+            let has_preds = self.phi_incoming.contains_key(bb) || Some(*bb) == entry_bb;
             if has_preds {
                 self.visit_block(*bb, Some(*bb) == entry_bb, &alloca_insts)?;
             }
@@ -595,11 +592,7 @@ impl<'a> LlvmWriter<'a> {
                     if func_ret_ty.is_unit() {
                         writeln!(self.buffer, "ret void")
                     } else {
-                        writeln!(
-                            self.buffer,
-                            "ret {} undef",
-                            self.type_to_llvm(&func_ret_ty)
-                        )
+                        writeln!(self.buffer, "ret {} undef", self.type_to_llvm(&func_ret_ty))
                     }
                 }
             }
@@ -862,14 +855,18 @@ impl<'a> LlvmWriter<'a> {
                         self.name_counter += 1;
                         let elem_llvm_ty = self.type_to_llvm(elem_ty);
                         let dest_name = get_name!(self, dest);
-                        let base_ty = self.type_to_llvm(&self.arena.inst_data(dest).ty().derefernce());
+                        let base_ty =
+                            self.type_to_llvm(&self.arena.inst_data(dest).ty().derefernce());
                         let idx_strs: Vec<String> = std::iter::once("i32 0".to_string())
                             .chain(new_indices.iter().map(|idx| format!("i32 {idx}")))
                             .collect();
                         writeln!(
                             self.buffer,
                             "  {} = getelementptr inbounds {}, ptr {}, {}",
-                            gep_name, base_ty, dest_name, idx_strs.join(", ")
+                            gep_name,
+                            base_ty,
+                            dest_name,
+                            idx_strs.join(", ")
                         )?;
                         writeln!(
                             self.buffer,
@@ -895,7 +892,10 @@ impl<'a> LlvmWriter<'a> {
                 writeln!(
                     self.buffer,
                     "  {} = getelementptr inbounds {}, ptr {}, {}",
-                    gep_name, base_ty, dest_name, idx_strs.join(", ")
+                    gep_name,
+                    base_ty,
+                    dest_name,
+                    idx_strs.join(", ")
                 )?;
                 let elem_val = agg.value()[0];
                 let elem_ty = self.type_to_llvm(self.arena.inst_data(elem_val).ty());

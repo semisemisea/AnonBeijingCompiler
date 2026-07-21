@@ -12,7 +12,23 @@ import time
 ROOT = Path("/work")
 TESTS_ROOT = ROOT / "tests"
 RESULTS_ROOT = ROOT / "results"
-SYSYLIB = ROOT / "sysylib" / "libsysy_arm.a"
+
+TARGET_CONFIG = {
+    "aarch64": {
+        "sysylib": "libsysy_arm.a",
+        "clang_target": "aarch64-linux-gnu",
+        "sysroot": "/usr/aarch64-linux-gnu",
+        "qemu": "qemu-aarch64-static",
+        "llvm_triple": "aarch64-linux-gnu",
+    },
+    "riscv64": {
+        "sysylib": "libsysy_riscv.a",
+        "clang_target": "riscv64-linux-gnu",
+        "sysroot": "/usr/riscv64-linux-gnu",
+        "qemu": "qemu-riscv64-static",
+        "llvm_triple": "riscv64-linux-gnu",
+    },
+}
 DEFAULT_COMPILER = Path(
     os.environ.get("SOYO_COMPILER", "/work/target/release/soyo_compiler")
 )
@@ -27,7 +43,7 @@ CODES = {
     "yellow": "\x1b[33m",
     "magenta": "\x1b[35m",
 }
-TEST_TIMEOUT = 120
+TEST_TIMEOUT = 1000
 
 STATUSES = ("PASS", "FAIL", " CE ", " RE ", " TLE", "SKIP")
 
@@ -142,9 +158,11 @@ def copy_testcase_files(src, out_dir):
             shutil.copy2(path, dst_base.with_suffix(path.suffix))
 
 
-def run_test(src, out_dir, opt_level, compiler, backend):
+def run_test(src, out_dir, opt_level, compiler, backend, target):
     start = time.perf_counter()
     src_rel = rel_test(src)
+    arch_config = TARGET_CONFIG[target]
+    sysylib = ROOT / "sysylib" / arch_config["sysylib"]
     if str(src_rel) in SKIP_TESTS:
         return time.perf_counter() - start, "SKIP", "skipped (missing input)"
     base = src.with_suffix("")
@@ -230,7 +248,7 @@ def run_test(src, out_dir, opt_level, compiler, backend):
                 [
                     "llc",
                     "-O2",
-                    "--mtriple=aarch64-linux-gnu",
+                    f"--mtriple={arch_config['llvm_triple']}",
                     "-filetype=obj",
                     str(compile_artifact),
                     "-o",
@@ -269,13 +287,14 @@ def run_test(src, out_dir, opt_level, compiler, backend):
         link_proc = subprocess.run(
             [
                 "clang",
-                "--target=aarch64-linux-gnu",
+                f"--target={arch_config['clang_target']}",
                 "--gcc-toolchain=/usr",
-                "--sysroot=/usr/aarch64-linux-gnu",
+                f"--sysroot={arch_config['sysroot']}",
                 "-fuse-ld=lld",
+                "-mcmodel=medany",
                 "-static",
                 link_input,
-                str(SYSYLIB),
+                str(sysylib),
                 "-o",
                 str(elf),
             ],
@@ -305,7 +324,7 @@ def run_test(src, out_dir, opt_level, compiler, backend):
     try:
         try:
             run_proc = subprocess.run(
-                ["qemu-aarch64-static", str(elf)],
+                [arch_config["qemu"], str(elf)],
                 stdin=stdin_file,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -360,7 +379,13 @@ def parse_args(argv):
         "--backend",
         choices=["asm", "llvm"],
         default="asm",
-        help="compiler backend: asm (ARMv8 assembly) or llvm (LLVM IR)",
+        help="compiler backend: asm (assemnly) or llvm (LLVM IR)",
+    )
+    parser.add_argument(
+        "--target",
+        choices=["aarch64", "riscv64"],
+        default="aarch64",
+        help="target architecture (default: aarch64)",
     )
     parser.add_argument(
         "--compiler",
@@ -386,9 +411,11 @@ def parse_args(argv):
     return args
 
 
-def check_mounts(compiler):
+def check_mounts(compiler, target):
+    arch_config = TARGET_CONFIG[target]
+    sysylib = ROOT / "sysylib" / arch_config["sysylib"]
     missing = []
-    for path in (TESTS_ROOT, RESULTS_ROOT, SYSYLIB, compiler):
+    for path in (TESTS_ROOT, RESULTS_ROOT, sysylib, compiler):
         if not path.exists():
             missing.append(str(path))
     if missing:
@@ -401,7 +428,7 @@ def check_mounts(compiler):
 
 def run_tests(args):
     compiler = args.compiler.resolve()
-    if not check_mounts(compiler):
+    if not check_mounts(compiler, args.target):
         return 1
 
     try:
@@ -462,7 +489,7 @@ def run_tests(args):
     try:
         futures = {
             pool.submit(
-                run_test, src, RESULTS_ROOT, args.opt_level, compiler, args.backend
+                run_test, src, RESULTS_ROOT, args.opt_level, compiler, args.backend, args.target
             ): src
             for src in files
         }

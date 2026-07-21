@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use crate::{
     reg_alloc::reg::{PReg, RegClass, SpillSlot},
-    types::Type,
+    types::LoweredType,
     vcode::VCodeInst,
 };
 use rustc_hash::FxHashMap;
@@ -56,6 +56,10 @@ impl Reg {
         Reg(bits)
     }
 
+    pub fn from_spillslot(slot: SpillSlot) -> Reg {
+        Reg(slot.raw_bits() | SPILLSLOT_BIT)
+    }
+
     pub fn to_spillslot(self) -> Option<SpillSlot> {
         if (self.0 & SPILLSLOT_BIT) != 0 {
             Some(SpillSlot::new((self.0 & SPILLSLOT_MASK) as usize))
@@ -105,23 +109,23 @@ impl Reg {
     }
 }
 
-// impl core::fmt::Debug for Reg {
-//     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-//         if VReg::from(self.0) == VReg::invalid() {
-//             write!(f, "<invalid>")
-//         } else if let Some(spillslot) = self.to_spillslot() {
-//             write!(f, "{spillslot}")
-//         } else if let Some(rreg) = self.to_real_reg() {
-//             let preg: PReg = rreg.into();
-//             write!(f, "{preg}")
-//         } else if let Some(vreg) = self.to_virtual_reg() {
-//             let vreg: VReg = vreg.into();
-//             write!(f, "{vreg}")
-//         } else {
-//             unreachable!()
-//         }
-//     }
-// }
+impl core::fmt::Debug for Reg {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        if VReg::from(self.0) == VReg::invalid() {
+            write!(f, "<invalid>")
+        } else if let Some(spillslot) = self.to_spillslot() {
+            write!(f, "{spillslot}")
+        } else if let Some(rreg) = self.to_real_reg() {
+            let preg: PReg = rreg.into();
+            write!(f, "{preg}")
+        } else if let Some(vreg) = self.to_virtual_reg() {
+            let vreg: VReg = vreg.into();
+            write!(f, "{vreg}")
+        } else {
+            unreachable!()
+        }
+    }
+}
 
 impl AsMut<Reg> for Reg {
     fn as_mut(&mut self) -> &mut Reg {
@@ -131,7 +135,7 @@ impl AsMut<Reg> for Reg {
 
 #[derive(Debug, Default)]
 pub struct VRegAllocator<I: VCodeInst> {
-    pub vreg_types: Vec<Type>,
+    pub vreg_types: Vec<LoweredType>,
     vreg_alias: FxHashMap<VReg, VReg>,
     _marker: PhantomData<I>,
 }
@@ -139,14 +143,16 @@ pub struct VRegAllocator<I: VCodeInst> {
 impl<I: VCodeInst> VRegAllocator<I> {
     pub fn with_capaticy(cap: usize) -> VRegAllocator<I> {
         let capacity = PINNED_PREG + cap;
+        let mut vreg_types = Vec::with_capacity(capacity);
+        vreg_types.resize(PINNED_PREG, LoweredType::invalid());
         VRegAllocator {
-            vreg_types: Vec::with_capacity(capacity),
+            vreg_types,
             vreg_alias: FxHashMap::default(),
             _marker: PhantomData,
         }
     }
 
-    pub fn alloc(&mut self, ty: Type) -> Reg {
+    pub fn alloc(&mut self, ty: LoweredType) -> Reg {
         let len = self.vreg_types.len();
         let (&[regclass], &[ty]) = I::rc_for_type(ty) else {
             // INFO: Since we only have to deal with i32, f32, u64 and self defined SIMD vector,
@@ -212,6 +218,7 @@ impl From<PReg> for Reg {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Writable<T> {
     pub(crate) reg: T,
 }

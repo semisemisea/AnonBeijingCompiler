@@ -14,8 +14,10 @@ RUN apt-get update \
         lld \
         llvm \
         gcc-aarch64-linux-gnu \
+        gcc-riscv64-linux-gnu \
         qemu-user-static \
         libc6-dev-arm64-cross \
+        libc6-dev-riscv64-cross \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work

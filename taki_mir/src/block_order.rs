@@ -1,6 +1,7 @@
-//! The order of we traversing a series of basicblock should be RPO of dominance tree.
+//! The order of traversing basic blocks uses RPO of the dominance tree.
 use std::ops::Range;
 
+use raana_ir::opt::prelude::{IDAllocator, cfg, dom_tree};
 use rustc_hash::FxHashMap;
 
 pub type MirBlockIndex = crate::reg_alloc::index::Block;
@@ -50,8 +51,44 @@ impl LoweredBlock {
 }
 
 impl BlockLoweringOrder {
-    fn new(arena: ArenaContext<'_>, rpo: &[HirBasicBlock]) -> BlockLoweringOrder {
+    pub fn new(arena: ArenaContext<'_>) -> BlockLoweringOrder {
         assert!(arena.curr_func.is_some());
+
+        let func_data = arena.f();
+        let mut bb_id = IDAllocator::default();
+        let (graph, prece) = cfg::build_cfg_both(func_data, &mut bb_id);
+        let plain_rpo = cfg::rpo_path(&graph);
+
+        let idom_map = dom_tree::idom(&prece, &plain_rpo);
+        let dom_children = dom_tree::build_dominance_tree(&idom_map, plain_rpo.len());
+
+        let mut rpo_index = vec![0usize; plain_rpo.len()];
+        for (i, &id) in plain_rpo.iter().enumerate() {
+            rpo_index[id] = i;
+        }
+
+        // Visit the dominator tree in pre-order, sorting children by the
+        // original CFG RPO so that sibling branches are processed in a
+        // predictable order.
+        let mut domtree_rpo = Vec::with_capacity(plain_rpo.len());
+        fn domtree_dfs(
+            node: usize,
+            children: &[Vec<usize>],
+            rpo_idx: &[usize],
+            result: &mut Vec<usize>,
+        ) {
+            result.push(node);
+            let mut child_list = children[node].clone();
+            child_list.sort_by_key(|&c| rpo_idx[c]);
+            for child in child_list {
+                domtree_dfs(child, children, rpo_idx, result);
+            }
+        }
+        domtree_dfs(0, &dom_children, &rpo_index, &mut domtree_rpo);
+
+        let rpo: Vec<HirBasicBlock> =
+            domtree_rpo.iter().map(|&id| bb_id.search_id(id)).collect();
+
         let mut in_degree: FxHashMap<HirBasicBlock, u32> = FxHashMap::default();
         let mut out_degree: FxHashMap<HirBasicBlock, u32> = FxHashMap::default();
         let mut lowered_order = Vec::new();
@@ -65,9 +102,10 @@ impl BlockLoweringOrder {
             let terminator = *bb_layout.insts().get_last().unwrap();
             let term_data = arena.inst_data(terminator);
 
+            out_degree.entry(bb).or_insert(0);
             for succ in term_data.bb_usage() {
                 *out_degree.get_mut(&bb).unwrap() += 1;
-                *in_degree.get_mut(&succ).unwrap() += 1;
+                *in_degree.entry(succ).or_insert(0) += 1;
                 block_succ.push(LoweredBlock::Orig { block: succ });
             }
 
@@ -76,7 +114,7 @@ impl BlockLoweringOrder {
         }
 
         let mut hlir_block_map = FxHashMap::default();
-        for &bb in rpo {
+        for &bb in &rpo {
             let idx = MirBlockIndex::new(lowered_order.len());
             lowered_order.push(LoweredBlock::Orig { block: bb });
             hlir_block_map.insert(bb, idx);
@@ -91,7 +129,8 @@ impl BlockLoweringOrder {
                             pred: bb,
                             succ: orig,
                             succ_idx: succ_idx as u32,
-                        }
+                        };
+                        lowered_order.push(*lowered_block);
                     }
                 }
             }

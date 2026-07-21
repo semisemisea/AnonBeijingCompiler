@@ -1,5 +1,13 @@
 use std::path::PathBuf;
 
+#[derive(Debug, clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
+#[clap(rename_all = "lowercase")]
+pub enum Target {
+    Riscv64,
+    #[clap(help = "aarch64 backend is not implemented yet")]
+    Aarch64,
+}
+
 #[derive(Debug, clap::Parser)]
 pub(crate) struct Arg {
     #[arg(short = 'S', default_value_t = false, conflicts_with = "emit")]
@@ -17,6 +25,12 @@ pub(crate) struct Arg {
         help = "emit ir, asm, or ir,asm"
     )]
     pub(crate) emit: Vec<EmitOption>,
+    #[arg(
+        long = "target",
+        value_enum,
+        default_value_t = Target::Riscv64
+    )]
+    pub(crate) target: Target,
 }
 
 #[derive(Debug, clap::ValueEnum, Clone, Copy, PartialEq, Eq)]

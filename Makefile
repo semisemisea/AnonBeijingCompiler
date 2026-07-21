@@ -15,16 +15,33 @@ TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
 $(eval $(TEST_ARGS):;@:)
 endif
 
+ifeq ($(firstword $(MAKECMDGOALS)),test-riscv)
+TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+$(eval $(TEST_ARGS):;@:)
+endif
+
 ifeq ($(firstword $(MAKECMDGOALS)),run-elf)
 RUN_ELF := $(word 2,$(MAKECMDGOALS))
 RUN_ELF_PATH := $(abspath $(RUN_ELF))
 $(eval $(RUN_ELF):;@:)
 endif
 
+ifeq ($(firstword $(MAKECMDGOALS)),run-elf-riscv)
+RUN_ELF_RISCV := $(word 2,$(MAKECMDGOALS))
+RUN_ELF_RISCV_PATH := $(abspath $(RUN_ELF_RISCV))
+$(eval $(RUN_ELF_RISCV):;@:)
+endif
+
 ifeq ($(firstword $(MAKECMDGOALS)),debug-elf)
 DEBUG_ELF := $(word 2,$(MAKECMDGOALS))
 DEBUG_ELF_PATH := $(abspath $(DEBUG_ELF))
 $(eval $(DEBUG_ELF):;@:)
+endif
+
+ifeq ($(firstword $(MAKECMDGOALS)),debug-elf-riscv)
+DEBUG_ELF_RISCV := $(word 2,$(MAKECMDGOALS))
+DEBUG_ELF_RISCV_PATH := $(abspath $(DEBUG_ELF_RISCV))
+$(eval $(DEBUG_ELF_RISCV):;@:)
 endif
 
 HOST_ARCH := $(shell uname -m)
@@ -46,7 +63,7 @@ endif
 HOST_TARGET_DIR := $(CURDIR)/target/host-musl
 COMPILER := /work/target/$(MUSL_TARGET)/release/soyo_compiler
 
-.PHONY: test test-llvm run-elf debug-elf test-image test-compiler build-lib clean-results
+.PHONY: test test-llvm test-riscv run-elf run-elf-riscv debug-elf debug-elf-riscv test-image test-compiler build-lib build-lib-riscv clean-results
 
 test: test-compiler build-lib .docker-image
 	mkdir -p "$(RESULTS)"
@@ -74,6 +91,19 @@ test-llvm: test-compiler build-lib .docker-image
 		-v "$(CURDIR)/sysylib:/work/sysylib:ro" \
 		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
 		"$(IMAGE)" --backend llvm $(ARGS) $(TESTS) $(TEST_ARGS)
+
+test-riscv: test-compiler build-lib-riscv .docker-image
+	mkdir -p "$(RESULTS)"
+	@cleanup() { $(DOCKER) rm -f "$(CONTAINER)" >/dev/null 2>&1 || true; }; \
+	trap cleanup EXIT INT TERM; \
+	cleanup; \
+	$(DOCKER) run -t --name "$(CONTAINER)" --network none \
+		-e SOYO_COMPILER="$(COMPILER)" \
+		-v "$(HOST_TARGET_DIR):/work/target:ro" \
+		-v "$(CURDIR)/tests:/work/tests:ro" \
+		-v "$(CURDIR)/sysylib:/work/sysylib:ro" \
+		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
+		"$(IMAGE)" --target riscv64 $(ARGS) $(TESTS) $(TEST_ARGS)
 
 run-elf: .docker-image
 	@if [ -z "$(RUN_ELF)" ]; then \
@@ -106,6 +136,37 @@ debug-elf: .docker-image
 			-ex "layout asm" \
 			-ex "focus cmd"'
 
+run-elf-riscv: .docker-image
+	@if [ -z "$(RUN_ELF_RISCV)" ]; then \
+		printf 'usage: make run-elf-riscv path/to/program.elf\n' >&2; \
+		exit 2; \
+	fi; \
+	if [ ! -f "$(RUN_ELF_RISCV_PATH)" ]; then \
+		printf 'ELF not found: %s\n' "$(RUN_ELF_RISCV)" >&2; \
+		exit 2; \
+	fi
+	$(DOCKER) run --rm -t --network none \
+		-v "$(RUN_ELF_RISCV_PATH):/work/program.elf:ro" \
+		--entrypoint qemu-riscv64-static \
+		"$(IMAGE)" "/work/program.elf"
+
+debug-elf-riscv: .docker-image
+	@if [ -z "$(DEBUG_ELF_RISCV)" ]; then \
+		printf 'usage: make debug-elf-riscv path/to/program.elf\n' >&2; \
+		exit 2; \
+	fi; \
+	if [ ! -f "$(DEBUG_ELF_RISCV_PATH)" ]; then \
+		printf 'ELF not found: %s\n' "$(DEBUG_ELF_RISCV)" >&2; \
+		exit 2; \
+	fi
+	$(DOCKER) run --rm -it --network none \
+		-v "$(DEBUG_ELF_RISCV_PATH):/work/program.elf:ro" \
+		--entrypoint /bin/sh \
+		"$(IMAGE)" -c 'qemu-riscv64-static -g 1234 /work/program.elf & gdb-multiarch /work/program.elf -ex "target remote localhost:1234" \
+			-ex "break main" \
+			-ex "layout asm" \
+			-ex "focus cmd"'
+
 # Build the test image if it doesn't exist or if Dockerfile/tests/test.py have changed
 test-image: .docker-image
 
@@ -122,6 +183,13 @@ build-lib: .docker-image
 		-w /work/sysylib \
 		--entrypoint /bin/sh \
 		"$(IMAGE)" -c 'aarch64-linux-gnu-gcc -c sylib.c -o sylib.o && aarch64-linux-gnu-ar rcs libsysy_arm.a sylib.o'
+
+build-lib-riscv: .docker-image
+	$(DOCKER) run --rm -u "$$(id -u):$$(id -g)" \
+		-v "$(CURDIR)/sysylib:/work/sysylib" \
+		-w /work/sysylib \
+		--entrypoint /bin/sh \
+		"$(IMAGE)" -c 'riscv64-linux-gnu-gcc -c sylib.c -o sylib.o && riscv64-linux-gnu-ar rcs libsysy_riscv.a sylib.o'
 
 clean-results:
 	rm -rf "$(RESULTS)"

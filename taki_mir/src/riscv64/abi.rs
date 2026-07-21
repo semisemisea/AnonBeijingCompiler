@@ -1,0 +1,550 @@
+use smallvec::{SmallVec, smallvec};
+
+use crate::{
+    abi::{ABIMachineSpec, ArgSlot, FrameLayout},
+    reg_alloc::reg::{MachineEnv, PReg, PRegSet, RegClass},
+    register::{Reg, Writable},
+    riscv64::{
+        instructions::{AluRRImm12OP, AMode, Imm12, LoadOP, MInst, StoreOP},
+        labels::Label,
+        regs::{
+            ARG_REG, FARG_REG,
+            fp_reg, link_reg, pf_reg, pv_reg, px_reg,
+            stack_reg,
+            writable_fp_reg, writable_link_reg,
+            writable_spilltmp_reg, writable_spilltmp_reg2,
+            writable_stack_reg,
+        },
+    },
+};
+use raana_ir::ir::arena::Arena;
+
+pub struct Riscv64ABI;
+
+impl ABIMachineSpec for Riscv64ABI {
+    type I = MInst;
+
+    fn stack_align() -> u32 {
+        16
+    }
+
+    fn gen_load_stack(
+        mem: crate::abi::StackAMode,
+        dst: Writable<crate::register::Reg>,
+        ty: crate::types::LoweredType,
+    ) -> Self::I {
+        MInst::LoadWord {
+            rd: dst,
+            op: ty.into(),
+            addr: mem.into(),
+        }
+    }
+
+    fn gen_args(args: Vec<crate::abi::ArgPair>) -> Self::I {
+        MInst::Args { pairs: args.into() }
+    }
+
+    fn spillslot_size(_regclass: RegClass) -> u32 {
+        8
+    }
+
+    fn gen_ret() -> Self::I {
+        MInst::Ret
+    }
+
+    fn gen_load_imm(dst: Writable<Reg>, imm: i32) -> Self::I {
+        MInst::LoadImm { rd: dst, imm }
+    }
+
+    fn gen_load_addr(
+        dst: Writable<Reg>,
+        gv: raana_ir::opt::prelude::Inst,
+    ) -> Self::I {
+        MInst::LoadAddr {
+            rd: dst,
+            label: Label::GlobalValue(gv),
+        }
+    }
+
+    fn gen_store_stack(
+        src: crate::register::Reg,
+        mem: crate::abi::StackAMode,
+        ty: crate::types::LoweredType,
+    ) -> Self::I {
+        MInst::StoreWord {
+            rs: src,
+            op: ty.into(),
+            addr: mem.into(),
+        }
+    }
+
+    fn gen_spill_store(
+        src: crate::register::Reg,
+        spill_off: i64,
+        ty: crate::types::LoweredType,
+    ) -> SmallVec<[MInst; 4]> {
+        let mut insts: SmallVec<[MInst; 4]> = smallvec![];
+        let (addr, extras) = AMode::SPOffset(spill_off).normalize_imm12();
+        for inst in extras {
+            insts.push(inst);
+        }
+        insts.push(MInst::StoreWord {
+            rs: src,
+            op: ty.into(),
+            addr,
+        });
+        insts
+    }
+
+    fn gen_spill_load(
+        spill_off: i64,
+        dst: Writable<crate::register::Reg>,
+        ty: crate::types::LoweredType,
+    ) -> SmallVec<[MInst; 4]> {
+        let mut insts: SmallVec<[MInst; 4]> = smallvec![];
+        let (addr, extras) = AMode::SPOffset(spill_off).normalize_imm12();
+        for inst in extras {
+            insts.push(inst);
+        }
+        insts.push(MInst::LoadWord {
+            rd: dst,
+            op: ty.into(),
+            addr,
+        });
+        insts
+    }
+
+    fn gen_incoming_arg_load(
+        fp_off: i64,
+        dst: Writable<crate::register::Reg>,
+        ty: crate::types::LoweredType,
+    ) -> SmallVec<[MInst; 4]> {
+        let mut insts: SmallVec<[MInst; 4]> = smallvec![];
+        let (addr, extras) = AMode::IncomingArg(fp_off).normalize_imm12();
+        for inst in extras {
+            insts.push(inst);
+        }
+        insts.push(MInst::LoadWord {
+            rd: dst,
+            op: ty.into(),
+            addr,
+        });
+        insts
+    }
+
+    fn gen_jump(block: raana_ir::opt::prelude::BasicBlock) -> Self::I {
+        todo!()
+    }
+
+    fn gen_nop() -> Self::I {
+        MInst::Nop
+    }
+
+    fn gen_move(
+        src: crate::register::Reg,
+        dst: crate::register::Reg,
+        _ty: crate::types::LoweredType,
+    ) -> Self::I {
+        MInst::Mov {
+            src,
+            dst: Writable::from_reg(dst),
+        }
+    }
+
+    fn compute_arg_loc(
+        arena: crate::prelude::ArenaContext<'_>,
+    ) -> (Vec<ArgSlot>, u32) {
+        use raana_ir::ir::TypeKind;
+        let mut args = vec![];
+        let mut int_arg_idx = 0;
+        let mut float_arg_idx = 0;
+        let mut stack_offset = 0usize;
+
+        for &param in arena.f().params() {
+            let ty = arena.inst_data(param).ty().clone();
+            let size = ty.size();
+            match ty.kind() {
+                TypeKind::Int32 | TypeKind::Pointer(_) => {
+                    if int_arg_idx < 8 {
+                        args.push(ArgSlot::Reg {
+                            reg: ARG_REG[int_arg_idx].to_physical_reg().unwrap(),
+                            ty,
+                        });
+                        int_arg_idx += 1;
+                    } else {
+                        args.push(ArgSlot::Stack {
+                            offset: stack_offset as i64,
+                            ty,
+                        });
+                        stack_offset += size;
+                    }
+                }
+                TypeKind::Float32 => {
+                    if float_arg_idx < 8 {
+                        args.push(ArgSlot::Reg {
+                            reg: FARG_REG[float_arg_idx].to_physical_reg().unwrap(),
+                            ty,
+                        });
+                        float_arg_idx += 1;
+                    } else {
+                        args.push(ArgSlot::Stack {
+                            offset: stack_offset as i64,
+                            ty,
+                        });
+                        stack_offset += size;
+                    }
+                }
+                _ => unreachable!("unexpected parameter type: {:?}", ty.kind()),
+            }
+        }
+
+        (args, stack_offset as u32)
+    }
+
+    fn get_machine_env() -> &'static MachineEnv {
+        static MACHINE_ENV: MachineEnv = create_reg_environment();
+        &MACHINE_ENV
+    }
+
+    fn is_callee_saved(preg: PReg) -> bool {
+        match preg.class() {
+            RegClass::Int => matches!(preg.hw_enc(), 8 | 9 | 18..=27),
+            RegClass::Float => matches!(preg.hw_enc(), 8 | 9 | 18..=27),
+            _ => false,
+        }
+    }
+
+    fn gen_prologue_frame_setup(frame: &FrameLayout) -> SmallVec<[MInst; 16]> {
+        let total = frame.total_size as i32;
+        let mut insts = smallvec![];
+        if frame.setup_area_size > 0 {
+            let base = frame.total_size as i64;
+            sp_adjust(&mut insts, -total);
+            store_stack_imm12(&mut insts, link_reg(), StoreOP::Sd, base - 8);
+            store_stack_imm12(&mut insts, fp_reg(), StoreOP::Sd, base - 16);
+            reg_add_imm(&mut insts, writable_fp_reg(), stack_reg(), base);
+        } else if total > 0 {
+            sp_adjust(&mut insts, -total);
+        }
+        insts
+    }
+
+    fn gen_epilogue_frame_restore(frame: &FrameLayout) -> SmallVec<[MInst; 16]> {
+        let mut insts = smallvec![];
+        if frame.setup_area_size > 0 {
+            let base = frame.total_size as i64;
+            load_stack_imm12(&mut insts, writable_link_reg(), LoadOP::Ld, base - 8);
+            load_stack_imm12(&mut insts, writable_fp_reg(), LoadOP::Ld, base - 16);
+        }
+        if frame.total_size > 0 {
+            sp_adjust(&mut insts, frame.total_size as i32);
+        }
+        insts
+    }
+
+    fn gen_clobber_save(frame: &FrameLayout) -> SmallVec<[MInst; 16]> {
+        let mut insts = smallvec![];
+        let base = frame.total_size as i64 - frame.setup_area_size as i64;
+        for (i, preg) in frame.callee_saved.iter().enumerate() {
+            let offset = base - (i as i64 + 1) * 8;
+            let rs = Reg::from_physical_reg(*preg);
+            let op = match preg.class() {
+                RegClass::Int => StoreOP::Sd,
+                _ => StoreOP::Fsw,
+            };
+            store_stack_imm12(&mut insts, rs, op, offset);
+        }
+        insts
+    }
+
+    fn gen_clobber_restore(frame: &FrameLayout) -> SmallVec<[MInst; 16]> {
+        let mut insts = smallvec![];
+        let base = frame.total_size as i64 - frame.setup_area_size as i64;
+        for (i, preg) in frame.callee_saved.iter().enumerate() {
+            let offset = base - (i as i64 + 1) * 8;
+            let rd = Writable::from_reg(Reg::from_physical_reg(*preg));
+            let op = match preg.class() {
+                RegClass::Int => LoadOP::Ld,
+                _ => LoadOP::Flw,
+            };
+            load_stack_imm12(&mut insts, rd, op, offset);
+        }
+        insts
+    }
+}
+
+fn sp_adjust(insts: &mut SmallVec<[MInst; 16]>, amount: i32) {
+    if amount == 0 {
+        return;
+    }
+    if let Some(imm) = Imm12::from_i32(amount) {
+        insts.push(MInst::AluRRImm12 {
+            op: AluRRImm12OP::Addi,
+            rd: writable_stack_reg(),
+            rs: stack_reg(),
+            imm,
+        });
+    } else {
+        let tmp = writable_spilltmp_reg();
+        insts.push(MInst::LoadImm {
+            rd: tmp,
+            imm: amount,
+        });
+        insts.push(MInst::AluRRR {
+            op: crate::riscv64::instructions::AluRRROP::Add,
+            rd: writable_stack_reg(),
+            rs1: stack_reg(),
+            rs2: tmp.to_reg(),
+        });
+    }
+}
+
+fn reg_add_imm(insts: &mut SmallVec<[MInst; 16]>, rd: Writable<Reg>, rs: Reg, amount: i64) {
+    if let Some(imm) = Imm12::from_i32(amount as i32) {
+        insts.push(MInst::AluRRImm12 {
+            op: AluRRImm12OP::Addi,
+            rd,
+            rs,
+            imm,
+        });
+    } else {
+        let tmp = writable_spilltmp_reg2();
+        insts.push(MInst::LoadImm {
+            rd: tmp,
+            imm: amount as i32,
+        });
+        insts.push(MInst::AluRRR {
+            op: crate::riscv64::instructions::AluRRROP::Add,
+            rd,
+            rs1: rs,
+            rs2: tmp.to_reg(),
+        });
+    }
+}
+
+fn store_stack_imm12(
+    insts: &mut SmallVec<[MInst; 16]>,
+    rs: Reg,
+    op: StoreOP,
+    sp_offset: i64,
+) {
+    let (addr, extras) = AMode::SPOffset(sp_offset).normalize_imm12();
+    for inst in extras {
+        insts.push(inst);
+    }
+    insts.push(MInst::StoreWord { rs, op, addr });
+}
+
+fn load_stack_imm12(
+    insts: &mut SmallVec<[MInst; 16]>,
+    rd: Writable<Reg>,
+    op: LoadOP,
+    sp_offset: i64,
+) {
+    let (addr, extras) = AMode::SPOffset(sp_offset).normalize_imm12();
+    for inst in extras {
+        insts.push(inst);
+    }
+    insts.push(MInst::LoadWord { rd, op, addr });
+}
+
+pub const DEFAULT_CLOBBERS: PRegSet = PRegSet::empty()
+    .with(px_reg(1))
+    .with(px_reg(5))
+    .with(px_reg(6))
+    .with(px_reg(7))
+    .with(px_reg(10))
+    .with(px_reg(11))
+    .with(px_reg(12))
+    .with(px_reg(13))
+    .with(px_reg(14))
+    .with(px_reg(15))
+    .with(px_reg(16))
+    .with(px_reg(17))
+    .with(px_reg(28))
+    .with(px_reg(29))
+    .with(px_reg(30))
+    .with(px_reg(31))
+    // F Regs
+    .with(pf_reg(0))
+    .with(pf_reg(1))
+    .with(pf_reg(2))
+    .with(pf_reg(3))
+    .with(pf_reg(4))
+    .with(pf_reg(5))
+    .with(pf_reg(6))
+    .with(pf_reg(7))
+    .with(pf_reg(9))
+    .with(pf_reg(10))
+    .with(pf_reg(11))
+    .with(pf_reg(12))
+    .with(pf_reg(13))
+    .with(pf_reg(14))
+    .with(pf_reg(15))
+    .with(pf_reg(16))
+    .with(pf_reg(17))
+    .with(pf_reg(28))
+    .with(pf_reg(29))
+    .with(pf_reg(30))
+    .with(pf_reg(31))
+    // V Regs - All vector regs get clobbered
+    .with(pv_reg(0))
+    .with(pv_reg(1))
+    .with(pv_reg(2))
+    .with(pv_reg(3))
+    .with(pv_reg(4))
+    .with(pv_reg(5))
+    .with(pv_reg(6))
+    .with(pv_reg(7))
+    .with(pv_reg(8))
+    .with(pv_reg(9))
+    .with(pv_reg(10))
+    .with(pv_reg(11))
+    .with(pv_reg(12))
+    .with(pv_reg(13))
+    .with(pv_reg(14))
+    .with(pv_reg(15))
+    .with(pv_reg(16))
+    .with(pv_reg(17))
+    .with(pv_reg(18))
+    .with(pv_reg(19))
+    .with(pv_reg(20))
+    .with(pv_reg(21))
+    .with(pv_reg(22))
+    .with(pv_reg(23))
+    .with(pv_reg(24))
+    .with(pv_reg(25))
+    .with(pv_reg(26))
+    .with(pv_reg(27))
+    .with(pv_reg(28))
+    .with(pv_reg(29))
+    .with(pv_reg(30))
+    .with(pv_reg(31));
+
+const fn create_reg_environment() -> MachineEnv {
+    // Some C Extension instructions can only use a subset of the registers.
+    // x8 - x15, f8 - f15, v8 - v15 so we should prefer to use those since
+    // they allow us to emit C instructions more often.
+    //
+    // In general the order of preference is:
+    //   1. Compressible Caller Saved registers.
+    //   2. Non-Compressible Caller Saved registers.
+    //   3. Compressible Callee Saved registers.
+    //   4. Non-Compressible Callee Saved registers.
+
+    let preferred_regs_by_class: [PRegSet; 3] = [
+        PRegSet::empty()
+            .with(px_reg(10))
+            .with(px_reg(11))
+            .with(px_reg(12))
+            .with(px_reg(13))
+            .with(px_reg(14))
+            .with(px_reg(15)),
+        PRegSet::empty()
+            .with(pf_reg(10))
+            .with(pf_reg(11))
+            .with(pf_reg(12))
+            .with(pf_reg(13))
+            .with(pf_reg(14))
+            .with(pf_reg(15)),
+        PRegSet::empty()
+            .with(pv_reg(8))
+            .with(pv_reg(9))
+            .with(pv_reg(10))
+            .with(pv_reg(11))
+            .with(pv_reg(12))
+            .with(pv_reg(13))
+            .with(pv_reg(14))
+            .with(pv_reg(15)),
+    ];
+
+    let non_preferred_regs_by_class: [PRegSet; 3] = [
+        // x0 - x4 are special registers, so we don't want to use them.
+        // Omit x30 and x31 since they are the spilltmp registers.
+        PRegSet::empty()
+            .with(px_reg(5))
+            .with(px_reg(6))
+            .with(px_reg(7))
+            // Start with the Non-Compressible Caller Saved registers.
+            .with(px_reg(16))
+            .with(px_reg(17))
+            .with(px_reg(28))
+            .with(px_reg(29))
+            // The first Callee Saved register is x9 since its Compressible
+            // Omit x8 since it's the frame pointer.
+            .with(px_reg(9))
+            // The rest of the Callee Saved registers are Non-Compressible
+            .with(px_reg(18))
+            .with(px_reg(19))
+            .with(px_reg(20))
+            .with(px_reg(21))
+            .with(px_reg(22))
+            .with(px_reg(23))
+            .with(px_reg(24))
+            .with(px_reg(25))
+            .with(px_reg(26))
+            .with(px_reg(27)),
+        // Prefer Caller Saved registers.
+        PRegSet::empty()
+            .with(pf_reg(0))
+            .with(pf_reg(1))
+            .with(pf_reg(2))
+            .with(pf_reg(3))
+            .with(pf_reg(4))
+            .with(pf_reg(5))
+            .with(pf_reg(6))
+            .with(pf_reg(7))
+            .with(pf_reg(16))
+            .with(pf_reg(17))
+            .with(pf_reg(28))
+            .with(pf_reg(29))
+            .with(pf_reg(30))
+            .with(pf_reg(31))
+            // Once those are exhausted, we should prefer f8 and f9 since they are
+            // callee saved, but compressible.
+            .with(pf_reg(8))
+            .with(pf_reg(9))
+            .with(pf_reg(18))
+            .with(pf_reg(19))
+            .with(pf_reg(20))
+            .with(pf_reg(21))
+            .with(pf_reg(22))
+            .with(pf_reg(23))
+            .with(pf_reg(24))
+            .with(pf_reg(25))
+            .with(pf_reg(26))
+            .with(pf_reg(27)),
+        PRegSet::empty()
+            .with(pv_reg(0))
+            .with(pv_reg(1))
+            .with(pv_reg(2))
+            .with(pv_reg(3))
+            .with(pv_reg(4))
+            .with(pv_reg(5))
+            .with(pv_reg(6))
+            .with(pv_reg(7))
+            .with(pv_reg(16))
+            .with(pv_reg(17))
+            .with(pv_reg(18))
+            .with(pv_reg(19))
+            .with(pv_reg(20))
+            .with(pv_reg(21))
+            .with(pv_reg(22))
+            .with(pv_reg(23))
+            .with(pv_reg(24))
+            .with(pv_reg(25))
+            .with(pv_reg(26))
+            .with(pv_reg(27))
+            .with(pv_reg(28))
+            .with(pv_reg(29))
+            .with(pv_reg(30))
+            .with(pv_reg(31)),
+    ];
+
+    MachineEnv {
+        preferred_regs_by_class,
+        non_preferred_regs_by_class,
+        fixed_stack_slots: vec![],
+        scratch_by_class: [None, None, None],
+    }
+}

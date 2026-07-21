@@ -629,6 +629,14 @@ Do not map floating remainder to integer remainder or approximate it silently.
 
 ## Milestone 6: Apply Register Allocation And Emit Final Assembly
 
+**Status: In progress (2026-07-21).** The target-neutral post-RA contract now
+exposes finalized VCode block/instruction operands and virtual-register types.
+Allocator move edits retain the source value's machine type, so a target emitter
+can select `w`/`x`/`s` register views and matching spill access widths without
+guessing from register class. The active native path remains the verified direct
+lowerer while instruction selection, physical instruction emission, and
+RA-dependent frame finalization are implemented incrementally.
+
 ### 6.1 Post-allocation Instruction Stream
 
 Implement a target-specific emitter that consumes:

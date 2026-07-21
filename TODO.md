@@ -635,7 +635,11 @@ Allocator move edits retain the source value's machine type, so a target emitter
 can select `w`/`x`/`s` register views and matching spill access widths without
 guessing from register class. The active native path remains the verified direct
 lowerer while instruction selection, physical instruction emission, and
-RA-dependent frame finalization are implemented incrementally.
+RA-dependent frame finalization are implemented incrementally. The AArch64
+emitter now has a tested post-RA move primitive for register and eight-byte spill
+locations, including typed integer/pointer/f32 accesses, spill-to-spill copies,
+and large-offset scratch-address formation. It is not yet wired into full VCode
+instruction rewriting or the native compiler path.
 
 ### 6.1 Post-allocation Instruction Stream
 

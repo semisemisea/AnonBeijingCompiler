@@ -1,7 +1,7 @@
 use raana_ir::ir::TypeKind;
 use taki_mir::{
     abi::{ABIMachineSpec, ArgPair, ArgSlot, StackAMode},
-    reg_alloc::reg::MachineEnv,
+    reg_alloc::reg::{MachineEnv, Output as RegAllocOutput, PReg, RegClass},
     register::Reg,
     types::Type,
 };
@@ -68,6 +68,7 @@ pub struct FrameLayout {
     pub spills: u32,
     pub callee_saves: u32,
     pub frame_size: u32,
+    pub used_callee_saves: Vec<PReg>,
 }
 
 impl FrameLayout {
@@ -80,7 +81,31 @@ impl FrameLayout {
             spills,
             callee_saves,
             frame_size,
+            used_callee_saves: Vec::new(),
         }
+    }
+
+    /// Finalize a frame after register allocation has selected spills and
+    /// integer callee-save registers.
+    pub fn from_regalloc(outgoing_args: u32, locals: u32, allocations: &RegAllocOutput) -> Self {
+        let mut used_callee_saves = allocations
+            .allocs
+            .iter()
+            .filter_map(|allocation| allocation.as_reg())
+            .filter(|preg| preg.class() == RegClass::Int && (19..=28).contains(&preg.hw_enc()))
+            .collect::<Vec<_>>();
+        used_callee_saves.sort_by_key(|preg| preg.hw_enc());
+        used_callee_saves.dedup();
+
+        let mut layout = Self::new(
+            outgoing_args,
+            locals,
+            u32::try_from(allocations.num_spillslots)
+                .expect("AArch64 spill area exceeds the supported frame range"),
+            (used_callee_saves.len() as u32) * 8,
+        );
+        layout.used_callee_saves = used_callee_saves;
+        layout
     }
 }
 
@@ -152,6 +177,7 @@ impl ABIMachineSpec for AArch64Abi {
 mod tests {
     use super::*;
     use raana_ir::ir::Type;
+    use taki_mir::reg_alloc::reg::{Allocation, Output as RegAllocOutput};
 
     #[test]
     fn separates_integer_and_float_argument_registers() {
@@ -183,5 +209,29 @@ mod tests {
     #[test]
     fn aligns_frame_to_sixteen_bytes() {
         assert_eq!(FrameLayout::new(8, 4, 8, 0).frame_size, 32);
+    }
+
+    #[test]
+    fn finalizes_spills_and_integer_callee_saves_from_ra() {
+        let allocations = RegAllocOutput {
+            num_spillslots: 24,
+            edits: vec![],
+            allocs: vec![
+                Allocation::reg(regs::int_preg(19)),
+                Allocation::reg(regs::int_preg(19)),
+                Allocation::reg(regs::int_preg(21)),
+                Allocation::reg(regs::float_preg(8)),
+            ],
+            inst_alloc_offsets: vec![0],
+        };
+        let layout = FrameLayout::from_regalloc(8, 12, &allocations);
+
+        assert_eq!(layout.spills, 24);
+        assert_eq!(layout.callee_saves, 16);
+        assert_eq!(
+            layout.used_callee_saves,
+            vec![regs::int_preg(19), regs::int_preg(21)]
+        );
+        assert_eq!(layout.frame_size, 64);
     }
 }

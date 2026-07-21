@@ -644,7 +644,10 @@ rewrite the current `Mov`/`Add`/`Cmp`/`CSet` VCode subset from operand
 allocations, inserting typed reloads and spill stores around physical
 instructions. A stream emitter now preserves the allocator's exact
 `Before -> instruction -> After` edit order; integration still requires full
-instruction selection coverage and RA-dependent frame finalization.
+instruction selection coverage and prologue/epilogue integration. Frame layout
+can now be finalized from RA output: allocator spill bytes are incorporated
+directly and the used integer callee-save set is deduplicated and recorded for
+save/restore emission.
 
 ### 6.1 Post-allocation Instruction Stream
 

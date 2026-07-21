@@ -11,6 +11,7 @@ pub const LR: u8 = 30;
 pub const INT_SCRATCH0: u8 = 16;
 pub const INT_SCRATCH1: u8 = 17;
 pub const FP_SCRATCH: u8 = 31;
+pub const FP_SCRATCH1: u8 = 8;
 
 pub const fn int_preg(index: u8) -> PReg {
     assert!(index <= 30);

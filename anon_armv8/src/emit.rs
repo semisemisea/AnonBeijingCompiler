@@ -51,7 +51,8 @@ fn label(function: &str, block: MirBlockIndex) -> String {
 fn format_inst(function: &str, inst: &Inst) -> String {
     match inst {
         Inst::Mov { dst, src, ty } => format!(
-            "mov {}, {}",
+            "{} {}, {}",
+            if ty.is_f32() { "fmov" } else { "mov" },
             regs::format_reg(*dst, *ty),
             regs::format_reg(*src, *ty)
         ),
@@ -125,6 +126,120 @@ pub fn emit_post_ra_move(output: &mut String, edit: &Edit, spill_base: u32) -> R
         }
     }
     Ok(())
+}
+
+/// Rewrites one VCode instruction using its register-allocation results and
+/// emits any reloads or spill stores required around it.
+pub fn emit_post_ra_inst(
+    output: &mut String,
+    function: &str,
+    inst: &Inst,
+    allocs: &[Allocation],
+    spill_base: u32,
+) -> Result<(), String> {
+    let mut rewritten = inst.clone();
+    let spill_def = match &mut rewritten {
+        Inst::Mov { dst, src, ty } => {
+            expect_alloc_count(inst, allocs, 2)?;
+            *src = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
+            let (reg, spill) = resolve_def(allocs[1], *ty, 0)?;
+            *dst = reg;
+            spill
+        }
+        Inst::Add { dst, lhs, rhs, ty } => {
+            expect_alloc_count(inst, allocs, 3)?;
+            *lhs = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
+            *rhs = resolve_use(output, allocs[1], *ty, 1, spill_base)?;
+            let (reg, spill) = resolve_def(allocs[2], *ty, 0)?;
+            *dst = reg;
+            spill
+        }
+        Inst::Cmp { lhs, rhs, ty } => {
+            expect_alloc_count(inst, allocs, 2)?;
+            if ty.is_f32() {
+                return Err("f32 comparison requires an FCmp instruction".into());
+            }
+            *lhs = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
+            *rhs = resolve_use(output, allocs[1], *ty, 1, spill_base)?;
+            None
+        }
+        Inst::CSet { dst, .. } => {
+            expect_alloc_count(inst, allocs, 1)?;
+            let (reg, spill) = resolve_def(allocs[0], Type::new_i32(), 0)?;
+            *dst = reg;
+            spill
+        }
+        Inst::Jump { .. } | Inst::Branch { .. } | Inst::Call { .. } | Inst::Ret | Inst::Nop => {
+            expect_alloc_count(inst, allocs, 0)?;
+            None
+        }
+    };
+
+    writeln!(output, "    {}", format_inst(function, &rewritten)).unwrap();
+    if let Some((reg, allocation, ty)) = spill_def {
+        emit_spill_access(
+            output,
+            "str",
+            reg,
+            ty,
+            spill_offset(allocation, spill_base)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn expect_alloc_count(inst: &Inst, allocs: &[Allocation], expected: usize) -> Result<(), String> {
+    if allocs.len() == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "register allocation returned {} locations for {inst:?}; expected {expected}",
+            allocs.len()
+        ))
+    }
+}
+
+fn resolve_use(
+    output: &mut String,
+    allocation: Allocation,
+    ty: Type,
+    scratch_index: usize,
+    spill_base: u32,
+) -> Result<Reg, String> {
+    if let Some(reg) = allocation.as_reg().map(Reg::from_physical_reg) {
+        return Ok(reg);
+    }
+    let scratch = scratch_reg(ty, scratch_index)?;
+    emit_spill_access(
+        output,
+        "ldr",
+        scratch,
+        ty,
+        spill_offset(allocation, spill_base)?,
+    )?;
+    Ok(scratch)
+}
+
+fn resolve_def(
+    allocation: Allocation,
+    ty: Type,
+    scratch_index: usize,
+) -> Result<(Reg, Option<(Reg, Allocation, Type)>), String> {
+    if let Some(reg) = allocation.as_reg().map(Reg::from_physical_reg) {
+        return Ok((reg, None));
+    }
+    let scratch = scratch_reg(ty, scratch_index)?;
+    Ok((scratch, Some((scratch, allocation, ty))))
+}
+
+fn scratch_reg(ty: Type, scratch_index: usize) -> Result<Reg, String> {
+    match (ty.is_f32(), scratch_index) {
+        (false, 0) => Ok(regs::int_reg(regs::INT_SCRATCH0)),
+        (false, 1) => Ok(regs::int_reg(regs::INT_SCRATCH1)),
+        (true, 0) => Ok(regs::float_reg(regs::FP_SCRATCH)),
+        (true, 1) => Ok(regs::float_reg(regs::FP_SCRATCH1)),
+        _ => Err("instruction needs more post-RA scratch registers than AArch64 reserves".into()),
+    }
 }
 
 fn allocation_reg(allocation: Allocation) -> Result<Reg, String> {
@@ -353,5 +468,65 @@ mod tests {
             "clang rejected post-RA moves: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn rewrites_spilled_instruction_operands() {
+        let mut output = String::new();
+        emit_post_ra_inst(
+            &mut output,
+            "main",
+            &Inst::Add {
+                dst: regs::int_reg(0),
+                lhs: regs::int_reg(1),
+                rhs: regs::int_reg(2),
+                ty: Type::new_i32(),
+            },
+            &[
+                Allocation::stack(SpillSlot::new(0)),
+                Allocation::stack(SpillSlot::new(8)),
+                Allocation::stack(SpillSlot::new(16)),
+            ],
+            32,
+        )
+        .unwrap();
+        emit_post_ra_inst(
+            &mut output,
+            "main",
+            &Inst::Cmp {
+                lhs: regs::int_reg(0),
+                rhs: regs::int_reg(1),
+                ty: Type::new_i32(),
+            },
+            &[
+                Allocation::stack(SpillSlot::new(0)),
+                Allocation::stack(SpillSlot::new(8)),
+            ],
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            "    ldr w16, [sp, #32]\n    ldr w17, [sp, #40]\n    add w16, w16, w17\n    str w16, [sp, #48]\n    ldr w16, [sp, #0]\n    ldr w17, [sp, #8]\n    cmp w16, w17\n"
+        );
+    }
+
+    #[test]
+    fn formats_float_moves_with_fmov() {
+        let program = AsmProgram {
+            functions: vec![AsmFunction {
+                name: "main".into(),
+                blocks: vec![AsmBlock {
+                    index: MirBlockIndex::new(0),
+                    insts: vec![Inst::Mov {
+                        dst: regs::float_reg(0),
+                        src: regs::float_reg(1),
+                        ty: Type::new_f32(),
+                    }],
+                }],
+            }],
+        };
+        assert!(program.emit().contains("    fmov s0, s1\n"));
     }
 }

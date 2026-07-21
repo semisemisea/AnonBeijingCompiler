@@ -639,7 +639,10 @@ RA-dependent frame finalization are implemented incrementally. The AArch64
 emitter now has a tested post-RA move primitive for register and eight-byte spill
 locations, including typed integer/pointer/f32 accesses, spill-to-spill copies,
 and large-offset scratch-address formation. It is not yet wired into full VCode
-instruction rewriting or the native compiler path.
+instruction rewriting or the native compiler path. The same emitter can now
+rewrite the current `Mov`/`Add`/`Cmp`/`CSet` VCode subset from operand
+allocations, inserting typed reloads and spill stores around physical
+instructions; full block/edit stream consumption remains pending.
 
 ### 6.1 Post-allocation Instruction Stream
 

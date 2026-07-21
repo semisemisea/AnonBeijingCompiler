@@ -4,7 +4,7 @@ use taki_mir::{
     reg_alloc::reg::{OperandVisitor, OperandVisitorImpl},
     register::{Reg, Writable},
     types::Type,
-    vcode::{CallType, MachInst, MachInstEmit, MachTerminator},
+    vcode::{CallType, MachInst, MachInstEmit, MachInstInfo, MachTerminator},
 };
 
 use crate::{abi::AArch64Abi, regs};
@@ -260,23 +260,39 @@ impl MachInst for Inst {
         }
     }
 
-    fn is_term(&self) -> MachTerminator {
+    fn inst_info(&self) -> MachInstInfo {
         match self {
-            Self::RetI32 { .. } | Self::RetF32 { .. } | Self::Ret => MachTerminator::Return,
-            Self::Jump { .. } | Self::Branch { .. } => MachTerminator::Branch,
-            _ => MachTerminator::None,
+            Self::Mov { .. } => MachInstInfo {
+                is_move: true,
+                ..Default::default()
+            },
+            Self::Cmp { .. } | Self::CmpZero { .. } => MachInstInfo {
+                produces_flags: true,
+                ..Default::default()
+            },
+            Self::Branch { .. } => MachInstInfo {
+                terminator: MachTerminator::Branch,
+                uses_flags: true,
+                has_side_effect: true,
+                ..Default::default()
+            },
+            Self::Jump { .. } => MachInstInfo {
+                terminator: MachTerminator::Branch,
+                has_side_effect: true,
+                ..Default::default()
+            },
+            Self::RetI32 { .. } | Self::RetF32 { .. } | Self::Ret => MachInstInfo {
+                terminator: MachTerminator::Return,
+                has_side_effect: true,
+                ..Default::default()
+            },
+            Self::Call { .. } => MachInstInfo {
+                call_type: CallType::Call,
+                has_side_effect: true,
+                ..Default::default()
+            },
+            _ => MachInstInfo::default(),
         }
-    }
-
-    fn call_type(&self) -> CallType {
-        match self {
-            Self::Call { .. } => CallType::Call,
-            _ => CallType::None,
-        }
-    }
-
-    fn is_mem_access(&self) -> bool {
-        false
     }
 
     fn rc_for_type(
@@ -357,6 +373,46 @@ mod tests {
         assert_eq!(visitor.operands.len(), 2);
         assert!(visitor.clobbers.contains(regs::int_preg(0)));
         assert!(visitor.clobbers.contains(regs::float_preg(0)));
+    }
+
+    #[test]
+    fn instruction_metadata_classifies_control_flow_and_flags() {
+        let cmp = Inst::Cmp {
+            lhs: regs::int_reg(0),
+            rhs: regs::int_reg(1),
+            ty: Type::new_i32(),
+        }
+        .inst_info();
+        assert!(cmp.produces_flags);
+
+        let branch = Inst::Branch {
+            cond: Cond::Eq,
+            target: MirBlockIndex::new(0),
+        }
+        .inst_info();
+        assert_eq!(branch.terminator, MachTerminator::Branch);
+        assert!(branch.uses_flags);
+        assert!(branch.has_side_effect);
+
+        let call = Inst::Call {
+            symbol: "callee".into(),
+            args: vec![],
+            result: None,
+        }
+        .inst_info();
+        assert_eq!(call.call_type, CallType::Call);
+        assert!(call.has_side_effect);
+
+        let mov = Inst::Mov {
+            dst: regs::int_reg(0),
+            src: regs::int_reg(1),
+            ty: Type::new_i32(),
+        }
+        .inst_info();
+        assert!(mov.is_move);
+
+        let ret = Inst::Ret.inst_info();
+        assert_eq!(ret.terminator, MachTerminator::Return);
     }
 }
 

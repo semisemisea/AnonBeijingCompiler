@@ -581,6 +581,83 @@ mod tests {
     }
 
     #[test]
+    fn spills_i32_values_under_cross_call_register_pressure() {
+        let mut program = Program::new();
+        let callee = program.new_function(
+            Type::get_i32(),
+            "add".into(),
+            vec![Type::get_i32(), Type::get_i32()],
+        );
+        let caller = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let data = program.func_data_mut(caller);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let values = (1..=32)
+            .map(|value| data.new_local_inst().integer(value))
+            .collect::<Vec<_>>();
+        let call = data.new_local_inst().call_with_type(
+            callee,
+            vec![values[0], values[1]],
+            Type::get_i32(),
+        );
+        let mut sum = call;
+        let mut insts = vec![call];
+        for value in values.iter().skip(2) {
+            sum = data.new_local_inst().binary(BinaryOp::Add, sum, *value);
+            insts.push(sum);
+        }
+        let ret = data.new_local_inst().ret(Some(sum));
+        insts.push(ret);
+        for inst in insts {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+
+        let assembly = compile_function_vcode(&program, caller).unwrap();
+        let call = assembly.find("    bl add").expect("missing direct call");
+        let stores_before_call = assembly[..call].matches("    str w").count();
+        let reloads_after_call = assembly[call..].matches("    ldr w").count();
+        assert!(
+            stores_before_call > 0,
+            "expected spills before call:\n{assembly}"
+        );
+        assert!(
+            reloads_after_call > 0,
+            "expected reloads after call:\n{assembly}"
+        );
+        assert!(
+            assembly[call..].matches("    add w").count() >= 30,
+            "{assembly}"
+        );
+
+        let mut clang = Command::new("clang")
+            .args([
+                "--target=aarch64-linux-gnu",
+                "-x",
+                "assembler",
+                "-c",
+                "-",
+                "-o",
+                "/dev/null",
+            ])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("clang must be available for AArch64 assembly validation");
+        clang
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(assembly.as_bytes())
+            .unwrap();
+        let output = clang.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "clang rejected generated assembly: {}\n{assembly}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn lowers_and_assembles_integer_control_flow() {
         let mut program = Program::new();
         let function = program.new_function(Type::get_i32(), "main".into(), vec![]);

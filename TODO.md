@@ -699,7 +699,10 @@ provisional stack offsets in pre-allocation instructions.
 code-generation failures as a concise `soyo_compiler:` diagnostic with a
 nonzero exit status instead of panicking. Existing `-S` and multi-emit output
 paths remain verified. Remaining M7 work is debug observability and final suite
-cleanup after M6's VCode-to-post-RA integration.
+cleanup after M6's VCode-to-post-RA integration. QEMU validation passes all
+100 `tests/functional` cases and all 40 `tests/h_functional` cases; aggregate
+zero initialization uses compact loops and `.zero` directives so large local
+and global arrays remain assembleable.
 
 ### 7.1 Compiler Driver
 

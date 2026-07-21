@@ -564,6 +564,13 @@ impl<'a> FunctionLowerer<'a> {
         let data = self.inst_data(value);
         match data.kind() {
             InstKind::Aggregate(aggregate) => {
+                if aggregate
+                    .value()
+                    .iter()
+                    .all(|&element| self.is_zero_initializer(element))
+                {
+                    return self.zero_memory(output, ty, offset);
+                }
                 let TypeKind::Array(element, _) = ty.kind() else {
                     return Err(format!(
                         "{}: aggregate value has non-array type {ty}",
@@ -584,30 +591,15 @@ impl<'a> FunctionLowerer<'a> {
             InstKind::ZeroInit => self.zero_memory(output, ty, offset),
             _ if ty.is_i32() => {
                 self.value_into(output, value, "w9")?;
-                if offset == 0 {
-                    writeln!(output, "    str w9, [x10]").unwrap();
-                } else {
-                    writeln!(output, "    str w9, [x10, #{offset}]").unwrap();
-                }
-                Ok(())
+                emit_memory_store(output, "w9", "x10", offset)
             }
             _ if ty.is_f32() => {
                 self.float_value_into(output, value, "s9")?;
-                if offset == 0 {
-                    writeln!(output, "    str s9, [x10]").unwrap();
-                } else {
-                    writeln!(output, "    str s9, [x10, #{offset}]").unwrap();
-                }
-                Ok(())
+                emit_memory_store(output, "s9", "x10", offset)
             }
             _ if ty.is_pointer() => {
                 self.address_into(output, value, "x9")?;
-                if offset == 0 {
-                    writeln!(output, "    str x9, [x10]").unwrap();
-                } else {
-                    writeln!(output, "    str x9, [x10, #{offset}]").unwrap();
-                }
-                Ok(())
+                emit_memory_store(output, "x9", "x10", offset)
             }
             _ => Err(format!(
                 "{}: unsupported aggregate element type {ty}",
@@ -618,15 +610,13 @@ impl<'a> FunctionLowerer<'a> {
 
     fn zero_memory(&self, output: &mut String, ty: &HirType, offset: u32) -> Result<(), String> {
         let size = target_size(ty)?;
+        emit_address_offset(output, "x16", "x10", offset)?;
+        emit_i32(output, "w11", size as i32)?;
         writeln!(output, "    mov w9, wzr").unwrap();
-        for byte_offset in (0..size).step_by(4) {
-            let at = offset + byte_offset;
-            if at == 0 {
-                writeln!(output, "    str w9, [x10]").unwrap();
-            } else {
-                writeln!(output, "    str w9, [x10, #{at}]").unwrap();
-            }
-        }
+        writeln!(output, "1:").unwrap();
+        writeln!(output, "    str w9, [x16], #4").unwrap();
+        writeln!(output, "    subs x11, x11, #4").unwrap();
+        writeln!(output, "    b.ne 1b").unwrap();
         Ok(())
     }
 
@@ -642,6 +632,19 @@ impl<'a> FunctionLowerer<'a> {
             self.program.global_arena().inst_arena().data_of(inst)
         } else {
             self.program.func_data(self.func).inst_data(inst)
+        }
+    }
+
+    fn is_zero_initializer(&self, inst: HirInst) -> bool {
+        match self.inst_data(inst).kind() {
+            InstKind::ZeroInit => true,
+            InstKind::Integer(value) => value.value() == 0,
+            InstKind::Float(value) => value.value() == 0.0,
+            InstKind::Aggregate(aggregate) => aggregate
+                .value()
+                .iter()
+                .all(|&element| self.is_zero_initializer(element)),
+            _ => false,
         }
     }
 
@@ -705,13 +708,34 @@ fn emit_global_initializer(
         }
         InstKind::ZeroInit => writeln!(output, "    .zero {}", target_size(data.ty())?).unwrap(),
         InstKind::Aggregate(aggregate) => {
-            for &value in aggregate.value() {
-                emit_global_initializer(program, value, output)?;
+            if aggregate
+                .value()
+                .iter()
+                .all(|&value| is_zero_global_initializer(program, value))
+            {
+                writeln!(output, "    .zero {}", target_size(data.ty())?).unwrap();
+            } else {
+                for &value in aggregate.value() {
+                    emit_global_initializer(program, value, output)?;
+                }
             }
         }
         _ => return Err(format!("unsupported global initializer: {:?}", data.kind())),
     }
     Ok(())
+}
+
+fn is_zero_global_initializer(program: &Program, inst: HirInst) -> bool {
+    match program.global_arena().inst_arena().data_of(inst).kind() {
+        InstKind::ZeroInit => true,
+        InstKind::Integer(value) => value.value() == 0,
+        InstKind::Float(value) => value.value() == 0.0,
+        InstKind::Aggregate(aggregate) => aggregate
+            .value()
+            .iter()
+            .all(|&value| is_zero_global_initializer(program, value)),
+        _ => false,
+    }
 }
 
 fn gep_step(ty: &HirType) -> Result<(HirType, u32), String> {

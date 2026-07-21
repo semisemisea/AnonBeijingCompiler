@@ -7,7 +7,7 @@ use taki_mir::{
     types::Type,
 };
 
-use crate::{inst::Inst, regs};
+use crate::{abi::FrameLayout, inst::Inst, regs};
 
 pub struct AsmBlock {
     pub index: MirBlockIndex,
@@ -228,6 +228,63 @@ pub fn emit_post_ra_stream(
             }
         }
     }
+    Ok(())
+}
+
+/// Emits the frame state required by a finalized post-RA function body.
+pub fn emit_post_ra_prologue(output: &mut String, layout: &FrameLayout) -> Result<(), String> {
+    writeln!(output, "    stp x29, x30, [sp, #-16]!").unwrap();
+    writeln!(output, "    mov x29, sp").unwrap();
+    emit_sp_adjust(output, "sub", layout.frame_size)?;
+
+    let mut offset = layout.outgoing_args + layout.locals + layout.spills;
+    for preg in &layout.used_callee_saves {
+        if preg.class() != taki_mir::reg_alloc::reg::RegClass::Int {
+            return Err("AArch64 post-RA frame only supports integer callee saves".into());
+        }
+        emit_spill_access(
+            output,
+            "str",
+            Reg::from_physical_reg(*preg),
+            Type::new_i64(),
+            offset,
+        )?;
+        offset += 8;
+    }
+    Ok(())
+}
+
+/// Restores the frame state established by [`emit_post_ra_prologue`].
+pub fn emit_post_ra_epilogue(output: &mut String, layout: &FrameLayout) -> Result<(), String> {
+    let save_base = layout.outgoing_args + layout.locals + layout.spills;
+    for (index, preg) in layout.used_callee_saves.iter().enumerate().rev() {
+        emit_spill_access(
+            output,
+            "ldr",
+            Reg::from_physical_reg(*preg),
+            Type::new_i64(),
+            save_base + (index as u32) * 8,
+        )?;
+    }
+    emit_sp_adjust(output, "add", layout.frame_size)?;
+    writeln!(output, "    ldp x29, x30, [sp], #16").unwrap();
+    writeln!(output, "    ret").unwrap();
+    Ok(())
+}
+
+fn emit_sp_adjust(output: &mut String, opcode: &str, amount: u32) -> Result<(), String> {
+    if amount == 0 {
+        return Ok(());
+    }
+    if amount <= 4095 {
+        writeln!(output, "    {opcode} sp, sp, #{amount}").unwrap();
+        return Ok(());
+    }
+    writeln!(output, "    movz x17, #{}", amount & 0xffff).unwrap();
+    if amount >> 16 != 0 {
+        writeln!(output, "    movk x17, #{}, lsl #16", amount >> 16).unwrap();
+    }
+    writeln!(output, "    {opcode} sp, sp, x17").unwrap();
     Ok(())
 }
 
@@ -614,5 +671,67 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, "    mov w1, w0\n    cset w3, eq\n    mov w2, w1\n");
+    }
+
+    #[test]
+    fn emits_finalized_callee_save_frame() {
+        let layout = FrameLayout {
+            outgoing_args: 8,
+            locals: 8,
+            spills: 16,
+            callee_saves: 16,
+            frame_size: 48,
+            used_callee_saves: vec![regs::int_preg(19), regs::int_preg(21)],
+        };
+        let mut output = String::new();
+        emit_post_ra_prologue(&mut output, &layout).unwrap();
+        emit_post_ra_epilogue(&mut output, &layout).unwrap();
+
+        assert_eq!(
+            output,
+            "    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    sub sp, sp, #48\n    str x19, [sp, #32]\n    str x21, [sp, #40]\n    ldr x21, [sp, #40]\n    ldr x19, [sp, #32]\n    add sp, sp, #48\n    ldp x29, x30, [sp], #16\n    ret\n"
+        );
+    }
+
+    #[test]
+    fn clang_accepts_finalized_frame() {
+        let layout = FrameLayout {
+            outgoing_args: 0,
+            locals: 0,
+            spills: 0,
+            callee_saves: 8,
+            frame_size: 65_536,
+            used_callee_saves: vec![regs::int_preg(19)],
+        };
+        let mut body = String::new();
+        emit_post_ra_prologue(&mut body, &layout).unwrap();
+        emit_post_ra_epilogue(&mut body, &layout).unwrap();
+        let assembly = format!("    .text\nmain:\n{body}");
+        let mut clang = Command::new("clang")
+            .args([
+                "--target=aarch64-linux-gnu",
+                "-x",
+                "assembler",
+                "-c",
+                "-",
+                "-o",
+                "/dev/null",
+            ])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("clang must be available for AArch64 assembly validation");
+        clang
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(assembly.as_bytes())
+            .unwrap();
+        let output = clang.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "clang rejected finalized frame: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

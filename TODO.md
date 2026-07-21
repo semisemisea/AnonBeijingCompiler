@@ -647,7 +647,9 @@ instructions. A stream emitter now preserves the allocator's exact
 instruction selection coverage and prologue/epilogue integration. Frame layout
 can now be finalized from RA output: allocator spill bytes are incorporated
 directly and the used integer callee-save set is deduplicated and recorded for
-save/restore emission.
+save/restore emission. Finalized frames now emit tested prologue/epilogue
+sequences that save and restore those integer callee-saves, including legal
+large-frame stack adjustment; they are not yet used by the native compiler path.
 
 ### 6.1 Post-allocation Instruction Stream
 

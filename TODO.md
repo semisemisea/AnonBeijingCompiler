@@ -257,62 +257,81 @@ final driver-replacement milestone.
 
 ### Driver Boundary And Capability Contract
 
-- [ ] Add a program-level VCode assembly entry point that emits all defined
+- [x] Add a program-level VCode assembly entry point that emits all defined
   functions in deterministic order and rejects unsupported program-level data
   such as globals instead of omitting it.
-- [ ] Add a temporary explicit `--asm-backend vcode` CLI mode. Keep the default
+- [x] Add a temporary explicit `--asm-backend vcode` CLI mode. Keep the default
   as `direct`; do not overload the harness's existing `--backend asm|llvm`
   artifact selector.
-- [ ] Preserve `-S`, `--emit asm`, `--emit llvm`, multi-emit naming, and direct
+- [x] Preserve `-S`, `--emit asm`, `--emit llvm`, multi-emit naming, and direct
   backend behavior when the new mode is absent.
-- [ ] Validate the VCode-supported HIR subset before lowering and return a
+- [x] Validate the VCode-supported HIR subset before lowering and return a
   concise `Err` with function and instruction context. No unsupported source
   construct may reach a driver-visible `panic!`.
-- [ ] Reject unsupported globals, memory operations, pointers, aggregate
+- [x] Reject unsupported globals, memory operations, pointers, aggregate
   values, stack arguments, indirect calls, and unsupported float operations
   explicitly until their owning milestones implement them.
-- [ ] Keep the one-function VCode API for unit tests, but make the program API
+- [x] Keep the one-function VCode API for unit tests, but make the program API
   own assembly section/program formatting so repeated `.text` directives and
   duplicate symbols cannot hide integration errors.
 
 ### Harness Integration
 
-- [ ] Teach `tests/test.py` to accept `--asm-backend direct|vcode` and forward
+- [x] Teach `tests/test.py` to accept `--asm-backend direct|vcode` and forward
   the selected value only to assembly compiler invocations.
-- [ ] Add a `test-vcode` Makefile target or documented `ARGS` invocation that
+- [x] Add a `test-vcode` Makefile target or documented `ARGS` invocation that
   uses the existing container image, cross-linker, QEMU, timeout, and output
   comparison behavior.
-- [ ] Keep `make test` and `make test-llvm` unchanged by default.
-- [ ] Make generated artifacts identify the selected assembly backend so a
+- [x] Keep `make test` and `make test-llvm` unchanged by default.
+- [x] Make generated artifacts identify the selected assembly backend so a
   fixture cannot accidentally exercise the direct lowerer.
-- [ ] Add a small, dedicated VCode fixture directory. Fixtures must state the
+- [x] Add a small, dedicated VCode fixture directory. Fixtures must state the
   required subset and avoid memory/global/stack-argument features until their
   milestones are complete.
 
 ### Initial Executable Corpus
 
-- [ ] Constant i32 return and integer arithmetic execute through VCode.
-- [ ] Signed division and remainder execute, including an `MSub` fixture with
+- [x] Constant i32 return and integer arithmetic execute through VCode.
+- [x] Signed division and remainder execute, including an `MSub` fixture with
   all three inputs allocated to spill slots under the post-RA contract.
-- [ ] Integer comparisons, branches, and one-successor block-parameter transfer
+- [x] Integer comparisons, branches, and one-successor block-parameter transfer
   execute with expected output.
-- [ ] Direct scalar i32 and f32 calls execute, including void calls and values
+- [x] Direct scalar i32 and f32 calls execute, including void calls and values
   live across a call.
-- [ ] Integer and f32 register-pressure fixtures execute and demonstrate the
+- [x] Integer and f32 register-pressure fixtures execute and demonstrate the
   expected spill/reload behavior without corrupting the result.
-- [ ] Each fixture has an assembly-shape assertion confirming the VCode MInst
+- [x] Each fixture has an assembly-shape assertion confirming the VCode MInst
   sequence that it intends to validate.
 
 ### Exit Gate
 
-- [ ] A focused SysY fixture runs through `SysY -> HIR -> VCode -> RA -> GNU
+- [x] A focused SysY fixture runs through `SysY -> HIR -> VCode -> RA -> GNU
   assembly -> Clang/linker -> QEMU` with `--asm-backend vcode`.
-- [ ] Direct remains the default backend, and the corresponding direct fixture
+- [x] Direct remains the default backend, and the corresponding direct fixture
   still passes unchanged.
-- [ ] Unsupported VCode input exits with a diagnostic rather than panic or
+- [x] Unsupported VCode input exits with a diagnostic rather than panic or
   silently using the direct backend.
-- [ ] The M0 three-spilled-input `MSub` regression assembles and executes under
+- [x] The M0 three-spilled-input `MSub` regression assembles and executes under
   QEMU.
+
+### M1 Verification Record
+
+- `make DOCKER=podman RESULTS=results-opencode test-vcode vcode` executes the
+  five source fixtures: constant return, direct i32 call, scalar division and
+  remainder, branch, and void call. Their adjacent `.asm` files assert the
+  selected VCode instruction shapes and the harness verifies the
+  `soyo-vcode` marker.
+- `make DOCKER=podman RESULTS=results-opencode test-vcode-m0-msub` executes the
+  all-spilled `MSub` M0 regression.
+- `make DOCKER=podman RESULTS=results-opencode test-vcode-m1-manual` executes
+  test-only HIR fixtures for f32 and i32 cross-call register pressure, f32
+  direct call/result, and one-successor i32 block-parameter transfer; it also
+  checks spill/reload and call/branch assembly shapes.
+- `make RESULTS=results-opencode test-vcode-diagnostic` verifies a local SysY
+  variable exits through the VCode pointer-value capability diagnostic without
+  a panic, direct fallback, or emitted assembly.
+- `make DOCKER=podman RESULTS=results-opencode test functional/00_main.sy`
+  confirms the default direct backend remains unchanged.
 
 ## M2: Encoding-Shaped AArch64 MInst
 

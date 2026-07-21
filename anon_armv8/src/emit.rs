@@ -700,14 +700,9 @@ fn resolve_def(
 }
 
 fn scratch_reg(ty: Type, scratch_index: usize) -> Result<Reg, String> {
-    match (ty.is_f32(), scratch_index) {
-        (false, 0) => Ok(regs::int_reg(regs::INT_SCRATCH0)),
-        (false, 1) => Ok(regs::int_reg(regs::INT_SCRATCH1)),
-        (false, 2) => Ok(regs::int_reg(regs::INT_SCRATCH2)),
-        (true, 0) => Ok(regs::float_reg(regs::FP_SCRATCH)),
-        (true, 1) => Ok(regs::float_reg(regs::FP_SCRATCH1)),
-        _ => Err("instruction needs more post-RA scratch registers than AArch64 reserves".into()),
-    }
+    regs::post_ra_scratch(ty, scratch_index).ok_or_else(|| {
+        "instruction needs more post-RA scratch registers than AArch64 reserves".into()
+    })
 }
 
 fn allocation_reg(allocation: Allocation) -> Result<Reg, String> {

@@ -87,9 +87,31 @@ pub fn machine_env() -> &'static MachineEnv {
                 Some(float_preg(FP_SCRATCH)),
                 None,
             ],
+            post_ra_scratch_by_class: [
+                vec![
+                    int_preg(INT_SCRATCH0),
+                    int_preg(INT_SCRATCH1),
+                    int_preg(INT_SCRATCH2),
+                    int_preg(INT_ADDR_SCRATCH),
+                ],
+                vec![float_preg(FP_SCRATCH), float_preg(FP_SCRATCH1)],
+                vec![],
+            ],
             fixed_stack_slots: Vec::new(),
         }
     })
+}
+
+pub fn post_ra_scratch(ty: Type, index: usize) -> Option<Reg> {
+    let class = if ty.is_f32() {
+        RegClass::Float
+    } else {
+        RegClass::Int
+    };
+    machine_env().post_ra_scratch_by_class[class as usize]
+        .get(index)
+        .copied()
+        .map(Reg::from_physical_reg)
 }
 
 #[cfg(test)]
@@ -117,6 +139,14 @@ mod tests {
         assert!(!allocatable.contains(int_preg(LR)));
         assert!(!allocatable.contains(float_preg(FP_SCRATCH)));
         assert!(!allocatable.contains(float_preg(FP_SCRATCH1)));
+        assert_eq!(
+            post_ra_scratch(Type::new_i32(), 2),
+            Some(int_reg(INT_SCRATCH2))
+        );
+        assert_eq!(
+            post_ra_scratch(Type::new_f32(), 1),
+            Some(float_reg(FP_SCRATCH1))
+        );
         assert!(allocatable.contains(int_preg(0)));
         assert!(allocatable.contains(int_preg(19)));
     }

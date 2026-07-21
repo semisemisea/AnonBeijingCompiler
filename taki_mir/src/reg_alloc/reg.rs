@@ -1208,8 +1208,7 @@ pub struct MachineEnv {
     /// Preferred physical registers for each class. These are the
     /// registers that will be allocated first, if free.
     ///
-    /// If an explicit scratch register is provided in `scratch_by_class` then
-    /// it must not appear in this list.
+    /// Scratch registers must not appear in this list.
     pub preferred_regs_by_class: [PRegSet; 3],
 
     /// Non-preferred physical registers for each class. These are the
@@ -1217,8 +1216,7 @@ pub struct MachineEnv {
     /// not available; using one of these is considered suboptimal,
     /// but still better than spilling.
     ///
-    /// If an explicit scratch register is provided in `scratch_by_class` then
-    /// it must not appear in this list.
+    /// Scratch registers must not appear in this list.
     pub non_preferred_regs_by_class: [PRegSet; 3],
 
     /// Optional dedicated scratch register per class. This is needed to perform
@@ -1237,6 +1235,10 @@ pub struct MachineEnv {
     /// automatically allocate one as needed, spilling a value to the stack if
     /// necessary.
     pub scratch_by_class: [Option<PReg>; 3],
+
+    /// Registers reserved for target post-RA expansion. They must not be
+    /// allocatable and include `scratch_by_class` where applicable.
+    pub post_ra_scratch_by_class: [Vec<PReg>; 3],
 
     /// Some `PReg`s can be designated as locations on the stack rather than
     /// actual registers. These can be used to tell the register allocator about

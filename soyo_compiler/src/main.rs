@@ -7,7 +7,6 @@ use crate::frontend::utils::AstGenContext;
 use frontend::utils::ToRaanaIR;
 
 mod cli;
-mod context;
 mod frontend;
 
 lalrpop_util::lalrpop_mod!(sysy);
@@ -99,9 +98,8 @@ fn dump_llvm(program: &raana_ir::ir::Program) -> String {
 fn dump_asm(program: &raana_ir::ir::Program, target: cli::Target) -> String {
     match target {
         cli::Target::Riscv64 => taki_mir::compile::<Riscv64Backend>(program),
-        cli::Target::Aarch64 => {
-            todo!("aarch64 assembly emission not yet implemented")
-        }
+        cli::Target::Aarch64 => anon_armv8::compile_program_to_asm(program)
+            .unwrap_or_else(|error| panic!("AArch64 code generation failed: {error}")),
     }
 }
 

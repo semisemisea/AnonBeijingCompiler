@@ -422,6 +422,15 @@ load/store form, construct the address with `x16` or `x17`.
 
 ## Milestone 3: Integer Core Lowering And Control Flow
 
+**Status: In progress (2026-07-21).** Native assembly generation is now wired
+to `-S` for an integer subset: constants, all integer binary operations and
+comparisons, branches, returns, scalar local allocation/load/store, block
+parameter transfers, and direct i32 calls. The implementation uses fixed stack
+slots for SSA values while post-RA emission remains deferred to M6. Locally,
+generated assembly for `00_main.sy`, `12_addc.sy`, and `11_add2.sy` is accepted
+by `clang --target=aarch64-linux-gnu`; Docker/QEMU runtime validation remains
+pending.
+
 ### 3.1 Constants And Scalar Values
 
 - Lower `Integer` and integer `ZeroInit` to integer constant materialization.

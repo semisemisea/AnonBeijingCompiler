@@ -659,7 +659,8 @@ path for constructed VCode blocks: it emits directives, finalized frame state,
 globally indexed edits/allocations, block labels, and a shared epilogue. A
 deliberately opt-in HIR selector now drives the complete
 `HIR -> VCode -> RA -> post-RA` path for zero-parameter i32 functions containing
-integer constants, `Add`, `Sub`, `Mul`, signed `Div`, all six signed comparisons,
+integer constants, `Add`, `Sub`, `Mul`, signed `Div`, signed `Rem`, integer
+bitwise operations, all three integer shifts, and all six signed comparisons,
 zero-argument `Jump`/nonzero i32 `Branch`, and i32 return. Its focused tests
 construct chained HIR arithmetic expressions, individually exercise every
 comparison condition through real allocation, and validate both arithmetic and a
@@ -671,8 +672,10 @@ exposed and fixed three generic allocator issues: the invalid VReg sentinel was
 unconstructable, register-only operand demand was not decremented after a fresh
 allocation, and reverse liveness retained values after their definitions. The
 selector is not connected to the native driver: function parameters, calls,
-memory, floats, block parameters, and the remaining integer operations still
-require VCode instruction selection and ABI coverage before M6 can be completed.
+memory, floats, and block parameters still require VCode instruction selection
+and ABI coverage before M6 can be completed. Signed remainder selects `sdiv`
+followed by `msub`; all remaining integer binary operations are validated through
+the post-RA assembler path.
 The selector now verifies a single-successor i32 block-parameter transfer through
 the allocator's spill-oriented edge edits. Conditional block-parameter edges,
 loop-carried values, and critical-edge copy cycles remain excluded because the

@@ -1,15 +1,22 @@
 use std::fmt::Debug;
 
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use tomori_utils::Ranges;
 
 use crate::{
     abi::{ABIMachineSpec, CalleeABI},
     block_order::{BlockLoweringOrder, MirBlockIndex},
-    prelude::*,
-    reg_alloc::reg::{Operand, OperandCollector, OperandVisitor, PReg, PRegSet, RegClass, VReg},
+    reg_alloc::{
+        function::Function,
+        index::{Block, Inst, InstRange},
+        reg::{
+            Operand, OperandCollector, OperandVisitor, OperandWriter, Output, PRegSet, RegClass,
+            VReg,
+        },
+    },
     register::{Reg, VRegAllocator, Writable},
-    types::Type,
+    types::LoweredType,
 };
 
 pub enum MachTerminator {
@@ -46,61 +53,67 @@ pub trait MachInst: Clone + Debug {
 
     fn is_mem_access(&self) -> bool;
 
-    fn rc_for_type(ty: Type) -> (&'static [RegClass], &'static [Type]);
+    fn rc_for_type(ty: LoweredType) -> (&'static [RegClass], &'static [LoweredType]);
 
     fn gen_jump(target: MirBlockIndex) -> Self;
 }
 
-pub trait MachInstEmit {}
+pub trait EmitContext: core::fmt::Write {
+    fn write_reg(&mut self, reg: &Reg) -> core::fmt::Result;
+    fn write_label_ref(&mut self, idx: MirBlockIndex) -> core::fmt::Result;
+    fn write_function_label(&mut self, func: crate::prelude::HirFunction) -> core::fmt::Result;
+    fn write_global_label(&mut self, gv: crate::prelude::HirInst) -> core::fmt::Result;
+}
+
+pub trait MachInstEmit {
+    fn emit(&self, ctx: &mut dyn EmitContext) -> core::fmt::Result;
+}
 
 pub trait VCodeInst: MachInst + MachInstEmit {}
 impl<T: MachInst + MachInstEmit> VCodeInst for T {}
-
-use crate::reg_alloc::index::Inst as InstIndex;
 
 pub struct VCodeContainer<I>
 where
     I: VCodeInst,
 {
-    vreg_types: Vec<Type>,
-    /// Array of instructions
-    /// `[i_0, i_1, i_2, i_3,...]`
+    vreg_types: Vec<LoweredType>,
     insts: Vec<I>,
 
     /// ABI of the function
     pub abi: CalleeABI<I::ABISpec>,
 
     /// clobber meanings some hidden interruption on liveness range of a variable.
-    clobbers: FxHashMap<InstIndex, PRegSet>,
+    clobbers: FxHashMap<u32, PRegSet>,
 
     /// Array of operands.
-    /// `[o_0, o_1, o_2, o_3, ...]`
     operands: Vec<Operand>,
 
     /// Reverse Post-order of dominate tree.
     block_order: BlockLoweringOrder,
 
     /// A ranges map the instruction to operands.
-    /// `[0..1, 2..4, ...]` indicates the instruction `i_0` use the operand `o_0` and `o_1`
     operands_range: Ranges,
 
     /// A range map the block to instructions
-    /// `[0..1, 2..4, ...]` indicates the block 0 owns the instruction `i_0` and `i_1`
     block_range: Ranges,
 
     /// Array of each block's successors.
-    block_succ: Vec<MirBlockIndex>,
+    block_succ: Vec<Block>,
     block_succ_range: Ranges,
 
     /// Array of each block's predecessors.
-    block_pred: Vec<MirBlockIndex>,
+    block_pred: Vec<Block>,
     block_pred_range: Ranges,
 
     block_params: Vec<VReg>,
     block_params_range: Ranges,
 
     branch_block_args: Vec<VReg>,
-    branch_block_args_range: Ranges,
+    branch_block_arg_range: Ranges,
+    branch_block_arg_succ_range: Ranges,
+
+    inst_is_branch: Vec<bool>,
+    inst_is_ret: Vec<bool>,
 }
 
 impl<I: VCodeInst> VCodeContainer<I> {
@@ -121,8 +134,102 @@ impl<I: VCodeInst> VCodeContainer<I> {
             block_params: Vec::new(),
             block_params_range: Ranges::default(),
             branch_block_args: Vec::new(),
-            branch_block_args_range: Ranges::default(),
+            branch_block_arg_range: Ranges::default(),
+            branch_block_arg_succ_range: Ranges::default(),
+            inst_is_branch: Vec::new(),
+            inst_is_ret: Vec::new(),
         }
+    }
+
+    pub fn write_back_allocs(&mut self, output: &Output) {
+        for i in 0..self.insts.len() {
+            let allocs = output.inst_allocs(i as u32);
+            let mut writer = OperandWriter::new(allocs);
+            self.insts[i].get_operands(&mut writer);
+        }
+    }
+
+    pub fn inst(&self, i: usize) -> &I {
+        &self.insts[i]
+    }
+
+    pub fn block_order(&self) -> &BlockLoweringOrder {
+        &self.block_order
+    }
+}
+
+impl<I: VCodeInst> Function for VCodeContainer<I> {
+    fn num_insts(&self) -> usize {
+        self.insts.len()
+    }
+
+    fn num_blocks(&self) -> usize {
+        self.block_range.len()
+    }
+
+    fn entry_block(&self) -> Block {
+        Block::new(0)
+    }
+
+    fn block_insns(&self, block: Block) -> InstRange {
+        let range = self.block_range.get(block.index());
+        InstRange::new(Inst::new(range.start), Inst::new(range.end))
+    }
+
+    fn block_succs(&self, block: Block) -> &[Block] {
+        let range = self.block_succ_range.get(block.index());
+        &self.block_succ[range]
+    }
+
+    fn block_preds(&self, block: Block) -> &[Block] {
+        let range = self.block_pred_range.get(block.index());
+        &self.block_pred[range]
+    }
+
+    fn block_params(&self, block: Block) -> &[VReg] {
+        let range = self.block_params_range.get(block.index());
+        &self.block_params[range]
+    }
+
+    fn is_ret(&self, insn: Inst) -> bool {
+        self.inst_is_ret.get(insn.index()).copied().unwrap_or(false)
+    }
+
+    fn is_branch(&self, insn: Inst) -> bool {
+        self.inst_is_branch
+            .get(insn.index())
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn branch_blockparams(&self, block: Block, _insn: Inst, succ_idx: usize) -> &[VReg] {
+        let succ_range = self.branch_block_arg_succ_range.get(block.index());
+        let succ_entry = succ_range.start + succ_idx;
+        if succ_entry >= succ_range.end {
+            return &[];
+        }
+        let arg_range = self.branch_block_arg_range.get(succ_entry);
+        &self.branch_block_args[arg_range]
+    }
+
+    fn inst_operands(&self, insn: Inst) -> &[Operand] {
+        let range = self.operands_range.get(insn.index());
+        &self.operands[range]
+    }
+
+    fn inst_clobbers(&self, insn: Inst) -> PRegSet {
+        self.clobbers
+            .get(&(insn.index() as u32))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn num_vregs(&self) -> usize {
+        self.vreg_types.len()
+    }
+
+    fn spillslot_size(&self, regclass: RegClass) -> usize {
+        self.abi.spillslot_size(regclass) as usize
     }
 }
 
@@ -162,7 +269,7 @@ impl<I: VCodeInst> VCodeBuilder<I> {
             .branch_block_args
             .extend(regs.iter().map(|reg| reg.to_virtual_reg().unwrap()));
         let end = self.vcode.branch_block_args.len();
-        self.vcode.branch_block_args_range.push_end(end);
+        self.vcode.branch_block_arg_range.push_end(end);
     }
 
     pub fn end_bb(&mut self) {
@@ -175,10 +282,10 @@ impl<I: VCodeInst> VCodeBuilder<I> {
         let block_param_end = self.vcode.block_params.len();
         self.vcode.block_params_range.push_end(block_param_end);
 
-        let branch_block_arg_end = self.vcode.branch_block_args.len();
+        let branch_block_arg_range_end = self.vcode.branch_block_arg_range.len();
         self.vcode
-            .branch_block_args_range
-            .push_end(branch_block_arg_end);
+            .branch_block_arg_succ_range
+            .push_end(branch_block_arg_range_end);
     }
 
     pub fn build(mut self, mut vregs: VRegAllocator<I>) -> VCodeContainer<I> {
@@ -186,7 +293,7 @@ impl<I: VCodeInst> VCodeBuilder<I> {
 
         self.reverse_and_finalize();
 
-        self.collect_operands(&vregs);
+        self.collect_operands_and_terminators(&vregs);
 
         self.compute_preds_from_succs();
 
@@ -205,9 +312,21 @@ impl<I: VCodeInst> VCodeBuilder<I> {
         self.vcode
     }
 
-    pub fn collect_operands(&mut self, vregs: &VRegAllocator<I>) {
+    pub fn collect_operands_and_terminators(&mut self, vregs: &VRegAllocator<I>) {
         let allocatable = PRegSet::from(self.vcode.abi.machine_env());
+        let num_insts = self.vcode.insts.len();
+        self.vcode.inst_is_branch = vec![false; num_insts];
+        self.vcode.inst_is_ret = vec![false; num_insts];
         for (i, inst) in self.vcode.insts.iter_mut().enumerate() {
+            match inst.is_term() {
+                MachTerminator::Branch | MachTerminator::TailReturn => {
+                    self.vcode.inst_is_branch[i] = true;
+                }
+                MachTerminator::Return => {
+                    self.vcode.inst_is_ret[i] = true;
+                }
+                MachTerminator::None => {}
+            }
             let mut op_collector =
                 OperandCollector::new(&mut self.vcode.operands, allocatable, |vreg| {
                     vregs.resolve_alias(vreg)
@@ -217,7 +336,7 @@ impl<I: VCodeInst> VCodeBuilder<I> {
             self.vcode.operands_range.push_end(ops);
 
             if clobbers != PRegSet::default() {
-                self.vcode.clobbers.insert(InstIndex::new(i), clobbers);
+                self.vcode.clobbers.insert(i as u32, clobbers);
             }
 
             if let Some((dst, src)) = inst.is_move() {
@@ -250,9 +369,9 @@ impl<I: VCodeInst> VCodeBuilder<I> {
         let end = end as usize;
         assert_eq!(end, self.vcode.block_succ.len());
 
-        self.vcode.block_pred.resize(end, MirBlockIndex::invalid());
+        self.vcode.block_pred.resize(end, Block::invalid());
         for (pred, range) in self.vcode.block_succ_range.iter() {
-            let pred = MirBlockIndex::new(pred);
+            let pred = Block::new(pred);
             for succ in self.vcode.block_succ[range].iter() {
                 let pos = &mut starts[succ.index()];
                 self.vcode.block_pred[*pos as usize] = pred;
@@ -275,6 +394,6 @@ impl<I: VCodeInst> VCodeBuilder<I> {
         self.vcode.block_params_range.reverse_index();
         self.vcode.block_succ_range.reverse_index();
         self.vcode.insts.reverse();
-        self.vcode.branch_block_args_range.reverse_index();
+        self.vcode.branch_block_arg_succ_range.reverse_index();
     }
 }

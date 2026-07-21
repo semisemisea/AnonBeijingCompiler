@@ -1,6 +1,7 @@
 use clap::Parser;
 use raana_ir::fmt::writer::Writer;
 use std::path::Path;
+use taki_mir::riscv64::lower::Riscv64Backend;
 
 use crate::frontend::utils::AstGenContext;
 use frontend::utils::ToRaanaIR;
@@ -56,7 +57,7 @@ fn main() {
         None
     };
     let asm = if needs_asm {
-        Some(dump_asm(&program))
+        Some(dump_asm(&program, args.target))
     } else {
         None
     };
@@ -95,8 +96,13 @@ fn dump_llvm(program: &raana_ir::ir::Program) -> String {
     raana_ir::llvm::write_llvm_ir(program)
 }
 
-fn dump_asm(_program: &raana_ir::ir::Program) -> String {
-    todo!()
+fn dump_asm(program: &raana_ir::ir::Program, target: cli::Target) -> String {
+    match target {
+        cli::Target::Riscv64 => taki_mir::compile::<Riscv64Backend>(program),
+        cli::Target::Aarch64 => {
+            todo!("aarch64 assembly emission not yet implemented")
+        }
+    }
 }
 
 fn write_file(path: &Path, buf: impl AsRef<[u8]>) {

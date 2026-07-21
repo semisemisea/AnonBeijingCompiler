@@ -137,11 +137,6 @@ impl Pass for SSATransform {
         );
 
         remove_list.into_iter().rev().for_each(|(inst, bb)| {
-            let vd = data.inst_data(inst);
-            let used_by = vd.used_by().iter().copied().collect::<Vec<_>>();
-            for val in used_by.into_iter().rev() {
-                data.remove_inst(val);
-            }
             data.remove_layout_inst(bb, inst);
         });
 

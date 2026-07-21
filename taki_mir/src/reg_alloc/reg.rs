@@ -104,7 +104,7 @@ impl VReg {
 
     #[inline(always)]
     pub const fn new(v_reg: usize, cls: RegClass) -> VReg {
-        assert!(v_reg < Self::MAX);
+        assert!(v_reg <= Self::MAX);
         VReg {
             repr: ((v_reg as u32) << 2) | (cls as u8 as u32),
         }
@@ -118,7 +118,7 @@ impl VReg {
 
     #[inline(always)]
     pub const fn class(self) -> RegClass {
-        match self.repr | 0b11 {
+        match self.repr & 0b11 {
             0 => RegClass::Int,
             1 => RegClass::Float,
             2 => RegClass::Vector,
@@ -393,6 +393,64 @@ impl Output {
             self.inst_alloc_offsets[inst as usize + 1] as usize
         };
         &self.allocs[start..end]
+    }
+
+    pub fn block_insts_and_edits<'a, F: crate::reg_alloc::function::Function>(
+        &'a self,
+        func: &'a F,
+        block: crate::reg_alloc::index::Block,
+    ) -> OutputIter<'a, F> {
+        let inst_range = func.block_insns(block);
+        let first_pp = ProgPoint::before(inst_range.first().raw_u32());
+        let edit_start = self
+            .edits
+            .binary_search_by(|&(pos, _)| {
+                if pos < first_pp {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            })
+            .unwrap_err();
+        OutputIter {
+            inst_range,
+            insts: func,
+            edits: &self.edits[edit_start..],
+        }
+    }
+}
+
+pub enum InstOrEdit<'a> {
+    Inst(crate::reg_alloc::index::Inst),
+    Edit(&'a Edit),
+}
+
+pub struct OutputIter<'a, F: crate::reg_alloc::function::Function> {
+    inst_range: crate::reg_alloc::index::InstRange,
+    insts: &'a F,
+    edits: &'a [(ProgPoint, Edit)],
+}
+
+impl<'a, F: crate::reg_alloc::function::Function> Iterator for OutputIter<'a, F> {
+    type Item = InstOrEdit<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some((first_edit, rest)) = self.edits.split_first() {
+            if self.inst_range.len() == 0
+                || first_edit.0 <= ProgPoint::before(self.inst_range.first().raw_u32())
+            {
+                self.edits = rest;
+                return Some(InstOrEdit::Edit(&first_edit.1));
+            }
+        }
+
+        if self.inst_range.len() == 0 {
+            return None;
+        }
+
+        let inst = self.inst_range.first();
+        self.inst_range = self.inst_range.rest();
+        Some(InstOrEdit::Inst(inst))
     }
 }
 
@@ -1375,5 +1433,38 @@ impl<T: FnMut(&mut Reg, OperandConstraint, OperandKind, OperandPos)> OperandVisi
         pos: OperandPos,
     ) {
         self(reg, constraint, kind, pos)
+    }
+}
+
+pub struct OperandWriter<'a> {
+    allocs: &'a [Allocation],
+    pos: usize,
+}
+
+impl<'a> OperandWriter<'a> {
+    pub fn new(allocs: &'a [Allocation]) -> Self {
+        Self { allocs, pos: 0 }
+    }
+}
+
+impl OperandVisitor for OperandWriter<'_> {
+    fn add_operand(
+        &mut self,
+        reg: &mut Reg,
+        _constraint: OperandConstraint,
+        _kind: OperandKind,
+        _pos: OperandPos,
+    ) {
+        let alloc = self.allocs[self.pos];
+        self.pos += 1;
+        match alloc.kind() {
+            AllocationKind::Reg => {
+                *reg = Reg::from_physical_reg(alloc.as_reg().unwrap());
+            }
+            AllocationKind::Stack => {
+                *reg = Reg::from_spillslot(alloc.as_stack().unwrap());
+            }
+            _ => {}
+        }
     }
 }

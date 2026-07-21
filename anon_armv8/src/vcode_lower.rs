@@ -519,6 +519,62 @@ mod tests {
     }
 
     #[test]
+    fn lowers_and_assembles_eight_i32_direct_call_arguments() {
+        let mut program = Program::new();
+        let callee = program.new_function(Type::get_i32(), "sum8".into(), vec![Type::get_i32(); 8]);
+        let caller = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let data = program.func_data_mut(caller);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let args = (1..=8)
+            .map(|value| data.new_local_inst().integer(value))
+            .collect::<Vec<_>>();
+        let call = data
+            .new_local_inst()
+            .call_with_type(callee, args, Type::get_i32());
+        let ret = data.new_local_inst().ret(Some(call));
+        data.layout_mut().insert_inst(entry, call);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let assembly = compile_function_vcode(&program, caller).unwrap();
+        let call = assembly.find("    bl sum8").expect("missing direct call");
+        for (reg, value) in (0..8).zip(1..=8) {
+            let argument = format!("movz w{reg}, #{value}");
+            let position = assembly[..call]
+                .find(&argument)
+                .unwrap_or_else(|| panic!("missing {argument} before call:\n{assembly}"));
+            assert!(position < call, "{assembly}");
+        }
+
+        let mut clang = Command::new("clang")
+            .args([
+                "--target=aarch64-linux-gnu",
+                "-x",
+                "assembler",
+                "-c",
+                "-",
+                "-o",
+                "/dev/null",
+            ])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("clang must be available for AArch64 assembly validation");
+        clang
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(assembly.as_bytes())
+            .unwrap();
+        let output = clang.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "clang rejected generated assembly: {}\n{assembly}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn lowers_and_assembles_void_i32_direct_call() {
         let mut program = Program::new();
         let callee = program.new_function(

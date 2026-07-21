@@ -682,7 +682,11 @@ a post-call use. A separate 32-value pressure fixture forces i32 spills across a
 direct call and validates spill stores before the call, reloads after it, and the
 post-call accumulation sequence. An eight-i32-argument direct-call fixture
 verifies all fixed `w0..w7` argument uses are populated before `bl`. Stack-passed,
-float, pointer, void, and
+float VCode now covers f32 entry arguments, `fadd`, f32 direct-call arguments
+and results in `s0..s7`/`s0`, and f32 returns. A 32-value cross-call f32 pressure
+fixture forces `str sN` spills before `bl`, `ldr sN` reloads afterward, and
+post-call `fadd` accumulation. Float constants, remaining float operations,
+comparisons, memory, stack arguments, pointer, void, and
 indirect calls remain unsupported, except direct void calls with up to eight i32
 register arguments. Signed remainder selects `sdiv` followed by `msub`; all
 remaining integer binary operations are likewise validated through that path.

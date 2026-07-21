@@ -680,7 +680,9 @@ through post-RA assembly. A focused regression verifies an i32 value live across
 a direct call is placed in a saved callee-save register and remains available to
 a post-call use. A separate 32-value pressure fixture forces i32 spills across a
 direct call and validates spill stores before the call, reloads after it, and the
-post-call accumulation sequence. Stack-passed, float, pointer, void, and
+post-call accumulation sequence. An eight-i32-argument direct-call fixture
+verifies all fixed `w0..w7` argument uses are populated before `bl`. Stack-passed,
+float, pointer, void, and
 indirect calls remain unsupported, except direct void calls with up to eight i32
 register arguments. Signed remainder selects `sdiv` followed by `msub`; all
 remaining integer binary operations are likewise validated through that path.

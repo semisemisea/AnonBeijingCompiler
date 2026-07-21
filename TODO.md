@@ -325,12 +325,14 @@ renaming unless escaping becomes necessary.
 
 ## Milestone 2: Linux AAPCS64 ABI And Stack Frames
 
-**Status: In progress (2026-07-21).** The target now assigns i32/pointer and
-f32 parameters through their independent eight-register AAPCS64 windows,
-assigns overflow scalar arguments to eight-byte stack slots, exposes scalar
-return locations, and computes 16-byte-aligned fixed frame sizes. The remaining
-M2 work is emitting prologues/epilogues and applying these locations to lowered
-calls; it depends on M3's function/body lowering.
+**Status: Completed (2026-07-21).** The target assigns i32/pointer and f32
+parameters through independent eight-register AAPCS64 windows, assigns overflow
+scalars to eight-byte stack slots, and uses the correct scalar return registers.
+Functions use a fixed 16-byte-aligned frame with an x29/x30 prologue and shared
+epilogue; the precomputed outgoing area supports direct calls without moving
+`sp`. QEMU passes the mixed register/stack ABI stress case
+`tests/h_functional/39_fp_params.sy` and the large integer argument case
+`tests/functional/88_many_params2.sy`.
 
 ### 2.1 ABI Scope
 
@@ -422,14 +424,12 @@ load/store form, construct the address with `x16` or `x17`.
 
 ## Milestone 3: Integer Core Lowering And Control Flow
 
-**Status: In progress (2026-07-21).** Native assembly generation is now wired
-to `-S` for an integer subset: constants, all integer binary operations and
-comparisons, branches, returns, scalar local allocation/load/store, block
-parameter transfers, and direct i32 calls. The implementation uses fixed stack
-slots for SSA values while post-RA emission remains deferred to M6. Locally,
-generated assembly for `00_main.sy`, `12_addc.sy`, and `11_add2.sy` is accepted
-by `clang --target=aarch64-linux-gnu`; Docker/QEMU runtime validation remains
-pending.
+**Status: Completed (2026-07-21).** Native `-S` lowering supports integer
+constants, arithmetic, comparisons, branches, returns, scalar memory,
+block-parameter transfers, direct calls, loops, and recursion using fixed SSA
+value slots. QEMU passes the targeted arithmetic/control-flow set and the full
+functional suite has no native backend runtime failures; remaining compile
+errors are the pre-existing `raana_ir` `not implemented` panic.
 
 ### 3.1 Constants And Scalar Values
 

@@ -1,13 +1,11 @@
 use itertools::Itertools;
 
 use crate::ir::{
-    BasicBlockBuilders, LocalBuilder,
     basic_block::{BasicBlock, BasicBlockArena, BasicBlockData},
     builder::ReplaceBuilder,
     function::{Function, FunctionArena, FunctionData},
-    instruction::{
-        GlobalInstArena, Inst, InstData, LocalInstArena, next_global_inst_id, next_local_inst_id,
-    },
+    instruction::{GlobalInstArena, Inst, InstData, LocalInstArena},
+    BasicBlockBuilders, LocalBuilder,
 };
 
 pub struct LocalArena {
@@ -114,14 +112,13 @@ pub trait Arena {
 
     #[inline]
     fn alloc_local_inst(&mut self, data: InstData) -> Inst {
-        let id = next_local_inst_id();
+        let id = self.local_mut().inst_arena.alloc(data.clone());
         for used in data.inst_usage() {
             self.inst_data_mut(used).used_by_mut().insert(id);
         }
         for bb in data.bb_usage() {
             self.bb_data_mut(bb).used_by_mut().insert(id);
         }
-        self.local_mut().inst_arena.alloc(id, data);
         id
     }
 
@@ -158,11 +155,10 @@ pub trait Arena {
 
     #[inline]
     fn alloc_global_inst(&mut self, data: InstData) -> Inst {
-        let id = next_global_inst_id();
+        let id = self.global_mut().inst_arena.alloc(data.clone());
         for used in data.inst_usage() {
             self.inst_data_mut(used).used_by_mut().insert(id);
         }
-        self.global_mut().inst_arena.alloc(id, data);
         id
     }
 

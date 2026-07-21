@@ -2,10 +2,9 @@ use crate::{
     fmt::writer::Writer,
     ir::{
         arena::{Arena, GlobalArena},
-        basic_block,
         builder::GlobalBuilder,
         function::{Function, FunctionData},
-        instruction::{self, Inst},
+        instruction::Inst,
         types::Type,
     },
 };
@@ -44,8 +43,6 @@ impl std::fmt::Display for Program {
 
 impl Program {
     pub fn new() -> Program {
-        basic_block::reset();
-        instruction::reset();
         Program {
             global_arena: GlobalArena::new(),
             function_layout: Vec::new(),

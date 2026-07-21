@@ -1,5 +1,4 @@
 use crate::ir::{
-    Program,
     arena::Arena,
     basic_block::{BasicBlock, BasicBlockData},
     function::Function,
@@ -9,6 +8,7 @@ use crate::ir::{
     },
     instruction::{Inst, InstData},
     types::Type,
+    Program,
 };
 
 pub trait InfoQuery {
@@ -337,9 +337,9 @@ impl InstInsert for ReplaceBuilder<'_> {
         }
         data.used_by = old_data.used_by;
         if self.inst.is_global() {
-            self.arena.global_mut().inst_arena.alloc(self.inst, data);
+            self.arena.global_mut().inst_arena.insert(self.inst, data);
         } else {
-            self.arena.local_mut().inst_arena.alloc(self.inst, data);
+            self.arena.local_mut().inst_arena.insert(self.inst, data);
         }
         self.inst
     }

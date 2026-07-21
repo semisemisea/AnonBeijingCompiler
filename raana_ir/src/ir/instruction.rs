@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     num::NonZeroU32,
-    sync::atomic::{AtomicU32, Ordering},
 };
 
 use crate::ir::{
@@ -102,42 +101,31 @@ const LOCAL_ID_START_FROM: u32 = 0x00000001;
 
 const GLOBAL_ID_START_FROM: u32 = 0x40000000;
 
-static LOCAL_INST_ID: AtomicU32 = AtomicU32::new(LOCAL_ID_START_FROM);
-
-static GLOBAL_INST_ID: AtomicU32 = AtomicU32::new(GLOBAL_ID_START_FROM);
-
-pub(crate) fn reset() {
-    LOCAL_INST_ID.store(LOCAL_ID_START_FROM, Ordering::Relaxed);
-    GLOBAL_INST_ID.store(GLOBAL_ID_START_FROM, Ordering::Relaxed);
-}
-
-pub(in crate::ir) fn next_local_inst_id() -> Inst {
-    Inst(unsafe { NonZeroU32::new_unchecked(LOCAL_INST_ID.fetch_add(1, Ordering::Relaxed)) })
-}
-
-pub(in crate::ir) fn next_global_inst_id() -> Inst {
-    Inst(unsafe { NonZeroU32::new_unchecked(GLOBAL_INST_ID.fetch_add(1, Ordering::Relaxed)) })
-}
-
 #[derive(Debug, Clone)]
 pub struct LocalInstArena {
     data: HashMap<Inst, InstData>,
+    next_id: u32,
 }
 
 #[derive(Debug, Clone)]
 pub struct GlobalInstArena {
     data: HashMap<Inst, InstData>,
+    next_id: u32,
 }
 
 impl LocalInstArena {
     pub fn new() -> LocalInstArena {
         LocalInstArena {
             data: HashMap::new(),
+            next_id: LOCAL_ID_START_FROM,
         }
     }
 
-    pub fn alloc(&mut self, inst: Inst, data: InstData) {
+    pub fn alloc(&mut self, data: InstData) -> Inst {
+        let inst = Inst(NonZeroU32::new(self.next_id).unwrap());
+        self.next_id += 1;
         self.data.insert(inst, data);
+        inst
     }
 
     pub fn data_of(&self, inst: Inst) -> &InstData {
@@ -165,11 +153,15 @@ impl GlobalInstArena {
     pub fn new() -> GlobalInstArena {
         GlobalInstArena {
             data: HashMap::new(),
+            next_id: GLOBAL_ID_START_FROM,
         }
     }
 
-    pub fn alloc(&mut self, inst: Inst, data: InstData) {
+    pub fn alloc(&mut self, data: InstData) -> Inst {
+        let inst = Inst(NonZeroU32::new(self.next_id).unwrap());
+        self.next_id += 1;
         self.data.insert(inst, data);
+        inst
     }
 
     pub fn data_of(&self, inst: Inst) -> &InstData {
@@ -182,6 +174,10 @@ impl GlobalInstArena {
 
     pub fn remove(&mut self, inst: Inst) -> InstData {
         self.data.remove(&inst).unwrap()
+    }
+
+    pub fn insert(&mut self, inst: Inst, data: InstData) {
+        self.data.insert(inst, data);
     }
 
     pub fn datas(&self) -> std::collections::hash_map::Iter<'_, Inst, InstData> {

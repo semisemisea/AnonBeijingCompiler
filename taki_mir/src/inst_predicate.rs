@@ -16,6 +16,6 @@ impl ArenaContext<'_> {
 
     pub fn is_branch(&self, inst: HirInst) -> bool {
         let inst = self.inst_data(inst).kind();
-        inst.is_terminator()
+        inst.is_branch()
     }
 }

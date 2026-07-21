@@ -135,6 +135,8 @@ pub enum Inst {
     },
     Call {
         symbol: String,
+        args: Vec<ArgPair>,
+        result: Option<(Reg, Type)>,
     },
     /// Return an i32 value through the AAPCS64 w0 register.
     RetI32 {
@@ -195,7 +197,13 @@ impl MachInst for Inst {
                     collector.reg_fixed_def(&mut Writable::from_reg(arg.vreg), arg.preg);
                 }
             }
-            Self::Call { .. } => {
+            Self::Call { args, result, .. } => {
+                for arg in args {
+                    collector.reg_fixed_use(&mut arg.vreg, arg.preg);
+                }
+                if let Some((result, _)) = result {
+                    collector.reg_fixed_def(&mut Writable::from_reg(*result), regs::int_reg(0));
+                }
                 let mut clobbers = taki_mir::reg_alloc::reg::PRegSet::empty();
                 for index in 0..=18 {
                     clobbers.add(regs::int_preg(index));

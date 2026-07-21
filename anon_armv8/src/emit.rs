@@ -232,7 +232,7 @@ fn format_inst(function: &str, inst: &Inst) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n    "),
-        Inst::Call { symbol } => format!("bl {symbol}"),
+        Inst::Call { symbol, .. } => format!("bl {symbol}"),
         Inst::RetI32 { src } => format!("mov w0, {}", regs::format_reg(*src, Type::new_i32())),
         Inst::Ret => "ret".to_string(),
         Inst::Nop => "nop".to_string(),
@@ -391,7 +391,22 @@ pub fn emit_post_ra_inst(
             *src = resolve_use(output, allocs[0], Type::new_i32(), 0, spill_base)?;
             None
         }
-        Inst::Jump { .. } | Inst::Branch { .. } | Inst::Call { .. } | Inst::Ret | Inst::Nop => {
+        Inst::Call { args, result, .. } => {
+            expect_alloc_count(inst, allocs, args.len() + usize::from(result.is_some()))?;
+            for (arg, allocation) in args.iter().zip(allocs) {
+                if allocation.as_reg() != arg.preg.to_physical_reg() {
+                    return Err("call argument was not assigned to its ABI register".into());
+                }
+            }
+            if let Some((_, ty)) = result {
+                let allocation = allocs[args.len()];
+                if allocation.as_reg() != regs::int_reg(0).to_physical_reg() || !ty.is_i32() {
+                    return Err("call result was not assigned to AAPCS64 w0".into());
+                }
+            }
+            None
+        }
+        Inst::Jump { .. } | Inst::Branch { .. } | Inst::Ret | Inst::Nop => {
             expect_alloc_count(inst, allocs, 0)?;
             None
         }

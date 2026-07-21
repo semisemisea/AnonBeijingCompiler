@@ -66,6 +66,49 @@ pub enum Inst {
         rhs: Reg,
         ty: Type,
     },
+    MSub {
+        dst: Reg,
+        mul_lhs: Reg,
+        mul_rhs: Reg,
+        sub: Reg,
+        ty: Type,
+    },
+    And {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+        ty: Type,
+    },
+    Orr {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+        ty: Type,
+    },
+    Eor {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+        ty: Type,
+    },
+    Lsl {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+        ty: Type,
+    },
+    Lsr {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+        ty: Type,
+    },
+    Asr {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+        ty: Type,
+    },
     Cmp {
         lhs: Reg,
         rhs: Reg,
@@ -114,9 +157,27 @@ impl MachInst for Inst {
             }
             Self::Sub { dst, lhs, rhs, .. }
             | Self::Mul { dst, lhs, rhs, .. }
-            | Self::SDiv { dst, lhs, rhs, .. } => {
+            | Self::SDiv { dst, lhs, rhs, .. }
+            | Self::And { dst, lhs, rhs, .. }
+            | Self::Orr { dst, lhs, rhs, .. }
+            | Self::Eor { dst, lhs, rhs, .. }
+            | Self::Lsl { dst, lhs, rhs, .. }
+            | Self::Lsr { dst, lhs, rhs, .. }
+            | Self::Asr { dst, lhs, rhs, .. } => {
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
+                collector.reg_def(&mut Writable::from_reg(*dst));
+            }
+            Self::MSub {
+                dst,
+                mul_lhs,
+                mul_rhs,
+                sub,
+                ..
+            } => {
+                collector.reg_use(mul_lhs);
+                collector.reg_use(mul_rhs);
+                collector.reg_use(sub);
                 collector.reg_def(&mut Writable::from_reg(*dst));
             }
             Self::Cmp { lhs, rhs, .. } => {

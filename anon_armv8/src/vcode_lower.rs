@@ -99,6 +99,58 @@ impl LowerBackend for IntegerBackend {
                         rhs,
                         ty: Type::new_i32(),
                     }),
+                    BinaryOp::Rem => {
+                        let quotient = ctx.alloc_temp(Type::new_i32());
+                        ctx.emit_inst(Inst::SDiv {
+                            dst: quotient,
+                            lhs,
+                            rhs,
+                            ty: Type::new_i32(),
+                        });
+                        ctx.emit_inst(Inst::MSub {
+                            dst,
+                            mul_lhs: quotient,
+                            mul_rhs: rhs,
+                            sub: lhs,
+                            ty: Type::new_i32(),
+                        });
+                    }
+                    BinaryOp::And => ctx.emit_inst(Inst::And {
+                        dst,
+                        lhs,
+                        rhs,
+                        ty: Type::new_i32(),
+                    }),
+                    BinaryOp::Or => ctx.emit_inst(Inst::Orr {
+                        dst,
+                        lhs,
+                        rhs,
+                        ty: Type::new_i32(),
+                    }),
+                    BinaryOp::Xor => ctx.emit_inst(Inst::Eor {
+                        dst,
+                        lhs,
+                        rhs,
+                        ty: Type::new_i32(),
+                    }),
+                    BinaryOp::Shl => ctx.emit_inst(Inst::Lsl {
+                        dst,
+                        lhs,
+                        rhs,
+                        ty: Type::new_i32(),
+                    }),
+                    BinaryOp::Shr => ctx.emit_inst(Inst::Lsr {
+                        dst,
+                        lhs,
+                        rhs,
+                        ty: Type::new_i32(),
+                    }),
+                    BinaryOp::Sar => ctx.emit_inst(Inst::Asr {
+                        dst,
+                        lhs,
+                        rhs,
+                        ty: Type::new_i32(),
+                    }),
                     op if op.is_compare() => {
                         ctx.emit_inst(Inst::Cmp {
                             lhs,
@@ -260,6 +312,65 @@ mod tests {
             assert!(assembly.contains("cset w"), "{assembly}");
             assert!(assembly.contains(&format!(", {condition}")), "{assembly}");
         }
+    }
+
+    #[test]
+    fn lowers_and_assembles_remaining_integer_operations() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let lhs = data.new_local_inst().integer(-29);
+        let rhs = data.new_local_inst().integer(6);
+        let rem = data.new_local_inst().binary(BinaryOp::Rem, lhs, rhs);
+        let and = data.new_local_inst().binary(BinaryOp::And, rem, rhs);
+        let or = data.new_local_inst().binary(BinaryOp::Or, and, lhs);
+        let xor = data.new_local_inst().binary(BinaryOp::Xor, or, rhs);
+        let shl = data.new_local_inst().binary(BinaryOp::Shl, xor, rhs);
+        let shr = data.new_local_inst().binary(BinaryOp::Shr, shl, rhs);
+        let sar = data.new_local_inst().binary(BinaryOp::Sar, shr, rhs);
+        let ret = data.new_local_inst().ret(Some(sar));
+        for inst in [rem, and, or, xor, shl, shr, sar, ret] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+
+        let assembly = compile_function_vcode(&program, function).unwrap();
+        for opcode in [
+            "sdiv w", "msub w", "and w", "orr w", "eor w", "lsl w", "lsr w", "asr w",
+        ] {
+            assert!(
+                assembly.contains(opcode),
+                "missing {opcode} in:\n{assembly}"
+            );
+        }
+
+        let mut clang = Command::new("clang")
+            .args([
+                "--target=aarch64-linux-gnu",
+                "-x",
+                "assembler",
+                "-c",
+                "-",
+                "-o",
+                "/dev/null",
+            ])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("clang must be available for AArch64 assembly validation");
+        clang
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(assembly.as_bytes())
+            .unwrap();
+        let output = clang.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "clang rejected generated assembly: {}\n{assembly}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

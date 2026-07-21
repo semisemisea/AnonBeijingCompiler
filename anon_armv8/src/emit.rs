@@ -159,6 +159,55 @@ fn format_inst(function: &str, inst: &Inst) -> String {
             regs::format_reg(*lhs, *ty),
             regs::format_reg(*rhs, *ty)
         ),
+        Inst::MSub {
+            dst,
+            mul_lhs,
+            mul_rhs,
+            sub,
+            ty,
+        } => format!(
+            "msub {}, {}, {}, {}",
+            regs::format_reg(*dst, *ty),
+            regs::format_reg(*mul_lhs, *ty),
+            regs::format_reg(*mul_rhs, *ty),
+            regs::format_reg(*sub, *ty)
+        ),
+        Inst::And { dst, lhs, rhs, ty } => format!(
+            "and {}, {}, {}",
+            regs::format_reg(*dst, *ty),
+            regs::format_reg(*lhs, *ty),
+            regs::format_reg(*rhs, *ty)
+        ),
+        Inst::Orr { dst, lhs, rhs, ty } => format!(
+            "orr {}, {}, {}",
+            regs::format_reg(*dst, *ty),
+            regs::format_reg(*lhs, *ty),
+            regs::format_reg(*rhs, *ty)
+        ),
+        Inst::Eor { dst, lhs, rhs, ty } => format!(
+            "eor {}, {}, {}",
+            regs::format_reg(*dst, *ty),
+            regs::format_reg(*lhs, *ty),
+            regs::format_reg(*rhs, *ty)
+        ),
+        Inst::Lsl { dst, lhs, rhs, ty } => format!(
+            "lsl {}, {}, {}",
+            regs::format_reg(*dst, *ty),
+            regs::format_reg(*lhs, *ty),
+            regs::format_reg(*rhs, *ty)
+        ),
+        Inst::Lsr { dst, lhs, rhs, ty } => format!(
+            "lsr {}, {}, {}",
+            regs::format_reg(*dst, *ty),
+            regs::format_reg(*lhs, *ty),
+            regs::format_reg(*rhs, *ty)
+        ),
+        Inst::Asr { dst, lhs, rhs, ty } => format!(
+            "asr {}, {}, {}",
+            regs::format_reg(*dst, *ty),
+            regs::format_reg(*lhs, *ty),
+            regs::format_reg(*rhs, *ty)
+        ),
         Inst::Cmp { lhs, rhs, ty } => format!(
             "cmp {}, {}",
             regs::format_reg(*lhs, *ty),
@@ -263,11 +312,32 @@ pub fn emit_post_ra_inst(
         }
         Inst::Sub { dst, lhs, rhs, ty }
         | Inst::Mul { dst, lhs, rhs, ty }
-        | Inst::SDiv { dst, lhs, rhs, ty } => {
+        | Inst::SDiv { dst, lhs, rhs, ty }
+        | Inst::And { dst, lhs, rhs, ty }
+        | Inst::Orr { dst, lhs, rhs, ty }
+        | Inst::Eor { dst, lhs, rhs, ty }
+        | Inst::Lsl { dst, lhs, rhs, ty }
+        | Inst::Lsr { dst, lhs, rhs, ty }
+        | Inst::Asr { dst, lhs, rhs, ty } => {
             expect_alloc_count(inst, allocs, 3)?;
             *lhs = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
             *rhs = resolve_use(output, allocs[1], *ty, 1, spill_base)?;
             let (reg, spill) = resolve_def(allocs[2], *ty, 0)?;
+            *dst = reg;
+            spill
+        }
+        Inst::MSub {
+            dst,
+            mul_lhs,
+            mul_rhs,
+            sub,
+            ty,
+        } => {
+            expect_alloc_count(inst, allocs, 4)?;
+            *mul_lhs = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
+            *mul_rhs = resolve_use(output, allocs[1], *ty, 1, spill_base)?;
+            *sub = resolve_use(output, allocs[2], *ty, 2, spill_base)?;
+            let (reg, spill) = resolve_def(allocs[3], *ty, 0)?;
             *dst = reg;
             spill
         }

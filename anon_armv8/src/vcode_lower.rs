@@ -212,4 +212,32 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    #[test]
+    fn lowers_all_signed_integer_comparisons() {
+        for (op, condition) in [
+            (BinaryOp::Eq, "eq"),
+            (BinaryOp::NotEq, "ne"),
+            (BinaryOp::Lt, "lt"),
+            (BinaryOp::Le, "le"),
+            (BinaryOp::Gt, "gt"),
+            (BinaryOp::Ge, "ge"),
+        ] {
+            let mut program = Program::new();
+            let function = program.new_function(Type::get_i32(), "main".into(), vec![]);
+            let data = program.func_data_mut(function);
+            let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+            data.layout_mut().push_bb_back(entry);
+            let lhs = data.new_local_inst().integer(-1);
+            let rhs = data.new_local_inst().integer(1);
+            let comparison = data.new_local_inst().binary(op, lhs, rhs);
+            let ret = data.new_local_inst().ret(Some(comparison));
+            data.layout_mut().insert_inst(entry, comparison);
+            data.layout_mut().insert_inst(entry, ret);
+
+            let assembly = compile_function_vcode(&program, function).unwrap();
+            assert!(assembly.contains("cset w"), "{assembly}");
+            assert!(assembly.contains(&format!(", {condition}")), "{assembly}");
+        }
+    }
 }

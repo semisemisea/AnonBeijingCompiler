@@ -11,7 +11,7 @@ pub const LR: u8 = 30;
 pub const INT_SCRATCH0: u8 = 16;
 pub const INT_SCRATCH1: u8 = 17;
 pub const FP_SCRATCH: u8 = 31;
-pub const FP_SCRATCH1: u8 = 8;
+pub const FP_SCRATCH1: u8 = 30;
 
 pub const fn int_preg(index: u8) -> PReg {
     assert!(index <= 30);
@@ -74,7 +74,7 @@ pub fn machine_env() -> &'static MachineEnv {
         for index in 0..=7 {
             preferred_float.add(float_preg(index));
         }
-        for index in 16..=30 {
+        for index in 16..=29 {
             preferred_float.add(float_preg(index));
         }
         MachineEnv {
@@ -111,6 +111,7 @@ mod tests {
         assert!(!allocatable.contains(int_preg(FP)));
         assert!(!allocatable.contains(int_preg(LR)));
         assert!(!allocatable.contains(float_preg(FP_SCRATCH)));
+        assert!(!allocatable.contains(float_preg(FP_SCRATCH1)));
         assert!(allocatable.contains(int_preg(0)));
         assert!(allocatable.contains(int_preg(19)));
     }

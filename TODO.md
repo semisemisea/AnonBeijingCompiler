@@ -650,6 +650,8 @@ directly and the used integer callee-save set is deduplicated and recorded for
 save/restore emission. Finalized frames now emit tested prologue/epilogue
 sequences that save and restore those integer callee-saves, including legal
 large-frame stack adjustment; they are not yet used by the native compiler path.
+The post-RA float scratch pair is `v30`/`v31`, both excluded from allocation, so
+spill rewriting does not clobber AAPCS64 callee-saved `v8..v15` state.
 
 ### 6.1 Post-allocation Instruction Stream
 

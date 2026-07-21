@@ -174,6 +174,16 @@ fn format_inst(function: &str, inst: &Inst) -> String {
             regs::format_reg(*dst, *ty),
             regs::format_reg(*src, *ty)
         ),
+        Inst::MovK {
+            dst,
+            imm16,
+            shift,
+            ty,
+            ..
+        } => format!(
+            "movk {}, #{imm16}, lsl #{shift}",
+            regs::format_reg(*dst, *ty)
+        ),
         Inst::FAdd { dst, lhs, rhs } => format!(
             "fadd {}, {}, {}",
             regs::format_reg(*dst, Type::new_f32()),
@@ -357,6 +367,15 @@ pub fn emit_post_ra_inst(
             *src = resolve_use(output, locations.next("source")?, *ty, 0, spill_base)?;
             let (reg, spill) = resolve_def(locations.next("destination")?, *ty, 0)?;
             *dst = reg;
+            spill
+        }
+        Inst::MovK { dst, src, ty, .. } => {
+            *src = resolve_use(output, locations.next("tied input")?, *ty, 0, spill_base)?;
+            let (reg, spill) = resolve_def(locations.next("tied destination")?, *ty, 0)?;
+            *dst = reg;
+            if *src != *dst {
+                return Err("movk tied input and destination received different locations".into());
+            }
             spill
         }
         Inst::FAdd { dst, lhs, rhs } => {
@@ -1005,6 +1024,30 @@ mod tests {
             output,
             "    ldr w16, [sp, #32]\n    ldr w17, [sp, #40]\n    ldr w14, [sp, #48]\n    msub w16, w16, w17, w14\n    str w16, [sp, #56]\n"
         );
+    }
+
+    #[test]
+    fn rewrites_tied_movk_operand() {
+        let mut output = String::new();
+        emit_post_ra_inst(
+            &mut output,
+            "main",
+            &Inst::MovK {
+                dst: regs::int_reg(0),
+                src: regs::int_reg(1),
+                imm16: 0xabcd,
+                shift: 16,
+                ty: Type::new_i32(),
+            },
+            &[
+                Allocation::reg(regs::int_preg(3)),
+                Allocation::reg(regs::int_preg(3)),
+            ],
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(output, "    movk w3, #43981, lsl #16\n");
     }
 
     #[test]

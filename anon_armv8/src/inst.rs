@@ -43,6 +43,14 @@ pub enum Inst {
         src: Reg,
         ty: Type,
     },
+    /// Move-wide keep form with a tied input/output register.
+    MovK {
+        dst: Reg,
+        src: Reg,
+        imm16: u16,
+        shift: u8,
+        ty: Type,
+    },
     FAdd {
         dst: Reg,
         lhs: Reg,
@@ -164,6 +172,10 @@ impl MachInst for Inst {
             Self::Mov { dst, src, .. } => {
                 collector.reg_use(src);
                 collector.reg_def(&mut Writable::from_reg(*dst));
+            }
+            Self::MovK { dst, src, .. } => {
+                collector.reg_use(src);
+                collector.reg_reuse_def(&mut Writable::from_reg(*dst), 0);
             }
             Self::FAdd { dst, lhs, rhs } => {
                 collector.reg_use(lhs);

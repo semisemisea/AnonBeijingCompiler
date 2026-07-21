@@ -4,7 +4,7 @@ use crate::{
         arena::{Arena, GlobalArena},
         basic_block,
         builder::GlobalBuilder,
-        function::{self, Function, FunctionData, next_function_id},
+        function::{Function, FunctionData},
         instruction::{self, Inst},
         types::Type,
     },
@@ -44,7 +44,6 @@ impl std::fmt::Display for Program {
 
 impl Program {
     pub fn new() -> Program {
-        function::reset();
         basic_block::reset();
         instruction::reset();
         Program {
@@ -87,8 +86,10 @@ impl Program {
     }
 
     pub fn new_function(&mut self, ret_ty: Type, name: String, params_ty: Vec<Type>) -> Function {
-        self.alloc_function(FunctionData::new(ret_ty, name, params_ty));
-        let id = next_function_id();
+        let id = self
+            .global_arena
+            .func_arena
+            .alloc(FunctionData::new(ret_ty, name, params_ty));
         self.func_layout_push(id);
         id
     }

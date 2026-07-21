@@ -143,41 +143,38 @@ impl<'a> FunctionLowerer<'a> {
                 crate::abi::ValueLocation::Reg(reg) => {
                     let number = reg.to_physical_reg().unwrap().hw_enc();
                     if data.inst_data(param).ty().is_f32() {
-                        writeln!(
+                        emit_memory_store(
                             output,
-                            "    str s{number}, [sp, #{}]",
-                            self.local_base() + offset
-                        )
-                        .unwrap();
+                            &format!("s{number}"),
+                            "sp",
+                            self.local_base() + offset,
+                        )?;
                     } else if data.inst_data(param).ty().is_pointer() {
-                        writeln!(
+                        emit_memory_store(
                             output,
-                            "    str x{number}, [sp, #{}]",
-                            self.local_base() + offset
-                        )
-                        .unwrap();
+                            &format!("x{number}"),
+                            "sp",
+                            self.local_base() + offset,
+                        )?;
                     } else {
-                        writeln!(
+                        emit_memory_store(
                             output,
-                            "    str w{number}, [sp, #{}]",
-                            self.local_base() + offset
-                        )
-                        .unwrap();
+                            &format!("w{number}"),
+                            "sp",
+                            self.local_base() + offset,
+                        )?;
                     }
                 }
                 crate::abi::ValueLocation::Stack { offset: incoming } => {
                     if data.inst_data(param).ty().is_f32() {
                         writeln!(output, "    ldr s9, [x29, #{}]", 16 + incoming).unwrap();
-                        writeln!(output, "    str s9, [sp, #{}]", self.local_base() + offset)
-                            .unwrap();
+                        emit_memory_store(output, "s9", "sp", self.local_base() + offset)?;
                     } else if data.inst_data(param).ty().is_pointer() {
                         writeln!(output, "    ldr x9, [x29, #{}]", 16 + incoming).unwrap();
-                        writeln!(output, "    str x9, [sp, #{}]", self.local_base() + offset)
-                            .unwrap();
+                        emit_memory_store(output, "x9", "sp", self.local_base() + offset)?;
                     } else {
                         writeln!(output, "    ldr w9, [x29, #{}]", 16 + incoming).unwrap();
-                        writeln!(output, "    str w9, [sp, #{}]", self.local_base() + offset)
-                            .unwrap();
+                        emit_memory_store(output, "w9", "sp", self.local_base() + offset)?;
                     }
                 }
             }
@@ -448,12 +445,7 @@ impl<'a> FunctionLowerer<'a> {
                 Ok(())
             }
             _ if data.ty().is_i32() => {
-                writeln!(
-                    output,
-                    "    ldr {reg}, [sp, #{}]",
-                    self.local_base() + self.slot(inst)?
-                )
-                .unwrap();
+                emit_memory_load(output, reg, "sp", self.local_base() + self.slot(inst)?)?;
                 Ok(())
             }
             _ => Err(format!("{}: expected i32 value for {}", self.name, inst)),
@@ -478,12 +470,7 @@ impl<'a> FunctionLowerer<'a> {
                 Ok(())
             }
             _ if data.ty().is_f32() => {
-                writeln!(
-                    output,
-                    "    ldr {reg}, [sp, #{}]",
-                    self.local_base() + self.slot(inst)?
-                )
-                .unwrap();
+                emit_memory_load(output, reg, "sp", self.local_base() + self.slot(inst)?)?;
                 Ok(())
             }
             _ => Err(format!("{}: expected f32 value for {}", self.name, inst)),
@@ -505,12 +492,7 @@ impl<'a> FunctionLowerer<'a> {
             .ty()
             .is_pointer()
         {
-            writeln!(
-                output,
-                "    ldr {reg}, [sp, #{}]",
-                self.local_base() + self.slot(inst)?
-            )
-            .unwrap();
+            emit_memory_load(output, reg, "sp", self.local_base() + self.slot(inst)?)?;
             Ok(())
         } else {
             Err(format!("{}: unsupported pointer value {}", self.name, inst))
@@ -556,33 +538,15 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn store_value(&self, output: &mut String, inst: HirInst, reg: &str) -> Result<(), String> {
-        writeln!(
-            output,
-            "    str {reg}, [sp, #{}]",
-            self.local_base() + self.slot(inst)?
-        )
-        .unwrap();
-        Ok(())
+        emit_memory_store(output, reg, "sp", self.local_base() + self.slot(inst)?)
     }
 
     fn store_pointer(&self, output: &mut String, inst: HirInst, reg: &str) -> Result<(), String> {
-        writeln!(
-            output,
-            "    str {reg}, [sp, #{}]",
-            self.local_base() + self.slot(inst)?
-        )
-        .unwrap();
-        Ok(())
+        emit_memory_store(output, reg, "sp", self.local_base() + self.slot(inst)?)
     }
 
     fn store_float(&self, output: &mut String, inst: HirInst, reg: &str) -> Result<(), String> {
-        writeln!(
-            output,
-            "    str {reg}, [sp, #{}]",
-            self.local_base() + self.slot(inst)?
-        )
-        .unwrap();
-        Ok(())
+        emit_memory_store(output, reg, "sp", self.local_base() + self.slot(inst)?)
     }
 
     fn store_initializer(
@@ -812,6 +776,52 @@ fn emit_sp_address(output: &mut String, reg: &str, offset: u32) -> Result<(), St
     while remaining != 0 {
         let chunk = remaining.min(4095);
         writeln!(output, "    add {reg}, {reg}, #{chunk}").unwrap();
+        remaining -= chunk;
+    }
+    Ok(())
+}
+
+fn emit_memory_load(output: &mut String, reg: &str, base: &str, offset: u32) -> Result<(), String> {
+    emit_memory_access(output, "ldr", reg, base, offset)
+}
+
+fn emit_memory_store(
+    output: &mut String,
+    reg: &str,
+    base: &str,
+    offset: u32,
+) -> Result<(), String> {
+    emit_memory_access(output, "str", reg, base, offset)
+}
+
+fn emit_memory_access(
+    output: &mut String,
+    op: &str,
+    reg: &str,
+    base: &str,
+    offset: u32,
+) -> Result<(), String> {
+    let scale = if reg.starts_with('x') { 8 } else { 4 };
+    if offset % scale == 0 && offset / scale <= 4095 {
+        writeln!(output, "    {op} {reg}, [{base}, #{offset}]").unwrap();
+        return Ok(());
+    }
+    emit_address_offset(output, "x16", base, offset)?;
+    writeln!(output, "    {op} {reg}, [x16]").unwrap();
+    Ok(())
+}
+
+fn emit_address_offset(
+    output: &mut String,
+    destination: &str,
+    base: &str,
+    offset: u32,
+) -> Result<(), String> {
+    writeln!(output, "    mov {destination}, {base}").unwrap();
+    let mut remaining = offset;
+    while remaining != 0 {
+        let chunk = remaining.min(4095);
+        writeln!(output, "    add {destination}, {destination}, #{chunk}").unwrap();
         remaining -= chunk;
     }
     Ok(())

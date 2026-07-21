@@ -487,8 +487,15 @@ appropriate `cset` condition code.
 
 ## Milestone 4: Memory, Arrays, And Global Data
 
-**Status: In progress (2026-07-21).** The native backend now uses explicit
-AArch64 target size/alignment rules for scalar and nested-array frame objects,
+**Status: Completed (2026-07-21).** The native backend uses explicit AArch64
+target size/alignment rules for scalar and nested-array frame objects, fixed
+local allocation, scalar and aggregate memory initialization, global data, and
+dynamic multidimensional GEP. Scalar value slots and local addresses support
+large offsets using `x16` scratch-address formation. QEMU validation passes for
+array/global programs as well as the large-frame cases `74_kmp.sy`,
+`83_long_array.sy`, and `88_many_params2.sy`. The full functional suite now has
+no native assembly or runtime failures; its remaining 16 compile errors are
+the pre-existing `raana_ir` `not implemented` panic.
 
 ### 4.1 Local Allocation, Load, And Store
 

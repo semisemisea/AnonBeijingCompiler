@@ -18,25 +18,25 @@ use crate::{
     Cond, Inst,
 };
 
-/// Lowers the deliberately small integer subset currently represented by
+/// Lowers the deliberately small scalar subset currently represented by
 /// [`Inst`] through VCode and register allocation. The direct lowering path
 /// remains the production backend until this selector covers full SysY HIR.
 pub fn compile_function_vcode(program: &Program, func: HirFunction) -> Result<String, String> {
     let data = program.func_data(func);
     if data.params().len() > 8
-        || data
-            .params()
-            .iter()
-            .any(|param| !data.inst_data(*param).ty().is_i32())
+        || data.params().iter().any(|param| {
+            let ty = data.inst_data(*param).ty();
+            !ty.is_i32() && !ty.is_f32()
+        })
     {
         return Err(format!(
-            "VCode AArch64 lowering for {} supports at most eight i32 register parameters",
+            "VCode AArch64 lowering for {} supports at most eight i32 or f32 register parameters",
             data.name()
         ));
     }
-    if !data.ret_ty().is_i32() {
+    if !data.ret_ty().is_i32() && !data.ret_ty().is_f32() {
         return Err(format!(
-            "VCode AArch64 lowering for {} only supports i32 returns",
+            "VCode AArch64 lowering for {} only supports i32 or f32 returns",
             data.name()
         ));
     }
@@ -172,36 +172,65 @@ impl LowerBackend for IntegerBackend {
                     op => panic!("unsupported VCode AArch64 integer binary operation: {op}"),
                 }
             }
+            InstKind::Binary(binary) if ty.is_f32() && binary.op() == BinaryOp::Add => {
+                let lhs = ctx.value_reg(binary.lhs());
+                let rhs = ctx.value_reg(binary.rhs());
+                let dst = ctx.result_reg(inst);
+                ctx.emit_inst(Inst::FAdd { dst, lhs, rhs });
+            }
             InstKind::Call(call) => {
                 let callee = ctx.program().func_data(call.callee());
-                if (!callee.ret_ty().is_i32() && !callee.ret_ty().is_unit())
+                if (!callee.ret_ty().is_i32()
+                    && !callee.ret_ty().is_f32()
+                    && !callee.ret_ty().is_unit())
                     || call.args().len() > 8
-                    || call
-                        .args()
-                        .iter()
-                        .any(|arg| !ctx.inst_data(*arg).ty().is_i32())
+                    || call.args().iter().any(|arg| {
+                        let ty = ctx.inst_data(*arg).ty();
+                        !ty.is_i32() && !ty.is_f32()
+                    })
                 {
                     panic!(
-                        "VCode AArch64 lowering only supports direct calls with at most eight i32 arguments and an i32 or void result"
+                        "VCode AArch64 lowering only supports direct calls with at most eight i32/f32 arguments and an i32, f32, or void result"
                     );
                 }
+                let mut int_index = 0;
+                let mut float_index = 0;
                 let args = call
                     .args()
                     .iter()
-                    .enumerate()
-                    .map(|(index, arg)| ArgPair {
-                        vreg: ctx.value_reg(*arg),
-                        preg: crate::regs::int_reg(index as u8),
-                        ty: Type::new_i32(),
+                    .map(|arg| {
+                        let ty = ctx.inst_data(*arg).ty();
+                        let ty = if ty.is_f32() {
+                            Type::new_f32()
+                        } else {
+                            Type::new_i32()
+                        };
+                        let preg = if ty.is_f32() {
+                            let preg = crate::regs::float_reg(float_index);
+                            float_index += 1;
+                            preg
+                        } else {
+                            let preg = crate::regs::int_reg(int_index);
+                            int_index += 1;
+                            preg
+                        };
+                        ArgPair {
+                            vreg: ctx.value_reg(*arg),
+                            preg,
+                            ty,
+                        }
                     })
                     .collect();
                 ctx.emit_inst(Inst::Call {
                     symbol: callee.name().to_owned(),
                     args,
-                    result: callee
-                        .ret_ty()
-                        .is_i32()
-                        .then(|| (ctx.result_reg(inst), Type::new_i32())),
+                    result: if callee.ret_ty().is_i32() {
+                        Some((ctx.result_reg(inst), Type::new_i32()))
+                    } else if callee.ret_ty().is_f32() {
+                        Some((ctx.result_reg(inst), Type::new_f32()))
+                    } else {
+                        None
+                    },
                 });
             }
             InstKind::Return(ret) => match ret.value() {
@@ -209,7 +238,11 @@ impl LowerBackend for IntegerBackend {
                     let src = ctx.value_reg(value);
                     ctx.emit_inst(Inst::RetI32 { src });
                 }
-                Some(_) => panic!("VCode AArch64 lowering only supports i32 return values"),
+                Some(value) if ctx.inst_data(value).ty().is_f32() => {
+                    let src = ctx.value_reg(value);
+                    ctx.emit_inst(Inst::RetF32 { src });
+                }
+                Some(_) => panic!("VCode AArch64 lowering only supports i32 or f32 return values"),
                 None => ctx.emit_inst(Inst::Ret),
             },
             kind => panic!("unsupported VCode AArch64 instruction: {kind:?}"),
@@ -743,6 +776,94 @@ mod tests {
         );
         assert!(
             assembly[call..].matches("    add w").count() >= 30,
+            "{assembly}"
+        );
+
+        let mut clang = Command::new("clang")
+            .args([
+                "--target=aarch64-linux-gnu",
+                "-x",
+                "assembler",
+                "-c",
+                "-",
+                "-o",
+                "/dev/null",
+            ])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("clang must be available for AArch64 assembly validation");
+        clang
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(assembly.as_bytes())
+            .unwrap();
+        let output = clang.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "clang rejected generated assembly: {}\n{assembly}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn spills_f32_values_under_cross_call_register_pressure() {
+        let mut program = Program::new();
+        let callee = program.new_function(
+            Type::get_f32(),
+            "addf".into(),
+            vec![Type::get_f32(), Type::get_f32()],
+        );
+        let caller = program.new_function(
+            Type::get_f32(),
+            "main".into(),
+            vec![Type::get_f32(), Type::get_f32()],
+        );
+        let data = program.func_data_mut(caller);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let params = data.params().to_vec();
+        let values = (0..32)
+            .map(|_| {
+                data.new_local_inst()
+                    .binary(BinaryOp::Add, params[0], params[1])
+            })
+            .collect::<Vec<_>>();
+        let call = data.new_local_inst().call_with_type(
+            callee,
+            vec![values[0], values[1]],
+            Type::get_f32(),
+        );
+        let mut sum = call;
+        let mut insts = values.clone();
+        insts.push(call);
+        for value in values.iter().skip(2) {
+            sum = data.new_local_inst().binary(BinaryOp::Add, sum, *value);
+            insts.push(sum);
+        }
+        let ret = data.new_local_inst().ret(Some(sum));
+        insts.push(ret);
+        for inst in insts {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+
+        let assembly = compile_function_vcode(&program, caller).unwrap();
+        let call = assembly
+            .find("    bl addf")
+            .expect("missing f32 direct call");
+        assert!(assembly[..call].contains("fmov s0, s0"), "{assembly}");
+        assert!(assembly[..call].contains("fmov s1, s1"), "{assembly}");
+        assert!(
+            assembly[..call].matches("    str s").count() > 0,
+            "{assembly}"
+        );
+        assert!(
+            assembly[call..].matches("    ldr s").count() > 0,
+            "{assembly}"
+        );
+        assert!(
+            assembly[call..].matches("    fadd s").count() >= 30,
             "{assembly}"
         );
 

@@ -86,7 +86,7 @@ pub fn emit_post_ra_function(
                 taki_mir::reg_alloc::reg::InstPosition::Before,
                 layout.outgoing_args + layout.locals,
             )?;
-            if matches!(inst, Inst::Ret | Inst::RetI32 { .. }) {
+            if matches!(inst, Inst::Ret | Inst::RetI32 { .. } | Inst::RetF32 { .. }) {
                 writeln!(output, "    b .L{name}_epilogue").unwrap();
             } else {
                 emit_post_ra_inst(
@@ -134,6 +134,12 @@ fn format_inst(function: &str, inst: &Inst) -> String {
             if ty.is_f32() { "fmov" } else { "mov" },
             regs::format_reg(*dst, *ty),
             regs::format_reg(*src, *ty)
+        ),
+        Inst::FAdd { dst, lhs, rhs } => format!(
+            "fadd {}, {}, {}",
+            regs::format_reg(*dst, Type::new_f32()),
+            regs::format_reg(*lhs, Type::new_f32()),
+            regs::format_reg(*rhs, Type::new_f32())
         ),
         Inst::Add { dst, lhs, rhs, ty } => format!(
             "add {}, {}, {}",
@@ -225,7 +231,8 @@ fn format_inst(function: &str, inst: &Inst) -> String {
             .iter()
             .map(|arg| {
                 format!(
-                    "mov {}, {}",
+                    "{} {}, {}",
+                    if arg.ty.is_f32() { "fmov" } else { "mov" },
                     regs::format_reg(arg.vreg, arg.ty),
                     regs::format_reg(arg.preg, arg.ty)
                 )
@@ -234,6 +241,7 @@ fn format_inst(function: &str, inst: &Inst) -> String {
             .join("\n    "),
         Inst::Call { symbol, .. } => format!("bl {symbol}"),
         Inst::RetI32 { src } => format!("mov w0, {}", regs::format_reg(*src, Type::new_i32())),
+        Inst::RetF32 { src } => format!("fmov s0, {}", regs::format_reg(*src, Type::new_f32())),
         Inst::Ret => "ret".to_string(),
         Inst::Nop => "nop".to_string(),
     }
@@ -310,6 +318,14 @@ pub fn emit_post_ra_inst(
             expect_alloc_count(inst, allocs, 2)?;
             *src = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
             let (reg, spill) = resolve_def(allocs[1], *ty, 0)?;
+            *dst = reg;
+            spill
+        }
+        Inst::FAdd { dst, lhs, rhs } => {
+            expect_alloc_count(inst, allocs, 3)?;
+            *lhs = resolve_use(output, allocs[0], Type::new_f32(), 0, spill_base)?;
+            *rhs = resolve_use(output, allocs[1], Type::new_f32(), 1, spill_base)?;
+            let (reg, spill) = resolve_def(allocs[2], Type::new_f32(), 0)?;
             *dst = reg;
             spill
         }
@@ -391,6 +407,11 @@ pub fn emit_post_ra_inst(
             *src = resolve_use(output, allocs[0], Type::new_i32(), 0, spill_base)?;
             None
         }
+        Inst::RetF32 { src } => {
+            expect_alloc_count(inst, allocs, 1)?;
+            *src = resolve_use(output, allocs[0], Type::new_f32(), 0, spill_base)?;
+            None
+        }
         Inst::Call { args, result, .. } => {
             expect_alloc_count(inst, allocs, args.len() + usize::from(result.is_some()))?;
             for (arg, allocation) in args.iter().zip(allocs) {
@@ -400,8 +421,15 @@ pub fn emit_post_ra_inst(
             }
             if let Some((_, ty)) = result {
                 let allocation = allocs[args.len()];
-                if allocation.as_reg() != regs::int_reg(0).to_physical_reg() || !ty.is_i32() {
-                    return Err("call result was not assigned to AAPCS64 w0".into());
+                let result_reg = if ty.is_f32() {
+                    regs::float_reg(0)
+                } else {
+                    regs::int_reg(0)
+                };
+                if allocation.as_reg() != result_reg.to_physical_reg() {
+                    return Err(
+                        "call result was not assigned to its AAPCS64 return register".into(),
+                    );
                 }
             }
             None

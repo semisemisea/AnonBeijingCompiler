@@ -43,6 +43,11 @@ pub enum Inst {
         src: Reg,
         ty: Type,
     },
+    FAdd {
+        dst: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
     Add {
         dst: Reg,
         lhs: Reg,
@@ -142,6 +147,10 @@ pub enum Inst {
     RetI32 {
         src: Reg,
     },
+    /// Return an f32 value through the AAPCS64 s0 register.
+    RetF32 {
+        src: Reg,
+    },
     Ret,
     Nop,
 }
@@ -154,6 +163,11 @@ impl MachInst for Inst {
             Self::MovImm { dst, .. } => collector.reg_def(&mut Writable::from_reg(*dst)),
             Self::Mov { dst, src, .. } => {
                 collector.reg_use(src);
+                collector.reg_def(&mut Writable::from_reg(*dst));
+            }
+            Self::FAdd { dst, lhs, rhs } => {
+                collector.reg_use(lhs);
+                collector.reg_use(rhs);
                 collector.reg_def(&mut Writable::from_reg(*dst));
             }
             Self::Add { dst, lhs, rhs, .. } => {
@@ -201,8 +215,13 @@ impl MachInst for Inst {
                 for arg in args {
                     collector.reg_fixed_use(&mut arg.vreg, arg.preg);
                 }
-                if let Some((result, _)) = result {
-                    collector.reg_fixed_def(&mut Writable::from_reg(*result), regs::int_reg(0));
+                if let Some((result, ty)) = result {
+                    let preg = if ty.is_f32() {
+                        regs::float_reg(0)
+                    } else {
+                        regs::int_reg(0)
+                    };
+                    collector.reg_fixed_def(&mut Writable::from_reg(*result), preg);
                 }
                 let mut clobbers = taki_mir::reg_alloc::reg::PRegSet::empty();
                 for index in 0..=18 {
@@ -217,6 +236,7 @@ impl MachInst for Inst {
                 collector.reg_clobbers(clobbers);
             }
             Self::RetI32 { src } => collector.reg_fixed_use(src, regs::int_reg(0)),
+            Self::RetF32 { src } => collector.reg_fixed_use(src, regs::float_reg(0)),
             Self::Jump { .. } | Self::Branch { .. } | Self::Ret | Self::Nop => {}
         }
     }
@@ -230,7 +250,7 @@ impl MachInst for Inst {
 
     fn is_term(&self) -> MachTerminator {
         match self {
-            Self::RetI32 { .. } | Self::Ret => MachTerminator::Return,
+            Self::RetI32 { .. } | Self::RetF32 { .. } | Self::Ret => MachTerminator::Return,
             Self::Jump { .. } | Self::Branch { .. } => MachTerminator::Branch,
             _ => MachTerminator::None,
         }

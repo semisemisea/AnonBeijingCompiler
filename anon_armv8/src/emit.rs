@@ -1,4 +1,4 @@
-use std::fmt::Write;
+use std::{fmt::Write, ops::Range};
 
 use taki_mir::{
     block_order::MirBlockIndex,
@@ -23,6 +23,14 @@ pub struct AsmProgram {
     pub functions: Vec<AsmFunction>,
 }
 
+/// A finalized VCode block paired with the global instruction range used by
+/// register-allocation outputs.
+pub struct PostRaBlock<'a> {
+    pub index: MirBlockIndex,
+    pub inst_range: Range<usize>,
+    pub insts: &'a [Inst],
+}
+
 impl AsmProgram {
     pub fn emit(&self) -> String {
         let mut output = String::new();
@@ -42,6 +50,66 @@ impl AsmProgram {
         }
         output
     }
+}
+
+/// Emits one finalized function from VCode blocks and register-allocation
+/// output. Returns branch to a single epilogue so callee saves are restored.
+pub fn emit_post_ra_function(
+    output: &mut String,
+    name: &str,
+    blocks: &[PostRaBlock<'_>],
+    allocations: &RegAllocOutput,
+    layout: &FrameLayout,
+) -> Result<(), String> {
+    writeln!(output, "    .p2align 2").unwrap();
+    writeln!(output, "    .globl {name}").unwrap();
+    writeln!(output, "    .type {name}, %function").unwrap();
+    writeln!(output, "{name}:").unwrap();
+    emit_post_ra_prologue(output, layout)?;
+
+    for block in blocks {
+        if block.inst_range.len() != block.insts.len() {
+            return Err(format!(
+                "block {} has {} instructions but range {:?}",
+                block.index.raw_u32(),
+                block.insts.len(),
+                block.inst_range
+            ));
+        }
+        writeln!(output, "{}:", label(name, block.index)).unwrap();
+        for (offset, inst) in block.insts.iter().enumerate() {
+            let index = (block.inst_range.start + offset) as u32;
+            emit_edits_at(
+                output,
+                allocations,
+                index,
+                taki_mir::reg_alloc::reg::InstPosition::Before,
+                layout.outgoing_args + layout.locals,
+            )?;
+            if matches!(inst, Inst::Ret) {
+                writeln!(output, "    b .L{name}_epilogue").unwrap();
+            } else {
+                emit_post_ra_inst(
+                    output,
+                    name,
+                    inst,
+                    allocations.inst_allocs(index),
+                    layout.outgoing_args + layout.locals,
+                )?;
+            }
+            emit_edits_at(
+                output,
+                allocations,
+                index,
+                taki_mir::reg_alloc::reg::InstPosition::After,
+                layout.outgoing_args + layout.locals,
+            )?;
+        }
+    }
+    writeln!(output, ".L{name}_epilogue:").unwrap();
+    emit_post_ra_epilogue(output, layout)?;
+    writeln!(output, "    .size {name}, .-{name}").unwrap();
+    Ok(())
 }
 
 fn label(function: &str, block: MirBlockIndex) -> String {
@@ -207,13 +275,13 @@ pub fn emit_post_ra_stream(
 
     for (index, inst) in insts.iter().enumerate() {
         let index = index as u32;
-        for (point, edit) in &allocations.edits {
-            if point.inst() == index
-                && point.pos() == taki_mir::reg_alloc::reg::InstPosition::Before
-            {
-                emit_post_ra_move(output, edit, spill_base)?;
-            }
-        }
+        emit_edits_at(
+            output,
+            allocations,
+            index,
+            taki_mir::reg_alloc::reg::InstPosition::Before,
+            spill_base,
+        )?;
         emit_post_ra_inst(
             output,
             function,
@@ -221,11 +289,27 @@ pub fn emit_post_ra_stream(
             allocations.inst_allocs(index),
             spill_base,
         )?;
-        for (point, edit) in &allocations.edits {
-            if point.inst() == index && point.pos() == taki_mir::reg_alloc::reg::InstPosition::After
-            {
-                emit_post_ra_move(output, edit, spill_base)?;
-            }
+        emit_edits_at(
+            output,
+            allocations,
+            index,
+            taki_mir::reg_alloc::reg::InstPosition::After,
+            spill_base,
+        )?;
+    }
+    Ok(())
+}
+
+fn emit_edits_at(
+    output: &mut String,
+    allocations: &RegAllocOutput,
+    index: u32,
+    position: taki_mir::reg_alloc::reg::InstPosition,
+    spill_base: u32,
+) -> Result<(), String> {
+    for (point, edit) in &allocations.edits {
+        if point.inst() == index && point.pos() == position {
+            emit_post_ra_move(output, edit, spill_base)?;
         }
     }
     Ok(())
@@ -731,6 +815,93 @@ mod tests {
         assert!(
             output.status.success(),
             "clang rejected finalized frame: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn emits_block_labelled_post_ra_function_with_shared_epilogue() {
+        let layout = FrameLayout::new(0, 0, 0, 0);
+        let allocations = RegAllocOutput {
+            num_spillslots: 0,
+            edits: vec![(
+                ProgPoint::before(1),
+                Edit::Move {
+                    from: Allocation::reg(regs::int_preg(0)),
+                    to: Allocation::reg(regs::int_preg(1)),
+                    ty: Type::new_i32(),
+                },
+            )],
+            allocs: vec![
+                Allocation::reg(regs::int_preg(0)),
+                Allocation::reg(regs::int_preg(2)),
+            ],
+            inst_alloc_offsets: vec![0, 1],
+        };
+        let blocks = [
+            PostRaBlock {
+                index: MirBlockIndex::new(0),
+                inst_range: 0..1,
+                insts: &[Inst::CSet {
+                    dst: regs::int_reg(0),
+                    cond: crate::inst::Cond::Eq,
+                }],
+            },
+            PostRaBlock {
+                index: MirBlockIndex::new(1),
+                inst_range: 1..2,
+                insts: &[Inst::Ret],
+            },
+        ];
+        let mut output = String::new();
+        emit_post_ra_function(&mut output, "main", &blocks, &allocations, &layout).unwrap();
+
+        assert_eq!(
+            output,
+            "    .p2align 2\n    .globl main\n    .type main, %function\nmain:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n.Lmain_bb0:\n    cset w0, eq\n.Lmain_bb1:\n    mov w1, w0\n    b .Lmain_epilogue\n.Lmain_epilogue:\n    ldp x29, x30, [sp], #16\n    ret\n    .size main, .-main\n"
+        );
+    }
+
+    #[test]
+    fn clang_accepts_block_labelled_post_ra_function() {
+        let layout = FrameLayout::new(0, 0, 0, 0);
+        let allocations = RegAllocOutput {
+            num_spillslots: 0,
+            edits: vec![],
+            allocs: vec![Allocation::reg(regs::int_preg(0))],
+            inst_alloc_offsets: vec![0],
+        };
+        let blocks = [PostRaBlock {
+            index: MirBlockIndex::new(0),
+            inst_range: 0..1,
+            insts: &[Inst::Ret],
+        }];
+        let mut body = String::from("    .text\n");
+        emit_post_ra_function(&mut body, "main", &blocks, &allocations, &layout).unwrap();
+        let mut clang = Command::new("clang")
+            .args([
+                "--target=aarch64-linux-gnu",
+                "-x",
+                "assembler",
+                "-c",
+                "-",
+                "-o",
+                "/dev/null",
+            ])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("clang must be available for AArch64 assembly validation");
+        clang
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
+        let output = clang.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "clang rejected post-RA function: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }

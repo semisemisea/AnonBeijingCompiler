@@ -654,7 +654,10 @@ The post-RA float scratch pair is `v30`/`v31`, both excluded from allocation, so
 spill rewriting does not clobber AAPCS64 callee-saved `v8..v15` state.
 Finalized VCode now exposes each block's global instruction range, matching the
 index space used by allocator allocations and edit program points for upcoming
-block-labelled function emission.
+block-labelled function emission. The post-RA emitter now has a function-level
+path for constructed VCode blocks: it emits directives, finalized frame state,
+globally indexed edits/allocations, block labels, and a shared epilogue. No HIR
+selector invokes this path yet.
 
 ### 6.1 Post-allocation Instruction Stream
 

@@ -361,13 +361,13 @@ pub fn emit_post_ra_inst(
         Inst::MovImm { dst, .. } => {
             let (reg, spill) = resolve_def(locations.next("destination")?, Type::new_i32(), 0)?;
             *dst = reg;
-            spill
+            spill.into_iter().collect()
         }
         Inst::Mov { dst, src, ty } => {
             *src = resolve_use(output, locations.next("source")?, *ty, 0, spill_base)?;
             let (reg, spill) = resolve_def(locations.next("destination")?, *ty, 0)?;
             *dst = reg;
-            spill
+            spill.into_iter().collect()
         }
         Inst::MovK { dst, src, ty, .. } => {
             *src = resolve_use(output, locations.next("tied input")?, *ty, 0, spill_base)?;
@@ -376,7 +376,7 @@ pub fn emit_post_ra_inst(
             if *src != *dst {
                 return Err("movk tied input and destination received different locations".into());
             }
-            spill
+            spill.into_iter().collect()
         }
         Inst::FAdd { dst, lhs, rhs } => {
             *lhs = resolve_use(
@@ -395,14 +395,14 @@ pub fn emit_post_ra_inst(
             )?;
             let (reg, spill) = resolve_def(locations.next("destination")?, Type::new_f32(), 0)?;
             *dst = reg;
-            spill
+            spill.into_iter().collect()
         }
         Inst::Add { dst, lhs, rhs, ty } => {
             *lhs = resolve_use(output, locations.next("left input")?, *ty, 0, spill_base)?;
             *rhs = resolve_use(output, locations.next("right input")?, *ty, 1, spill_base)?;
             let (reg, spill) = resolve_def(locations.next("destination")?, *ty, 0)?;
             *dst = reg;
-            spill
+            spill.into_iter().collect()
         }
         Inst::Sub { dst, lhs, rhs, ty }
         | Inst::Mul { dst, lhs, rhs, ty }
@@ -417,7 +417,7 @@ pub fn emit_post_ra_inst(
             *rhs = resolve_use(output, locations.next("right input")?, *ty, 1, spill_base)?;
             let (reg, spill) = resolve_def(locations.next("destination")?, *ty, 0)?;
             *dst = reg;
-            spill
+            spill.into_iter().collect()
         }
         Inst::MSub {
             dst,
@@ -449,7 +449,7 @@ pub fn emit_post_ra_inst(
             )?;
             let (reg, spill) = resolve_def(locations.next("destination")?, *ty, 0)?;
             *dst = reg;
-            spill
+            spill.into_iter().collect()
         }
         Inst::Cmp { lhs, rhs, ty } => {
             if ty.is_f32() {
@@ -457,19 +457,19 @@ pub fn emit_post_ra_inst(
             }
             *lhs = resolve_use(output, locations.next("left input")?, *ty, 0, spill_base)?;
             *rhs = resolve_use(output, locations.next("right input")?, *ty, 1, spill_base)?;
-            None
+            vec![]
         }
         Inst::CmpZero { src, ty } => {
             if ty.is_f32() {
                 return Err("f32 comparison requires an FCmp instruction".into());
             }
             *src = resolve_use(output, locations.next("input")?, *ty, 0, spill_base)?;
-            None
+            vec![]
         }
         Inst::CSet { dst, .. } => {
             let (reg, spill) = resolve_def(locations.next("destination")?, Type::new_i32(), 0)?;
             *dst = reg;
-            spill
+            spill.into_iter().collect()
         }
         Inst::Args { args } => {
             for arg in args {
@@ -479,7 +479,7 @@ pub fn emit_post_ra_inst(
                 }
                 arg.vreg = reg;
             }
-            None
+            vec![]
         }
         Inst::RetI32 { src } => {
             *src = resolve_use(
@@ -489,7 +489,7 @@ pub fn emit_post_ra_inst(
                 0,
                 spill_base,
             )?;
-            None
+            vec![]
         }
         Inst::RetF32 { src } => {
             *src = resolve_use(
@@ -499,7 +499,7 @@ pub fn emit_post_ra_inst(
                 0,
                 spill_base,
             )?;
-            None
+            vec![]
         }
         Inst::Call { args, result, .. } => {
             for arg in args {
@@ -521,15 +521,15 @@ pub fn emit_post_ra_inst(
                     );
                 }
             }
-            None
+            vec![]
         }
-        Inst::Jump { .. } | Inst::Branch { .. } | Inst::Ret | Inst::Nop => None,
+        Inst::Jump { .. } | Inst::Branch { .. } | Inst::Ret | Inst::Nop => vec![],
     };
 
     locations.finish(&format!("{inst:?}"))?;
 
     writeln!(output, "    {}", format_inst(function, &rewritten)).unwrap();
-    if let Some((reg, allocation, ty)) = spill_def {
+    for (reg, allocation, ty) in spill_def.into_iter() {
         emit_spill_access(
             output,
             "str",

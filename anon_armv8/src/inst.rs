@@ -71,6 +71,10 @@ pub enum Inst {
         rhs: Reg,
         ty: Type,
     },
+    CmpZero {
+        src: Reg,
+        ty: Type,
+    },
     CSet {
         dst: Reg,
         cond: Cond,
@@ -119,6 +123,7 @@ impl MachInst for Inst {
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
             }
+            Self::CmpZero { src, .. } => collector.reg_use(src),
             Self::CSet { dst, .. } => collector.reg_def(&mut Writable::from_reg(*dst)),
             Self::Call { .. } => {
                 let mut clobbers = taki_mir::reg_alloc::reg::PRegSet::empty();

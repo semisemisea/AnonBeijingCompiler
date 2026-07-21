@@ -660,18 +660,22 @@ globally indexed edits/allocations, block labels, and a shared epilogue. A
 deliberately opt-in HIR selector now drives the complete
 `HIR -> VCode -> RA -> post-RA` path for zero-parameter i32 functions containing
 integer constants, `Add`, `Sub`, `Mul`, signed `Div`, all six signed comparisons,
-and i32 return. Its focused tests construct chained HIR arithmetic expressions and
-individually exercise every comparison condition through real allocation; the
-arithmetic test validates emitted assembly with Clang.
-Selecting HIR blocks in reverse order ensures each consumer records its uses before
-the producer is considered. This integration
+zero-argument `Jump`/nonzero i32 `Branch`, and i32 return. Its focused tests
+construct chained HIR arithmetic expressions, individually exercise every
+comparison condition through real allocation, and validate both arithmetic and a
+four-block control-flow fixture with Clang. Branches select `cmp wN, #0`, `b.ne`
+to the true target, and an unconditional false-edge branch. Selecting HIR blocks
+in reverse order ensures each consumer records its uses before the producer is
+considered. This integration
 exposed and fixed three generic allocator issues: the invalid VReg sentinel was
 unconstructable, register-only operand demand was not decremented after a fresh
 allocation, and reverse liveness retained values after their definitions. The
 selector is not connected to the native driver: function parameters, calls,
-memory, floats, branches, block parameters, and the remaining integer operations
-still require VCode instruction selection and ABI coverage before M6 can be
-completed.
+memory, floats, block parameters, and the remaining integer operations still
+require VCode instruction selection and ABI coverage before M6 can be completed.
+The current control-flow coverage intentionally excludes block-parameter edge
+copies, loop-carried values, and critical-edge cycles; those require a separate
+allocator-edit correctness slice.
 
 ### 6.1 Post-allocation Instruction Stream
 

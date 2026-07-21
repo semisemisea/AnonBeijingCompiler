@@ -164,6 +164,7 @@ fn format_inst(function: &str, inst: &Inst) -> String {
             regs::format_reg(*lhs, *ty),
             regs::format_reg(*rhs, *ty)
         ),
+        Inst::CmpZero { src, ty } => format!("cmp {}, #0", regs::format_reg(*src, *ty)),
         Inst::CSet { dst, cond } => format!(
             "cset {}, {}",
             regs::format_reg(*dst, Type::new_i32()),
@@ -277,6 +278,14 @@ pub fn emit_post_ra_inst(
             }
             *lhs = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
             *rhs = resolve_use(output, allocs[1], *ty, 1, spill_base)?;
+            None
+        }
+        Inst::CmpZero { src, ty } => {
+            expect_alloc_count(inst, allocs, 1)?;
+            if ty.is_f32() {
+                return Err("f32 comparison requires an FCmp instruction".into());
+            }
+            *src = resolve_use(output, allocs[0], *ty, 0, spill_base)?;
             None
         }
         Inst::CSet { dst, .. } => {

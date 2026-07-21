@@ -127,11 +127,32 @@ impl LowerBackend for IntegerBackend {
 
     fn lower_branch(
         &self,
-        _ctx: &mut LowerContext<Inst>,
-        _inst: taki_mir::prelude::HirInst,
-        _target: &[MirBlockIndex],
+        ctx: &mut LowerContext<Inst>,
+        inst: taki_mir::prelude::HirInst,
+        target: &[MirBlockIndex],
     ) {
-        panic!("VCode AArch64 branch lowering is not implemented yet")
+        match ctx.inst_data(inst).kind() {
+            InstKind::Jump(_) => {
+                assert_eq!(target.len(), 1, "jump must have exactly one target");
+                ctx.emit_inst(Inst::Jump { target: target[0] });
+            }
+            InstKind::Branch(branch) => {
+                assert_eq!(target.len(), 2, "branch must have exactly two targets");
+                let cond = ctx.value_reg(branch.cond());
+                ctx.emit_inst(Inst::CmpZero {
+                    src: cond,
+                    ty: Type::new_i32(),
+                });
+                ctx.emit_inst(Inst::Branch {
+                    cond: Cond::Ne,
+                    target: target[0],
+                });
+                ctx.emit_inst(Inst::Jump { target: target[1] });
+            }
+            kind => {
+                panic!("VCode AArch64 branch lowering received non-branch instruction: {kind:?}")
+            }
+        }
     }
 }
 
@@ -239,5 +260,76 @@ mod tests {
             assert!(assembly.contains("cset w"), "{assembly}");
             assert!(assembly.contains(&format!(", {condition}")), "{assembly}");
         }
+    }
+
+    #[test]
+    fn lowers_and_assembles_integer_control_flow() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        let decide = data.new_basic_block().basic_block("decide".into(), vec![]);
+        let on_true = data.new_basic_block().basic_block("true".into(), vec![]);
+        let on_false = data.new_basic_block().basic_block("false".into(), vec![]);
+        for block in [entry, decide, on_true, on_false] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let jump = data.new_local_inst().jump(decide, vec![]);
+        data.layout_mut().insert_inst(entry, jump);
+        let cond = data.new_local_inst().integer(1);
+        let branch = data
+            .new_local_inst()
+            .branch(cond, on_true, vec![], on_false, vec![]);
+        data.layout_mut().insert_inst(decide, branch);
+        let true_value = data.new_local_inst().integer(7);
+        let true_return = data.new_local_inst().ret(Some(true_value));
+        data.layout_mut().insert_inst(on_true, true_return);
+        let false_value = data.new_local_inst().integer(9);
+        let false_return = data.new_local_inst().ret(Some(false_value));
+        data.layout_mut().insert_inst(on_false, false_return);
+
+        let assembly = compile_function_vcode(&program, function).unwrap();
+        let compare = assembly.find("    cmp w").expect("missing compare");
+        let branch = assembly
+            .find("    b.ne .Lmain_bb")
+            .expect("missing conditional branch");
+        let jump = assembly[branch + 1..]
+            .find("    b .Lmain_bb")
+            .map(|offset| branch + 1 + offset)
+            .expect("missing false-edge jump");
+        assert!(compare < branch && branch < jump, "{assembly}");
+        assert!(assembly.contains(", #0"), "{assembly}");
+        assert!(
+            assembly.matches("    b .Lmain_bb").count() >= 2,
+            "{assembly}"
+        );
+
+        let mut clang = Command::new("clang")
+            .args([
+                "--target=aarch64-linux-gnu",
+                "-x",
+                "assembler",
+                "-c",
+                "-",
+                "-o",
+                "/dev/null",
+            ])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("clang must be available for AArch64 assembly validation");
+        clang
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(assembly.as_bytes())
+            .unwrap();
+        let output = clang.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "clang rejected generated assembly: {}\n{assembly}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

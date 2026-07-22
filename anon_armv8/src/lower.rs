@@ -12,7 +12,7 @@ use taki_mir::{
 };
 
 use crate::{
-    instructions::{AluOp, Cond, Imm12, ImmLogic, ImmShift, MInst},
+    instructions::{AluOp, Cond, FpuOp, Imm12, ImmLogic, ImmShift, MInst},
     labels::Label,
     regs::{self, Gpr, OperandSize},
 };
@@ -38,6 +38,18 @@ impl LowerBackend for AArch64Backend {
             InstKind::Binary(binary) => {
                 let lhs = ctx.put_value_in_reg(binary.lhs());
                 let dst = Writable::from_reg(ctx.reg_map[&inst]);
+                if matches!(
+                    ctx.arena.inst_data(binary.lhs()).ty().kind(),
+                    TypeKind::Float32
+                ) {
+                    ctx.emit(MInst::FAlu {
+                        op: float_alu_op(binary.op()),
+                        dst,
+                        lhs,
+                        rhs: ctx.put_value_in_reg(binary.rhs()),
+                    });
+                    return;
+                }
                 let size = operand_size(ctx.arena.inst_data(binary.lhs()).ty().kind());
                 let rhs_imm = integer_constant(ctx, binary.rhs());
 
@@ -156,6 +168,20 @@ impl LowerBackend for AArch64Backend {
                     }
                 }
             }
+            InstKind::Cast(cast) => {
+                let src = cast.src();
+                let src_ty = ctx.arena.inst_data(src).ty().kind().clone();
+                let dst_ty = ctx.arena.inst_data(inst).ty().kind().clone();
+                let dst = Writable::from_reg(ctx.reg_map[&inst]);
+                let src = ctx.put_value_in_reg(src);
+                match (src_ty, dst_ty) {
+                    (TypeKind::Int32, TypeKind::Float32) => ctx.emit(MInst::Scvtf { dst, src }),
+                    (TypeKind::Float32, TypeKind::Int32) => ctx.emit(MInst::Fcvtzs { dst, src }),
+                    (src_ty, dst_ty) => {
+                        unreachable!("unsupported AArch64 cast: {src_ty:?} -> {dst_ty:?}")
+                    }
+                }
+            }
             InstKind::Return(ret) => {
                 if let Some(value) = ret.value() {
                     let src = ctx.put_value_in_reg(value);
@@ -163,6 +189,7 @@ impl LowerBackend for AArch64Backend {
                         TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => {
                             regs::INT_RETURN_REG
                         }
+                        TypeKind::Float32 => regs::FLOAT_RETURN_REG,
                         ty => unreachable!("unsupported AArch64 return type: {ty:?}"),
                     };
                     ctx.emit(MInst::RetVal {
@@ -328,6 +355,16 @@ fn alu_op(op: BinaryOp) -> AluOp {
         BinaryOp::Shr => AluOp::Lsr,
         BinaryOp::Sar => AluOp::Asr,
         _ => unreachable!("binary operation has no direct AArch64 ALU form"),
+    }
+}
+
+fn float_alu_op(op: BinaryOp) -> FpuOp {
+    match op {
+        BinaryOp::Add => FpuOp::Add,
+        BinaryOp::Sub => FpuOp::Sub,
+        BinaryOp::Mul => FpuOp::Mul,
+        BinaryOp::Div => FpuOp::Div,
+        _ => unreachable!("unsupported AArch64 floating binary operation: {op:?}"),
     }
 }
 

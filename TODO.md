@@ -17,9 +17,6 @@
 - [ ] Add generic MIR CFG tests for diamonds, loops, break/continue, critical
   edges, loop-carried block parameters, and true/false edges with distinct
   arguments.
-- [ ] Add generic parallel-copy tests for register-to-register,
-  register-to-spill, spill-to-register, and spill-to-spill cycles using ABI
-  move/spill hooks.
 - [ ] Add VCode verification tests for CFG metadata, terminators, edge argument
   counts/classes, target instruction verification failures, and allocation
   write-back.

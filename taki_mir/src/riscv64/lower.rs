@@ -1,4 +1,4 @@
-use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind as HirTypeKind, arena::Arena};
+use raana_ir::ir::{arena::Arena, BinaryOp, InstKind, Type as HirType, TypeKind as HirTypeKind};
 use smallvec::smallvec;
 
 use crate::{
@@ -12,7 +12,7 @@ use crate::{
         abi::DEFAULT_CLOBBERS,
         instructions::{AMode, AluRRImm12OP, AluRRROP, FpuRRROP, Imm12, LoadOP, MInst, StoreOP},
         labels::Label,
-        regs::{ARG_REG, FARG_REG, a0, fa0, fp_reg, preg_name, stack_reg, zero_reg},
+        regs::{a0, fa0, fp_reg, preg_name, stack_reg, zero_reg, ARG_REG, FARG_REG},
     },
     types::LoweredType,
 };
@@ -598,9 +598,21 @@ impl LowerBackend for Riscv64Backend {
                 ctx.vcode.vcode.abi.set_has_calls();
                 ctx.vcode.vcode.abi.set_outgoing_arg_size(outgoing_arg_size);
             }
-            raana_ir::ir::InstKind::Return(..)
-            | raana_ir::ir::InstKind::Jump(..)
-            | raana_ir::ir::InstKind::Branch(..) => {
+            raana_ir::ir::InstKind::Return(ret) => {
+                if let Some(val) = ret.value() {
+                    let preg = match ctx.arena.inst_data(val).ty().kind() {
+                        raana_ir::ir::TypeKind::Int32 | raana_ir::ir::TypeKind::Pointer(_) => a0(),
+                        raana_ir::ir::TypeKind::Float32 => fa0(),
+                        ty => unreachable!("unexpected return type: {ty:?}"),
+                    };
+                    let src = ctx.put_value_in_reg(val);
+                    ctx.emit(MInst::RetVal {
+                        pair: RetPair { vreg: src, preg },
+                    });
+                }
+                ctx.emit(MInst::Ret);
+            }
+            raana_ir::ir::InstKind::Jump(..) | raana_ir::ir::InstKind::Branch(..) => {
                 unreachable!("should not lower branch instruction in here.")
             }
         }
@@ -618,21 +630,6 @@ impl LowerBackend for Riscv64Backend {
             .func_data(ctx.arena.curr_func.unwrap())
             .inst_data(inst);
         match inst_data.kind() {
-            raana_ir::ir::InstKind::Return(ret) => {
-                let val = ret.value();
-                if let Some(val) = val {
-                    let preg = match ctx.arena.inst_data(val).ty().kind() {
-                        raana_ir::ir::TypeKind::Int32 | raana_ir::ir::TypeKind::Pointer(_) => a0(),
-                        raana_ir::ir::TypeKind::Float32 => fa0(),
-                        ty => unreachable!("unexpected return type: {ty:?}"),
-                    };
-                    let src = ctx.put_value_in_reg(val);
-                    ctx.emit(MInst::RetVal {
-                        pair: RetPair { vreg: src, preg },
-                    });
-                }
-                ctx.emit(MInst::Ret);
-            }
             raana_ir::ir::InstKind::Jump(jump) => {
                 let args = jump.args();
                 for &arg in args {

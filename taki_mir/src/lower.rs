@@ -1,6 +1,6 @@
 use log::{debug, trace};
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::{SmallVec, smallvec};
+use smallvec::{smallvec, SmallVec};
 
 use crate::abi::{ABIMachineSpec, CalleeABI};
 use crate::block_order::{BlockLoweringOrder, LoweredBlock, MirBlockIndex};
@@ -346,14 +346,6 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 {
                     self.lower_branch::<B>(branch_inst, block_index, &targets_buffer)?;
                     self.finish_ir_inst();
-                } else {
-                    let succs = self.vcode.block_order().succ_indices(block_index).1;
-                    let &[succ] = succs else {
-                        unreachable!("non-branch block must have exactly one successor")
-                    };
-                    B::emit_long_jump(&mut self, succ);
-                    self.finish_ir_inst();
-                    self.lower_branch_blockparam_args_move(block_index);
                 }
             } else {
                 let &[succ] = self.vcode.block_order().succ_indices(block_index).1 else {
@@ -362,6 +354,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 B::emit_long_jump(&mut self, succ);
                 self.finish_ir_inst();
                 self.lower_branch_blockparam_args_move(block_index);
+                self.finish_ir_inst();
             }
 
             if let Some(bb) = lb.orig_block() {
@@ -642,7 +635,9 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 self.cur_color = Some(color);
             }
 
-            if self.arena.is_terminator(inst) {
+            // Branches are selected before the reverse block walk. Returns
+            // have no CFG successors and are lowered as ordinary root instructions.
+            if self.arena.is_branch(inst) {
                 continue;
             }
 

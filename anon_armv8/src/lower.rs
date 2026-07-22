@@ -1,6 +1,6 @@
 //! AArch64 selection from Raana HIR into generic VCode.
 
-use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind, arena::Arena};
+use raana_ir::ir::{arena::Arena, BinaryOp, InstKind, Type as HirType, TypeKind};
 use taki_mir::{
     abi::{CallArgPair, CallRetPair, RetPair},
     block_order::{LoweredBlock, MirBlockIndex},
@@ -558,7 +558,6 @@ impl LowerBackend for AArch64Backend {
     ) -> Result<(), CodegenError> {
         let kind = ctx.arena.inst_data(inst).kind().clone();
         match kind {
-            InstKind::Return(..) => return Self::lower(ctx, inst),
             InstKind::Jump(jump) => {
                 for &arg in jump.args() {
                     ctx.put_value_in_reg(arg);

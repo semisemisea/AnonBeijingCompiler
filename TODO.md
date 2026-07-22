@@ -48,13 +48,13 @@
   and consumer.
 - [x] Preserve generic edge-block ownership of block-parameter parallel copies
   and defer branch inversion/fallthrough elimination until layout is known.
-- [ ] Lower f32 constants through an assembler-valid constant-pool or
-  relocatable-load scheme.
+- [x] Lower f32 constants by materializing exact IEEE-754 bits through the
+  typed i32 constant planner and transferring them with AArch64 `fmov`.
 - [x] Lower f32 add, sub, mul, and div.
 - [x] Lower ordered f32 comparisons and truthiness with correct NaN behavior.
 - [x] Lower `scvtf` and `fcvtzs` casts.
-- [ ] Reject f32 remainder with an instruction-specific diagnostic unless an
-  explicit runtime `fmodf` strategy is implemented.
+- [x] Reject f32 remainder during frontend semantic lowering; f32 `rem` HIR
+  is not an accepted backend input.
 - [x] Lower direct calls, mixed integer/float arguments, overflow stack
   arguments, and integer/pointer/f32 results.
 - [x] Keep indirect calls unsupported; Raana HIR calls carry direct function

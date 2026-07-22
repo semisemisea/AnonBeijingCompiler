@@ -1,7 +1,7 @@
 //! The order of traversing basic blocks uses RPO of the dominance tree.
 use std::ops::Range;
 
-use raana_ir::opt::prelude::{IDAllocator, cfg, dom_tree};
+use raana_ir::opt::prelude::{cfg, dom_tree, IDAllocator};
 use rustc_hash::FxHashMap;
 
 pub type MirBlockIndex = crate::reg_alloc::index::Block;
@@ -253,7 +253,7 @@ fn outgoing_block_args(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raana_ir::ir::{Program, arena::Arena};
+    use raana_ir::ir::{arena::Arena, Program};
     use raana_ir::opt::prelude::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder};
 
     fn add_block(data: &mut HirFunctionData, name: &str, params: Vec<HirType>) -> HirBasicBlock {
@@ -317,6 +317,27 @@ mod tests {
                 succ_idx: 1,
             }
         );
+    }
+
+    #[test]
+    fn keeps_return_out_of_branch_metadata() {
+        let mut program = Program::new();
+        let func = program.new_function(HirType::get_i32(), "returning".to_owned(), vec![]);
+        let entry = {
+            let data = program.func_data_mut(func);
+            let entry = add_block(data, "entry", vec![]);
+            let value = data.new_local_inst().integer(42);
+            let ret = data.new_local_inst().ret(Some(value));
+            data.layout_mut().insert_inst(entry, ret);
+            entry
+        };
+
+        let order = order_for(&program, func);
+        let entry_index = order.lowered_index_for_block(entry).unwrap();
+        let (branch, successors) = order.succ_indices(entry_index);
+
+        assert_eq!(branch, None, "return is not a CFG branch");
+        assert!(successors.is_empty(), "return has no CFG successors");
     }
 
     #[test]

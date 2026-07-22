@@ -62,7 +62,7 @@ fn run() -> Result<(), String> {
         None
     };
     let asm = if needs_asm {
-        Some(dump_asm(&program, args.target, args.asm_backend)?)
+        Some(dump_asm(&program, args.target)?)
     } else {
         None
     };
@@ -105,14 +105,10 @@ fn dump_llvm(program: &raana_ir::ir::Program) -> String {
 fn dump_asm(
     program: &raana_ir::ir::Program,
     target: cli::Target,
-    backend: cli::AsmBackend,
 ) -> Result<String, String> {
     match target {
         cli::Target::Riscv64 => Ok(taki_mir::compile::<Riscv64Backend>(program)),
-        cli::Target::Aarch64 => match backend {
-            cli::AsmBackend::Direct => anon_armv8::compile_program_to_asm(program),
-            cli::AsmBackend::Vcode => anon_armv8::compile_program_vcode(program),
-        },
+        cli::Target::Aarch64 => Err("AArch64 backend replacement is in progress".to_string()),
     }
 }
 

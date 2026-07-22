@@ -4,9 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-log = "0.4.29"
-num_enum = "0.7.6"
 raana_ir = { path = "../raana_ir/" }
 taki_mir = { path = "../taki_mir/" }
-smallvec = { path = "../dependencies/rust-smallvec/" }
-rustc-hash = { path = "../dependencies/rustc-hash/" }

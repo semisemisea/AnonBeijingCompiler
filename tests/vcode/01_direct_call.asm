@@ -1,2 +1,0 @@
-bl value
-add w

@@ -31,8 +31,6 @@ pub(crate) struct Arg {
         default_value_t = Target::Riscv64
     )]
     pub(crate) target: Target,
-    #[arg(long, value_enum, default_value_t = AsmBackend::Direct)]
-    pub(crate) asm_backend: AsmBackend,
 }
 
 #[derive(Debug, clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
@@ -41,11 +39,4 @@ pub enum EmitOption {
     Ir,
     Llvm,
     Asm,
-}
-
-#[derive(Debug, clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
-#[clap(rename_all = "lower")]
-pub(crate) enum AsmBackend {
-    Direct,
-    Vcode,
 }

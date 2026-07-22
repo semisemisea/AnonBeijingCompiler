@@ -1,7 +1,0 @@
-int value() {
-    return 40;
-}
-
-int main() {
-    return value() + 2;
-}

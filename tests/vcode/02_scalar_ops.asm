@@ -1,2 +1,0 @@
-sdiv w
-msub w

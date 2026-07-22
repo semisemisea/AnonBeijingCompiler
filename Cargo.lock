@@ -15,11 +15,7 @@ dependencies = [
 name = "anon_armv8"
 version = "0.1.0"
 dependencies = [
- "log",
- "num_enum",
  "raana_ir",
- "rustc-hash",
- "smallvec 1.15.1",
  "taki_mir",
 ]
 

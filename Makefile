@@ -20,11 +20,6 @@ TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
 $(eval $(TEST_ARGS):;@:)
 endif
 
-ifeq ($(firstword $(MAKECMDGOALS)),test-vcode)
-TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
-$(eval $(TEST_ARGS):;@:)
-endif
-
 ifeq ($(firstword $(MAKECMDGOALS)),run-elf)
 RUN_ELF := $(word 2,$(MAKECMDGOALS))
 RUN_ELF_PATH := $(abspath $(RUN_ELF))
@@ -68,7 +63,7 @@ endif
 HOST_TARGET_DIR := $(CURDIR)/target/host-musl
 COMPILER := /work/target/$(MUSL_TARGET)/release/soyo_compiler
 
-.PHONY: test test-llvm test-riscv test-vcode test-vcode-m0-msub test-vcode-m1-manual test-vcode-diagnostic run-elf run-elf-riscv debug-elf debug-elf-riscv test-image test-compiler build-lib build-lib-riscv clean-results
+.PHONY: test test-llvm test-riscv run-elf run-elf-riscv debug-elf debug-elf-riscv test-image test-compiler build-lib build-lib-riscv clean-results
 
 test: test-compiler build-lib .docker-image
 	mkdir -p "$(RESULTS)"
@@ -109,71 +104,6 @@ test-riscv: test-compiler build-lib-riscv .docker-image
 		-v "$(CURDIR)/sysylib:/work/sysylib:ro" \
 		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
 		"$(IMAGE)" --target riscv64 $(ARGS) $(TESTS) $(TEST_ARGS)
-
-# The VCode driver is opt-in. Production `make test` remains direct by default.
-test-vcode: test-compiler build-lib .docker-image
-	mkdir -p "$(RESULTS)"
-	@cleanup() { $(DOCKER) rm -f "$(CONTAINER)" >/dev/null 2>&1 || true; }; \
-	trap cleanup EXIT INT TERM; \
-	cleanup; \
-	$(DOCKER) run -t --name "$(CONTAINER)" --network none \
-		-e SOYO_COMPILER="$(COMPILER)" \
-		-v "$(HOST_TARGET_DIR):/work/target:ro" \
-		-v "$(CURDIR)/tests:/work/tests:ro" \
-		-v "$(CURDIR)/sysylib:/work/sysylib:ro" \
-		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
-		"$(IMAGE)" --asm-backend vcode $(ARGS) $(TESTS) $(TEST_ARGS)
-
-# Executes the M0 three-spill post-RA MSub contract without changing the
-# production driver or claiming that current SysY lowering can create it.
-test-vcode-m0-msub: .docker-image
-	mkdir -p "$(RESULTS)"
-	cargo run -p anon_armv8 --quiet --bin vcode_msub_spills > "$(RESULTS)/vcode_msub_spills.s"
-	$(DOCKER) run --rm --network none \
-		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
-		-v "$(CURDIR)/tests/vcode_msub_spills_start.s:/work/start.s:ro" \
-		--entrypoint /bin/sh \
-		"$(IMAGE)" -c 'aarch64-linux-gnu-gcc -nostdlib -static -o /work/results/vcode_msub_spills.elf /work/start.s /work/results/vcode_msub_spills.s'
-	$(DOCKER) run --rm -t --network none \
-		-v "$(CURDIR)/$(RESULTS)/vcode_msub_spills.elf:/work/program.elf:ro" \
-		--entrypoint qemu-aarch64-static \
-		"$(IMAGE)" /work/program.elf
-
-# Exercises f32 call pressure and block parameters that M1's current SysY
-# frontend cannot represent without M4 memory lowering.
-test-vcode-m1-manual: .docker-image
-	mkdir -p "$(RESULTS)"
-	cargo run -p anon_armv8 --quiet --bin vcode_m1_manual > "$(RESULTS)/vcode_m1_manual.s"
-	@for pattern in 'fadd s' 'bl addf' 'str s' 'ldr s' 'bl addi' 'str w' 'ldr w' 'b .L'; do \
-		grep -F -q "$$pattern" "$(RESULTS)/vcode_m1_manual.s" || { \
-			printf 'missing VCode assembly shape: %s\n' "$$pattern" >&2; exit 1; \
-		}; \
-	done
-	$(DOCKER) run --rm --network none \
-		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
-		-v "$(CURDIR)/tests/vcode_m1_manual_start.s:/work/start.s:ro" \
-		--entrypoint /bin/sh \
-		"$(IMAGE)" -c 'aarch64-linux-gnu-gcc -nostdlib -static -o /work/results/vcode_m1_manual.elf /work/start.s /work/results/vcode_m1_manual.s'
-	$(DOCKER) run --rm -t --network none \
-		-v "$(CURDIR)/$(RESULTS)/vcode_m1_manual.elf:/work/program.elf:ro" \
-		--entrypoint qemu-aarch64-static \
-		"$(IMAGE)" /work/program.elf
-
-# Verifies an unsupported source construct returns the VCode capability error
-# through the real CLI instead of panicking or selecting the direct backend.
-test-vcode-diagnostic:
-	mkdir -p "$(RESULTS)"
-	@set -e; \
-	if cargo run -p soyo_compiler --quiet -- -S --asm-backend vcode -o "$(RESULTS)/unsupported_local.s" tests/vcode/unsupported_local.sy > "$(RESULTS)/unsupported_local.stdout" 2> "$(RESULTS)/unsupported_local.stderr"; then \
-		printf 'unsupported VCode source unexpectedly compiled\n' >&2; exit 1; \
-	fi; \
-	grep -F -q 'VCode AArch64 lowering for main does not support *i32 values' "$(RESULTS)/unsupported_local.stderr"; \
-	if grep -F -q 'panicked at' "$(RESULTS)/unsupported_local.stderr"; then \
-		printf 'unsupported VCode source panicked\n' >&2; exit 1; \
-	fi; \
-	if [ -e "$(RESULTS)/unsupported_local.s" ]; then \
-		printf 'unsupported VCode source emitted assembly\n' >&2; exit 1; \
-	fi
 
 run-elf: .docker-image
 	@if [ -z "$(RUN_ELF)" ]; then \

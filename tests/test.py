@@ -158,7 +158,7 @@ def copy_testcase_files(src, out_dir):
             shutil.copy2(path, dst_base.with_suffix(path.suffix))
 
 
-def run_test(src, out_dir, opt_level, compiler, backend, target, asm_backend):
+def run_test(src, out_dir, opt_level, compiler, backend, target):
     start = time.perf_counter()
     src_rel = rel_test(src)
     arch_config = TARGET_CONFIG[target]
@@ -189,8 +189,6 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, asm_backend):
             "-S",
             "--target",
             target,
-            "--asm-backend",
-            asm_backend,
             "-o",
             str(compile_artifact),
             str(src),
@@ -226,27 +224,6 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, asm_backend):
             " CE ",
             f"exit {compile_proc.returncode}\n{output or '(no output)'}",
         )
-    if backend == "asm" and asm_backend == "vcode":
-        artifact = compile_artifact.read_text()
-        if '    .ident "soyo-vcode"' not in artifact:
-            return (
-                time.perf_counter() - start,
-                " CE ",
-                "VCode assembly marker missing; direct backend fallback is forbidden",
-            )
-        shape_path = base.with_suffix(".asm")
-        if shape_path.exists():
-            missing = [
-                line
-                for line in shape_path.read_text().splitlines()
-                if line and line not in artifact
-            ]
-            if missing:
-                return (
-                    time.perf_counter() - start,
-                    " CE ",
-                    f"VCode assembly missing required shapes: {', '.join(missing)}",
-                )
 
     ir_args = [str(compiler)]
     if opt_level:
@@ -418,12 +395,6 @@ def parse_args(argv):
         help="target architecture (default: aarch64)",
     )
     parser.add_argument(
-        "--asm-backend",
-        choices=["direct", "vcode"],
-        default="direct",
-        help="assembly lowering backend when --backend=asm (default: direct)",
-    )
-    parser.add_argument(
         "--compiler",
         type=Path,
         default=DEFAULT_COMPILER,
@@ -532,7 +503,6 @@ def run_tests(args):
                 compiler,
                 args.backend,
                 args.target,
-                args.asm_backend,
             ): src
             for src in files
         }

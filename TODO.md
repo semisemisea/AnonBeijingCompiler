@@ -46,6 +46,18 @@ Completed on 2026-07-22.
 - Left AArch64 assembly generation unavailable until the generic replacement is
   introduced; there is no fallback backend.
 
+### Phase 2 Complete: Registers And Labels
+
+Completed on 2026-07-22.
+
+- Added `anon_armv8::regs` with AArch64 physical register units, AAPCS64
+  argument/return registers, allocator and post-RA scratch policy, callee-save
+  classification, call clobbers, physical names, and `MachineEnv`.
+- Kept SP/ZR as explicit `Gpr` variants rather than allocator registers, and
+  reserved FP/LR plus all scratch registers from allocation.
+- Added `anon_armv8::labels::Label` to emit MIR block, HIR function, and HIR
+  global references through the shared `EmitContext`.
+
 ## Scope And Constraints
 
 ### In Scope

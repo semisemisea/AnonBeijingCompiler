@@ -76,6 +76,10 @@ soyo_compiler -S --target aarch64 -o testcase.s testcase.sy [-O 1]
 `-O 1` enables the intended optimization path. The compiler accepts one input
 file and requires `-o`.
 
+Unsupported backend HIR is reported as a concise code-generation error with
+function, block where available, instruction, type, phase, and legality
+context. Internal compiler invariants remain fail-fast errors.
+
 ## Build from source
 
 To be announced

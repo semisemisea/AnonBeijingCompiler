@@ -1,173 +1,91 @@
 # AArch64 Backend TODO
 
-## Current State
+## Scope And Invariants
 
-- [x] Remove the legacy direct backend, old VCode driver, custom post-RA
-  emitter, fallback CLI path, and legacy-only tests.
-- [x] Add the AArch64 register model, labels, typed MInst forms, constant
-  planner, AAPCS64 ABI hooks, GNU assembly emission, and generic VCode traits.
-- [x] Add the first `AArch64Backend` selector slice for scalar integer/pointer
-  arithmetic, comparisons, returns, jumps, and two-edge control flow.
-- [x] Dispatch AArch64 assembly exclusively through
-  `taki_mir::compile::<anon_armv8::AArch64Backend>(program)`.
-
-## Architecture Constraints
-
-- [ ] Keep the sole AArch64 pipeline as SysY -> Raana HIR -> generic VCode ->
+- [ ] Preserve the sole AArch64 pipeline: SysY -> Raana HIR -> generic VCode ->
   register allocation -> AAPCS64 frame finalization -> GNU AArch64 assembly.
-- [ ] Keep target-specific production code limited to `anon_armv8/src/{abi,
-  constants,instructions,labels,lower,regs}.rs` and module exports in `lib.rs`.
-- [ ] Do not restore a direct backend, custom allocation driver, post-RA
-  emitter, private frame layout, compatibility wrapper, fallback backend, or
+- [ ] Keep target-specific production code in `anon_armv8/src/{abi,constants,
+  instructions,labels,lower,regs}.rs` and module exports in `lib.rs`.
+- [ ] Do not restore a direct backend, custom allocation driver, post-RA emitter,
+  private frame layout, compatibility wrapper, fallback backend, or
   `--asm-backend` flag.
-- [ ] Use only public `LowerContext` APIs in selector code: `arena`, `reg_map`,
-  `put_value_in_reg`, `alloc_tmp`, `emit`, and `vcode`.
-- [ ] Keep SP and ZR explicit special operands; do not expose them as
-  allocatable registers.
-- [ ] Do not run focused or workspace tests until all implementation phases and
-  the replacement test suite are complete. Static inspection, `rustfmt`, and
-  `git diff --check` are permitted during implementation.
+- [ ] Keep selector code on public `LowerContext` APIs and preserve explicit,
+  non-allocatable SP and ZR operands.
 
-## Selector
+## Correctness Test Suite
 
-- [x] Audit and correct scalar integer/pointer lowering instruction order for
-  reverse VCode construction, including remainder's `sdiv` + `msub` sequence,
-  compare-plus-`cset`, and return-value setup.
-- [x] Lower i32 and pointer constants through the shared constant planner with
-  correct 32-bit and 64-bit widths.
-- [x] Select add/sub immediates, including negated-immediate conversion.
-- [x] Select logical immediates and immediate shifts when legal.
-- [x] Select zero-register forms, shifted-register arithmetic, and
-  extended-register address arithmetic when legal.
-- [x] Add safe `madd` and `msub` fusion only when the multiply result has no
-  independent use.
-- [x] Introduce selector-level conditions for zero/nonzero, NZCV flags, and
-  proven one-bit tests.
-- [x] Select direct compare-to-branch, `cbz`/`cbnz`, and proven `tbz`/`tbnz`
-  patterns without inserting a flags-clobbering instruction between producer
-  and consumer.
-- [x] Preserve generic edge-block ownership of block-parameter parallel copies
-  and defer branch inversion/fallthrough elimination until layout is known.
-- [x] Lower f32 constants by materializing exact IEEE-754 bits through the
-  typed i32 constant planner and transferring them with AArch64 `fmov`.
-- [x] Lower f32 add, sub, mul, and div.
-- [x] Lower ordered f32 comparisons and truthiness with correct NaN behavior.
-- [x] Lower `scvtf` and `fcvtzs` casts.
-- [x] Reject f32 remainder during frontend semantic lowering; f32 `rem` HIR
-  is not an accepted backend input.
-- [x] Lower direct calls, mixed integer/float arguments, overflow stack
-  arguments, and integer/pointer/f32 results.
-- [x] Keep indirect calls unsupported; Raana HIR calls carry direct function
-  handles only.
-
-## Memory And Data
-
-- [x] Lower `Alloc` into generic fixed frame-object requests with target size
-  and alignment for i32, f32, pointers, strings, arrays, and nested arrays.
-- [x] Lower typed i32, pointer/i64, and f32 loads/stores for locals, GEPs,
-  globals, incoming arguments, outgoing arguments, and spill slots.
-- [x] Select direct unsigned-scaled and signed-unscaled offsets before register,
-  scaled-register, extended-register, or late scratch-address forms.
-- [x] Keep program-memory selection distinct from generic ABI spill-memory
-  hooks.
-- [x] Audit GEP semantics against `raana_ir/src/llvm/writer.rs`.
-- [x] Lower folded constant GEP offsets, dynamic i32 indices, widened indices,
-  power-of-two scaled indexing, non-power-of-two multiply-add indexing, and
-  nested array indexing.
-- [x] Materialize global addresses with `adrp` plus `:lo12:`.
-- [x] Lower scalar and nested aggregate global initialization through generic
-  global emission.
-- [x] Lower local aggregate and zero initialization completely before optional
-  store-pair, memset, or loop-fill optimization.
-
-## ABI, Frames, And Late Legalization
-
-- [x] Verify AAPCS64 argument and return behavior for independent x0..x7 and
-  v0..v7 windows, eight-byte overflow slots, unit values, and declarations
-  without bodies.
-- [x] Reserve the maximum outgoing overflow-argument area once per frame;
-  calls must not dynamically adjust SP.
-- [x] Preserve 16-byte SP alignment at every ABI boundary.
-- [x] Save and restore only allocated x19..x28 registers in deterministic
-  order; keep v8..v15 unallocatable until their low-64-bit save/restore is
-  implemented.
-- [x] Add late legalization for large stack adjustments, frame offsets, spill
-  offsets, stack-to-stack edits, and symbolic locations not directly encodable
-  by AArch64.
-- [x] Restrict late-legalization temporaries to
-  `MachineEnv.post_ra_scratch_by_class`; never allocate vregs or untracked
-  stack slots during legalization.
-- [x] Use pair save/restore only for legal adjacent registers and locations.
-
-## CFG And Allocation
-
-- [ ] Validate diamonds, loops, break/continue, critical edges, loop-carried
-  block parameters, and true/false edges with different arguments.
-- [ ] Validate register-to-register, register-to-spill, spill-to-register, and
-  spill-to-spill parallel-copy cycles using generic ABI move/spill hooks.
-- [x] Support i32, pointer, and f32 block-parameter transfers with correct
-  register classes and memory widths.
-- [ ] Remove unconditional jumps only when the successor is physically next and
-  its edge has no required work.
-
-## Diagnostics And Documentation
-
-- [ ] Replace selector `unreachable!` paths for unsupported user HIR with
-  concise code-generation errors containing function, block where available,
-  HIR instruction, source/target type, phase, and legality reason.
-- [x] Add debug observability for HIR functions, block order, selected MInst,
-  verification failures, operand constraints, allocations, allocator edits,
-  frame layout, legalized MInst, and final assembly.
-- [x] Update `anon_armv8/README.md`, root `README.md`, `AGENTS.md`, CLI help,
-  and Makefile documentation for the single AArch64 backend and its AAPCS64
-  policy.
-
-## Performance
-
-- [ ] Build measurement infrastructure separating compiler time, IR dumping,
-  assembly/linking, QEMU startup, and application runtime.
-- [ ] Parse SysY `TOTAL` timing into structured samples and report median,
-  geometric mean, code size, instruction mix, and confidence intervals.
-- [ ] Apply optimizations only after semantic implementation and validation:
-  address folding, immediates, direct compare-to-branch, safe fallthrough,
-  shifted/extended ALU operands, `madd`/`msub`, safe pairs, `tbz`/`tbnz`, and
-  finally `csel`.
-- [ ] Use QEMU for semantic and gross instruction-count checks only; require
-  native AArch64 measurements for microarchitectural performance claims.
-
-## Tests And Final Validation
-
-- [ ] Add MInst tests for operands, fixed ABI constraints, reuse constraints,
-  clobbers, metadata, verification failures, allocation write-back, GNU
-  formatting, and immediate/address boundary cases.
-- [ ] Add ABI and allocation tests for 0/1/8/9 integer and float arguments,
+- [ ] Add generic MIR CFG tests for diamonds, loops, break/continue, critical
+  edges, loop-carried block parameters, and true/false edges with distinct
+  arguments.
+- [ ] Add generic parallel-copy tests for register-to-register,
+  register-to-spill, spill-to-register, and spill-to-spill cycles using ABI
+  move/spill hooks.
+- [ ] Add VCode verification tests for CFG metadata, terminators, edge argument
+  counts/classes, target instruction verification failures, and allocation
+  write-back.
+- [ ] Add AArch64 MInst tests for operands, fixed ABI constraints, reuse
+  constraints, clobbers, metadata, GNU formatting, and immediate/address
+  boundary cases.
+- [ ] Add AArch64 ABI/allocation tests for 0/1/8/9 integer and float arguments,
   mixed signatures, returns, nested calls, recursion, live-across-call values,
   frame variants, spills, large offsets, stack-to-stack moves, and alignment.
-- [ ] Add selector, memory, and CFG tests for immediate/fused arithmetic,
-  signed division/remainder/shifts, f32 behavior and NaNs, locals, arrays,
-  globals, aggregates, GEPs, edge copies, and unsupported diagnostics.
-- [ ] Run `cargo fmt --check`.
-- [ ] Run `cargo test -p taki_mir`.
-- [ ] Run `cargo test -p anon_armv8`.
-- [ ] Run `cargo test --workspace`.
-- [ ] Run `cargo build -p soyo_compiler`.
-- [ ] Run `make test`.
-- [ ] Run `make test ARGS="-O 1"`.
-- [ ] Run `make test-llvm`.
-- [ ] Run `git diff --check`.
+- [ ] Add selector, memory, and CFG tests for immediate/fused arithmetic, signed
+  division/remainder/shifts, f32 behavior and NaNs, locals, arrays, globals,
+  aggregates, GEPs, edge copies, and unsupported diagnostics.
+- [ ] Add integration fixtures for critical edges, distinct edge arguments,
+  loop-carried values, forced spill cycles, large frames, and mixed overflow
+  integer/float argument windows.
+
+## Correctness Validation
+
+- [ ] Run `cargo fmt --check` and `git diff --check` after the replacement test
+  suite is complete.
+- [ ] Run focused new MIR and AArch64 unit tests, then `cargo test -p taki_mir`
+  and `cargo test -p anon_armv8`.
+- [ ] Run `cargo test --workspace` and `cargo build -p soyo_compiler`.
+- [ ] Run focused AArch64 end-to-end cases for remainder, float/NaN behavior,
+  calls, register pressure, loops, arrays, globals, and CFG edges.
+- [ ] Run `make test`, `make test ARGS="-O 1"`, and `make test-llvm`.
 - [ ] Run focused Clang assembly acceptance, AArch64 static-linking, QEMU,
   LLVM-differential, diagnostic, and debug-output checks.
 
-## Completion Criteria
+## Performance Measurement
 
-- [ ] Every currently accepted SysY HIR construct lowers through typed AArch64
-  VCode.
-- [ ] AAPCS64 integer, pointer, f32, stack-argument, caller-save, callee-save,
-  and frame behavior is implemented.
-- [ ] Globals, arrays, aggregates, dynamic GEPs, recursion, and edge-specific
-  CFG transfers are implemented.
-- [ ] All final unit, workspace, Clang, QEMU, LLVM, diagnostic, formatting, and
-  performance validation requirements pass.
+- [ ] Build measurement infrastructure that separates compiler/frontend time,
+  optimization, lowering/allocation/emission, optional IR dumping,
+  assembly/object generation, linking, QEMU startup, and application runtime.
+- [ ] Parse SysY `TOTAL` timing into structured repeated samples and report
+  median, geometric mean, confidence intervals, code size, and instruction mix.
+- [ ] Freeze reproducible `-O0` and `-O1` baselines only after correctness
+  validation passes.
+- [ ] Use QEMU only for semantic and gross instruction-count checks; require
+  native AArch64 measurements for microarchitectural performance claims.
+
+## Performance Optimizations
+
+- [ ] Remove an unconditional jump only when its successor is physically next
+  and no edge block, allocator edit, or block-parameter work is bypassed.
+- [ ] Measure and audit existing address folding, immediate forms, direct
+  compare-to-branch, shifted/extended operands, `madd`/`msub`, safe pairs, and
+  `tbz`/`tbnz`; retain changes only with demonstrated benefit.
+- [ ] Add `csel` only for measured profitable, side-effect-free patterns after
+  branch and register-pressure behavior is proven.
+- [ ] Re-run affected unit and end-to-end correctness tests after every retained
+  optimization.
+
+## Final Validation And Completion
+
+- [ ] Re-run formatting, crate, workspace, build, AArch64 `-O0`, AArch64 `-O1`,
+  LLVM, Clang, static-linking, QEMU, differential, diagnostic, and debug-output
+  validation after optimization.
+- [ ] Confirm every currently accepted SysY HIR construct lowers through typed
+  AArch64 VCode.
+- [ ] Confirm AAPCS64 integer, pointer, f32, stack-argument, caller-save,
+  callee-save, and frame behavior is covered by passing tests.
+- [ ] Confirm globals, arrays, aggregates, dynamic GEPs, recursion, and
+  edge-specific CFG transfers are covered by passing tests.
+- [ ] Publish final native AArch64 performance results with reproducible
+  measurement metadata and benchmark-level regressions identified.
 
 ## Deferred After Completion
 

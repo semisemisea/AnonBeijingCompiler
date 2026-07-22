@@ -44,3 +44,11 @@ soyo_compiler -S --target aarch64 -o testcase.s testcase.sy
 
 The emitted assembly uses GNU AArch64 syntax and is intended for the AArch64
 test harness and cross-linker described in the workspace `AGENTS.md`.
+
+## Diagnostics
+
+Unsupported user HIR is reported as a code-generation error rather than a
+selector panic. The diagnostic identifies the lowering phase, function, source
+block when available, HIR instruction, relevant source/target types, and the
+unsupported legality reason. Internal VCode, allocator, and target-encoding
+invariants remain fail-fast errors because they indicate compiler defects.

@@ -105,7 +105,7 @@ fn lower_global_init(program: &HirProgram, init: HirInst) -> Vec<GlobalData> {
     }
 }
 
-pub fn compile<B: LowerBackend>(p: &HirProgram) -> String
+pub fn compile<B: LowerBackend>(p: &HirProgram) -> Result<String, crate::lower::CodegenError>
 where
     B::MInst: MachInstEmit,
 {
@@ -157,8 +157,8 @@ where
         };
         let lower_order = BlockLoweringOrder::new(arena);
         let abi = CalleeABI::new(arena);
-        let lower = LowerContext::new(p, func, abi, lower_order);
-        let mut vcode = lower.lower::<B>();
+        let lower = LowerContext::new(p, func, abi, lower_order)?;
+        let mut vcode = lower.lower::<B>()?;
         vcode.verify("post-lowering").unwrap_or_else(|error| {
             log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
             panic!("function={} {error}", func_data.name());
@@ -195,5 +195,5 @@ where
         log::debug!(target: "taki_mir::emit", "function={} final assembly: bytes={}, lines={}\n{}", func_data.name(), asm.len(), asm.lines().count(), asm);
     }
 
-    buf
+    Ok(buf)
 }

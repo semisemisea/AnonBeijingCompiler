@@ -1,10 +1,10 @@
 //! AArch64 selection from Raana HIR into generic VCode.
 
-use raana_ir::ir::{arena::Arena, BinaryOp, InstKind, Type as HirType, TypeKind};
+use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind, arena::Arena};
 use taki_mir::{
     abi::{CallArgPair, CallRetPair, RetPair},
     block_order::{LoweredBlock, MirBlockIndex},
-    lower::{LowerBackend, LowerContext},
+    lower::{CodegenError, LowerBackend, LowerContext},
     prelude::HirFunctionData,
     reg_alloc::reg::PReg,
     register::Writable,
@@ -24,7 +24,10 @@ pub struct AArch64Backend;
 impl LowerBackend for AArch64Backend {
     type MInst = MInst;
 
-    fn lower(ctx: &mut LowerContext<Self::MInst>, inst: raana_ir::opt::prelude::Inst) {
+    fn lower(
+        ctx: &mut LowerContext<Self::MInst>,
+        inst: raana_ir::opt::prelude::Inst,
+    ) -> Result<(), CodegenError> {
         let kind = ctx.arena.inst_data(inst).kind().clone();
         match kind {
             InstKind::BlockArgRef(..)
@@ -65,9 +68,16 @@ impl LowerBackend for AArch64Backend {
                                 dst,
                             });
                         }
-                        op => unreachable!("unsupported AArch64 floating binary operation: {op:?}"),
+                        op => {
+                            return Err(ctx.unsupported(
+                                "AArch64 instruction selection",
+                                format!("floating binary operation {op:?} is unsupported"),
+                                Some(ctx.arena.inst_data(binary.lhs()).ty()),
+                                Some(ctx.arena.inst_data(inst).ty()),
+                            ));
+                        }
                     }
-                    return;
+                    return Ok(());
                 }
                 let size = operand_size(ctx.arena.inst_data(binary.lhs()).ty().kind());
                 if let Some((op, lhs, rhs, addend)) =
@@ -90,7 +100,7 @@ impl LowerBackend for AArch64Backend {
                         }),
                         _ => unreachable!("multiply-accumulate folding only selects add or sub"),
                     }
-                    return;
+                    return Ok(());
                 }
                 let lhs = ctx.put_value_in_reg(binary.lhs());
                 let rhs_imm = integer_constant(ctx, binary.rhs());
@@ -284,12 +294,21 @@ impl LowerBackend for AArch64Backend {
                 let src_ty = ctx.arena.inst_data(src).ty().kind().clone();
                 let dst_ty = ctx.arena.inst_data(inst).ty().kind().clone();
                 let dst = Writable::from_reg(ctx.reg_map[&inst]);
-                let src = ctx.put_value_in_reg(src);
+                let src_reg = ctx.put_value_in_reg(src);
                 match (src_ty, dst_ty) {
-                    (TypeKind::Int32, TypeKind::Float32) => ctx.emit(MInst::Scvtf { dst, src }),
-                    (TypeKind::Float32, TypeKind::Int32) => ctx.emit(MInst::Fcvtzs { dst, src }),
+                    (TypeKind::Int32, TypeKind::Float32) => {
+                        ctx.emit(MInst::Scvtf { dst, src: src_reg })
+                    }
+                    (TypeKind::Float32, TypeKind::Int32) => {
+                        ctx.emit(MInst::Fcvtzs { dst, src: src_reg })
+                    }
                     (src_ty, dst_ty) => {
-                        unreachable!("unsupported AArch64 cast: {src_ty:?} -> {dst_ty:?}")
+                        return Err(ctx.unsupported(
+                            "AArch64 instruction selection",
+                            "cast is unsupported",
+                            Some(ctx.arena.inst_data(src).ty()),
+                            Some(ctx.arena.inst_data(inst).ty()),
+                        ));
                     }
                 }
             }
@@ -436,7 +455,14 @@ impl LowerBackend for AArch64Backend {
                                 stack_offset += 8;
                             }
                         }
-                        ty => unreachable!("unsupported AArch64 call argument type: {ty:?}"),
+                        ty => {
+                            return Err(ctx.unsupported(
+                                "AArch64 instruction selection",
+                                format!("call argument type {ty:?} is unsupported"),
+                                Some(ctx.arena.inst_data(arg).ty()),
+                                None,
+                            ));
+                        }
                     }
                 }
                 let ret = match ctx.arena.inst_data(inst).ty().kind() {
@@ -451,7 +477,14 @@ impl LowerBackend for AArch64Backend {
                         vreg: Writable::from_reg(ctx.reg_map[&inst]),
                         preg: regs::FLOAT_RETURN_REG,
                     }),
-                    ty => unreachable!("unsupported AArch64 call return type: {ty:?}"),
+                    ty => {
+                        return Err(ctx.unsupported(
+                            "AArch64 instruction selection",
+                            format!("call return type {ty:?} is unsupported"),
+                            None,
+                            Some(ctx.arena.inst_data(inst).ty()),
+                        ));
+                    }
                 };
                 ctx.emit(MInst::Call {
                     args,
@@ -473,7 +506,14 @@ impl LowerBackend for AArch64Backend {
                             regs::INT_RETURN_REG
                         }
                         TypeKind::Float32 => regs::FLOAT_RETURN_REG,
-                        ty => unreachable!("unsupported AArch64 return type: {ty:?}"),
+                        ty => {
+                            return Err(ctx.unsupported(
+                                "AArch64 instruction selection",
+                                format!("return type {ty:?} is unsupported"),
+                                Some(ctx.arena.inst_data(value).ty()),
+                                None,
+                            ));
+                        }
                     };
                     ctx.emit(MInst::RetVal {
                         pair: RetPair { vreg: src, preg },
@@ -484,18 +524,26 @@ impl LowerBackend for AArch64Backend {
             InstKind::Jump(..) | InstKind::Branch(..) => {
                 unreachable!("terminators are lowered by LowerBackend::lower_branch")
             }
-            kind => unreachable!("AArch64 lowering is not implemented for {kind:?}"),
+            kind => {
+                return Err(ctx.unsupported(
+                    "AArch64 instruction selection",
+                    format!("HIR instruction {kind:?} is unsupported"),
+                    None,
+                    Some(ctx.arena.inst_data(inst).ty()),
+                ));
+            }
         }
+        Ok(())
     }
 
     fn lower_branch(
         ctx: &mut LowerContext<Self::MInst>,
         inst: raana_ir::opt::prelude::Inst,
         target: &[MirBlockIndex],
-    ) {
+    ) -> Result<(), CodegenError> {
         let kind = ctx.arena.inst_data(inst).kind().clone();
         match kind {
-            InstKind::Return(..) => Self::lower(ctx, inst),
+            InstKind::Return(..) => return Self::lower(ctx, inst),
             InstKind::Jump(jump) => {
                 for &arg in jump.args() {
                     ctx.put_value_in_reg(arg);
@@ -513,7 +561,7 @@ impl LowerBackend for AArch64Backend {
                     unreachable!("branch must have two lowered successors");
                 };
                 if select_branch_condition(ctx, inst, branch.cond(), true_target, false_target) {
-                    return;
+                    return Ok(());
                 }
 
                 let cond = ctx.put_value_in_reg(branch.cond());
@@ -528,8 +576,16 @@ impl LowerBackend for AArch64Backend {
                     false_label: Label::from_block(false_target),
                 });
             }
-            _ => unreachable!("non-terminator passed to AArch64 branch lowering"),
+            kind => {
+                return Err(ctx.unsupported(
+                    "AArch64 branch selection",
+                    format!("non-terminator HIR instruction {kind:?} cannot select a branch"),
+                    None,
+                    Some(ctx.arena.inst_data(inst).ty()),
+                ));
+            }
         }
+        Ok(())
     }
 
     fn data_section_directive() -> &'static str {

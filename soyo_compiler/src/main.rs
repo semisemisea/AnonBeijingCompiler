@@ -115,8 +115,12 @@ fn dump_llvm(program: &raana_ir::ir::Program) -> String {
 
 fn dump_asm(program: &raana_ir::ir::Program, target: cli::Target) -> Result<String, String> {
     match target {
-        cli::Target::Riscv64 => Ok(taki_mir::compile::<Riscv64Backend>(program)),
-        cli::Target::Aarch64 => Ok(taki_mir::compile::<AArch64Backend>(program)),
+        cli::Target::Riscv64 => {
+            taki_mir::compile::<Riscv64Backend>(program).map_err(|error| error.to_string())
+        }
+        cli::Target::Aarch64 => {
+            taki_mir::compile::<AArch64Backend>(program).map_err(|error| error.to_string())
+        }
     }
 }
 

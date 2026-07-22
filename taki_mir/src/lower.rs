@@ -12,6 +12,62 @@ use crate::types::{F32, I32};
 use crate::vcode::{VCodeBuilder, VCodeContainer, VCodeInst};
 use raana_ir::ir::TypeKind as HirTypeKind;
 
+#[derive(Debug)]
+pub struct CodegenError {
+    function: String,
+    block: Option<String>,
+    instruction: String,
+    source_type: Option<String>,
+    target_type: Option<String>,
+    phase: &'static str,
+    reason: String,
+}
+
+impl core::fmt::Display for CodegenError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "code generation failed in {} for function `{}`",
+            self.phase, self.function
+        )?;
+        if let Some(block) = &self.block {
+            write!(f, ", block `{block}`")?;
+        }
+        write!(f, ": {}", self.reason)?;
+        write!(f, " (HIR instruction {})", self.instruction)?;
+        if let Some(source_type) = &self.source_type {
+            write!(f, ", source type {source_type}")?;
+        }
+        if let Some(target_type) = &self.target_type {
+            write!(f, ", target type {target_type}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CodegenError {}
+
+impl CodegenError {
+    fn unsupported(
+        arena: ArenaContext<'_>,
+        inst: HirInst,
+        phase: &'static str,
+        reason: impl Into<String>,
+        source_type: Option<&HirType>,
+        target_type: Option<&HirType>,
+    ) -> Self {
+        Self {
+            function: arena.f().name().to_owned(),
+            block: None,
+            instruction: format!("{inst:?}"),
+            source_type: source_type.map(|ty| format!("{ty:?}")),
+            target_type: target_type.map(|ty| format!("{ty:?}")),
+            phase,
+            reason: reason.into(),
+        }
+    }
+}
+
 pub enum ValueUseCount {
     Unused = 0,
     Once = 1,
@@ -37,6 +93,9 @@ pub struct LowerContext<'prog, I: VCodeInst> {
 
     /// Current HirInstruction about to lower
     cur_inst: Option<HirInst>,
+
+    /// Current source block, when lowering a source-backed VCode block.
+    cur_block: Option<HirBasicBlock>,
 
     /// Record the sunk inst.
     /// A dynamically changing map
@@ -84,9 +143,13 @@ pub struct LowerContext<'prog, I: VCodeInst> {
 pub trait LowerBackend {
     type MInst: VCodeInst;
 
-    fn lower(ctx: &mut LowerContext<Self::MInst>, inst: HirInst);
+    fn lower(ctx: &mut LowerContext<Self::MInst>, inst: HirInst) -> Result<(), CodegenError>;
 
-    fn lower_branch(ctx: &mut LowerContext<Self::MInst>, inst: HirInst, target: &[MirBlockIndex]);
+    fn lower_branch(
+        ctx: &mut LowerContext<Self::MInst>,
+        inst: HirInst,
+        target: &[MirBlockIndex],
+    ) -> Result<(), CodegenError>;
 
     fn data_section_directive() -> &'static str;
 
@@ -112,13 +175,13 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         func: HirFunction,
         abi: CalleeABI<I::ABISpec>,
         block_order: BlockLoweringOrder,
-    ) -> LowerContext<'prog, I> {
+    ) -> Result<LowerContext<'prog, I>, CodegenError> {
         let arena = ArenaContext {
             program,
             curr_func: Some(func),
         };
         let mut abi = abi;
-        abi.set_outgoing_arg_size(Self::precompute_outgoing_arg_size(arena));
+        abi.set_outgoing_arg_size(Self::precompute_outgoing_arg_size(arena)?);
         let vcode = VCodeBuilder::new(abi, block_order);
         let mut vregs_alloc = VRegAllocator::with_capaticy(0);
         let mut reg_map = FxHashMap::default();
@@ -199,22 +262,23 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             bb_end_color.insert(bb_layout.bb(), acc_color);
         }
 
-        LowerContext {
+        Ok(LowerContext {
             arena,
             vcode,
             vregs_alloc,
             reg_map,
             cur_inst: None,
+            cur_block: None,
             inst_sunk: FxHashSet::default(),
             inst_color,
             cur_color: None,
             bb_end_color,
             value_lowered_use: FxHashMap::default(),
             ir_inst: Vec::new(),
-        }
+        })
     }
 
-    fn precompute_outgoing_arg_size(arena: ArenaContext<'_>) -> usize {
+    fn precompute_outgoing_arg_size(arena: ArenaContext<'_>) -> Result<usize, CodegenError> {
         let mut max_size = 0usize;
         for bb_layout in arena.f().layout().basicblocks() {
             for &inst in bb_layout.insts() {
@@ -241,17 +305,26 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                                 outgoing_size += ty.size();
                             }
                         }
-                        _ => unreachable!("unexpected call argument type: {:?}", ty.kind()),
+                        kind => {
+                            return Err(CodegenError::unsupported(
+                                arena,
+                                inst,
+                                "outgoing argument sizing",
+                                format!("call argument type {kind:?} is unsupported"),
+                                Some(ty),
+                                None,
+                            ));
+                        }
                     }
                 }
                 max_size = max_size.max(outgoing_size);
             }
         }
-        max_size
+        Ok(max_size)
     }
 
     /// Lower the function.
-    pub fn lower<B: LowerBackend<MInst = I>>(mut self) -> VCodeContainer<I> {
+    pub fn lower<B: LowerBackend<MInst = I>>(mut self) -> Result<VCodeContainer<I>, CodegenError> {
         let mut targets_buffer = smallvec![];
         let lowered_order: SmallVec<[LoweredBlock; 64]> = self
             .vcode
@@ -266,11 +339,12 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             let block_index = MirBlockIndex::new(block_index);
             debug!(target: "taki_mir::lower", "function={} lowering block={} descriptor={lb:?}", self.arena.f().name(), block_index.index());
 
-            if let Some(_bb) = lb.orig_block() {
+            if let Some(bb) = lb.orig_block() {
+                self.cur_block = Some(bb);
                 if let Some(branch_inst) =
                     self.collect_branch_and_targets(block_index, &mut targets_buffer)
                 {
-                    self.lower_branch::<B>(branch_inst, block_index, &targets_buffer);
+                    self.lower_branch::<B>(branch_inst, block_index, &targets_buffer)?;
                     self.finish_ir_inst();
                 } else {
                     let succs = self.vcode.block_order().succ_indices(block_index).1;
@@ -291,7 +365,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             }
 
             if let Some(bb) = lb.orig_block() {
-                self.lower_block::<B>(bb);
+                self.lower_block::<B>(bb)?;
                 self.process_block_param(bb);
             }
 
@@ -302,12 +376,13 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             }
 
             self.finish_bb();
+            self.cur_block = None;
         }
 
         let vcode = self.vcode.build(self.vregs_alloc);
         debug!(target: "taki_mir::lower", "function={} finalized VCode: blocks={}, instructions={}", self.arena.f().name(), vcode.num_blocks(), vcode.num_insts());
 
-        vcode
+        Ok(vcode)
     }
 
     fn gen_arg_setup(&mut self) {
@@ -368,15 +443,16 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         branch: HirInst,
         block: MirBlockIndex,
         target: &[MirBlockIndex],
-    ) {
+    ) -> Result<(), CodegenError> {
         trace!("to lower the branch: {:?}, block: {:?}", branch, block);
         self.cur_inst = Some(branch);
 
-        B::lower_branch(self, branch, target);
+        B::lower_branch(self, branch, target)?;
 
         self.finish_ir_inst();
 
         self.lower_branch_blockparam_args_move(block);
+        Ok(())
     }
 
     /// Lower the move of basicblock parameter.
@@ -538,7 +614,11 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         (succ, &buffer[..])
     }
 
-    fn lower_block<B: LowerBackend<MInst = I>>(&mut self, block: HirBasicBlock) {
+    fn lower_block<B: LowerBackend<MInst = I>>(
+        &mut self,
+        block: HirBasicBlock,
+    ) -> Result<(), CodegenError> {
+        self.cur_block = Some(block);
         self.cur_color = Some(self.bb_end_color[&block]);
         for &inst in self
             .arena
@@ -578,13 +658,15 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             );
 
             if side_effect || value_needed {
-                B::lower(self, inst);
+                B::lower(self, inst)?;
             }
 
             self.finish_ir_inst();
 
             self.cur_color = None;
         }
+        self.cur_block = None;
+        Ok(())
     }
 
     fn is_inst_sunk(&self, inst: HirInst) -> bool {
@@ -710,6 +792,28 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     pub fn emit(&mut self, mach_inst: I) {
         trace!(target: "taki_mir::lower", "function={} HIR inst={:?} selected MInst={mach_inst:?}", self.arena.f().name(), self.cur_inst);
         self.ir_inst.push(mach_inst);
+    }
+
+    pub fn unsupported(
+        &self,
+        phase: &'static str,
+        reason: impl Into<String>,
+        source_type: Option<&HirType>,
+        target_type: Option<&HirType>,
+    ) -> CodegenError {
+        let mut error = CodegenError::unsupported(
+            self.arena,
+            self.cur_inst
+                .expect("unsupported diagnostics require a current HIR instruction"),
+            phase,
+            reason,
+            source_type,
+            target_type,
+        );
+        error.block = self
+            .cur_block
+            .map(|block| self.arena.f().bb_data(block).name().to_owned());
+        error
     }
 
     fn finish_bb(&mut self) {

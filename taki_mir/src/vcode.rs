@@ -219,7 +219,7 @@ impl<I: VCodeInst> VCodeContainer<I> {
             log::trace!(
                 target: "taki_mir::verify",
                 "stage={stage} inst={inst_index} operands={:?} instruction={inst:?} clobbers={:?}",
-                self.operands[self.operands_range.get(inst_index)],
+                &self.operands[self.operands_range.get(inst_index)],
                 self.clobbers.get(&(inst_index as u32))
             );
         }

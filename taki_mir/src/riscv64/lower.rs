@@ -1,10 +1,10 @@
-use raana_ir::ir::{arena::Arena, BinaryOp, InstKind, Type as HirType, TypeKind as HirTypeKind};
+use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind as HirTypeKind, arena::Arena};
 use smallvec::smallvec;
 
 use crate::{
     abi::{ArgPair, CallArgPair, CallRetPair, RetPair},
     block_order::LoweredBlock,
-    lower::{LowerBackend, LowerContext},
+    lower::{CodegenError, LowerBackend, LowerContext},
     prelude::HirFunctionData,
     reg_alloc::reg::PReg,
     register::Writable,
@@ -12,7 +12,7 @@ use crate::{
         abi::DEFAULT_CLOBBERS,
         instructions::{AMode, AluRRImm12OP, AluRRROP, FpuRRROP, Imm12, LoadOP, MInst, StoreOP},
         labels::Label,
-        regs::{a0, fa0, fp_reg, preg_name, stack_reg, zero_reg, ARG_REG, FARG_REG},
+        regs::{ARG_REG, FARG_REG, a0, fa0, fp_reg, preg_name, stack_reg, zero_reg},
     },
     types::LoweredType,
 };
@@ -77,7 +77,7 @@ impl LowerBackend for Riscv64Backend {
     fn lower(
         ctx: &mut crate::lower::LowerContext<Self::MInst>,
         inst: raana_ir::opt::prelude::Inst,
-    ) {
+    ) -> Result<(), CodegenError> {
         let func_data = ctx.arena.program.func_data(ctx.arena.curr_func.unwrap());
         let inst_data = func_data.inst_data(inst);
         match inst_data.kind() {
@@ -604,13 +604,14 @@ impl LowerBackend for Riscv64Backend {
                 unreachable!("should not lower branch instruction in here.")
             }
         }
+        Ok(())
     }
 
     fn lower_branch(
         ctx: &mut crate::lower::LowerContext<Self::MInst>,
         inst: raana_ir::opt::prelude::Inst,
         target: &[crate::block_order::MirBlockIndex],
-    ) {
+    ) -> Result<(), CodegenError> {
         let inst_data = ctx
             .arena
             .program
@@ -671,6 +672,7 @@ impl LowerBackend for Riscv64Backend {
             }
             _ => unreachable!("should not lower non-branch isntruction in here."),
         }
+        Ok(())
     }
 
     fn data_section_directive() -> &'static str {

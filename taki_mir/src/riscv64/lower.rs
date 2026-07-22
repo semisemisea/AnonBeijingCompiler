@@ -697,10 +697,11 @@ impl LowerBackend for Riscv64Backend {
     }
 
     fn format_block_label(lb: &LoweredBlock, func_data: &HirFunctionData) -> String {
+        let function = func_data.name().replace('%', "_");
         match lb {
             LoweredBlock::Orig { block } => {
                 let bb_name = func_data.bb_data(*block).name().replace('%', "_");
-                format!(".L_{}", bb_name)
+                format!(".L_{function}_{bb_name}")
             }
             LoweredBlock::Edge {
                 pred,
@@ -709,7 +710,7 @@ impl LowerBackend for Riscv64Backend {
             } => {
                 let p = func_data.bb_data(*pred).name().replace('%', "_");
                 let s = func_data.bb_data(*succ).name().replace('%', "_");
-                format!(".L_{}_to_{}_edge_{}", p, s, succ_idx)
+                format!(".L_{function}_{p}_to_{s}_edge_{succ_idx}")
             }
         }
     }

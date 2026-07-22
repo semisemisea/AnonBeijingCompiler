@@ -627,16 +627,20 @@ impl LowerBackend for AArch64Backend {
     }
 
     fn format_block_label(lb: &LoweredBlock, func_data: &HirFunctionData) -> String {
+        let function = func_data.name().replace('%', "_");
         match lb {
             LoweredBlock::Orig { block } => {
-                format!(".L_{}", func_data.bb_data(*block).name().replace('%', "_"))
+                format!(
+                    ".L_{function}_{}",
+                    func_data.bb_data(*block).name().replace('%', "_")
+                )
             }
             LoweredBlock::Edge {
                 pred,
                 succ,
                 succ_idx,
             } => format!(
-                ".L_{}_to_{}_edge_{}",
+                ".L_{function}_{}_to_{}_edge_{}",
                 func_data.bb_data(*pred).name().replace('%', "_"),
                 func_data.bb_data(*succ).name().replace('%', "_"),
                 succ_idx

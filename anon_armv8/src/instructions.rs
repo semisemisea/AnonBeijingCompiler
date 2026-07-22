@@ -4,7 +4,7 @@ use taki_mir::{
     abi::{ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
     reg_alloc::reg::{OperandVisitor, OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
-    types::{F32, I32, I64, LoweredType},
+    types::{LoweredType, F32, I32, I64},
     vcode::{CallType, EmitContext, MachInst, MachInstEmit, MachTerminator},
 };
 
@@ -1086,15 +1086,17 @@ impl MachInstEmit for MInst {
                     ctx,
                     "{} ",
                     if matches!(self, Self::Cbz { .. }) {
-                        "cbz"
-                    } else {
                         "cbnz"
+                    } else {
+                        "cbz"
                     }
                 )?;
                 emit_reg(ctx, *reg, *size)?;
-                write!(ctx, ", ")?;
+                // Conditional branches have shorter reach than `b`; skip the
+                // first long jump locally, then use long jumps for both arms.
+                write!(ctx, ", 1f\n    b ")?;
                 true_label.emit(ctx)?;
-                write!(ctx, "\n    b ")?;
+                write!(ctx, "\n1:\n    b ")?;
                 false_label.emit(ctx)
             }
             Self::Tbz {
@@ -1115,15 +1117,15 @@ impl MachInstEmit for MInst {
                     ctx,
                     "{} ",
                     if matches!(self, Self::Tbz { .. }) {
-                        "tbz"
-                    } else {
                         "tbnz"
+                    } else {
+                        "tbz"
                     }
                 )?;
                 emit_reg(ctx, *reg, *size)?;
-                write!(ctx, ", #{bit}, ")?;
+                write!(ctx, ", #{bit}, 1f\n    b ")?;
                 true_label.emit(ctx)?;
-                write!(ctx, "\n    b ")?;
+                write!(ctx, "\n1:\n    b ")?;
                 false_label.emit(ctx)
             }
             Self::CondBr {
@@ -1131,9 +1133,9 @@ impl MachInstEmit for MInst {
                 true_label,
                 false_label,
             } => {
-                write!(ctx, "b.{} ", cond_name(*cond))?;
+                write!(ctx, "b.{} 1f\n    b ", cond_name(invert_cond(*cond)))?;
                 true_label.emit(ctx)?;
-                write!(ctx, "\n    b ")?;
+                write!(ctx, "\n1:\n    b ")?;
                 false_label.emit(ctx)
             }
             Self::Jump { label } => {
@@ -1633,6 +1635,25 @@ fn cond_name(cond: Cond) -> &'static str {
         Cond::Lt => "lt",
         Cond::Gt => "gt",
         Cond::Le => "le",
+    }
+}
+
+fn invert_cond(cond: Cond) -> Cond {
+    match cond {
+        Cond::Eq => Cond::Ne,
+        Cond::Ne => Cond::Eq,
+        Cond::Hs => Cond::Lo,
+        Cond::Lo => Cond::Hs,
+        Cond::Mi => Cond::Pl,
+        Cond::Pl => Cond::Mi,
+        Cond::Vs => Cond::Vc,
+        Cond::Vc => Cond::Vs,
+        Cond::Hi => Cond::Ls,
+        Cond::Ls => Cond::Hi,
+        Cond::Ge => Cond::Lt,
+        Cond::Lt => Cond::Ge,
+        Cond::Gt => Cond::Le,
+        Cond::Le => Cond::Gt,
     }
 }
 fn fpu_name(op: FpuOp) -> &'static str {

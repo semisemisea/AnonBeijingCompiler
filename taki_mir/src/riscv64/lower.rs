@@ -1,4 +1,4 @@
-use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind as HirTypeKind, arena::Arena};
+use raana_ir::ir::{arena::Arena, BinaryOp, InstKind, Type as HirType, TypeKind as HirTypeKind};
 use smallvec::smallvec;
 
 use crate::{
@@ -12,7 +12,7 @@ use crate::{
         abi::DEFAULT_CLOBBERS,
         instructions::{AMode, AluRRImm12OP, AluRRROP, FpuRRROP, Imm12, LoadOP, MInst, StoreOP},
         labels::Label,
-        regs::{ARG_REG, FARG_REG, a0, fa0, fp_reg, preg_name, stack_reg, zero_reg},
+        regs::{a0, fa0, fp_reg, preg_name, stack_reg, zero_reg, ARG_REG, FARG_REG},
     },
     types::LoweredType,
 };
@@ -26,10 +26,10 @@ fn normalize_amode(amode: &AMode, ctx: &mut LowerContext<'_, MInst>) -> AMode {
     if (-2048..2048).contains(&off) {
         return amode.clone();
     }
-    let tmp_off = ctx.alloc_tmp(HirType::get_i32());
+    let tmp_off = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
     ctx.emit(MInst::LoadImm {
         rd: Writable::from_reg(tmp_off),
-        imm: off as i32,
+        value: off as u64,
     });
     let tmp_addr = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
     ctx.emit(MInst::AluRRR {
@@ -315,7 +315,7 @@ impl LowerBackend for Riscv64Backend {
                 let rd = Writable::from_reg(def);
                 let pointee_ty = inst_data.ty().derefernce();
                 let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(inst, pointee_ty) as i64;
-                if let Some(imm12) = Imm12::from_i32(offset as i32) {
+                if let Some(imm12) = i32::try_from(offset).ok().and_then(Imm12::from_i32) {
                     ctx.emit(MInst::AluRRImm12 {
                         op: AluRRImm12OP::Addi,
                         rd,
@@ -323,10 +323,10 @@ impl LowerBackend for Riscv64Backend {
                         imm: imm12,
                     });
                 } else {
-                    let tmp = ctx.alloc_tmp(HirType::get_i32());
+                    let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
                     ctx.emit(MInst::LoadImm {
                         rd: Writable::from_reg(tmp),
-                        imm: offset as i32,
+                        value: offset as u64,
                     });
                     ctx.emit(MInst::AluRRR {
                         op: AluRRROP::Add,
@@ -344,11 +344,11 @@ impl LowerBackend for Riscv64Backend {
 
                 let def = *ctx.reg_map.get(&inst).unwrap();
                 let rd = Writable::from_reg(def);
-                let tmp = ctx.alloc_tmp(HirType::get_i32());
+                let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
                 let wtmp = Writable::from_reg(tmp);
-                let acc = ctx.alloc_tmp(HirType::get_i32());
+                let acc = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
                 let wacc = Writable::from_reg(acc);
-                ctx.emit(MInst::LoadImm { rd: wacc, imm: 0 });
+                ctx.emit(MInst::LoadImm { rd: wacc, value: 0 });
                 let mut ty = src_ty;
                 for &index in indices {
                     let elem_size = if ty.is_pointer() {
@@ -364,7 +364,7 @@ impl LowerBackend for Riscv64Backend {
                     };
                     ctx.emit(MInst::LoadImm {
                         rd: wtmp,
-                        imm: elem_size as i32,
+                        value: elem_size as u64,
                     });
                     let rhs = ctx.put_value_in_reg(index);
                     ctx.emit(MInst::AluRRR {

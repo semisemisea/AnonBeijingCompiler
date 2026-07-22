@@ -7,7 +7,7 @@ use crate::block_order::{BlockLoweringOrder, LoweredBlock, MirBlockIndex};
 use crate::prelude::*;
 use crate::reg_alloc::reg::PReg;
 use crate::register::{Reg, VRegAllocator, Writable};
-use crate::types::F32;
+use crate::types::{F32, I32};
 use crate::vcode::{VCodeBuilder, VCodeContainer, VCodeInst};
 use raana_ir::ir::TypeKind as HirTypeKind;
 
@@ -604,14 +604,16 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             Some(Remat::Int(value)) => {
                 self.emit(<I::ABISpec as ABIMachineSpec>::gen_load_imm(
                     Writable::from_reg(reg),
-                    value,
+                    value as u32 as u64,
+                    I32,
                 ));
             }
             Some(Remat::Float(bits)) => {
                 let tmp = self.alloc_tmp(HirType::get_i32());
                 self.emit(<I::ABISpec as ABIMachineSpec>::gen_load_imm(
                     Writable::from_reg(tmp),
-                    bits as i32,
+                    bits as u64,
+                    I32,
                 ));
                 self.emit(<I::ABISpec as ABIMachineSpec>::gen_move(tmp, reg, F32));
             }

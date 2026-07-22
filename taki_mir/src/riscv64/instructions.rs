@@ -5,7 +5,7 @@ use crate::{
     reg_alloc::reg::{OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
     riscv64::{abi::Riscv64ABI, labels::Label},
-    types::{F32, I32, I64, LoweredType},
+    types::{LoweredType, F32, I32, I64},
     vcode::{CallType, EmitContext, MachInst, MachInstEmit, MachTerminator},
 };
 
@@ -162,10 +162,10 @@ impl MachInstEmit for MInst {
                 ctx.write_reg(rs)?;
                 write!(ctx, ", {}", imm)
             }
-            MInst::LoadImm { rd, imm } => {
+            MInst::LoadImm { rd, value } => {
                 write!(ctx, "li ")?;
                 ctx.write_reg(&rd.reg)?;
-                write!(ctx, ", {}", imm)
+                write!(ctx, ", 0x{value:x}")
             }
             MInst::LoadAddr { rd, label } => {
                 write!(ctx, "la ")?;
@@ -299,7 +299,7 @@ pub enum MInst {
     },
     LoadImm {
         rd: WritableReg,
-        imm: i32,
+        value: u64,
     },
     LoadWord {
         rd: WritableReg,
@@ -622,7 +622,7 @@ impl AMode {
         let tmp2 = writable_spilltmp_reg2();
         extra.push(MInst::LoadImm {
             rd: tmp2,
-            imm: off as i32,
+            value: off as u64,
         });
         let tmp = writable_spilltmp_reg();
         extra.push(MInst::AluRRR {

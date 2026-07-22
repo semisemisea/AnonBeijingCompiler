@@ -60,7 +60,11 @@ pub trait ABIMachineSpec {
 
     fn gen_load_stack(mem: StackAMode, dst: Writable<Reg>, ty: LoweredType) -> Self::I;
 
-    fn gen_load_imm(dst: Writable<Reg>, imm: i32) -> Self::I;
+    /// Materialize the low bits of `value` according to `ty`.
+    ///
+    /// Integer constants are bit patterns, rather than host-sized signed values:
+    /// this keeps i32 and pointer-width materialization distinct.
+    fn gen_load_imm(dst: Writable<Reg>, value: u64, ty: LoweredType) -> Self::I;
 
     fn gen_load_addr(dst: Writable<Reg>, label: HirInst) -> Self::I;
 

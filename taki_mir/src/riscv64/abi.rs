@@ -1,4 +1,4 @@
-use smallvec::{SmallVec, smallvec};
+use smallvec::{smallvec, SmallVec};
 
 use crate::{
     abi::{ABIMachineSpec, ArgSlot, FrameLayout},
@@ -8,9 +8,9 @@ use crate::{
         instructions::{AMode, AluRRImm12OP, Imm12, LoadOP, MInst, StoreOP},
         labels::Label,
         regs::{
-            ARG_REG, FARG_REG, fp_reg, link_reg, pf_reg, pv_reg, px_reg, stack_reg,
-            writable_fp_reg, writable_link_reg, writable_spilltmp_reg, writable_spilltmp_reg2,
-            writable_stack_reg,
+            fp_reg, link_reg, pf_reg, pv_reg, px_reg, stack_reg, writable_fp_reg,
+            writable_link_reg, writable_spilltmp_reg, writable_spilltmp_reg2, writable_stack_reg,
+            ARG_REG, FARG_REG,
         },
     },
 };
@@ -49,8 +49,15 @@ impl ABIMachineSpec for Riscv64ABI {
         MInst::Ret
     }
 
-    fn gen_load_imm(dst: Writable<Reg>, imm: i32) -> Self::I {
-        MInst::LoadImm { rd: dst, imm }
+    fn gen_load_imm(dst: Writable<Reg>, value: u64, ty: crate::types::LoweredType) -> Self::I {
+        match ty {
+            crate::types::I32 => MInst::LoadImm {
+                rd: dst,
+                value: value & u64::from(u32::MAX),
+            },
+            crate::types::I64 => MInst::LoadImm { rd: dst, value },
+            _ => unreachable!("unsupported RISC-V immediate type: {ty:?}"),
+        }
     }
 
     fn gen_load_addr(dst: Writable<Reg>, gv: raana_ir::opt::prelude::Inst) -> Self::I {
@@ -207,7 +214,7 @@ impl ABIMachineSpec for Riscv64ABI {
     }
 
     fn gen_prologue_frame_setup(frame: &FrameLayout) -> SmallVec<[MInst; 16]> {
-        let total = frame.total_size as i32;
+        let total = i64::from(frame.total_size);
         let mut insts = smallvec![];
         if frame.setup_area_size > 0 {
             let base = frame.total_size as i64;
@@ -229,7 +236,7 @@ impl ABIMachineSpec for Riscv64ABI {
             load_stack_imm12(&mut insts, writable_fp_reg(), LoadOP::Ld, base - 16);
         }
         if frame.total_size > 0 {
-            sp_adjust(&mut insts, frame.total_size as i32);
+            sp_adjust(&mut insts, i64::from(frame.total_size));
         }
         insts
     }
@@ -265,11 +272,11 @@ impl ABIMachineSpec for Riscv64ABI {
     }
 }
 
-fn sp_adjust(insts: &mut SmallVec<[MInst; 16]>, amount: i32) {
+fn sp_adjust(insts: &mut SmallVec<[MInst; 16]>, amount: i64) {
     if amount == 0 {
         return;
     }
-    if let Some(imm) = Imm12::from_i32(amount) {
+    if let Some(imm) = i32::try_from(amount).ok().and_then(Imm12::from_i32) {
         insts.push(MInst::AluRRImm12 {
             op: AluRRImm12OP::Addi,
             rd: writable_stack_reg(),
@@ -280,7 +287,7 @@ fn sp_adjust(insts: &mut SmallVec<[MInst; 16]>, amount: i32) {
         let tmp = writable_spilltmp_reg();
         insts.push(MInst::LoadImm {
             rd: tmp,
-            imm: amount,
+            value: amount as u64,
         });
         insts.push(MInst::AluRRR {
             op: crate::riscv64::instructions::AluRRROP::Add,
@@ -292,7 +299,7 @@ fn sp_adjust(insts: &mut SmallVec<[MInst; 16]>, amount: i32) {
 }
 
 fn reg_add_imm(insts: &mut SmallVec<[MInst; 16]>, rd: Writable<Reg>, rs: Reg, amount: i64) {
-    if let Some(imm) = Imm12::from_i32(amount as i32) {
+    if let Some(imm) = i32::try_from(amount).ok().and_then(Imm12::from_i32) {
         insts.push(MInst::AluRRImm12 {
             op: AluRRImm12OP::Addi,
             rd,
@@ -303,7 +310,7 @@ fn reg_add_imm(insts: &mut SmallVec<[MInst; 16]>, rd: Writable<Reg>, rs: Reg, am
         let tmp = writable_spilltmp_reg2();
         insts.push(MInst::LoadImm {
             rd: tmp,
-            imm: amount as i32,
+            value: amount as u64,
         });
         insts.push(MInst::AluRRR {
             op: crate::riscv64::instructions::AluRRROP::Add,

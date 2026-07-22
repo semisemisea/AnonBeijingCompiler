@@ -33,7 +33,7 @@
 - [x] Audit and correct scalar integer/pointer lowering instruction order for
   reverse VCode construction, including remainder's `sdiv` + `msub` sequence,
   compare-plus-`cset`, and return-value setup.
-- [ ] Lower i32 and pointer constants through the shared constant planner with
+- [x] Lower i32 and pointer constants through the shared constant planner with
   correct 32-bit and 64-bit widths.
 - [x] Select add/sub immediates, including negated-immediate conversion.
 - [x] Select logical immediates and immediate shifts when legal.

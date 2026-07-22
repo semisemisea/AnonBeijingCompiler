@@ -70,12 +70,13 @@ impl ABIMachineSpec for AArch64Abi {
         }]
     }
 
-    fn gen_load_imm(dst: Writable<Reg>, imm: i32) -> MInst {
-        MInst::LoadImm {
-            size: OperandSize::Size32,
-            dst,
-            value: imm as u32 as u64,
-        }
+    fn gen_load_imm(dst: Writable<Reg>, value: u64, ty: LoweredType) -> MInst {
+        let size = match ty {
+            I32 => OperandSize::Size32,
+            I64 => OperandSize::Size64,
+            _ => unreachable!("unsupported AArch64 immediate type: {ty:?}"),
+        };
+        MInst::LoadImm { size, dst, value }
     }
 
     fn gen_load_addr(dst: Writable<Reg>, label: taki_mir::prelude::HirInst) -> MInst {

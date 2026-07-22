@@ -51,7 +51,7 @@
 - [ ] Lower f32 constants through an assembler-valid constant-pool or
   relocatable-load scheme.
 - [x] Lower f32 add, sub, mul, and div.
-- [ ] Lower ordered f32 comparisons and truthiness with correct NaN behavior.
+- [x] Lower ordered f32 comparisons and truthiness with correct NaN behavior.
 - [x] Lower `scvtf` and `fcvtzs` casts.
 - [ ] Reject f32 remainder with an instruction-specific diagnostic unless an
   explicit runtime `fmodf` strategy is implemented.

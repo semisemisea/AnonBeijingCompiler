@@ -1,6 +1,6 @@
 //! AArch64 selection from Raana HIR into generic VCode.
 
-use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind, arena::Arena};
+use raana_ir::ir::{arena::Arena, BinaryOp, InstKind, Type as HirType, TypeKind};
 use taki_mir::{
     abi::{CallArgPair, CallRetPair, RetPair},
     block_order::{LoweredBlock, MirBlockIndex},
@@ -41,12 +41,30 @@ impl LowerBackend for AArch64Backend {
                     ctx.arena.inst_data(binary.lhs()).ty().kind(),
                     TypeKind::Float32
                 ) {
-                    ctx.emit(MInst::FAlu {
-                        op: float_alu_op(binary.op()),
-                        dst,
-                        lhs,
-                        rhs: ctx.put_value_in_reg(binary.rhs()),
-                    });
+                    let rhs = ctx.put_value_in_reg(binary.rhs());
+                    match binary.op() {
+                        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+                            ctx.emit(MInst::FAlu {
+                                op: float_alu_op(binary.op()),
+                                dst,
+                                lhs,
+                                rhs,
+                            });
+                        }
+                        BinaryOp::Eq
+                        | BinaryOp::NotEq
+                        | BinaryOp::Gt
+                        | BinaryOp::Lt
+                        | BinaryOp::Ge
+                        | BinaryOp::Le => {
+                            ctx.emit(MInst::FCmp { lhs, rhs });
+                            ctx.emit(MInst::CSet {
+                                cond: float_comparison_cond(binary.op()),
+                                dst,
+                            });
+                        }
+                        op => unreachable!("unsupported AArch64 floating binary operation: {op:?}"),
+                    }
                     return;
                 }
                 let size = operand_size(ctx.arena.inst_data(binary.lhs()).ty().kind());
@@ -726,5 +744,19 @@ fn comparison_cond(op: BinaryOp) -> Cond {
         BinaryOp::Ge => Cond::Ge,
         BinaryOp::Le => Cond::Le,
         _ => unreachable!("binary operation is not a comparison"),
+    }
+}
+
+fn float_comparison_cond(op: BinaryOp) -> Cond {
+    match op {
+        BinaryOp::Eq => Cond::Eq,
+        BinaryOp::NotEq => Cond::Ne,
+        BinaryOp::Gt => Cond::Gt,
+        // `fcmp` sets N for ordered less-than and C for unordered operands.
+        // `mi` and `ls` therefore implement ordered `<` and `<=` respectively.
+        BinaryOp::Lt => Cond::Mi,
+        BinaryOp::Ge => Cond::Ge,
+        BinaryOp::Le => Cond::Ls,
+        _ => unreachable!("binary operation is not a floating comparison"),
     }
 }

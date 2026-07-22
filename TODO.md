@@ -41,9 +41,9 @@
   extended-register address arithmetic when legal.
 - [x] Add safe `madd` and `msub` fusion only when the multiply result has no
   independent use.
-- [ ] Introduce selector-level conditions for zero/nonzero, NZCV flags, and
+- [x] Introduce selector-level conditions for zero/nonzero, NZCV flags, and
   proven one-bit tests.
-- [ ] Select direct compare-to-branch, `cbz`/`cbnz`, and proven `tbz`/`tbnz`
+- [x] Select direct compare-to-branch, `cbz`/`cbnz`, and proven `tbz`/`tbnz`
   patterns without inserting a flags-clobbering instruction between producer
   and consumer.
 - [x] Preserve generic edge-block ownership of block-parameter parallel copies

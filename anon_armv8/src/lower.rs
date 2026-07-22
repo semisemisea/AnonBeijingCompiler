@@ -506,13 +506,17 @@ impl LowerBackend for AArch64Backend {
                 ctx.emit(MInst::gen_jump(target));
             }
             InstKind::Branch(branch) => {
-                let cond = ctx.put_value_in_reg(branch.cond());
                 for &arg in branch.t_args().iter().chain(branch.f_args()) {
                     ctx.put_value_in_reg(arg);
                 }
                 let &[true_target, false_target] = target else {
                     unreachable!("branch must have two lowered successors");
                 };
+                if select_branch_condition(ctx, inst, branch.cond(), true_target, false_target) {
+                    return;
+                }
+
+                let cond = ctx.put_value_in_reg(branch.cond());
                 ctx.emit(MInst::CmpImm {
                     size: OperandSize::Size32,
                     lhs: cond,
@@ -572,6 +576,275 @@ impl LowerBackend for AArch64Backend {
 
     fn emit_long_jump(ctx: &mut LowerContext<Self::MInst>, target: MirBlockIndex) {
         ctx.emit(MInst::gen_jump(target));
+    }
+}
+
+/// Select a branch-local, pure condition tree.  Claims are made through the
+/// generic lowering context so reverse traversal never independently lowers a
+/// producer whose result is consumed here.
+fn select_branch_condition(
+    ctx: &mut LowerContext<'_, MInst>,
+    branch: raana_ir::opt::prelude::Inst,
+    cond: raana_ir::opt::prelude::Inst,
+    true_target: MirBlockIndex,
+    false_target: MirBlockIndex,
+) -> bool {
+    let InstKind::Binary(outer) = ctx.arena.inst_data(cond).kind().clone() else {
+        return false;
+    };
+    if !is_comparison(outer.op()) || !has_only_user(ctx, cond, branch) {
+        return false;
+    }
+
+    let labels = (
+        Label::from_block(true_target),
+        Label::from_block(false_target),
+    );
+    let zero_outer = zero_comparison(ctx, &outer);
+    if let Some((value, is_eq)) = zero_outer {
+        if let InstKind::Binary(inner) = ctx.arena.inst_data(value).kind().clone() {
+            if is_comparison(inner.op()) && has_only_user(ctx, value, cond) {
+                // Claim the leaf first: a rejection must leave the outer
+                // condition available for the conservative fallback.
+                if !ctx.sink_pure_single_use_producer(value, cond)
+                    || !ctx.sink_pure_single_use_producer(cond, branch)
+                {
+                    return false;
+                }
+                emit_comparison_branch(ctx, &inner, !is_eq, labels);
+                return true;
+            }
+            if let Some((tested, bit)) = single_bit_mask(ctx, &inner, value, cond) {
+                if !ctx.sink_pure_single_use_producer(value, cond)
+                    || !ctx.sink_pure_single_use_producer(cond, branch)
+                {
+                    return false;
+                }
+                let tested = ctx.put_value_in_reg(tested);
+                let (true_label, false_label) = labels;
+                ctx.emit(if is_eq {
+                    MInst::Tbz {
+                        size: OperandSize::Size32,
+                        reg: tested,
+                        bit,
+                        true_label,
+                        false_label,
+                    }
+                } else {
+                    MInst::Tbnz {
+                        size: OperandSize::Size32,
+                        reg: tested,
+                        bit,
+                        true_label,
+                        false_label,
+                    }
+                });
+                return true;
+            }
+        }
+
+        let ty = ctx.arena.inst_data(value).ty().kind().clone();
+        if matches!(
+            &ty,
+            TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String
+        ) {
+            if !ctx.sink_pure_single_use_producer(cond, branch) {
+                return false;
+            }
+            let value = ctx.put_value_in_reg(value);
+            let size = operand_size(&ty);
+            let (true_label, false_label) = labels;
+            ctx.emit(if is_eq {
+                MInst::Cbz {
+                    size,
+                    reg: value,
+                    true_label,
+                    false_label,
+                }
+            } else {
+                MInst::Cbnz {
+                    size,
+                    reg: value,
+                    true_label,
+                    false_label,
+                }
+            });
+            return true;
+        }
+        if matches!(&ty, TypeKind::Float32) {
+            if !ctx.sink_pure_single_use_producer(cond, branch) {
+                return false;
+            }
+            let value = ctx.put_value_in_reg(value);
+            emit_float_zero_branch(ctx, value, if is_eq { Cond::Eq } else { Cond::Ne }, labels);
+            return true;
+        }
+    }
+
+    if !ctx.sink_pure_single_use_producer(cond, branch) {
+        return false;
+    }
+    emit_comparison_branch(ctx, &outer, false, labels);
+    true
+}
+
+fn has_only_user(
+    ctx: &LowerContext<'_, MInst>,
+    producer: raana_ir::opt::prelude::Inst,
+    user: raana_ir::opt::prelude::Inst,
+) -> bool {
+    let users = ctx.arena.inst_data(producer).used_by();
+    users.len() == 1 && users.contains(&user)
+}
+
+fn zero_comparison(
+    ctx: &LowerContext<'_, MInst>,
+    binary: &raana_ir::ir::Binary,
+) -> Option<(raana_ir::opt::prelude::Inst, bool)> {
+    let is_eq = match binary.op() {
+        BinaryOp::Eq => true,
+        BinaryOp::NotEq => false,
+        _ => return None,
+    };
+    if integer_constant(ctx, binary.lhs()) == Some(0) {
+        Some((binary.rhs(), is_eq))
+    } else if integer_constant(ctx, binary.rhs()) == Some(0) {
+        Some((binary.lhs(), is_eq))
+    } else {
+        None
+    }
+}
+
+fn single_bit_mask(
+    ctx: &LowerContext<'_, MInst>,
+    and: &raana_ir::ir::Binary,
+    and_inst: raana_ir::opt::prelude::Inst,
+    outer: raana_ir::opt::prelude::Inst,
+) -> Option<(raana_ir::opt::prelude::Inst, u8)> {
+    if and.op() != BinaryOp::And
+        || !matches!(ctx.arena.inst_data(and_inst).ty().kind(), TypeKind::Int32)
+        || !has_only_user(ctx, and_inst, outer)
+    {
+        return None;
+    }
+    let (value, mask) = if let Some(mask) = integer_constant(ctx, and.lhs()) {
+        (and.rhs(), mask)
+    } else {
+        (and.lhs(), integer_constant(ctx, and.rhs())?)
+    };
+    let mask = u32::try_from(mask).ok()?;
+    if mask.count_ones() != 1 || !matches!(ctx.arena.inst_data(value).ty().kind(), TypeKind::Int32)
+    {
+        return None;
+    }
+    Some((value, mask.trailing_zeros() as u8))
+}
+
+fn emit_comparison_branch(
+    ctx: &mut LowerContext<'_, MInst>,
+    binary: &raana_ir::ir::Binary,
+    invert: bool,
+    (true_label, false_label): (Label, Label),
+) {
+    let lhs_ty = ctx.arena.inst_data(binary.lhs()).ty().kind().clone();
+    let (cond, float_comparison) = if matches!(&lhs_ty, TypeKind::Float32) {
+        let lhs = ctx.put_value_in_reg(binary.lhs());
+        let rhs = ctx.put_value_in_reg(binary.rhs());
+        ctx.emit(MInst::FCmp { lhs, rhs });
+        (float_comparison_cond(binary.op()), true)
+    } else {
+        let size = operand_size(&lhs_ty);
+        let lhs = ctx.put_value_in_reg(binary.lhs());
+        if let Some(imm) = integer_constant(ctx, binary.rhs()).and_then(positive_imm12) {
+            ctx.emit(MInst::CmpImm { size, lhs, imm });
+        } else {
+            let rhs = ctx.put_value_in_reg(binary.rhs());
+            ctx.emit(MInst::CmpRR {
+                size,
+                lhs,
+                rhs: RegOrZr::Reg(rhs),
+            });
+        }
+        (comparison_cond(binary.op()), false)
+    };
+    ctx.emit(MInst::CondBr {
+        // Floating ordered `<`/`<=` need Mi/Ls for direct selection, but
+        // their boolean negations include unordered values.  Select the
+        // corresponding flag condition rather than mechanically inverting
+        // Mi/Ls, while integer conditions use the complete inverse table.
+        cond: if invert {
+            if float_comparison {
+                invert_float_comparison_cond(binary.op())
+            } else {
+                invert_cond(cond)
+            }
+        } else {
+            cond
+        },
+        true_label,
+        false_label,
+    });
+}
+
+fn emit_float_zero_branch(
+    ctx: &mut LowerContext<'_, MInst>,
+    value: taki_mir::register::Reg,
+    cond: Cond,
+    (true_label, false_label): (Label, Label),
+) {
+    let zero = ctx.alloc_tmp(HirType::get_f32());
+    ctx.emit(MInst::FMovFromZero {
+        dst: Writable::from_reg(zero),
+    });
+    ctx.emit(MInst::FCmp {
+        lhs: value,
+        rhs: zero,
+    });
+    ctx.emit(MInst::CondBr {
+        cond,
+        true_label,
+        false_label,
+    });
+}
+
+fn is_comparison(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Gt | BinaryOp::Lt | BinaryOp::Ge | BinaryOp::Le
+    )
+}
+
+fn invert_cond(cond: Cond) -> Cond {
+    match cond {
+        Cond::Eq => Cond::Ne,
+        Cond::Ne => Cond::Eq,
+        Cond::Hs => Cond::Lo,
+        Cond::Lo => Cond::Hs,
+        Cond::Mi => Cond::Pl,
+        Cond::Pl => Cond::Mi,
+        Cond::Vs => Cond::Vc,
+        Cond::Vc => Cond::Vs,
+        Cond::Hi => Cond::Ls,
+        Cond::Ls => Cond::Hi,
+        Cond::Ge => Cond::Lt,
+        Cond::Lt => Cond::Ge,
+        Cond::Gt => Cond::Le,
+        Cond::Le => Cond::Gt,
+    }
+}
+
+fn invert_float_comparison_cond(op: BinaryOp) -> Cond {
+    match op {
+        BinaryOp::Eq => Cond::Ne,
+        BinaryOp::NotEq => Cond::Eq,
+        BinaryOp::Gt => Cond::Le,
+        // `hs` includes ordered >= and unordered, exactly `!(lhs < rhs)`.
+        BinaryOp::Lt => Cond::Hs,
+        // Generic `lt` includes unordered (N != V), exactly `!(lhs >= rhs)`.
+        BinaryOp::Ge => Cond::Lt,
+        // `hi` includes ordered > and unordered, exactly `!(lhs <= rhs)`.
+        BinaryOp::Le => Cond::Hi,
+        _ => unreachable!("binary operation is not a floating comparison"),
     }
 }
 

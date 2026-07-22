@@ -442,22 +442,28 @@ pub enum MInst {
     Cbz {
         size: OperandSize,
         reg: Reg,
-        label: Label,
+        true_label: Label,
+        false_label: Label,
     },
     Cbnz {
         size: OperandSize,
         reg: Reg,
-        label: Label,
+        true_label: Label,
+        false_label: Label,
     },
     Tbz {
+        size: OperandSize,
         reg: Reg,
         bit: u8,
-        label: Label,
+        true_label: Label,
+        false_label: Label,
     },
     Tbnz {
+        size: OperandSize,
         reg: Reg,
         bit: u8,
-        label: Label,
+        true_label: Label,
+        false_label: Label,
     },
     CondBr {
         cond: Cond,
@@ -581,7 +587,7 @@ impl MInst {
             {
                 Err("invalid AArch64 pair memory address form")
             }
-            Self::Tbz { bit, .. } | Self::Tbnz { bit, .. } if *bit >= 64 => {
+            Self::Tbz { size, bit, .. } | Self::Tbnz { size, bit, .. } if *bit >= size.bits() => {
                 Err("test-bit index exceeds AArch64 encoding range")
             }
             Self::LoadPair { ty, addr, .. } | Self::StorePair { ty, addr, .. }
@@ -1058,7 +1064,18 @@ impl MachInstEmit for MInst {
                 write!(ctx, "b.{} ", cond_name(*cond))?;
                 label.emit(ctx)
             }
-            Self::Cbz { size, reg, label } | Self::Cbnz { size, reg, label } => {
+            Self::Cbz {
+                size,
+                reg,
+                true_label,
+                false_label,
+            }
+            | Self::Cbnz {
+                size,
+                reg,
+                true_label,
+                false_label,
+            } => {
                 write!(
                     ctx,
                     "{} ",
@@ -1070,9 +1087,24 @@ impl MachInstEmit for MInst {
                 )?;
                 emit_reg(ctx, *reg, *size)?;
                 write!(ctx, ", ")?;
-                label.emit(ctx)
+                true_label.emit(ctx)?;
+                write!(ctx, "\n    b ")?;
+                false_label.emit(ctx)
             }
-            Self::Tbz { reg, bit, label } | Self::Tbnz { reg, bit, label } => {
+            Self::Tbz {
+                size,
+                reg,
+                bit,
+                true_label,
+                false_label,
+            }
+            | Self::Tbnz {
+                size,
+                reg,
+                bit,
+                true_label,
+                false_label,
+            } => {
                 write!(
                     ctx,
                     "{} ",
@@ -1082,9 +1114,11 @@ impl MachInstEmit for MInst {
                         "tbnz"
                     }
                 )?;
-                emit_reg(ctx, *reg, OperandSize::Size64)?;
+                emit_reg(ctx, *reg, *size)?;
                 write!(ctx, ", #{bit}, ")?;
-                label.emit(ctx)
+                true_label.emit(ctx)?;
+                write!(ctx, "\n    b ")?;
+                false_label.emit(ctx)
             }
             Self::CondBr {
                 cond,

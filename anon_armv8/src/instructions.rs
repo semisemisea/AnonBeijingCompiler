@@ -329,7 +329,7 @@ pub enum MInst {
         op: AluOp,
         size: OperandSize,
         dst: WritableReg,
-        src: Reg,
+        src: Gpr,
         imm: ImmLogic,
     },
     AluRRImmShift {

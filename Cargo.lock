@@ -16,6 +16,7 @@ name = "anon_armv8"
 version = "0.1.0"
 dependencies = [
  "raana_ir",
+ "smallvec 1.15.1",
  "taki_mir",
 ]
 

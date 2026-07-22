@@ -71,6 +71,18 @@ Completed on 2026-07-22.
   introduced, because the public generic contract requires the ABI associated
   type rather than a compatibility placeholder.
 
+### Phase 4 Foundation Complete: Shared Constant Planning
+
+Completed on 2026-07-22.
+
+- Added a shared i32/i64 AArch64 constant planner that chooses zero, one
+  `movz`/`movn`, logical-immediate `orr`, or a minimal move-wide seed and
+  `movk` patches without depending on host width.
+- Added a target-register materialization helper that emits only typed MInst and
+  never allocates a vreg, stack slot, or undeclared scratch register.
+- Deferred post-RA frame/address legalization until the ABI supplies finalized
+  frame offsets and the generic emitter can consume the resulting MInst stream.
+
 ## Scope And Constraints
 
 ### In Scope

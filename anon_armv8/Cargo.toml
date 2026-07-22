@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 raana_ir = { path = "../raana_ir/" }
 taki_mir = { path = "../taki_mir/" }
+smallvec = { path = "../dependencies/rust-smallvec/" }

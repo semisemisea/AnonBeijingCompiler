@@ -37,12 +37,12 @@ impl LowerBackend for AArch64Backend {
                 unreachable!("constants and argument references are rematerialized by LowerContext")
             }
             InstKind::Binary(binary) => {
-                let lhs = ctx.put_value_in_reg(binary.lhs());
                 let dst = Writable::from_reg(ctx.reg_map[&inst]);
                 if matches!(
                     ctx.arena.inst_data(binary.lhs()).ty().kind(),
                     TypeKind::Float32
                 ) {
+                    let lhs = ctx.put_value_in_reg(binary.lhs());
                     let rhs = ctx.put_value_in_reg(binary.rhs());
                     match binary.op() {
                         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
@@ -70,6 +70,29 @@ impl LowerBackend for AArch64Backend {
                     return;
                 }
                 let size = operand_size(ctx.arena.inst_data(binary.lhs()).ty().kind());
+                if let Some((op, lhs, rhs, addend)) =
+                    fold_mul_add_sub(ctx, inst, binary.op(), binary.lhs(), binary.rhs(), size)
+                {
+                    match op {
+                        BinaryOp::Add => ctx.emit(MInst::MAdd {
+                            size,
+                            dst,
+                            lhs,
+                            rhs,
+                            addend,
+                        }),
+                        BinaryOp::Sub => ctx.emit(MInst::MSub {
+                            size,
+                            dst,
+                            lhs,
+                            rhs,
+                            subtrahend: addend,
+                        }),
+                        _ => unreachable!("multiply-accumulate folding only selects add or sub"),
+                    }
+                    return;
+                }
+                let lhs = ctx.put_value_in_reg(binary.lhs());
                 let rhs_imm = integer_constant(ctx, binary.rhs());
 
                 match binary.op() {
@@ -555,6 +578,81 @@ fn integer_constant(
         InstKind::Integer(value) => Some(value.value()),
         _ => None,
     }
+}
+
+/// Fold a single-use integer or pointer multiplication into an add/sub
+/// consumer. The sink claim happens only after all shape and type checks, so
+/// a rejected candidate follows normal instruction selection unchanged.
+fn fold_mul_add_sub(
+    ctx: &mut LowerContext<'_, MInst>,
+    consumer: raana_ir::opt::prelude::Inst,
+    op: BinaryOp,
+    lhs: raana_ir::opt::prelude::Inst,
+    rhs: raana_ir::opt::prelude::Inst,
+    size: OperandSize,
+) -> Option<(
+    BinaryOp,
+    taki_mir::register::Reg,
+    taki_mir::register::Reg,
+    taki_mir::register::Reg,
+)> {
+    let (mul_inst, addend) = match op {
+        BinaryOp::Add if !is_mul(ctx, lhs) && is_mul(ctx, rhs) => (rhs, lhs),
+        BinaryOp::Add if is_mul(ctx, lhs) && !is_mul(ctx, rhs) => (lhs, rhs),
+        BinaryOp::Sub if !is_mul(ctx, lhs) && is_mul(ctx, rhs) => (rhs, lhs),
+        _ => return None,
+    };
+    let InstKind::Binary(mul) = ctx.arena.inst_data(mul_inst).kind().clone() else {
+        unreachable!("multiply candidate must be a binary instruction");
+    };
+
+    if mul.op() != BinaryOp::Mul
+        || !fusion_types_match(
+            ctx,
+            consumer,
+            lhs,
+            rhs,
+            mul_inst,
+            mul.lhs(),
+            mul.rhs(),
+            size,
+        )
+        || !ctx.sink_pure_single_use_producer(mul_inst, consumer)
+    {
+        return None;
+    }
+
+    Some((
+        op,
+        ctx.put_value_in_reg(mul.lhs()),
+        ctx.put_value_in_reg(mul.rhs()),
+        ctx.put_value_in_reg(addend),
+    ))
+}
+
+fn is_mul(ctx: &LowerContext<'_, MInst>, inst: raana_ir::opt::prelude::Inst) -> bool {
+    matches!(
+        ctx.arena.inst_data(inst).kind(),
+        InstKind::Binary(binary) if binary.op() == BinaryOp::Mul
+    )
+}
+
+fn fusion_types_match(
+    ctx: &LowerContext<'_, MInst>,
+    consumer: raana_ir::opt::prelude::Inst,
+    lhs: raana_ir::opt::prelude::Inst,
+    rhs: raana_ir::opt::prelude::Inst,
+    mul: raana_ir::opt::prelude::Inst,
+    mul_lhs: raana_ir::opt::prelude::Inst,
+    mul_rhs: raana_ir::opt::prelude::Inst,
+    size: OperandSize,
+) -> bool {
+    [consumer, lhs, rhs, mul, mul_lhs, mul_rhs]
+        .into_iter()
+        .all(|inst| {
+            let ty = ctx.arena.inst_data(inst).ty().kind();
+            matches!(ty, TypeKind::Int32 | TypeKind::Pointer(_)) && operand_size(ty) == size
+        })
 }
 
 /// Fold `rhs = input <<const shift` (or its logical/arithmetic right-shift

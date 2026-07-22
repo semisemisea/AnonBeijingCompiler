@@ -39,7 +39,7 @@
 - [x] Select logical immediates and immediate shifts when legal.
 - [x] Select zero-register forms, shifted-register arithmetic, and
   extended-register address arithmetic when legal.
-- [ ] Add safe `madd` and `msub` fusion only when the multiply result has no
+- [x] Add safe `madd` and `msub` fusion only when the multiply result has no
   independent use.
 - [ ] Introduce selector-level conditions for zero/nonzero, NZCV flags, and
   proven one-bit tests.

@@ -201,7 +201,8 @@ impl ABIMachineSpec for Riscv64ABI {
     }
 
     fn get_machine_env() -> &'static MachineEnv {
-        static MACHINE_ENV: MachineEnv = create_reg_environment();
+        static MACHINE_ENV: std::sync::LazyLock<MachineEnv> =
+            std::sync::LazyLock::new(create_reg_environment);
         &MACHINE_ENV
     }
 
@@ -415,7 +416,7 @@ pub const DEFAULT_CLOBBERS: PRegSet = PRegSet::empty()
     .with(pv_reg(30))
     .with(pv_reg(31));
 
-const fn create_reg_environment() -> MachineEnv {
+fn create_reg_environment() -> MachineEnv {
     // Some C Extension instructions can only use a subset of the registers.
     // x8 - x15, f8 - f15, v8 - v15 so we should prefer to use those since
     // they allow us to emit C instructions more often.
@@ -540,5 +541,6 @@ const fn create_reg_environment() -> MachineEnv {
         non_preferred_regs_by_class,
         fixed_stack_slots: vec![],
         scratch_by_class: [None, None, None],
+        post_ra_scratch_by_class: [vec![], vec![], vec![]],
     }
 }

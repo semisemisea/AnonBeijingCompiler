@@ -110,10 +110,11 @@ impl LowerBackend for AArch64Backend {
                         if binary.op() == BinaryOp::Add
                             && integer_constant(ctx, binary.lhs()) == Some(0)
                         {
+                            let rhs = ctx.put_value_in_reg(binary.rhs());
                             ctx.emit(MInst::Mov {
                                 size,
                                 dst,
-                                src: ctx.put_value_in_reg(binary.rhs()),
+                                src: rhs,
                             });
                         } else if rhs_imm == Some(0) {
                             ctx.emit(MInst::Mov {
@@ -124,12 +125,13 @@ impl LowerBackend for AArch64Backend {
                         } else if binary.op() == BinaryOp::Sub
                             && integer_constant(ctx, binary.lhs()) == Some(0)
                         {
+                            let rhs = ctx.put_value_in_reg(binary.rhs());
                             ctx.emit(MInst::AluRRR {
                                 op: AluOp::Sub,
                                 size,
                                 dst,
                                 lhs: RegOrZr::Zr,
-                                rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
+                                rhs: RegOrZr::Reg(rhs),
                             });
                         } else if let Some((op, imm)) = add_sub_immediate(binary.op(), rhs_imm) {
                             ctx.emit(MInst::AluRRImm12 {
@@ -152,12 +154,13 @@ impl LowerBackend for AArch64Backend {
                                 amount,
                             });
                         } else {
+                            let rhs = ctx.put_value_in_reg(binary.rhs());
                             ctx.emit(MInst::AluRRR {
                                 op: alu_op(binary.op()),
                                 size,
                                 dst,
                                 lhs: RegOrZr::Reg(lhs),
-                                rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
+                                rhs: RegOrZr::Reg(rhs),
                             });
                         }
                     }
@@ -170,10 +173,11 @@ impl LowerBackend for AArch64Backend {
                         } else if matches!(binary.op(), BinaryOp::Or | BinaryOp::Xor)
                             && lhs_imm == Some(0)
                         {
+                            let rhs = ctx.put_value_in_reg(binary.rhs());
                             ctx.emit(MInst::Mov {
                                 size,
                                 dst,
-                                src: ctx.put_value_in_reg(binary.rhs()),
+                                src: rhs,
                             });
                         } else if matches!(binary.op(), BinaryOp::Or | BinaryOp::Xor)
                             && rhs_imm == Some(0)
@@ -206,12 +210,13 @@ impl LowerBackend for AArch64Backend {
                                 amount,
                             });
                         } else {
+                            let rhs = ctx.put_value_in_reg(binary.rhs());
                             ctx.emit(MInst::AluRRR {
                                 op: alu_op(binary.op()),
                                 size,
                                 dst,
                                 lhs: RegOrZr::Reg(lhs),
-                                rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
+                                rhs: RegOrZr::Reg(rhs),
                             });
                         }
                     }
@@ -228,28 +233,35 @@ impl LowerBackend for AArch64Backend {
                                 shift,
                             });
                         } else {
+                            let rhs = ctx.put_value_in_reg(binary.rhs());
                             ctx.emit(MInst::AluRRR {
                                 op: alu_op(binary.op()),
                                 size,
                                 dst,
                                 lhs: RegOrZr::Reg(lhs),
-                                rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
+                                rhs: RegOrZr::Reg(rhs),
                             });
                         }
                     }
-                    BinaryOp::Mul => ctx.emit(MInst::AluRRR {
-                        op: alu_op(binary.op()),
-                        size,
-                        dst,
-                        lhs: RegOrZr::Reg(lhs),
-                        rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
-                    }),
-                    BinaryOp::Div => ctx.emit(MInst::SDiv {
-                        size,
-                        dst,
-                        lhs,
-                        rhs: ctx.put_value_in_reg(binary.rhs()),
-                    }),
+                    BinaryOp::Mul => {
+                        let rhs = ctx.put_value_in_reg(binary.rhs());
+                        ctx.emit(MInst::AluRRR {
+                            op: alu_op(binary.op()),
+                            size,
+                            dst,
+                            lhs: RegOrZr::Reg(lhs),
+                            rhs: RegOrZr::Reg(rhs),
+                        });
+                    }
+                    BinaryOp::Div => {
+                        let rhs = ctx.put_value_in_reg(binary.rhs());
+                        ctx.emit(MInst::SDiv {
+                            size,
+                            dst,
+                            lhs,
+                            rhs,
+                        });
+                    }
                     BinaryOp::Rem => {
                         let quotient = ctx.alloc_tmp(HirType::get_i32());
                         let rhs = ctx.put_value_in_reg(binary.rhs());
@@ -276,10 +288,11 @@ impl LowerBackend for AArch64Backend {
                         if let Some(imm) = rhs_imm.and_then(positive_imm12) {
                             ctx.emit(MInst::CmpImm { size, lhs, imm });
                         } else {
+                            let rhs = ctx.put_value_in_reg(binary.rhs());
                             ctx.emit(MInst::CmpRR {
                                 size,
                                 lhs,
-                                rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
+                                rhs: RegOrZr::Reg(rhs),
                             });
                         }
                         ctx.emit(MInst::CSet {
@@ -340,12 +353,13 @@ impl LowerBackend for AArch64Backend {
                     } else {
                         if let Some(shift) = stride_shift(stride) {
                             let next = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+                            let index = ctx.put_value_in_reg(index);
                             ctx.emit(MInst::AluRRRExtend {
                                 op: AluOp::Add,
                                 size: OperandSize::Size64,
                                 dst: Writable::from_reg(next),
                                 lhs: Gpr::Reg(address),
-                                rhs: ctx.put_value_in_reg(index),
+                                rhs: index,
                                 extend: ExtendOp::Sxtw,
                                 shift,
                             });
@@ -359,12 +373,13 @@ impl LowerBackend for AArch64Backend {
                             size: OperandSize::Size64,
                             dst: Writable::from_reg(extended),
                         });
+                        let index = ctx.put_value_in_reg(index);
                         ctx.emit(MInst::AluRRRExtend {
                             op: AluOp::Add,
                             size: OperandSize::Size64,
                             dst: Writable::from_reg(extended),
                             lhs: Gpr::Reg(extended),
-                            rhs: ctx.put_value_in_reg(index),
+                            rhs: index,
                             extend: ExtendOp::Sxtw,
                             shift: 0,
                         });
@@ -1151,10 +1166,11 @@ fn emit_store_at(
     offset: i64,
 ) {
     let memory_ty = memory_type(ty.kind());
+    let addr = memory_address(ctx, base, offset, memory_ty);
     ctx.emit(MInst::Store {
         ty: memory_ty,
         src,
-        addr: memory_address(ctx, base, offset, memory_ty),
+        addr,
     });
 }
 

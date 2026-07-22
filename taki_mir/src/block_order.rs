@@ -223,28 +223,28 @@ impl BlockLoweringOrder {
     }
 }
 
-fn outgoing_block_args<'a>(
-    arena: ArenaContext<'a>,
+fn outgoing_block_args(
+    arena: ArenaContext<'_>,
     terminator: HirInst,
     succ_idx: usize,
     expected_succ: HirBasicBlock,
-) -> &'a [HirInst] {
+) -> Vec<HirInst> {
     match arena.inst_data(terminator).kind() {
         InstKind::Branch(branch) => match succ_idx {
             0 => {
                 assert_eq!(branch.t_target(), expected_succ);
-                branch.t_args()
+                branch.t_args().to_vec()
             }
             1 => {
                 assert_eq!(branch.f_target(), expected_succ);
-                branch.f_args()
+                branch.f_args().to_vec()
             }
             _ => unreachable!("branch has exactly two successors"),
         },
         InstKind::Jump(jump) => {
             assert_eq!(succ_idx, 0, "jump has exactly one successor");
             assert_eq!(jump.target(), expected_succ);
-            jump.args()
+            jump.args().to_vec()
         }
         _ => unreachable!("CFG successor must come from a branch or jump terminator"),
     }

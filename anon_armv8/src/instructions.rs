@@ -162,14 +162,15 @@ pub struct UImm12Scaled {
 
 impl UImm12Scaled {
     pub const fn new(value: u64, access_size: u8) -> Option<Self> {
-        if !matches!(access_size, 4 | 8) || value % u64::from(access_size) != 0 {
+        let access_size = access_size as u64;
+        if !matches!(access_size, 4 | 8) || value % access_size != 0 {
             return None;
         }
-        let scaled = value / u64::from(access_size);
+        let scaled = value / access_size;
         if scaled <= 0xfff {
             Some(Self {
                 value: scaled as u16,
-                access_size,
+                access_size: access_size as u8,
             })
         } else {
             None
@@ -189,14 +190,15 @@ pub struct SImm7Scaled {
 
 impl SImm7Scaled {
     pub const fn new(value: i64, access_size: u8) -> Option<Self> {
-        if !matches!(access_size, 4 | 8) || value % i64::from(access_size) != 0 {
+        let access_size = access_size as i64;
+        if !matches!(access_size, 4 | 8) || value % access_size != 0 {
             return None;
         }
-        let scaled = value / i64::from(access_size);
-        if (-64..=63).contains(&scaled) {
+        let scaled = value / access_size;
+        if scaled >= -64 && scaled <= 63 {
             Some(Self {
                 value: scaled as i8,
-                access_size,
+                access_size: access_size as u8,
             })
         } else {
             None
@@ -577,7 +579,7 @@ impl MInst {
             } if matches!(lhs, Gpr::Zr) || !extended_alu_is_legal(*op, *size, *extend, *shift) => {
                 Err("invalid AArch64 extended-register ALU form")
             }
-            Self::Load { ty, addr, .. } | Self::Store { ty, addr }
+            Self::Load { ty, addr, .. } | Self::Store { ty, addr, .. }
                 if !amode_is_legal(addr, *ty) =>
             {
                 Err("invalid AArch64 memory address form")

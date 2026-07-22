@@ -2,7 +2,7 @@
 
 use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind, arena::Arena};
 use taki_mir::{
-    abi::RetPair,
+    abi::{CallArgPair, CallRetPair, RetPair},
     block_order::{LoweredBlock, MirBlockIndex},
     lower::{LowerBackend, LowerContext},
     prelude::HirFunctionData,
@@ -12,7 +12,7 @@ use taki_mir::{
 };
 
 use crate::{
-    instructions::{AluOp, Cond, FpuOp, Imm12, ImmLogic, ImmShift, MInst},
+    instructions::{AMode, AluOp, Cond, FpuOp, Imm12, ImmLogic, ImmShift, MInst, MemoryType},
     labels::Label,
     regs::{self, Gpr, OperandSize},
 };
@@ -182,6 +182,69 @@ impl LowerBackend for AArch64Backend {
                     }
                 }
             }
+            InstKind::Call(call) => {
+                let mut args = Vec::new();
+                let (mut int_index, mut float_index, mut stack_offset) = (0usize, 0usize, 0i64);
+                for &arg in call.args() {
+                    let src = ctx.put_value_in_reg(arg);
+                    match ctx.arena.inst_data(arg).ty().kind() {
+                        TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => {
+                            if let Some(&preg) = regs::INT_ARG_REGS.get(int_index) {
+                                args.push(CallArgPair { vreg: src, preg });
+                                int_index += 1;
+                            } else {
+                                ctx.emit(MInst::Store {
+                                    ty: memory_type(ctx.arena.inst_data(arg).ty().kind()),
+                                    src,
+                                    addr: AMode::OutgoingArg(stack_offset),
+                                });
+                                int_index += 1;
+                                stack_offset += 8;
+                            }
+                        }
+                        TypeKind::Float32 => {
+                            if let Some(&preg) = regs::FLOAT_ARG_REGS.get(float_index) {
+                                args.push(CallArgPair { vreg: src, preg });
+                                float_index += 1;
+                            } else {
+                                ctx.emit(MInst::Store {
+                                    ty: MemoryType::F32,
+                                    src,
+                                    addr: AMode::OutgoingArg(stack_offset),
+                                });
+                                float_index += 1;
+                                stack_offset += 8;
+                            }
+                        }
+                        ty => unreachable!("unsupported AArch64 call argument type: {ty:?}"),
+                    }
+                }
+                let ret = match ctx.arena.inst_data(inst).ty().kind() {
+                    TypeKind::Unit => None,
+                    TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => {
+                        Some(CallRetPair {
+                            vreg: Writable::from_reg(ctx.reg_map[&inst]),
+                            preg: regs::INT_RETURN_REG,
+                        })
+                    }
+                    TypeKind::Float32 => Some(CallRetPair {
+                        vreg: Writable::from_reg(ctx.reg_map[&inst]),
+                        preg: regs::FLOAT_RETURN_REG,
+                    }),
+                    ty => unreachable!("unsupported AArch64 call return type: {ty:?}"),
+                };
+                ctx.emit(MInst::Call {
+                    args,
+                    ret,
+                    clobbers: regs::DEFAULT_CLOBBERS,
+                    label: Label::from_function(call.callee()),
+                });
+                ctx.vcode.vcode.abi.set_has_calls();
+                ctx.vcode
+                    .vcode
+                    .abi
+                    .set_outgoing_arg_size(stack_offset as usize);
+            }
             InstKind::Return(ret) => {
                 if let Some(value) = ret.value() {
                     let src = ctx.put_value_in_reg(value);
@@ -332,6 +395,14 @@ fn integer_bits(value: i32, size: OperandSize) -> u64 {
     match size {
         OperandSize::Size32 => value as u32 as u64,
         OperandSize::Size64 => value as i64 as u64,
+    }
+}
+
+fn memory_type(ty: &TypeKind) -> MemoryType {
+    match ty {
+        TypeKind::Int32 => MemoryType::I32,
+        TypeKind::Pointer(_) | TypeKind::String => MemoryType::I64,
+        ty => unreachable!("unsupported AArch64 integer memory type: {ty:?}"),
     }
 }
 

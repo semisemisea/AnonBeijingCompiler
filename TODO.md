@@ -55,9 +55,10 @@
 - [x] Lower `scvtf` and `fcvtzs` casts.
 - [ ] Reject f32 remainder with an instruction-specific diagnostic unless an
   explicit runtime `fmodf` strategy is implemented.
-- [ ] Lower direct calls, mixed integer/float arguments, overflow stack
+- [x] Lower direct calls, mixed integer/float arguments, overflow stack
   arguments, and integer/pointer/f32 results.
-- [ ] Reject unsupported indirect calls with a concise code-generation error.
+- [x] Keep indirect calls unsupported; Raana HIR calls carry direct function
+  handles only.
 
 ## Memory And Data
 

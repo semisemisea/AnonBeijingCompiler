@@ -14,9 +14,6 @@
 
 ## Correctness Test Suite
 
-- [ ] Add generic MIR CFG tests for diamonds, loops, break/continue, critical
-  edges, loop-carried block parameters, and true/false edges with distinct
-  arguments.
 - [ ] Add VCode verification tests for CFG metadata, terminators, edge argument
   counts/classes, target instruction verification failures, and allocation
   write-back.

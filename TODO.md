@@ -58,6 +58,19 @@ Completed on 2026-07-22.
 - Added `anon_armv8::labels::Label` to emit MIR block, HIR function, and HIR
   global references through the shared `EmitContext`.
 
+### Phase 3 Foundation Complete: Typed Operands And MInst Model
+
+Completed on 2026-07-22.
+
+- Added `anon_armv8::instructions` as the sole typed AArch64 instruction model.
+- Added validated immediate and offset types, typed memory address modes,
+  condition/operation descriptors, and all planned MInst family data forms.
+- Added static MInst verification for width, extension shift, bit-test, and pair
+  memory-width invariants.
+- Deferred `MachInst` operand visiting and GNU emission until `AArch64Abi` is
+  introduced, because the public generic contract requires the ABI associated
+  type rather than a compatibility placeholder.
+
 ## Scope And Constraints
 
 ### In Scope

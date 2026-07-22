@@ -46,7 +46,7 @@
 - [ ] Select direct compare-to-branch, `cbz`/`cbnz`, and proven `tbz`/`tbnz`
   patterns without inserting a flags-clobbering instruction between producer
   and consumer.
-- [ ] Preserve generic edge-block ownership of block-parameter parallel copies
+- [x] Preserve generic edge-block ownership of block-parameter parallel copies
   and defer branch inversion/fallthrough elimination until layout is known.
 - [ ] Lower f32 constants through an assembler-valid constant-pool or
   relocatable-load scheme.
@@ -105,7 +105,7 @@
   block parameters, and true/false edges with different arguments.
 - [ ] Validate register-to-register, register-to-spill, spill-to-register, and
   spill-to-spill parallel-copy cycles using generic ABI move/spill hooks.
-- [ ] Support i32, pointer, and f32 block-parameter transfers with correct
+- [x] Support i32, pointer, and f32 block-parameter transfers with correct
   register classes and memory widths.
 - [ ] Remove unconditional jumps only when the successor is physically next and
   its edge has no required work.

@@ -703,10 +703,14 @@ impl LowerBackend for Riscv64Backend {
                 let bb_name = func_data.bb_data(*block).name().replace('%', "_");
                 format!(".L_{}", bb_name)
             }
-            LoweredBlock::Edge { pred, succ, .. } => {
+            LoweredBlock::Edge {
+                pred,
+                succ,
+                succ_idx,
+            } => {
                 let p = func_data.bb_data(*pred).name().replace('%', "_");
                 let s = func_data.bb_data(*succ).name().replace('%', "_");
-                format!(".L_{}_to_{}_edge", p, s)
+                format!(".L_{}_to_{}_edge_{}", p, s, succ_idx)
             }
         }
     }

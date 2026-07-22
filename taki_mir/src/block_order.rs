@@ -1,7 +1,7 @@
 //! The order of traversing basic blocks uses RPO of the dominance tree.
 use std::ops::Range;
 
-use raana_ir::opt::prelude::{IDAllocator, cfg, dom_tree};
+use raana_ir::opt::prelude::{cfg, dom_tree, IDAllocator};
 use rustc_hash::FxHashMap;
 
 pub type MirBlockIndex = crate::reg_alloc::index::Block;
@@ -88,13 +88,12 @@ impl BlockLoweringOrder {
 
         let rpo: Vec<HirBasicBlock> = domtree_rpo.iter().map(|&id| bb_id.search_id(id)).collect();
 
-        let mut in_degree: FxHashMap<HirBasicBlock, u32> = FxHashMap::default();
         let mut out_degree: FxHashMap<HirBasicBlock, u32> = FxHashMap::default();
         let mut lowered_order = Vec::new();
         let mut block_succ = Vec::new();
         let mut block_succ_range: FxHashMap<HirBasicBlock, Range<usize>> = FxHashMap::default();
 
-        // Count in-degree and out-degree
+        // Record each original CFG successor in terminator successor order.
         for bb_layout in arena.f().layout().basicblocks() {
             let succ_start_index = block_succ.len();
             let bb = bb_layout.bb();
@@ -104,7 +103,6 @@ impl BlockLoweringOrder {
             out_degree.entry(bb).or_insert(0);
             for succ in term_data.bb_usage() {
                 *out_degree.get_mut(&bb).unwrap() += 1;
-                *in_degree.entry(succ).or_insert(0) += 1;
                 block_succ.push(LoweredBlock::Orig { block: succ });
             }
 
@@ -123,13 +121,43 @@ impl BlockLoweringOrder {
                 let succs = block_succ[range].iter_mut().enumerate();
                 for (succ_idx, lowered_block) in succs {
                     let orig = lowered_block.orig_block().unwrap();
-                    if in_degree[&orig] > 1 {
-                        *lowered_block = LoweredBlock::Edge {
+                    let terminator = *arena
+                        .f()
+                        .layout()
+                        .basicblock(bb)
+                        .insts()
+                        .get_last()
+                        .unwrap();
+                    let args = outgoing_block_args(arena, terminator, succ_idx, orig);
+                    let params = arena.f().bb_data(orig).params();
+                    assert_eq!(
+                        args.len(),
+                        params.len(),
+                        "edge arguments must match successor block parameters"
+                    );
+                    for (&arg, &param) in args.iter().zip(params) {
+                        assert_eq!(
+                            arena.inst_data(arg).ty(),
+                            arena.inst_data(param).ty(),
+                            "edge arguments must have the type of their successor block parameter"
+                        );
+                    }
+
+                    // A multi-way terminator cannot own a parallel copy for just one
+                    // outgoing edge. Materialize every value-carrying edge, even if
+                    // the destination has only one predecessor.
+                    if !args.is_empty() || !params.is_empty() {
+                        let edge = LoweredBlock::Edge {
                             pred: bb,
                             succ: orig,
                             succ_idx: succ_idx as u32,
                         };
-                        lowered_order.push(*lowered_block);
+                        assert!(
+                            !lowered_order.contains(&edge),
+                            "each source successor index must produce a distinct edge block"
+                        );
+                        *lowered_block = edge;
+                        lowered_order.push(edge);
                     }
                 }
             }
@@ -192,5 +220,32 @@ impl BlockLoweringOrder {
     pub fn succ_indices(&self, block: MirBlockIndex) -> (Option<HirInst>, &[MirBlockIndex]) {
         let (opt_inst, range) = &self.lowered_succ_ranges[block.index()];
         (*opt_inst, &self.lowered_succ_indices[range.clone()])
+    }
+}
+
+fn outgoing_block_args<'a>(
+    arena: ArenaContext<'a>,
+    terminator: HirInst,
+    succ_idx: usize,
+    expected_succ: HirBasicBlock,
+) -> &'a [HirInst] {
+    match arena.inst_data(terminator).kind() {
+        InstKind::Branch(branch) => match succ_idx {
+            0 => {
+                assert_eq!(branch.t_target(), expected_succ);
+                branch.t_args()
+            }
+            1 => {
+                assert_eq!(branch.f_target(), expected_succ);
+                branch.f_args()
+            }
+            _ => unreachable!("branch has exactly two successors"),
+        },
+        InstKind::Jump(jump) => {
+            assert_eq!(succ_idx, 0, "jump has exactly one successor");
+            assert_eq!(jump.target(), expected_succ);
+            jump.args()
+        }
+        _ => unreachable!("CFG successor must come from a branch or jump terminator"),
     }
 }

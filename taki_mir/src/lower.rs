@@ -269,7 +269,10 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                     self.lower_branch::<B>(branch_inst, block_index, &targets_buffer);
                     self.finish_ir_inst();
                 } else {
-                    let succ = self.vcode.block_order().succ_indices(block_index).1[0];
+                    let succs = self.vcode.block_order().succ_indices(block_index).1;
+                    let &[succ] = succs else {
+                        unreachable!("non-branch block must have exactly one successor")
+                    };
                     B::emit_long_jump(&mut self, succ);
                     self.finish_ir_inst();
                     self.lower_branch_blockparam_args_move(block_index);
@@ -404,14 +407,39 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     ) -> (MirBlockIndex, &'a [Reg]) {
         let block_order = self.vcode.block_order();
         let (_, succs) = block_order.succ_indices(block);
+        assert!(succ_idx < succs.len(), "successor index must be valid");
         let succ = succs[succ_idx];
         let this_lb = block_order.lowered_order()[block.index()];
         let succ_lb = block_order.lowered_order()[succ.index()];
         let (branch_inst, succ_idx) = match (this_lb, succ_lb) {
-            (_, LoweredBlock::Edge { .. }) => {
+            (
+                LoweredBlock::Orig { block: pred },
+                LoweredBlock::Edge {
+                    pred: edge_pred,
+                    succ_idx: edge_succ_idx,
+                    ..
+                },
+            ) => {
+                assert_eq!(pred, edge_pred, "edge must be owned by its predecessor");
+                assert_eq!(
+                    succ_idx, edge_succ_idx as usize,
+                    "edge must retain its source successor index"
+                );
                 return (succ, &[]);
             }
-            (LoweredBlock::Edge { pred, succ_idx, .. }, _) => {
+            (LoweredBlock::Edge { .. }, LoweredBlock::Edge { .. }) => {
+                unreachable!("edge blocks must not target edge blocks")
+            }
+            (
+                LoweredBlock::Edge {
+                    pred,
+                    succ: edge_succ,
+                    succ_idx: source_succ_idx,
+                },
+                LoweredBlock::Orig { block: target },
+            ) => {
+                assert_eq!(edge_succ, target, "edge must target its recorded successor");
+                assert_eq!(succ_idx, 0, "edge block must have one successor");
                 let branch = *self
                     .arena
                     .f()
@@ -420,15 +448,14 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                     .insts()
                     .get_last()
                     .unwrap();
-                (branch, succ_idx as usize)
+                (branch, source_succ_idx as usize)
             }
-            (this, _) => {
-                let block = this.orig_block().unwrap();
+            (LoweredBlock::Orig { block: orig }, _) => {
                 let branch = *self
                     .arena
                     .f()
                     .layout()
-                    .basicblock(block)
+                    .basicblock(orig)
                     .insts()
                     .get_last()
                     .unwrap();
@@ -440,15 +467,45 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         // Magic match
         let args: SmallVec<[HirInst; 16]> = match block_param.kind() {
             InstKind::Branch(branch) => match succ_idx {
-                0 => branch.t_args().iter().copied().collect(),
-                1 => branch.f_args().iter().copied().collect(),
+                0 => {
+                    assert_eq!(branch.t_target(), lowered_hir_block(succ_lb));
+                    branch.t_args().iter().copied().collect()
+                }
+                1 => {
+                    assert_eq!(branch.f_target(), lowered_hir_block(succ_lb));
+                    branch.f_args().iter().copied().collect()
+                }
                 _ => unreachable!(),
             },
-            InstKind::Jump(jump) => jump.args().iter().copied().collect(),
+            InstKind::Jump(jump) => {
+                assert_eq!(succ_idx, 0, "jump has exactly one successor");
+                assert_eq!(jump.target(), lowered_hir_block(succ_lb));
+                jump.args().iter().copied().collect()
+            }
             _ => unreachable!(),
         };
 
-        for arg in args {
+        let params: SmallVec<[HirInst; 16]> = self
+            .arena
+            .bb_data(lowered_hir_block(succ_lb))
+            .params()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            args.len(),
+            params.len(),
+            "edge arguments must match block parameters"
+        );
+        for (&arg, &param) in args.iter().zip(params.iter()) {
+            assert_eq!(
+                self.arena.inst_data(arg).ty(),
+                self.arena.inst_data(param).ty(),
+                "edge argument type must match block parameter type"
+            );
+        }
+
+        for (arg_idx, arg) in args.into_iter().enumerate() {
             // INFO: inline method of [put_value_in_reg]
             // I don't know what the fuck the borrow checker is doing.
             // Partial borrow when?
@@ -465,6 +522,12 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 self.rematerialize_if_needed(inst, reg, use_count);
                 reg
             };
+            let param_reg = self.reg_map[&params[arg_idx]];
+            assert_eq!(
+                reg.class(),
+                param_reg.class(),
+                "edge argument and block parameter must use compatible register classes"
+            );
             buffer.push(reg);
         }
         (succ, &buffer[..])
@@ -647,4 +710,10 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     fn finish_bb(&mut self) {
         self.vcode.end_bb()
     }
+}
+
+fn lowered_hir_block(lb: LoweredBlock) -> HirBasicBlock {
+    lb.succ_block()
+        .or_else(|| lb.orig_block())
+        .expect("lowered successor has an HIR block")
 }

@@ -107,10 +107,22 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
                         let crate::reg_alloc::reg::Edit::Move { from, to } = edit;
                         match (from.as_reg(), to.as_reg()) {
                             (Some(from_reg), Some(to_reg)) => {
+                                assert_eq!(
+                                    from_reg.class(),
+                                    to_reg.class(),
+                                    "register-to-register allocation moves cannot cross register classes"
+                                );
+                                let ty = match from_reg.class() {
+                                    RegClass::Float => crate::types::F32,
+                                    RegClass::Int => crate::types::I64,
+                                    RegClass::Vector => {
+                                        unreachable!("vector register moves are unsupported")
+                                    }
+                                };
                                 let mv = S::<B>::gen_move(
                                     Reg::from_physical_reg(from_reg),
                                     Reg::from_physical_reg(to_reg),
-                                    crate::types::I64,
+                                    ty,
                                 );
                                 self.write_inst(frame, &mv);
                             }

@@ -557,10 +557,15 @@ impl LowerBackend for AArch64Backend {
             LoweredBlock::Orig { block } => {
                 format!(".L_{}", func_data.bb_data(*block).name().replace('%', "_"))
             }
-            LoweredBlock::Edge { pred, succ, .. } => format!(
-                ".L_{}_to_{}_edge",
+            LoweredBlock::Edge {
+                pred,
+                succ,
+                succ_idx,
+            } => format!(
+                ".L_{}_to_{}_edge_{}",
                 func_data.bb_data(*pred).name().replace('%', "_"),
-                func_data.bb_data(*succ).name().replace('%', "_")
+                func_data.bb_data(*succ).name().replace('%', "_"),
+                succ_idx
             ),
         }
     }

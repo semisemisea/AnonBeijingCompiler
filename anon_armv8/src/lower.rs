@@ -30,7 +30,6 @@ impl LowerBackend for AArch64Backend {
             | InstKind::Aggregate(..)
             | InstKind::GlobalAlloc(..)
             | InstKind::Undef
-            | InstKind::ZeroInit
             | InstKind::Integer(..)
             | InstKind::Float(..) => {
                 unreachable!("constants and argument references are rematerialized by LowerContext")
@@ -182,6 +181,97 @@ impl LowerBackend for AArch64Backend {
                     }
                 }
             }
+            InstKind::Alloc => {
+                let dst = Writable::from_reg(ctx.reg_map[&inst]);
+                let pointee = ctx.arena.inst_data(inst).ty().derefernce();
+                let offset = i64::from(ctx.alloc_stackslot_or_get(inst, pointee));
+                emit_stack_address(ctx, dst, offset);
+            }
+            InstKind::GetElemPtr(gep) => {
+                let dst = Writable::from_reg(ctx.reg_map[&inst]);
+                let mut current_ty = ctx.arena.inst_data(gep.base()).ty().clone();
+                let mut address = ctx.put_value_in_reg(gep.base());
+
+                for &index in gep.offsets() {
+                    let element_ty = if current_ty.is_pointer() {
+                        current_ty.derefernce()
+                    } else {
+                        current_ty.get_array_elem_ty()
+                    };
+                    let stride = element_ty.size() as i64;
+                    current_ty = element_ty;
+
+                    if let Some(value) = integer_constant(ctx, index) {
+                        let byte_offset = i64::from(value) * stride;
+                        let next = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+                        emit_add_offset(ctx, Writable::from_reg(next), address, byte_offset);
+                        address = next;
+                    } else {
+                        // Indices are i32 in Raana IR. Sign-extend before the
+                        // multiply so negative indices retain GEP semantics.
+                        let extended = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+                        ctx.emit(MInst::AluRRRExtend {
+                            op: AluOp::Add,
+                            size: OperandSize::Size64,
+                            dst: Writable::from_reg(extended),
+                            lhs: Gpr::Zr,
+                            rhs: ctx.put_value_in_reg(index),
+                            extend: crate::instructions::ExtendOp::Sxtw,
+                            shift: 0,
+                        });
+                        let byte_offset = if stride == 1 {
+                            extended
+                        } else {
+                            let scale = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+                            ctx.emit(MInst::LoadImm {
+                                size: OperandSize::Size64,
+                                dst: Writable::from_reg(scale),
+                                value: stride as u64,
+                            });
+                            let product = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+                            ctx.emit(MInst::AluRRR {
+                                op: AluOp::Mul,
+                                size: OperandSize::Size64,
+                                dst: Writable::from_reg(product),
+                                lhs: extended,
+                                rhs: scale,
+                            });
+                            product
+                        };
+                        let next = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+                        ctx.emit(MInst::AluRRR {
+                            op: AluOp::Add,
+                            size: OperandSize::Size64,
+                            dst: Writable::from_reg(next),
+                            lhs: address,
+                            rhs: byte_offset,
+                        });
+                        address = next;
+                    }
+                }
+                assert_eq!(
+                    current_ty.reference(),
+                    ctx.arena.inst_data(inst).ty().clone()
+                );
+                ctx.emit(MInst::Mov {
+                    size: OperandSize::Size64,
+                    dst,
+                    src: address,
+                });
+            }
+            InstKind::Load(load) => {
+                let dst = Writable::from_reg(ctx.reg_map[&inst]);
+                let src = ctx.put_value_in_reg(load.src());
+                ctx.emit(MInst::Load {
+                    ty: memory_type(ctx.arena.inst_data(inst).ty().kind()),
+                    dst,
+                    addr: AMode::Reg {
+                        base: Gpr::Reg(src),
+                    },
+                });
+            }
+            InstKind::Store(store) => lower_store(ctx, store.src(), store.dest()),
+            InstKind::ZeroInit => unreachable!("zero initialization is lowered by its store"),
             InstKind::Call(call) => {
                 let mut args = Vec::new();
                 let (mut int_index, mut float_index, mut stack_offset) = (0usize, 0usize, 0i64);
@@ -401,8 +491,196 @@ fn integer_bits(value: i32, size: OperandSize) -> u64 {
 fn memory_type(ty: &TypeKind) -> MemoryType {
     match ty {
         TypeKind::Int32 => MemoryType::I32,
+        TypeKind::Float32 => MemoryType::F32,
         TypeKind::Pointer(_) | TypeKind::String => MemoryType::I64,
         ty => unreachable!("unsupported AArch64 integer memory type: {ty:?}"),
+    }
+}
+
+fn lower_store(
+    ctx: &mut LowerContext<'_, MInst>,
+    src: raana_ir::opt::prelude::Inst,
+    dest: raana_ir::opt::prelude::Inst,
+) {
+    let base = ctx.put_value_in_reg(dest);
+    match ctx.arena.inst_data(src).kind().clone() {
+        InstKind::Aggregate(aggregate) => {
+            let mut offset = 0i64;
+            for value in aggregate.flatten(&ctx.arena) {
+                let ty = ctx.arena.inst_data(value).ty().clone();
+                if matches!(ctx.arena.inst_data(value).kind(), InstKind::ZeroInit) {
+                    emit_zero_init(ctx, base, &ty, offset);
+                } else {
+                    let value = ctx.put_value_in_reg(value);
+                    emit_store_at(ctx, value, &ty, base, offset);
+                }
+                offset += ty.size() as i64;
+            }
+        }
+        InstKind::ZeroInit => {
+            let ty = ctx.arena.inst_data(src).ty().clone();
+            emit_zero_init(ctx, base, &ty, 0);
+        }
+        _ => {
+            let ty = ctx.arena.inst_data(src).ty().clone();
+            let value = ctx.put_value_in_reg(src);
+            emit_store_at(ctx, value, &ty, base, 0);
+        }
+    }
+}
+
+fn emit_zero_init(
+    ctx: &mut LowerContext<'_, MInst>,
+    base: taki_mir::register::Reg,
+    ty: &HirType,
+    offset: i64,
+) {
+    match ty.kind() {
+        TypeKind::Array(element, len) => {
+            let stride = element.size() as i64;
+            for index in 0..*len {
+                emit_zero_init(ctx, base, element, offset + index as i64 * stride);
+            }
+        }
+        TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => {
+            let zero = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+            ctx.emit(MInst::MovFromZero {
+                size: if matches!(ty.kind(), TypeKind::Int32) {
+                    OperandSize::Size32
+                } else {
+                    OperandSize::Size64
+                },
+                dst: Writable::from_reg(zero),
+            });
+            emit_store_at(ctx, zero, ty, base, offset);
+        }
+        TypeKind::Float32 => {
+            let zero = ctx.alloc_tmp(HirType::get_f32());
+            ctx.emit(MInst::FMovFromZero {
+                dst: Writable::from_reg(zero),
+            });
+            emit_store_at(ctx, zero, ty, base, offset);
+        }
+        ty => unreachable!("cannot zero-initialize AArch64 type: {ty:?}"),
+    }
+}
+
+fn emit_store_at(
+    ctx: &mut LowerContext<'_, MInst>,
+    src: taki_mir::register::Reg,
+    ty: &HirType,
+    base: taki_mir::register::Reg,
+    offset: i64,
+) {
+    let memory_ty = memory_type(ty.kind());
+    ctx.emit(MInst::Store {
+        ty: memory_ty,
+        src,
+        addr: memory_address(ctx, base, offset, memory_ty),
+    });
+}
+
+fn memory_address(
+    ctx: &mut LowerContext<'_, MInst>,
+    base: taki_mir::register::Reg,
+    offset: i64,
+    ty: MemoryType,
+) -> AMode {
+    if offset == 0 {
+        return AMode::Reg {
+            base: Gpr::Reg(base),
+        };
+    }
+    if offset > 0 {
+        if let Some(offset) = crate::instructions::UImm12Scaled::new(offset as u64, ty.byte_size())
+        {
+            return AMode::UnsignedOffset {
+                base: Gpr::Reg(base),
+                offset,
+            };
+        }
+    }
+    if let Ok(offset) = i16::try_from(offset) {
+        if let Some(offset) = crate::instructions::SImm9::new(offset) {
+            return AMode::SignedOffset {
+                base: Gpr::Reg(base),
+                offset,
+            };
+        }
+    }
+
+    let address = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+    emit_add_offset(ctx, Writable::from_reg(address), base, offset);
+    AMode::Reg {
+        base: Gpr::Reg(address),
+    }
+}
+
+fn emit_stack_address(
+    ctx: &mut LowerContext<'_, MInst>,
+    dst: Writable<taki_mir::register::Reg>,
+    offset: i64,
+) {
+    if let Some((AluOp::Add, imm)) = add_sub_immediate(BinaryOp::Add, i32::try_from(offset).ok()) {
+        ctx.emit(MInst::AluRRImm12 {
+            op: AluOp::Add,
+            size: OperandSize::Size64,
+            dst,
+            src: Gpr::Sp,
+            imm,
+        });
+    } else {
+        let constant = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+        ctx.emit(MInst::LoadImm {
+            size: OperandSize::Size64,
+            dst: Writable::from_reg(constant),
+            value: offset as u64,
+        });
+        // The regular three-register form cannot name SP as its left operand.
+        let sp_copy = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+        ctx.emit(MInst::MovPhys {
+            size: OperandSize::Size64,
+            dst: Gpr::Reg(sp_copy),
+            src: Gpr::Sp,
+        });
+        ctx.emit(MInst::AluRRR {
+            op: AluOp::Add,
+            size: OperandSize::Size64,
+            dst,
+            lhs: sp_copy,
+            rhs: constant,
+        });
+    }
+}
+
+fn emit_add_offset(
+    ctx: &mut LowerContext<'_, MInst>,
+    dst: Writable<taki_mir::register::Reg>,
+    base: taki_mir::register::Reg,
+    offset: i64,
+) {
+    if let Some((op, imm)) = add_sub_immediate(BinaryOp::Add, i32::try_from(offset).ok()) {
+        ctx.emit(MInst::AluRRImm12 {
+            op,
+            size: OperandSize::Size64,
+            dst,
+            src: Gpr::Reg(base),
+            imm,
+        });
+    } else {
+        let constant = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+        ctx.emit(MInst::LoadImm {
+            size: OperandSize::Size64,
+            dst: Writable::from_reg(constant),
+            value: offset as u64,
+        });
+        ctx.emit(MInst::AluRRR {
+            op: AluOp::Add,
+            size: OperandSize::Size64,
+            dst,
+            lhs: base,
+            rhs: constant,
+        });
     }
 }
 

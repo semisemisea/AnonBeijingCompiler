@@ -473,6 +473,9 @@ pub enum MInst {
         dst: WritableReg,
         src: Reg,
     },
+    FMovFromZero {
+        dst: WritableReg,
+    },
     FAlu {
         op: FpuOp,
         dst: WritableReg,
@@ -648,6 +651,7 @@ impl MachInst for MInst {
             | Self::MovZ { dst, .. }
             | Self::MovN { dst, .. }
             | Self::MovFromZero { dst, .. }
+            | Self::FMovFromZero { dst }
             | Self::LoadAddr { dst, .. }
             | Self::CSet { dst, .. } => collector.reg_def(dst),
             Self::MovK { dst, src, .. } => {
@@ -1046,6 +1050,11 @@ impl MachInstEmit for MInst {
                 write!(ctx, ", {}", cond_name(*cond))
             }
             Self::FMov { dst, src } => emit_fmov(ctx, dst.to_reg(), src),
+            Self::FMovFromZero { dst } => {
+                write!(ctx, "fmov ")?;
+                emit_float_reg(ctx, dst.to_reg(), false)?;
+                write!(ctx, ", wzr")
+            }
             Self::FAlu { op, dst, lhs, rhs } => {
                 emit_float_rrr(ctx, fpu_name(*op), dst.to_reg(), lhs, rhs)
             }

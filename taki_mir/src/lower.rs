@@ -598,6 +598,14 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         self.vregs_alloc.alloc(ty.into())
     }
 
+    /// Allocate (or retrieve) a stack slot owned by an HIR `Alloc`.
+    ///
+    /// Backends must use this rather than reaching through the VCode builder so
+    /// that stack-frame ownership remains part of the generic lowering API.
+    pub fn alloc_stackslot_or_get(&mut self, alloc: HirInst, ty: HirType) -> u32 {
+        self.vcode.vcode.abi.alloc_stackslot_or_get(alloc, ty)
+    }
+
     pub fn emit(&mut self, mach_inst: I) {
         trace!("emit mach inst {:?}", mach_inst);
         self.ir_inst.push(mach_inst);

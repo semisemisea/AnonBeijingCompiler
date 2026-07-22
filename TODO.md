@@ -62,21 +62,22 @@
 
 ## Memory And Data
 
-- [ ] Lower `Alloc` into generic fixed frame-object requests with target size
+- [x] Lower `Alloc` into generic fixed frame-object requests with target size
   and alignment for i32, f32, pointers, strings, arrays, and nested arrays.
-- [ ] Lower typed i32, pointer/i64, and f32 loads/stores for locals, GEPs,
+- [x] Lower typed i32, pointer/i64, and f32 loads/stores for locals, GEPs,
   globals, incoming arguments, outgoing arguments, and spill slots.
-- [ ] Select direct unsigned-scaled and signed-unscaled offsets before register,
+- [x] Select direct unsigned-scaled and signed-unscaled offsets before register,
   scaled-register, extended-register, or late scratch-address forms.
-- [ ] Keep program-memory metadata distinct from spill-memory metadata.
-- [ ] Audit GEP semantics against `raana_ir/src/llvm/writer.rs`.
-- [ ] Lower folded constant GEP offsets, dynamic i32 indices, widened indices,
+- [x] Keep program-memory selection distinct from generic ABI spill-memory
+  hooks.
+- [x] Audit GEP semantics against `raana_ir/src/llvm/writer.rs`.
+- [x] Lower folded constant GEP offsets, dynamic i32 indices, widened indices,
   power-of-two scaled indexing, non-power-of-two multiply-add indexing, and
   nested array indexing.
-- [ ] Materialize global addresses with `adrp` plus `:lo12:`.
-- [ ] Lower scalar and nested aggregate global initialization through generic
+- [x] Materialize global addresses with `adrp` plus `:lo12:`.
+- [x] Lower scalar and nested aggregate global initialization through generic
   global emission.
-- [ ] Lower local aggregate and zero initialization completely before optional
+- [x] Lower local aggregate and zero initialization completely before optional
   store-pair, memset, or loop-fill optimization.
 
 ## ABI, Frames, And Late Legalization

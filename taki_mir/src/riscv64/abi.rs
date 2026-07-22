@@ -1,4 +1,4 @@
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 
 use crate::{
     abi::{ABIMachineSpec, ArgSlot, FrameLayout},
@@ -8,9 +8,9 @@ use crate::{
         instructions::{AMode, AluRRImm12OP, Imm12, LoadOP, MInst, StoreOP},
         labels::Label,
         regs::{
-            fp_reg, link_reg, pf_reg, pv_reg, px_reg, stack_reg, writable_fp_reg,
-            writable_link_reg, writable_spilltmp_reg, writable_spilltmp_reg2, writable_stack_reg,
-            ARG_REG, FARG_REG,
+            ARG_REG, FARG_REG, fp_reg, link_reg, pf_reg, pv_reg, px_reg, stack_reg,
+            writable_fp_reg, writable_link_reg, writable_spilltmp_reg, writable_spilltmp_reg2,
+            writable_stack_reg,
         },
     },
 };

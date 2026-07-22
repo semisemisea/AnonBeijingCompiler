@@ -1,7 +1,7 @@
 //! The order of traversing basic blocks uses RPO of the dominance tree.
 use std::ops::Range;
 
-use raana_ir::opt::prelude::{cfg, dom_tree, IDAllocator};
+use raana_ir::opt::prelude::{IDAllocator, cfg, dom_tree};
 use rustc_hash::FxHashMap;
 
 pub type MirBlockIndex = crate::reg_alloc::index::Block;

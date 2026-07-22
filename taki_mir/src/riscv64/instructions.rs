@@ -5,7 +5,7 @@ use crate::{
     reg_alloc::reg::{OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
     riscv64::{abi::Riscv64ABI, labels::Label},
-    types::{LoweredType, F32, I32, I64},
+    types::{F32, I32, I64, LoweredType},
     vcode::{CallType, EmitContext, MachInst, MachInstEmit, MachTerminator},
 };
 

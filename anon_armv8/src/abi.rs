@@ -1,13 +1,13 @@
 //! AAPCS64 calling convention and frame hooks for AArch64.
 
 use raana_ir::ir::arena::Arena;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use taki_mir::{
     abi::{ABIMachineSpec, ArgSlot, FrameLayout, StackAMode},
     prelude::ArenaContext,
     reg_alloc::reg::{MachineEnv, PReg, RegClass},
     register::{Reg, Writable},
-    types::{LoweredType, F32, I32, I64},
+    types::{F32, I32, I64, LoweredType},
 };
 
 use crate::{

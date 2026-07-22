@@ -2,8 +2,8 @@ use std::marker::PhantomData;
 use std::num::NonZeroU64;
 
 use rustc_hash::FxHashMap;
-use smallvec::{smallvec, SmallVec};
-use tomori_utils::{entity_impl, PrimaryMap, SecondaryMap};
+use smallvec::{SmallVec, smallvec};
+use tomori_utils::{PrimaryMap, SecondaryMap, entity_impl};
 
 use crate::prelude::*;
 use crate::reg_alloc::reg::{MachineEnv, PReg, RegClass};

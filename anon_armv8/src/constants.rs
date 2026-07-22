@@ -1,6 +1,6 @@
 //! Shared AArch64 integer constant planning.
 
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use taki_mir::register::{Reg, Writable};
 
 use crate::{

@@ -30,15 +30,15 @@
 
 ## Selector
 
-- [ ] Audit and correct scalar integer/pointer lowering instruction order for
+- [x] Audit and correct scalar integer/pointer lowering instruction order for
   reverse VCode construction, including remainder's `sdiv` + `msub` sequence,
   compare-plus-`cset`, and return-value setup.
 - [ ] Lower i32 and pointer constants through the shared constant planner with
   correct 32-bit and 64-bit widths.
-- [ ] Select add/sub immediates, including negated-immediate conversion.
-- [ ] Select logical immediates, zero-register forms, immediate shifts,
-  shifted-register arithmetic, and extended-register address arithmetic when
-  legal.
+- [x] Select add/sub immediates, including negated-immediate conversion.
+- [x] Select logical immediates and immediate shifts when legal.
+- [ ] Select zero-register forms, shifted-register arithmetic, and
+  extended-register address arithmetic when legal.
 - [ ] Add safe `madd` and `msub` fusion only when the multiply result has no
   independent use.
 - [ ] Introduce selector-level conditions for zero/nonzero, NZCV flags, and

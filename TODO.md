@@ -83,6 +83,22 @@ Completed on 2026-07-22.
 - Deferred post-RA frame/address legalization until the ABI supplies finalized
   frame offsets and the generic emitter can consume the resulting MInst stream.
 
+### ABI Interface Complete: AAPCS64 And VCode MInst Contract
+
+Completed on 2026-07-22.
+
+- Added `AArch64Abi: ABIMachineSpec<I = MInst>` with independent AAPCS64
+  integer and float argument windows, eight-byte scalar overflow slots, stack
+  and spill hooks, frame setup/teardown, and deterministic callee-save hooks.
+- Completed `MInst: MachInst<ABISpec = AArch64Abi> + MachInstEmit`, including
+  operand visitation, fixed ABI operands, `MovK` reuse, call clobbers,
+  terminator metadata, typed GNU emission, and symbolic labels.
+- Added typed `LoadImm` expansion and `adrp`/`:lo12:` address emission without
+  creating an allocator-visible temporary or a separate post-RA emitter.
+- Left arbitrary large finalized frame offsets for the planned late
+  legalization pass; no target-local frame or allocation compatibility path was
+  introduced.
+
 ## Scope And Constraints
 
 ### In Scope

@@ -1533,6 +1533,11 @@ impl OperandVisitor for OperandWriter<'_> {
             _ => {}
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn allocation_cursor_checks_location_consumption() {

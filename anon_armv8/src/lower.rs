@@ -12,9 +12,11 @@ use taki_mir::{
 };
 
 use crate::{
-    instructions::{AMode, AluOp, Cond, FpuOp, Imm12, ImmLogic, ImmShift, MInst, MemoryType},
+    instructions::{
+        AMode, AluOp, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift, MInst, MemoryType, ShiftOp,
+    },
     labels::Label,
-    regs::{self, Gpr, OperandSize},
+    regs::{self, Gpr, OperandSize, RegOrZr},
 };
 
 pub struct AArch64Backend;
@@ -72,7 +74,31 @@ impl LowerBackend for AArch64Backend {
 
                 match binary.op() {
                     BinaryOp::Add | BinaryOp::Sub => {
-                        if let Some((op, imm)) = add_sub_immediate(binary.op(), rhs_imm) {
+                        if binary.op() == BinaryOp::Add
+                            && integer_constant(ctx, binary.lhs()) == Some(0)
+                        {
+                            ctx.emit(MInst::Mov {
+                                size,
+                                dst,
+                                src: ctx.put_value_in_reg(binary.rhs()),
+                            });
+                        } else if rhs_imm == Some(0) {
+                            ctx.emit(MInst::Mov {
+                                size,
+                                dst,
+                                src: lhs,
+                            });
+                        } else if binary.op() == BinaryOp::Sub
+                            && integer_constant(ctx, binary.lhs()) == Some(0)
+                        {
+                            ctx.emit(MInst::AluRRR {
+                                op: AluOp::Sub,
+                                size,
+                                dst,
+                                lhs: RegOrZr::Zr,
+                                rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
+                            });
+                        } else if let Some((op, imm)) = add_sub_immediate(binary.op(), rhs_imm) {
                             ctx.emit(MInst::AluRRImm12 {
                                 op,
                                 size,
@@ -80,34 +106,79 @@ impl LowerBackend for AArch64Backend {
                                 src: Gpr::Reg(lhs),
                                 imm,
                             });
+                        } else if let Some((rhs, shift, amount)) =
+                            fold_shifted_rhs(ctx, inst, binary.rhs(), size)
+                        {
+                            ctx.emit(MInst::AluRRRShift {
+                                op: alu_op(binary.op()),
+                                size,
+                                dst,
+                                lhs: RegOrZr::Reg(lhs),
+                                rhs: RegOrZr::Reg(rhs),
+                                shift,
+                                amount,
+                            });
                         } else {
                             ctx.emit(MInst::AluRRR {
                                 op: alu_op(binary.op()),
                                 size,
                                 dst,
-                                lhs,
-                                rhs: ctx.put_value_in_reg(binary.rhs()),
+                                lhs: RegOrZr::Reg(lhs),
+                                rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
                             });
                         }
                     }
                     BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
-                        if let Some(imm) =
+                        let lhs_imm = integer_constant(ctx, binary.lhs());
+                        if binary.op() == BinaryOp::And
+                            && (lhs_imm == Some(0) || rhs_imm == Some(0))
+                        {
+                            ctx.emit(MInst::MovFromZero { size, dst });
+                        } else if matches!(binary.op(), BinaryOp::Or | BinaryOp::Xor)
+                            && lhs_imm == Some(0)
+                        {
+                            ctx.emit(MInst::Mov {
+                                size,
+                                dst,
+                                src: ctx.put_value_in_reg(binary.rhs()),
+                            });
+                        } else if matches!(binary.op(), BinaryOp::Or | BinaryOp::Xor)
+                            && rhs_imm == Some(0)
+                        {
+                            ctx.emit(MInst::Mov {
+                                size,
+                                dst,
+                                src: lhs,
+                            });
+                        } else if let Some(imm) =
                             rhs_imm.and_then(|value| ImmLogic::new(integer_bits(value, size), size))
                         {
                             ctx.emit(MInst::AluRRImmLogic {
                                 op: alu_op(binary.op()),
                                 size,
                                 dst,
-                                src: Gpr::Reg(lhs),
+                                src: RegOrZr::Reg(lhs),
                                 imm,
+                            });
+                        } else if let Some((rhs, shift, amount)) =
+                            fold_shifted_rhs(ctx, inst, binary.rhs(), size)
+                        {
+                            ctx.emit(MInst::AluRRRShift {
+                                op: alu_op(binary.op()),
+                                size,
+                                dst,
+                                lhs: RegOrZr::Reg(lhs),
+                                rhs: RegOrZr::Reg(rhs),
+                                shift,
+                                amount,
                             });
                         } else {
                             ctx.emit(MInst::AluRRR {
                                 op: alu_op(binary.op()),
                                 size,
                                 dst,
-                                lhs,
-                                rhs: ctx.put_value_in_reg(binary.rhs()),
+                                lhs: RegOrZr::Reg(lhs),
+                                rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
                             });
                         }
                     }
@@ -128,8 +199,8 @@ impl LowerBackend for AArch64Backend {
                                 op: alu_op(binary.op()),
                                 size,
                                 dst,
-                                lhs,
-                                rhs: ctx.put_value_in_reg(binary.rhs()),
+                                lhs: RegOrZr::Reg(lhs),
+                                rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
                             });
                         }
                     }
@@ -137,8 +208,8 @@ impl LowerBackend for AArch64Backend {
                         op: alu_op(binary.op()),
                         size,
                         dst,
-                        lhs,
-                        rhs: ctx.put_value_in_reg(binary.rhs()),
+                        lhs: RegOrZr::Reg(lhs),
+                        rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
                     }),
                     BinaryOp::Div => ctx.emit(MInst::SDiv {
                         size,
@@ -175,7 +246,7 @@ impl LowerBackend for AArch64Backend {
                             ctx.emit(MInst::CmpRR {
                                 size,
                                 lhs,
-                                rhs: Gpr::Reg(ctx.put_value_in_reg(binary.rhs())),
+                                rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
                             });
                         }
                         ctx.emit(MInst::CSet {
@@ -225,16 +296,34 @@ impl LowerBackend for AArch64Backend {
                         emit_add_offset(ctx, Writable::from_reg(next), address, byte_offset);
                         address = next;
                     } else {
+                        if let Some(shift) = stride_shift(stride) {
+                            let next = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+                            ctx.emit(MInst::AluRRRExtend {
+                                op: AluOp::Add,
+                                size: OperandSize::Size64,
+                                dst: Writable::from_reg(next),
+                                lhs: Gpr::Reg(address),
+                                rhs: ctx.put_value_in_reg(index),
+                                extend: ExtendOp::Sxtw,
+                                shift,
+                            });
+                            address = next;
+                            continue;
+                        }
                         // Indices are i32 in Raana IR. Sign-extend before the
                         // multiply so negative indices retain GEP semantics.
                         let extended = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+                        ctx.emit(MInst::MovFromZero {
+                            size: OperandSize::Size64,
+                            dst: Writable::from_reg(extended),
+                        });
                         ctx.emit(MInst::AluRRRExtend {
                             op: AluOp::Add,
                             size: OperandSize::Size64,
                             dst: Writable::from_reg(extended),
-                            lhs: Gpr::Zr,
+                            lhs: Gpr::Reg(extended),
                             rhs: ctx.put_value_in_reg(index),
-                            extend: crate::instructions::ExtendOp::Sxtw,
+                            extend: ExtendOp::Sxtw,
                             shift: 0,
                         });
                         let byte_offset = if stride == 1 {
@@ -251,8 +340,8 @@ impl LowerBackend for AArch64Backend {
                                 op: AluOp::Mul,
                                 size: OperandSize::Size64,
                                 dst: Writable::from_reg(product),
-                                lhs: extended,
-                                rhs: scale,
+                                lhs: RegOrZr::Reg(extended),
+                                rhs: RegOrZr::Reg(scale),
                             });
                             product
                         };
@@ -261,8 +350,8 @@ impl LowerBackend for AArch64Backend {
                             op: AluOp::Add,
                             size: OperandSize::Size64,
                             dst: Writable::from_reg(next),
-                            lhs: address,
-                            rhs: byte_offset,
+                            lhs: RegOrZr::Reg(address),
+                            rhs: RegOrZr::Reg(byte_offset),
                         });
                         address = next;
                     }
@@ -468,6 +557,45 @@ fn integer_constant(
     }
 }
 
+/// Fold `rhs = input <<const shift` (or its logical/arithmetic right-shift
+/// counterparts) into an AArch64 shifted-register data-processing operand.
+/// The generic context atomically claims the producer before we name its
+/// input, preventing its later reverse-traversal lowering.
+fn fold_shifted_rhs(
+    ctx: &mut LowerContext<'_, MInst>,
+    consumer: raana_ir::opt::prelude::Inst,
+    rhs: raana_ir::opt::prelude::Inst,
+    size: OperandSize,
+) -> Option<(taki_mir::register::Reg, ShiftOp, ImmShift)> {
+    let InstKind::Binary(shift) = ctx.arena.inst_data(rhs).kind().clone() else {
+        return None;
+    };
+    let shift_op = match shift.op() {
+        BinaryOp::Shl => ShiftOp::Lsl,
+        BinaryOp::Shr => ShiftOp::Lsr,
+        BinaryOp::Sar => ShiftOp::Asr,
+        _ => return None,
+    };
+    let amount = integer_constant(ctx, shift.rhs())
+        .and_then(|value| u8::try_from(value).ok())
+        .and_then(|value| ImmShift::new(value, size))?;
+    if !ctx.sink_pure_single_use_producer(rhs, consumer) {
+        return None;
+    }
+    Some((ctx.put_value_in_reg(shift.lhs()), shift_op, amount))
+}
+
+fn stride_shift(stride: i64) -> Option<u8> {
+    match stride {
+        1 => Some(0),
+        2 => Some(1),
+        4 => Some(2),
+        8 => Some(3),
+        16 => Some(4),
+        _ => None,
+    }
+}
+
 fn add_sub_immediate(op: BinaryOp, value: Option<i32>) -> Option<(AluOp, Imm12)> {
     let value = i64::from(value?);
     let (op, magnitude) = match (op, value.is_negative()) {
@@ -665,8 +793,8 @@ fn emit_stack_address(
             op: AluOp::Add,
             size: OperandSize::Size64,
             dst,
-            lhs: sp_copy,
-            rhs: constant,
+            lhs: RegOrZr::Reg(sp_copy),
+            rhs: RegOrZr::Reg(constant),
         });
     }
 }
@@ -696,8 +824,8 @@ fn emit_add_offset(
             op: AluOp::Add,
             size: OperandSize::Size64,
             dst,
-            lhs: base,
-            rhs: constant,
+            lhs: RegOrZr::Reg(base),
+            rhs: RegOrZr::Reg(constant),
         });
     }
 }

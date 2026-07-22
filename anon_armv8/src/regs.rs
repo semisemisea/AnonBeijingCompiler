@@ -21,10 +21,27 @@ pub enum OperandSize {
     Size64,
 }
 
+impl OperandSize {
+    pub const fn bits(self) -> u8 {
+        match self {
+            Self::Size32 => 32,
+            Self::Size64 => 64,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gpr {
     Reg(Reg),
     Sp,
+    Zr,
+}
+
+/// A general-purpose data operand. Unlike [`Gpr`], this deliberately cannot
+/// name SP: in data-processing encodings register 31 denotes ZR, not SP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegOrZr {
+    Reg(Reg),
     Zr,
 }
 

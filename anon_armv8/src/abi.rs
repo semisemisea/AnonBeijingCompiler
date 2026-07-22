@@ -16,7 +16,7 @@ use crate::{
         AMode, AluOp, Imm12, MInst, MemoryType, PairAMode, SImm7Scaled, SImm9, UImm12Scaled,
     },
     labels::Label,
-    regs::{self, Gpr, OperandSize},
+    regs::{self, Gpr, OperandSize, RegOrZr},
 };
 
 pub struct AArch64Abi;
@@ -348,8 +348,8 @@ fn legalize_amode(
         op: AluOp::Add,
         size: OperandSize::Size64,
         dst: address,
-        lhs: base,
-        rhs: offset_reg.to_reg(),
+        lhs: RegOrZr::Reg(base),
+        rhs: RegOrZr::Reg(offset_reg.to_reg()),
     });
     (
         AMode::Reg {
@@ -419,7 +419,7 @@ fn append_add_constant(
         op: AluOp::Add,
         size: OperandSize::Size64,
         dst,
-        lhs: base,
-        rhs: scratch.to_reg(),
+        lhs: RegOrZr::Reg(base),
+        rhs: RegOrZr::Reg(scratch.to_reg()),
     });
 }

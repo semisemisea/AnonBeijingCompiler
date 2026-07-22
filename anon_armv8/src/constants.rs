@@ -1,11 +1,11 @@
 //! Shared AArch64 integer constant planning.
 
-use smallvec::{SmallVec, smallvec};
+use smallvec::{smallvec, SmallVec};
 use taki_mir::register::{Reg, Writable};
 
 use crate::{
     instructions::{AluOp, ImmLogic, MInst, MoveWideConst},
-    regs::{Gpr, OperandSize},
+    regs::{OperandSize, RegOrZr},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,7 +96,7 @@ pub fn materialize_integer_constant(
                 op: AluOp::Orr,
                 size,
                 dst,
-                src: Gpr::Zr,
+                src: RegOrZr::Zr,
                 imm,
             },
             ConstantStep::MovZ(imm) => MInst::MovZ { size, dst, imm },

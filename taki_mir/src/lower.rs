@@ -1,6 +1,6 @@
 use log::trace;
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::{SmallVec, smallvec};
+use smallvec::{smallvec, SmallVec};
 
 use crate::abi::{ABIMachineSpec, CalleeABI};
 use crate::block_order::{BlockLoweringOrder, LoweredBlock, MirBlockIndex};
@@ -504,7 +504,9 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
 
             trace!(
                 "to lower the instruction: {:?}, side-effect: {}, value_needed: {}",
-                inst, side_effect, value_needed
+                inst,
+                side_effect,
+                value_needed
             );
 
             if side_effect || value_needed {
@@ -549,6 +551,35 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         });
         self.rematerialize_if_needed(inst, reg, use_count);
         reg
+    }
+
+    /// Mark a pure producer as consumed directly by `consumer`.
+    ///
+    /// Lowering walks HIR in reverse, so a selected consumer can emit an
+    /// encoding which names its producer's inputs directly. This is only
+    /// sound when the HIR use graph says that `consumer` is the producer's
+    /// sole user and the producer has not otherwise been lowered.
+    pub fn sink_pure_single_use_producer(&mut self, producer: HirInst, consumer: HirInst) -> bool {
+        if producer == consumer
+            || self.cur_inst != Some(consumer)
+            || self.inst_sunk.contains(&producer)
+            || self.value_lowered_use.contains_key(&producer)
+            || self.arena.is_terminator(producer)
+            || self.arena.has_side_effect_when_lowering(producer)
+            || !matches!(
+                self.arena.inst_data(producer).kind(),
+                InstKind::Binary(_) | InstKind::Cast(_) | InstKind::GetElemPtr(_) | InstKind::Alloc
+            )
+        {
+            return false;
+        }
+
+        let users = self.arena.inst_data(producer).used_by();
+        if users.len() != 1 || !users.contains(&consumer) {
+            return false;
+        }
+
+        self.inst_sunk.insert(producer)
     }
 
     fn rematerialize_if_needed(&mut self, inst: HirInst, reg: Reg, use_count: u32) {

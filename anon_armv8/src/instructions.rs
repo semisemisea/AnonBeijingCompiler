@@ -11,7 +11,7 @@ use taki_mir::{
 use crate::{
     abi::AArch64Abi,
     labels::Label,
-    regs::{Gpr, OperandSize},
+    regs::{Gpr, OperandSize, RegOrZr},
 };
 
 pub type WritableReg = Writable<Reg>;
@@ -314,8 +314,8 @@ pub enum MInst {
         op: AluOp,
         size: OperandSize,
         dst: WritableReg,
-        lhs: Reg,
-        rhs: Reg,
+        lhs: RegOrZr,
+        rhs: RegOrZr,
     },
     AluRRRR {
         op: AluOp,
@@ -336,7 +336,7 @@ pub enum MInst {
         op: AluOp,
         size: OperandSize,
         dst: WritableReg,
-        src: Gpr,
+        src: RegOrZr,
         imm: ImmLogic,
     },
     AluRRImmShift {
@@ -350,8 +350,8 @@ pub enum MInst {
         op: AluOp,
         size: OperandSize,
         dst: WritableReg,
-        lhs: Reg,
-        rhs: Reg,
+        lhs: RegOrZr,
+        rhs: RegOrZr,
         shift: ShiftOp,
         amount: ImmShift,
     },
@@ -387,7 +387,7 @@ pub enum MInst {
     CmpRR {
         size: OperandSize,
         lhs: Reg,
-        rhs: Gpr,
+        rhs: RegOrZr,
     },
     CmpImm {
         size: OperandSize,
@@ -536,11 +536,50 @@ pub enum MInst {
 impl MInst {
     pub fn verify(&self) -> Result<(), &'static str> {
         match self {
+            Self::AluRRImm12 { op, .. } if !matches!(op, AluOp::Add | AluOp::Sub) => {
+                Err("invalid AArch64 add/sub immediate operation")
+            }
+            Self::AluRRImmLogic { op, .. }
+                if !matches!(op, AluOp::And | AluOp::Orr | AluOp::Eor) =>
+            {
+                Err("invalid AArch64 logical immediate operation")
+            }
+            Self::AluRRImmShift { op, .. }
+                if !matches!(op, AluOp::Lsl | AluOp::Lsr | AluOp::Asr) =>
+            {
+                Err("invalid AArch64 immediate shift operation")
+            }
             Self::AluRRImmLogic { size, imm, .. } if *size != imm.size() => {
                 Err("logical immediate width does not match instruction width")
             }
-            Self::AluRRRExtend { shift, .. } if *shift > 4 => {
-                Err("extended register shift exceeds AArch64 encoding range")
+            Self::AluRRRShift {
+                op,
+                size,
+                shift,
+                amount,
+                ..
+            } if !shifted_alu_is_legal(*op, *shift) || amount.value() >= size.bits() => {
+                Err("invalid AArch64 shifted-register ALU form")
+            }
+            Self::AluRRRExtend {
+                op,
+                size,
+                lhs,
+                extend,
+                shift,
+                ..
+            } if matches!(lhs, Gpr::Zr) || !extended_alu_is_legal(*op, *size, *extend, *shift) => {
+                Err("invalid AArch64 extended-register ALU form")
+            }
+            Self::Load { ty, addr, .. } | Self::Store { ty, addr }
+                if !amode_is_legal(addr, *ty) =>
+            {
+                Err("invalid AArch64 memory address form")
+            }
+            Self::LoadPair { addr, .. } | Self::StorePair { addr, .. }
+                if !pair_amode_is_legal(addr) =>
+            {
+                Err("invalid AArch64 pair memory address form")
             }
             Self::Tbz { bit, .. } | Self::Tbnz { bit, .. } if *bit >= 64 => {
                 Err("test-bit index exceeds AArch64 encoding range")
@@ -571,9 +610,12 @@ impl MachInst for MInst {
     fn get_operands(&mut self, collector: &mut impl OperandVisitor) {
         match self {
             Self::Nop | Self::BCond { .. } | Self::Jump { .. } | Self::Ret => {}
-            Self::AluRRR { dst, lhs, rhs, .. }
-            | Self::SDiv { dst, lhs, rhs, .. }
-            | Self::FAlu { dst, lhs, rhs, .. } => {
+            Self::AluRRR { dst, lhs, rhs, .. } => {
+                use_reg_or_zr(collector, lhs);
+                use_reg_or_zr(collector, rhs);
+                collector.reg_def(dst);
+            }
+            Self::SDiv { dst, lhs, rhs, .. } | Self::FAlu { dst, lhs, rhs, .. } => {
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
                 collector.reg_def(dst);
@@ -590,8 +632,12 @@ impl MachInst for MInst {
                 collector.reg_use(carry);
                 collector.reg_def(dst);
             }
-            Self::AluRRImm12 { dst, src, .. } | Self::AluRRImmLogic { dst, src, .. } => {
+            Self::AluRRImm12 { dst, src, .. } => {
                 use_gpr(collector, src);
+                collector.reg_def(dst);
+            }
+            Self::AluRRImmLogic { dst, src, .. } => {
+                use_reg_or_zr(collector, src);
                 collector.reg_def(dst);
             }
             Self::AluRRImmShift { dst, src, .. }
@@ -603,8 +649,8 @@ impl MachInst for MInst {
                 collector.reg_def(dst);
             }
             Self::AluRRRShift { dst, lhs, rhs, .. } => {
-                collector.reg_use(lhs);
-                collector.reg_use(rhs);
+                use_reg_or_zr(collector, lhs);
+                use_reg_or_zr(collector, rhs);
                 collector.reg_def(dst);
             }
             Self::AluRRRExtend { dst, lhs, rhs, .. } => {
@@ -638,7 +684,7 @@ impl MachInst for MInst {
             }
             Self::CmpRR { lhs, rhs, .. } => {
                 collector.reg_use(lhs);
-                use_gpr(collector, rhs);
+                use_reg_or_zr(collector, rhs);
             }
             Self::CmpImm { lhs, .. }
             | Self::Cbz { reg: lhs, .. }
@@ -762,6 +808,11 @@ fn use_gpr(collector: &mut impl OperandVisitor, gpr: &mut Gpr) {
         collector.reg_use(reg);
     }
 }
+fn use_reg_or_zr(collector: &mut impl OperandVisitor, reg: &mut RegOrZr) {
+    if let RegOrZr::Reg(reg) = reg {
+        collector.reg_use(reg);
+    }
+}
 fn def_gpr(collector: &mut impl OperandVisitor, gpr: &mut Gpr) {
     if let Gpr::Reg(reg) = gpr {
         collector.reg_def_reg(reg);
@@ -802,7 +853,7 @@ impl MachInstEmit for MInst {
                 dst,
                 lhs,
                 rhs,
-            } => emit_sized_rrr(ctx, alu_name(*op, *size), *size, dst.to_reg(), lhs, rhs),
+            } => emit_sized_data_rrr(ctx, alu_name(*op, *size), *size, dst.to_reg(), lhs, rhs),
             Self::AluRRRR {
                 op,
                 size,
@@ -846,7 +897,7 @@ impl MachInstEmit for MInst {
                 write!(ctx, "{} ", alu_name(*op, *size))?;
                 emit_reg(ctx, dst.to_reg(), *size)?;
                 write!(ctx, ", ")?;
-                emit_gpr(ctx, src, *size)?;
+                emit_reg_or_zr(ctx, src, *size)?;
                 write!(ctx, ", #0x{:x}", imm.value())
             }
             Self::AluRRImmShift {
@@ -874,9 +925,9 @@ impl MachInstEmit for MInst {
                 write!(ctx, "{} ", alu_name(*op, *size))?;
                 emit_reg(ctx, dst.to_reg(), *size)?;
                 write!(ctx, ", ")?;
-                emit_reg(ctx, *lhs, *size)?;
+                emit_reg_or_zr(ctx, lhs, *size)?;
                 write!(ctx, ", ")?;
-                emit_reg(ctx, *rhs, *size)?;
+                emit_reg_or_zr(ctx, rhs, *size)?;
                 write!(ctx, ", {} #{}", shift_name(*shift), amount.value())
             }
             Self::AluRRRExtend {
@@ -893,7 +944,7 @@ impl MachInstEmit for MInst {
                 write!(ctx, ", ")?;
                 emit_gpr(ctx, lhs, *size)?;
                 write!(ctx, ", ")?;
-                emit_reg(ctx, *rhs, *size)?;
+                emit_reg(ctx, *rhs, extend_source_size(*extend, *size))?;
                 write!(ctx, ", {}", extend_name(*extend))?;
                 if *shift != 0 {
                     write!(ctx, " #{}", shift)?;
@@ -935,7 +986,7 @@ impl MachInstEmit for MInst {
                 write!(ctx, "cmp ")?;
                 emit_reg(ctx, *lhs, *size)?;
                 write!(ctx, ", ")?;
-                emit_gpr(ctx, rhs, *size)
+                emit_reg_or_zr(ctx, rhs, *size)
             }
             Self::CmpImm { size, lhs, imm } => {
                 write!(ctx, "cmp ")?;
@@ -1261,6 +1312,21 @@ fn emit_sized_rrr(
     write!(ctx, ", ")?;
     emit_reg(ctx, *rhs, size)
 }
+fn emit_sized_data_rrr(
+    ctx: &mut dyn EmitContext,
+    op: &str,
+    size: OperandSize,
+    dst: Reg,
+    lhs: &RegOrZr,
+    rhs: &RegOrZr,
+) -> core::fmt::Result {
+    write!(ctx, "{op} ")?;
+    emit_reg(ctx, dst, size)?;
+    write!(ctx, ", ")?;
+    emit_reg_or_zr(ctx, lhs, size)?;
+    write!(ctx, ", ")?;
+    emit_reg_or_zr(ctx, rhs, size)
+}
 fn emit_sized_rrrr(
     ctx: &mut dyn EmitContext,
     op: &str,
@@ -1325,6 +1391,16 @@ fn emit_gpr(ctx: &mut dyn EmitContext, reg: &Gpr, size: OperandSize) -> core::fm
         ),
     }
 }
+fn emit_reg_or_zr(
+    ctx: &mut dyn EmitContext,
+    reg: &RegOrZr,
+    size: OperandSize,
+) -> core::fmt::Result {
+    match reg {
+        RegOrZr::Reg(reg) => emit_reg(ctx, *reg, size),
+        RegOrZr::Zr => emit_gpr(ctx, &Gpr::Zr, size),
+    }
+}
 fn emit_amode(ctx: &mut dyn EmitContext, addr: &AMode) -> core::fmt::Result {
     match addr {
         AMode::Reg { base } => {
@@ -1365,7 +1441,11 @@ fn emit_amode(ctx: &mut dyn EmitContext, addr: &AMode) -> core::fmt::Result {
             write!(ctx, "[")?;
             emit_gpr(ctx, base, OperandSize::Size64)?;
             write!(ctx, ", ")?;
-            emit_reg(ctx, *index, OperandSize::Size64)?;
+            emit_reg(
+                ctx,
+                *index,
+                extend_source_size(*extend, OperandSize::Size64),
+            )?;
             write!(ctx, ", {}", extend_name(*extend))?;
             if *shift != 0 {
                 write!(ctx, " #{shift}")?;
@@ -1429,6 +1509,73 @@ fn extend_name(op: ExtendOp) -> &'static str {
         ExtendOp::Sxtw => "sxtw",
         ExtendOp::Sxtx => "sxtx",
     }
+}
+fn extend_source_size(extend: ExtendOp, size: OperandSize) -> OperandSize {
+    match extend {
+        ExtendOp::Uxtb
+        | ExtendOp::Uxth
+        | ExtendOp::Uxtw
+        | ExtendOp::Sxtb
+        | ExtendOp::Sxth
+        | ExtendOp::Sxtw => OperandSize::Size32,
+        ExtendOp::Uxtx | ExtendOp::Sxtx => size,
+    }
+}
+fn shifted_alu_is_legal(op: AluOp, shift: ShiftOp) -> bool {
+    match op {
+        AluOp::Add | AluOp::Sub => matches!(shift, ShiftOp::Lsl | ShiftOp::Lsr | ShiftOp::Asr),
+        AluOp::And | AluOp::Orr | AluOp::Eor => {
+            matches!(
+                shift,
+                ShiftOp::Lsl | ShiftOp::Lsr | ShiftOp::Asr | ShiftOp::Ror
+            )
+        }
+        _ => false,
+    }
+}
+fn extended_alu_is_legal(op: AluOp, size: OperandSize, extend: ExtendOp, shift: u8) -> bool {
+    matches!(op, AluOp::Add | AluOp::Sub)
+        && shift <= 4
+        && match size {
+            OperandSize::Size32 => matches!(
+                extend,
+                ExtendOp::Uxtb | ExtendOp::Uxth | ExtendOp::Sxtb | ExtendOp::Sxth
+            ),
+            OperandSize::Size64 => true,
+        }
+}
+fn amode_is_legal(addr: &AMode, ty: MemoryType) -> bool {
+    match addr {
+        AMode::Reg { base }
+        | AMode::UnsignedOffset { base, .. }
+        | AMode::SignedOffset { base, .. }
+        | AMode::RegOffset { base, .. } => !matches!(base, Gpr::Zr),
+        AMode::ScaledRegOffset { base, shift, .. } => {
+            !matches!(base, Gpr::Zr) && *shift == ty.byte_size().trailing_zeros() as u8
+        }
+        AMode::ExtendedRegOffset {
+            base,
+            extend,
+            shift,
+            ..
+        } => {
+            !matches!(base, Gpr::Zr)
+                && matches!(
+                    extend,
+                    ExtendOp::Uxtw | ExtendOp::Sxtw | ExtendOp::Uxtx | ExtendOp::Sxtx
+                )
+                && (*shift == 0 || *shift == ty.byte_size().trailing_zeros() as u8)
+        }
+        _ => true,
+    }
+}
+fn pair_amode_is_legal(addr: &PairAMode) -> bool {
+    let base = match addr {
+        PairAMode::SignedOffset { base, .. }
+        | PairAMode::PreIndex { base, .. }
+        | PairAMode::PostIndex { base, .. } => base,
+    };
+    !matches!(base, Gpr::Zr)
 }
 fn cond_name(cond: Cond) -> &'static str {
     match cond {

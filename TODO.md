@@ -37,7 +37,7 @@
   correct 32-bit and 64-bit widths.
 - [x] Select add/sub immediates, including negated-immediate conversion.
 - [x] Select logical immediates and immediate shifts when legal.
-- [ ] Select zero-register forms, shifted-register arithmetic, and
+- [x] Select zero-register forms, shifted-register arithmetic, and
   extended-register address arithmetic when legal.
 - [ ] Add safe `madd` and `msub` fusion only when the multiply result has no
   independent use.

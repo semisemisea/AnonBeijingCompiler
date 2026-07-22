@@ -99,6 +99,22 @@ Completed on 2026-07-22.
   legalization pass; no target-local frame or allocation compatibility path was
   introduced.
 
+### Phase 6 First Slice Complete: Scalar Control Flow Selection
+
+Completed on 2026-07-22.
+
+- Added `AArch64Backend: LowerBackend<MInst = MInst>` in
+  `anon_armv8::lower` and exported it from the target crate.
+- Added typed i32/pointer scalar selection for arithmetic, signed division and
+  remainder, shifts, bitwise operations, comparisons, returns, and direct
+  jumps.
+- Lowered HIR two-edge branches as `CmpImm` plus the single
+  allocator-visible `CondBr` terminator, preserving generic edge-block
+  ownership of block-parameter parallel copies.
+- Deferred float, cast, memory, stack-object, GEP, global, aggregate, and call
+  selection to their dedicated Phase 6 slices. Unsupported HIR variants fail
+  explicitly rather than silently selecting a compatibility path.
+
 ## Scope And Constraints
 
 ### In Scope

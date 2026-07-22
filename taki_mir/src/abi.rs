@@ -2,8 +2,8 @@ use std::marker::PhantomData;
 use std::num::NonZeroU64;
 
 use rustc_hash::FxHashMap;
-use smallvec::{SmallVec, smallvec};
-use tomori_utils::{PrimaryMap, SecondaryMap, entity_impl};
+use smallvec::{smallvec, SmallVec};
+use tomori_utils::{entity_impl, PrimaryMap, SecondaryMap};
 
 use crate::prelude::*;
 use crate::reg_alloc::reg::{MachineEnv, PReg, RegClass};
@@ -82,6 +82,20 @@ pub trait ABIMachineSpec {
         smallvec![Self::gen_load_stack(StackAMode::Slot(spill_off), dst, ty)]
     }
 
+    /// Spill access for an allocator edit whose offset is already resolved
+    /// against the post-prologue stack pointer.
+    fn gen_spill_store_at_sp(src: Reg, spill_off: i64, ty: LoweredType) -> SmallVec<[Self::I; 4]> {
+        Self::gen_spill_store(src, spill_off, ty)
+    }
+
+    fn gen_spill_load_at_sp(
+        spill_off: i64,
+        dst: Writable<Reg>,
+        ty: LoweredType,
+    ) -> SmallVec<[Self::I; 4]> {
+        Self::gen_spill_load(spill_off, dst, ty)
+    }
+
     fn gen_incoming_arg_load(
         fp_off: i64,
         dst: Writable<Reg>,
@@ -111,6 +125,19 @@ pub trait ABIMachineSpec {
     fn gen_clobber_save(frame: &FrameLayout) -> SmallVec<[Self::I; 16]>;
 
     fn gen_clobber_restore(frame: &FrameLayout) -> SmallVec<[Self::I; 16]>;
+
+    /// Expand frame-dependent pseudo addressing after allocation. Implementations
+    /// must use only `MachineEnv::post_ra_scratch_by_class` registers.
+    fn legalize_inst(_frame: &FrameLayout, inst: Self::I) -> SmallVec<[Self::I; 4]> {
+        smallvec![inst]
+    }
+
+    /// Copy between allocator spill slots. Spill slots are eight-byte units, so
+    /// an integer-width raw copy also preserves f32 values without requiring
+    /// type information in allocator edits.
+    fn gen_stack_to_stack_move(_from: i64, _to: i64) -> SmallVec<[Self::I; 4]> {
+        panic!("target does not implement stack-to-stack allocator edits")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -205,7 +232,12 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
 
     pub fn allocate_stackslot(&mut self, ty: HirType) -> u32 {
         let align = M::stack_align();
-        let ret = self.outgoing_arg_size + self.total_stackslots_size;
+        // Stack objects are addressed relative to the stack-object area, not
+        // to the outgoing area as it happened to be sized at allocation time.
+        // Calls are discovered during lowering, so folding the then-current
+        // outgoing size here would make early objects overlap a later maximum
+        // outgoing-call area.
+        let ret = self.total_stackslots_size;
         let size = ty.size() as u32;
         let actual_size = size.next_multiple_of(align);
         self.total_stackslots_size += actual_size;

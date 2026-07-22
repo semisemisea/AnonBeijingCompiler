@@ -1,18 +1,20 @@
 //! AAPCS64 calling convention and frame hooks for AArch64.
 
 use raana_ir::ir::arena::Arena;
-use smallvec::{SmallVec, smallvec};
+use smallvec::{smallvec, SmallVec};
 use taki_mir::{
     abi::{ABIMachineSpec, ArgSlot, FrameLayout, StackAMode},
     prelude::ArenaContext,
     reg_alloc::reg::{MachineEnv, PReg, RegClass},
     register::{Reg, Writable},
-    types::{F32, I32, I64, LoweredType},
+    types::{LoweredType, F32, I32, I64},
 };
 
 use crate::{
     constants::materialize_integer_constant,
-    instructions::{AMode, AluOp, Imm12, MInst, MemoryType, PairAMode, SImm7Scaled},
+    instructions::{
+        AMode, AluOp, Imm12, MInst, MemoryType, PairAMode, SImm7Scaled, SImm9, UImm12Scaled,
+    },
     labels::Label,
     regs::{self, Gpr, OperandSize},
 };
@@ -46,6 +48,26 @@ impl ABIMachineSpec for AArch64Abi {
             src,
             addr: mem.into(),
         }
+    }
+
+    fn gen_spill_store_at_sp(src: Reg, spill_off: i64, ty: LoweredType) -> SmallVec<[MInst; 4]> {
+        smallvec![MInst::Store {
+            ty: memory_type(ty),
+            src,
+            addr: AMode::SpOffset(spill_off),
+        }]
+    }
+
+    fn gen_spill_load_at_sp(
+        spill_off: i64,
+        dst: Writable<Reg>,
+        ty: LoweredType,
+    ) -> SmallVec<[MInst; 4]> {
+        smallvec![MInst::Load {
+            ty: memory_type(ty),
+            dst,
+            addr: AMode::SpOffset(spill_off),
+        }]
     }
 
     fn gen_load_imm(dst: Writable<Reg>, imm: i32) -> MInst {
@@ -204,7 +226,7 @@ impl ABIMachineSpec for AArch64Abi {
                     MemoryType::I64
                 },
                 src: Reg::from_physical_reg(*preg),
-                addr: AMode::FrameSlot(base - (index as i64 + 1) * 8),
+                addr: AMode::SpOffset(base - (index as i64 + 1) * 8),
             });
         }
         insts
@@ -221,10 +243,42 @@ impl ABIMachineSpec for AArch64Abi {
                     MemoryType::I64
                 },
                 dst: Writable::from_reg(Reg::from_physical_reg(*preg)),
-                addr: AMode::FrameSlot(base - (index as i64 + 1) * 8),
+                addr: AMode::SpOffset(base - (index as i64 + 1) * 8),
             });
         }
         insts
+    }
+
+    fn legalize_inst(frame: &FrameLayout, inst: MInst) -> SmallVec<[MInst; 4]> {
+        match inst {
+            MInst::Load { ty, dst, addr } => {
+                let (addr, mut prefix) = legalize_amode(frame, addr, ty, None);
+                prefix.push(MInst::Load { ty, dst, addr });
+                prefix
+            }
+            MInst::Store { ty, src, addr } => {
+                let (addr, mut prefix) = legalize_amode(frame, addr, ty, Some(src));
+                prefix.push(MInst::Store { ty, src, addr });
+                prefix
+            }
+            inst => smallvec![inst],
+        }
+    }
+
+    fn gen_stack_to_stack_move(from: i64, to: i64) -> SmallVec<[MInst; 4]> {
+        let scratch = Writable::from_reg(regs::int_reg(regs::INT_POST_RA_SCRATCH[0]));
+        smallvec![
+            MInst::Load {
+                ty: MemoryType::I64,
+                dst: scratch,
+                addr: AMode::SpOffset(from),
+            },
+            MInst::Store {
+                ty: MemoryType::I64,
+                src: scratch.to_reg(),
+                addr: AMode::SpOffset(to),
+            },
+        ]
     }
 }
 
@@ -243,6 +297,66 @@ fn memory_type(ty: LoweredType) -> MemoryType {
     } else {
         MemoryType::I64
     }
+}
+
+/// Resolve frame-relative pseudo addresses after register allocation.  AArch64
+/// has no arbitrary immediate memory form; retain directly encodable offsets
+/// and otherwise materialize the address in declared post-RA integer scratches.
+fn legalize_amode(
+    frame: &FrameLayout,
+    addr: AMode,
+    ty: MemoryType,
+    store_src: Option<Reg>,
+) -> (AMode, SmallVec<[MInst; 4]>) {
+    let (base, offset) = match addr {
+        AMode::FrameSlot(offset) => (Gpr::Sp, i64::from(frame.outgoing_args_size) + offset),
+        AMode::SpOffset(offset) => (Gpr::Sp, offset),
+        AMode::OutgoingArg(offset) => (Gpr::Sp, offset),
+        AMode::IncomingArg(offset) => (Gpr::Reg(regs::int_reg(regs::FP)), offset),
+        addr => return (addr, smallvec![]),
+    };
+
+    if offset >= 0 {
+        if let Some(offset) = UImm12Scaled::new(offset as u64, ty.byte_size()) {
+            return (AMode::UnsignedOffset { base, offset }, smallvec![]);
+        }
+    }
+    if let Some(offset) = SImm9::new(offset as i16).filter(|_| (-256..=255).contains(&offset)) {
+        return (AMode::SignedOffset { base, offset }, smallvec![]);
+    }
+
+    let mut scratches = regs::INT_POST_RA_SCRATCH
+        .into_iter()
+        .map(regs::int_reg)
+        .filter(|scratch| Some(*scratch) != store_src);
+    let address = Writable::from_reg(scratches.next().expect("two integer post-RA scratches"));
+    let offset_reg = Writable::from_reg(scratches.next().expect("two integer post-RA scratches"));
+    let mut insts = materialize_integer_constant(offset as u64, OperandSize::Size64, offset_reg);
+    let base = match base {
+        Gpr::Reg(reg) => reg,
+        Gpr::Sp => {
+            insts.push(MInst::MovPhys {
+                size: OperandSize::Size64,
+                dst: Gpr::Reg(address.to_reg()),
+                src: Gpr::Sp,
+            });
+            address.to_reg()
+        }
+        Gpr::Zr => unreachable!("stack address cannot use zero register as base"),
+    };
+    insts.push(MInst::AluRRR {
+        op: AluOp::Add,
+        size: OperandSize::Size64,
+        dst: address,
+        lhs: base,
+        rhs: offset_reg.to_reg(),
+    });
+    (
+        AMode::Reg {
+            base: Gpr::Reg(address.to_reg()),
+        },
+        insts,
+    )
 }
 
 fn append_sp_adjust(insts: &mut SmallVec<[MInst; 16]>, amount: i64) {

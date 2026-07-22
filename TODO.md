@@ -82,22 +82,22 @@
 
 ## ABI, Frames, And Late Legalization
 
-- [ ] Verify AAPCS64 argument and return behavior for independent x0..x7 and
+- [x] Verify AAPCS64 argument and return behavior for independent x0..x7 and
   v0..v7 windows, eight-byte overflow slots, unit values, and declarations
   without bodies.
-- [ ] Reserve the maximum outgoing overflow-argument area once per frame;
+- [x] Reserve the maximum outgoing overflow-argument area once per frame;
   calls must not dynamically adjust SP.
-- [ ] Preserve 16-byte SP alignment at every ABI boundary.
-- [ ] Save and restore only allocated x19..x28 registers in deterministic
+- [x] Preserve 16-byte SP alignment at every ABI boundary.
+- [x] Save and restore only allocated x19..x28 registers in deterministic
   order; keep v8..v15 unallocatable until their low-64-bit save/restore is
   implemented.
-- [ ] Add late legalization for large stack adjustments, frame offsets, spill
+- [x] Add late legalization for large stack adjustments, frame offsets, spill
   offsets, stack-to-stack edits, and symbolic locations not directly encodable
   by AArch64.
-- [ ] Restrict late-legalization temporaries to
+- [x] Restrict late-legalization temporaries to
   `MachineEnv.post_ra_scratch_by_class`; never allocate vregs or untracked
   stack slots during legalization.
-- [ ] Use pair save/restore only for legal adjacent registers and locations.
+- [x] Use pair save/restore only for legal adjacent registers and locations.
 
 ## CFG And Allocation
 

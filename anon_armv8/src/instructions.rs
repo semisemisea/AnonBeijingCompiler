@@ -4,7 +4,7 @@ use taki_mir::{
     abi::{ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
     reg_alloc::reg::{OperandVisitor, OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
-    types::{F32, I32, I64, LoweredType},
+    types::{LoweredType, F32, I32, I64},
     vcode::{CallType, EmitContext, MachInst, MachInstEmit, MachTerminator},
 };
 
@@ -255,6 +255,8 @@ pub enum AMode {
         shift: u8,
     },
     FrameSlot(i64),
+    /// A fixed offset from the post-prologue stack pointer.
+    SpOffset(i64),
     IncomingArg(i64),
     OutgoingArg(i64),
 }
@@ -776,7 +778,10 @@ fn visit_amode(collector: &mut impl OperandVisitor, addr: &mut AMode) {
             use_gpr(collector, base);
             collector.reg_use(index);
         }
-        AMode::FrameSlot(_) | AMode::IncomingArg(_) | AMode::OutgoingArg(_) => {}
+        AMode::FrameSlot(_)
+        | AMode::SpOffset(_)
+        | AMode::IncomingArg(_)
+        | AMode::OutgoingArg(_) => {}
     }
 }
 fn visit_pair_amode(collector: &mut impl OperandVisitor, addr: &mut PairAMode) {
@@ -1367,7 +1372,9 @@ fn emit_amode(ctx: &mut dyn EmitContext, addr: &AMode) -> core::fmt::Result {
             }
             write!(ctx, "]")
         }
-        AMode::FrameSlot(offset) | AMode::OutgoingArg(offset) => write!(ctx, "[sp, #{offset}]"),
+        AMode::FrameSlot(offset) | AMode::SpOffset(offset) | AMode::OutgoingArg(offset) => {
+            write!(ctx, "[sp, #{offset}]")
+        }
         AMode::IncomingArg(offset) => write!(ctx, "[x29, #{offset}]"),
     }
 }

@@ -1,3 +1,4 @@
+use anon_armv8::AArch64Backend;
 use clap::Parser;
 use raana_ir::fmt::writer::Writer;
 use std::path::Path;
@@ -102,13 +103,10 @@ fn dump_llvm(program: &raana_ir::ir::Program) -> String {
     raana_ir::llvm::write_llvm_ir(program)
 }
 
-fn dump_asm(
-    program: &raana_ir::ir::Program,
-    target: cli::Target,
-) -> Result<String, String> {
+fn dump_asm(program: &raana_ir::ir::Program, target: cli::Target) -> Result<String, String> {
     match target {
         cli::Target::Riscv64 => Ok(taki_mir::compile::<Riscv64Backend>(program)),
-        cli::Target::Aarch64 => Err("AArch64 backend replacement is in progress".to_string()),
+        cli::Target::Aarch64 => Ok(taki_mir::compile::<AArch64Backend>(program)),
     }
 }
 

@@ -115,6 +115,16 @@ Completed on 2026-07-22.
   selection to their dedicated Phase 6 slices. Unsupported HIR variants fail
   explicitly rather than silently selecting a compatibility path.
 
+### Integration Complete: Single AArch64 Compiler Entry Point
+
+Completed on 2026-07-22.
+
+- Replaced the temporary AArch64 replacement-in-progress diagnostic with the
+  sole production path:
+  `taki_mir::compile::<anon_armv8::AArch64Backend>(program)`.
+- AArch64 has no fallback backend. Unsupported HIR is now rejected by the
+  generic selector rather than target dispatch.
+
 ## Scope And Constraints
 
 ### In Scope

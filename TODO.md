@@ -118,7 +118,7 @@
 - [ ] Add debug observability for HIR functions, block order, selected MInst,
   verification failures, operand constraints, allocations, allocator edits,
   frame layout, legalized MInst, and final assembly.
-- [ ] Update `anon_armv8/README.md`, root `README.md`, `AGENTS.md`, CLI help,
+- [x] Update `anon_armv8/README.md`, root `README.md`, `AGENTS.md`, CLI help,
   and Makefile documentation for the single AArch64 backend and its AAPCS64
   policy.
 

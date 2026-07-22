@@ -5,7 +5,7 @@
 - Rust toolchain is pinned to `1.85.0` (`rust-toolchain.toml`); the workspace uses edition 2024.
 - `soyo_compiler` is the CLI entrypoint. The pipeline is SysY source -> RaanaIR (`raana_ir`) -> VCode/MIR (`taki_mir`) -> AArch64 assembly (`anon_armv8`); `tomori_utils` provides shared data structures.
 - `soyo_compiler/build.rs` runs LALRPOP. Update `soyo_compiler/src/sysy.lalrpop`, not generated files under `target/`.
-- The CLI accepts one input and requires `-o`. `-S` emits AArch64 assembly; `--emit ir`, `--emit llvm`, and `--emit asm` select outputs. Multiple comma-separated `--emit` values treat `-o` as an output directory and create files named after the input stem.
+- The CLI accepts one input and requires `-o`. `-S` is an alias for `--emit asm`; the default target is RISC-V, so use `--target aarch64` for GNU AArch64 assembly. `--emit ir`, `--emit llvm`, and `--emit asm` select outputs. Multiple comma-separated `--emit` values treat `-o` as an output directory and create files named after the input stem.
 - Optimizations run only when `-O` is greater than zero; `-O1` is the intended optimized path.
 
 ## Verification

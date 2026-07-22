@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[clap(rename_all = "lowercase")]
 pub enum Target {
     Riscv64,
-    #[clap(help = "aarch64 backend is not implemented yet")]
+    #[clap(help = "emit GNU AArch64 assembly through the generic VCode pipeline")]
     Aarch64,
 }
 

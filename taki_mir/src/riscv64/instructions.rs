@@ -32,6 +32,9 @@ impl MachInst for MInst {
             MInst::LoadAddr { rd, .. } => {
                 collector.reg_def(rd);
             }
+            MInst::StackAddr { rd, .. } => {
+                collector.reg_def(rd);
+            }
             MInst::LoadWord { rd, addr, .. } => {
                 collector.reg_def(rd);
                 if let AMode::RegOffest(base, _) = addr {
@@ -173,6 +176,9 @@ impl MachInstEmit for MInst {
                 write!(ctx, ", ")?;
                 label.emit(ctx)
             }
+            MInst::StackAddr { .. } => {
+                unreachable!("stack addresses must be legalized before emission")
+            }
             MInst::LoadWord { rd, op, addr } => {
                 write!(ctx, "{} ", op)?;
                 ctx.write_reg(&rd.reg)?;
@@ -309,6 +315,10 @@ pub enum MInst {
     LoadAddr {
         rd: WritableReg,
         label: Label,
+    },
+    StackAddr {
+        rd: WritableReg,
+        addr: AMode,
     },
     Fcvt {
         mode: FcvtMode,

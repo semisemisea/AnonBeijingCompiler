@@ -1,25 +1,30 @@
-use raana_ir::ir::{arena::Arena, BinaryOp, InstKind, Type as HirType, TypeKind as HirTypeKind};
+use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind as HirTypeKind, arena::Arena};
 use smallvec::smallvec;
 
 use crate::{
-    abi::{ArgPair, CallArgPair, CallRetPair, RetPair},
+    abi::{ABIMachineSpec, ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::LoweredBlock,
     lower::{CodegenError, LowerBackend, LowerContext},
     prelude::HirFunctionData,
     reg_alloc::reg::PReg,
     register::Writable,
     riscv64::{
-        abi::DEFAULT_CLOBBERS,
+        abi::{DEFAULT_CLOBBERS, Riscv64ABI},
         instructions::{AMode, AluRRImm12OP, AluRRROP, FpuRRROP, Imm12, LoadOP, MInst, StoreOP},
         labels::Label,
-        regs::{a0, fa0, fp_reg, preg_name, stack_reg, zero_reg, ARG_REG, FARG_REG},
+        regs::{ARG_REG, FARG_REG, a0, fa0, fp_reg, preg_name, stack_reg, zero_reg},
     },
     types::LoweredType,
 };
 
 fn normalize_amode(amode: &AMode, ctx: &mut LowerContext<'_, MInst>) -> AMode {
+    // Slot offsets need the final outgoing-argument-area displacement, which
+    // is unavailable during lowering. Keep them symbolic for ABI legalization.
+    if matches!(amode, AMode::SlotOffset(_)) {
+        return amode.clone();
+    }
     let (off, base) = match *amode {
-        AMode::SPOffset(o) | AMode::SlotOffset(o) | AMode::OutgoingArg(o) => (o, stack_reg()),
+        AMode::SPOffset(o) | AMode::OutgoingArg(o) => (o, stack_reg()),
         AMode::FPOffset(o) | AMode::IncomingArg(o) => (o, fp_reg()),
         _ => return amode.clone(),
     };
@@ -315,26 +320,10 @@ impl LowerBackend for Riscv64Backend {
                 let rd = Writable::from_reg(def);
                 let pointee_ty = inst_data.ty().derefernce();
                 let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(inst, pointee_ty) as i64;
-                if let Some(imm12) = i32::try_from(offset).ok().and_then(Imm12::from_i32) {
-                    ctx.emit(MInst::AluRRImm12 {
-                        op: AluRRImm12OP::Addi,
-                        rd,
-                        rs: stack_reg(),
-                        imm: imm12,
-                    });
-                } else {
-                    let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                    ctx.emit(MInst::LoadImm {
-                        rd: Writable::from_reg(tmp),
-                        value: offset as u64,
-                    });
-                    ctx.emit(MInst::AluRRR {
-                        op: AluRRROP::Add,
-                        rd,
-                        rs1: stack_reg(),
-                        rs2: tmp,
-                    });
-                }
+                ctx.emit(<Riscv64ABI as ABIMachineSpec>::gen_get_stack_addr(
+                    StackAMode::Slot(offset),
+                    rd,
+                ));
             }
             raana_ir::ir::InstKind::GetElemPtr(get_elem_ptr) => {
                 let indices = get_elem_ptr.offsets();

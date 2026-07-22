@@ -86,6 +86,13 @@ impl ABIMachineSpec for AArch64Abi {
         }
     }
 
+    fn gen_get_stack_addr(mem: StackAMode, dst: Writable<Reg>) -> MInst {
+        MInst::StackAddr {
+            dst,
+            addr: mem.into(),
+        }
+    }
+
     fn gen_args(args: Vec<taki_mir::abi::ArgPair>) -> MInst {
         MInst::Args { pairs: args }
     }
@@ -252,6 +259,19 @@ impl ABIMachineSpec for AArch64Abi {
 
     fn legalize_inst(frame: &FrameLayout, inst: MInst) -> SmallVec<[MInst; 4]> {
         match inst {
+            MInst::StackAddr {
+                dst,
+                addr: AMode::FrameSlot(offset),
+            } => {
+                let mut insts = smallvec![];
+                append_add_constant(
+                    &mut insts,
+                    dst,
+                    Gpr::Sp,
+                    i64::from(frame.outgoing_args_size) + offset,
+                );
+                insts.into_iter().collect()
+            }
             MInst::Load { ty, dst, addr } => {
                 let (addr, mut prefix) = legalize_amode(frame, addr, ty, None);
                 prefix.push(MInst::Load { ty, dst, addr });

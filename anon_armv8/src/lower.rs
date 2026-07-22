@@ -1,8 +1,8 @@
 //! AArch64 selection from Raana HIR into generic VCode.
 
-use raana_ir::ir::{arena::Arena, BinaryOp, InstKind, Type as HirType, TypeKind};
+use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind, arena::Arena};
 use taki_mir::{
-    abi::{CallArgPair, CallRetPair, RetPair},
+    abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::{LoweredBlock, MirBlockIndex},
     lower::{CodegenError, LowerBackend, LowerContext},
     prelude::HirFunctionData,
@@ -12,6 +12,7 @@ use taki_mir::{
 };
 
 use crate::{
+    abi::AArch64Abi,
     instructions::{
         AMode, AluOp, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift, MInst, MemoryType, ShiftOp,
     },
@@ -329,7 +330,10 @@ impl LowerBackend for AArch64Backend {
                 let dst = Writable::from_reg(ctx.reg_map[&inst]);
                 let pointee = ctx.arena.inst_data(inst).ty().derefernce();
                 let offset = i64::from(ctx.alloc_stackslot_or_get(inst, pointee));
-                emit_stack_address(ctx, dst, offset);
+                ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
+                    StackAMode::Slot(offset),
+                    dst,
+                ));
             }
             InstKind::GetElemPtr(gep) => {
                 let dst = Writable::from_reg(ctx.reg_map[&inst]);
@@ -1210,43 +1214,6 @@ fn memory_address(
     emit_add_offset(ctx, Writable::from_reg(address), base, offset);
     AMode::Reg {
         base: Gpr::Reg(address),
-    }
-}
-
-fn emit_stack_address(
-    ctx: &mut LowerContext<'_, MInst>,
-    dst: Writable<taki_mir::register::Reg>,
-    offset: i64,
-) {
-    if let Some((AluOp::Add, imm)) = add_sub_immediate(BinaryOp::Add, i32::try_from(offset).ok()) {
-        ctx.emit(MInst::AluRRImm12 {
-            op: AluOp::Add,
-            size: OperandSize::Size64,
-            dst,
-            src: Gpr::Sp,
-            imm,
-        });
-    } else {
-        let constant = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-        ctx.emit(MInst::LoadImm {
-            size: OperandSize::Size64,
-            dst: Writable::from_reg(constant),
-            value: offset as u64,
-        });
-        // The regular three-register form cannot name SP as its left operand.
-        let sp_copy = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-        ctx.emit(MInst::MovPhys {
-            size: OperandSize::Size64,
-            dst: Gpr::Reg(sp_copy),
-            src: Gpr::Sp,
-        });
-        ctx.emit(MInst::AluRRR {
-            op: AluOp::Add,
-            size: OperandSize::Size64,
-            dst,
-            lhs: RegOrZr::Reg(sp_copy),
-            rhs: RegOrZr::Reg(constant),
-        });
     }
 }
 

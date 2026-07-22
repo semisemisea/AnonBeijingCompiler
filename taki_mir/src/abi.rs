@@ -68,6 +68,11 @@ pub trait ABIMachineSpec {
 
     fn gen_load_addr(dst: Writable<Reg>, label: HirInst) -> Self::I;
 
+    /// Generate a frame-dependent address for a stack location. `Slot` offsets
+    /// are relative to the stack-object area and must be resolved after the
+    /// final outgoing-argument area is known.
+    fn gen_get_stack_addr(mem: StackAMode, dst: Writable<Reg>) -> Self::I;
+
     fn gen_args(args: Vec<ArgPair>) -> Self::I;
 
     fn gen_ret() -> Self::I;

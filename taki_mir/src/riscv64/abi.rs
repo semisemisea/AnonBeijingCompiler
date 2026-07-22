@@ -1,7 +1,7 @@
 use smallvec::{SmallVec, smallvec};
 
 use crate::{
-    abi::{ABIMachineSpec, ArgSlot, FrameLayout},
+    abi::{ABIMachineSpec, ArgSlot, FrameLayout, StackAMode},
     reg_alloc::reg::{MachineEnv, PReg, PRegSet, RegClass},
     register::{Reg, Writable},
     riscv64::{
@@ -64,6 +64,13 @@ impl ABIMachineSpec for Riscv64ABI {
         MInst::LoadAddr {
             rd: dst,
             label: Label::GlobalValue(gv),
+        }
+    }
+
+    fn gen_get_stack_addr(mem: StackAMode, dst: Writable<Reg>) -> Self::I {
+        MInst::StackAddr {
+            rd: dst,
+            addr: mem.into(),
         }
     }
 
@@ -271,6 +278,86 @@ impl ABIMachineSpec for Riscv64ABI {
         }
         insts
     }
+
+    fn legalize_inst(frame: &FrameLayout, inst: MInst) -> SmallVec<[MInst; 4]> {
+        match inst {
+            MInst::StackAddr {
+                rd,
+                addr: AMode::SlotOffset(offset),
+            } => {
+                let offset = offset + i64::from(frame.outgoing_args_size);
+                if let Some(imm) = i32::try_from(offset).ok().and_then(Imm12::from_i32) {
+                    smallvec![MInst::AluRRImm12 {
+                        op: AluRRImm12OP::Addi,
+                        rd,
+                        rs: stack_reg(),
+                        imm,
+                    }]
+                } else {
+                    smallvec![
+                        MInst::LoadImm {
+                            rd: writable_spilltmp_reg2(),
+                            value: offset as u64,
+                        },
+                        MInst::AluRRR {
+                            op: crate::riscv64::instructions::AluRRROP::Add,
+                            rd,
+                            rs1: stack_reg(),
+                            rs2: writable_spilltmp_reg2().to_reg(),
+                        },
+                    ]
+                }
+            }
+            MInst::LoadWord {
+                rd,
+                op,
+                addr: AMode::SlotOffset(offset),
+            } => {
+                let (addr, mut insts) = legalize_slot_amode(frame, offset);
+                insts.push(MInst::LoadWord { rd, op, addr });
+                insts
+            }
+            MInst::StoreWord {
+                rs,
+                op,
+                addr: AMode::SlotOffset(offset),
+            } => {
+                let (addr, mut insts) = legalize_slot_amode(frame, offset);
+                insts.push(MInst::StoreWord { rs, op, addr });
+                insts
+            }
+            inst => smallvec![inst],
+        }
+    }
+}
+
+fn legalize_slot_amode(frame: &FrameLayout, offset: i64) -> (AMode, SmallVec<[MInst; 4]>) {
+    let offset = offset + i64::from(frame.outgoing_args_size);
+    if i32::try_from(offset)
+        .ok()
+        .and_then(Imm12::from_i32)
+        .is_some()
+    {
+        return (AMode::SPOffset(offset), smallvec![]);
+    }
+
+    let address = writable_spilltmp_reg();
+    let offset_reg = writable_spilltmp_reg2();
+    (
+        AMode::RegOffest(address.to_reg(), 0),
+        smallvec![
+            MInst::LoadImm {
+                rd: offset_reg,
+                value: offset as u64,
+            },
+            MInst::AluRRR {
+                op: crate::riscv64::instructions::AluRRROP::Add,
+                rd: address,
+                rs1: stack_reg(),
+                rs2: offset_reg.to_reg(),
+            },
+        ],
+    )
 }
 
 fn sp_adjust(insts: &mut SmallVec<[MInst; 16]>, amount: i64) {

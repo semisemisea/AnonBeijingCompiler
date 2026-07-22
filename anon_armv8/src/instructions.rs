@@ -4,7 +4,7 @@ use taki_mir::{
     abi::{ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
     reg_alloc::reg::{OperandVisitor, OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
-    types::{LoweredType, F32, I32, I64},
+    types::{F32, I32, I64, LoweredType},
     vcode::{CallType, EmitContext, MachInst, MachInstEmit, MachTerminator},
 };
 
@@ -437,6 +437,10 @@ pub enum MInst {
         dst: WritableReg,
         label: Label,
     },
+    StackAddr {
+        dst: WritableReg,
+        addr: AMode,
+    },
     BCond {
         cond: Cond,
         label: Label,
@@ -713,6 +717,7 @@ impl MachInst for MInst {
             | Self::MovFromZero { dst, .. }
             | Self::FMovFromZero { dst }
             | Self::LoadAddr { dst, .. }
+            | Self::StackAddr { dst, .. }
             | Self::CSet { dst, .. } => collector.reg_def(dst),
             Self::MovK { dst, src, .. } => {
                 collector.reg_use(src);
@@ -1065,6 +1070,9 @@ impl MachInstEmit for MInst {
                 emit_reg(ctx, dst.to_reg(), OperandSize::Size64)?;
                 write!(ctx, ", :lo12:")?;
                 label.emit(ctx)
+            }
+            Self::StackAddr { .. } => {
+                unreachable!("stack addresses must be legalized before emission")
             }
             Self::BCond { cond, label } => {
                 write!(ctx, "b.{} ", cond_name(*cond))?;

@@ -17,16 +17,26 @@ lalrpop_util::lalrpop_mod!(sysy);
 ///     -S is a compatibility alias for `--emit asm`
 ///     --emit ir,asm writes both outputs under the folder passed to `-o`
 fn main() {
-    env_logger::init();
-    if let Err(error) = run() {
+    let args = cli::Arg::parse();
+    let mut logger = env_logger::Builder::new();
+    logger.target(env_logger::Target::Stderr);
+    logger.filter_level(log::LevelFilter::Warn);
+    let env_filter = std::env::var("RUST_LOG").ok();
+    let filter = args
+        .log
+        .as_deref()
+        .or(env_filter.as_deref())
+        .unwrap_or("warn");
+    logger.parse_filters(filter);
+    logger.init();
+
+    if let Err(error) = run(args) {
         eprintln!("soyo_compiler: {error}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), String> {
-    let args = cli::Arg::parse();
-
+fn run(args: cli::Arg) -> Result<(), String> {
     let source_code = std::fs::read_to_string(&args.input_path).unwrap();
 
     let ast = sysy::CompUnitsParser::new().parse(&source_code).unwrap();

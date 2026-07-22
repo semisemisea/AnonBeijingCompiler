@@ -1,10 +1,11 @@
-use log::trace;
+use log::{debug, trace};
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 
 use crate::abi::{ABIMachineSpec, CalleeABI};
 use crate::block_order::{BlockLoweringOrder, LoweredBlock, MirBlockIndex};
 use crate::prelude::*;
+use crate::reg_alloc::function::Function;
 use crate::reg_alloc::reg::PReg;
 use crate::register::{Reg, VRegAllocator, Writable};
 use crate::types::{F32, I32};
@@ -130,6 +131,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         // - Pre-allocate the virtual register
         // - Calculate the side-effect color of each instruction.
         let data = arena.f();
+        debug!(target: "taki_mir::lower", "function={} HIR params={} blocks={}", data.name(), data.params().len(), data.layout().basicblocks().into_iter().count());
         let mut acc_color = 0;
 
         // Allocate each function parameter a virtual register.
@@ -258,9 +260,11 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             .iter()
             .copied()
             .collect();
+        debug!(target: "taki_mir::lower", "function={} lowered block order={lowered_order:?}", self.arena.f().name());
 
         for (block_index, lb) in lowered_order.iter().enumerate().rev() {
             let block_index = MirBlockIndex::new(block_index);
+            debug!(target: "taki_mir::lower", "function={} lowering block={} descriptor={lb:?}", self.arena.f().name(), block_index.index());
 
             if let Some(_bb) = lb.orig_block() {
                 if let Some(branch_inst) =
@@ -301,6 +305,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         }
 
         let vcode = self.vcode.build(self.vregs_alloc);
+        debug!(target: "taki_mir::lower", "function={} finalized VCode: blocks={}, instructions={}", self.arena.f().name(), vcode.num_blocks(), vcode.num_insts());
 
         vcode
     }
@@ -565,9 +570,9 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
 
             let value_needed = self.is_value_needed(inst);
 
-            trace!(
-                "to lower the instruction: {:?}, side-effect: {}, value_needed: {}",
-                inst,
+            trace!(target: "taki_mir::lower",
+                "function={} block={block:?} HIR inst={inst:?} side_effect={} value_needed={}",
+                self.arena.f().name(),
                 side_effect,
                 value_needed
             );
@@ -703,7 +708,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     }
 
     pub fn emit(&mut self, mach_inst: I) {
-        trace!("emit mach inst {:?}", mach_inst);
+        trace!(target: "taki_mir::lower", "function={} HIR inst={:?} selected MInst={mach_inst:?}", self.arena.f().name(), self.cur_inst);
         self.ir_inst.push(mach_inst);
     }
 

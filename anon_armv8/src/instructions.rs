@@ -4,7 +4,7 @@ use taki_mir::{
     abi::{ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
     reg_alloc::reg::{OperandVisitor, OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
-    types::{LoweredType, F32, I32, I64},
+    types::{F32, I32, I64, LoweredType},
     vcode::{CallType, EmitContext, MachInst, MachInstEmit, MachTerminator},
 };
 
@@ -611,6 +611,10 @@ impl From<StackAMode> for AMode {
 }
 
 impl MachInst for MInst {
+    fn verify(&self) -> Result<(), String> {
+        MInst::verify(self).map_err(str::to_owned)
+    }
+
     type ABISpec = AArch64Abi;
 
     fn get_operands(&mut self, collector: &mut impl OperandVisitor) {

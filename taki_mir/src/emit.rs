@@ -192,7 +192,9 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
         frame: &FrameLayout,
         inst: &I,
     ) {
-        for inst in I::ABISpec::legalize_inst(frame, inst.clone()) {
+        let legalized = I::ABISpec::legalize_inst(frame, inst.clone());
+        log::trace!(target: "taki_mir::emit", "legalize original={inst:?} legalized={legalized:?}");
+        for inst in legalized {
             write!(self.buf, "    ").unwrap();
             inst.emit(self).unwrap();
             writeln!(self.buf).unwrap();

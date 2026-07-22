@@ -10,6 +10,12 @@ pub enum Target {
 
 #[derive(Debug, clap::Parser)]
 pub(crate) struct Arg {
+    #[arg(
+        long,
+        value_name = "FILTER",
+        help = "logging filter (overrides RUST_LOG; default: warn)"
+    )]
+    pub(crate) log: Option<String>,
     #[arg(short = 'S', default_value_t = false, conflicts_with = "emit")]
     pub(crate) assembly_only: bool,
     #[arg(value_name = "INPUT")]

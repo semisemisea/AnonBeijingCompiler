@@ -58,6 +58,12 @@ pub trait MachInst: Clone + Debug {
     fn rc_for_type(ty: LoweredType) -> (&'static [RegClass], &'static [LoweredType]);
 
     fn gen_jump(target: MirBlockIndex) -> Self;
+
+    /// Target-specific encoding/form validation. Targets without additional
+    /// invariants inherit the no-op verifier.
+    fn verify(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub trait EmitContext: core::fmt::Write {
@@ -157,6 +163,147 @@ impl<I: VCodeInst> VCodeContainer<I> {
 
     pub fn block_order(&self) -> &BlockLoweringOrder {
         &self.block_order
+    }
+
+    /// Validate VCode metadata and target instruction invariants at a pipeline
+    /// boundary. Errors name both the stage and the affected VCode entity.
+    pub fn verify(&self, stage: &str) -> Result<(), String> {
+        let blocks = self.block_range.len();
+        let fail = |detail: String| Err(format!("VCode verification failed at {stage}: {detail}"));
+        if self.block_succ_range.len() != blocks
+            || self.block_pred_range.len() != blocks
+            || self.block_params_range.len() != blocks
+            || self.branch_block_arg_succ_range.len() != blocks
+        {
+            return fail(format!(
+                "block metadata lengths differ (blocks={blocks}, succ={}, pred={}, params={}, branch-args={})",
+                self.block_succ_range.len(),
+                self.block_pred_range.len(),
+                self.block_params_range.len(),
+                self.branch_block_arg_succ_range.len()
+            ));
+        }
+        if self.branch_block_arg_range.len() != self.block_succ.len() {
+            return fail(format!(
+                "edge argument metadata differs from successor count (argument-ranges={}, successors={})",
+                self.branch_block_arg_range.len(),
+                self.block_succ.len()
+            ));
+        }
+        if self.operands_range.len() != self.insts.len()
+            || self.inst_is_branch.len() != self.insts.len()
+            || self.inst_is_ret.len() != self.insts.len()
+        {
+            return fail(format!(
+                "instruction metadata lengths differ (insts={}, operands={}, branches={}, returns={})",
+                self.insts.len(),
+                self.operands_range.len(),
+                self.inst_is_branch.len(),
+                self.inst_is_ret.len()
+            ));
+        }
+
+        for (inst_index, inst) in self.insts.iter().enumerate() {
+            if let Err(error) = inst.verify() {
+                return fail(format!("instruction {inst_index} {inst:?}: {error}"));
+            }
+            let term = inst.is_term();
+            if self.inst_is_branch[inst_index]
+                != matches!(term, MachTerminator::Branch | MachTerminator::TailReturn)
+                || self.inst_is_ret[inst_index] != matches!(term, MachTerminator::Return)
+            {
+                return fail(format!(
+                    "instruction {inst_index} terminator metadata disagrees with {term:?}"
+                ));
+            }
+            log::trace!(
+                target: "taki_mir::verify",
+                "stage={stage} inst={inst_index} operands={:?} instruction={inst:?} clobbers={:?}",
+                self.operands[self.operands_range.get(inst_index)],
+                self.clobbers.get(&(inst_index as u32))
+            );
+        }
+
+        for block_index in 0..blocks {
+            let block = Block::new(block_index);
+            let insts = self.block_range.get(block_index);
+            let succs = &self.block_succ[self.block_succ_range.get(block_index)];
+            let preds = &self.block_pred[self.block_pred_range.get(block_index)];
+            let params = &self.block_params[self.block_params_range.get(block_index)];
+            for &succ in succs {
+                if !succ.is_valid() || succ.index() >= blocks {
+                    return fail(format!(
+                        "block {block_index} has invalid successor {succ:?}"
+                    ));
+                }
+                if !self.block_preds(succ).contains(&block) {
+                    return fail(format!(
+                        "block {block_index} -> {} is absent from successor predecessors",
+                        succ.index()
+                    ));
+                }
+            }
+            for &pred in preds {
+                if !pred.is_valid()
+                    || pred.index() >= blocks
+                    || !self.block_succs(pred).contains(&block)
+                {
+                    return fail(format!(
+                        "block {block_index} has inconsistent predecessor {pred:?}"
+                    ));
+                }
+            }
+            let arg_entries = self.branch_block_arg_succ_range.get(block_index);
+            if arg_entries.len() != succs.len() {
+                return fail(format!(
+                    "block {block_index} has {} successors but {} argument lists",
+                    succs.len(),
+                    arg_entries.len()
+                ));
+            }
+            for (succ_index, &succ) in succs.iter().enumerate() {
+                let args = &self.branch_block_args[self
+                    .branch_block_arg_range
+                    .get(arg_entries.start + succ_index)];
+                let target_params = self.block_params(succ);
+                if args.len() != target_params.len() {
+                    return fail(format!(
+                        "block {block_index} edge {succ_index} -> {} has {} args for {} params",
+                        succ.index(),
+                        args.len(),
+                        target_params.len()
+                    ));
+                }
+                if let Some((arg, param)) = args
+                    .iter()
+                    .zip(target_params)
+                    .find(|(arg, param)| arg.class() != param.class())
+                {
+                    return fail(format!(
+                        "block {block_index} edge {succ_index} -> {} class mismatch: {arg:?} -> {param:?}",
+                        succ.index()
+                    ));
+                }
+            }
+            let terminator = insts.end.checked_sub(1).map(|index| &self.insts[index]);
+            match (succs.is_empty(), terminator.map(|inst| inst.is_term())) {
+                (false, Some(MachTerminator::Branch)) => {}
+                (true, Some(MachTerminator::Return | MachTerminator::TailReturn)) => {}
+                (false, term) => {
+                    return fail(format!(
+                        "block {block_index} has successors but terminal instruction is {term:?}"
+                    ));
+                }
+                (true, term) => {
+                    return fail(format!(
+                        "block {block_index} has no successors but terminal instruction is {term:?}"
+                    ));
+                }
+            }
+            log::debug!(target: "taki_mir::verify", "stage={stage} block={block_index} insts={insts:?} succs={succs:?} params={params:?}");
+        }
+        log::debug!(target: "taki_mir::verify", "stage={stage} passed: blocks={blocks}, insts={}, vregs={}, operands={}", self.insts.len(), self.vreg_types.len(), self.operands.len());
+        Ok(())
     }
 }
 

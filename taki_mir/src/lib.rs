@@ -5,6 +5,7 @@ use crate::{
     block_order::BlockLoweringOrder,
     emit::AsmWriter,
     lower::{LowerBackend, LowerContext},
+    reg_alloc::function::Function,
     reg_alloc::reg::RegClass,
     vcode::MachInstEmit,
 };
@@ -158,17 +159,40 @@ where
         let abi = CalleeABI::new(arena);
         let lower = LowerContext::new(p, func, abi, lower_order);
         let mut vcode = lower.lower::<B>();
+        vcode.verify("post-lowering").unwrap_or_else(|error| {
+            log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
+            panic!("function={} {error}", func_data.name());
+        });
 
         let machine_env = vcode.abi.machine_env();
         let output =
             crate::reg_alloc::alloc::run(&vcode, machine_env).expect("register allocation failed");
+        log::debug!(target: "taki_mir::reg_alloc", "function={} allocation complete: locations={}, spill-slots={}, edits={}", func_data.name(), output.allocs.len(), output.num_spillslots, output.edits.len());
+        for (inst, allocs) in
+            (0..vcode.num_insts()).map(|index| (index, output.inst_allocs(index as u32)))
+        {
+            log::trace!(target: "taki_mir::reg_alloc", "function={} inst={inst} allocations={allocs:?}", func_data.name());
+        }
+        for (point, edit) in &output.edits {
+            log::debug!(target: "taki_mir::reg_alloc", "function={} edit at {point:?}: {edit:?}", func_data.name());
+        }
         vcode.write_back_allocs(&output);
+        vcode
+            .verify("post-allocation-writeback")
+            .unwrap_or_else(|error| {
+                log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
+                panic!("function={} {error}", func_data.name());
+            });
 
         let spill_size = output.num_spillslots as u32 * vcode.abi.spillslot_size(RegClass::Int);
         vcode.abi.compute_frame_layout(spill_size, &output);
+        log::debug!(target: "taki_mir::emit", "function={} frame layout={:?}", func_data.name(), vcode.abi.frame_layout());
 
+        let asm_start = buf.len();
         let mut w = AsmWriter::<B>::new(&mut buf, func_data, p);
         w.write_function(&vcode, &output);
+        let asm = &buf[asm_start..];
+        log::debug!(target: "taki_mir::emit", "function={} final assembly: bytes={}, lines={}\n{}", func_data.name(), asm.len(), asm.lines().count(), asm);
     }
 
     buf

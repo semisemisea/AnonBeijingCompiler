@@ -115,7 +115,7 @@
 - [ ] Replace selector `unreachable!` paths for unsupported user HIR with
   concise code-generation errors containing function, block where available,
   HIR instruction, source/target type, phase, and legality reason.
-- [ ] Add debug observability for HIR functions, block order, selected MInst,
+- [x] Add debug observability for HIR functions, block order, selected MInst,
   verification failures, operand constraints, allocations, allocator edits,
   frame layout, legalized MInst, and final assembly.
 - [x] Update `anon_armv8/README.md`, root `README.md`, `AGENTS.md`, CLI help,

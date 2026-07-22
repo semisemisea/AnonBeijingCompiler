@@ -1,5 +1,6 @@
 //! AAPCS64 calling convention and frame hooks for AArch64.
 
+use raana_ir::ir::arena::Arena;
 use smallvec::{SmallVec, smallvec};
 use taki_mir::{
     abi::{ABIMachineSpec, ArgSlot, FrameLayout, StackAMode},
@@ -8,7 +9,6 @@ use taki_mir::{
     register::{Reg, Writable},
     types::{F32, I32, I64, LoweredType},
 };
-use raana_ir::ir::arena::Arena;
 
 use crate::{
     constants::materialize_integer_constant,

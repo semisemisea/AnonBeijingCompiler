@@ -1,4 +1,5 @@
 use crate::ir::{
+    Program,
     arena::Arena,
     basic_block::{BasicBlock, BasicBlockData},
     function::Function,
@@ -8,7 +9,6 @@ use crate::ir::{
     },
     instruction::{Inst, InstData},
     types::Type,
-    Program,
 };
 
 pub trait InfoQuery {

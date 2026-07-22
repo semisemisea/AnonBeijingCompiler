@@ -100,7 +100,9 @@ impl MachInst for MInst {
 
     fn is_term(&self) -> crate::vcode::MachTerminator {
         match self {
-            MInst::LongBnez { .. } | MInst::Jump { .. } | MInst::JumpReg { .. } => MachTerminator::Branch,
+            MInst::LongBnez { .. } | MInst::Jump { .. } | MInst::JumpReg { .. } => {
+                MachTerminator::Branch
+            }
             MInst::Ret => MachTerminator::Return,
             _ => MachTerminator::None,
         }
@@ -216,7 +218,11 @@ impl MachInstEmit for MInst {
                 write!(ctx, "jr ")?;
                 ctx.write_reg(rs)
             }
-            MInst::LongBnez { cond, scratch, label } => {
+            MInst::LongBnez {
+                cond,
+                scratch,
+                label,
+            } => {
                 write!(ctx, "beqz ")?;
                 ctx.write_reg(cond)?;
                 writeln!(ctx, ", 1f")?;
@@ -240,7 +246,12 @@ impl MachInstEmit for MInst {
                     Some(r) => (r.class() == RegClass::Int, r.class() == RegClass::Float),
                     None => (true, false),
                 };
-                match (int_src && int_dst, float_src && float_dst, float_src && int_dst, int_src && float_dst) {
+                match (
+                    int_src && int_dst,
+                    float_src && float_dst,
+                    float_src && int_dst,
+                    int_src && float_dst,
+                ) {
                     (true, _, _, _) => {
                         write!(ctx, "mv ")?;
                         ctx.write_reg(&dst.reg)?;
@@ -466,9 +477,7 @@ pub enum AMode {
 impl From<StackAMode> for AMode {
     fn from(value: StackAMode) -> Self {
         match value {
-            StackAMode::IncomingArg(offset, _stack_arg_size) => {
-                AMode::IncomingArg(offset)
-            }
+            StackAMode::IncomingArg(offset, _stack_arg_size) => AMode::IncomingArg(offset),
             StackAMode::Slot(slot_offset) => AMode::SlotOffset(slot_offset),
             StackAMode::OutgoingArg(offset) => AMode::OutgoingArg(offset),
         }
@@ -478,25 +487,53 @@ impl From<StackAMode> for AMode {
 impl core::fmt::Display for AluRRROP {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         use AluRRROP::*;
-        write!(f, "{}", match self {
-            Add => "add", Sub => "sub", Mul => "mul", Div => "div", Rem => "rem",
-            AddW => "addw", SubW => "subw", MulW => "mulw", DivW => "divw", RemW => "remw",
-            Snez => "snez", Seqz => "seqz", Slt => "slt",
-            And => "and", Or => "or", Xor => "xor",
-            Shl => "sll", Shr => "srl", Sar => "sra",
-            ShlW => "sllw", ShrW => "srlw", SarW => "sraw",
-        })
+        write!(
+            f,
+            "{}",
+            match self {
+                Add => "add",
+                Sub => "sub",
+                Mul => "mul",
+                Div => "div",
+                Rem => "rem",
+                AddW => "addw",
+                SubW => "subw",
+                MulW => "mulw",
+                DivW => "divw",
+                RemW => "remw",
+                Snez => "snez",
+                Seqz => "seqz",
+                Slt => "slt",
+                And => "and",
+                Or => "or",
+                Xor => "xor",
+                Shl => "sll",
+                Shr => "srl",
+                Sar => "sra",
+                ShlW => "sllw",
+                ShrW => "srlw",
+                SarW => "sraw",
+            }
+        )
     }
 }
 
 impl core::fmt::Display for FpuRRROP {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         use FpuRRROP::*;
-        write!(f, "{}", match self {
-            FaddS => "fadd.s", FsubS => "fsub.s",
-            FmulS => "fmul.s", FdivS => "fdiv.s",
-            FeqS => "feq.s", FltS => "flt.s", FleS => "fle.s",
-        })
+        write!(
+            f,
+            "{}",
+            match self {
+                FaddS => "fadd.s",
+                FsubS => "fsub.s",
+                FmulS => "fmul.s",
+                FdivS => "fdiv.s",
+                FeqS => "feq.s",
+                FltS => "flt.s",
+                FleS => "fle.s",
+            }
+        )
     }
 }
 
@@ -567,12 +604,12 @@ impl AMode {
     /// extra_instructions is empty. Otherwise, extra contains li+add and the
     /// returned AMode is RegOffest(tmp, 0) where tmp = x31 (spilltmp).
     pub fn normalize_imm12(&self) -> (AMode, SmallVec<[MInst; 3]>) {
-        use crate::riscv64::regs::{fp_reg, stack_reg, writable_spilltmp_reg, writable_spilltmp_reg2};
+        use crate::riscv64::regs::{
+            fp_reg, stack_reg, writable_spilltmp_reg, writable_spilltmp_reg2,
+        };
 
         let (off, base) = match *self {
-            AMode::SPOffset(o) | AMode::SlotOffset(o) | AMode::OutgoingArg(o) => {
-                (o, stack_reg())
-            }
+            AMode::SPOffset(o) | AMode::SlotOffset(o) | AMode::OutgoingArg(o) => (o, stack_reg()),
             AMode::FPOffset(o) | AMode::IncomingArg(o) => (o, fp_reg()),
             _ => return (self.clone(), smallvec::SmallVec::new()),
         };

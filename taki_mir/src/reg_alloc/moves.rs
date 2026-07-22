@@ -1,6 +1,6 @@
 use crate::reg_alloc::reg::{Allocation, PReg};
 use core::fmt::Debug;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 
 pub type MoveVec<T> = SmallVec<[(Allocation, Allocation, T); 16]>;
 
@@ -58,8 +58,7 @@ impl<T: Clone + Copy + Default + PartialEq> ParallelMoves<T> {
             }
         }
 
-        self.parallel_moves
-            .retain(|&mut (src, dst, _)| src != dst);
+        self.parallel_moves.retain(|&mut (src, dst, _)| src != dst);
 
         if !self.sources_overlap_dests() {
             return MoveVecWithScratch::NoScratch(self.parallel_moves);
@@ -84,8 +83,7 @@ impl<T: Clone + Copy + Default + PartialEq> ParallelMoves<T> {
         }
         let mut ret: MoveVec<T> = smallvec![];
         let mut stack: SmallVec<[usize; 16]> = smallvec![];
-        let mut state: SmallVec<[State; 16]> =
-            smallvec![State::ToDo; self.parallel_moves.len()];
+        let mut state: SmallVec<[State; 16]> = smallvec![State::ToDo; self.parallel_moves.len()];
         let mut scratch_used = false;
 
         while let Some(next) = state.iter().position(|&state| state == State::ToDo) {
@@ -144,12 +142,8 @@ impl<T> MoveVecWithScratch<T> {
             MoveVecWithScratch::NoScratch(moves) => moves,
             MoveVecWithScratch::Scratch(mut moves) => {
                 for (src, dst, _) in &mut moves {
-                    debug_assert!(
-                        *src != scratch && *dst != scratch,
-                    );
-                    debug_assert!(
-                        !(src.is_none() && dst.is_none()),
-                    );
+                    debug_assert!(*src != scratch && *dst != scratch,);
+                    debug_assert!(!(src.is_none() && dst.is_none()),);
                     if src.is_none() {
                         *src = scratch;
                     }
@@ -189,8 +183,7 @@ where
     pub borrowed_scratch_reg: PReg,
 }
 
-impl<GetReg, GetStackSlot, IsStackAlloc>
-    MoveAndScratchResolver<GetReg, GetStackSlot, IsStackAlloc>
+impl<GetReg, GetStackSlot, IsStackAlloc> MoveAndScratchResolver<GetReg, GetStackSlot, IsStackAlloc>
 where
     GetReg: FnMut() -> Option<Allocation>,
     GetStackSlot: FnMut() -> Allocation,

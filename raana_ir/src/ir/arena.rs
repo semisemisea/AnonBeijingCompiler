@@ -1,11 +1,11 @@
 use itertools::Itertools;
 
 use crate::ir::{
+    BasicBlockBuilders, LocalBuilder,
     basic_block::{BasicBlock, BasicBlockArena, BasicBlockData},
     builder::ReplaceBuilder,
     function::{Function, FunctionArena, FunctionData},
     instruction::{GlobalInstArena, Inst, InstData, LocalInstArena},
-    BasicBlockBuilders, LocalBuilder,
 };
 
 pub struct LocalArena {

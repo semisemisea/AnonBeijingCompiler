@@ -12,8 +12,8 @@ pub trait ToRaanaIR {
 use super::items::*;
 use raana_ir::ir::{arena::Arena, builder_trait::*, *};
 use std::collections::{
-    hash_map::Entry::{Occupied, Vacant},
     HashMap,
+    hash_map::Entry::{Occupied, Vacant},
 };
 
 pub type Ident = std::rc::Rc<str>;

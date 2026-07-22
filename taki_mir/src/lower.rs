@@ -85,11 +85,7 @@ pub trait LowerBackend {
 
     fn lower(ctx: &mut LowerContext<Self::MInst>, inst: HirInst);
 
-    fn lower_branch(
-        ctx: &mut LowerContext<Self::MInst>,
-        inst: HirInst,
-        target: &[MirBlockIndex],
-    );
+    fn lower_branch(ctx: &mut LowerContext<Self::MInst>, inst: HirInst, target: &[MirBlockIndex]);
 
     fn data_section_directive() -> &'static str;
 
@@ -462,10 +458,10 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 *uses += 1;
                 let use_count = *uses;
                 assert!(!self.inst_sunk.contains(&inst));
-                let reg = *self
-                    .reg_map
-                    .entry(inst)
-                    .or_insert_with(|| self.vregs_alloc.alloc(self.arena.inst_data(inst).ty().into()));
+                let reg = *self.reg_map.entry(inst).or_insert_with(|| {
+                    self.vregs_alloc
+                        .alloc(self.arena.inst_data(inst).ty().into())
+                });
                 self.rematerialize_if_needed(inst, reg, use_count);
                 reg
             };
@@ -547,10 +543,10 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         *uses += 1;
         let use_count = *uses;
         assert!(!self.inst_sunk.contains(&inst));
-        let reg = *self
-            .reg_map
-            .entry(inst)
-            .or_insert_with(|| self.vregs_alloc.alloc(self.arena.inst_data(inst).ty().into()));
+        let reg = *self.reg_map.entry(inst).or_insert_with(|| {
+            self.vregs_alloc
+                .alloc(self.arena.inst_data(inst).ty().into())
+        });
         self.rematerialize_if_needed(inst, reg, use_count);
         reg
     }

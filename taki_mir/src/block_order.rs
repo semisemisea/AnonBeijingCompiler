@@ -86,8 +86,7 @@ impl BlockLoweringOrder {
         }
         domtree_dfs(0, &dom_children, &rpo_index, &mut domtree_rpo);
 
-        let rpo: Vec<HirBasicBlock> =
-            domtree_rpo.iter().map(|&id| bb_id.search_id(id)).collect();
+        let rpo: Vec<HirBasicBlock> = domtree_rpo.iter().map(|&id| bb_id.search_id(id)).collect();
 
         let mut in_degree: FxHashMap<HirBasicBlock, u32> = FxHashMap::default();
         let mut out_degree: FxHashMap<HirBasicBlock, u32> = FxHashMap::default();

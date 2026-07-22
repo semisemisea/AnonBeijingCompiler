@@ -5,14 +5,11 @@ use crate::{
     reg_alloc::reg::{MachineEnv, PReg, PRegSet, RegClass},
     register::{Reg, Writable},
     riscv64::{
-        instructions::{AluRRImm12OP, AMode, Imm12, LoadOP, MInst, StoreOP},
+        instructions::{AMode, AluRRImm12OP, Imm12, LoadOP, MInst, StoreOP},
         labels::Label,
         regs::{
-            ARG_REG, FARG_REG,
-            fp_reg, link_reg, pf_reg, pv_reg, px_reg,
-            stack_reg,
-            writable_fp_reg, writable_link_reg,
-            writable_spilltmp_reg, writable_spilltmp_reg2,
+            ARG_REG, FARG_REG, fp_reg, link_reg, pf_reg, pv_reg, px_reg, stack_reg,
+            writable_fp_reg, writable_link_reg, writable_spilltmp_reg, writable_spilltmp_reg2,
             writable_stack_reg,
         },
     },
@@ -56,10 +53,7 @@ impl ABIMachineSpec for Riscv64ABI {
         MInst::LoadImm { rd: dst, imm }
     }
 
-    fn gen_load_addr(
-        dst: Writable<Reg>,
-        gv: raana_ir::opt::prelude::Inst,
-    ) -> Self::I {
+    fn gen_load_addr(dst: Writable<Reg>, gv: raana_ir::opt::prelude::Inst) -> Self::I {
         MInst::LoadAddr {
             rd: dst,
             label: Label::GlobalValue(gv),
@@ -151,9 +145,7 @@ impl ABIMachineSpec for Riscv64ABI {
         }
     }
 
-    fn compute_arg_loc(
-        arena: crate::prelude::ArenaContext<'_>,
-    ) -> (Vec<ArgSlot>, u32) {
+    fn compute_arg_loc(arena: crate::prelude::ArenaContext<'_>) -> (Vec<ArgSlot>, u32) {
         use raana_ir::ir::TypeKind;
         let mut args = vec![];
         let mut int_arg_idx = 0;
@@ -322,12 +314,7 @@ fn reg_add_imm(insts: &mut SmallVec<[MInst; 16]>, rd: Writable<Reg>, rs: Reg, am
     }
 }
 
-fn store_stack_imm12(
-    insts: &mut SmallVec<[MInst; 16]>,
-    rs: Reg,
-    op: StoreOP,
-    sp_offset: i64,
-) {
+fn store_stack_imm12(insts: &mut SmallVec<[MInst; 16]>, rs: Reg, op: StoreOP, sp_offset: i64) {
     let (addr, extras) = AMode::SPOffset(sp_offset).normalize_imm12();
     for inst in extras {
         insts.push(inst);

@@ -95,8 +95,7 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
 
         let frame = vcode.abi.frame_layout();
         let spill_base = (frame.outgoing_args_size + frame.stackslots_size) as i64;
-        let slot_size =
-            S::<B>::spillslot_size(crate::reg_alloc::reg::RegClass::Int) as i64;
+        let slot_size = S::<B>::spillslot_size(crate::reg_alloc::reg::RegClass::Int) as i64;
 
         for (bi, _lb) in block_order.lowered_order().iter().enumerate() {
             writeln!(self.buf, "{}:", self.block_labels[bi]).unwrap();
@@ -117,8 +116,7 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
                             }
                             (Some(from_reg), None) => {
                                 let slot = to.as_stack().unwrap();
-                                let offset = spill_base
-                                    + slot.raw_bits() as i64 * slot_size;
+                                let offset = spill_base + slot.raw_bits() as i64 * slot_size;
                                 let ty = match from_reg.class() {
                                     RegClass::Float => crate::types::F32,
                                     _ => crate::types::I64,
@@ -133,17 +131,16 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
                             }
                             (None, Some(to_reg)) => {
                                 let slot = from.as_stack().unwrap();
-                                let offset = spill_base
-                                    + slot.raw_bits() as i64 * slot_size;
+                                let offset = spill_base + slot.raw_bits() as i64 * slot_size;
                                 let ty = match to_reg.class() {
                                     RegClass::Float => crate::types::F32,
                                     _ => crate::types::I64,
                                 };
                                 for inst in S::<B>::gen_spill_load(
                                     offset,
-                                    crate::register::Writable::from_reg(
-                                        Reg::from_physical_reg(to_reg),
-                                    ),
+                                    crate::register::Writable::from_reg(Reg::from_physical_reg(
+                                        to_reg,
+                                    )),
                                     ty,
                                 ) {
                                     self.write_inst(&inst);

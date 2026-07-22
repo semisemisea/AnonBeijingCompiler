@@ -70,11 +70,7 @@ pub trait ABIMachineSpec {
 
     fn gen_store_stack(src: Reg, mem: StackAMode, ty: LoweredType) -> Self::I;
 
-    fn gen_spill_store(
-        src: Reg,
-        spill_off: i64,
-        ty: LoweredType,
-    ) -> SmallVec<[Self::I; 4]> {
+    fn gen_spill_store(src: Reg, spill_off: i64, ty: LoweredType) -> SmallVec<[Self::I; 4]> {
         smallvec![Self::gen_store_stack(src, StackAMode::Slot(spill_off), ty)]
     }
 
@@ -258,17 +254,16 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
         let stackslots_size = self.total_stackslots_size;
         let outgoing_args_size = self.outgoing_arg_size;
         let clobber_size = callee_saved.len() as u32 * M::word_bytes();
-        let setup_area_size =
-            if self.has_calls
-                || self.sized_stack_arg_size > 0
-                || self.total_stackslots_size > 0
-                || clobber_size > 0
-                || spill_size > 0
-            {
-                2 * M::word_bytes()
-            } else {
-                0
-            };
+        let setup_area_size = if self.has_calls
+            || self.sized_stack_arg_size > 0
+            || self.total_stackslots_size > 0
+            || clobber_size > 0
+            || spill_size > 0
+        {
+            2 * M::word_bytes()
+        } else {
+            0
+        };
         let mut total =
             setup_area_size + clobber_size + spill_size + stackslots_size + outgoing_args_size;
         let align = M::stack_align();
@@ -313,11 +308,7 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
             if self.reg_arg_spillslots[idx] < 0 {
                 self.reg_arg_spillslots[idx] = self.allocate_stackslot(ty.clone()) as i64;
             }
-            for inst in M::gen_spill_store(
-                preg.into(),
-                self.reg_arg_spillslots[idx],
-                ty.into(),
-            ) {
+            for inst in M::gen_spill_store(preg.into(), self.reg_arg_spillslots[idx], ty.into()) {
                 insts.push(inst);
             }
         }
@@ -330,15 +321,19 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
             ArgSlot::Reg { reg: preg, ty } => {
                 if self.reg_arg_spillslots[idx] < 0 {
                     self.reg_arg_spillslots[idx] = self.allocate_stackslot(ty.clone()) as i64;
-                    for inst in
-                        M::gen_spill_store(preg.into(), self.reg_arg_spillslots[idx], ty.clone().into())
-                    {
+                    for inst in M::gen_spill_store(
+                        preg.into(),
+                        self.reg_arg_spillslots[idx],
+                        ty.clone().into(),
+                    ) {
                         insts.push(inst);
                     }
                 }
-                for inst in
-                    M::gen_spill_load(self.reg_arg_spillslots[idx], Writable::from_reg(into_reg), ty.clone().into())
-                {
+                for inst in M::gen_spill_load(
+                    self.reg_arg_spillslots[idx],
+                    Writable::from_reg(into_reg),
+                    ty.clone().into(),
+                ) {
                     insts.push(inst);
                 }
                 let arg = ArgPair {
@@ -348,11 +343,9 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
                 self.reg_args.push(arg);
             }
             ArgSlot::Stack { offset, ty } => {
-                for inst in M::gen_incoming_arg_load(
-                    offset,
-                    Writable::from_reg(into_reg),
-                    ty.into(),
-                ) {
+                for inst in
+                    M::gen_incoming_arg_load(offset, Writable::from_reg(into_reg), ty.into())
+                {
                     insts.push(inst);
                 }
             }

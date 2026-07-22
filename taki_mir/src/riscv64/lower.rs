@@ -109,34 +109,84 @@ impl LowerBackend for Riscv64Backend {
                     use crate::riscv64::instructions::FpuRRROP;
                     match bop {
                         raana_ir::ir::BinaryOp::Add => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FaddS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FaddS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Sub => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FsubS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FsubS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Mul => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FmulS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FmulS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Div => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FdivS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FdivS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Lt => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FltS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FltS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Gt => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FltS, rd, rs1: rhs, rs2: lhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FltS,
+                                rd,
+                                rs1: rhs,
+                                rs2: lhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Le => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FleS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FleS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Ge => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FleS, rd, rs1: rhs, rs2: lhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FleS,
+                                rd,
+                                rs1: rhs,
+                                rs2: lhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Eq => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FeqS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FeqS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::NotEq => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FeqS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FeqS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                             ctx.emit(MInst::AluRRImm12 {
                                 op: super::instructions::AluRRImm12OP::Xori,
                                 rd,
@@ -151,37 +201,87 @@ impl LowerBackend for Riscv64Backend {
                         .then(|| alu_op_for_hir_binary(bop, inst_data.ty()));
                     let sub_op = alu_op_for_hir_binary(BinaryOp::Sub, inst_data.ty());
                     match bop {
-                    raana_ir::ir::BinaryOp::NotEq => {
-                        ctx.emit(MInst::AluRRR { op: sub_op, rd, rs1: lhs, rs2: rhs });
-                        ctx.emit(MInst::AluRRR { op: AluRRROP::Snez, rd, rs1: def, rs2: zero_reg() });
-                    }
-                    raana_ir::ir::BinaryOp::Eq => {
-                        ctx.emit(MInst::AluRRR { op: sub_op, rd, rs1: lhs, rs2: rhs });
-                        ctx.emit(MInst::AluRRR { op: AluRRROP::Seqz, rd, rs1: def, rs2: zero_reg() });
-                    }
-                    raana_ir::ir::BinaryOp::Lt |
-                    raana_ir::ir::BinaryOp::Add |
-                    raana_ir::ir::BinaryOp::Sub |
-                    raana_ir::ir::BinaryOp::Mul |
-                    raana_ir::ir::BinaryOp::Div |
-                    raana_ir::ir::BinaryOp::Rem |
-                    raana_ir::ir::BinaryOp::And |
-                    raana_ir::ir::BinaryOp::Or |
-                    raana_ir::ir::BinaryOp::Xor |
-                    raana_ir::ir::BinaryOp::Shl |
-                    raana_ir::ir::BinaryOp::Shr |
-                    raana_ir::ir::BinaryOp::Sar => ctx.emit(MInst::AluRRR { op: op.unwrap(), rd, rs1: lhs, rs2: rhs }),
-                    raana_ir::ir::BinaryOp::Gt => {
-                        ctx.emit(MInst::AluRRR { op: op.unwrap(), rd, rs1: rhs, rs2: lhs });
-                    }
-                    raana_ir::ir::BinaryOp::Ge => {
-                        ctx.emit(MInst::AluRRR { op: op.unwrap(), rd, rs1: lhs, rs2: rhs });
-                        ctx.emit(MInst::AluRRImm12 { op: super::instructions::AluRRImm12OP::Xori, rd, rs: def, imm:Imm12::ONE  });
-                    }
-                    raana_ir::ir::BinaryOp::Le => {
-                        ctx.emit(MInst::AluRRR { op: op.unwrap(), rd, rs1: rhs, rs2: lhs });
-                        ctx.emit(MInst::AluRRImm12 { op: super::instructions::AluRRImm12OP::Xori, rd, rs: def, imm: Imm12::ONE });
-                    }
+                        raana_ir::ir::BinaryOp::NotEq => {
+                            ctx.emit(MInst::AluRRR {
+                                op: sub_op,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
+                            ctx.emit(MInst::AluRRR {
+                                op: AluRRROP::Snez,
+                                rd,
+                                rs1: def,
+                                rs2: zero_reg(),
+                            });
+                        }
+                        raana_ir::ir::BinaryOp::Eq => {
+                            ctx.emit(MInst::AluRRR {
+                                op: sub_op,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
+                            ctx.emit(MInst::AluRRR {
+                                op: AluRRROP::Seqz,
+                                rd,
+                                rs1: def,
+                                rs2: zero_reg(),
+                            });
+                        }
+                        raana_ir::ir::BinaryOp::Lt
+                        | raana_ir::ir::BinaryOp::Add
+                        | raana_ir::ir::BinaryOp::Sub
+                        | raana_ir::ir::BinaryOp::Mul
+                        | raana_ir::ir::BinaryOp::Div
+                        | raana_ir::ir::BinaryOp::Rem
+                        | raana_ir::ir::BinaryOp::And
+                        | raana_ir::ir::BinaryOp::Or
+                        | raana_ir::ir::BinaryOp::Xor
+                        | raana_ir::ir::BinaryOp::Shl
+                        | raana_ir::ir::BinaryOp::Shr
+                        | raana_ir::ir::BinaryOp::Sar => ctx.emit(MInst::AluRRR {
+                            op: op.unwrap(),
+                            rd,
+                            rs1: lhs,
+                            rs2: rhs,
+                        }),
+                        raana_ir::ir::BinaryOp::Gt => {
+                            ctx.emit(MInst::AluRRR {
+                                op: op.unwrap(),
+                                rd,
+                                rs1: rhs,
+                                rs2: lhs,
+                            });
+                        }
+                        raana_ir::ir::BinaryOp::Ge => {
+                            ctx.emit(MInst::AluRRR {
+                                op: op.unwrap(),
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
+                            ctx.emit(MInst::AluRRImm12 {
+                                op: super::instructions::AluRRImm12OP::Xori,
+                                rd,
+                                rs: def,
+                                imm: Imm12::ONE,
+                            });
+                        }
+                        raana_ir::ir::BinaryOp::Le => {
+                            ctx.emit(MInst::AluRRR {
+                                op: op.unwrap(),
+                                rd,
+                                rs1: rhs,
+                                rs2: lhs,
+                            });
+                            ctx.emit(MInst::AluRRImm12 {
+                                op: super::instructions::AluRRImm12OP::Xori,
+                                rd,
+                                rs: def,
+                                imm: Imm12::ONE,
+                            });
+                        }
                     }
                 }
             }
@@ -309,17 +409,16 @@ impl LowerBackend for Riscv64Backend {
                         .vcode
                         .vcode
                         .abi
-                        .alloc_stackslot_or_get(dst, dst_pointee.clone()) as i64;
+                        .alloc_stackslot_or_get(dst, dst_pointee.clone())
+                        as i64;
                     let mut elem_offset: i64 = 0;
                     for elem in elems {
                         let rs = ctx.put_value_in_reg(elem);
                         let elem_ty = ctx.arena.inst_data(elem).ty().clone();
                         let m_type: LoweredType = elem_ty.clone().into();
                         let op: StoreOP = m_type.into();
-                        let addr = normalize_amode(
-                            &AMode::SlotOffset(base_offset + elem_offset),
-                            ctx,
-                        );
+                        let addr =
+                            normalize_amode(&AMode::SlotOffset(base_offset + elem_offset), ctx);
                         ctx.emit(MInst::StoreWord { rs, op, addr });
                         elem_offset += elem_ty.size() as i64;
                     }
@@ -330,7 +429,8 @@ impl LowerBackend for Riscv64Backend {
                         .vcode
                         .vcode
                         .abi
-                        .alloc_stackslot_or_get(dst, dst_pointee.clone()) as i64;
+                        .alloc_stackslot_or_get(dst, dst_pointee.clone())
+                        as i64;
                     let total = src_ty.array_flatten_length();
                     let scalar_ty = src_ty.array_base_scalar_type();
                     let elem_size = scalar_ty.size() as i64;
@@ -376,15 +476,8 @@ impl LowerBackend for Riscv64Backend {
                                 let pointee_ty = ctx.arena.inst_data(dst).ty().derefernce();
                                 let offset =
                                     ctx.vcode.vcode.abi.alloc_stackslot_or_get(dst, pointee_ty);
-                                let addr = normalize_amode(
-                                    &AMode::SlotOffset(offset as i64),
-                                    ctx,
-                                );
-                                ctx.emit(MInst::StoreWord {
-                                    rs,
-                                    op,
-                                    addr,
-                                });
+                                let addr = normalize_amode(&AMode::SlotOffset(offset as i64), ctx);
+                                ctx.emit(MInst::StoreWord { rs, op, addr });
                             }
                             _ => {
                                 unreachable!(
@@ -421,8 +514,7 @@ impl LowerBackend for Riscv64Backend {
                     // All load from integer/float is translated into SSA from.
                     let alloc_ty = ctx.arena.inst_data(src).ty().derefernce();
                     let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(src, alloc_ty);
-                    let addr =
-                        normalize_amode(&AMode::SlotOffset(offset as i64), ctx);
+                    let addr = normalize_amode(&AMode::SlotOffset(offset as i64), ctx);
                     ctx.emit(MInst::LoadWord { rd, op, addr });
                 }
             }
@@ -535,10 +627,7 @@ impl LowerBackend for Riscv64Backend {
                     };
                     let src = ctx.put_value_in_reg(val);
                     ctx.emit(MInst::RetVal {
-                        pair: RetPair {
-                            vreg: src,
-                            preg,
-                        },
+                        pair: RetPair { vreg: src, preg },
                     });
                 }
                 ctx.emit(MInst::Ret);

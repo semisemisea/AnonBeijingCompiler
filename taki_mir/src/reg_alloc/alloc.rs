@@ -281,8 +281,7 @@ impl<'a, F: Function> State<'a, F> {
         log::trace!("The removed vreg: {}", evicted_vreg);
         debug_assert_ne!(evicted_vreg, VReg::invalid());
         if self.vreg_spillslots[evicted_vreg.vreg()].is_invalid() {
-            self.vreg_spillslots[evicted_vreg.vreg()] =
-                self.stack.allocstack(evicted_vreg.class());
+            self.vreg_spillslots[evicted_vreg.vreg()] = self.stack.allocstack(evicted_vreg.class());
         }
         let slot = self.vreg_spillslots[evicted_vreg.vreg()];
         self.vreg_allocs[evicted_vreg.vreg()] = Allocation::stack(slot);
@@ -337,9 +336,7 @@ impl<'a, F: Function> State<'a, F> {
                 dec_clamp_zero(
                     &mut self.num_available_pregs[ExclusiveOperandPos::EarlyOnly][class],
                 );
-                dec_clamp_zero(
-                    &mut self.num_available_pregs[ExclusiveOperandPos::LateOnly][class],
-                );
+                dec_clamp_zero(&mut self.num_available_pregs[ExclusiveOperandPos::LateOnly][class]);
             }
             log::trace!("Edit is stack-to-stack. Generating two edits with a scratch register");
             let scratch_reg = self.scratch_regs[class].unwrap();
@@ -607,10 +604,7 @@ impl<'a, F: Function> Env<'a, F> {
                         return false;
                     }
                     if !self.available_pregs[op.pos()].contains(preg) {
-                        log::trace!(
-                            "The vreg in {preg}: {}",
-                            self.vreg_in_preg[preg.index()]
-                        );
+                        log::trace!("The vreg in {preg}: {}", self.vreg_in_preg[preg.index()]);
                         self.vreg_in_preg[preg.index()] == op.vreg()
                             && (op.pos() != OperandPos::Late
                                 || !self.func.inst_clobbers(inst).contains(preg))
@@ -627,10 +621,7 @@ impl<'a, F: Function> Env<'a, F> {
                 }
                 if let Some(preg) = alloc.as_reg() {
                     if !self.available_pregs[op.pos()].contains(preg) {
-                        log::trace!(
-                            "The vreg in {preg}: {}",
-                            self.vreg_in_preg[preg.index()]
-                        );
+                        log::trace!("The vreg in {preg}: {}", self.vreg_in_preg[preg.index()]);
                         self.vreg_in_preg[preg.index()] == op.vreg()
                             && (op.pos() != OperandPos::Late
                                 || !self.func.inst_clobbers(inst).contains(preg))
@@ -812,13 +803,7 @@ impl<'a, F: Function> Env<'a, F> {
                     log::trace!(
                         "Adding edit from {new_alloc:?} to {curr_alloc:?} after inst {inst:?} for {op}"
                     );
-                    self.add_move(
-                        inst,
-                        new_alloc,
-                        curr_alloc,
-                        op.class(),
-                        InstPosition::After,
-                    )?;
+                    self.add_move(inst, new_alloc, curr_alloc, op.class(), InstPosition::After)?;
                 }
                 if let Some(preg) = new_alloc.as_reg() {
                     self.vreg_in_preg[preg.index()] = VReg::invalid();
@@ -1009,8 +994,7 @@ impl<'a, F: Function> Env<'a, F> {
             self.process_operand_allocation(inst, new_reuse_op, op_idx)?;
         } else if self.func.is_branch(inst) {
             let mut param_spillslot = None;
-            'outer: for (succ_idx, succ) in
-                self.func.block_succs(block).iter().cloned().enumerate()
+            'outer: for (succ_idx, succ) in self.func.block_succs(block).iter().cloned().enumerate()
             {
                 for (param_idx, branch_arg_vreg) in self
                     .func
@@ -1307,9 +1291,7 @@ impl<'a, F: Function> Env<'a, F> {
         log::trace!(
             "Checking for predecessor branch args/livein vregs defined in the branch with fixed-reg constraint"
         );
-        for (param_idx, block_param) in
-            self.func.block_params(block).iter().cloned().enumerate()
-        {
+        for (param_idx, block_param) in self.func.block_params(block).iter().cloned().enumerate() {
             if self.state.vreg_spillslots[block_param.vreg()].is_invalid() {
                 continue;
             }
@@ -1331,7 +1313,8 @@ impl<'a, F: Function> Env<'a, F> {
         for vreg in live_vregs2 {
             for pred in self.func.block_preds(block).iter().cloned() {
                 let slot = self.state.vreg_spillslots[vreg.vreg()];
-                self.state.move_if_def_pred_branch(block, pred, vreg, slot)?;
+                self.state
+                    .move_if_def_pred_branch(block, pred, vreg, slot)?;
             }
         }
         Ok(())
@@ -1371,10 +1354,7 @@ impl<'a, F: Function> DerefMut for Env<'a, F> {
     }
 }
 
-pub fn run<F: Function>(
-    func: &F,
-    mach_env: &MachineEnv,
-) -> Result<Output, String> {
+pub fn run<F: Function>(func: &F, mach_env: &MachineEnv) -> Result<Output, String> {
     let mut env = Env::new(func, mach_env);
     env.run()?;
 

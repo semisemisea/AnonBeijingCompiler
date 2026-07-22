@@ -2,7 +2,8 @@ use std::collections::{HashMap, hash_map::Entry};
 
 use crate::{
     ir::{
-        BasicBlock, FunctionData, Inst, InstKind, Type, TypeKind, arena::Arena,
+        BasicBlock, FunctionData, Inst, InstKind, Type, TypeKind,
+        arena::Arena,
         builder_trait::{LocalInstBuilder, ScalarInstBuilder},
     },
     opt::pass::ArenaContext,

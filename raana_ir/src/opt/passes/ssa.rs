@@ -17,28 +17,30 @@ type InsertTable = Vec<Vec<(VId, Index)>>;
 type ValStack = Vec<Vec<Inst>>;
 
 impl Pass for SSATransform {
-    fn run(&self, program: &mut crate::ir::Program) {
+    fn run(&self, program: &mut crate::ir::Program) -> bool {
         let funcs = program.global_arena().func_arena().funcs();
         let mut arena_context = ArenaContext {
             program,
             curr_func: None,
         };
+        let mut changed = false;
         for func in funcs {
             arena_context.curr_func = Some(func);
-            self.run_on(&mut arena_context);
+            changed |= self.run_on(&mut arena_context);
         }
         let dce = super::dce::DeadCodeElimination;
-        dce.run(program);
+        changed |= dce.run(program);
+        changed
     }
 
-    fn run_on(&self, data: &mut ArenaContext<'_>) {
+    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
         // function declaration. skip.
         if data.layout().entry_bb().is_none() {
-            return;
+            return false;
         }
 
-        let ubb = Box::new(super::dce::UnreachableBasicBlock);
-        ubb.run_on(data);
+        let ubb = super::dce::UnreachableBasicBlock;
+        let mut changed = ubb.run_on(data);
 
         debug!("----------------------------------");
         debug!("function: {:?}", data.curr_func.unwrap());
@@ -109,6 +111,7 @@ impl Pass for SSATransform {
                 let var_ty = utils::alloc_ty(val_id.search_id(vid as _), data).clone();
 
                 let p = data.new_basic_block().add_param(bb, var_ty);
+                changed = true;
                 insert_table[front].push((vid, index));
                 data.inst_data_mut(p).set_name(format!("vid_{}", vid));
 
@@ -136,6 +139,7 @@ impl Pass for SSATransform {
             &mut remove_list,
         );
 
+        changed |= !remove_list.is_empty();
         remove_list.into_iter().rev().for_each(|(inst, bb)| {
             data.remove_layout_inst(bb, inst);
         });
@@ -143,6 +147,7 @@ impl Pass for SSATransform {
         debug!("");
         debug!("----------------------------------");
         debug!("");
+        changed
     }
 }
 

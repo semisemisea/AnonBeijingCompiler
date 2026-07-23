@@ -14,16 +14,8 @@ const REMOVE_FLAG: bool = true;
 /// Function (call to function)
 /// Branches and Return
 impl Pass for DeadCodeElimination {
-    fn run(&self, program: &mut Program) {
-        let funcs = program.global_arena().func_arena().funcs();
-        let mut arena_context = ArenaContext {
-            program,
-            curr_func: None,
-        };
-        for func in funcs {
-            arena_context.curr_func = Some(func);
-            self.run_on_func(&mut arena_context);
-        }
+    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
+        self.run_on_func(data)
     }
 }
 
@@ -58,7 +50,7 @@ fn is_critical(value: Inst, data: &FunctionData) -> bool {
 }
 
 impl DeadCodeElimination {
-    pub(crate) fn run_on_func(&self, data: &mut ArenaContext<'_>) {
+    pub(crate) fn run_on_func(&self, data: &mut ArenaContext<'_>) -> bool {
         let mut worklist = VecDeque::new();
         let mut live_inst = HashSet::new();
 
@@ -159,14 +151,16 @@ impl DeadCodeElimination {
                     .zip(std::iter::repeat(layout.bb())),
             );
         }
+        let changed = !rename_list.is_empty();
         for (inst, bb) in rename_list {
             data.remove_layout_inst(bb, inst);
         }
+        changed
     }
 }
 
 impl Pass for DeadPhiElimination {
-    fn run_on(&self, data: &mut ArenaContext<'_>) {
+    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
         let mut bb_allocator: IDAllocator<BasicBlock, BId> = IDAllocator::new(1);
         let mut unused_params_indices = Vec::with_capacity(data.layout().basicblocks().len());
 
@@ -179,7 +173,12 @@ impl Pass for DeadPhiElimination {
                 .collect::<Vec<_>>();
             unused_params_indices.push(unused_params_index);
         }
+        let mut changed = false;
         for (i, unused_params_index) in unused_params_indices.into_iter().enumerate() {
+            if unused_params_index.is_empty() {
+                continue;
+            }
+            changed = true;
             let bb = bb_allocator.search_id(i);
 
             for &index in unused_params_index.iter() {
@@ -226,14 +225,16 @@ impl Pass for DeadPhiElimination {
                 }
             }
         }
+        changed
     }
 }
 
 impl Pass for UnreachableBasicBlock {
-    fn run_on(&self, data: &mut ArenaContext<'_>) {
+    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
         if data.layout().entry_bb().is_none() {
-            return;
+            return false;
         }
+        let mut changed = false;
         loop {
             let mut id_allocator = IDAllocator::new(1);
             let (g, prece) = cfg::build_cfg_both(data, &mut id_allocator);
@@ -249,7 +250,7 @@ impl Pass for UnreachableBasicBlock {
 
             if unreachable_bb.is_empty() && id_allocator.cnt() == data.layout().basicblocks().len()
             {
-                break;
+                return changed;
             }
 
             let mut island = Vec::new();
@@ -267,6 +268,7 @@ impl Pass for UnreachableBasicBlock {
                 let bb = id_allocator.search_id(id);
                 data.remove_layout_basicblock(bb);
             }
+            changed = true;
         }
     }
 }

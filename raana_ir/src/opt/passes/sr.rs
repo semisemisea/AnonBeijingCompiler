@@ -3,13 +3,13 @@ use crate::opt::prelude::*;
 pub struct StrengthReduction;
 
 impl Pass for StrengthReduction {
-    fn run_on(&self, data: &mut ArenaContext<'_>) {
-        self.local_reduction(data);
+    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
+        self.local_reduction(data)
     }
 }
 
 impl StrengthReduction {
-    fn local_reduction(&self, data: &mut ArenaContext<'_>) {
+    fn local_reduction(&self, data: &mut ArenaContext<'_>) -> bool {
         let to_change = data
             .layout()
             .basicblocks()
@@ -19,6 +19,7 @@ impl StrengthReduction {
             .copied()
             .collect::<Vec<_>>();
 
+        let mut changed = false;
         for val in to_change {
             let InstKind::Binary(binary) = data.inst_data(val).kind() else {
                 unreachable!()
@@ -33,6 +34,7 @@ impl StrengthReduction {
                                 data.new_local_inst().integer(po2.trailing_zeros() as i32);
                             data.replace_inst_with(val)
                                 .binary(BinaryOp::Shl, shl_base, shl_offset);
+                            changed = true;
                         }
                     } else if let InstKind::Integer(int) = data.inst_data(binary.rhs()).kind() {
                         if int.value().is_positive() && (int.value() as u32).is_power_of_two() {
@@ -42,6 +44,7 @@ impl StrengthReduction {
                                 data.new_local_inst().integer(po2.trailing_zeros() as i32);
                             data.replace_inst_with(val)
                                 .binary(BinaryOp::Shl, shl_base, shl_offset);
+                            changed = true;
                         }
                     }
                 }
@@ -49,5 +52,6 @@ impl StrengthReduction {
                 _ => {}
             }
         }
+        changed
     }
 }

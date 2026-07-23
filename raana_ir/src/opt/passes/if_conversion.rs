@@ -24,9 +24,10 @@ struct Candidate {
 }
 
 impl Pass for IfConversion {
-    fn run_on(&self, data: &mut ArenaContext<'_>) {
+    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
         // Re-scan after every rewrite. Apart from keeping the analysis simple,
         // this permits an exposed outer candidate to be converted as well.
+        let mut changed = false;
         loop {
             let blocks = data
                 .layout()
@@ -34,11 +35,14 @@ impl Pass for IfConversion {
                 .iter()
                 .map(|layout| layout.bb())
                 .collect::<Vec<_>>();
-            let candidate = blocks
+            let Some(candidate) = blocks
                 .into_iter()
-                .find_map(|head| self.candidate(data, head));
-            let Some(candidate) = candidate else { break };
+                .find_map(|head| self.candidate(data, head))
+            else {
+                return changed;
+            };
             self.apply(data, candidate);
+            changed = true;
         }
     }
 }

@@ -193,10 +193,10 @@ impl LayeredMap {
 }
 
 impl Pass for GlobalInstNumbering {
-    fn run_on(&self, data: &mut ArenaContext<'_>) {
+    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
         // function declaration. we just have to skip it.
         if data.layout().entry_bb().is_none() {
-            return;
+            return false;
         }
         debug!("----------------------------------------------------");
         debug!("gvn start: {:?}", data.name());
@@ -220,7 +220,7 @@ impl Pass for GlobalInstNumbering {
             val_alloc: &mut VIDAlloc,
             bb_alloc: &mut BIDAlloc,
             data: &mut ArenaContext<'_>,
-        ) {
+        ) -> bool {
             layered_type_map.new_scope();
             let bb = bb_alloc.search_id(bb_id);
 
@@ -243,17 +243,19 @@ impl Pass for GlobalInstNumbering {
                 }
             }
 
+            let changed = !to_replace.is_empty();
             for (rep, rep_with) in to_replace {
                 utils::visit_and_replace(data, rep, rep_with);
             }
 
-            dom_tree[bb_id].iter().for_each(|&child| {
-                dfs(child, dom_tree, layered_type_map, val_alloc, bb_alloc, data)
+            let changed = dom_tree[bb_id].iter().fold(changed, |changed, &child| {
+                dfs(child, dom_tree, layered_type_map, val_alloc, bb_alloc, data) || changed
             });
 
             layered_type_map.pop_scope();
+            changed
         }
-        dfs(
+        let changed = dfs(
             0,
             &donimnace_tree,
             &mut layered_type_map,
@@ -263,5 +265,6 @@ impl Pass for GlobalInstNumbering {
         );
 
         debug!("----------------------------------------------------");
+        changed
     }
 }

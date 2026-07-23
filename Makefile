@@ -190,14 +190,14 @@ build-lib: .docker-image
 		-v "$(CURDIR)/sysylib:/work/sysylib" \
 		-w /work/sysylib \
 		--entrypoint /bin/sh \
-		"$(IMAGE)" -c 'aarch64-linux-gnu-gcc -c sylib.c -o sylib.o && aarch64-linux-gnu-ar rcs libsysy_arm.a sylib.o'
+		"$(IMAGE)" -c 'aarch64-linux-gnu-gcc -c sylib.c -o sylib_arm.o && aarch64-linux-gnu-ar rcs libsysy_arm.a sylib_arm.o'
 
 build-lib-riscv: .docker-image
 	$(DOCKER) run --rm -u "$$(id -u):$$(id -g)" \
 		-v "$(CURDIR)/sysylib:/work/sysylib" \
 		-w /work/sysylib \
 		--entrypoint /bin/sh \
-		"$(IMAGE)" -c 'riscv64-linux-gnu-gcc -c sylib.c -o sylib.o && riscv64-linux-gnu-ar rcs libsysy_riscv.a sylib.o'
+		"$(IMAGE)" -c 'riscv64-linux-gnu-gcc -c sylib.c -o sylib_riscv.o && riscv64-linux-gnu-ar rcs libsysy_riscv.a sylib_riscv.o'
 
 clean-results:
 	rm -rf "$(RESULTS)"

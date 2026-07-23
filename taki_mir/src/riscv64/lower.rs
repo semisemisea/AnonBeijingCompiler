@@ -87,13 +87,18 @@ struct SelectAluOps {
 ///   mask = 0 - (cond != 0)
 ///   result = if_false ^ ((if_true ^ if_false) & mask)
 ///
-/// The subtraction width follows the selected value's type. In particular,
-/// pointers (and RaanaIR strings, which are pointer-sized) require an XLEN
-/// mask, while an i32 select retains the backend's normal word semantics.
+/// The subtraction width follows the selected value's representation. In
+/// particular, pointers (and RaanaIR strings, which are pointer-sized) require
+/// an XLEN mask, while i32 and f32 selects operate on 32-bit words.
 fn select_alu_ops(ty: &HirType) -> Option<SelectAluOps> {
     match ty.kind() {
-        HirTypeKind::Int32 | HirTypeKind::Pointer(_) | HirTypeKind::String => Some(SelectAluOps {
-            sub: alu_op_for_hir_binary(BinaryOp::Sub, ty),
+        HirTypeKind::Int32 | HirTypeKind::Float32 => Some(SelectAluOps {
+            sub: AluRRROP::SubW,
+            xor: AluRRROP::Xor,
+            and: AluRRROP::And,
+        }),
+        HirTypeKind::Pointer(_) | HirTypeKind::String => Some(SelectAluOps {
+            sub: AluRRROP::Sub,
             xor: alu_op_for_hir_binary(BinaryOp::Xor, ty),
             and: alu_op_for_hir_binary(BinaryOp::And, ty),
         }),
@@ -103,7 +108,7 @@ fn select_alu_ops(ty: &HirType) -> Option<SelectAluOps> {
 
 fn select_tmp_ty(ty: &HirType) -> HirType {
     match ty.kind() {
-        HirTypeKind::Int32 => HirType::get_i32(),
+        HirTypeKind::Int32 | HirTypeKind::Float32 => HirType::get_i32(),
         HirTypeKind::Pointer(_) | HirTypeKind::String => HirType::get_pointer(HirType::get_i32()),
         _ => unreachable!("unsupported RISC-V select type: {ty:?}"),
     }
@@ -329,7 +334,7 @@ impl LowerBackend for Riscv64Backend {
                 let Some(ops) = select_alu_ops(ty) else {
                     return Err(ctx.unsupported(
                         "RISC-V lowering",
-                        "RaanaIR select supports only i32 and pointer/string results",
+                        "RaanaIR select supports only i32, f32, and pointer/string results",
                         None,
                         Some(ty),
                     ));
@@ -340,6 +345,23 @@ impl LowerBackend for Riscv64Backend {
                 let if_false = ctx.put_value_in_reg(select.if_false());
                 let def = *ctx.reg_map.get(&inst).unwrap();
                 let tmp_ty = select_tmp_ty(ty);
+                let is_float = matches!(ty.kind(), HirTypeKind::Float32);
+                let (if_true, if_false, result) = if is_float {
+                    let true_bits = ctx.alloc_tmp(HirType::get_i32());
+                    let false_bits = ctx.alloc_tmp(HirType::get_i32());
+                    let result_bits = ctx.alloc_tmp(HirType::get_i32());
+                    ctx.emit(MInst::Mov {
+                        src: if_true,
+                        dst: Writable::from_reg(true_bits),
+                    });
+                    ctx.emit(MInst::Mov {
+                        src: if_false,
+                        dst: Writable::from_reg(false_bits),
+                    });
+                    (true_bits, false_bits, result_bits)
+                } else {
+                    (if_true, if_false, def)
+                };
                 let is_nonzero = ctx.alloc_tmp(HirType::get_i32());
                 let mask = ctx.alloc_tmp(tmp_ty.clone());
                 let delta = ctx.alloc_tmp(tmp_ty.clone());
@@ -373,10 +395,16 @@ impl LowerBackend for Riscv64Backend {
                 });
                 ctx.emit(MInst::AluRRR {
                     op: ops.xor,
-                    rd: Writable::from_reg(def),
+                    rd: Writable::from_reg(result),
                     rs1: if_false,
                     rs2: masked_delta,
                 });
+                if is_float {
+                    ctx.emit(MInst::Mov {
+                        src: result,
+                        dst: Writable::from_reg(def),
+                    });
+                }
             }
             raana_ir::ir::InstKind::Cast(cast) => {
                 use crate::riscv64::instructions::FcvtMode;
@@ -839,8 +867,11 @@ mod tests {
     }
 
     #[test]
-    fn select_rejects_f32_without_cross_class_bit_moves() {
-        assert_eq!(select_alu_ops(&HirType::get_f32()), None);
+    fn select_uses_word_mask_for_f32_bits() {
+        let ops = select_alu_ops(&HirType::get_f32()).unwrap();
+        assert_eq!(ops.sub, AluRRROP::SubW);
+        assert_eq!(ops.xor, AluRRROP::Xor);
+        assert_eq!(ops.and, AluRRROP::And);
     }
 
     #[test]
@@ -896,6 +927,35 @@ mod tests {
         assert!(asm.contains("snez "), "{asm}");
         assert!(asm.contains("sub "), "{asm}");
         assert!(!asm.contains("subw "), "{asm}");
+        assert!(!asm.contains("beqz "), "{asm}");
+        assert!(!asm.contains("bnez "), "{asm}");
+    }
+
+    #[test]
+    fn lowers_f32_select_through_integer_bit_mask() {
+        let mut program = Program::new();
+        let function =
+            program.new_function(HirType::get_f32(), "choose_float".to_string(), Vec::new());
+        let data = program.func_data_mut(function);
+        let entry = data
+            .new_basic_block()
+            .basic_block("entry".to_string(), Vec::new());
+        data.layout_mut().push_bb_back(entry);
+
+        let cond = data.new_local_inst().integer(-2);
+        let if_true = data.new_local_inst().float(1.5);
+        let if_false = data.new_local_inst().float(-0.0);
+        let select = data.new_local_inst().select(cond, if_true, if_false);
+        data.layout_mut().insert_inst(entry, select);
+        let ret = data.new_local_inst().ret(Some(select));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = crate::compile::<Riscv64Backend>(&program).unwrap();
+        assert_eq!(asm.matches("fmv.x.w ").count(), 2, "{asm}");
+        assert!(asm.contains("fmv.w.x "), "{asm}");
+        assert!(asm.contains("snez "), "{asm}");
+        assert!(asm.contains("subw "), "{asm}");
+        assert_eq!(asm.matches("xor ").count(), 2, "{asm}");
         assert!(!asm.contains("beqz "), "{asm}");
         assert!(!asm.contains("bnez "), "{asm}");
     }

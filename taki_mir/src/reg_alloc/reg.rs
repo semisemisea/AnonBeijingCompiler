@@ -474,17 +474,16 @@ impl<'a, F: crate::reg_alloc::function::Function> Iterator for OutputIter<'a, F>
     type Item = InstOrEdit<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // There can't be any edits after the last instruction in a block, so
+        // we don't need to worry about that case.
+        if self.inst_range.len() == 0 {
+            return None;
+        }
         if let Some((first_edit, rest)) = self.edits.split_first() {
-            if self.inst_range.len() == 0
-                || first_edit.0 <= ProgPoint::before(self.inst_range.first().raw_u32())
-            {
+            if first_edit.0 <= ProgPoint::before(self.inst_range.first().raw_u32()) {
                 self.edits = rest;
                 return Some(InstOrEdit::Edit(&first_edit.1));
             }
-        }
-
-        if self.inst_range.len() == 0 {
-            return None;
         }
 
         let inst = self.inst_range.first();

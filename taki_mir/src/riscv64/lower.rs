@@ -75,6 +75,40 @@ fn alu_op_for_hir_binary(op: BinaryOp, ty: &HirType) -> AluRRROP {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectAluOps {
+    sub: AluRRROP,
+    xor: AluRRROP,
+    and: AluRRROP,
+}
+
+/// Select is implemented as:
+///
+///   mask = 0 - (cond != 0)
+///   result = if_false ^ ((if_true ^ if_false) & mask)
+///
+/// The subtraction width follows the selected value's type. In particular,
+/// pointers (and RaanaIR strings, which are pointer-sized) require an XLEN
+/// mask, while an i32 select retains the backend's normal word semantics.
+fn select_alu_ops(ty: &HirType) -> Option<SelectAluOps> {
+    match ty.kind() {
+        HirTypeKind::Int32 | HirTypeKind::Pointer(_) | HirTypeKind::String => Some(SelectAluOps {
+            sub: alu_op_for_hir_binary(BinaryOp::Sub, ty),
+            xor: alu_op_for_hir_binary(BinaryOp::Xor, ty),
+            and: alu_op_for_hir_binary(BinaryOp::And, ty),
+        }),
+        _ => None,
+    }
+}
+
+fn select_tmp_ty(ty: &HirType) -> HirType {
+    match ty.kind() {
+        HirTypeKind::Int32 => HirType::get_i32(),
+        HirTypeKind::Pointer(_) | HirTypeKind::String => HirType::get_pointer(HirType::get_i32()),
+        _ => unreachable!("unsupported RISC-V select type: {ty:?}"),
+    }
+}
+
 pub struct Riscv64Backend;
 
 impl LowerBackend for Riscv64Backend {
@@ -290,13 +324,59 @@ impl LowerBackend for Riscv64Backend {
                     }
                 }
             }
-            raana_ir::ir::InstKind::Select(..) => {
-                return Err(ctx.unsupported(
-                    "RISC-V lowering",
-                    "RaanaIR select lowering is not implemented",
-                    None,
-                    Some(inst_data.ty()),
-                ));
+            raana_ir::ir::InstKind::Select(select) => {
+                let ty = inst_data.ty();
+                let Some(ops) = select_alu_ops(ty) else {
+                    return Err(ctx.unsupported(
+                        "RISC-V lowering",
+                        "RaanaIR select supports only i32 and pointer/string results",
+                        None,
+                        Some(ty),
+                    ));
+                };
+
+                let cond = ctx.put_value_in_reg(select.cond());
+                let if_true = ctx.put_value_in_reg(select.if_true());
+                let if_false = ctx.put_value_in_reg(select.if_false());
+                let def = *ctx.reg_map.get(&inst).unwrap();
+                let tmp_ty = select_tmp_ty(ty);
+                let is_nonzero = ctx.alloc_tmp(HirType::get_i32());
+                let mask = ctx.alloc_tmp(tmp_ty.clone());
+                let delta = ctx.alloc_tmp(tmp_ty.clone());
+                let masked_delta = ctx.alloc_tmp(tmp_ty);
+
+                // Do not assume that an i32 condition has already been
+                // canonicalized to 0 or 1: any nonzero value selects true.
+                ctx.emit(MInst::AluRRR {
+                    op: AluRRROP::Snez,
+                    rd: Writable::from_reg(is_nonzero),
+                    rs1: cond,
+                    rs2: zero_reg(),
+                });
+                ctx.emit(MInst::AluRRR {
+                    op: ops.sub,
+                    rd: Writable::from_reg(mask),
+                    rs1: zero_reg(),
+                    rs2: is_nonzero,
+                });
+                ctx.emit(MInst::AluRRR {
+                    op: ops.xor,
+                    rd: Writable::from_reg(delta),
+                    rs1: if_true,
+                    rs2: if_false,
+                });
+                ctx.emit(MInst::AluRRR {
+                    op: ops.and,
+                    rd: Writable::from_reg(masked_delta),
+                    rs1: delta,
+                    rs2: mask,
+                });
+                ctx.emit(MInst::AluRRR {
+                    op: ops.xor,
+                    rd: Writable::from_reg(def),
+                    rs1: if_false,
+                    rs2: masked_delta,
+                });
             }
             raana_ir::ir::InstKind::Cast(cast) => {
                 use crate::riscv64::instructions::FcvtMode;
@@ -726,5 +806,97 @@ impl LowerBackend for Riscv64Backend {
             label: Label::Block(target),
         });
         ctx.emit(MInst::JumpReg { rs: tmp });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use raana_ir::ir::{
+        Program,
+        builder_trait::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
+    };
+
+    #[test]
+    fn select_uses_word_mask_for_i32() {
+        let ops = select_alu_ops(&HirType::get_i32()).unwrap();
+        assert_eq!(ops.sub, AluRRROP::SubW);
+        assert_eq!(ops.xor, AluRRROP::Xor);
+        assert_eq!(ops.and, AluRRROP::And);
+    }
+
+    #[test]
+    fn select_uses_full_width_mask_for_pointer_and_string() {
+        for ty in [
+            HirType::get_pointer(HirType::get_i32()),
+            HirType::get_string(),
+        ] {
+            let ops = select_alu_ops(&ty).unwrap();
+            assert_eq!(ops.sub, AluRRROP::Sub);
+            assert_eq!(ops.xor, AluRRROP::Xor);
+            assert_eq!(ops.and, AluRRROP::And);
+        }
+    }
+
+    #[test]
+    fn select_rejects_f32_without_cross_class_bit_moves() {
+        assert_eq!(select_alu_ops(&HirType::get_f32()), None);
+    }
+
+    #[test]
+    fn lowers_noncanonical_i32_select_to_branchless_mask_sequence() {
+        let mut program = Program::new();
+        let function = program.new_function(HirType::get_i32(), "choose".to_string(), Vec::new());
+        let data = program.func_data_mut(function);
+        let entry = data
+            .new_basic_block()
+            .basic_block("entry".to_string(), Vec::new());
+        data.layout_mut().push_bb_back(entry);
+
+        let cond = data.new_local_inst().integer(2);
+        let if_true = data.new_local_inst().integer(10);
+        let if_false = data.new_local_inst().integer(20);
+        let select = data.new_local_inst().select(cond, if_true, if_false);
+        data.layout_mut().insert_inst(entry, select);
+        let ret = data.new_local_inst().ret(Some(select));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = crate::compile::<Riscv64Backend>(&program).unwrap();
+        assert!(asm.contains("snez "), "{asm}");
+        assert!(asm.contains("subw "), "{asm}");
+        assert!(asm.contains("and "), "{asm}");
+        assert_eq!(asm.matches("xor ").count(), 2, "{asm}");
+        assert!(!asm.contains("beqz "), "{asm}");
+        assert!(!asm.contains("bnez "), "{asm}");
+    }
+
+    #[test]
+    fn lowers_pointer_select_with_full_width_mask() {
+        let mut program = Program::new();
+        let pointer_ty = HirType::get_pointer(HirType::get_i32());
+        let function =
+            program.new_function(pointer_ty.clone(), "choose_pointer".to_string(), Vec::new());
+        let data = program.func_data_mut(function);
+        let entry = data
+            .new_basic_block()
+            .basic_block("entry".to_string(), Vec::new());
+        data.layout_mut().push_bb_back(entry);
+
+        let cond = data.new_local_inst().integer(2);
+        let if_true = data.new_local_inst().alloc(HirType::get_i32());
+        let if_false = data.new_local_inst().alloc(HirType::get_i32());
+        data.layout_mut().insert_inst(entry, if_true);
+        data.layout_mut().insert_inst(entry, if_false);
+        let select = data.new_local_inst().select(cond, if_true, if_false);
+        data.layout_mut().insert_inst(entry, select);
+        let ret = data.new_local_inst().ret(Some(select));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = crate::compile::<Riscv64Backend>(&program).unwrap();
+        assert!(asm.contains("snez "), "{asm}");
+        assert!(asm.contains("sub "), "{asm}");
+        assert!(!asm.contains("subw "), "{asm}");
+        assert!(!asm.contains("beqz "), "{asm}");
+        assert!(!asm.contains("bnez "), "{asm}");
     }
 }

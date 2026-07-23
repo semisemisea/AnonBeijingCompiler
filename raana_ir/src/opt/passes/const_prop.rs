@@ -113,9 +113,9 @@ type SSAWorklist = VecDeque<Inst>;
 const REMOVE_FLAG: bool = true;
 
 impl Pass for SparseConditionConstantPropagation {
-    fn run_on(&self, data: &mut ArenaContext<'_>) {
+    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
         let Some(entry_bb) = data.layout().entry_bb() else {
-            return;
+            return false;
         };
         let mut bb_allocator: IDAllocator<BasicBlock, BId> = IDAllocator::new(1);
         bb_allocator.check_or_alloc_id_same(entry_bb.bb());
@@ -187,6 +187,7 @@ impl Pass for SparseConditionConstantPropagation {
                 .copied()
                 .collect_vec();
 
+            let mut changed = false;
             for inst in replace_list.into_iter().rev() {
                 let Some(constant) = value_status_map.get(inst).as_const() else {
                     continue;
@@ -194,6 +195,7 @@ impl Pass for SparseConditionConstantPropagation {
                 data.replace_inst_with(inst).integer(constant);
                 let parent_bb = data.layout().parent_bb(inst).unwrap();
                 data.detach_layout_inst(parent_bb, inst);
+                changed = true;
             }
 
             let mut useless_unconditional_list = Vec::new();
@@ -219,6 +221,7 @@ impl Pass for SparseConditionConstantPropagation {
                     (branch.t_target(), branch.t_args().to_vec())
                 };
                 data.replace_inst_with(t_inst).jump(target, args);
+                changed = true;
             }
 
             let remove_list = data
@@ -234,10 +237,11 @@ impl Pass for SparseConditionConstantPropagation {
             for bb in remove_list {
                 data.remove_layout_basicblock(bb);
                 // data.remove_bb(bb);
+                changed = true;
             }
 
-            let ubb = Box::new(super::dce::UnreachableBasicBlock);
-            ubb.run_on(data);
+            let ubb = super::dce::UnreachableBasicBlock;
+            changed |= ubb.run_on(data);
 
             let mut useless_phi_list = Vec::new();
             for layout in data.layout().basicblocks() {
@@ -315,7 +319,11 @@ impl Pass for SparseConditionConstantPropagation {
                     }
                     _ => unreachable!(),
                 }
+                changed = true;
             }
+            changed
+        } else {
+            false
         }
     }
 }
@@ -363,13 +371,9 @@ fn process_instruction(
                         } else {
                             match value_status_map.get($e) {
                                 VariableStatus::Top => {
-                                    unreachable!(
-                                        "{} as {:?} \n{}: {:?}",
-                                        inst,
-                                        data.inst_data(inst),
-                                        $e,
-                                        data.inst_data($e)
-                                    )
+                                    return value_status_map
+                                        .insert_or_merge(inst, VariableStatus::new_variable())
+                                        .then_some(ret_with!(inst));
                                 }
                                 VariableStatus::Constant(constant) => *constant,
                                 VariableStatus::Bottom => {
@@ -422,7 +426,12 @@ fn process_instruction(
                 let cond = branch.cond();
                 let condition_value_status = value_status_map.get(cond);
                 let worklist = match condition_value_status {
-                    VariableStatus::Top => unreachable!(),
+                    // A later pipeline iteration can expose a value that was
+                    // not visited by this SCCP walk. Treat it conservatively.
+                    VariableStatus::Top => [
+                        Some((branch.t_target(), branch.t_args())),
+                        Some((branch.f_target(), branch.f_args())),
+                    ],
                     VariableStatus::Constant(constant) => [
                         Some(if *constant != 0 {
                             (branch.t_target(), branch.t_args())

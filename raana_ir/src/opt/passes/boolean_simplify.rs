@@ -7,7 +7,8 @@ use crate::opt::prelude::*;
 pub struct BooleanSimplification;
 
 impl Pass for BooleanSimplification {
-    fn run_on(&self, data: &mut ArenaContext<'_>) {
+    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
+        let mut changed = false;
         loop {
             let insts = data
                 .layout()
@@ -15,10 +16,10 @@ impl Pass for BooleanSimplification {
                 .iter()
                 .flat_map(|layout| layout.insts().iter().copied())
                 .collect::<Vec<_>>();
-            let changed = insts.into_iter().any(|inst| self.simplify_inst(data, inst));
-            if !changed {
-                break;
+            if !insts.into_iter().any(|inst| self.simplify_inst(data, inst)) {
+                return changed;
             }
+            changed = true;
         }
     }
 }

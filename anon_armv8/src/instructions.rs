@@ -811,7 +811,7 @@ impl MachInst for MInst {
                 collector.reg_def(dst);
             }
             Self::Store { src, addr, .. } => {
-                collector.reg_use(src);
+                use_store_src(collector, src);
                 visit_amode(collector, addr);
             }
             Self::LoadPair {
@@ -906,6 +906,11 @@ fn use_gpr(collector: &mut impl OperandVisitor, gpr: &mut Gpr) {
 }
 fn use_reg_or_zr(collector: &mut impl OperandVisitor, reg: &mut RegOrZr) {
     if let RegOrZr::Reg(reg) = reg {
+        collector.reg_use(reg);
+    }
+}
+fn use_store_src(collector: &mut impl OperandVisitor, reg: &mut Reg) {
+    if reg.is_virtual() {
         collector.reg_use(reg);
     }
 }

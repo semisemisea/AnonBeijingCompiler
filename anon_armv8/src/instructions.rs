@@ -309,6 +309,46 @@ pub enum FpuOp {
     Div,
 }
 
+/// The flag-producing half of an atomic conditional-select pseudo.
+///
+/// Keeping this in the same [`MInst`] as the flag consumer is intentional:
+/// NZCV is implicit state and is not represented by the register allocator.
+#[derive(Clone, Debug)]
+pub enum SelectCmp {
+    IntRR {
+        size: OperandSize,
+        lhs: Reg,
+        rhs: RegOrZr,
+    },
+    IntImm {
+        size: OperandSize,
+        lhs: Reg,
+        imm: Imm12,
+    },
+    Float {
+        lhs: Reg,
+        rhs: Reg,
+    },
+}
+
+/// The flag-consuming half of an atomic conditional-select pseudo.
+#[derive(Clone, Debug)]
+pub enum SelectValue {
+    Int {
+        size: OperandSize,
+        dst: WritableReg,
+        if_true: Reg,
+        if_false: Reg,
+    },
+    Float {
+        dst: WritableReg,
+        if_true: Reg,
+        if_false: Reg,
+    },
+    /// Materialize the selected boolean using `cset`.
+    Bool { dst: WritableReg },
+}
+
 #[derive(Clone, Debug)]
 pub enum MInst {
     Nop,
@@ -482,6 +522,14 @@ pub enum MInst {
     CSet {
         cond: Cond,
         dst: WritableReg,
+    },
+    /// Emits an adjacent comparison and `csel`, `fcsel`, or `cset` pair.
+    /// This is atomic at the machine-instruction level because NZCV is not an
+    /// allocatable value and must not be separated from its consumer.
+    CmpSelect {
+        cmp: SelectCmp,
+        cond: Cond,
+        value: SelectValue,
     },
     FMov {
         dst: WritableReg,
@@ -719,6 +767,37 @@ impl MachInst for MInst {
             | Self::LoadAddr { dst, .. }
             | Self::StackAddr { dst, .. }
             | Self::CSet { dst, .. } => collector.reg_def(dst),
+            Self::CmpSelect { cmp, value, .. } => {
+                match cmp {
+                    SelectCmp::IntRR { lhs, rhs, .. } => {
+                        collector.reg_use(lhs);
+                        use_reg_or_zr(collector, rhs);
+                    }
+                    SelectCmp::IntImm { lhs, .. } => collector.reg_use(lhs),
+                    SelectCmp::Float { lhs, rhs } => {
+                        collector.reg_use(lhs);
+                        collector.reg_use(rhs);
+                    }
+                }
+                match value {
+                    SelectValue::Int {
+                        dst,
+                        if_true,
+                        if_false,
+                        ..
+                    }
+                    | SelectValue::Float {
+                        dst,
+                        if_true,
+                        if_false,
+                    } => {
+                        collector.reg_use(if_true);
+                        collector.reg_use(if_false);
+                        collector.reg_def(dst);
+                    }
+                    SelectValue::Bool { dst } => collector.reg_def(dst),
+                }
+            }
             Self::MovK { dst, src, .. } => {
                 collector.reg_use(src);
                 collector.reg_reuse_def(dst, 0);
@@ -1155,6 +1234,44 @@ impl MachInstEmit for MInst {
                 emit_reg(ctx, dst.to_reg(), OperandSize::Size32)?;
                 write!(ctx, ", {}", cond_name(*cond))
             }
+            Self::CmpSelect { cmp, cond, value } => {
+                emit_select_cmp(ctx, cmp)?;
+                write!(ctx, "\n    ")?;
+                match value {
+                    SelectValue::Int {
+                        size,
+                        dst,
+                        if_true,
+                        if_false,
+                    } => {
+                        write!(ctx, "csel ")?;
+                        emit_reg(ctx, dst.to_reg(), *size)?;
+                        write!(ctx, ", ")?;
+                        emit_reg(ctx, *if_true, *size)?;
+                        write!(ctx, ", ")?;
+                        emit_reg(ctx, *if_false, *size)?;
+                        write!(ctx, ", {}", cond_name(*cond))
+                    }
+                    SelectValue::Float {
+                        dst,
+                        if_true,
+                        if_false,
+                    } => {
+                        write!(ctx, "fcsel ")?;
+                        emit_float_reg(ctx, dst.to_reg(), false)?;
+                        write!(ctx, ", ")?;
+                        emit_float_reg(ctx, *if_true, false)?;
+                        write!(ctx, ", ")?;
+                        emit_float_reg(ctx, *if_false, false)?;
+                        write!(ctx, ", {}", cond_name(*cond))
+                    }
+                    SelectValue::Bool { dst } => {
+                        write!(ctx, "cset ")?;
+                        emit_reg(ctx, dst.to_reg(), OperandSize::Size32)?;
+                        write!(ctx, ", {}", cond_name(*cond))
+                    }
+                }
+            }
             Self::FMov { dst, src } => emit_fmov(ctx, dst.to_reg(), src),
             Self::FMovFromZero { dst } => {
                 write!(ctx, "fmov ")?;
@@ -1222,6 +1339,27 @@ impl MachInstEmit for MInst {
             }
             Self::Ret => write!(ctx, "ret"),
         }
+    }
+}
+
+fn emit_select_cmp(ctx: &mut dyn EmitContext, cmp: &SelectCmp) -> core::fmt::Result {
+    match cmp {
+        SelectCmp::IntRR { size, lhs, rhs } => {
+            write!(ctx, "cmp ")?;
+            emit_reg(ctx, *lhs, *size)?;
+            write!(ctx, ", ")?;
+            emit_reg_or_zr(ctx, rhs, *size)
+        }
+        SelectCmp::IntImm { size, lhs, imm } => {
+            write!(ctx, "cmp ")?;
+            emit_reg(ctx, *lhs, *size)?;
+            write!(ctx, ", #{}", imm.value())?;
+            if imm.shift12() {
+                write!(ctx, ", lsl #12")?;
+            }
+            Ok(())
+        }
+        SelectCmp::Float { lhs, rhs } => emit_float_rr(ctx, "fcmp", *lhs, rhs),
     }
 }
 
@@ -1733,4 +1871,124 @@ fn is_logical_immediate(value: u64, size: OperandSize) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use taki_mir::{
+        block_order::MirBlockIndex,
+        prelude::{HirFunction, HirInst},
+        register::Writable,
+        vcode::{EmitContext, MachInstEmit},
+    };
+
+    use super::{Cond, Imm12, MInst, SelectCmp, SelectValue};
+    use crate::regs::{OperandSize, float_reg, int_reg};
+
+    #[derive(Default)]
+    struct TestEmitContext(String);
+
+    impl core::fmt::Write for TestEmitContext {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            self.0.push_str(text);
+            Ok(())
+        }
+    }
+
+    impl EmitContext for TestEmitContext {
+        fn write_reg(&mut self, _reg: &taki_mir::register::Reg) -> core::fmt::Result {
+            unreachable!("tests use physical registers")
+        }
+
+        fn write_label_ref(&mut self, _idx: MirBlockIndex) -> core::fmt::Result {
+            unreachable!("select pseudo has no labels")
+        }
+
+        fn write_function_label(&mut self, _func: HirFunction) -> core::fmt::Result {
+            unreachable!("select pseudo has no labels")
+        }
+
+        fn write_global_label(&mut self, _global: HirInst) -> core::fmt::Result {
+            unreachable!("select pseudo has no labels")
+        }
+    }
+
+    fn emit(inst: MInst) -> String {
+        let mut ctx = TestEmitContext::default();
+        inst.emit(&mut ctx).unwrap();
+        ctx.0
+    }
+
+    #[test]
+    fn emits_adjacent_i32_cmp_and_csel() {
+        let text = emit(MInst::CmpSelect {
+            cmp: SelectCmp::IntImm {
+                size: OperandSize::Size32,
+                lhs: int_reg(1),
+                imm: Imm12::new(0, false).unwrap(),
+            },
+            cond: Cond::Ne,
+            value: SelectValue::Int {
+                size: OperandSize::Size32,
+                dst: Writable::from_reg(int_reg(0)),
+                if_true: int_reg(2),
+                if_false: int_reg(3),
+            },
+        });
+        assert_eq!(text, "cmp w1, #0\n    csel w0, w2, w3, ne");
+    }
+
+    #[test]
+    fn emits_64_bit_csel_for_pointer_values() {
+        let text = emit(MInst::CmpSelect {
+            cmp: SelectCmp::IntImm {
+                // RaanaIR select conditions are always i32, even when the
+                // selected values are pointers or strings.
+                size: OperandSize::Size32,
+                lhs: int_reg(1),
+                imm: Imm12::new(0, false).unwrap(),
+            },
+            cond: Cond::Ne,
+            value: SelectValue::Int {
+                size: OperandSize::Size64,
+                dst: Writable::from_reg(int_reg(0)),
+                if_true: int_reg(2),
+                if_false: int_reg(3),
+            },
+        });
+        assert_eq!(text, "cmp w1, #0\n    csel x0, x2, x3, ne");
+    }
+
+    #[test]
+    fn emits_adjacent_float_cmp_and_fcsel() {
+        let text = emit(MInst::CmpSelect {
+            cmp: SelectCmp::Float {
+                lhs: float_reg(4),
+                rhs: float_reg(5),
+            },
+            cond: Cond::Mi,
+            value: SelectValue::Float {
+                dst: Writable::from_reg(float_reg(0)),
+                if_true: float_reg(1),
+                if_false: float_reg(2),
+            },
+        });
+        assert_eq!(text, "fcmp s4, s5\n    fcsel s0, s1, s2, mi");
+    }
+
+    #[test]
+    fn emits_adjacent_cmp_and_cset() {
+        let text = emit(MInst::CmpSelect {
+            cmp: SelectCmp::IntRR {
+                size: OperandSize::Size32,
+                lhs: int_reg(1),
+                rhs: crate::regs::RegOrZr::Reg(int_reg(2)),
+            },
+            cond: Cond::Eq,
+            value: SelectValue::Bool {
+                dst: Writable::from_reg(int_reg(0)),
+            },
+        });
+        assert_eq!(text, "cmp w1, w2\n    cset w0, eq");
+    }
 }

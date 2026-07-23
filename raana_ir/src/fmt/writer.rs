@@ -8,7 +8,7 @@ use crate::ir::BasicBlock;
 use crate::ir::{
     Aggregate, Function, FunctionData, InstKind, Program, Type,
     arena::Arena,
-    inst_kind::{Binary, Branch, Call, Cast, GetElemPtr, Jump, Load, Return, Store},
+    inst_kind::{Binary, Branch, Call, Cast, GetElemPtr, Jump, Load, Return, Select, Store},
     instruction::{Inst, InstData},
     layout::BasicBlockLayout,
 };
@@ -269,6 +269,7 @@ impl Writer<'_> {
         match data.kind() {
             InstKind::Alloc => self.visit_alloc(data.ty()),
             InstKind::Binary(binary) => self.visit_binary(binary, data.ty()),
+            InstKind::Select(select) => self.visit_select(select, data.ty()),
             InstKind::Branch(branch) => self.visit_branch(branch),
             InstKind::Cast(cast) => self.visit_cast(cast, data.ty()),
             InstKind::Call(call) => self.visit_call(call),
@@ -309,6 +310,18 @@ impl Writer<'_> {
             self.buffer,
             "cast {} <type = {}, size = {}>",
             get_name!(self, cast.src()),
+            ty,
+            ty.size()
+        )
+    }
+
+    fn visit_select(&mut self, select: &Select, ty: &Type) -> std::fmt::Result {
+        write!(
+            self.buffer,
+            "select {}, {}, {} <type = {}, size = {}>",
+            get_name!(self, select.cond()),
+            get_name!(self, select.if_true()),
+            get_name!(self, select.if_false()),
             ty,
             ty.size()
         )
@@ -442,6 +455,7 @@ mod test {
         fmt::writer::Writer,
         ir::{
             BinaryOp, Program, Type,
+            arena::Arena,
             builder::{BasicBlockBuilder, GlobalInstBuilder, LocalInstBuilder, ScalarInstBuilder},
         },
     };
@@ -493,6 +507,36 @@ entry_0:
 }
 
 ",
+        );
+    }
+
+    #[test]
+    fn select_format_and_usage() {
+        let mut p = Program::new();
+        let f = p.new_function(Type::get_i32(), "choose".to_string(), vec![]);
+        let fd = p.func_data_mut(f);
+        let b = fd
+            .new_basic_block()
+            .basic_block("entry".to_string(), vec![]);
+        fd.layout_mut().push_bb_back(b);
+        let cond = fd.new_local_inst().integer(1);
+        let if_true = fd.new_local_inst().integer(2);
+        let if_false = fd.new_local_inst().integer(3);
+        let select = fd.new_local_inst().select(cond, if_true, if_false);
+        assert_eq!(
+            fd.inst_data(select).inst_usage().collect::<Vec<_>>(),
+            vec![cond, if_true, if_false]
+        );
+        fd.layout_mut().insert_inst(b, select);
+        let ret = fd.new_local_inst().ret(Some(select));
+        fd.layout_mut().insert_inst(b, ret);
+
+        let mut writer = Writer::new(&p);
+        writer.write().unwrap();
+        let output = writer.finish();
+        assert!(
+            output.contains("select 1, 2, 3 <type = i32, size = 4>"),
+            "{output}"
         );
     }
 }

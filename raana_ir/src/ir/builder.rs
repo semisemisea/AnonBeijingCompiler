@@ -5,7 +5,7 @@ use crate::ir::{
     function::Function,
     inst_kind::{
         Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Cast, Float, GetElemPtr,
-        GlobalAlloc, InstKind, Integer, Jump, Load, Return, Store,
+        GlobalAlloc, InstKind, Integer, Jump, Load, Return, Select, Store,
     },
     instruction::{Inst, InstData},
     types::Type,
@@ -69,6 +69,22 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
             "only the same type is supported currently\ntype of lhs: {lhs_type}\ntype of rhs: {rhs_type}"
         );
         self.insert_inst(Binary::new_data(lhs, rhs, op, lhs_type))
+    }
+
+    fn select(&mut self, cond: Inst, if_true: Inst, if_false: Inst) -> Inst {
+        let cond_ty = self.inst_type(cond);
+        let true_ty = self.inst_type(if_true);
+        let false_ty = self.inst_type(if_false);
+        assert!(
+            cond_ty.is_i32(),
+            "select condition must be i32, got {cond_ty}"
+        );
+        assert_eq!(
+            true_ty, false_ty,
+            "select alternatives must have the same type"
+        );
+        assert!(!true_ty.is_unit(), "select cannot produce a unit value");
+        self.insert_inst(Select::new_data(cond, if_true, if_false, true_ty))
     }
 
     fn branch(

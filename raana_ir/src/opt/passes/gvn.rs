@@ -60,6 +60,11 @@ enum InstType {
         lhs: InstNumber,
         rhs: InstNumber,
     },
+    Select {
+        cond: InstNumber,
+        if_true: InstNumber,
+        if_false: InstNumber,
+    },
     GetElemPtr {
         source: InstNumber,
         index: Vec<InstNumber>,
@@ -145,6 +150,11 @@ impl InstType {
                     })
                 }
             }
+            InstKind::Select(select) => Some(Self::Select {
+                cond: val_id.check_or_alloc_id_same(select.cond()),
+                if_true: val_id.check_or_alloc_id_same(select.if_true()),
+                if_false: val_id.check_or_alloc_id_same(select.if_false()),
+            }),
             InstKind::Return(..) | InstKind::Jump(..) | InstKind::Branch(..) => None,
         }
     }

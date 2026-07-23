@@ -50,7 +50,8 @@ fn is_critical(value: Inst, data: &FunctionData) -> bool {
         | InstKind::Alloc
         | InstKind::Load(..)
         | InstKind::GetElemPtr(..)
-        | InstKind::Binary(..) => false,
+        | InstKind::Binary(..)
+        | InstKind::Select(..) => false,
         // rdf is not ready
         InstKind::Call(call) => has_side_effect(call.callee()),
     }
@@ -118,6 +119,11 @@ impl DeadCodeElimination {
                 InstKind::Binary(binary) => {
                     mark_live!(binary.lhs());
                     mark_live!(binary.rhs());
+                }
+                InstKind::Select(select) => {
+                    mark_live!(select.cond());
+                    mark_live!(select.if_true());
+                    mark_live!(select.if_false());
                 }
                 InstKind::Branch(branch) => {
                     mark_live!(branch.cond());

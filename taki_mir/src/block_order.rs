@@ -1,7 +1,7 @@
 //! The order of traversing basic blocks uses RPO of the dominance tree.
 use std::ops::Range;
 
-use raana_ir::opt::prelude::{cfg, dom_tree, IDAllocator};
+use raana_ir::opt::prelude::{IDAllocator, cfg, dom_tree};
 use rustc_hash::FxHashMap;
 
 pub type MirBlockIndex = crate::reg_alloc::index::Block;
@@ -253,7 +253,7 @@ fn outgoing_block_args(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raana_ir::ir::{arena::Arena, Program};
+    use raana_ir::ir::{Program, arena::Arena};
     use raana_ir::opt::prelude::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder};
 
     fn add_block(data: &mut HirFunctionData, name: &str, params: Vec<HirType>) -> HirBasicBlock {

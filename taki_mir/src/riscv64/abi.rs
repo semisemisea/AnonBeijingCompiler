@@ -53,7 +53,7 @@ impl ABIMachineSpec for Riscv64ABI {
         match ty {
             crate::types::I32 => MInst::LoadImm {
                 rd: dst,
-                value: value & u64::from(u32::MAX),
+                value: (value as u32 as i32) as i64 as u64,
             },
             crate::types::I64 => MInst::LoadImm { rd: dst, value },
             _ => unreachable!("unsupported RISC-V immediate type: {ty:?}"),
@@ -406,6 +406,29 @@ fn reg_add_imm(insts: &mut SmallVec<[MInst; 16]>, rd: Writable<Reg>, rs: Reg, am
             rs1: rs,
             rs2: tmp.to_reg(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        riscv64::{instructions::MInst, regs::px_reg},
+        types::I32,
+    };
+
+    #[test]
+    fn i32_negative_immediates_are_sign_extended() {
+        let inst = Riscv64ABI::gen_load_imm(
+            Writable::from_reg(Reg::from_physical_reg(px_reg(5))),
+            (-1_i32) as u32 as u64,
+            I32,
+        );
+
+        let MInst::LoadImm { value, .. } = inst else {
+            panic!("expected an immediate load");
+        };
+        assert_eq!(value, u64::MAX);
     }
 }
 

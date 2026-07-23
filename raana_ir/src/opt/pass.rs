@@ -97,6 +97,9 @@ impl PassesManager {
             let sr = Box::new(sr::StrengthReduction);
             p.register(sr);
 
+            let if_conversion = Box::new(if_conversion::IfConversion);
+            p.register(if_conversion);
+
             let dpe = dce::DeadPhiElimination;
             p.register(Box::new(dpe));
             let dce = dce::DeadCodeElimination;

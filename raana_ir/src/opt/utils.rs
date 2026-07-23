@@ -182,10 +182,17 @@ fn visit_and_replace_single(data: &mut ArenaContext<'_>, used_by: Inst, rep: Ins
             data.replace_inst_with(used_by).load(rep_with);
         }
         InstKind::Store(store) => {
-            if store.src() == rep {
-                let dest = store.dest();
-                data.replace_inst_with(used_by).store(rep_with, dest);
-            }
+            let src = if store.src() == rep {
+                rep_with
+            } else {
+                store.src()
+            };
+            let dest = if store.dest() == rep {
+                rep_with
+            } else {
+                store.dest()
+            };
+            data.replace_inst_with(used_by).store(src, dest);
         }
         InstKind::GetElemPtr(get_elem_ptr) => {
             if get_elem_ptr.base() == rep || get_elem_ptr.offsets().contains(&rep) {

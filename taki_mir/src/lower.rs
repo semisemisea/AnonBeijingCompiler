@@ -153,6 +153,8 @@ pub trait LowerBackend {
 
     fn data_section_directive() -> &'static str;
 
+    fn bss_section_directive() -> &'static str;
+
     fn text_section_directive() -> &'static str;
 
     fn global_directive() -> &'static str;

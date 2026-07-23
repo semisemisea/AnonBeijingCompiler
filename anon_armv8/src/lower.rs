@@ -610,6 +610,10 @@ impl LowerBackend for AArch64Backend {
         ".section .data"
     }
 
+    fn bss_section_directive() -> &'static str {
+        ".section .bss"
+    }
+
     fn text_section_directive() -> &'static str {
         ".section .text"
     }

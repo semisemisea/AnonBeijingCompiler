@@ -88,6 +88,23 @@ pub enum GlobalData {
     ZeroInit(u32),
 }
 
+impl GlobalData {
+    fn is_zero(&self) -> bool {
+        match self {
+            Self::I32(value) => *value == 0,
+            Self::F32(bits) => *bits == 0,
+            Self::ZeroInit(_) => true,
+        }
+    }
+
+    fn size(&self) -> u32 {
+        match self {
+            Self::I32(_) | Self::F32(_) => 4,
+            Self::ZeroInit(size) => *size,
+        }
+    }
+}
+
 fn lower_global_init(program: &HirProgram, init: HirInst) -> Vec<GlobalData> {
     let inst_data = program.inst_data(init);
     match inst_data.kind() {
@@ -121,9 +138,13 @@ where
         globals.push((name, lower_global_init(p, alloc.init())));
     }
 
-    if !globals.is_empty() {
+    let (zero_initialized, initialized): (Vec<_>, Vec<_>) = globals
+        .iter()
+        .partition(|(_, data)| data.iter().all(GlobalData::is_zero));
+
+    if !initialized.is_empty() {
         writeln!(buf, "{}", B::data_section_directive()).unwrap();
-        for (name, data) in &globals {
+        for (name, data) in initialized {
             writeln!(buf, "{} {name}", B::global_directive()).unwrap();
             writeln!(buf, "{name}:").unwrap();
             for entry in data {
@@ -139,6 +160,17 @@ where
                     }
                 }
             }
+            writeln!(buf).unwrap();
+        }
+    }
+
+    if !zero_initialized.is_empty() {
+        writeln!(buf, "{}", B::bss_section_directive()).unwrap();
+        for (name, data) in zero_initialized {
+            writeln!(buf, "{} {name}", B::global_directive()).unwrap();
+            writeln!(buf, "{name}:").unwrap();
+            let size = data.iter().map(GlobalData::size).sum::<u32>();
+            writeln!(buf, "    {} {size}", B::zero_directive()).unwrap();
             writeln!(buf).unwrap();
         }
     }

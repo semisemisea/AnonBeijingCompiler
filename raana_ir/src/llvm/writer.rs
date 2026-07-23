@@ -670,9 +670,11 @@ impl<'a> LlvmWriter<'a> {
                 (BinaryOp::Eq, false) => {
                     writeln!(self.buffer, "{} = icmp eq i32 {}, {}", cmp_name, lhs, rhs)?
                 }
+                // SysY/C `!=` is true for unordered float operands, matching
+                // frontend folding and AArch64 `fcmp` plus `cset ne`.
                 (BinaryOp::NotEq, true) => writeln!(
                     self.buffer,
-                    "{} = fcmp one float {}, {}",
+                    "{} = fcmp une float {}, {}",
                     cmp_name, lhs, rhs
                 )?,
                 (BinaryOp::NotEq, false) => {
@@ -971,5 +973,30 @@ mod tests {
         assert!(llvm.contains("icmp ne i32 2, 0"), "{llvm}");
         assert!(llvm.contains("select i1 %selectcond"), "{llvm}");
         assert!(llvm.contains(", i32 10, i32 20"), "{llvm}");
+    }
+
+    #[test]
+    fn writes_unordered_float_not_equal() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "float_not_equal".into(),
+            vec![Type::get_f32(), Type::get_f32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let lhs = data.params()[0];
+        let rhs = data.params()[1];
+        let not_equal = data
+            .new_local_inst()
+            .binary(crate::ir::BinaryOp::NotEq, lhs, rhs);
+        let ret = data.new_local_inst().ret(Some(not_equal));
+        data.layout_mut().insert_inst(entry, not_equal);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let mut writer = LlvmWriter::new(&program);
+        writer.write().unwrap();
+        assert!(writer.finish().contains("fcmp une float"));
     }
 }

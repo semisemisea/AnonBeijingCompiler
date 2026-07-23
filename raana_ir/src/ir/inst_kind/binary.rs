@@ -63,6 +63,35 @@ impl BinaryOp {
                 | BinaryOp::Le
         )
     }
+
+    /// Returns the integer comparison that is true exactly when `self` is
+    /// false. Floating-point relational comparisons need unordered predicates,
+    /// which RaanaIR does not represent, so callers must first establish that
+    /// the operands are integers.
+    pub fn complement_integer_compare(&self) -> Option<Self> {
+        Some(match self {
+            BinaryOp::NotEq => BinaryOp::Eq,
+            BinaryOp::Eq => BinaryOp::NotEq,
+            BinaryOp::Gt => BinaryOp::Le,
+            BinaryOp::Lt => BinaryOp::Ge,
+            BinaryOp::Ge => BinaryOp::Lt,
+            BinaryOp::Le => BinaryOp::Gt,
+            _ => return None,
+        })
+    }
+
+    /// Returns the comparison equivalent to swapping the operands.
+    pub fn swap_compare_args(&self) -> Option<Self> {
+        Some(match self {
+            BinaryOp::NotEq => BinaryOp::NotEq,
+            BinaryOp::Eq => BinaryOp::Eq,
+            BinaryOp::Gt => BinaryOp::Lt,
+            BinaryOp::Lt => BinaryOp::Gt,
+            BinaryOp::Ge => BinaryOp::Le,
+            BinaryOp::Le => BinaryOp::Ge,
+            _ => return None,
+        })
+    }
 }
 
 impl std::fmt::Display for BinaryOp {
@@ -90,5 +119,40 @@ impl std::fmt::Display for BinaryOp {
                 BinaryOp::Sar => "sar",
             }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BinaryOp;
+
+    #[test]
+    fn complements_integer_comparisons() {
+        for (op, complement) in [
+            (BinaryOp::Eq, BinaryOp::NotEq),
+            (BinaryOp::NotEq, BinaryOp::Eq),
+            (BinaryOp::Lt, BinaryOp::Ge),
+            (BinaryOp::Le, BinaryOp::Gt),
+            (BinaryOp::Gt, BinaryOp::Le),
+            (BinaryOp::Ge, BinaryOp::Lt),
+        ] {
+            assert_eq!(op.complement_integer_compare(), Some(complement));
+        }
+        assert_eq!(BinaryOp::Add.complement_integer_compare(), None);
+    }
+
+    #[test]
+    fn swaps_comparison_arguments() {
+        for (op, swapped) in [
+            (BinaryOp::Eq, BinaryOp::Eq),
+            (BinaryOp::NotEq, BinaryOp::NotEq),
+            (BinaryOp::Lt, BinaryOp::Gt),
+            (BinaryOp::Le, BinaryOp::Ge),
+            (BinaryOp::Gt, BinaryOp::Lt),
+            (BinaryOp::Ge, BinaryOp::Le),
+        ] {
+            assert_eq!(op.swap_compare_args(), Some(swapped));
+        }
+        assert_eq!(BinaryOp::Add.swap_compare_args(), None);
     }
 }

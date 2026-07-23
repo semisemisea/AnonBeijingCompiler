@@ -557,6 +557,10 @@ impl AstGenContext {
         if let Some(float) = self.as_f32(val) {
             return self.new_local_value().integer((float != 0.0) as i32);
         }
+        if matches!(self.inst_data(val).kind(), InstKind::Binary(binary) if binary.op().is_compare())
+        {
+            return val;
+        }
         let zero = self.zero_local(&ty);
         let cond = self.new_local_value().binary(BinaryOp::NotEq, val, zero);
         self.push_inst(cond);

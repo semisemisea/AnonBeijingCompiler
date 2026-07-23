@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::fmt::Write;
 
-const VERBOSE: bool = true;
+const VERBOSE: bool = false;
 
 use crate::ir::BasicBlock;
 use crate::ir::{
@@ -209,9 +209,11 @@ impl Writer<'_> {
             )?;
         }
         writeln!(self.buffer, ">: {{")?;
-        for layout in data.layout().basicblocks() {
+        for (index, layout) in data.layout().basicblocks().iter().enumerate() {
+            let name = data.bb_data(layout.bb()).name();
+            let base_name = name.rsplit_once('_').map_or(name, |(base, _)| base);
             self.bb_name
-                .insert(layout.bb(), data.bb_data(layout.bb()).name().to_string());
+                .insert(layout.bb(), format!("{base_name}_{index}"));
         }
         for layout in data.layout().basicblocks() {
             self.visit_bb(layout)?;

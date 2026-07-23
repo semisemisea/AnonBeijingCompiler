@@ -1,3 +1,4 @@
+pub mod boolean_simplify;
 pub mod const_prop;
 pub mod dce;
 pub mod gvn;

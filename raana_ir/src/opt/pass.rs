@@ -100,6 +100,9 @@ impl PassesManager {
             let if_conversion = Box::new(if_conversion::IfConversion);
             p.register(if_conversion);
 
+            let boolean_simplification = Box::new(boolean_simplify::BooleanSimplification);
+            p.register(boolean_simplification);
+
             let dpe = dce::DeadPhiElimination;
             p.register(Box::new(dpe));
             let dce = dce::DeadCodeElimination;

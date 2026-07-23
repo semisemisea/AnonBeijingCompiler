@@ -1515,9 +1515,9 @@ impl ToRaanaIR for items::UnaryOp {
                 ctx.new_local_value().binary(BinaryOp::Sub, zero, rhs)
             }
             items::UnaryOp::Negation => {
-                let truthy = ctx.truthy_local(rhs);
-                let zero = ctx.new_local_value().integer(0);
-                ctx.new_local_value().binary(BinaryOp::Eq, zero, truthy)
+                let ty = ctx.inst_data(rhs).ty().clone();
+                let zero = ctx.zero_local(&ty);
+                ctx.new_local_value().binary(BinaryOp::Eq, rhs, zero)
             }
         };
         ctx.push_val(operation);

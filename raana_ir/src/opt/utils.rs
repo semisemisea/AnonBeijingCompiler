@@ -224,6 +224,25 @@ fn visit_and_replace_single(data: &mut ArenaContext<'_>, used_by: Inst, rep: Ins
             // info!("");
             data.replace_inst_with(used_by).binary(op, lhs, rhs);
         }
+        InstKind::Select(select) => {
+            let cond = if select.cond() == rep {
+                rep_with
+            } else {
+                select.cond()
+            };
+            let if_true = if select.if_true() == rep {
+                rep_with
+            } else {
+                select.if_true()
+            };
+            let if_false = if select.if_false() == rep {
+                rep_with
+            } else {
+                select.if_false()
+            };
+            data.replace_inst_with(used_by)
+                .select(cond, if_true, if_false);
+        }
         InstKind::Branch(branch) => {
             let cond = if branch.cond() == rep {
                 rep_with

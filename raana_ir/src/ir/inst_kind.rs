@@ -9,6 +9,7 @@ pub mod jump;
 pub mod ptr;
 pub mod r3turn;
 pub mod scalar;
+pub mod select;
 pub mod stack_mem;
 
 pub use aggregate::Aggregate;
@@ -25,6 +26,7 @@ pub use ptr::GetElemPtr;
 pub use r3turn::Return;
 pub use scalar::Float;
 pub use scalar::Integer;
+pub use select::Select;
 pub use stack_mem::Load;
 pub use stack_mem::Store;
 
@@ -38,6 +40,7 @@ pub enum InstKind {
     Integer(Integer),
     Float(Float),
     Binary(Binary),
+    Select(Select),
     Jump(Jump),
     Branch(Branch),
     Cast(Cast),
@@ -152,6 +155,9 @@ impl Iterator for InstUsage<'_> {
             InstKind::Call(call) => call.args().get(cur_index).copied(),
             InstKind::Aggregate(aggregate) => aggregate.value().get(cur_index).copied(),
             InstKind::Binary(binary) => field_use!(binary.lhs(), binary.rhs()),
+            InstKind::Select(select) => {
+                field_use!(select.cond(), select.if_true(), select.if_false())
+            }
             InstKind::Jump(jump) => jump.args().get(cur_index).copied(),
         }
     }

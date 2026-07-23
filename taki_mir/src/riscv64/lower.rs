@@ -290,6 +290,14 @@ impl LowerBackend for Riscv64Backend {
                     }
                 }
             }
+            raana_ir::ir::InstKind::Select(..) => {
+                return Err(ctx.unsupported(
+                    "RISC-V lowering",
+                    "RaanaIR select lowering is not implemented",
+                    None,
+                    Some(inst_data.ty()),
+                ));
+            }
             raana_ir::ir::InstKind::Cast(cast) => {
                 use crate::riscv64::instructions::FcvtMode;
                 let src = cast.src();

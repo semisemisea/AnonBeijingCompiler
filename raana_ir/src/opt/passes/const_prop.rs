@@ -33,8 +33,16 @@ impl VariableStatus {
 
     #[must_use]
     fn update(&mut self, status: VariableStatus) -> bool {
-        match &self {
-            old_status @ VariableStatus::Constant(..) if **old_status != status => {
+        match (*self, status) {
+            (VariableStatus::Top, new_status) if new_status != VariableStatus::Top => {
+                *self = new_status;
+                true
+            }
+            (VariableStatus::Constant(old), VariableStatus::Constant(new)) if old != new => {
+                *self = VariableStatus::Bottom;
+                true
+            }
+            (VariableStatus::Constant(..), VariableStatus::Bottom) => {
                 *self = VariableStatus::Bottom;
                 true
             }
@@ -378,6 +386,36 @@ fn process_instruction(
                 let outcome = mathematic_operation(binary.op(), lhs, rhs);
                 value_status_map
                     .insert_or_merge(inst, VariableStatus::new_with_const(outcome))
+                    .then_some(ret_with!(inst))
+            }
+            InstKind::Select(select) => {
+                let status_of = |value| match data.inst_data(value).kind() {
+                    InstKind::Integer(integer) => VariableStatus::Constant(integer.value()),
+                    _ => *value_status_map.get(value),
+                };
+                let status = match status_of(select.cond()) {
+                    VariableStatus::Constant(cond) => status_of(if cond != 0 {
+                        select.if_true()
+                    } else {
+                        select.if_false()
+                    }),
+                    VariableStatus::Top => VariableStatus::Top,
+                    VariableStatus::Bottom => {
+                        let if_true = status_of(select.if_true());
+                        let if_false = status_of(select.if_false());
+                        match (if_true, if_false) {
+                            (VariableStatus::Top, status) | (status, VariableStatus::Top) => status,
+                            (VariableStatus::Constant(a), VariableStatus::Constant(b))
+                                if a == b =>
+                            {
+                                VariableStatus::Constant(a)
+                            }
+                            _ => VariableStatus::Bottom,
+                        }
+                    }
+                };
+                value_status_map
+                    .insert_or_merge(inst, status)
                     .then_some(ret_with!(inst))
             }
             InstKind::Branch(branch) => {

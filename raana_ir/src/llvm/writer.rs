@@ -520,8 +520,9 @@ impl<'a> LlvmWriter<'a> {
             &kind,
             InstKind::Binary(b) if b.op().is_compare()
         );
+        let is_select = matches!(&kind, InstKind::Select(..));
 
-        if !ty.is_unit() && !is_cmp {
+        if !ty.is_unit() && !is_cmp && !is_select {
             write!(self.buffer, "  {} = ", get_name!(self, inst))?;
         } else if !ty.is_unit() {
             write!(self.buffer, "  ")?;
@@ -540,6 +541,7 @@ impl<'a> LlvmWriter<'a> {
                 )
             }
             InstKind::Binary(binary) => self.visit_binary(binary, inst, &ty),
+            InstKind::Select(select) => self.visit_select(select, inst, &ty),
             InstKind::Branch(branch) => {
                 // RaanaIR branch condition is i32 (0=false, non-zero=true).
                 // LLVM br needs i1. Emit: %tmp = trunc i32 %cond to i1
@@ -763,6 +765,32 @@ impl<'a> LlvmWriter<'a> {
         }
     }
 
+    fn visit_select(
+        &mut self,
+        select: &crate::ir::Select,
+        inst: Inst,
+        ty: &Type,
+    ) -> std::fmt::Result {
+        let cond_name = format!("%selectcond{}", self.name_counter);
+        self.name_counter += 1;
+        writeln!(
+            self.buffer,
+            "{} = icmp ne i32 {}, 0",
+            cond_name,
+            get_name!(self, select.cond())
+        )?;
+        writeln!(
+            self.buffer,
+            "  {} = select i1 {}, {} {}, {} {}",
+            get_name!(self, inst),
+            cond_name,
+            self.type_to_llvm(ty),
+            get_name!(self, select.if_true()),
+            self.type_to_llvm(ty),
+            get_name!(self, select.if_false())
+        )
+    }
+
     fn visit_call(&mut self, call: &Call, ret_ty: &Type) -> std::fmt::Result {
         let callee_data = self.arena.func_data(call.callee());
         let args_str: Vec<String> = call
@@ -909,5 +937,39 @@ impl<'a> LlvmWriter<'a> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ir::{
+        Program, Type,
+        builder_trait::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
+    };
+
+    use super::LlvmWriter;
+
+    #[test]
+    fn writes_select_with_i32_truthiness() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_i32(), "choose".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+
+        let cond = data.new_local_inst().integer(2);
+        let if_true = data.new_local_inst().integer(10);
+        let if_false = data.new_local_inst().integer(20);
+        let select = data.new_local_inst().select(cond, if_true, if_false);
+        data.layout_mut().insert_inst(entry, select);
+        let ret = data.new_local_inst().ret(Some(select));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let mut writer = LlvmWriter::new(&program);
+        writer.write().unwrap();
+        let llvm = writer.finish();
+        assert!(llvm.contains("icmp ne i32 2, 0"), "{llvm}");
+        assert!(llvm.contains("select i1 %selectcond"), "{llvm}");
+        assert!(llvm.contains(", i32 10, i32 20"), "{llvm}");
     }
 }

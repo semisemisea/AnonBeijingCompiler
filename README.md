@@ -1,6 +1,6 @@
 # AnonBeijingCompiler
 
-Entry for CSC Compiler Implementation Competition. A SysY to Arm/RISC-V compiler, written in rust.
+Entry for CSC Compiler Implementation Competition. A SysY to AArch64/RISC-V compiler, written in Rust.
 
 ## Introduction
 
@@ -31,6 +31,16 @@ For more information please go to the crate `raana_ir`
 Backend is built around machine-specific intermediate representation(MIR).
 This part is influenced by the **VCode** from *Cranelift* and **GlobalISel** from **LLVM**.
 
+The production AArch64 path is:
+
+```text
+SysY -> RaanaIR -> generic VCode/MIR -> register allocation -> AAPCS64 frame -> GNU AArch64 assembly
+```
+
+`anon_armv8` supplies typed instruction selection, AAPCS64 ABI hooks, and GNU
+assembly emission. Allocation, frame layout, and final emission are driven by
+the generic `taki_mir` pipeline; there is no alternate AArch64 backend path.
+
 For more information please go to the crate `taki_mir`
 
 #### Register Allocation
@@ -52,15 +62,23 @@ See the Appendix(i)
 
 ## Usage
 
-When most of work is done, you can:
-Run the command
+Build the CLI with `cargo build -p soyo_compiler`, then run:
 
 ```bash
-compiler -S -o testcase.s testcase.sy [-O1]
+soyo_compiler -S --target aarch64 -o testcase.s testcase.sy [-O 1]
 ```
 
-will generate assembly in file `testcase.s`.
-Only this form of prompt is accepted by compiler.
+`-S` is an alias for `--emit asm`. The default target is `riscv64`; pass
+`--target aarch64` for GNU AArch64 assembly. `--emit ir`, `--emit llvm`, and
+`--emit asm` select outputs. Multiple comma-separated `--emit` values treat
+`-o` as an output directory and name files from the input stem.
+
+`-O 1` enables the intended optimization path. The compiler accepts one input
+file and requires `-o`.
+
+Unsupported backend HIR is reported as a concise code-generation error with
+function, block where available, instruction, type, phase, and legality
+context. Internal compiler invariants remain fail-fast errors.
 
 ## Build from source
 

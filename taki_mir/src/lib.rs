@@ -5,12 +5,12 @@ use crate::{
     block_order::BlockLoweringOrder,
     emit::AsmWriter,
     lower::{LowerBackend, LowerContext},
+    reg_alloc::function::Function,
     reg_alloc::reg::RegClass,
     vcode::MachInstEmit,
 };
 
 pub mod abi;
-pub mod armv8;
 pub mod block_order;
 pub mod emit;
 pub mod inst_predicate;
@@ -88,6 +88,23 @@ pub enum GlobalData {
     ZeroInit(u32),
 }
 
+impl GlobalData {
+    fn is_zero(&self) -> bool {
+        match self {
+            Self::I32(value) => *value == 0,
+            Self::F32(bits) => *bits == 0,
+            Self::ZeroInit(_) => true,
+        }
+    }
+
+    fn size(&self) -> u32 {
+        match self {
+            Self::I32(_) | Self::F32(_) => 4,
+            Self::ZeroInit(size) => *size,
+        }
+    }
+}
+
 fn lower_global_init(program: &HirProgram, init: HirInst) -> Vec<GlobalData> {
     let inst_data = program.inst_data(init);
     match inst_data.kind() {
@@ -105,7 +122,7 @@ fn lower_global_init(program: &HirProgram, init: HirInst) -> Vec<GlobalData> {
     }
 }
 
-pub fn compile<B: LowerBackend>(p: &HirProgram) -> String
+pub fn compile<B: LowerBackend>(p: &HirProgram) -> Result<String, crate::lower::CodegenError>
 where
     B::MInst: MachInstEmit,
 {
@@ -121,9 +138,13 @@ where
         globals.push((name, lower_global_init(p, alloc.init())));
     }
 
-    if !globals.is_empty() {
+    let (zero_initialized, initialized): (Vec<_>, Vec<_>) = globals
+        .iter()
+        .partition(|(_, data)| data.iter().all(GlobalData::is_zero));
+
+    if !initialized.is_empty() {
         writeln!(buf, "{}", B::data_section_directive()).unwrap();
-        for (name, data) in &globals {
+        for (name, data) in initialized {
             writeln!(buf, "{} {name}", B::global_directive()).unwrap();
             writeln!(buf, "{name}:").unwrap();
             for entry in data {
@@ -143,6 +164,17 @@ where
         }
     }
 
+    if !zero_initialized.is_empty() {
+        writeln!(buf, "{}", B::bss_section_directive()).unwrap();
+        for (name, data) in zero_initialized {
+            writeln!(buf, "{} {name}", B::global_directive()).unwrap();
+            writeln!(buf, "{name}:").unwrap();
+            let size = data.iter().map(GlobalData::size).sum::<u32>();
+            writeln!(buf, "    {} {size}", B::zero_directive()).unwrap();
+            writeln!(buf).unwrap();
+        }
+    }
+
     writeln!(buf, "{}", B::text_section_directive()).unwrap();
 
     for &func in p.function_layout() {
@@ -157,20 +189,43 @@ where
         };
         let lower_order = BlockLoweringOrder::new(arena);
         let abi = CalleeABI::new(arena);
-        let lower = LowerContext::new(p, func, abi, lower_order);
-        let mut vcode = lower.lower::<B>();
+        let lower = LowerContext::new(p, func, abi, lower_order)?;
+        let mut vcode = lower.lower::<B>()?;
+        vcode.verify("post-lowering").unwrap_or_else(|error| {
+            log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
+            panic!("function={} {error}", func_data.name());
+        });
 
         let machine_env = vcode.abi.machine_env();
         let output =
             crate::reg_alloc::alloc::run(&vcode, machine_env).expect("register allocation failed");
+        log::debug!(target: "taki_mir::reg_alloc", "function={} allocation complete: locations={}, spill-slots={}, edits={}", func_data.name(), output.allocs.len(), output.num_spillslots, output.edits.len());
+        for (inst, allocs) in
+            (0..vcode.num_insts()).map(|index| (index, output.inst_allocs(index as u32)))
+        {
+            log::trace!(target: "taki_mir::reg_alloc", "function={} inst={inst} allocations={allocs:?}", func_data.name());
+        }
+        for (point, edit) in &output.edits {
+            log::debug!(target: "taki_mir::reg_alloc", "function={} edit at {point:?}: {edit:?}", func_data.name());
+        }
         vcode.write_back_allocs(&output);
+        vcode
+            .verify("post-allocation-writeback")
+            .unwrap_or_else(|error| {
+                log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
+                panic!("function={} {error}", func_data.name());
+            });
 
         let spill_size = output.num_spillslots as u32 * vcode.abi.spillslot_size(RegClass::Int);
         vcode.abi.compute_frame_layout(spill_size, &output);
+        log::debug!(target: "taki_mir::emit", "function={} frame layout={:?}", func_data.name(), vcode.abi.frame_layout());
 
+        let asm_start = buf.len();
         let mut w = AsmWriter::<B>::new(&mut buf, func_data, p);
         w.write_function(&vcode, &output);
+        let asm = &buf[asm_start..];
+        log::debug!(target: "taki_mir::emit", "function={} final assembly: bytes={}, lines={}\n{}", func_data.name(), asm.len(), asm.lines().count(), asm);
     }
 
-    buf
+    Ok(buf)
 }

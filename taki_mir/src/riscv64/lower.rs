@@ -2,14 +2,14 @@ use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind as HirTypeKind,
 use smallvec::smallvec;
 
 use crate::{
-    abi::{ArgPair, CallArgPair, CallRetPair, RetPair},
+    abi::{ABIMachineSpec, ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::LoweredBlock,
-    lower::{LowerBackend, LowerContext},
+    lower::{CodegenError, LowerBackend, LowerContext},
     prelude::HirFunctionData,
     reg_alloc::reg::PReg,
     register::Writable,
     riscv64::{
-        abi::DEFAULT_CLOBBERS,
+        abi::{DEFAULT_CLOBBERS, Riscv64ABI},
         instructions::{AMode, AluRRImm12OP, AluRRROP, FpuRRROP, Imm12, LoadOP, MInst, StoreOP},
         labels::Label,
         regs::{ARG_REG, FARG_REG, a0, fa0, fp_reg, preg_name, stack_reg, zero_reg},
@@ -18,18 +18,23 @@ use crate::{
 };
 
 fn normalize_amode(amode: &AMode, ctx: &mut LowerContext<'_, MInst>) -> AMode {
+    // Slot offsets need the final outgoing-argument-area displacement, which
+    // is unavailable during lowering. Keep them symbolic for ABI legalization.
+    if matches!(amode, AMode::SlotOffset(_)) {
+        return amode.clone();
+    }
     let (off, base) = match *amode {
-        AMode::SPOffset(o) | AMode::SlotOffset(o) | AMode::OutgoingArg(o) => (o, stack_reg()),
+        AMode::SPOffset(o) | AMode::OutgoingArg(o) => (o, stack_reg()),
         AMode::FPOffset(o) | AMode::IncomingArg(o) => (o, fp_reg()),
         _ => return amode.clone(),
     };
     if (-2048..2048).contains(&off) {
         return amode.clone();
     }
-    let tmp_off = ctx.alloc_tmp(HirType::get_i32());
+    let tmp_off = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
     ctx.emit(MInst::LoadImm {
         rd: Writable::from_reg(tmp_off),
-        imm: off as i32,
+        value: off as u64,
     });
     let tmp_addr = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
     ctx.emit(MInst::AluRRR {
@@ -77,7 +82,7 @@ impl LowerBackend for Riscv64Backend {
     fn lower(
         ctx: &mut crate::lower::LowerContext<Self::MInst>,
         inst: raana_ir::opt::prelude::Inst,
-    ) {
+    ) -> Result<(), CodegenError> {
         let func_data = ctx.arena.program.func_data(ctx.arena.curr_func.unwrap());
         let inst_data = func_data.inst_data(inst);
         match inst_data.kind() {
@@ -109,34 +114,84 @@ impl LowerBackend for Riscv64Backend {
                     use crate::riscv64::instructions::FpuRRROP;
                     match bop {
                         raana_ir::ir::BinaryOp::Add => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FaddS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FaddS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Sub => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FsubS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FsubS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Mul => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FmulS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FmulS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Div => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FdivS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FdivS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Lt => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FltS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FltS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Gt => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FltS, rd, rs1: rhs, rs2: lhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FltS,
+                                rd,
+                                rs1: rhs,
+                                rs2: lhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Le => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FleS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FleS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Ge => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FleS, rd, rs1: rhs, rs2: lhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FleS,
+                                rd,
+                                rs1: rhs,
+                                rs2: lhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::Eq => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FeqS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FeqS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                         }
                         raana_ir::ir::BinaryOp::NotEq => {
-                            ctx.emit(MInst::FpuRRR { op: FpuRRROP::FeqS, rd, rs1: lhs, rs2: rhs });
+                            ctx.emit(MInst::FpuRRR {
+                                op: FpuRRROP::FeqS,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
                             ctx.emit(MInst::AluRRImm12 {
                                 op: super::instructions::AluRRImm12OP::Xori,
                                 rd,
@@ -151,37 +206,87 @@ impl LowerBackend for Riscv64Backend {
                         .then(|| alu_op_for_hir_binary(bop, inst_data.ty()));
                     let sub_op = alu_op_for_hir_binary(BinaryOp::Sub, inst_data.ty());
                     match bop {
-                    raana_ir::ir::BinaryOp::NotEq => {
-                        ctx.emit(MInst::AluRRR { op: sub_op, rd, rs1: lhs, rs2: rhs });
-                        ctx.emit(MInst::AluRRR { op: AluRRROP::Snez, rd, rs1: def, rs2: zero_reg() });
-                    }
-                    raana_ir::ir::BinaryOp::Eq => {
-                        ctx.emit(MInst::AluRRR { op: sub_op, rd, rs1: lhs, rs2: rhs });
-                        ctx.emit(MInst::AluRRR { op: AluRRROP::Seqz, rd, rs1: def, rs2: zero_reg() });
-                    }
-                    raana_ir::ir::BinaryOp::Lt |
-                    raana_ir::ir::BinaryOp::Add |
-                    raana_ir::ir::BinaryOp::Sub |
-                    raana_ir::ir::BinaryOp::Mul |
-                    raana_ir::ir::BinaryOp::Div |
-                    raana_ir::ir::BinaryOp::Rem |
-                    raana_ir::ir::BinaryOp::And |
-                    raana_ir::ir::BinaryOp::Or |
-                    raana_ir::ir::BinaryOp::Xor |
-                    raana_ir::ir::BinaryOp::Shl |
-                    raana_ir::ir::BinaryOp::Shr |
-                    raana_ir::ir::BinaryOp::Sar => ctx.emit(MInst::AluRRR { op: op.unwrap(), rd, rs1: lhs, rs2: rhs }),
-                    raana_ir::ir::BinaryOp::Gt => {
-                        ctx.emit(MInst::AluRRR { op: op.unwrap(), rd, rs1: rhs, rs2: lhs });
-                    }
-                    raana_ir::ir::BinaryOp::Ge => {
-                        ctx.emit(MInst::AluRRR { op: op.unwrap(), rd, rs1: lhs, rs2: rhs });
-                        ctx.emit(MInst::AluRRImm12 { op: super::instructions::AluRRImm12OP::Xori, rd, rs: def, imm:Imm12::ONE  });
-                    }
-                    raana_ir::ir::BinaryOp::Le => {
-                        ctx.emit(MInst::AluRRR { op: op.unwrap(), rd, rs1: rhs, rs2: lhs });
-                        ctx.emit(MInst::AluRRImm12 { op: super::instructions::AluRRImm12OP::Xori, rd, rs: def, imm: Imm12::ONE });
-                    }
+                        raana_ir::ir::BinaryOp::NotEq => {
+                            ctx.emit(MInst::AluRRR {
+                                op: sub_op,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
+                            ctx.emit(MInst::AluRRR {
+                                op: AluRRROP::Snez,
+                                rd,
+                                rs1: def,
+                                rs2: zero_reg(),
+                            });
+                        }
+                        raana_ir::ir::BinaryOp::Eq => {
+                            ctx.emit(MInst::AluRRR {
+                                op: sub_op,
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
+                            ctx.emit(MInst::AluRRR {
+                                op: AluRRROP::Seqz,
+                                rd,
+                                rs1: def,
+                                rs2: zero_reg(),
+                            });
+                        }
+                        raana_ir::ir::BinaryOp::Lt
+                        | raana_ir::ir::BinaryOp::Add
+                        | raana_ir::ir::BinaryOp::Sub
+                        | raana_ir::ir::BinaryOp::Mul
+                        | raana_ir::ir::BinaryOp::Div
+                        | raana_ir::ir::BinaryOp::Rem
+                        | raana_ir::ir::BinaryOp::And
+                        | raana_ir::ir::BinaryOp::Or
+                        | raana_ir::ir::BinaryOp::Xor
+                        | raana_ir::ir::BinaryOp::Shl
+                        | raana_ir::ir::BinaryOp::Shr
+                        | raana_ir::ir::BinaryOp::Sar => ctx.emit(MInst::AluRRR {
+                            op: op.unwrap(),
+                            rd,
+                            rs1: lhs,
+                            rs2: rhs,
+                        }),
+                        raana_ir::ir::BinaryOp::Gt => {
+                            ctx.emit(MInst::AluRRR {
+                                op: op.unwrap(),
+                                rd,
+                                rs1: rhs,
+                                rs2: lhs,
+                            });
+                        }
+                        raana_ir::ir::BinaryOp::Ge => {
+                            ctx.emit(MInst::AluRRR {
+                                op: op.unwrap(),
+                                rd,
+                                rs1: lhs,
+                                rs2: rhs,
+                            });
+                            ctx.emit(MInst::AluRRImm12 {
+                                op: super::instructions::AluRRImm12OP::Xori,
+                                rd,
+                                rs: def,
+                                imm: Imm12::ONE,
+                            });
+                        }
+                        raana_ir::ir::BinaryOp::Le => {
+                            ctx.emit(MInst::AluRRR {
+                                op: op.unwrap(),
+                                rd,
+                                rs1: rhs,
+                                rs2: lhs,
+                            });
+                            ctx.emit(MInst::AluRRImm12 {
+                                op: super::instructions::AluRRImm12OP::Xori,
+                                rd,
+                                rs: def,
+                                imm: Imm12::ONE,
+                            });
+                        }
                     }
                 }
             }
@@ -215,26 +320,10 @@ impl LowerBackend for Riscv64Backend {
                 let rd = Writable::from_reg(def);
                 let pointee_ty = inst_data.ty().derefernce();
                 let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(inst, pointee_ty) as i64;
-                if let Some(imm12) = Imm12::from_i32(offset as i32) {
-                    ctx.emit(MInst::AluRRImm12 {
-                        op: AluRRImm12OP::Addi,
-                        rd,
-                        rs: stack_reg(),
-                        imm: imm12,
-                    });
-                } else {
-                    let tmp = ctx.alloc_tmp(HirType::get_i32());
-                    ctx.emit(MInst::LoadImm {
-                        rd: Writable::from_reg(tmp),
-                        imm: offset as i32,
-                    });
-                    ctx.emit(MInst::AluRRR {
-                        op: AluRRROP::Add,
-                        rd,
-                        rs1: stack_reg(),
-                        rs2: tmp,
-                    });
-                }
+                ctx.emit(<Riscv64ABI as ABIMachineSpec>::gen_get_stack_addr(
+                    StackAMode::Slot(offset),
+                    rd,
+                ));
             }
             raana_ir::ir::InstKind::GetElemPtr(get_elem_ptr) => {
                 let indices = get_elem_ptr.offsets();
@@ -244,11 +333,11 @@ impl LowerBackend for Riscv64Backend {
 
                 let def = *ctx.reg_map.get(&inst).unwrap();
                 let rd = Writable::from_reg(def);
-                let tmp = ctx.alloc_tmp(HirType::get_i32());
+                let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
                 let wtmp = Writable::from_reg(tmp);
-                let acc = ctx.alloc_tmp(HirType::get_i32());
+                let acc = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
                 let wacc = Writable::from_reg(acc);
-                ctx.emit(MInst::LoadImm { rd: wacc, imm: 0 });
+                ctx.emit(MInst::LoadImm { rd: wacc, value: 0 });
                 let mut ty = src_ty;
                 for &index in indices {
                     let elem_size = if ty.is_pointer() {
@@ -264,7 +353,7 @@ impl LowerBackend for Riscv64Backend {
                     };
                     ctx.emit(MInst::LoadImm {
                         rd: wtmp,
-                        imm: elem_size as i32,
+                        value: elem_size as u64,
                     });
                     let rhs = ctx.put_value_in_reg(index);
                     ctx.emit(MInst::AluRRR {
@@ -309,17 +398,16 @@ impl LowerBackend for Riscv64Backend {
                         .vcode
                         .vcode
                         .abi
-                        .alloc_stackslot_or_get(dst, dst_pointee.clone()) as i64;
+                        .alloc_stackslot_or_get(dst, dst_pointee.clone())
+                        as i64;
                     let mut elem_offset: i64 = 0;
                     for elem in elems {
                         let rs = ctx.put_value_in_reg(elem);
                         let elem_ty = ctx.arena.inst_data(elem).ty().clone();
                         let m_type: LoweredType = elem_ty.clone().into();
                         let op: StoreOP = m_type.into();
-                        let addr = normalize_amode(
-                            &AMode::SlotOffset(base_offset + elem_offset),
-                            ctx,
-                        );
+                        let addr =
+                            normalize_amode(&AMode::SlotOffset(base_offset + elem_offset), ctx);
                         ctx.emit(MInst::StoreWord { rs, op, addr });
                         elem_offset += elem_ty.size() as i64;
                     }
@@ -330,7 +418,8 @@ impl LowerBackend for Riscv64Backend {
                         .vcode
                         .vcode
                         .abi
-                        .alloc_stackslot_or_get(dst, dst_pointee.clone()) as i64;
+                        .alloc_stackslot_or_get(dst, dst_pointee.clone())
+                        as i64;
                     let total = src_ty.array_flatten_length();
                     let scalar_ty = src_ty.array_base_scalar_type();
                     let elem_size = scalar_ty.size() as i64;
@@ -376,15 +465,8 @@ impl LowerBackend for Riscv64Backend {
                                 let pointee_ty = ctx.arena.inst_data(dst).ty().derefernce();
                                 let offset =
                                     ctx.vcode.vcode.abi.alloc_stackslot_or_get(dst, pointee_ty);
-                                let addr = normalize_amode(
-                                    &AMode::SlotOffset(offset as i64),
-                                    ctx,
-                                );
-                                ctx.emit(MInst::StoreWord {
-                                    rs,
-                                    op,
-                                    addr,
-                                });
+                                let addr = normalize_amode(&AMode::SlotOffset(offset as i64), ctx);
+                                ctx.emit(MInst::StoreWord { rs, op, addr });
                             }
                             _ => {
                                 unreachable!(
@@ -421,8 +503,7 @@ impl LowerBackend for Riscv64Backend {
                     // All load from integer/float is translated into SSA from.
                     let alloc_ty = ctx.arena.inst_data(src).ty().derefernce();
                     let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(src, alloc_ty);
-                    let addr =
-                        normalize_amode(&AMode::SlotOffset(offset as i64), ctx);
+                    let addr = normalize_amode(&AMode::SlotOffset(offset as i64), ctx);
                     ctx.emit(MInst::LoadWord { rd, op, addr });
                 }
             }
@@ -506,28 +587,8 @@ impl LowerBackend for Riscv64Backend {
                 ctx.vcode.vcode.abi.set_has_calls();
                 ctx.vcode.vcode.abi.set_outgoing_arg_size(outgoing_arg_size);
             }
-            raana_ir::ir::InstKind::Return(..)
-            | raana_ir::ir::InstKind::Jump(..)
-            | raana_ir::ir::InstKind::Branch(..) => {
-                unreachable!("should not lower branch instruction in here.")
-            }
-        }
-    }
-
-    fn lower_branch(
-        ctx: &mut crate::lower::LowerContext<Self::MInst>,
-        inst: raana_ir::opt::prelude::Inst,
-        target: &[crate::block_order::MirBlockIndex],
-    ) {
-        let inst_data = ctx
-            .arena
-            .program
-            .func_data(ctx.arena.curr_func.unwrap())
-            .inst_data(inst);
-        match inst_data.kind() {
             raana_ir::ir::InstKind::Return(ret) => {
-                let val = ret.value();
-                if let Some(val) = val {
+                if let Some(val) = ret.value() {
                     let preg = match ctx.arena.inst_data(val).ty().kind() {
                         raana_ir::ir::TypeKind::Int32 | raana_ir::ir::TypeKind::Pointer(_) => a0(),
                         raana_ir::ir::TypeKind::Float32 => fa0(),
@@ -535,14 +596,29 @@ impl LowerBackend for Riscv64Backend {
                     };
                     let src = ctx.put_value_in_reg(val);
                     ctx.emit(MInst::RetVal {
-                        pair: RetPair {
-                            vreg: src,
-                            preg,
-                        },
+                        pair: RetPair { vreg: src, preg },
                     });
                 }
                 ctx.emit(MInst::Ret);
             }
+            raana_ir::ir::InstKind::Jump(..) | raana_ir::ir::InstKind::Branch(..) => {
+                unreachable!("should not lower branch instruction in here.")
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_branch(
+        ctx: &mut crate::lower::LowerContext<Self::MInst>,
+        inst: raana_ir::opt::prelude::Inst,
+        target: &[crate::block_order::MirBlockIndex],
+    ) -> Result<(), CodegenError> {
+        let inst_data = ctx
+            .arena
+            .program
+            .func_data(ctx.arena.curr_func.unwrap())
+            .inst_data(inst);
+        match inst_data.kind() {
             raana_ir::ir::InstKind::Jump(jump) => {
                 let args = jump.args();
                 for &arg in args {
@@ -582,10 +658,15 @@ impl LowerBackend for Riscv64Backend {
             }
             _ => unreachable!("should not lower non-branch isntruction in here."),
         }
+        Ok(())
     }
 
     fn data_section_directive() -> &'static str {
         ".section .data"
+    }
+
+    fn bss_section_directive() -> &'static str {
+        ".section .bss"
     }
 
     fn text_section_directive() -> &'static str {
@@ -609,15 +690,20 @@ impl LowerBackend for Riscv64Backend {
     }
 
     fn format_block_label(lb: &LoweredBlock, func_data: &HirFunctionData) -> String {
+        let function = func_data.name().replace('%', "_");
         match lb {
             LoweredBlock::Orig { block } => {
                 let bb_name = func_data.bb_data(*block).name().replace('%', "_");
-                format!(".L_{}", bb_name)
+                format!(".L_{function}_{bb_name}")
             }
-            LoweredBlock::Edge { pred, succ, .. } => {
+            LoweredBlock::Edge {
+                pred,
+                succ,
+                succ_idx,
+            } => {
                 let p = func_data.bb_data(*pred).name().replace('%', "_");
                 let s = func_data.bb_data(*succ).name().replace('%', "_");
-                format!(".L_{}_to_{}_edge", p, s)
+                format!(".L_{function}_{p}_to_{s}_edge_{succ_idx}")
             }
         }
     }

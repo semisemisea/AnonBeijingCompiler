@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     num::NonZeroU32,
-    sync::atomic::{AtomicU32, Ordering},
 };
 
 use crate::ir::instruction::Inst;
@@ -50,25 +49,17 @@ impl BasicBlockData {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BasicBlock(NonZeroU32);
 
-static BBID: AtomicU32 = AtomicU32::new(1);
-
-pub(crate) fn reset() {
-    BBID.store(1, Ordering::Relaxed);
-}
-
-fn next_bbid() -> BasicBlock {
-    BasicBlock(unsafe { NonZeroU32::new_unchecked(BBID.fetch_add(1, Ordering::Relaxed)) })
-}
-
 #[derive(Debug, Clone)]
 pub struct BasicBlockArena {
     data: HashMap<BasicBlock, BasicBlockData>,
+    next_id: u32,
 }
 
 impl BasicBlockArena {
     pub fn new() -> BasicBlockArena {
         BasicBlockArena {
             data: HashMap::new(),
+            next_id: 1,
         }
     }
 
@@ -81,7 +72,8 @@ impl BasicBlockArena {
     }
 
     pub fn alloc(&mut self, mut bb_data: BasicBlockData) -> BasicBlock {
-        let id = next_bbid();
+        let id = BasicBlock(NonZeroU32::new(self.next_id).unwrap());
+        self.next_id += 1;
         bb_data.set_name(format!("{}_{}", bb_data.name(), id.0.get()));
         self.data.insert(id, bb_data);
         id

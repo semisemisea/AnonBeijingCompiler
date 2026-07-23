@@ -63,7 +63,15 @@ endif
 HOST_TARGET_DIR := $(CURDIR)/target/host-musl
 COMPILER := /work/target/$(MUSL_TARGET)/release/soyo_compiler
 
-.PHONY: test test-llvm test-riscv run-elf run-elf-riscv debug-elf debug-elf-riscv test-image test-compiler build-lib build-lib-riscv clean-results
+.PHONY: help test test-llvm test-riscv run-elf run-elf-riscv debug-elf debug-elf-riscv test-image test-compiler build-lib build-lib-riscv clean-results
+
+help:
+	@printf '%s\n' 'make test [functional/case.sy]      Build the AArch64 compiler and run the AArch64 harness.'
+	@printf '%s\n' 'make test ARGS="-O 1"             Pass compiler options to the AArch64 harness.'
+	@printf '%s\n' 'make test-llvm [functional/case.sy] Validate the LLVM IR emitter through the harness.'
+	@printf '%s\n' 'make test-riscv [functional/case.sy] Build and run the RISC-V harness.'
+	@printf '%s\n' 'make run-elf path/to/program.elf  Execute an AArch64 ELF in the test container.'
+	@printf '%s\n' 'make debug-elf path/to/program.elf Start the AArch64 QEMU/GDB workflow.'
 
 test: test-compiler build-lib .docker-image
 	mkdir -p "$(RESULTS)"
@@ -182,14 +190,14 @@ build-lib: .docker-image
 		-v "$(CURDIR)/sysylib:/work/sysylib" \
 		-w /work/sysylib \
 		--entrypoint /bin/sh \
-		"$(IMAGE)" -c 'aarch64-linux-gnu-gcc -c sylib.c -o sylib.o && aarch64-linux-gnu-ar rcs libsysy_arm.a sylib.o'
+		"$(IMAGE)" -c 'aarch64-linux-gnu-gcc -c sylib.c -o sylib_arm.o && aarch64-linux-gnu-ar rcs libsysy_arm.a sylib_arm.o'
 
 build-lib-riscv: .docker-image
 	$(DOCKER) run --rm -u "$$(id -u):$$(id -g)" \
 		-v "$(CURDIR)/sysylib:/work/sysylib" \
 		-w /work/sysylib \
 		--entrypoint /bin/sh \
-		"$(IMAGE)" -c 'riscv64-linux-gnu-gcc -c sylib.c -o sylib.o && riscv64-linux-gnu-ar rcs libsysy_riscv.a sylib.o'
+		"$(IMAGE)" -c 'riscv64-linux-gnu-gcc -c sylib.c -o sylib_riscv.o && riscv64-linux-gnu-ar rcs libsysy_riscv.a sylib_riscv.o'
 
 clean-results:
 	rm -rf "$(RESULTS)"

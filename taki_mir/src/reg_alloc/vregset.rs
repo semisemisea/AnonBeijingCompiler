@@ -48,6 +48,10 @@ impl VRegSet {
         self.items[vreg_num].vreg = VReg::invalid();
     }
 
+    pub fn contains(&self, vreg: VReg) -> bool {
+        self.items[vreg.vreg()].vreg == vreg
+    }
+
     pub fn is_empty(&self) -> bool {
         self.items[self.head].next == self.head
     }

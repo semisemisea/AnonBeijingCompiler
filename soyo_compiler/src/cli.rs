@@ -4,12 +4,18 @@ use std::path::PathBuf;
 #[clap(rename_all = "lowercase")]
 pub enum Target {
     Riscv64,
-    #[clap(help = "aarch64 backend is not implemented yet")]
+    #[clap(help = "emit GNU AArch64 assembly through the generic VCode pipeline")]
     Aarch64,
 }
 
 #[derive(Debug, clap::Parser)]
 pub(crate) struct Arg {
+    #[arg(
+        long,
+        value_name = "FILTER",
+        help = "logging filter (overrides RUST_LOG; default: warn)"
+    )]
+    pub(crate) log: Option<String>,
     #[arg(short = 'S', default_value_t = false, conflicts_with = "emit")]
     pub(crate) assembly_only: bool,
     #[arg(value_name = "INPUT")]

@@ -107,6 +107,12 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
         self.insert_inst(Call::new_data(callee, args, self.func_type(callee)))
     }
 
+    /// Constructs a cross-function call when the local builder cannot inspect
+    /// the Program-owned callee arena.
+    fn call_with_type(&mut self, callee: Function, args: Vec<Inst>, ret_ty: Type) -> Inst {
+        self.insert_inst(Call::new_data(callee, args, ret_ty))
+    }
+
     fn cast(&mut self, src: Inst, ty: Type) -> Inst {
         let src_ty = self.inst_type(src);
         assert!(src_ty.is_scalar(), "cast source is not scalar");
@@ -337,9 +343,9 @@ impl InstInsert for ReplaceBuilder<'_> {
         }
         data.used_by = old_data.used_by;
         if self.inst.is_global() {
-            self.arena.global_mut().inst_arena.alloc(self.inst, data);
+            self.arena.global_mut().inst_arena.insert(self.inst, data);
         } else {
-            self.arena.local_mut().inst_arena.alloc(self.inst, data);
+            self.arena.local_mut().inst_arena.insert(self.inst, data);
         }
         self.inst
     }

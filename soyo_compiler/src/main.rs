@@ -1,3 +1,4 @@
+use anon_armv8::AArch64Backend;
 use clap::Parser;
 use raana_ir::fmt::writer::Writer;
 use std::path::Path;
@@ -7,7 +8,6 @@ use crate::frontend::utils::AstGenContext;
 use frontend::utils::ToRaanaIR;
 
 mod cli;
-mod context;
 mod frontend;
 
 lalrpop_util::lalrpop_mod!(sysy);
@@ -17,10 +17,26 @@ lalrpop_util::lalrpop_mod!(sysy);
 ///     -S is a compatibility alias for `--emit asm`
 ///     --emit ir,asm writes both outputs under the folder passed to `-o`
 fn main() {
-    env_logger::init();
-
     let args = cli::Arg::parse();
+    let mut logger = env_logger::Builder::new();
+    logger.target(env_logger::Target::Stderr);
+    logger.filter_level(log::LevelFilter::Warn);
+    let env_filter = std::env::var("RUST_LOG").ok();
+    let filter = args
+        .log
+        .as_deref()
+        .or(env_filter.as_deref())
+        .unwrap_or("warn");
+    logger.parse_filters(filter);
+    logger.init();
 
+    if let Err(error) = run(args) {
+        eprintln!("soyo_compiler: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run(args: cli::Arg) -> Result<(), String> {
     let source_code = std::fs::read_to_string(&args.input_path).unwrap();
 
     let ast = sysy::CompUnitsParser::new().parse(&source_code).unwrap();
@@ -57,7 +73,7 @@ fn main() {
         None
     };
     let asm = if needs_asm {
-        Some(dump_asm(&program, args.target))
+        Some(dump_asm(&program, args.target)?)
     } else {
         None
     };
@@ -84,6 +100,7 @@ fn main() {
             write_file(&args.output_path.join(format!("{stem}.s")), asm);
         }
     }
+    Ok(())
 }
 
 fn dump_ir(program: &raana_ir::ir::Program) -> String {
@@ -96,11 +113,13 @@ fn dump_llvm(program: &raana_ir::ir::Program) -> String {
     raana_ir::llvm::write_llvm_ir(program)
 }
 
-fn dump_asm(program: &raana_ir::ir::Program, target: cli::Target) -> String {
+fn dump_asm(program: &raana_ir::ir::Program, target: cli::Target) -> Result<String, String> {
     match target {
-        cli::Target::Riscv64 => taki_mir::compile::<Riscv64Backend>(program),
+        cli::Target::Riscv64 => {
+            taki_mir::compile::<Riscv64Backend>(program).map_err(|error| error.to_string())
+        }
         cli::Target::Aarch64 => {
-            todo!("aarch64 assembly emission not yet implemented")
+            taki_mir::compile::<AArch64Backend>(program).map_err(|error| error.to_string())
         }
     }
 }

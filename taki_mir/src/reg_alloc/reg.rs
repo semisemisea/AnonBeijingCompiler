@@ -384,6 +384,45 @@ pub struct Output {
     pub inst_alloc_offsets: Vec<u32>,
 }
 
+/// Checked, ordered access to the locations allocated for one instruction.
+/// Machine backends name each consumed operand, avoiding unchecked positional
+/// indexing while retaining the operand order declared by `get_operands()`.
+pub struct AllocationCursor<'a> {
+    allocations: &'a [Allocation],
+    next: usize,
+}
+
+impl<'a> AllocationCursor<'a> {
+    pub fn new(allocations: &'a [Allocation]) -> Self {
+        Self {
+            allocations,
+            next: 0,
+        }
+    }
+
+    pub fn next(&mut self, operand: &str) -> Result<Allocation, String> {
+        let allocation = self.allocations.get(self.next).copied().ok_or_else(|| {
+            format!(
+                "register allocation omitted location {} for operand {operand}",
+                self.next
+            )
+        })?;
+        self.next += 1;
+        Ok(allocation)
+    }
+
+    pub fn finish(self, inst: &str) -> Result<(), String> {
+        if self.next == self.allocations.len() {
+            Ok(())
+        } else {
+            Err(format!(
+                "register allocation returned {} unused locations for {inst}",
+                self.allocations.len() - self.next
+            ))
+        }
+    }
+}
+
 impl Output {
     pub fn inst_allocs(&self, inst: u32) -> &[Allocation] {
         let start = self.inst_alloc_offsets[inst as usize] as usize;
@@ -435,17 +474,16 @@ impl<'a, F: crate::reg_alloc::function::Function> Iterator for OutputIter<'a, F>
     type Item = InstOrEdit<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // There can't be any edits after the last instruction in a block, so
+        // we don't need to worry about that case.
+        if self.inst_range.len() == 0 {
+            return None;
+        }
         if let Some((first_edit, rest)) = self.edits.split_first() {
-            if self.inst_range.len() == 0
-                || first_edit.0 <= ProgPoint::before(self.inst_range.first().raw_u32())
-            {
+            if first_edit.0 <= ProgPoint::before(self.inst_range.first().raw_u32()) {
                 self.edits = rest;
                 return Some(InstOrEdit::Edit(&first_edit.1));
             }
-        }
-
-        if self.inst_range.len() == 0 {
-            return None;
         }
 
         let inst = self.inst_range.first();
@@ -1169,8 +1207,7 @@ pub struct MachineEnv {
     /// Preferred physical registers for each class. These are the
     /// registers that will be allocated first, if free.
     ///
-    /// If an explicit scratch register is provided in `scratch_by_class` then
-    /// it must not appear in this list.
+    /// Scratch registers must not appear in this list.
     pub preferred_regs_by_class: [PRegSet; 3],
 
     /// Non-preferred physical registers for each class. These are the
@@ -1178,8 +1215,7 @@ pub struct MachineEnv {
     /// not available; using one of these is considered suboptimal,
     /// but still better than spilling.
     ///
-    /// If an explicit scratch register is provided in `scratch_by_class` then
-    /// it must not appear in this list.
+    /// Scratch registers must not appear in this list.
     pub non_preferred_regs_by_class: [PRegSet; 3],
 
     /// Optional dedicated scratch register per class. This is needed to perform
@@ -1198,6 +1234,10 @@ pub struct MachineEnv {
     /// automatically allocate one as needed, spilling a value to the stack if
     /// necessary.
     pub scratch_by_class: [Option<PReg>; 3],
+
+    /// Registers reserved for target post-RA expansion. They must not be
+    /// allocatable and include `scratch_by_class` where applicable.
+    pub post_ra_scratch_by_class: [Vec<PReg>; 3],
 
     /// Some `PReg`s can be designated as locations on the stack rather than
     /// actual registers. These can be used to tell the register allocator about
@@ -1303,6 +1343,11 @@ pub trait OperandVisitorImpl: OperandVisitor {
         self.reg_maybe_fixed(reg.reg.as_mut(), OperandKind::Def, OperandPos::Late);
     }
 
+    /// Add a definition held directly in an instruction register field.
+    fn reg_def_reg(&mut self, reg: &mut Reg) {
+        self.reg_maybe_fixed(reg, OperandKind::Def, OperandPos::Late);
+    }
+
     /// Add a register "early def", which logically occurs at the
     /// beginning of the instruction, alongside all uses. Use this
     /// when the def may be written before all uses are read; the
@@ -1327,6 +1372,11 @@ pub trait OperandVisitorImpl: OperandVisitor {
     /// RealReg at this point.
     fn reg_fixed_def(&mut self, reg: &mut Writable<impl AsMut<Reg>>, rreg: Reg) {
         self.reg_fixed(reg.reg.as_mut(), rreg, OperandKind::Def, OperandPos::Late);
+    }
+
+    /// Add a fixed definition held directly in an instruction register field.
+    fn reg_fixed_def_reg(&mut self, reg: &mut Reg, rreg: Reg) {
+        self.reg_fixed(reg, rreg, OperandKind::Def, OperandPos::Late);
     }
 
     /// Add an operand tying a virtual register to a physical register.
@@ -1366,6 +1416,21 @@ pub trait OperandVisitorImpl: OperandVisitor {
             // virtual register.
             let constraint = OperandConstraint::Reuse(idx);
             self.add_operand(reg, constraint, OperandKind::Def, OperandPos::Late);
+        }
+    }
+
+    /// Add a tied definition held directly in an instruction register field.
+    fn reg_reuse_def_reg(&mut self, reg: &mut Reg, idx: usize) {
+        if let Some(rreg) = reg.to_real_reg() {
+            self.reg_fixed_nonallocatable(rreg.into());
+        } else {
+            debug_assert!(reg.is_virtual());
+            self.add_operand(
+                reg,
+                OperandConstraint::Reuse(idx),
+                OperandKind::Def,
+                OperandPos::Late,
+            );
         }
     }
 
@@ -1466,5 +1531,23 @@ impl OperandVisitor for OperandWriter<'_> {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocation_cursor_checks_location_consumption() {
+        let allocation = Allocation::reg(PReg::new(0, RegClass::Int));
+        let allocations = [allocation];
+        let mut cursor = AllocationCursor::new(&allocations);
+        assert_eq!(cursor.next("input").unwrap(), allocation);
+        assert!(cursor.next("output").is_err());
+        assert!(cursor.finish("test instruction").is_ok());
+
+        let cursor = AllocationCursor::new(&allocations);
+        assert!(cursor.finish("test instruction").is_err());
     }
 }

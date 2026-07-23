@@ -60,9 +60,18 @@ pub trait ABIMachineSpec {
 
     fn gen_load_stack(mem: StackAMode, dst: Writable<Reg>, ty: LoweredType) -> Self::I;
 
-    fn gen_load_imm(dst: Writable<Reg>, imm: i32) -> Self::I;
+    /// Materialize the low bits of `value` according to `ty`.
+    ///
+    /// Integer constants are bit patterns, rather than host-sized signed values:
+    /// this keeps i32 and pointer-width materialization distinct.
+    fn gen_load_imm(dst: Writable<Reg>, value: u64, ty: LoweredType) -> Self::I;
 
     fn gen_load_addr(dst: Writable<Reg>, label: HirInst) -> Self::I;
+
+    /// Generate a frame-dependent address for a stack location. `Slot` offsets
+    /// are relative to the stack-object area and must be resolved after the
+    /// final outgoing-argument area is known.
+    fn gen_get_stack_addr(mem: StackAMode, dst: Writable<Reg>) -> Self::I;
 
     fn gen_args(args: Vec<ArgPair>) -> Self::I;
 
@@ -70,11 +79,7 @@ pub trait ABIMachineSpec {
 
     fn gen_store_stack(src: Reg, mem: StackAMode, ty: LoweredType) -> Self::I;
 
-    fn gen_spill_store(
-        src: Reg,
-        spill_off: i64,
-        ty: LoweredType,
-    ) -> SmallVec<[Self::I; 4]> {
+    fn gen_spill_store(src: Reg, spill_off: i64, ty: LoweredType) -> SmallVec<[Self::I; 4]> {
         smallvec![Self::gen_store_stack(src, StackAMode::Slot(spill_off), ty)]
     }
 
@@ -84,6 +89,20 @@ pub trait ABIMachineSpec {
         ty: LoweredType,
     ) -> SmallVec<[Self::I; 4]> {
         smallvec![Self::gen_load_stack(StackAMode::Slot(spill_off), dst, ty)]
+    }
+
+    /// Spill access for an allocator edit whose offset is already resolved
+    /// against the post-prologue stack pointer.
+    fn gen_spill_store_at_sp(src: Reg, spill_off: i64, ty: LoweredType) -> SmallVec<[Self::I; 4]> {
+        Self::gen_spill_store(src, spill_off, ty)
+    }
+
+    fn gen_spill_load_at_sp(
+        spill_off: i64,
+        dst: Writable<Reg>,
+        ty: LoweredType,
+    ) -> SmallVec<[Self::I; 4]> {
+        Self::gen_spill_load(spill_off, dst, ty)
     }
 
     fn gen_incoming_arg_load(
@@ -115,6 +134,19 @@ pub trait ABIMachineSpec {
     fn gen_clobber_save(frame: &FrameLayout) -> SmallVec<[Self::I; 16]>;
 
     fn gen_clobber_restore(frame: &FrameLayout) -> SmallVec<[Self::I; 16]>;
+
+    /// Expand frame-dependent pseudo addressing after allocation. Implementations
+    /// must use only `MachineEnv::post_ra_scratch_by_class` registers.
+    fn legalize_inst(_frame: &FrameLayout, inst: Self::I) -> SmallVec<[Self::I; 4]> {
+        smallvec![inst]
+    }
+
+    /// Copy between allocator spill slots. Spill slots are eight-byte units, so
+    /// an integer-width raw copy also preserves f32 values without requiring
+    /// type information in allocator edits.
+    fn gen_stack_to_stack_move(_from: i64, _to: i64) -> SmallVec<[Self::I; 4]> {
+        panic!("target does not implement stack-to-stack allocator edits")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -209,7 +241,12 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
 
     pub fn allocate_stackslot(&mut self, ty: HirType) -> u32 {
         let align = M::stack_align();
-        let ret = self.outgoing_arg_size + self.total_stackslots_size;
+        // Stack objects are addressed relative to the stack-object area, not
+        // to the outgoing area as it happened to be sized at allocation time.
+        // Calls are discovered during lowering, so folding the then-current
+        // outgoing size here would make early objects overlap a later maximum
+        // outgoing-call area.
+        let ret = self.total_stackslots_size;
         let size = ty.size() as u32;
         let actual_size = size.next_multiple_of(align);
         self.total_stackslots_size += actual_size;
@@ -258,17 +295,16 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
         let stackslots_size = self.total_stackslots_size;
         let outgoing_args_size = self.outgoing_arg_size;
         let clobber_size = callee_saved.len() as u32 * M::word_bytes();
-        let setup_area_size =
-            if self.has_calls
-                || self.sized_stack_arg_size > 0
-                || self.total_stackslots_size > 0
-                || clobber_size > 0
-                || spill_size > 0
-            {
-                2 * M::word_bytes()
-            } else {
-                0
-            };
+        let setup_area_size = if self.has_calls
+            || self.sized_stack_arg_size > 0
+            || self.total_stackslots_size > 0
+            || clobber_size > 0
+            || spill_size > 0
+        {
+            2 * M::word_bytes()
+        } else {
+            0
+        };
         let mut total =
             setup_area_size + clobber_size + spill_size + stackslots_size + outgoing_args_size;
         let align = M::stack_align();
@@ -313,11 +349,7 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
             if self.reg_arg_spillslots[idx] < 0 {
                 self.reg_arg_spillslots[idx] = self.allocate_stackslot(ty.clone()) as i64;
             }
-            for inst in M::gen_spill_store(
-                preg.into(),
-                self.reg_arg_spillslots[idx],
-                ty.into(),
-            ) {
+            for inst in M::gen_spill_store(preg.into(), self.reg_arg_spillslots[idx], ty.into()) {
                 insts.push(inst);
             }
         }
@@ -330,15 +362,19 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
             ArgSlot::Reg { reg: preg, ty } => {
                 if self.reg_arg_spillslots[idx] < 0 {
                     self.reg_arg_spillslots[idx] = self.allocate_stackslot(ty.clone()) as i64;
-                    for inst in
-                        M::gen_spill_store(preg.into(), self.reg_arg_spillslots[idx], ty.clone().into())
-                    {
+                    for inst in M::gen_spill_store(
+                        preg.into(),
+                        self.reg_arg_spillslots[idx],
+                        ty.clone().into(),
+                    ) {
                         insts.push(inst);
                     }
                 }
-                for inst in
-                    M::gen_spill_load(self.reg_arg_spillslots[idx], Writable::from_reg(into_reg), ty.clone().into())
-                {
+                for inst in M::gen_spill_load(
+                    self.reg_arg_spillslots[idx],
+                    Writable::from_reg(into_reg),
+                    ty.clone().into(),
+                ) {
                     insts.push(inst);
                 }
                 let arg = ArgPair {
@@ -348,11 +384,9 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
                 self.reg_args.push(arg);
             }
             ArgSlot::Stack { offset, ty } => {
-                for inst in M::gen_incoming_arg_load(
-                    offset,
-                    Writable::from_reg(into_reg),
-                    ty.into(),
-                ) {
+                for inst in
+                    M::gen_incoming_arg_load(offset, Writable::from_reg(into_reg), ty.into())
+                {
                     insts.push(inst);
                 }
             }

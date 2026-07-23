@@ -1,7 +1,4 @@
-use std::{
-    num::NonZeroU32,
-    sync::atomic::{AtomicU32, Ordering},
-};
+use std::num::NonZeroU32;
 
 use crate::ir::{
     arena::{Arena, LocalArena},
@@ -166,16 +163,6 @@ impl FunctionData {
 pub struct Function(NonZeroU32);
 // pub type Function = NonZeroU32;
 
-static FUNCTION_ID: AtomicU32 = AtomicU32::new(1);
-
-pub(crate) fn reset() {
-    FUNCTION_ID.store(1, Ordering::Relaxed);
-}
-
-pub(in crate::ir) fn next_function_id() -> Function {
-    Function(unsafe { NonZeroU32::new_unchecked(FUNCTION_ID.fetch_add(1, Ordering::Relaxed)) })
-}
-
 pub struct FunctionArena {
     data: Vec<FunctionData>,
 }
@@ -193,8 +180,10 @@ impl FunctionArena {
         &mut self.data[(func.0.get() - 1) as usize]
     }
 
-    pub fn alloc(&mut self, func_data: FunctionData) {
+    pub fn alloc(&mut self, func_data: FunctionData) -> Function {
+        let id = (self.data.len() + 1) as u32;
         self.data.push(func_data);
+        Function(NonZeroU32::new(id).unwrap())
     }
 
     pub fn functions(&self) -> impl Iterator<Item = (Function, &FunctionData)> {
@@ -216,7 +205,6 @@ impl FunctionArena {
     }
 
     pub fn funcs(&self) -> impl Iterator<Item = Function> + use<> {
-        (1..FUNCTION_ID.load(Ordering::Relaxed))
-            .map(|n| Function(unsafe { NonZeroU32::new_unchecked(n) }))
+        (1..=self.data.len() as u32).map(|n| Function(NonZeroU32::new(n).unwrap()))
     }
 }

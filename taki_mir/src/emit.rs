@@ -1,6 +1,6 @@
 use core::fmt::Write;
 
-use crate::abi::ABIMachineSpec;
+use crate::abi::{ABIMachineSpec, FrameLayout};
 use crate::block_order::MirBlockIndex;
 use crate::lower::LowerBackend;
 use crate::prelude::*;
@@ -82,8 +82,9 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
         writeln!(self.buf, "{} {name}", B::global_directive()).unwrap();
         writeln!(self.buf, "{name}:").unwrap();
 
+        let frame = vcode.abi.frame_layout();
         for inst in &vcode.abi.gen_prologue() {
-            self.write_inst(inst);
+            self.write_inst(frame, inst);
         }
 
         let block_order = vcode.block_order();
@@ -93,10 +94,8 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
             .map(|lb| B::format_block_label(lb, self.func_data))
             .collect();
 
-        let frame = vcode.abi.frame_layout();
         let spill_base = (frame.outgoing_args_size + frame.stackslots_size) as i64;
-        let slot_size =
-            S::<B>::spillslot_size(crate::reg_alloc::reg::RegClass::Int) as i64;
+        let slot_size = S::<B>::spillslot_size(crate::reg_alloc::reg::RegClass::Int) as i64;
 
         for (bi, _lb) in block_order.lowered_order().iter().enumerate() {
             writeln!(self.buf, "{}:", self.block_labels[bi]).unwrap();
@@ -108,49 +107,67 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
                         let crate::reg_alloc::reg::Edit::Move { from, to } = edit;
                         match (from.as_reg(), to.as_reg()) {
                             (Some(from_reg), Some(to_reg)) => {
+                                assert_eq!(
+                                    from_reg.class(),
+                                    to_reg.class(),
+                                    "register-to-register allocation moves cannot cross register classes"
+                                );
+                                let ty = match from_reg.class() {
+                                    RegClass::Float => crate::types::F32,
+                                    RegClass::Int => crate::types::I64,
+                                    RegClass::Vector => {
+                                        unreachable!("vector register moves are unsupported")
+                                    }
+                                };
                                 let mv = S::<B>::gen_move(
                                     Reg::from_physical_reg(from_reg),
                                     Reg::from_physical_reg(to_reg),
-                                    crate::types::I64,
+                                    ty,
                                 );
-                                self.write_inst(&mv);
+                                self.write_inst(frame, &mv);
                             }
                             (Some(from_reg), None) => {
                                 let slot = to.as_stack().unwrap();
-                                let offset = spill_base
-                                    + slot.raw_bits() as i64 * slot_size;
+                                let offset = spill_base + slot.raw_bits() as i64 * slot_size;
                                 let ty = match from_reg.class() {
                                     RegClass::Float => crate::types::F32,
                                     _ => crate::types::I64,
                                 };
-                                for inst in S::<B>::gen_spill_store(
+                                for inst in S::<B>::gen_spill_store_at_sp(
                                     Reg::from_physical_reg(from_reg),
                                     offset,
                                     ty,
                                 ) {
-                                    self.write_inst(&inst);
+                                    self.write_inst(frame, &inst);
                                 }
                             }
                             (None, Some(to_reg)) => {
                                 let slot = from.as_stack().unwrap();
-                                let offset = spill_base
-                                    + slot.raw_bits() as i64 * slot_size;
+                                let offset = spill_base + slot.raw_bits() as i64 * slot_size;
                                 let ty = match to_reg.class() {
                                     RegClass::Float => crate::types::F32,
                                     _ => crate::types::I64,
                                 };
-                                for inst in S::<B>::gen_spill_load(
+                                for inst in S::<B>::gen_spill_load_at_sp(
                                     offset,
-                                    crate::register::Writable::from_reg(
-                                        Reg::from_physical_reg(to_reg),
-                                    ),
+                                    crate::register::Writable::from_reg(Reg::from_physical_reg(
+                                        to_reg,
+                                    )),
                                     ty,
                                 ) {
-                                    self.write_inst(&inst);
+                                    self.write_inst(frame, &inst);
                                 }
                             }
                             (None, None) => {
-                                panic!("stack-to-stack edit should not exist")
+                                let from_slot = from.as_stack().unwrap();
+                                let to_slot = to.as_stack().unwrap();
+                                let from_offset =
+                                    spill_base + from_slot.raw_bits() as i64 * slot_size;
+                                let to_offset = spill_base + to_slot.raw_bits() as i64 * slot_size;
+                                for inst in S::<B>::gen_stack_to_stack_move(from_offset, to_offset)
+                                {
+                                    self.write_inst(frame, &inst);
+                                }
                             }
                         }
                     }
@@ -159,10 +176,10 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
 
                         if matches!(inst.is_term(), MachTerminator::Return) {
                             for epi in &vcode.abi.gen_epilogue() {
-                                self.write_inst(epi);
+                                self.write_inst(frame, epi);
                             }
                         }
-                        self.write_inst(inst);
+                        self.write_inst(frame, inst);
                     }
                 }
             }
@@ -170,9 +187,17 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
         writeln!(self.buf).unwrap();
     }
 
-    fn write_inst<I: crate::vcode::VCodeInst + MachInstEmit>(&mut self, inst: &I) {
-        write!(self.buf, "    ").unwrap();
-        inst.emit(self).unwrap();
-        writeln!(self.buf).unwrap();
+    fn write_inst<I: crate::vcode::VCodeInst + MachInstEmit>(
+        &mut self,
+        frame: &FrameLayout,
+        inst: &I,
+    ) {
+        let legalized = I::ABISpec::legalize_inst(frame, inst.clone());
+        log::trace!(target: "taki_mir::emit", "legalize original={inst:?} legalized={legalized:?}");
+        for inst in legalized {
+            write!(self.buf, "    ").unwrap();
+            inst.emit(self).unwrap();
+            writeln!(self.buf).unwrap();
+        }
     }
 }

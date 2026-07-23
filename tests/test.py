@@ -43,7 +43,7 @@ CODES = {
     "yellow": "\x1b[33m",
     "magenta": "\x1b[35m",
 }
-TEST_TIMEOUT = 1000
+TEST_TIMEOUT = 600
 
 STATUSES = ("PASS", "FAIL", " CE ", " RE ", " TLE", "SKIP")
 
@@ -185,7 +185,14 @@ def run_test(src, out_dir, opt_level, compiler, backend, target):
     if opt_level:
         compile_args.append(f"-O{opt_level}")
     if backend == "asm":
-        compile_args += ["-S", "-o", str(compile_artifact), str(src)]
+        compile_args += [
+            "-S",
+            "--target",
+            target,
+            "-o",
+            str(compile_artifact),
+            str(src),
+        ]
     else:
         compile_args += ["--emit", "llvm", "-o", str(compile_artifact), str(src)]
 
@@ -489,7 +496,13 @@ def run_tests(args):
     try:
         futures = {
             pool.submit(
-                run_test, src, RESULTS_ROOT, args.opt_level, compiler, args.backend, args.target
+                run_test,
+                src,
+                RESULTS_ROOT,
+                args.opt_level,
+                compiler,
+                args.backend,
+                args.target,
             ): src
             for src in files
         }

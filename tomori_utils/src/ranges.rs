@@ -70,6 +70,11 @@ impl Ranges {
             .map(|(index, range)| (self.map_index(index), range[0] as usize..range[1] as usize))
     }
 
+    /// Materialize the indexed ranges in their logical order.
+    pub fn to_vec(&self) -> Vec<Range<usize>> {
+        (0..self.len()).map(|index| self.get(index)).collect()
+    }
+
     /// Reverse this list of ranges, so that the first range is at the
     /// last index and the last range is at the first index.
     ///

@@ -1,6 +1,6 @@
 use crate::reg_alloc::reg::{Allocation, PReg};
 use core::fmt::Debug;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 
 pub type MoveVec<T> = SmallVec<[(Allocation, Allocation, T); 16]>;
 
@@ -58,8 +58,7 @@ impl<T: Clone + Copy + Default + PartialEq> ParallelMoves<T> {
             }
         }
 
-        self.parallel_moves
-            .retain(|&mut (src, dst, _)| src != dst);
+        self.parallel_moves.retain(|&mut (src, dst, _)| src != dst);
 
         if !self.sources_overlap_dests() {
             return MoveVecWithScratch::NoScratch(self.parallel_moves);
@@ -84,8 +83,7 @@ impl<T: Clone + Copy + Default + PartialEq> ParallelMoves<T> {
         }
         let mut ret: MoveVec<T> = smallvec![];
         let mut stack: SmallVec<[usize; 16]> = smallvec![];
-        let mut state: SmallVec<[State; 16]> =
-            smallvec![State::ToDo; self.parallel_moves.len()];
+        let mut state: SmallVec<[State; 16]> = smallvec![State::ToDo; self.parallel_moves.len()];
         let mut scratch_used = false;
 
         while let Some(next) = state.iter().position(|&state| state == State::ToDo) {
@@ -144,12 +142,8 @@ impl<T> MoveVecWithScratch<T> {
             MoveVecWithScratch::NoScratch(moves) => moves,
             MoveVecWithScratch::Scratch(mut moves) => {
                 for (src, dst, _) in &mut moves {
-                    debug_assert!(
-                        *src != scratch && *dst != scratch,
-                    );
-                    debug_assert!(
-                        !(src.is_none() && dst.is_none()),
-                    );
+                    debug_assert!(*src != scratch && *dst != scratch,);
+                    debug_assert!(!(src.is_none() && dst.is_none()),);
                     if src.is_none() {
                         *src = scratch;
                     }
@@ -189,8 +183,7 @@ where
     pub borrowed_scratch_reg: PReg,
 }
 
-impl<GetReg, GetStackSlot, IsStackAlloc>
-    MoveAndScratchResolver<GetReg, GetStackSlot, IsStackAlloc>
+impl<GetReg, GetStackSlot, IsStackAlloc> MoveAndScratchResolver<GetReg, GetStackSlot, IsStackAlloc>
 where
     GetReg: FnMut() -> Option<Allocation>,
     GetStackSlot: FnMut() -> Allocation,
@@ -285,4 +278,100 @@ where
 #[inline(always)]
 fn u64_key(b: u32, a: u32) -> u64 {
     a as u64 | (b as u64) << 32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reg_alloc::reg::{AllocationKind, RegClass, SpillSlot};
+    use std::collections::BTreeMap;
+
+    fn reg(index: usize) -> Allocation {
+        Allocation::reg(PReg::new(index, RegClass::Int))
+    }
+
+    fn stack(index: usize) -> Allocation {
+        Allocation::stack(SpillSlot::new(index))
+    }
+
+    fn apply(moves: &MoveVec<u8>, values: &mut BTreeMap<Allocation, u8>) {
+        for &(src, dst, _) in moves {
+            let value = values[&src];
+            values.insert(dst, value);
+        }
+    }
+
+    #[test]
+    fn resolves_register_cycle_with_scratch() {
+        let (a, b, scratch) = (reg(0), reg(1), reg(2));
+        let mut moves = ParallelMoves::new();
+        moves.add(a, b, 0);
+        moves.add(b, a, 0);
+
+        let moves = moves.resolve().with_scratch(scratch);
+        let mut values = BTreeMap::from([(a, 10), (b, 20), (scratch, 0)]);
+        apply(&moves, &mut values);
+
+        assert_eq!(values[&a], 20);
+        assert_eq!(values[&b], 10);
+    }
+
+    #[test]
+    fn resolves_three_way_mixed_location_cycle() {
+        let (a, b, c, scratch) = (reg(0), stack(0), reg(1), reg(2));
+        let mut moves = ParallelMoves::new();
+        moves.add(a, b, 0);
+        moves.add(b, c, 0);
+        moves.add(c, a, 0);
+
+        let moves = moves.resolve().with_scratch(scratch);
+        let mut values = BTreeMap::from([(a, 10), (b, 20), (c, 30), (scratch, 0)]);
+        apply(&moves, &mut values);
+
+        assert_eq!(values[&a], 30);
+        assert_eq!(values[&b], 10);
+        assert_eq!(values[&c], 20);
+    }
+
+    #[test]
+    fn expands_stack_to_stack_move_through_free_register() {
+        let (src, dst, scratch) = (stack(0), stack(1), reg(0));
+        let mut moves = ParallelMoves::new();
+        moves.add(src, dst, 7);
+
+        let moves = MoveAndScratchResolver {
+            find_free_reg: || Some(scratch),
+            get_stackslot: || panic!("free scratch should avoid a spill slot"),
+            is_stack_alloc: |alloc| alloc.kind() == AllocationKind::Stack,
+            borrowed_scratch_reg: PReg::new(1, RegClass::Int),
+        }
+        .compute(moves.resolve());
+
+        assert_eq!(moves.as_slice(), &[(src, scratch, 7), (scratch, dst, 7)]);
+    }
+
+    #[test]
+    fn borrows_and_restores_scratch_for_stack_to_stack_move() {
+        let (src, dst, borrowed, save) = (stack(0), stack(1), reg(0), stack(2));
+        let mut moves = ParallelMoves::new();
+        moves.add(src, dst, 7);
+
+        let moves = MoveAndScratchResolver {
+            find_free_reg: || None,
+            get_stackslot: || save,
+            is_stack_alloc: |alloc| alloc.kind() == AllocationKind::Stack,
+            borrowed_scratch_reg: borrowed.as_reg().unwrap(),
+        }
+        .compute(moves.resolve());
+
+        assert_eq!(
+            moves.as_slice(),
+            &[
+                (borrowed, save, 0),
+                (src, borrowed, 7),
+                (borrowed, dst, 7),
+                (save, borrowed, 0)
+            ]
+        );
+    }
 }

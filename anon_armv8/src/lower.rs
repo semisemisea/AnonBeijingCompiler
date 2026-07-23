@@ -678,25 +678,21 @@ fn lower_select(
     // If the condition is a single-use comparison, consume its operands
     // directly. This avoids cmp+cset+cmp+csel and, more importantly, keeps the
     // final flag producer and consumer in one machine pseudo.
-    let comparison = match ctx.arena.inst_data(select.cond()).kind().clone() {
-        InstKind::Binary(binary)
-            if is_comparison(binary.op()) && has_only_user(ctx, select.cond(), inst) =>
-        {
-            Some(binary)
-        }
-        _ => None,
-    };
-    let comparison = comparison.filter(|_| ctx.sink_pure_single_use_producer(select.cond(), inst));
-    let (cmp, cond, float_comparison) = if let Some(binary) = comparison {
+    let condition = select_comparison(ctx, inst, select);
+    let (cmp, cond) = if let Some((binary, invert)) = condition {
         let lhs_ty = ctx.arena.inst_data(binary.lhs()).ty().kind().clone();
         if matches!(&lhs_ty, TypeKind::Float32) {
+            let cond = if invert {
+                invert_float_comparison_cond(binary.op())
+            } else {
+                float_comparison_cond(binary.op())
+            };
             (
                 SelectCmp::Float {
                     lhs: ctx.put_value_in_reg(binary.lhs()),
                     rhs: ctx.put_value_in_reg(binary.rhs()),
                 },
-                float_comparison_cond(binary.op()),
-                true,
+                cond,
             )
         } else {
             let size = operand_size(&lhs_ty);
@@ -711,7 +707,8 @@ fn lower_select(
                         rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
                     }
                 };
-            (cmp, comparison_cond(binary.op()), false)
+            let cond = comparison_cond(binary.op());
+            (cmp, if invert { invert_cond(cond) } else { cond })
         }
     } else {
         (
@@ -721,7 +718,6 @@ fn lower_select(
                 imm: Imm12::new(0, false).unwrap(),
             },
             Cond::Ne,
-            false,
         )
     };
 
@@ -737,15 +733,7 @@ fn lower_select(
         && true_constant == Some(0)
         && false_constant == Some(1)
     {
-        let inverted = if float_comparison {
-            let InstKind::Binary(binary) = ctx.arena.inst_data(select.cond()).kind() else {
-                unreachable!("peeled floating comparison must remain available in HIR")
-            };
-            invert_float_comparison_cond(binary.op())
-        } else {
-            invert_cond(cond)
-        };
-        (inverted, SelectValue::Bool { dst })
+        (invert_cond(cond), SelectValue::Bool { dst })
     } else {
         let if_true = ctx.put_value_in_reg(select.if_true());
         let if_false = ctx.put_value_in_reg(select.if_false());
@@ -768,6 +756,37 @@ fn lower_select(
 
     ctx.emit(MInst::CmpSelect { cmp, cond, value });
     Ok(())
+}
+
+fn select_comparison(
+    ctx: &mut LowerContext<'_, MInst>,
+    inst: raana_ir::opt::prelude::Inst,
+    select: &raana_ir::ir::Select,
+) -> Option<(raana_ir::ir::Binary, bool)> {
+    let cond = select.cond();
+    if select.if_true() == cond || select.if_false() == cond || !has_only_user(ctx, cond, inst) {
+        return None;
+    }
+    let InstKind::Binary(outer) = ctx.arena.inst_data(cond).kind().clone() else {
+        return None;
+    };
+
+    if is_comparison(outer.op()) {
+        if let Some((inner_inst, is_eq)) = zero_comparison(ctx, &outer) {
+            if let InstKind::Binary(inner) = ctx.arena.inst_data(inner_inst).kind().clone() {
+                if is_comparison(inner.op())
+                    && has_only_user(ctx, inner_inst, cond)
+                    && ctx.sink_pure_single_use_chain(inner_inst, cond, inst)
+                {
+                    return Some((inner, is_eq));
+                }
+            }
+        }
+        if ctx.sink_pure_single_use_producer(cond, inst) {
+            return Some((outer, false));
+        }
+    }
+    None
 }
 
 /// Select a branch-local, pure condition tree.  Claims are made through the
@@ -1021,6 +1040,79 @@ fn invert_cond(cond: Cond) -> Cond {
         Cond::Lt => Cond::Ge,
         Cond::Gt => Cond::Le,
         Cond::Le => Cond::Gt,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use raana_ir::ir::{
+        BinaryOp, Program, Type,
+        builder_trait::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
+    };
+
+    use super::AArch64Backend;
+
+    #[test]
+    fn select_does_not_sink_a_condition_also_used_as_a_value() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_i32(), "choose_bool".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+
+        let one = data.new_local_inst().integer(1);
+        let two = data.new_local_inst().integer(2);
+        let cond = data.new_local_inst().binary(BinaryOp::Lt, one, two);
+        data.layout_mut().insert_inst(entry, cond);
+        let select = data.new_local_inst().select(cond, cond, one);
+        data.layout_mut().insert_inst(entry, select);
+        let ret = data.new_local_inst().ret(Some(select));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
+        assert!(asm.contains("cset "), "{asm}");
+        assert!(asm.contains("csel "), "{asm}");
+    }
+
+    fn compile_nested_float_bool_select(
+        outer_op: BinaryOp,
+        true_value: i32,
+        false_value: i32,
+    ) -> String {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_i32(), "choose_float_bool".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+
+        let nan = data.new_local_inst().float(f32::NAN);
+        let one_float = data.new_local_inst().float(1.0);
+        let inner = data.new_local_inst().binary(BinaryOp::Lt, nan, one_float);
+        data.layout_mut().insert_inst(entry, inner);
+        let zero = data.new_local_inst().integer(0);
+        let outer = data.new_local_inst().binary(outer_op, inner, zero);
+        data.layout_mut().insert_inst(entry, outer);
+        let if_true = data.new_local_inst().integer(true_value);
+        let if_false = data.new_local_inst().integer(false_value);
+        let select = data.new_local_inst().select(outer, if_true, if_false);
+        data.layout_mut().insert_inst(entry, select);
+        let ret = data.new_local_inst().ret(Some(select));
+        data.layout_mut().insert_inst(entry, ret);
+
+        taki_mir::compile::<AArch64Backend>(&program).unwrap()
+    }
+
+    #[test]
+    fn nested_float_bool_select_preserves_unordered_conditions() {
+        for (outer_op, true_value, false_value, expected) in [
+            (BinaryOp::Eq, 1, 0, "cset w0, hs"),
+            (BinaryOp::Eq, 0, 1, "cset w0, lo"),
+            (BinaryOp::NotEq, 1, 0, "cset w0, mi"),
+            (BinaryOp::NotEq, 0, 1, "cset w0, pl"),
+        ] {
+            let asm = compile_nested_float_bool_select(outer_op, true_value, false_value);
+            assert!(asm.contains(expected), "expected {expected} in:\n{asm}");
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 use log::{debug, trace};
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 
 use crate::abi::{ABIMachineSpec, CalleeABI};
 use crate::block_order::{BlockLoweringOrder, LoweredBlock, MirBlockIndex};
@@ -707,8 +707,37 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     /// sound when the HIR use graph says that `consumer` is the producer's
     /// sole user and the producer has not otherwise been lowered.
     pub fn sink_pure_single_use_producer(&mut self, producer: HirInst, consumer: HirInst) -> bool {
+        if !self.can_sink_pure_single_use_producer(producer, consumer, consumer) {
+            return false;
+        }
+        self.inst_sunk.insert(producer)
+    }
+
+    /// Atomically mark a two-producer chain consumed while lowering `root`.
+    pub fn sink_pure_single_use_chain(
+        &mut self,
+        producer: HirInst,
+        intermediate: HirInst,
+        root: HirInst,
+    ) -> bool {
+        if !self.can_sink_pure_single_use_producer(producer, intermediate, root)
+            || !self.can_sink_pure_single_use_producer(intermediate, root, root)
+        {
+            return false;
+        }
+        self.inst_sunk.insert(producer);
+        self.inst_sunk.insert(intermediate);
+        true
+    }
+
+    fn can_sink_pure_single_use_producer(
+        &self,
+        producer: HirInst,
+        consumer: HirInst,
+        root: HirInst,
+    ) -> bool {
         if producer == consumer
-            || self.cur_inst != Some(consumer)
+            || self.cur_inst != Some(root)
             || self.inst_sunk.contains(&producer)
             || self.value_lowered_use.contains_key(&producer)
             || self.arena.is_terminator(producer)
@@ -725,8 +754,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         if users.len() != 1 || !users.contains(&consumer) {
             return false;
         }
-
-        self.inst_sunk.insert(producer)
+        true
     }
 
     fn rematerialize_if_needed(&mut self, inst: HirInst, reg: Reg, use_count: u32) {

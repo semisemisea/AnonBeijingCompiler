@@ -2,9 +2,11 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
 import os
 from pathlib import Path
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -164,7 +166,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target):
     arch_config = TARGET_CONFIG[target]
     sysylib = ROOT / "sysylib" / arch_config["sysylib"]
     if str(src_rel) in SKIP_TESTS:
-        return time.perf_counter() - start, "SKIP", "skipped (missing input)"
+        return None, "SKIP", "skipped (missing input)"
     base = src.with_suffix("")
     copy_testcase_files(src, out_dir)
 
@@ -206,7 +208,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target):
     except subprocess.TimeoutExpired as err:
         write_timeout_output(err, compile_stdout, compile_stderr, compile_returncode)
         return (
-            time.perf_counter() - start,
+            None,
             " TLE",
             f"compile timeout after {TEST_TIMEOUT}s",
         )
@@ -220,7 +222,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target):
             .strip()
         )
         return (
-            time.perf_counter() - start,
+            None,
             " CE ",
             f"exit {compile_proc.returncode}\n{output or '(no output)'}",
         )
@@ -239,11 +241,11 @@ def run_test(src, out_dir, opt_level, compiler, backend, target):
         )
     except subprocess.TimeoutExpired as err:
         write_timeout_output(err, compile_stdout, compile_stderr, compile_returncode)
-        return time.perf_counter() - start, " TLE", f"ir timeout after {TEST_TIMEOUT}s"
+        return None, " TLE", f"ir timeout after {TEST_TIMEOUT}s"
     if ir_proc.returncode:
         output = (ir_proc.stdout + ir_proc.stderr).decode("utf-8", "replace").strip()
         return (
-            time.perf_counter() - start,
+            None,
             " CE ",
             f"ir exit {ir_proc.returncode}\n{output or '(no output)'}",
         )
@@ -270,7 +272,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target):
                 err, runtime_stdout, runtime_stderr, runtime_returncode
             )
             return (
-                time.perf_counter() - start,
+                None,
                 " TLE",
                 f"llc timeout after {TEST_TIMEOUT}s",
             )
@@ -282,7 +284,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target):
                 llc_proc, runtime_stdout, runtime_stderr, runtime_returncode
             )
             return (
-                time.perf_counter() - start,
+                None,
                 " CE ",
                 f"llc exit {llc_proc.returncode}\n{output or '(no output)'}",
             )
@@ -312,7 +314,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target):
     except subprocess.TimeoutExpired as err:
         write_timeout_output(err, runtime_stdout, runtime_stderr, runtime_returncode)
         return (
-            time.perf_counter() - start,
+            None,
             " TLE",
             f"link timeout after {TEST_TIMEOUT}s",
         )
@@ -321,13 +323,14 @@ def run_test(src, out_dir, opt_level, compiler, backend, target):
             link_proc, runtime_stdout, runtime_stderr, runtime_returncode
         )
         return (
-            time.perf_counter() - start,
+            None,
             " RE ",
             f"link exit {link_proc.returncode}\n{link_proc.stderr.decode('utf-8', 'replace').strip() or '(no output)'}",
         )
 
     stdin = base.with_suffix(".in")
     stdin_file = stdin.open("rb") if stdin.exists() else None
+    runtime_start = time.perf_counter()
     try:
         try:
             run_proc = subprocess.run(
@@ -342,7 +345,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target):
                 err, runtime_stdout, runtime_stderr, runtime_returncode
             )
             return (
-                time.perf_counter() - start,
+                time.perf_counter() - runtime_start,
                 " TLE",
                 f"runtime timeout after {TEST_TIMEOUT}s",
             )
@@ -354,17 +357,17 @@ def run_test(src, out_dir, opt_level, compiler, backend, target):
     actual = combined_output(run_proc.stdout, run_proc.returncode)
     status, msg = compare_output(actual, base.with_suffix(".out"), run_proc.stderr)
     if status == "PASS":
-        return time.perf_counter() - start, status, msg
+        return time.perf_counter() - runtime_start, status, msg
 
     if run_proc.returncode != 0 and run_proc.stderr.strip():
         output = (run_proc.stdout + run_proc.stderr).decode("utf-8", "replace").strip()
         return (
-            time.perf_counter() - start,
+            time.perf_counter() - runtime_start,
             " RE ",
             f"exit {run_proc.returncode}\n{output or '(no output)'}",
         )
 
-    return time.perf_counter() - start, status, msg
+    return time.perf_counter() - runtime_start, status, msg
 
 
 def parse_args(argv):
@@ -511,14 +514,17 @@ def run_tests(args):
             src = futures[future]
             elapsed, status, msg = future.result()
             path = rel_test(src)
-            timings.append((elapsed, path))
+            if elapsed is not None:
+                timings.append((elapsed, path))
             counts[status] += 1
 
             running = next(
                 (rel_test(futures[item]) for item in futures if not item.done()), None
             )
             log(
-                f"{paint_status(status)} {elapsed * 1000:.2f}ms {paint(str(path), 'dim')}",
+                f"{paint_status(status)} "
+                f"{f'{elapsed * 1000:.2f}ms' if elapsed is not None else 'runtime n/a'} "
+                f"{paint(str(path), 'dim')}",
                 running is not None,
             )
             if status != "PASS" and args.verbose:
@@ -548,9 +554,21 @@ def run_tests(args):
         paint(f"\n{counts[' TLE']:>5} TLE (timeout error)", "yellow", "bold"),
         paint(f"\n{skipped:>5} Skipped", "dim"),
     )
-    print("\nTop 5 slowest tests:")
-    for elapsed, path in sorted(timings, reverse=True)[:5]:
-        print(f"{elapsed * 1000:>10.2f}ms {paint(path, 'dim')}")
+    if timings:
+        print("\nTop 5 slowest tests (runtime only):")
+        for elapsed, path in sorted(timings, reverse=True)[:5]:
+            print(f"{elapsed * 1000:>10.2f}ms {paint(path, 'dim')}")
+        sorted_elapsed_times = sorted(elapsed for elapsed, _ in timings)
+        p95 = sorted_elapsed_times[math.ceil(len(sorted_elapsed_times) * 0.95) - 1]
+        elapsed_times = [elapsed for elapsed, _ in timings]
+        print(
+            "\nRuntime summary:"
+            f"\n  Average: {statistics.mean(elapsed_times) * 1000:.2f}ms"
+            f"\n  Median:  {statistics.median(elapsed_times) * 1000:.2f}ms"
+            f"\n  P95:     {p95 * 1000:.2f}ms"
+            f"\n  Fastest: {min(elapsed_times) * 1000:.2f}ms"
+            f"\n  Slowest: {max(elapsed_times) * 1000:.2f}ms"
+        )
     return 0 if failed == 0 else 1
 
 

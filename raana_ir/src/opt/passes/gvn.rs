@@ -233,6 +233,12 @@ impl Pass for GlobalInstNumbering {
                 .copied();
 
             for val in iter {
+                // DCE intentionally keeps calls even after their result is
+                // unused. Replacing such a value again cannot change IR and
+                // would keep a fixed-point pipeline alive forever.
+                if data.inst_data(val).used_by().is_empty() {
+                    continue;
+                }
                 if let Some(expr) = InstType::build_from_value(data, val, val_alloc) {
                     debug!("epxr: {:?}", expr);
                     if let Some(rep_with) = layered_type_map.get(&expr) {

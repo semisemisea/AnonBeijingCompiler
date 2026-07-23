@@ -14,7 +14,8 @@ use taki_mir::{
 use crate::{
     abi::AArch64Abi,
     instructions::{
-        AMode, AluOp, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift, MInst, MemoryType, ShiftOp,
+        AMode, AluOp, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift, MInst, MemoryType,
+        SelectCmp, SelectValue, ShiftOp,
     },
     labels::Label,
     regs::{self, Gpr, OperandSize, RegOrZr},
@@ -303,6 +304,9 @@ impl LowerBackend for AArch64Backend {
                     }
                 }
             }
+            InstKind::Select(select) => {
+                lower_select(ctx, inst, &select)?;
+            }
             InstKind::Cast(cast) => {
                 let src = cast.src();
                 let src_ty = ctx.arena.inst_data(src).ty().kind().clone();
@@ -543,14 +547,6 @@ impl LowerBackend for AArch64Backend {
             InstKind::Jump(..) | InstKind::Branch(..) => {
                 unreachable!("terminators are lowered by LowerBackend::lower_branch")
             }
-            kind => {
-                return Err(ctx.unsupported(
-                    "AArch64 instruction selection",
-                    format!("HIR instruction {kind:?} is unsupported"),
-                    None,
-                    Some(ctx.arena.inst_data(inst).ty()),
-                ));
-            }
         }
         Ok(())
     }
@@ -659,6 +655,119 @@ impl LowerBackend for AArch64Backend {
     fn emit_long_jump(ctx: &mut LowerContext<Self::MInst>, target: MirBlockIndex) {
         ctx.emit(MInst::gen_jump(target));
     }
+}
+
+fn lower_select(
+    ctx: &mut LowerContext<'_, MInst>,
+    inst: raana_ir::opt::prelude::Inst,
+    select: &raana_ir::ir::Select,
+) -> Result<(), CodegenError> {
+    let result_ty = ctx.arena.inst_data(inst).ty().kind().clone();
+    if !matches!(
+        &result_ty,
+        TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String | TypeKind::Float32
+    ) {
+        return Err(ctx.unsupported(
+            "AArch64 instruction selection",
+            format!("select result type {result_ty:?} is unsupported"),
+            Some(ctx.arena.inst_data(select.cond()).ty()),
+            Some(ctx.arena.inst_data(inst).ty()),
+        ));
+    }
+
+    // If the condition is a single-use comparison, consume its operands
+    // directly. This avoids cmp+cset+cmp+csel and, more importantly, keeps the
+    // final flag producer and consumer in one machine pseudo.
+    let comparison = match ctx.arena.inst_data(select.cond()).kind().clone() {
+        InstKind::Binary(binary)
+            if is_comparison(binary.op()) && has_only_user(ctx, select.cond(), inst) =>
+        {
+            Some(binary)
+        }
+        _ => None,
+    };
+    let comparison = comparison.filter(|_| ctx.sink_pure_single_use_producer(select.cond(), inst));
+    let (cmp, cond, float_comparison) = if let Some(binary) = comparison {
+        let lhs_ty = ctx.arena.inst_data(binary.lhs()).ty().kind().clone();
+        if matches!(&lhs_ty, TypeKind::Float32) {
+            (
+                SelectCmp::Float {
+                    lhs: ctx.put_value_in_reg(binary.lhs()),
+                    rhs: ctx.put_value_in_reg(binary.rhs()),
+                },
+                float_comparison_cond(binary.op()),
+                true,
+            )
+        } else {
+            let size = operand_size(&lhs_ty);
+            let lhs = ctx.put_value_in_reg(binary.lhs());
+            let cmp =
+                if let Some(imm) = integer_constant(ctx, binary.rhs()).and_then(positive_imm12) {
+                    SelectCmp::IntImm { size, lhs, imm }
+                } else {
+                    SelectCmp::IntRR {
+                        size,
+                        lhs,
+                        rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
+                    }
+                };
+            (cmp, comparison_cond(binary.op()), false)
+        }
+    } else {
+        (
+            SelectCmp::IntImm {
+                size: OperandSize::Size32,
+                lhs: ctx.put_value_in_reg(select.cond()),
+                imm: Imm12::new(0, false).unwrap(),
+            },
+            Cond::Ne,
+            false,
+        )
+    };
+
+    let dst = Writable::from_reg(ctx.reg_map[&inst]);
+    let true_constant = integer_constant(ctx, select.if_true());
+    let false_constant = integer_constant(ctx, select.if_false());
+    let (cond, value) = if matches!(&result_ty, TypeKind::Int32)
+        && true_constant == Some(1)
+        && false_constant == Some(0)
+    {
+        (cond, SelectValue::Bool { dst })
+    } else if matches!(&result_ty, TypeKind::Int32)
+        && true_constant == Some(0)
+        && false_constant == Some(1)
+    {
+        let inverted = if float_comparison {
+            let InstKind::Binary(binary) = ctx.arena.inst_data(select.cond()).kind() else {
+                unreachable!("peeled floating comparison must remain available in HIR")
+            };
+            invert_float_comparison_cond(binary.op())
+        } else {
+            invert_cond(cond)
+        };
+        (inverted, SelectValue::Bool { dst })
+    } else {
+        let if_true = ctx.put_value_in_reg(select.if_true());
+        let if_false = ctx.put_value_in_reg(select.if_false());
+        let value = match &result_ty {
+            TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => SelectValue::Int {
+                size: operand_size(&result_ty),
+                dst,
+                if_true,
+                if_false,
+            },
+            TypeKind::Float32 => SelectValue::Float {
+                dst,
+                if_true,
+                if_false,
+            },
+            _ => unreachable!("select result type checked above"),
+        };
+        (cond, value)
+    };
+
+    ctx.emit(MInst::CmpSelect { cmp, cond, value });
+    Ok(())
 }
 
 /// Select a branch-local, pure condition tree.  Claims are made through the

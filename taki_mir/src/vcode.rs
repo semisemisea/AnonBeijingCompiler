@@ -70,6 +70,7 @@ pub trait EmitContext: core::fmt::Write {
     fn write_label_ref(&mut self, idx: MirBlockIndex) -> core::fmt::Result;
     fn write_function_label(&mut self, func: crate::prelude::HirFunction) -> core::fmt::Result;
     fn write_global_label(&mut self, gv: crate::prelude::HirInst) -> core::fmt::Result;
+    fn write_external_symbol(&mut self, symbol: &str) -> core::fmt::Result;
 }
 
 pub trait MachInstEmit {

@@ -5,6 +5,7 @@ pub enum Label {
     Block(MirBlockIndex),
     Function(HirFunction),
     GlobalValue(HirInst),
+    ExternalSymbol(&'static str),
 }
 
 impl Label {
@@ -21,11 +22,16 @@ impl Label {
         Self::Block(block)
     }
 
+    pub fn libcall(libcall: taki_mir::libcall::LibCall) -> Self {
+        Self::ExternalSymbol(libcall.symbol())
+    }
+
     pub fn emit(&self, ctx: &mut dyn EmitContext) -> core::fmt::Result {
         match self {
             Self::Block(block) => ctx.write_label_ref(*block),
             Self::Function(function) => ctx.write_function_label(*function),
             Self::GlobalValue(value) => ctx.write_global_label(*value),
+            Self::ExternalSymbol(symbol) => ctx.write_external_symbol(symbol),
         }
     }
 }

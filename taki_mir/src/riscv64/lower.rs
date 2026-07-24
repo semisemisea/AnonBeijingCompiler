@@ -4,6 +4,7 @@ use smallvec::smallvec;
 use crate::{
     abi::{ABIMachineSpec, ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::LoweredBlock,
+    libcall::LibCall,
     lower::{CodegenError, LowerBackend, LowerContext},
     prelude::HirFunctionData,
     reg_alloc::reg::PReg,
@@ -12,7 +13,7 @@ use crate::{
         abi::{DEFAULT_CLOBBERS, Riscv64ABI},
         instructions::{AMode, AluRRImm12OP, AluRRROP, FpuRRROP, Imm12, LoadOP, MInst, StoreOP},
         labels::Label,
-        regs::{ARG_REG, FARG_REG, a0, fa0, fp_reg, preg_name, stack_reg, zero_reg},
+        regs::{ARG_REG, FARG_REG, a0, a1, a2, fa0, fp_reg, preg_name, stack_reg, zero_reg},
     },
     types::LoweredType,
 };
@@ -600,6 +601,57 @@ impl LowerBackend for Riscv64Backend {
                         }
                     }
                 }
+            }
+            raana_ir::ir::InstKind::MemZero(mem_zero) => {
+                let alloc = matches!(ctx.arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
+                    .then_some(mem_zero.dest());
+                let (dest, stack_offset) = if let Some(alloc) = alloc {
+                    let pointee = ctx.arena.inst_data(alloc).ty().derefernce();
+                    let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
+                    (
+                        ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
+                        Some(offset),
+                    )
+                } else {
+                    (ctx.put_value_in_reg(mem_zero.dest()), None)
+                };
+                let zero = ctx.alloc_tmp(HirType::get_i32());
+                let byte_len = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+                if let Some(offset) = stack_offset {
+                    ctx.emit(<Riscv64ABI as ABIMachineSpec>::gen_get_stack_addr(
+                        StackAMode::Slot(offset),
+                        Writable::from_reg(dest),
+                    ));
+                }
+                ctx.emit(MInst::LoadImm {
+                    rd: Writable::from_reg(zero),
+                    value: 0,
+                });
+                ctx.emit(MInst::LoadImm {
+                    rd: Writable::from_reg(byte_len),
+                    value: mem_zero.byte_len() as u64,
+                });
+                ctx.emit(MInst::Call {
+                    arg_pairs: smallvec![
+                        CallArgPair {
+                            vreg: dest,
+                            preg: a0()
+                        },
+                        CallArgPair {
+                            vreg: zero,
+                            preg: a1()
+                        },
+                        CallArgPair {
+                            vreg: byte_len,
+                            preg: a2()
+                        },
+                    ],
+                    ret: None,
+                    clobbers: DEFAULT_CLOBBERS,
+                    label: Label::libcall(LibCall::Memset),
+                });
+                ctx.vcode.vcode.abi.set_has_calls();
+                ctx.vcode.vcode.abi.set_outgoing_arg_size(0);
             }
             raana_ir::ir::InstKind::Load(load) => {
                 let src = load.src();

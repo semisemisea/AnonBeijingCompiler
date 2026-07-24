@@ -5,6 +5,7 @@ pub enum Label {
     Block(MirBlockIndex),
     Function(HirFunction),
     GlobalValue(HirInst),
+    ExternalSymbol(&'static str),
 }
 
 impl Label {
@@ -21,11 +22,16 @@ impl Label {
         Label::Block(block)
     }
 
+    pub fn libcall(libcall: crate::libcall::LibCall) -> Self {
+        Self::ExternalSymbol(libcall.symbol())
+    }
+
     pub fn emit(&self, ctx: &mut dyn EmitContext) -> core::fmt::Result {
         match self {
             Label::Block(b) => ctx.write_label_ref(*b),
             Label::Function(f) => ctx.write_function_label(*f),
             Label::GlobalValue(gv) => ctx.write_global_label(*gv),
+            Label::ExternalSymbol(symbol) => ctx.write_external_symbol(symbol),
         }
     }
 }

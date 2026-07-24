@@ -6,7 +6,11 @@ impl ArenaContext<'_> {
     /// as having no side effect.
     pub fn has_side_effect_when_lowering(&self, inst: HirInst) -> bool {
         let inst = self.inst_data(inst).kind();
-        inst.is_call() || inst.is_load() || inst.is_store() || matches!(inst, InstKind::Return(..))
+        inst.is_call()
+            || inst.is_load()
+            || inst.is_store()
+            || inst.is_mem_zero()
+            || matches!(inst, InstKind::Return(..))
     }
 
     pub fn is_terminator(&self, inst: HirInst) -> bool {

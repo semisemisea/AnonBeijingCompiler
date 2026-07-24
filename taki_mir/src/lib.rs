@@ -210,8 +210,8 @@ where
 
         let machine_env = vcode.abi.machine_env();
         let allocation_start = Instant::now();
-        let output = crate::reg_alloc::ion::run(&vcode, machine_env)
-            .expect("register allocation failed");
+        let output =
+            crate::reg_alloc::ion::run(&vcode, machine_env).expect("register allocation failed");
         vcode.verify_alloc_output(&output).unwrap_or_else(|error| {
             log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
             panic!("function={} {error}", func_data.name());
@@ -276,3 +276,4 @@ where
 
     Ok(buf)
 }
+pub mod libcall;

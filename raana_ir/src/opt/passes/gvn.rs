@@ -124,7 +124,7 @@ impl InstType {
             | InstKind::Undef
             | InstKind::ZeroInit => Some(Self::Var(val_id.check_or_alloc_id_same(value))),
             InstKind::GlobalAlloc(_global_alloc) => unreachable!(),
-            InstKind::Store(_store) => None,
+            InstKind::Store(..) | InstKind::MemZero(..) => None,
             InstKind::GetElemPtr(get_elem_ptr) => Some(Self::GetElemPtr {
                 source: val_id.check_or_alloc_id_same(get_elem_ptr.base()),
                 index: get_elem_ptr

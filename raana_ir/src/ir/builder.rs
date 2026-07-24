@@ -5,7 +5,7 @@ use crate::ir::{
     function::Function,
     inst_kind::{
         Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Cast, Float, GetElemPtr,
-        GlobalAlloc, InstKind, Integer, Jump, Load, Return, Select, Store,
+        GlobalAlloc, InstKind, Integer, Jump, Load, MemZero, Return, Select, Store,
     },
     instruction::{Inst, InstData},
     types::Type,
@@ -176,6 +176,15 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
 
     fn store(&mut self, src: Inst, dest: Inst) -> Inst {
         self.insert_inst(Store::new_data(src, dest))
+    }
+
+    fn mem_zero(&mut self, dest: Inst, byte_len: usize) -> Inst {
+        assert!(
+            self.inst_type(dest).is_pointer(),
+            "memzero destination must be a pointer"
+        );
+        assert!(byte_len > 0, "memzero byte length must be nonzero");
+        self.insert_inst(MemZero::new_data(dest, byte_len))
     }
 }
 

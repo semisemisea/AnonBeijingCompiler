@@ -33,6 +33,7 @@ pub fn is_pure_function(program: &Program, func: Function) -> bool {
                         return false;
                     }
                 }
+                InstKind::MemZero(..) => return false,
                 InstKind::Call(_call) => {
                     // TODO: Use graph algorithm to get better result.
                     // if !is_pure_function(program, call.callee()) {

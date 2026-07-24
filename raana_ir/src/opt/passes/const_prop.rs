@@ -358,7 +358,7 @@ fn process_instruction(
         | InstKind::BlockArgRef(..)
         | InstKind::FuncArgRef(..)
         | InstKind::GlobalAlloc(..) => unreachable!(),
-        InstKind::Store(..) => None,
+        InstKind::Store(..) | InstKind::MemZero(..) => None,
         left => match left {
             InstKind::GetElemPtr(..) | InstKind::Load(..) | InstKind::Alloc => value_status_map
                 .insert_or_merge(inst, VariableStatus::new_variable())

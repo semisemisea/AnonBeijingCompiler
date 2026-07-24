@@ -69,6 +69,26 @@ fn eval_f32_binary(op: BinaryOp, lhs: f32, rhs: f32) -> items::Number {
     }
 }
 
+fn local_array_element_ptr(
+    ctx: &mut AstGenContext,
+    alloc: Inst,
+    array_shape: &[i32],
+    flat_index: usize,
+) -> Inst {
+    let mut offsets = Vec::with_capacity(array_shape.len() + 1);
+    offsets.push(ctx.new_local_value().integer(0));
+    let mut remaining = flat_index;
+    let mut indices = Vec::with_capacity(array_shape.len());
+    for &dim in array_shape.iter().rev() {
+        indices.push(remaining % dim as usize);
+        remaining /= dim as usize;
+    }
+    for index in indices.into_iter().rev() {
+        offsets.push(ctx.new_local_value().integer(index as i32));
+    }
+    ctx.new_local_value().get_elem_ptr(alloc, offsets)
+}
+
 impl ToRaanaIR for items::CompUnits {
     fn convert(&self, ctx: &mut AstGenContext) {
         ctx.decl_library_functions();
@@ -280,6 +300,7 @@ impl ToRaanaIR for items::ConstDef {
                 .iter()
                 .map(|x| *x as usize)
                 .rfold(ty.clone(), Type::get_array);
+            let byte_len = arr_ty.size();
             let alloc_var = ctx.new_local_value().alloc(arr_ty);
             ctx.set_value_name(alloc_var, self.ident.clone());
             ctx.push_inst(alloc_var);
@@ -287,29 +308,17 @@ impl ToRaanaIR for items::ConstDef {
             if !matches!(self.const_init_val, items::ConstInitVal::Array(_)) {
                 panic!("Invalid assign: integer to an array")
             }
-            let exps = self.const_init_val.init_val_shape(&array_shape);
-
-            let zero = ctx.zero_local(&ty);
-            let elems = exps
-                .iter()
-                .map(|const_exp| match const_exp {
-                    Some(exp) => {
-                        exp.convert(ctx);
-                        let val = ctx.pop_val().unwrap();
-                        ctx.coerce_local(val, &ty)
-                    }
-                    None => zero,
-                })
-                .collect::<Vec<_>>();
-            let agg = array_shape.iter().rev().fold(elems, |elems, &dim_l| {
-                elems
-                    .chunks(dim_l as _)
-                    .map(|chunk| ctx.new_local_value().aggregate(chunk.to_owned()))
-                    .collect::<Vec<_>>()
-            });
-            let init = *agg.first().unwrap();
-            let store = ctx.new_local_value().store(init, alloc_var);
-            ctx.push_inst(store);
+            let clear = ctx.new_local_value().mem_zero(alloc_var, byte_len);
+            ctx.push_inst(clear);
+            for (flat_index, exp) in self.const_init_val.explicit_init_vals(&array_shape) {
+                exp.convert(ctx);
+                let value = ctx.pop_val().unwrap();
+                let value = ctx.coerce_local(value, &ty);
+                let dest = local_array_element_ptr(ctx, alloc_var, &array_shape, flat_index);
+                ctx.push_inst(dest);
+                let store = ctx.new_local_value().store(value, dest);
+                ctx.push_inst(store);
+            }
             ctx.insert_const(self.ident.clone(), alloc_var)
         }
     }
@@ -483,6 +492,7 @@ impl ToRaanaIR for items::VarDef {
                 .iter()
                 .map(|x| *x as usize)
                 .rfold(ty.clone(), Type::get_array);
+            let byte_len = arr_ty.size();
             let alloc_var = ctx.new_local_value().alloc(arr_ty);
             ctx.set_value_name(alloc_var, self.ident.clone());
             ctx.push_inst(alloc_var);
@@ -494,35 +504,17 @@ impl ToRaanaIR for items::VarDef {
                     panic!("Invalid assign: integer to an array")
                 };
 
-                // Flatten it up, filling the missing init val with None
-                // `a[2][2] = {{1}, 3}` => [Some(exp_1), None, Some(exp_3), None];
-                // `a[2][2] = {1, 3}` => [Some(exp_1), Some(exp_3), None, None];
-                let exps = init_val.init_val_shape(&array_shape);
-
-                // Check every item, if `Some(exp)`, then calculate exp and take the value
-                // if None, then fill it with default value zero
-                let zero = ctx.zero_local(&ty);
-                let elems = exps
-                    .iter()
-                    .map(|exp| match exp {
-                        Some(exp) => {
-                            exp.convert(ctx);
-                            let val = ctx.pop_val().unwrap();
-                            ctx.coerce_local(val, &ty)
-                        }
-                        None => zero,
-                    })
-                    .collect::<Vec<_>>();
-
-                let agg = array_shape.iter().rev().fold(elems, |elems, &dim_l| {
-                    elems
-                        .chunks(dim_l as _)
-                        .map(|chunk| ctx.new_local_value().aggregate(chunk.to_owned()))
-                        .collect::<Vec<_>>()
-                });
-                let init = *agg.first().unwrap();
-                let store = ctx.new_local_value().store(init, alloc_var);
-                ctx.push_inst(store);
+                let clear = ctx.new_local_value().mem_zero(alloc_var, byte_len);
+                ctx.push_inst(clear);
+                for (flat_index, exp) in init_val.explicit_init_vals(&array_shape) {
+                    exp.convert(ctx);
+                    let value = ctx.pop_val().unwrap();
+                    let value = ctx.coerce_local(value, &ty);
+                    let dest = local_array_element_ptr(ctx, alloc_var, &array_shape, flat_index);
+                    ctx.push_inst(dest);
+                    let store = ctx.new_local_value().store(value, dest);
+                    ctx.push_inst(store);
+                }
             }
             ctx.insert_var(self.ident.clone(), alloc_var)
         }

@@ -27,9 +27,11 @@ fn has_side_effect(_func: Function) -> bool {
 #[inline]
 fn is_critical(value: Inst, data: &FunctionData) -> bool {
     match data.inst_data(value).kind() {
-        InstKind::Branch(..) | InstKind::Jump(..) | InstKind::Store(..) | InstKind::Return(..) => {
-            true
-        }
+        InstKind::Branch(..)
+        | InstKind::Jump(..)
+        | InstKind::Store(..)
+        | InstKind::MemZero(..)
+        | InstKind::Return(..) => true,
         InstKind::GlobalAlloc(..)
         | InstKind::BlockArgRef(..)
         | InstKind::FuncArgRef(..)
@@ -98,6 +100,7 @@ impl DeadCodeElimination {
                     mark_live!(store.src());
                     mark_live!(store.dest());
                 }
+                InstKind::MemZero(mem_zero) => mark_live!(mem_zero.dest()),
                 InstKind::Load(load) => {
                     mark_live!(load.src());
                 }

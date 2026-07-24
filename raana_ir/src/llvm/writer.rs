@@ -577,6 +577,17 @@ impl<'a> LlvmWriter<'a> {
                     get_name!(self, load.src())
                 )
             }
+            InstKind::MemZero(mem_zero) => {
+                put_name!(self, mem_zero.dest());
+                writeln!(
+                    self.buffer,
+                    "call void @llvm.memset.p0.i64(ptr {}, i8 0, i64 {}, i1 false)",
+                    get_name!(self, mem_zero.dest()),
+                    mem_zero.byte_len()
+                )?;
+                self.used_memset = true;
+                Ok(())
+            }
             InstKind::Return(ret) => {
                 if let Some(val) = ret.value() {
                     writeln!(

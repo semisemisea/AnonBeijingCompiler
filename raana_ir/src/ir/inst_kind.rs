@@ -6,6 +6,7 @@ pub mod call;
 pub mod cast;
 pub mod global_alloc;
 pub mod jump;
+pub mod mem_zero;
 pub mod ptr;
 pub mod r3turn;
 pub mod scalar;
@@ -22,6 +23,7 @@ pub use call::Call;
 pub use cast::Cast;
 pub use global_alloc::GlobalAlloc;
 pub use jump::Jump;
+pub use mem_zero::MemZero;
 pub use ptr::GetElemPtr;
 pub use r3turn::Return;
 pub use scalar::Float;
@@ -49,6 +51,7 @@ pub enum InstKind {
     Alloc,
     GlobalAlloc(GlobalAlloc),
     Store(Store),
+    MemZero(MemZero),
     Load(Load),
     Call(Call),
     BlockArgRef(BlockArgRef),
@@ -74,6 +77,10 @@ impl InstKind {
 
     pub fn is_store(&self) -> bool {
         matches!(self, InstKind::Store(..))
+    }
+
+    pub fn is_mem_zero(&self) -> bool {
+        matches!(self, InstKind::MemZero(..))
     }
 
     pub fn is_terminator(&self) -> bool {
@@ -150,6 +157,7 @@ impl Iterator for InstUsage<'_> {
             }
             InstKind::GlobalAlloc(global_alloc) => field_use!(global_alloc.init()),
             InstKind::Store(store) => field_use!(store.src(), store.dest()),
+            InstKind::MemZero(mem_zero) => field_use!(mem_zero.dest()),
             InstKind::Load(load) => field_use!(load.src()),
             InstKind::Cast(cast) => field_use!(cast.src()),
             InstKind::Call(call) => call.args().get(cur_index).copied(),

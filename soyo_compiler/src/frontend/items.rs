@@ -133,6 +133,55 @@ pub enum ConstInitVal {
 }
 
 impl ConstInitVal {
+    pub fn explicit_init_vals(&self, array_shape: &[i32]) -> Vec<(usize, &ConstExp)> {
+        let Self::Array(_) = self else { unreachable!() };
+        let mut entries = Vec::new();
+        self.collect_explicit_init_vals(array_shape, 0, &mut entries);
+        entries
+    }
+
+    fn collect_explicit_init_vals<'a>(
+        &'a self,
+        array_shape: &[i32],
+        base: usize,
+        entries: &mut Vec<(usize, &'a ConstExp)>,
+    ) {
+        let Self::Array(init_vals) = self else {
+            unreachable!()
+        };
+        let capacity = array_shape.iter().map(|&dim| dim as usize).product();
+        let mut cursor = 0;
+        for init_val in init_vals {
+            if cursor >= capacity {
+                break;
+            }
+            match init_val {
+                Self::Normal(exp) => {
+                    entries.push((base + cursor, exp));
+                    cursor += 1;
+                }
+                Self::Array(..) => {
+                    let mut stride = 1;
+                    let mut sub_shape_idx = array_shape.len();
+                    for (index, &dim) in array_shape.iter().enumerate().rev() {
+                        stride *= dim as usize;
+                        if cursor % stride == 0 {
+                            sub_shape_idx = index;
+                        } else {
+                            break;
+                        }
+                    }
+                    if sub_shape_idx == 0 && !array_shape.is_empty() {
+                        sub_shape_idx = 1;
+                    }
+                    let sub_shape = &array_shape[sub_shape_idx..];
+                    init_val.collect_explicit_init_vals(sub_shape, base + cursor, entries);
+                    cursor += sub_shape.iter().map(|&dim| dim as usize).product::<usize>();
+                }
+            }
+        }
+    }
+
     pub fn init_val_shape(&self, array_shape: &[i32]) -> Vec<Option<&ConstExp>> {
         let Self::Array(c_init_vals) = self else {
             unreachable!()
@@ -203,6 +252,55 @@ pub enum InitVal {
 }
 
 impl InitVal {
+    pub fn explicit_init_vals(&self, array_shape: &[i32]) -> Vec<(usize, &Exp)> {
+        let Self::Array(_) = self else { unreachable!() };
+        let mut entries = Vec::new();
+        self.collect_explicit_init_vals(array_shape, 0, &mut entries);
+        entries
+    }
+
+    fn collect_explicit_init_vals<'a>(
+        &'a self,
+        array_shape: &[i32],
+        base: usize,
+        entries: &mut Vec<(usize, &'a Exp)>,
+    ) {
+        let Self::Array(init_vals) = self else {
+            unreachable!()
+        };
+        let capacity = array_shape.iter().map(|&dim| dim as usize).product();
+        let mut cursor = 0;
+        for init_val in init_vals {
+            if cursor >= capacity {
+                break;
+            }
+            match init_val {
+                Self::Normal(exp) => {
+                    entries.push((base + cursor, exp));
+                    cursor += 1;
+                }
+                Self::Array(..) => {
+                    let mut stride = 1;
+                    let mut sub_shape_idx = array_shape.len();
+                    for (index, &dim) in array_shape.iter().enumerate().rev() {
+                        stride *= dim as usize;
+                        if cursor % stride == 0 {
+                            sub_shape_idx = index;
+                        } else {
+                            break;
+                        }
+                    }
+                    if sub_shape_idx == 0 && !array_shape.is_empty() {
+                        sub_shape_idx = 1;
+                    }
+                    let sub_shape = &array_shape[sub_shape_idx..];
+                    init_val.collect_explicit_init_vals(sub_shape, base + cursor, entries);
+                    cursor += sub_shape.iter().map(|&dim| dim as usize).product::<usize>();
+                }
+            }
+        }
+    }
+
     pub fn init_val_shape(&self, array_shape: &[i32]) -> Vec<Option<&Exp>> {
         let Self::Array(c_init_vals) = self else {
             unreachable!()

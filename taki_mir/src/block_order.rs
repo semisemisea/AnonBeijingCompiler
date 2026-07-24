@@ -89,6 +89,7 @@ impl BlockLoweringOrder {
         let rpo: Vec<HirBasicBlock> = domtree_rpo.iter().map(|&id| bb_id.search_id(id)).collect();
 
         let mut out_degree: FxHashMap<HirBasicBlock, u32> = FxHashMap::default();
+        let mut in_degree: FxHashMap<HirBasicBlock, u32> = FxHashMap::default();
         let mut lowered_order = Vec::new();
         let mut block_succ = Vec::new();
         let mut block_succ_range: FxHashMap<HirBasicBlock, Range<usize>> = FxHashMap::default();
@@ -103,6 +104,7 @@ impl BlockLoweringOrder {
             out_degree.entry(bb).or_insert(0);
             for succ in term_data.bb_usage() {
                 *out_degree.get_mut(&bb).unwrap() += 1;
+                *in_degree.entry(succ).or_insert(0) += 1;
                 block_succ.push(LoweredBlock::Orig { block: succ });
             }
 
@@ -143,10 +145,10 @@ impl BlockLoweringOrder {
                         );
                     }
 
-                    // A multi-way terminator cannot own a parallel copy for just one
-                    // outgoing edge. Materialize every value-carrying edge, even if
-                    // the destination has only one predecessor.
-                    if !args.is_empty() || !params.is_empty() {
+                    // A multi-way terminator cannot own edge-specific work. Split
+                    // critical edges and every value-carrying edge, retaining the
+                    // source successor index even when two edges share a target.
+                    if in_degree[&orig] > 1 || !args.is_empty() || !params.is_empty() {
                         let edge = LoweredBlock::Edge {
                             pred: bb,
                             succ: orig,
@@ -392,16 +394,24 @@ mod tests {
         );
         assert_eq!(
             order.lowered_order()[body_successors[1].index()],
-            LoweredBlock::Orig { block: exit },
-            "break remains a direct edge when it has no block arguments"
+            LoweredBlock::Edge {
+                pred: body,
+                succ: exit,
+                succ_idx: 1,
+            },
+            "break critical edge has a dedicated edge block"
         );
         assert_eq!(header_successors.len(), 2);
         assert!(
             header_successors
                 .iter()
                 .any(|successor| order.lowered_order()[successor.index()]
-                    == LoweredBlock::Orig { block: exit }),
-            "the header-to-exit critical edge remains represented independently"
+                    == LoweredBlock::Edge {
+                        pred: header,
+                        succ: exit,
+                        succ_idx: 1,
+                    }),
+            "the header-to-exit critical edge has its own edge block"
         );
         assert!(order.lowered_index_for_block(entry).is_some());
     }

@@ -1,7 +1,6 @@
 use std::fmt::Debug;
 
 use rustc_hash::FxHashMap;
-use smallvec::SmallVec;
 use tomori_utils::Ranges;
 
 use crate::{
@@ -11,8 +10,8 @@ use crate::{
         function::Function,
         index::{Block, Inst, InstRange},
         reg::{
-            AllocationKind, Edit, Operand, OperandCollector, OperandConstraint, OperandVisitor,
-            OperandWriter, Output, PRegSet, RegClass, VReg,
+            AllocationKind, Edit, Operand, OperandCollector, OperandConstraint, OperandKind,
+            OperandVisitor, OperandWriter, Output, PRegSet, RegClass, VReg,
         },
     },
     register::{Reg, VRegAllocator, Writable},
@@ -440,6 +439,13 @@ impl<I: VCodeInst> VCodeContainer<I> {
                 }
             }
             let terminator = insts.end.checked_sub(1).map(|index| &self.insts[index]);
+            for inst_index in insts.start..insts.end.saturating_sub(1) {
+                if self.insts[inst_index].is_term() != MachTerminator::None {
+                    return fail(format!(
+                        "block {block_index} has a non-final terminator at instruction {inst_index}"
+                    ));
+                }
+            }
             match (succs.is_empty(), terminator.map(|inst| inst.is_term())) {
                 (false, Some(MachTerminator::Branch)) => {}
                 (true, Some(MachTerminator::Return | MachTerminator::TailReturn)) => {}
@@ -456,7 +462,153 @@ impl<I: VCodeInst> VCodeContainer<I> {
             }
             log::debug!(target: "taki_mir::verify", "stage={stage} block={block_index} insts={insts:?} succs={succs:?} params={params:?}");
         }
+        self.verify_strict_ssa(stage)?;
         log::debug!(target: "taki_mir::verify", "stage={stage} passed: blocks={blocks}, insts={}, vregs={}, operands={}", self.insts.len(), self.vreg_types.len(), self.operands.len());
+        Ok(())
+    }
+
+    /// Validate the SSA form required by Ion. Block parameters define values at
+    /// block entry; all other definitions are instruction operands.
+    fn verify_strict_ssa(&self, stage: &str) -> Result<(), String> {
+        #[derive(Clone, Copy, Debug)]
+        enum DefLoc {
+            BlockEntry(Block),
+            Inst(Block, usize),
+        }
+
+        let blocks = self.num_blocks();
+        let fail = |detail: String| {
+            Err(format!(
+                "VCode SSA verification failed at {stage}: {detail}"
+            ))
+        };
+        if blocks == 0 {
+            return fail("function has no entry block".to_owned());
+        }
+
+        let mut inst_blocks = vec![Block::invalid(); self.insts.len()];
+        for block_index in 0..blocks {
+            let block = Block::new(block_index);
+            for inst_index in self.block_range.get(block_index) {
+                if !inst_blocks[inst_index].is_valid() {
+                    inst_blocks[inst_index] = block;
+                } else {
+                    return fail(format!(
+                        "instruction {inst_index} belongs to multiple blocks"
+                    ));
+                }
+            }
+        }
+        if let Some((inst_index, _)) = inst_blocks
+            .iter()
+            .enumerate()
+            .find(|(_, block)| !block.is_valid())
+        {
+            return fail(format!("instruction {inst_index} belongs to no block"));
+        }
+
+        // Compute dominators over the VCode CFG. Multiple successor entries to
+        // the same block remain distinct elsewhere; dominance only needs sets.
+        let all_blocks: Vec<bool> = vec![true; blocks];
+        let mut dominates = vec![all_blocks; blocks];
+        dominates[0] = (0..blocks).map(|index| index == 0).collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for block_index in 1..blocks {
+                let preds = self.block_preds(Block::new(block_index));
+                if preds.is_empty() {
+                    return fail(format!("non-entry block {block_index} has no predecessors"));
+                }
+                let mut next = vec![true; blocks];
+                for pred in preds {
+                    for (index, value) in next.iter_mut().enumerate() {
+                        *value &= dominates[pred.index()][index];
+                    }
+                }
+                next[block_index] = true;
+                if next != dominates[block_index] {
+                    dominates[block_index] = next;
+                    changed = true;
+                }
+            }
+        }
+
+        let mut defs: FxHashMap<VReg, DefLoc> = FxHashMap::default();
+        for block_index in 0..blocks {
+            let block = Block::new(block_index);
+            for &vreg in self.block_params(block) {
+                if block_index == 0 {
+                    return fail(format!("entry block has live-in block parameter {vreg}"));
+                }
+                if let Some(previous) = defs.insert(vreg, DefLoc::BlockEntry(block)) {
+                    return fail(format!(
+                        "VReg {vreg} has more than one definition: {previous:?} and block entry {block_index}"
+                    ));
+                }
+            }
+        }
+        for (inst_index, operands) in
+            (0..self.insts.len()).map(|index| (index, self.inst_operands(Inst::new(index))))
+        {
+            let block = inst_blocks[inst_index];
+            for &operand in operands {
+                if operand.kind() == OperandKind::Def {
+                    if let Some(previous) =
+                        defs.insert(operand.vreg(), DefLoc::Inst(block, inst_index))
+                    {
+                        return fail(format!(
+                            "VReg {} has more than one definition: {previous:?} and instruction {inst_index} in block {} ({:?})",
+                            operand.vreg(),
+                            block.index(),
+                            self.insts[inst_index]
+                        ));
+                    }
+                }
+            }
+        }
+
+        let dominates_use = |vreg: VReg, use_block: Block, use_inst: usize| match defs.get(&vreg) {
+            Some(DefLoc::BlockEntry(def_block)) => dominates[use_block.index()][def_block.index()],
+            Some(DefLoc::Inst(def_block, def_inst)) if *def_block == use_block => {
+                *def_inst < use_inst
+            }
+            Some(DefLoc::Inst(def_block, _)) => dominates[use_block.index()][def_block.index()],
+            None => false,
+        };
+        for (inst_index, operands) in
+            (0..self.insts.len()).map(|index| (index, self.inst_operands(Inst::new(index))))
+        {
+            let block = inst_blocks[inst_index];
+            for &operand in operands {
+                if operand.kind() == OperandKind::Use
+                    && !dominates_use(operand.vreg(), block, inst_index)
+                {
+                    return fail(format!(
+                        "use of {} by instruction {inst_index} in block {} has no dominating definition",
+                        operand.vreg(),
+                        block.index()
+                    ));
+                }
+            }
+        }
+        for block_index in 0..blocks {
+            let block = Block::new(block_index);
+            let terminator = self.block_range.get(block_index).end - 1;
+            for succ_index in 0..self.block_succs(block).len() {
+                let args = self.branch_blockparams(block, Inst::new(terminator), succ_index);
+                for &vreg in args {
+                    if !dominates_use(vreg, block, terminator) {
+                        let inst_range = self.block_range.get(block_index);
+                        return fail(format!(
+                            "edge {block_index}:{succ_index} arguments {args:?} use {vreg} without a definition dominating its terminator; definition is {:?}; block instructions are {:?}",
+                            defs.get(&vreg),
+                            &self.insts[inst_range]
+                        ));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -759,6 +911,124 @@ mod tests {
         builder.push(MInst::LoadImm { rd: dst, value: 1 });
         builder.end_bb();
         builder.build(vregs)
+    }
+
+    #[test]
+    fn strict_ssa_verifier_rejects_duplicate_definitions() {
+        let mut program = Program::new();
+        let func = program.new_function(HirType::get_unit(), "verify".to_owned(), vec![]);
+        add_block(program.func_data_mut(func), "entry");
+        let arena = ArenaContext {
+            program: &program,
+            curr_func: Some(func),
+        };
+        let abi = CalleeABI::<Riscv64ABI>::new(arena);
+        let order = BlockLoweringOrder::new(arena);
+        let mut builder = VCodeBuilder::new(abi, order);
+        let mut vregs = VRegAllocator::with_capaticy(1);
+        let dst = Writable::from_reg(vregs.alloc(I64));
+        builder.push(MInst::Ret);
+        builder.push(MInst::LoadImm { rd: dst, value: 2 });
+        builder.push(MInst::LoadImm { rd: dst, value: 1 });
+        builder.end_bb();
+
+        let error = builder.build(vregs).verify("test").unwrap_err();
+        assert!(error.contains("more than one definition"), "{error}");
+    }
+
+    #[test]
+    fn strict_ssa_verifier_rejects_undefined_instruction_use() {
+        let mut program = Program::new();
+        let func = program.new_function(HirType::get_unit(), "verify".to_owned(), vec![]);
+        add_block(program.func_data_mut(func), "entry");
+        let arena = ArenaContext {
+            program: &program,
+            curr_func: Some(func),
+        };
+        let abi = CalleeABI::<Riscv64ABI>::new(arena);
+        let order = BlockLoweringOrder::new(arena);
+        let mut builder = VCodeBuilder::new(abi, order);
+        let mut vregs = VRegAllocator::with_capaticy(2);
+        let undefined = vregs.alloc(I64);
+        let dst = Writable::from_reg(vregs.alloc(I64));
+        builder.push(MInst::Ret);
+        builder.push(MInst::Mov {
+            src: undefined,
+            dst,
+        });
+        builder.end_bb();
+
+        let error = builder.build(vregs).verify("test").unwrap_err();
+        assert!(error.contains("has no dominating definition"), "{error}");
+    }
+
+    #[test]
+    fn strict_ssa_verifier_rejects_entry_block_parameters() {
+        let mut program = Program::new();
+        let func = program.new_function(HirType::get_unit(), "verify".to_owned(), vec![]);
+        add_block(program.func_data_mut(func), "entry");
+        let arena = ArenaContext {
+            program: &program,
+            curr_func: Some(func),
+        };
+        let abi = CalleeABI::<Riscv64ABI>::new(arena);
+        let order = BlockLoweringOrder::new(arena);
+        let mut builder = VCodeBuilder::new(abi, order);
+        let mut vregs = VRegAllocator::with_capaticy(1);
+        builder.push(MInst::Ret);
+        builder.add_block_param(vregs.alloc(I64).into());
+        builder.end_bb();
+
+        let error = builder.build(vregs).verify("test").unwrap_err();
+        assert!(
+            error.contains("entry block has live-in block parameter"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn strict_ssa_verifier_rejects_undefined_edge_argument() {
+        let mut program = Program::new();
+        let func = program.new_function(HirType::get_unit(), "verify".to_owned(), vec![]);
+        add_block(program.func_data_mut(func), "entry");
+        let arena = ArenaContext {
+            program: &program,
+            curr_func: Some(func),
+        };
+        let abi = CalleeABI::<Riscv64ABI>::new(arena);
+        let order = BlockLoweringOrder::new(arena);
+        let mut builder = VCodeBuilder::new(abi, order);
+        let mut vregs = VRegAllocator::with_capaticy(2);
+        let param = vregs.alloc(I64);
+        let undefined = vregs.alloc(I64);
+        builder.push(MInst::Ret);
+        builder.add_block_param(param.into());
+        builder.end_bb();
+        builder.push(MInst::gen_jump(Block::new(1)));
+        builder.add_succ(Block::new(1), &[undefined]);
+        builder.end_bb();
+
+        let error = builder.build(vregs).verify("test").unwrap_err();
+        assert!(
+            error.contains("arguments") && error.contains("without a definition"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn vcode_verifier_rejects_non_final_terminator() {
+        let mut vcode = empty_vcode();
+        vcode.insts.insert(0, MInst::Ret);
+        vcode.operands_range = Ranges::default();
+        vcode.operands_range.push_end(0);
+        vcode.operands_range.push_end(0);
+        vcode.inst_is_branch.insert(0, false);
+        vcode.inst_is_ret.insert(0, true);
+        vcode.block_range = Ranges::default();
+        vcode.block_range.push_end(2);
+
+        let error = vcode.verify("test").unwrap_err();
+        assert!(error.contains("non-final terminator"), "{error}");
     }
 
     #[test]

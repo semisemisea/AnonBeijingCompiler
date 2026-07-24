@@ -376,17 +376,18 @@ impl LowerBackend for AArch64Backend {
                         }
                         // Indices are i32 in Raana IR. Sign-extend before the
                         // multiply so negative indices retain GEP semantics.
+                        let zero = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
                         let extended = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
                         ctx.emit(MInst::MovFromZero {
                             size: OperandSize::Size64,
-                            dst: Writable::from_reg(extended),
+                            dst: Writable::from_reg(zero),
                         });
                         let index = ctx.put_value_in_reg(index);
                         ctx.emit(MInst::AluRRRExtend {
                             op: AluOp::Add,
                             size: OperandSize::Size64,
                             dst: Writable::from_reg(extended),
-                            lhs: Gpr::Reg(extended),
+                            lhs: Gpr::Reg(zero),
                             rhs: index,
                             extend: ExtendOp::Sxtw,
                             shift: 0,

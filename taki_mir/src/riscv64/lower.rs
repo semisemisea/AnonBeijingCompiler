@@ -225,16 +225,17 @@ impl LowerBackend for Riscv64Backend {
                             });
                         }
                         raana_ir::ir::BinaryOp::NotEq => {
+                            let compare = Writable::from_reg(ctx.alloc_tmp(HirType::get_i32()));
                             ctx.emit(MInst::FpuRRR {
                                 op: FpuRRROP::FeqS,
-                                rd,
+                                rd: compare,
                                 rs1: lhs,
                                 rs2: rhs,
                             });
                             ctx.emit(MInst::AluRRImm12 {
                                 op: super::instructions::AluRRImm12OP::Xori,
                                 rd,
-                                rs: def,
+                                rs: compare.to_reg(),
                                 imm: Imm12::ONE,
                             });
                         }
@@ -246,30 +247,32 @@ impl LowerBackend for Riscv64Backend {
                     let sub_op = alu_op_for_hir_binary(BinaryOp::Sub, inst_data.ty());
                     match bop {
                         raana_ir::ir::BinaryOp::NotEq => {
+                            let compare = Writable::from_reg(ctx.alloc_tmp(HirType::get_i32()));
                             ctx.emit(MInst::AluRRR {
                                 op: sub_op,
-                                rd,
+                                rd: compare,
                                 rs1: lhs,
                                 rs2: rhs,
                             });
                             ctx.emit(MInst::AluRRR {
                                 op: AluRRROP::Snez,
                                 rd,
-                                rs1: def,
+                                rs1: compare.to_reg(),
                                 rs2: zero_reg(),
                             });
                         }
                         raana_ir::ir::BinaryOp::Eq => {
+                            let compare = Writable::from_reg(ctx.alloc_tmp(HirType::get_i32()));
                             ctx.emit(MInst::AluRRR {
                                 op: sub_op,
-                                rd,
+                                rd: compare,
                                 rs1: lhs,
                                 rs2: rhs,
                             });
                             ctx.emit(MInst::AluRRR {
                                 op: AluRRROP::Seqz,
                                 rd,
-                                rs1: def,
+                                rs1: compare.to_reg(),
                                 rs2: zero_reg(),
                             });
                         }
@@ -299,30 +302,32 @@ impl LowerBackend for Riscv64Backend {
                             });
                         }
                         raana_ir::ir::BinaryOp::Ge => {
+                            let compare = Writable::from_reg(ctx.alloc_tmp(HirType::get_i32()));
                             ctx.emit(MInst::AluRRR {
                                 op: op.unwrap(),
-                                rd,
+                                rd: compare,
                                 rs1: lhs,
                                 rs2: rhs,
                             });
                             ctx.emit(MInst::AluRRImm12 {
                                 op: super::instructions::AluRRImm12OP::Xori,
                                 rd,
-                                rs: def,
+                                rs: compare.to_reg(),
                                 imm: Imm12::ONE,
                             });
                         }
                         raana_ir::ir::BinaryOp::Le => {
+                            let compare = Writable::from_reg(ctx.alloc_tmp(HirType::get_i32()));
                             ctx.emit(MInst::AluRRR {
                                 op: op.unwrap(),
-                                rd,
+                                rd: compare,
                                 rs1: rhs,
                                 rs2: lhs,
                             });
                             ctx.emit(MInst::AluRRImm12 {
                                 op: super::instructions::AluRRImm12OP::Xori,
                                 rd,
-                                rs: def,
+                                rs: compare.to_reg(),
                                 imm: Imm12::ONE,
                             });
                         }
@@ -449,12 +454,11 @@ impl LowerBackend for Riscv64Backend {
 
                 let def = *ctx.reg_map.get(&inst).unwrap();
                 let rd = Writable::from_reg(def);
-                let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                let wtmp = Writable::from_reg(tmp);
                 let acc = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
                 let wacc = Writable::from_reg(acc);
                 ctx.emit(MInst::LoadImm { rd: wacc, value: 0 });
                 let mut ty = src_ty;
+                let mut acc = acc;
                 for &index in indices {
                     let elem_size = if ty.is_pointer() {
                         let deref = ty.derefernce();
@@ -467,23 +471,27 @@ impl LowerBackend for Riscv64Backend {
                         ty = elem_ty;
                         size
                     };
+                    let factor = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
                     ctx.emit(MInst::LoadImm {
-                        rd: wtmp,
+                        rd: Writable::from_reg(factor),
                         value: elem_size as u64,
                     });
                     let rhs = ctx.put_value_in_reg(index);
+                    let product = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
                     ctx.emit(MInst::AluRRR {
                         op: AluRRROP::Mul,
-                        rd: wtmp,
-                        rs1: tmp,
+                        rd: Writable::from_reg(product),
+                        rs1: factor,
                         rs2: rhs,
                     });
+                    let next_acc = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
                     ctx.emit(MInst::AluRRR {
                         op: AluRRROP::Add,
-                        rd: wacc,
+                        rd: Writable::from_reg(next_acc),
                         rs1: acc,
-                        rs2: tmp,
+                        rs2: product,
                     });
+                    acc = next_acc;
                 }
                 let final_ty = ty.reference();
                 assert_eq!(

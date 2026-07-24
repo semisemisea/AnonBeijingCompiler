@@ -84,6 +84,36 @@ impl CFGInfo {
             }
             self.block_entry[index] = ProgPoint::before(insns.first().raw_u32());
             self.block_exit[index] = ProgPoint::after(insns.last().raw_u32());
+
+            // Edge copies execute at the source tail. They are safe only when
+            // the successor has one predecessor, or when the source terminator
+            // has no ordinary operands that a copy could overwrite.
+            let preds =
+                function.block_preds(block).len() + usize::from(block == function.entry_block());
+            if preds > 1 {
+                for &pred in function.block_preds(block) {
+                    if function.block_succs(pred).len() > 1 {
+                        return Err(format!(
+                            "unsplit critical edge from block {} to block {}",
+                            pred.index(),
+                            block.index()
+                        ));
+                    }
+                }
+            }
+            let requires_operand_free_terminator =
+                function.block_succs(block).iter().any(|&succ| {
+                    function.block_preds(succ).len() + usize::from(succ == function.entry_block())
+                        > 1
+                });
+            if requires_operand_free_terminator && !function.inst_operands(insns.last()).is_empty()
+            {
+                return Err(format!(
+                    "block {} terminator instruction {} has register operands on an edge that may require copies",
+                    block.index(),
+                    insns.last().index()
+                ));
+            }
             for &succ in function.block_succs(block) {
                 if succ.index() <= index {
                     backedge_in[succ.index()] += 1;

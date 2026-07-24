@@ -83,9 +83,8 @@ impl MachInst for MInst {
             MInst::JumpReg { rs } => {
                 collector.reg_use(rs);
             }
-            MInst::LongBnez { cond, scratch, .. } => {
+            MInst::CondBr { cond, .. } => {
                 collector.reg_use(cond);
-                collector.reg_def(scratch);
             }
             MInst::Mov { src, dst } => {
                 collector.reg_use(src);
@@ -103,7 +102,9 @@ impl MachInst for MInst {
 
     fn is_term(&self) -> crate::vcode::MachTerminator {
         match self {
-            MInst::Jump { .. } | MInst::JumpReg { .. } => MachTerminator::Branch,
+            MInst::Jump { .. } | MInst::JumpReg { .. } | MInst::CondBr { .. } => {
+                MachTerminator::Branch
+            }
             MInst::Ret => MachTerminator::Return,
             _ => MachTerminator::None,
         }
@@ -258,29 +259,32 @@ impl MachInstEmit for MInst {
             MInst::Ret => write!(ctx, "ret"),
             MInst::RetVal { .. } => Ok(()),
             MInst::Jump { label } => {
-                write!(ctx, "j ")?;
-                label.emit(ctx)
+                // CFG labels are symbolic until emission. Use the post-RA scratch
+                // register so allocator edge moves cannot clobber a jump target.
+                write!(ctx, "la t6, ")?;
+                label.emit(ctx)?;
+                write!(ctx, "\n    jr t6")
             }
             MInst::JumpReg { rs } => {
                 write!(ctx, "jr ")?;
                 ctx.write_reg(rs)
             }
-            MInst::LongBnez {
+            MInst::CondBr {
                 cond,
-                scratch,
-                label,
+                true_label,
+                false_label,
             } => {
                 write!(ctx, "beqz ")?;
                 ctx.write_reg(cond)?;
                 writeln!(ctx, ", 1f")?;
-                write!(ctx, "    la ")?;
-                ctx.write_reg(&scratch.reg)?;
-                write!(ctx, ", ")?;
-                label.emit(ctx)?;
+                write!(ctx, "    la t6, ")?;
+                true_label.emit(ctx)?;
                 writeln!(ctx, "")?;
-                write!(ctx, "    jr ")?;
-                ctx.write_reg(&scratch.reg)?;
-                write!(ctx, "\n1:")
+                writeln!(ctx, "    jr t6")?;
+                writeln!(ctx, "1:")?;
+                write!(ctx, "    la t6, ")?;
+                false_label.emit(ctx)?;
+                write!(ctx, "\n    jr t6")
             }
             MInst::Mov { src, dst } => {
                 let src_real = src.to_real_reg();
@@ -396,10 +400,10 @@ pub enum MInst {
     JumpReg {
         rs: Reg,
     },
-    LongBnez {
+    CondBr {
         cond: Reg,
-        scratch: WritableReg,
-        label: Label,
+        true_label: Label,
+        false_label: Label,
     },
     Mov {
         src: Reg,

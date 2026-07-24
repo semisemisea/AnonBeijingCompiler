@@ -833,12 +833,9 @@ impl LowerBackend for Riscv64Backend {
                     ctx.put_value_in_reg(arg);
                 }
                 let &[target] = target else { unreachable!() };
-                let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                ctx.emit(MInst::LoadAddr {
-                    rd: Writable::from_reg(tmp),
+                ctx.emit(MInst::Jump {
                     label: Label::Block(target),
                 });
-                ctx.emit(MInst::JumpReg { rs: tmp });
             }
             raana_ir::ir::InstKind::Branch(branch) => {
                 let cond = branch.cond();
@@ -851,18 +848,11 @@ impl LowerBackend for Riscv64Backend {
                 let &[t_target, f_target] = target else {
                     unreachable!()
                 };
-                let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                ctx.emit(MInst::LongBnez {
+                ctx.emit(MInst::CondBr {
                     cond,
-                    scratch: Writable::from_reg(tmp),
-                    label: Label::Block(t_target),
+                    true_label: Label::Block(t_target),
+                    false_label: Label::Block(f_target),
                 });
-                let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                ctx.emit(MInst::LoadAddr {
-                    rd: Writable::from_reg(tmp),
-                    label: Label::Block(f_target),
-                });
-                ctx.emit(MInst::JumpReg { rs: tmp });
             }
             _ => unreachable!("should not lower non-branch isntruction in here."),
         }
@@ -920,12 +910,9 @@ impl LowerBackend for Riscv64Backend {
         ctx: &mut crate::lower::LowerContext<MInst>,
         target: crate::block_order::MirBlockIndex,
     ) {
-        let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-        ctx.emit(MInst::LoadAddr {
-            rd: Writable::from_reg(tmp),
+        ctx.emit(MInst::Jump {
             label: Label::Block(target),
         });
-        ctx.emit(MInst::JumpReg { rs: tmp });
     }
 }
 

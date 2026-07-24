@@ -5,8 +5,9 @@ historical measurements belong in commits, tests, or dedicated documentation.
 
 ## Current Priority: Bulk Local Array Initialization Follow-Up
 
-- [ ] Add focused RaanaIR, frontend, LLVM writer, and backend instruction-selection
-  tests for `MemZero`, including sparse nested initializers and side effects.
+- [ ] Add `MemZero` DCE/replacement and source-level initializer side-effect-order
+  regression tests. The builder, sparse nested initializer, text/LLVM writer, and
+  AArch64 `memset` call-shape coverage are in place.
 - [ ] Implement and measure a small-clear inline-store policy before replacing the
   current target `memset` calls for small local arrays.
 - [ ] Validate RISC-V `MemZero` code generation after fixing the pre-existing

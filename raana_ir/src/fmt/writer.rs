@@ -547,4 +547,29 @@ entry_0:
             "{output}"
         );
     }
+
+    #[test]
+    fn formats_mem_zero_without_an_ssa_result() {
+        let mut p = Program::new();
+        let f = p.new_function(Type::get_unit(), "clear".to_string(), vec![]);
+        let fd = p.func_data_mut(f);
+        let b = fd
+            .new_basic_block()
+            .basic_block("entry".to_string(), vec![]);
+        fd.layout_mut().push_bb_back(b);
+        let alloc = fd
+            .new_local_inst()
+            .alloc(Type::get_array(Type::get_i32(), 4));
+        let clear = fd.new_local_inst().mem_zero(alloc, 16);
+        fd.layout_mut().insert_inst(b, clear);
+        let ret = fd.new_local_inst().ret(None);
+        fd.layout_mut().insert_inst(b, ret);
+
+        let mut writer = Writer::new(&p);
+        writer.write().unwrap();
+        let output = writer.finish();
+        assert!(output.contains("memzero %"), "{output}");
+        assert!(output.contains(", 16"), "{output}");
+        assert!(!output.contains("= memzero"), "{output}");
+    }
 }

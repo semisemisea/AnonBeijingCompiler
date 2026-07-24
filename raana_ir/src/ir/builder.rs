@@ -330,6 +330,56 @@ impl BasicBlockBuilder for BasicBlockBuilders<'_> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder};
+    use crate::ir::{Program, Type, arena::Arena, inst_kind::InstKind};
+
+    #[test]
+    fn mem_zero_has_unit_type_and_registers_its_destination_use() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "clear".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let alloc = data
+            .new_local_inst()
+            .alloc(Type::get_array(Type::get_i32(), 4));
+        let clear = data.new_local_inst().mem_zero(alloc, 16);
+
+        assert!(data.inst_data(clear).ty().is_unit());
+        assert!(matches!(
+            data.inst_data(clear).kind(),
+            InstKind::MemZero(..)
+        ));
+        assert_eq!(
+            data.inst_data(clear).inst_usage().collect::<Vec<_>>(),
+            vec![alloc]
+        );
+        assert!(data.inst_data(alloc).used_by().contains(&clear));
+    }
+
+    #[test]
+    #[should_panic(expected = "memzero destination must be a pointer")]
+    fn mem_zero_rejects_non_pointer_destinations() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "clear".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let integer = data.new_local_inst().integer(0);
+        data.new_local_inst().mem_zero(integer, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "memzero byte length must be nonzero")]
+    fn mem_zero_rejects_zero_length() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "clear".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let alloc = data.new_local_inst().alloc(Type::get_i32());
+        data.new_local_inst().mem_zero(alloc, 0);
+    }
+}
+
 pub struct ReplaceBuilder<'a> {
     pub(crate) arena: &'a mut dyn Arena,
     pub(crate) inst: Inst,

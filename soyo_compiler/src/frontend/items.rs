@@ -533,7 +533,7 @@ pub fn parse_float_const(src: &str) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_float_const;
+    use super::{CompUnit, ConstInitVal, Decl, InitVal, parse_float_const};
 
     #[test]
     fn parses_c99_float_constants_as_f32() {
@@ -551,6 +551,46 @@ mod tests {
         assert_eq!(
             parse_float_const("03.141592653589793").to_bits(),
             std::f32::consts::PI.to_bits()
+        );
+    }
+
+    #[test]
+    fn sparse_initializers_preserve_nested_subobject_positions() {
+        let ast = crate::sysy::CompUnitsParser::new()
+            .parse("int a[3][3] = {{1}, {}, {2, 3}}; const int b[3][3] = {{1}, {}, {2, 3}};")
+            .unwrap();
+        let CompUnit::Decl(Decl::VarDecl(var_decl)) = &ast.comp_units[0] else {
+            panic!("expected variable declaration")
+        };
+        let Some(InitVal::Array(_)) = &var_decl.var_defs[0].init_val else {
+            panic!("expected array initializer")
+        };
+        assert_eq!(
+            var_decl.var_defs[0]
+                .init_val
+                .as_ref()
+                .unwrap()
+                .explicit_init_vals(&[3, 3])
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![0, 6, 7]
+        );
+
+        let CompUnit::Decl(Decl::ConstDecl(const_decl)) = &ast.comp_units[1] else {
+            panic!("expected constant declaration")
+        };
+        let ConstInitVal::Array(_) = &const_decl.const_defs[0].const_init_val else {
+            panic!("expected array initializer")
+        };
+        assert_eq!(
+            const_decl.const_defs[0]
+                .const_init_val
+                .explicit_init_vals(&[3, 3])
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![0, 6, 7]
         );
     }
 }

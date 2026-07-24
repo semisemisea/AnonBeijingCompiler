@@ -4,9 +4,8 @@ use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind, arena::Arena};
 use taki_mir::{
     abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::{LoweredBlock, MirBlockIndex},
-    libcall::LibCall,
     lower::{CodegenError, LowerBackend, LowerContext},
-    prelude::HirFunctionData,
+    prelude::{HirFunctionData, HirProgram},
     reg_alloc::reg::PReg,
     register::Writable,
     vcode::MachInst,
@@ -18,13 +17,34 @@ use crate::{
         AMode, AluOp, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift, MInst, MemoryType,
         SelectCmp, SelectValue, ShiftOp,
     },
-    labels::Label,
+    labels::{EmbeddedSymbol, Label},
     regs::{self, Gpr, OperandSize, RegOrZr},
 };
 
 pub struct AArch64Backend;
 
 const INLINE_MEMZERO_MAX_STORES: usize = 4;
+
+fn mem_zero_is_inline(byte_len: usize) -> bool {
+    byte_len % 4 == 0 && byte_len / 4 <= INLINE_MEMZERO_MAX_STORES
+}
+
+fn needs_embedded_memset(program: &HirProgram) -> bool {
+    program.function_layout().iter().any(|&function| {
+        program
+            .func_data(function)
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|block| block.insts().iter())
+            .any(
+                |&inst| match program.func_data(function).inst_data(inst).kind() {
+                    InstKind::MemZero(mem_zero) => !mem_zero_is_inline(mem_zero.byte_len()),
+                    _ => false,
+                },
+            )
+    })
+}
 
 impl LowerBackend for AArch64Backend {
     type MInst = MInst;
@@ -449,7 +469,7 @@ impl LowerBackend for AArch64Backend {
             InstKind::Store(store) => lower_store(ctx, store.src(), store.dest()),
             InstKind::MemZero(mem_zero) => {
                 let inline_store_count = mem_zero.byte_len() / 4;
-                if mem_zero.byte_len() % 4 == 0 && inline_store_count <= INLINE_MEMZERO_MAX_STORES {
+                if mem_zero_is_inline(mem_zero.byte_len()) {
                     let alloc =
                         matches!(ctx.arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
                             .then_some(mem_zero.dest());
@@ -526,7 +546,7 @@ impl LowerBackend for AArch64Backend {
                     ],
                     ret: None,
                     clobbers: regs::DEFAULT_CLOBBERS,
-                    label: Label::libcall(LibCall::Memset),
+                    label: Label::Embedded(EmbeddedSymbol::Memset),
                 });
                 ctx.vcode.vcode.abi.set_has_calls();
                 ctx.vcode.vcode.abi.set_outgoing_arg_size(0);
@@ -742,6 +762,10 @@ impl LowerBackend for AArch64Backend {
 
     fn emit_long_jump(ctx: &mut LowerContext<Self::MInst>, target: MirBlockIndex) {
         ctx.emit(MInst::gen_jump(target));
+    }
+
+    fn runtime_assembly(program: &HirProgram) -> Option<&'static str> {
+        needs_embedded_memset(program).then_some(include_str!("lib/memset.S"))
     }
 }
 
@@ -1204,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn lowers_mem_zero_to_memset_with_64_bit_length() {
+    fn lowers_large_mem_zero_to_embedded_helper_with_64_bit_length() {
         let mut program = Program::new();
         let function = program.new_function(Type::get_unit(), "clear".into(), vec![]);
         let data = program.func_data_mut(function);
@@ -1220,7 +1244,11 @@ mod tests {
 
         let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
         assert!(asm.contains("movz x2, #0x14"), "{asm}");
-        assert!(asm.contains("bl memset"), "{asm}");
+        assert!(asm.contains("bl .Lsoyo_memset"), "{asm}");
+        assert_eq!(asm.matches("\n.Lsoyo_memset:\n").count(), 1, "{asm}");
+        assert!(!asm.contains("bl memset"), "{asm}");
+        assert!(!asm.contains(".globl memset"), "{asm}");
+        assert!(!asm.contains("\nmemset:\n"), "{asm}");
     }
 
     #[test]
@@ -1240,7 +1268,50 @@ mod tests {
 
         let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
         assert!(!asm.contains("bl memset"), "{asm}");
+        assert!(!asm.contains("bl .Lsoyo_memset"), "{asm}");
+        assert!(!asm.contains("\n.Lsoyo_memset:\n"), "{asm}");
         assert_eq!(asm.matches("str w").count(), 4, "{asm}");
+    }
+
+    #[test]
+    fn embeds_memset_once_for_multiple_large_clears() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "clear_twice".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+
+        for _ in 0..2 {
+            let alloc = data
+                .new_local_inst()
+                .alloc(Type::get_array(Type::get_i32(), 5));
+            let clear = data.new_local_inst().mem_zero(alloc, 20);
+            data.layout_mut().insert_inst(entry, clear);
+        }
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
+        assert_eq!(asm.matches("bl .Lsoyo_memset").count(), 2, "{asm}");
+        assert_eq!(asm.matches("\n.Lsoyo_memset:\n").count(), 1, "{asm}");
+    }
+
+    #[test]
+    fn non_word_mem_zero_uses_embedded_helper() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "clear_tail".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let alloc = data.new_local_inst().alloc(Type::get_i32());
+        let clear = data.new_local_inst().mem_zero(alloc, 3);
+        data.layout_mut().insert_inst(entry, clear);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
+        assert!(asm.contains("bl .Lsoyo_memset"), "{asm}");
+        assert_eq!(asm.matches("\n.Lsoyo_memset:\n").count(), 1, "{asm}");
     }
 }
 

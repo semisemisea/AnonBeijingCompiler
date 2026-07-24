@@ -1,39 +1,42 @@
-use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind as HirTypeKind, arena::Arena};
+use raana_ir::ir::{
+    Binary, BinaryOp, Call, Cast, GetElemPtr, InstKind, Load, Return, Store, Type as HirType,
+    TypeKind as HirTypeKind, arena::Arena,
+};
 use smallvec::smallvec;
 
 use crate::{
     abi::{DEFAULT_CLOBBERS, Riscv64ABI},
     instructions::{
-        AMode, AluRRImm12OP, AluRRImmShiftOP, AluRRROP, FpuRRROP, Imm12, LoadOP, MInst, ShiftImm,
-        StoreOP,
+        AMode, AluRRImm12OP, AluRRImmShiftOP, AluRRROP, FcvtMode, FpuRRROP, Imm12, LoadOP, MInst,
+        ShiftImm, StoreOP,
     },
     labels::Label,
     regs::{ARG_REG, FARG_REG, a0, fa0, fp_reg, preg_name, stack_reg, zero_reg},
 };
 
 use taki_mir::{
-    abi::{ABIMachineSpec, ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
+    abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::LoweredBlock,
-    lower::{LowerBackend, LowerContext},
-    prelude::HirFunctionData,
+    lower::{LowerBackend, LowerContext, LoweredOutput},
+    prelude::{ArenaContext, HirFunctionData, HirInst},
     reg_alloc::reg::PReg,
-    register::Writable,
+    register::{Reg, Writable},
     types::LoweredType,
 };
 
-fn normalize_amode(amode: &AMode, ctx: &mut LowerContext<'_, MInst>) -> AMode {
+fn normalize_amode(amode: AMode, ctx: &mut LowerContext<'_, MInst>) -> AMode {
     // Slot offsets need the final outgoing-argument-area displacement, which
     // is unavailable during lowering. Keep them symbolic for ABI legalization.
     if matches!(amode, AMode::SlotOffset(_)) {
-        return amode.clone();
+        return amode;
     }
-    let (off, base) = match *amode {
-        AMode::SPOffset(o) | AMode::OutgoingArg(o) => (o, stack_reg()),
-        AMode::FPOffset(o) | AMode::IncomingArg(o) => (o, fp_reg()),
-        _ => return amode.clone(),
+    let (off, base) = match &amode {
+        AMode::SPOffset(o) | AMode::OutgoingArg(o) => (*o, stack_reg()),
+        AMode::FPOffset(o) | AMode::IncomingArg(o) => (*o, fp_reg()),
+        _ => return amode,
     };
     if (-2048..2048).contains(&off) {
-        return amode.clone();
+        return amode;
     }
     let tmp_off = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
     ctx.emit(MInst::LoadImm {
@@ -79,12 +82,9 @@ fn alu_op_for_hir_binary(op: BinaryOp, ty: &HirType) -> AluRRROP {
     }
 }
 
-fn integer_constant(
-    ctx: &taki_mir::lower::LowerContext<'_, MInst>,
-    inst: raana_ir::opt::prelude::Inst,
-) -> Option<i32> {
-    match ctx.arena.inst_data(inst).kind() {
-        raana_ir::ir::InstKind::Integer(value) => Some(value.value()),
+fn integer_constant(arena: ArenaContext<'_>, inst: HirInst) -> Option<i32> {
+    match arena.inst_data(inst).kind() {
+        InstKind::Integer(value) => Some(value.value()),
         _ => None,
     }
 }
@@ -100,10 +100,10 @@ fn signed_power_of_two(value: i32) -> Option<(u8, bool)> {
 }
 
 fn lower_signed_div_rem_power_of_two(
-    ctx: &mut taki_mir::lower::LowerContext<'_, MInst>,
+    ctx: &mut LowerContext<'_, MInst>,
     op: BinaryOp,
-    rd: Writable<taki_mir::register::Reg>,
-    lhs: taki_mir::register::Reg,
+    rd: Writable<Reg>,
+    lhs: Reg,
     divisor: i32,
 ) -> bool {
     let Some((shift, negate_quotient)) = signed_power_of_two(divisor) else {
@@ -187,542 +187,482 @@ fn lower_signed_div_rem_power_of_two(
     true
 }
 
+fn lower_binary(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    binary: &Binary,
+) -> LoweredOutput {
+    let bop = binary.op();
+    let lhs = ctx.put_value_in_reg(binary.lhs());
+    let def = ctx.result_reg(inst);
+    let rd = Writable::from_reg(def);
+    let inst_ty = arena.inst_data(inst).ty();
+    let is_float = matches!(inst_ty.kind(), HirTypeKind::Float32)
+        || matches!(
+            arena.inst_data(binary.lhs()).ty().kind(),
+            HirTypeKind::Float32
+        );
+
+    if is_float {
+        let rhs = ctx.put_value_in_reg(binary.rhs());
+        let op = match bop {
+            BinaryOp::Add => FpuRRROP::FaddS,
+            BinaryOp::Sub => FpuRRROP::FsubS,
+            BinaryOp::Mul => FpuRRROP::FmulS,
+            BinaryOp::Div => FpuRRROP::FdivS,
+            BinaryOp::Lt | BinaryOp::Gt => FpuRRROP::FltS,
+            BinaryOp::Le | BinaryOp::Ge => FpuRRROP::FleS,
+            BinaryOp::Eq | BinaryOp::NotEq => FpuRRROP::FeqS,
+            _ => unreachable!("unexpected float binary op: {:?}", bop),
+        };
+        let (rs1, rs2) = if matches!(bop, BinaryOp::Gt | BinaryOp::Ge) {
+            (rhs, lhs)
+        } else {
+            (lhs, rhs)
+        };
+        ctx.emit(MInst::FpuRRR { op, rd, rs1, rs2 });
+        if bop == BinaryOp::NotEq {
+            ctx.emit(MInst::AluRRImm12 {
+                op: AluRRImm12OP::Xori,
+                rd,
+                rs: def,
+                imm: Imm12::ONE,
+            });
+        }
+    } else {
+        if bop == BinaryOp::Div && integer_constant(arena, binary.rhs()) == Some(1) {
+            return LoweredOutput::Value(lhs);
+        }
+        if matches!(inst_ty.kind(), HirTypeKind::Int32)
+            && matches!(bop, BinaryOp::Div | BinaryOp::Rem)
+            && integer_constant(arena, binary.rhs()).is_some_and(|divisor| {
+                lower_signed_div_rem_power_of_two(ctx, bop, rd, lhs, divisor)
+            })
+        {
+            return LoweredOutput::Value(def);
+        }
+        let rhs = ctx.put_value_in_reg(binary.rhs());
+        let op = (!matches!(bop, BinaryOp::Eq | BinaryOp::NotEq))
+            .then(|| alu_op_for_hir_binary(bop, inst_ty));
+        let sub_op = alu_op_for_hir_binary(BinaryOp::Sub, inst_ty);
+        match bop {
+            BinaryOp::NotEq => {
+                ctx.emit(MInst::AluRRR {
+                    op: sub_op,
+                    rd,
+                    rs1: lhs,
+                    rs2: rhs,
+                });
+                ctx.emit(MInst::AluRRR {
+                    op: AluRRROP::Snez,
+                    rd,
+                    rs1: def,
+                    rs2: zero_reg(),
+                });
+            }
+            BinaryOp::Eq => {
+                ctx.emit(MInst::AluRRR {
+                    op: sub_op,
+                    rd,
+                    rs1: lhs,
+                    rs2: rhs,
+                });
+                ctx.emit(MInst::AluRRR {
+                    op: AluRRROP::Seqz,
+                    rd,
+                    rs1: def,
+                    rs2: zero_reg(),
+                });
+            }
+            BinaryOp::Lt
+            | BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Rem
+            | BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Xor
+            | BinaryOp::Shl
+            | BinaryOp::Shr
+            | BinaryOp::Sar => ctx.emit(MInst::AluRRR {
+                op: op.unwrap(),
+                rd,
+                rs1: lhs,
+                rs2: rhs,
+            }),
+            BinaryOp::Gt => ctx.emit(MInst::AluRRR {
+                op: op.unwrap(),
+                rd,
+                rs1: rhs,
+                rs2: lhs,
+            }),
+            BinaryOp::Ge | BinaryOp::Le => {
+                let (rs1, rs2) = if bop == BinaryOp::Ge {
+                    (lhs, rhs)
+                } else {
+                    (rhs, lhs)
+                };
+                ctx.emit(MInst::AluRRR {
+                    op: op.unwrap(),
+                    rd,
+                    rs1,
+                    rs2,
+                });
+                ctx.emit(MInst::AluRRImm12 {
+                    op: AluRRImm12OP::Xori,
+                    rd,
+                    rs: def,
+                    imm: Imm12::ONE,
+                });
+            }
+        }
+    }
+    LoweredOutput::Value(def)
+}
+
+fn lower_cast(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    cast: &Cast,
+) -> LoweredOutput {
+    let rs = ctx.put_value_in_reg(cast.src());
+    let into_ty = arena.inst_data(inst).ty().kind();
+    let def = ctx.result_reg(inst);
+    let rd = Writable::from_reg(def);
+    let mode = match into_ty {
+        HirTypeKind::Int32 => FcvtMode::SinglePrecisionToWord,
+        HirTypeKind::Float32 => FcvtMode::WordToSinglePrecision,
+        _ => unreachable!("cast only produce i32 or f32"),
+    };
+    ctx.emit(MInst::Fcvt { mode, rd, rs });
+    LoweredOutput::Value(def)
+}
+
+fn lower_alloc(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+) -> LoweredOutput {
+    let def = ctx.result_reg(inst);
+    let rd = Writable::from_reg(def);
+    let pointee_ty = arena.inst_data(inst).ty().derefernce();
+    let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(inst, pointee_ty) as i64;
+    ctx.emit(<Riscv64ABI as ABIMachineSpec>::gen_get_stack_addr(
+        StackAMode::Slot(offset),
+        rd,
+    ));
+    LoweredOutput::Value(def)
+}
+
+fn lower_get_elem_ptr(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    get_elem_ptr: &GetElemPtr,
+) -> LoweredOutput {
+    let src = get_elem_ptr.base();
+    let mut ty = arena.inst_data(src).ty().clone();
+    let rs = ctx.put_value_in_reg(src);
+    let def = ctx.result_reg(inst);
+    let rd = Writable::from_reg(def);
+    let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+    let wtmp = Writable::from_reg(tmp);
+    let acc = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+    let wacc = Writable::from_reg(acc);
+    ctx.emit(MInst::LoadImm { rd: wacc, value: 0 });
+    for &index in get_elem_ptr.offsets() {
+        let elem_size = if ty.is_pointer() {
+            let deref = ty.derefernce();
+            let size = deref.size();
+            ty = deref;
+            size
+        } else {
+            let (elem_ty, _len) = ty.get_array_info();
+            let size = elem_ty.size();
+            ty = elem_ty;
+            size
+        };
+        ctx.emit(MInst::LoadImm {
+            rd: wtmp,
+            value: elem_size as u64,
+        });
+        let rhs = ctx.put_value_in_reg(index);
+        ctx.emit(MInst::AluRRR {
+            op: AluRRROP::Mul,
+            rd: wtmp,
+            rs1: tmp,
+            rs2: rhs,
+        });
+        ctx.emit(MInst::AluRRR {
+            op: AluRRROP::Add,
+            rd: wacc,
+            rs1: acc,
+            rs2: tmp,
+        });
+    }
+    let final_ty = ty.reference();
+    assert_eq!(
+        final_ty,
+        *arena.inst_data(inst).ty(),
+        "GEP type mismatch for {:?}: computed={:?}, declared={:?}, base_idx={:?}",
+        inst,
+        final_ty,
+        arena.inst_data(inst).ty(),
+        get_elem_ptr.base(),
+    );
+    ctx.emit(MInst::AluRRR {
+        op: AluRRROP::Add,
+        rd,
+        rs1: rs,
+        rs2: acc,
+    });
+    LoweredOutput::Value(def)
+}
+
+fn lower_store(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    store: &Store,
+) -> LoweredOutput {
+    let src = store.src();
+    let dst = store.dest();
+
+    if let InstKind::Aggregate(agg) = arena.inst_data(src).kind() {
+        let elems = agg.flatten(&arena);
+        assert!(matches!(arena.inst_data(dst).kind(), InstKind::Alloc));
+        let dst_pointee = arena.inst_data(dst).ty().derefernce();
+        let base_offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(dst, dst_pointee) as i64;
+        let mut elem_offset: i64 = 0;
+        for elem in elems {
+            let rs = ctx.put_value_in_reg(elem);
+            let elem_ty = arena.inst_data(elem).ty();
+            let m_type: LoweredType = elem_ty.into();
+            let op: StoreOP = m_type.into();
+            let addr = normalize_amode(AMode::SlotOffset(base_offset + elem_offset), ctx);
+            ctx.emit(MInst::StoreWord { rs, op, addr });
+            elem_offset += elem_ty.size() as i64;
+        }
+    } else if matches!(arena.inst_data(src).kind(), InstKind::ZeroInit) {
+        let src_ty = arena.inst_data(src).ty();
+        let total = src_ty.array_flatten_length();
+        let elem_size = src_ty.array_base_scalar_type().size() as i64;
+        let dst_pointee = arena.inst_data(dst).ty().derefernce();
+        let base_offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(dst, dst_pointee) as i64;
+        for i in 0..total {
+            let addr = normalize_amode(AMode::SlotOffset(base_offset + i as i64 * elem_size), ctx);
+            ctx.emit(MInst::StoreWord {
+                rs: zero_reg(),
+                op: StoreOP::Sw,
+                addr,
+            });
+        }
+    } else {
+        let m_type: LoweredType = arena.inst_data(src).ty().into();
+        let op = m_type.into();
+        let rs = ctx.put_value_in_reg(src);
+        if dst.is_global() {
+            let addr_tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+            ctx.emit(MInst::LoadAddr {
+                rd: Writable::from_reg(addr_tmp),
+                label: Label::GlobalValue(dst),
+            });
+            ctx.emit(MInst::StoreWord {
+                rs,
+                op,
+                addr: AMode::RegOffest(addr_tmp, 0),
+            });
+        } else {
+            match arena.inst_data(dst).kind() {
+                InstKind::GetElemPtr(..) => {
+                    let addr = ctx.put_value_in_reg(dst);
+                    ctx.emit(MInst::StoreWord {
+                        rs,
+                        op,
+                        addr: AMode::RegOffest(addr, 0),
+                    });
+                }
+                InstKind::Alloc => {
+                    let pointee_ty = arena.inst_data(dst).ty().derefernce();
+                    let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(dst, pointee_ty);
+                    let addr = normalize_amode(AMode::SlotOffset(offset as i64), ctx);
+                    ctx.emit(MInst::StoreWord { rs, op, addr });
+                }
+                _ => unreachable!("should not store in instruction other than GEP or Alloc"),
+            }
+        }
+    }
+    LoweredOutput::None
+}
+
+fn lower_load(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    load: &Load,
+) -> LoweredOutput {
+    let src = load.src();
+    let m_type: LoweredType = arena.inst_data(inst).ty().into();
+    let op: LoadOP = m_type.into();
+    let def = ctx.result_reg(inst);
+    let rd = Writable::from_reg(def);
+    if src.is_global() {
+        ctx.emit(MInst::LoadWord {
+            rd,
+            op,
+            addr: AMode::Label(Label::GlobalValue(src)),
+        })
+    } else if matches!(arena.inst_data(src).kind(), InstKind::GetElemPtr(..)) {
+        // relative pointer.
+        let rs = ctx.put_value_in_reg(src);
+        ctx.emit(MInst::LoadWord {
+            rd,
+            op,
+            addr: AMode::RegOffest(rs, 0),
+        });
+    } else {
+        // For SysY, this branch only happen when SSA is disabled.
+        // All load from integer/float is translated into SSA from.
+        let alloc_ty = arena.inst_data(src).ty().derefernce();
+        let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(src, alloc_ty);
+        let addr = normalize_amode(AMode::SlotOffset(offset as i64), ctx);
+        ctx.emit(MInst::LoadWord { rd, op, addr });
+    }
+    LoweredOutput::Value(def)
+}
+
+fn lower_call(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    call: &Call,
+) -> LoweredOutput {
+    let mut outgoing_arg_size = 0usize;
+    let mut call_arg_pairs = smallvec![];
+    let mut int_arg_idx = 0;
+    let mut float_arg_idx = 0;
+    for &arg in call.args() {
+        let arg_reg = ctx.put_value_in_reg(arg);
+        let arg_ty = arena.inst_data(arg).ty();
+        let m_type: LoweredType = arg_ty.into();
+        match arg_ty.kind() {
+            HirTypeKind::Int32 | HirTypeKind::Pointer(_) => {
+                if int_arg_idx < 8 {
+                    call_arg_pairs.push(CallArgPair {
+                        vreg: arg_reg,
+                        preg: ARG_REG[int_arg_idx],
+                    });
+                    int_arg_idx += 1;
+                } else {
+                    let op: StoreOP = m_type.into();
+                    let addr = normalize_amode(AMode::OutgoingArg(outgoing_arg_size as i64), ctx);
+                    ctx.emit(MInst::StoreWord {
+                        rs: arg_reg,
+                        op,
+                        addr,
+                    });
+                    outgoing_arg_size += arg_ty.size();
+                }
+            }
+            HirTypeKind::Float32 => {
+                if float_arg_idx < 8 {
+                    call_arg_pairs.push(CallArgPair {
+                        vreg: arg_reg,
+                        preg: FARG_REG[float_arg_idx],
+                    });
+                    float_arg_idx += 1;
+                } else {
+                    let op: StoreOP = m_type.into();
+                    let addr = normalize_amode(AMode::OutgoingArg(outgoing_arg_size as i64), ctx);
+                    ctx.emit(MInst::StoreWord {
+                        rs: arg_reg,
+                        op,
+                        addr,
+                    });
+                    outgoing_arg_size += arg_ty.size();
+                }
+            }
+            _ => unreachable!("unexpected call argument type: {:?}", arg_ty.kind()),
+        }
+    }
+    let result_ty = arena.inst_data(inst).ty();
+    let result = (!result_ty.is_unit()).then(|| ctx.result_reg(inst));
+    let ret_arg_pair = match result_ty.kind() {
+        HirTypeKind::Unit => None,
+        HirTypeKind::Int32 => Some(CallRetPair {
+            vreg: Writable::from_reg(result.unwrap()),
+            preg: a0(),
+        }),
+        HirTypeKind::Float32 => Some(CallRetPair {
+            vreg: Writable::from_reg(result.unwrap()),
+            preg: fa0(),
+        }),
+        _ => unreachable!(),
+    };
+    ctx.emit(MInst::Call {
+        arg_pairs: call_arg_pairs,
+        ret: ret_arg_pair,
+        clobbers: DEFAULT_CLOBBERS,
+        label: Label::Function(call.callee()),
+    });
+    ctx.vcode.vcode.abi.set_has_calls();
+    ctx.vcode.vcode.abi.set_outgoing_arg_size(outgoing_arg_size);
+    result.map_or(LoweredOutput::None, LoweredOutput::Value)
+}
+
+fn lower_return(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    ret: &Return,
+) -> LoweredOutput {
+    if let Some(val) = ret.value() {
+        let preg = match arena.inst_data(val).ty().kind() {
+            HirTypeKind::Int32 | HirTypeKind::Pointer(_) => a0(),
+            HirTypeKind::Float32 => fa0(),
+            ty => unreachable!("unexpected return type: {ty:?}"),
+        };
+        let src = ctx.put_value_in_reg(val);
+        ctx.emit(MInst::RetVal {
+            pair: RetPair { vreg: src, preg },
+        });
+    }
+    ctx.emit(MInst::Ret);
+    LoweredOutput::None
+}
+
 pub struct Riscv64Backend;
 
 impl LowerBackend for Riscv64Backend {
     type MInst = MInst;
-    fn lower(
-        ctx: &mut taki_mir::lower::LowerContext<Self::MInst>,
-        inst: raana_ir::opt::prelude::Inst,
-    ) {
-        let func_data = ctx.arena.program.func_data(ctx.arena.curr_func.unwrap());
-        let inst_data = func_data.inst_data(inst);
-        match inst_data.kind() {
-            raana_ir::ir::InstKind::BlockArgRef(..)
-            | raana_ir::ir::InstKind::FuncArgRef(..)
-            | raana_ir::ir::InstKind::Aggregate(..)
-            | raana_ir::ir::InstKind::GlobalAlloc(..)
-            | raana_ir::ir::InstKind::Undef
-            | raana_ir::ir::InstKind::ZeroInit
-            | raana_ir::ir::InstKind::Integer(..)
-            | raana_ir::ir::InstKind::Float(..) => {
+    fn lower(ctx: &mut LowerContext<Self::MInst>, inst: HirInst) -> LoweredOutput {
+        let arena = ctx.arena;
+        match arena.inst_data(inst).kind() {
+            InstKind::BlockArgRef(..)
+            | InstKind::FuncArgRef(..)
+            | InstKind::Aggregate(..)
+            | InstKind::GlobalAlloc(..)
+            | InstKind::Undef
+            | InstKind::ZeroInit
+            | InstKind::Integer(..)
+            | InstKind::Float(..) => {
                 // Should not in layout for now.
                 // Even when changed we don't have to do anything
                 // Because these instruction are just defining a value.
                 unreachable!("currently constants are not in layout")
             }
-            raana_ir::ir::InstKind::Binary(binary) => {
-                let bop = binary.op();
-                let lhs = ctx.put_value_in_reg(binary.lhs());
-                let def = *ctx.reg_map.get(&inst).unwrap();
-                let rd = Writable::from_reg(def);
-
-                let lhs_ty = ctx.arena.inst_data(binary.lhs()).ty();
-                let is_float = matches!(inst_data.ty().kind(), raana_ir::ir::TypeKind::Float32)
-                    || matches!(lhs_ty.kind(), raana_ir::ir::TypeKind::Float32);
-
-                if is_float {
-                    let rhs = ctx.put_value_in_reg(binary.rhs());
-                    use crate::instructions::FpuRRROP;
-                    match bop {
-                        raana_ir::ir::BinaryOp::Add => {
-                            ctx.emit(MInst::FpuRRR {
-                                op: FpuRRROP::FaddS,
-                                rd,
-                                rs1: lhs,
-                                rs2: rhs,
-                            });
-                        }
-                        raana_ir::ir::BinaryOp::Sub => {
-                            ctx.emit(MInst::FpuRRR {
-                                op: FpuRRROP::FsubS,
-                                rd,
-                                rs1: lhs,
-                                rs2: rhs,
-                            });
-                        }
-                        raana_ir::ir::BinaryOp::Mul => {
-                            ctx.emit(MInst::FpuRRR {
-                                op: FpuRRROP::FmulS,
-                                rd,
-                                rs1: lhs,
-                                rs2: rhs,
-                            });
-                        }
-                        raana_ir::ir::BinaryOp::Div => {
-                            ctx.emit(MInst::FpuRRR {
-                                op: FpuRRROP::FdivS,
-                                rd,
-                                rs1: lhs,
-                                rs2: rhs,
-                            });
-                        }
-                        raana_ir::ir::BinaryOp::Lt => {
-                            ctx.emit(MInst::FpuRRR {
-                                op: FpuRRROP::FltS,
-                                rd,
-                                rs1: lhs,
-                                rs2: rhs,
-                            });
-                        }
-                        raana_ir::ir::BinaryOp::Gt => {
-                            ctx.emit(MInst::FpuRRR {
-                                op: FpuRRROP::FltS,
-                                rd,
-                                rs1: rhs,
-                                rs2: lhs,
-                            });
-                        }
-                        raana_ir::ir::BinaryOp::Le => {
-                            ctx.emit(MInst::FpuRRR {
-                                op: FpuRRROP::FleS,
-                                rd,
-                                rs1: lhs,
-                                rs2: rhs,
-                            });
-                        }
-                        raana_ir::ir::BinaryOp::Ge => {
-                            ctx.emit(MInst::FpuRRR {
-                                op: FpuRRROP::FleS,
-                                rd,
-                                rs1: rhs,
-                                rs2: lhs,
-                            });
-                        }
-                        raana_ir::ir::BinaryOp::Eq => {
-                            ctx.emit(MInst::FpuRRR {
-                                op: FpuRRROP::FeqS,
-                                rd,
-                                rs1: lhs,
-                                rs2: rhs,
-                            });
-                        }
-                        raana_ir::ir::BinaryOp::NotEq => {
-                            ctx.emit(MInst::FpuRRR {
-                                op: FpuRRROP::FeqS,
-                                rd,
-                                rs1: lhs,
-                                rs2: rhs,
-                            });
-                            ctx.emit(MInst::AluRRImm12 {
-                                op: crate::instructions::AluRRImm12OP::Xori,
-                                rd,
-                                rs: def,
-                                imm: Imm12::ONE,
-                            });
-                        }
-                        _ => unreachable!("unexpected float binary op: {:?}", bop),
-                    }
-                } else {
-                    if matches!(inst_data.ty().kind(), HirTypeKind::Int32)
-                        && matches!(bop, BinaryOp::Div | BinaryOp::Rem)
-                        && integer_constant(ctx, binary.rhs()).is_some_and(|divisor| {
-                            lower_signed_div_rem_power_of_two(ctx, bop, rd, lhs, divisor)
-                        })
-                    {
-                        return;
-                    }
-                    let rhs = ctx.put_value_in_reg(binary.rhs());
-                    let op = (!matches!(bop, BinaryOp::Eq | BinaryOp::NotEq))
-                        .then(|| alu_op_for_hir_binary(bop, inst_data.ty()));
-                    let sub_op = alu_op_for_hir_binary(BinaryOp::Sub, inst_data.ty());
-                    match bop {
-                        raana_ir::ir::BinaryOp::NotEq => {
-                            ctx.emit(MInst::AluRRR {
-                                op: sub_op,
-                                rd,
-                                rs1: lhs,
-                                rs2: rhs,
-                            });
-                            ctx.emit(MInst::AluRRR {
-                                op: AluRRROP::Snez,
-                                rd,
-                                rs1: def,
-                                rs2: zero_reg(),
-                            });
-                        }
-                        raana_ir::ir::BinaryOp::Eq => {
-                            ctx.emit(MInst::AluRRR {
-                                op: sub_op,
-                                rd,
-                                rs1: lhs,
-                                rs2: rhs,
-                            });
-                            ctx.emit(MInst::AluRRR {
-                                op: AluRRROP::Seqz,
-                                rd,
-                                rs1: def,
-                                rs2: zero_reg(),
-                            });
-                        }
-                        raana_ir::ir::BinaryOp::Lt
-                        | raana_ir::ir::BinaryOp::Add
-                        | raana_ir::ir::BinaryOp::Sub
-                        | raana_ir::ir::BinaryOp::Mul
-                        | raana_ir::ir::BinaryOp::Div
-                        | raana_ir::ir::BinaryOp::Rem
-                        | raana_ir::ir::BinaryOp::And
-                        | raana_ir::ir::BinaryOp::Or
-                        | raana_ir::ir::BinaryOp::Xor
-                        | raana_ir::ir::BinaryOp::Shl
-                        | raana_ir::ir::BinaryOp::Shr
-                        | raana_ir::ir::BinaryOp::Sar => ctx.emit(MInst::AluRRR {
-                            op: op.unwrap(),
-                            rd,
-                            rs1: lhs,
-                            rs2: rhs,
-                        }),
-                        raana_ir::ir::BinaryOp::Gt => {
-                            ctx.emit(MInst::AluRRR {
-                                op: op.unwrap(),
-                                rd,
-                                rs1: rhs,
-                                rs2: lhs,
-                            });
-                        }
-                        raana_ir::ir::BinaryOp::Ge => {
-                            ctx.emit(MInst::AluRRR {
-                                op: op.unwrap(),
-                                rd,
-                                rs1: lhs,
-                                rs2: rhs,
-                            });
-                            ctx.emit(MInst::AluRRImm12 {
-                                op: super::instructions::AluRRImm12OP::Xori,
-                                rd,
-                                rs: def,
-                                imm: Imm12::ONE,
-                            });
-                        }
-                        raana_ir::ir::BinaryOp::Le => {
-                            ctx.emit(MInst::AluRRR {
-                                op: op.unwrap(),
-                                rd,
-                                rs1: rhs,
-                                rs2: lhs,
-                            });
-                            ctx.emit(MInst::AluRRImm12 {
-                                op: super::instructions::AluRRImm12OP::Xori,
-                                rd,
-                                rs: def,
-                                imm: Imm12::ONE,
-                            });
-                        }
-                    }
-                }
+            InstKind::Binary(binary) => lower_binary(ctx, arena, inst, binary),
+            InstKind::Cast(cast) => lower_cast(ctx, arena, inst, cast),
+            InstKind::Alloc => lower_alloc(ctx, arena, inst),
+            InstKind::GetElemPtr(get_elem_ptr) => {
+                lower_get_elem_ptr(ctx, arena, inst, get_elem_ptr)
             }
-            raana_ir::ir::InstKind::Cast(cast) => {
-                use crate::instructions::FcvtMode;
-                let src = cast.src();
-                let rs = ctx.put_value_in_reg(src);
-                let into_ty = inst_data.ty();
-                let def = *ctx.reg_map.get(&inst).unwrap();
-                let rd = Writable::from_reg(def);
-                match into_ty.kind() {
-                    raana_ir::ir::TypeKind::Int32 => {
-                        ctx.emit(MInst::Fcvt {
-                            mode: FcvtMode::SinglePrecisionToWord,
-                            rd,
-                            rs,
-                        });
-                    }
-                    raana_ir::ir::TypeKind::Float32 => {
-                        ctx.emit(MInst::Fcvt {
-                            mode: FcvtMode::WordToSinglePrecision,
-                            rd,
-                            rs,
-                        });
-                    }
-                    _ => unreachable!("cast only produce i32 or f32"),
-                }
-            }
-            raana_ir::ir::InstKind::Alloc => {
-                let def = *ctx.reg_map.get(&inst).unwrap();
-                let rd = Writable::from_reg(def);
-                let pointee_ty = inst_data.ty().derefernce();
-                let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(inst, pointee_ty) as i64;
-                ctx.emit(<Riscv64ABI as ABIMachineSpec>::gen_get_stack_addr(
-                    StackAMode::Slot(offset),
-                    rd,
-                ));
-            }
-            raana_ir::ir::InstKind::GetElemPtr(get_elem_ptr) => {
-                let indices = get_elem_ptr.offsets();
-                let src = get_elem_ptr.base();
-                let mut src_ty = ctx.arena.inst_data(src).ty().clone();
-                let rs = ctx.put_value_in_reg(src);
-
-                let def = *ctx.reg_map.get(&inst).unwrap();
-                let rd = Writable::from_reg(def);
-                let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                let wtmp = Writable::from_reg(tmp);
-                let acc = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                let wacc = Writable::from_reg(acc);
-                ctx.emit(MInst::LoadImm { rd: wacc, value: 0 });
-                let mut ty = src_ty;
-                for &index in indices {
-                    let elem_size = if ty.is_pointer() {
-                        let deref = ty.derefernce();
-                        let size = deref.size();
-                        ty = deref;
-                        size
-                    } else {
-                        let (elem_ty, _len) = ty.get_array_info();
-                        let size = elem_ty.size();
-                        ty = elem_ty;
-                        size
-                    };
-                    ctx.emit(MInst::LoadImm {
-                        rd: wtmp,
-                        value: elem_size as u64,
-                    });
-                    let rhs = ctx.put_value_in_reg(index);
-                    ctx.emit(MInst::AluRRR {
-                        op: AluRRROP::Mul,
-                        rd: wtmp,
-                        rs1: tmp,
-                        rs2: rhs,
-                    });
-                    ctx.emit(MInst::AluRRR {
-                        op: AluRRROP::Add,
-                        rd: wacc,
-                        rs1: acc,
-                        rs2: tmp,
-                    });
-                }
-                let final_ty = ty.reference();
-                assert_eq!(
-                    final_ty,
-                    *inst_data.ty(),
-                    "GEP type mismatch for {:?}: computed={:?}, declared={:?}, base_idx={:?}",
-                    inst,
-                    final_ty,
-                    inst_data.ty(),
-                    get_elem_ptr.base(),
-                );
-                ctx.emit(MInst::AluRRR {
-                    op: AluRRROP::Add,
-                    rd,
-                    rs1: rs,
-                    rs2: acc,
-                });
-            }
-            raana_ir::ir::InstKind::Store(store) => {
-                let src = store.src();
-                let dst = store.dest();
-
-                if let InstKind::Aggregate(agg) = ctx.arena.inst_data(src).kind() {
-                    let elems = agg.flatten(&ctx.arena);
-                    assert!(matches!(ctx.arena.inst_data(dst).kind(), InstKind::Alloc));
-                    let dst_pointee = ctx.arena.inst_data(dst).ty().derefernce();
-                    let base_offset = ctx
-                        .vcode
-                        .vcode
-                        .abi
-                        .alloc_stackslot_or_get(dst, dst_pointee.clone())
-                        as i64;
-                    let mut elem_offset: i64 = 0;
-                    for elem in elems {
-                        let rs = ctx.put_value_in_reg(elem);
-                        let elem_ty = ctx.arena.inst_data(elem).ty().clone();
-                        let m_type: LoweredType = elem_ty.clone().into();
-                        let op: StoreOP = m_type.into();
-                        let addr =
-                            normalize_amode(&AMode::SlotOffset(base_offset + elem_offset), ctx);
-                        ctx.emit(MInst::StoreWord { rs, op, addr });
-                        elem_offset += elem_ty.size() as i64;
-                    }
-                } else if matches!(ctx.arena.inst_data(src).kind(), InstKind::ZeroInit) {
-                    let src_ty = ctx.arena.inst_data(src).ty();
-                    let dst_pointee = ctx.arena.inst_data(dst).ty().derefernce();
-                    let base_offset = ctx
-                        .vcode
-                        .vcode
-                        .abi
-                        .alloc_stackslot_or_get(dst, dst_pointee.clone())
-                        as i64;
-                    let total = src_ty.array_flatten_length();
-                    let scalar_ty = src_ty.array_base_scalar_type();
-                    let elem_size = scalar_ty.size() as i64;
-                    let zero = zero_reg();
-                    for i in 0..total {
-                        let addr = normalize_amode(
-                            &AMode::SlotOffset(base_offset + i as i64 * elem_size),
-                            ctx,
-                        );
-                        ctx.emit(MInst::StoreWord {
-                            rs: zero,
-                            op: StoreOP::Sw,
-                            addr,
-                        });
-                    }
-                } else {
-                    let m_type: LoweredType = ctx.arena.inst_data(src).ty().clone().into();
-                    let op = m_type.into();
-                    let rs = ctx.put_value_in_reg(src);
-
-                    if dst.is_global() {
-                        let addr_tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                        ctx.emit(MInst::LoadAddr {
-                            rd: Writable::from_reg(addr_tmp),
-                            label: Label::GlobalValue(dst),
-                        });
-                        ctx.emit(MInst::StoreWord {
-                            rs,
-                            op,
-                            addr: AMode::RegOffest(addr_tmp, 0),
-                        });
-                    } else {
-                        match ctx.arena.inst_data(dst).kind() {
-                            InstKind::GetElemPtr(..) => {
-                                let addr = ctx.put_value_in_reg(dst);
-                                ctx.emit(MInst::StoreWord {
-                                    rs,
-                                    op,
-                                    addr: AMode::RegOffest(addr, 0),
-                                });
-                            }
-                            InstKind::Alloc => {
-                                let pointee_ty = ctx.arena.inst_data(dst).ty().derefernce();
-                                let offset =
-                                    ctx.vcode.vcode.abi.alloc_stackslot_or_get(dst, pointee_ty);
-                                let addr = normalize_amode(&AMode::SlotOffset(offset as i64), ctx);
-                                ctx.emit(MInst::StoreWord { rs, op, addr });
-                            }
-                            _ => {
-                                unreachable!(
-                                    "should not store in instruction other than GEP or Alloc"
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-            raana_ir::ir::InstKind::Load(load) => {
-                let src = load.src();
-                let src_ty = inst_data.ty().clone();
-                let m_type: LoweredType = src_ty.clone().into();
-                let op: LoadOP = m_type.into();
-                let def = *ctx.reg_map.get(&inst).unwrap();
-                let rd = Writable::from_reg(def);
-                if src.is_global() {
-                    ctx.emit(MInst::LoadWord {
-                        rd,
-                        op,
-                        addr: AMode::Label(Label::GlobalValue(src)),
-                    })
-                } else if matches!(ctx.arena.inst_data(src).kind(), InstKind::GetElemPtr(..)) {
-                    // relative pointer.
-                    let rs = ctx.put_value_in_reg(src);
-                    ctx.emit(MInst::LoadWord {
-                        rd,
-                        op,
-                        addr: AMode::RegOffest(rs, 0),
-                    });
-                } else {
-                    // For SysY, this branch only happen when SSA is disabled.
-                    // All load from integer/float is translated into SSA from.
-                    let alloc_ty = ctx.arena.inst_data(src).ty().derefernce();
-                    let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(src, alloc_ty);
-                    let addr = normalize_amode(&AMode::SlotOffset(offset as i64), ctx);
-                    ctx.emit(MInst::LoadWord { rd, op, addr });
-                }
-            }
-            raana_ir::ir::InstKind::Call(call) => {
-                use raana_ir::ir::TypeKind;
-                let args = call.args();
-                let callee = call.callee();
-
-                let mut outgoing_arg_size = 0usize;
-                let mut call_arg_pairs = smallvec![];
-                let mut int_arg_idx = 0;
-                let mut float_arg_idx = 0;
-                for &arg in args {
-                    let arg_reg = ctx.put_value_in_reg(arg);
-                    let arg_ty = ctx.arena.inst_data(arg).ty().clone();
-                    let m_type: LoweredType = arg_ty.clone().into();
-                    match arg_ty.kind() {
-                        TypeKind::Int32 | TypeKind::Pointer(_) => {
-                            if int_arg_idx < 8 {
-                                call_arg_pairs.push(CallArgPair {
-                                    vreg: arg_reg,
-                                    preg: ARG_REG[int_arg_idx],
-                                });
-                                int_arg_idx += 1;
-                            } else {
-                                let op: StoreOP = m_type.into();
-                                let addr = normalize_amode(
-                                    &AMode::OutgoingArg(outgoing_arg_size as i64),
-                                    ctx,
-                                );
-                                ctx.emit(MInst::StoreWord {
-                                    rs: arg_reg,
-                                    op,
-                                    addr,
-                                });
-                                outgoing_arg_size += arg_ty.size();
-                            }
-                        }
-                        TypeKind::Float32 => {
-                            if float_arg_idx < 8 {
-                                call_arg_pairs.push(CallArgPair {
-                                    vreg: arg_reg,
-                                    preg: FARG_REG[float_arg_idx],
-                                });
-                                float_arg_idx += 1;
-                            } else {
-                                let op: StoreOP = m_type.into();
-                                let addr = normalize_amode(
-                                    &AMode::OutgoingArg(outgoing_arg_size as i64),
-                                    ctx,
-                                );
-                                ctx.emit(MInst::StoreWord {
-                                    rs: arg_reg,
-                                    op,
-                                    addr,
-                                });
-                                outgoing_arg_size += arg_ty.size();
-                            }
-                        }
-                        _ => unreachable!("unexpected call argument type: {:?}", arg_ty.kind()),
-                    }
-                }
-                let ret_arg_pair = match inst_data.ty().kind() {
-                    raana_ir::ir::TypeKind::Unit => None,
-                    raana_ir::ir::TypeKind::Int32 => Some(CallRetPair {
-                        vreg: Writable::from_reg(*ctx.reg_map.get(&inst).unwrap()),
-                        preg: a0(),
-                    }),
-                    raana_ir::ir::TypeKind::Float32 => Some(CallRetPair {
-                        vreg: Writable::from_reg(*ctx.reg_map.get(&inst).unwrap()),
-                        preg: fa0(),
-                    }),
-                    _ => unreachable!(),
-                };
-                ctx.emit(MInst::Call {
-                    arg_pairs: call_arg_pairs,
-                    ret: ret_arg_pair,
-                    clobbers: DEFAULT_CLOBBERS,
-                    label: Label::Function(callee),
-                });
-                ctx.vcode.vcode.abi.set_has_calls();
-                ctx.vcode.vcode.abi.set_outgoing_arg_size(outgoing_arg_size);
-            }
-            raana_ir::ir::InstKind::Return(ret) => {
-                if let Some(val) = ret.value() {
-                    let preg = match ctx.arena.inst_data(val).ty().kind() {
-                        raana_ir::ir::TypeKind::Int32 | raana_ir::ir::TypeKind::Pointer(_) => a0(),
-                        raana_ir::ir::TypeKind::Float32 => fa0(),
-                        ty => unreachable!("unexpected return type: {ty:?}"),
-                    };
-                    let src = ctx.put_value_in_reg(val);
-                    ctx.emit(MInst::RetVal {
-                        pair: RetPair { vreg: src, preg },
-                    });
-                }
-                ctx.emit(MInst::Ret);
-            }
-            raana_ir::ir::InstKind::Jump(..) | raana_ir::ir::InstKind::Branch(..) => {
+            InstKind::Store(store) => lower_store(ctx, arena, store),
+            InstKind::Load(load) => lower_load(ctx, arena, inst, load),
+            InstKind::Call(call) => lower_call(ctx, arena, inst, call),
+            InstKind::Return(ret) => lower_return(ctx, arena, ret),
+            InstKind::Jump(..) | InstKind::Branch(..) => {
                 unreachable!("should not lower branch instruction in here.")
             }
         }

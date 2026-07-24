@@ -172,20 +172,43 @@ impl<I: VCodeInst> VRegAllocator<I> {
     }
 
     pub fn set_reg_alias(&mut self, from: Reg, to: Reg) {
-        let from = from.into();
-        let resolved_to = self.resolve_alias(to.into());
+        let from = from
+            .to_virtual_reg()
+            .expect("register alias source must be a virtual register");
+        let to = to
+            .to_virtual_reg()
+            .expect("register alias target must be a virtual register");
+        let from_ty = *self
+            .vreg_types
+            .get(from.vreg())
+            .expect("register alias source must be allocated by this allocator");
+        let resolved_to = self.resolve_alias(to);
+        let to_ty = *self
+            .vreg_types
+            .get(resolved_to.vreg())
+            .expect("register alias target must be allocated by this allocator");
 
-        assert_ne!(from, resolved_to);
+        assert_ne!(from, resolved_to, "register alias would form a cycle");
+        assert_eq!(
+            from_ty, to_ty,
+            "register aliases must have identical lowered types"
+        );
+        assert!(
+            !self.vreg_alias.contains_key(&from),
+            "register alias source was already assigned"
+        );
 
-        let old_alias = self.vreg_alias.insert(from, resolved_to);
-        debug_assert_eq!(old_alias, None);
+        self.vreg_alias.insert(from, resolved_to);
     }
 
     pub fn resolve_alias(&self, mut vreg: VReg) -> VReg {
-        while let Some(alias) = self.vreg_alias.get(&vreg) {
+        for _ in 0..=self.vreg_alias.len() {
+            let Some(alias) = self.vreg_alias.get(&vreg) else {
+                return vreg;
+            };
             vreg = *alias;
         }
-        vreg
+        panic!("register alias graph contains a cycle")
     }
 
     #[inline]

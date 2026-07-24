@@ -2,7 +2,7 @@ use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind as HirTypeKind,
 use smallvec::smallvec;
 
 use crate::{
-    abi::{ABIMachineSpec, ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
+    abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::LoweredBlock,
     libcall::LibCall,
     lower::{CodegenError, LowerBackend, LowerContext},
@@ -11,9 +11,9 @@ use crate::{
     register::Writable,
     riscv64::{
         abi::{DEFAULT_CLOBBERS, Riscv64ABI},
-        instructions::{AMode, AluRRImm12OP, AluRRROP, FpuRRROP, Imm12, LoadOP, MInst, StoreOP},
+        instructions::{AMode, AluRRROP, Imm12, LoadOP, MInst, StoreOP},
         labels::Label,
-        regs::{ARG_REG, FARG_REG, a0, a1, a2, fa0, fp_reg, preg_name, stack_reg, zero_reg},
+        regs::{a0, a1, a2, fa0, fp_reg, preg_name, stack_reg, zero_reg},
     },
     types::LoweredType,
 };
@@ -716,62 +716,32 @@ impl LowerBackend for Riscv64Backend {
                 }
             }
             raana_ir::ir::InstKind::Call(call) => {
-                use raana_ir::ir::TypeKind;
                 let args = call.args();
                 let callee = call.callee();
 
-                let mut outgoing_arg_size = 0usize;
+                let types: Vec<_> = args
+                    .iter()
+                    .map(|&arg| ctx.arena.inst_data(arg).ty().clone())
+                    .collect();
+                let layout = Riscv64ABI::arg_layout(&types);
                 let mut call_arg_pairs = smallvec![];
-                let mut int_arg_idx = 0;
-                let mut float_arg_idx = 0;
-                for &arg in args {
+                for (&arg, location) in args.iter().zip(layout.locations) {
                     let arg_reg = ctx.put_value_in_reg(arg);
-                    let arg_ty = ctx.arena.inst_data(arg).ty().clone();
-                    let m_type: LoweredType = arg_ty.clone().into();
-                    match arg_ty.kind() {
-                        TypeKind::Int32 | TypeKind::Pointer(_) => {
-                            if int_arg_idx < 8 {
-                                call_arg_pairs.push(CallArgPair {
-                                    vreg: arg_reg,
-                                    preg: ARG_REG[int_arg_idx],
-                                });
-                                int_arg_idx += 1;
-                            } else {
-                                let op: StoreOP = m_type.into();
-                                let addr = normalize_amode(
-                                    &AMode::OutgoingArg(outgoing_arg_size as i64),
-                                    ctx,
-                                );
-                                ctx.emit(MInst::StoreWord {
-                                    rs: arg_reg,
-                                    op,
-                                    addr,
-                                });
-                                outgoing_arg_size += arg_ty.size();
-                            }
+                    match location {
+                        crate::riscv64::abi::RiscvArgLoc::Reg { reg, .. } => {
+                            call_arg_pairs.push(CallArgPair {
+                                vreg: arg_reg,
+                                preg: reg,
+                            });
                         }
-                        TypeKind::Float32 => {
-                            if float_arg_idx < 8 {
-                                call_arg_pairs.push(CallArgPair {
-                                    vreg: arg_reg,
-                                    preg: FARG_REG[float_arg_idx],
-                                });
-                                float_arg_idx += 1;
-                            } else {
-                                let op: StoreOP = m_type.into();
-                                let addr = normalize_amode(
-                                    &AMode::OutgoingArg(outgoing_arg_size as i64),
-                                    ctx,
-                                );
-                                ctx.emit(MInst::StoreWord {
-                                    rs: arg_reg,
-                                    op,
-                                    addr,
-                                });
-                                outgoing_arg_size += arg_ty.size();
-                            }
+                        crate::riscv64::abi::RiscvArgLoc::Stack { offset, ty, .. } => {
+                            let addr = normalize_amode(&AMode::OutgoingArg(offset), ctx);
+                            ctx.emit(MInst::StoreWord {
+                                rs: arg_reg,
+                                op: LoweredType::from(ty).into(),
+                                addr,
+                            });
                         }
-                        _ => unreachable!("unexpected call argument type: {:?}", arg_ty.kind()),
                     }
                 }
                 let ret_arg_pair = match inst_data.ty().kind() {
@@ -793,7 +763,10 @@ impl LowerBackend for Riscv64Backend {
                     label: Label::Function(callee),
                 });
                 ctx.vcode.vcode.abi.set_has_calls();
-                ctx.vcode.vcode.abi.set_outgoing_arg_size(outgoing_arg_size);
+                ctx.vcode
+                    .vcode
+                    .abi
+                    .set_outgoing_arg_size(layout.stack_size as usize);
             }
             raana_ir::ir::InstKind::Return(ret) => {
                 if let Some(val) = ret.value() {

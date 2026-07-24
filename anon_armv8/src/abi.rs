@@ -177,6 +177,51 @@ impl ABIMachineSpec for AArch64Abi {
         (slots, stack_offset)
     }
 
+    fn compute_call_arg_loc(types: &[taki_mir::prelude::HirType]) -> (Vec<ArgSlot>, u32) {
+        use raana_ir::ir::TypeKind;
+
+        let mut slots = Vec::new();
+        let (mut int_index, mut float_index, mut stack_offset) = (0usize, 0usize, 0u32);
+        for ty in types {
+            let reg = match ty.kind() {
+                TypeKind::Float32 if float_index < regs::FLOAT_ARG_REGS.len() => {
+                    let reg = regs::FLOAT_ARG_REGS[float_index];
+                    float_index += 1;
+                    Some(reg)
+                }
+                TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String
+                    if int_index < regs::INT_ARG_REGS.len() =>
+                {
+                    let reg = regs::INT_ARG_REGS[int_index];
+                    int_index += 1;
+                    Some(reg)
+                }
+                TypeKind::Float32 => {
+                    float_index += 1;
+                    None
+                }
+                TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => {
+                    int_index += 1;
+                    None
+                }
+                _ => unreachable!("non-scalar AAPCS64 parameter: {:?}", ty.kind()),
+            };
+            if let Some(reg) = reg {
+                slots.push(ArgSlot::Reg {
+                    reg: reg.to_physical_reg().unwrap(),
+                    ty: ty.clone(),
+                });
+            } else {
+                slots.push(ArgSlot::Stack {
+                    offset: i64::from(stack_offset),
+                    ty: ty.clone(),
+                });
+                stack_offset += 8;
+            }
+        }
+        (slots, stack_offset)
+    }
+
     fn get_machine_env() -> &'static MachineEnv {
         regs::machine_env()
     }

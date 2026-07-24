@@ -132,6 +132,11 @@ pub trait ABIMachineSpec {
 
     fn compute_arg_loc(arena: ArenaContext<'_>) -> (Vec<ArgSlot>, u32);
 
+    /// Assign locations for a call signature using the same convention as
+    /// incoming function parameters. The returned size includes ABI-required
+    /// padding for the complete outgoing argument area.
+    fn compute_call_arg_loc(types: &[HirType]) -> (Vec<ArgSlot>, u32);
+
     fn get_machine_env() -> &'static MachineEnv;
 
     fn gen_prologue_frame_setup(frame: &FrameLayout) -> SmallVec<[Self::I; 16]>;

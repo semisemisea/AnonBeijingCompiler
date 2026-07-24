@@ -4,6 +4,7 @@ use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind, arena::Arena};
 use taki_mir::{
     abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::{LoweredBlock, MirBlockIndex},
+    libcall::LibCall,
     lower::{CodegenError, LowerBackend, LowerContext},
     prelude::HirFunctionData,
     reg_alloc::reg::PReg,
@@ -444,6 +445,59 @@ impl LowerBackend for AArch64Backend {
                 });
             }
             InstKind::Store(store) => lower_store(ctx, store.src(), store.dest()),
+            InstKind::MemZero(mem_zero) => {
+                let alloc = matches!(ctx.arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
+                    .then_some(mem_zero.dest());
+                let (dest, stack_offset) = if let Some(alloc) = alloc {
+                    let pointee = ctx.arena.inst_data(alloc).ty().derefernce();
+                    let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
+                    (
+                        ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
+                        Some(offset),
+                    )
+                } else {
+                    (ctx.put_value_in_reg(mem_zero.dest()), None)
+                };
+                let zero = ctx.alloc_tmp(HirType::get_i32());
+                let byte_len = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+                if let Some(offset) = stack_offset {
+                    ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
+                        StackAMode::Slot(offset),
+                        Writable::from_reg(dest),
+                    ));
+                }
+                ctx.emit(MInst::LoadImm {
+                    size: OperandSize::Size32,
+                    dst: Writable::from_reg(zero),
+                    value: 0,
+                });
+                ctx.emit(MInst::LoadImm {
+                    size: OperandSize::Size64,
+                    dst: Writable::from_reg(byte_len),
+                    value: mem_zero.byte_len() as u64,
+                });
+                ctx.emit(MInst::Call {
+                    args: vec![
+                        CallArgPair {
+                            vreg: dest,
+                            preg: regs::INT_ARG_REGS[0],
+                        },
+                        CallArgPair {
+                            vreg: zero,
+                            preg: regs::INT_ARG_REGS[1],
+                        },
+                        CallArgPair {
+                            vreg: byte_len,
+                            preg: regs::INT_ARG_REGS[2],
+                        },
+                    ],
+                    ret: None,
+                    clobbers: regs::DEFAULT_CLOBBERS,
+                    label: Label::libcall(LibCall::Memset),
+                });
+                ctx.vcode.vcode.abi.set_has_calls();
+                ctx.vcode.vcode.abi.set_outgoing_arg_size(0);
+            }
             InstKind::ZeroInit => unreachable!("zero initialization is lowered by its store"),
             InstKind::Call(call) => {
                 let mut args = Vec::new();

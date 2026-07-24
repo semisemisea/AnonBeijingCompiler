@@ -68,6 +68,10 @@ impl<B: LowerBackend> EmitContext for AsmWriter<'_, B> {
             write!(self, "<gv>")
         }
     }
+
+    fn write_external_symbol(&mut self, symbol: &str) -> core::fmt::Result {
+        write!(self, "{symbol}")
+    }
 }
 
 impl<B: LowerBackend> AsmWriter<'_, B> {

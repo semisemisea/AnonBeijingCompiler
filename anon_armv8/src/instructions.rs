@@ -1888,6 +1888,8 @@ fn is_logical_immediate(value: u64, size: OperandSize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use core::fmt::Write;
+
     use taki_mir::{
         block_order::MirBlockIndex,
         prelude::{HirFunction, HirInst},
@@ -1919,6 +1921,10 @@ mod tests {
 
         fn write_function_label(&mut self, _func: HirFunction) -> core::fmt::Result {
             unreachable!("select pseudo has no labels")
+        }
+
+        fn write_external_symbol(&mut self, symbol: &str) -> core::fmt::Result {
+            write!(self, "{symbol}")
         }
 
         fn write_global_label(&mut self, _global: HirInst) -> core::fmt::Result {

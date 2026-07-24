@@ -183,7 +183,9 @@ test-image: .docker-image
 	date '+%Y-%m-%dT%H:%M%z' > .docker-image
 
 test-compiler:
-	$(CARGO_TARGET_LINKER) cargo build -p soyo_compiler --release --target "$(MUSL_TARGET)" --target-dir "$(HOST_TARGET_DIR)" --quiet
+	@echo "Building soyo_compiler..."
+	@$(CARGO_TARGET_LINKER) cargo build -p soyo_compiler --release --target "$(MUSL_TARGET)" --target-dir "$(HOST_TARGET_DIR)" --quiet >/dev/null 2>&1
+	@echo "Built soyo_compiler at $(COMPILER)"
 
 build-lib: .docker-image
 	$(DOCKER) run --rm -u "$$(id -u):$$(id -g)" \

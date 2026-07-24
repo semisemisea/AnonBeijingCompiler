@@ -7,11 +7,6 @@ historical measurements belong in commits, tests, or dedicated documentation.
 
 ### Scope And Non-Goals
 
-- [ ] Preserve the sole pipeline: SysY -> RaanaIR -> generic VCode -> register
-  allocation -> target ABI frame finalization -> GNU assembly.
-- [ ] Keep target-specific production code in
-  `anon_armv8/src/{abi,constants,instructions,labels,lower,regs}.rs`; retain
-  generic allocation, frame, and emission ownership in `taki_mir`.
 - [ ] Port regalloc2 0.15.1 Ion into `taki_mir`; do not retain a permanent
   external compatibility wrapper, a second production allocator, a fallback path,
   or a user-facing allocator selection flag.
@@ -24,95 +19,6 @@ historical measurements belong in commits, tests, or dedicated documentation.
 - [ ] Use `h_functional/29_long_line.sy -O1` as the allocator stress benchmark.
   Attribute edge-copy/frame improvements to register allocation separately from
   CFG cleanup, if-conversion, boolean simplification, and arithmetic lowering.
-
-### Phase 1: Stabilize Spill Correctness
-
-#### Regression Coverage
-
-- [ ] Add deterministic integer, f32, and pointer-width spill fixtures with
-  values live across calls, loops, and merge/block-parameter edges.
-- [ ] Add synthetic VCode tests for a parameterized jump, diamond merge,
-  parameterized and non-parameterized critical edges, repeated successor edges,
-  loop backedges, mixed integer/float parameters, and branch-defined edge values.
-- [ ] Add semantic parallel-copy tests for register/register, register/stack, and
-  stack/register moves; two-way and three-way cycles; no-free-scratch handling;
-  and temporary spill slots. Test resulting values, not only edit order.
-- [ ] Add end-to-end cases combining local stack objects, outgoing arguments,
-  register-argument backing slots, callee saves, and allocator spills. Include
-  large frames that require AArch64 and RISC-V offset legalization.
-- [ ] Run all spill fixtures at `-O0` and `-O1`. Capture the current baseline:
-  logical spill units, spill/frame bytes, edits by kind, `ldr`/`str`, static
-  instruction count, and allocation time.
-
-#### Logical Spill-Unit Contract
-
-- [ ] Define `SpillSlot` and `Output::num_spillslots` as logical allocator units.
-  Convert units to bytes only in target ABI/frame code.
-- [ ] Change `Function::spillslot_size(RegClass)` in
-  `taki_mir/src/reg_alloc/function.rs` to return logical units. Current `Int` and
-  `Float` values require one unit; vectors remain unsupported.
-- [ ] Add a distinct ABI/frame query for bytes per logical spill unit. Retain the
-  current eight-byte physical unit on AArch64 and RISC-V without returning `8`
-  from the allocator-facing query.
-- [ ] Update `taki_mir/src/vcode.rs`, `taki_mir/src/lib.rs`,
-  `taki_mir/src/emit.rs`, `anon_armv8/src/abi.rs`, and
-  `taki_mir/src/riscv64/abi.rs` together so slot counts, frame size, and emitted
-  offsets cannot mix logical units with bytes.
-- [ ] Use checked arithmetic for spill-slot alignment, frame size, and byte
-  offsets; report an explicit compilation error instead of wrapping.
-- [ ] Reject vector spill allocations and edits explicitly until vector register
-  allocation and multi-unit target moves exist.
-
-#### Slot Allocation And Frame Layout
-
-- [ ] Make `Stack::allocstack()` allocate and align by
-  `Function::spillslot_size(class)`, including the named-first/named-last policy
-  for multi-unit slots if added to the local function contract.
-- [ ] Route parallel-copy temporary slots through the same class-aware allocator;
-  remove direct `num_spillslots += 1` allocation in `process_branch()`.
-- [ ] Add unit tests for size-one and synthetic size-two slots, alignment holes,
-  mixed-size allocation, returned slot naming, and temporary-copy slots.
-- [ ] Centralize allocator spill addressing with frame helpers equivalent to
-  `spill_base_bytes()`, `spill_slot_offset(slot)`, and `spill_region_end()`.
-- [ ] Preserve and document the post-prologue layout: outgoing arguments, normal
-  ABI/HIR stack objects, allocator spills, callee saves, and setup area.
-- [ ] Assert that every spill access stays within the spill region; regions do not
-  overlap; and final frame size satisfies target alignment.
-- [ ] Test zero/one/multiple spills, alignment padding, coexisting stack regions,
-  and the first out-of-range target load/store offset.
-
-#### Edit Semantics And Verification
-
-- [ ] Define `Output.edits` in runtime execution order by `ProgPoint`, including
-  a deterministic order for edits at the same point. Remove implicit dependence
-  on reverse scans and repeated vector reversal.
-- [ ] Verify scratch preservation for stack-to-stack copies and parallel-copy
-  cycles; a borrowed scratch register must be saved before its live value is
-  destroyed and restored afterwards.
-- [ ] Document and test edit width semantics: Int copies preserve a full
-  eight-byte unit, Float spills/reloads use F32 instructions at eight-byte-strided
-  slots, stack-to-stack copies preserve a complete unit, and cross-class edits
-  are rejected.
-- [ ] Add an allocator-independent verifier before
-  `VCodeContainer::write_back_allocs` that checks allocation arity/order,
-  constraints, register classes, fixed/reuse operands, clobber conflicts, edit
-  points/order, and spill-slot bounds.
-- [ ] Include function, instruction, operand, constraint, allocation, program
-  point, and edit context in verifier failures.
-- [ ] Keep post-writeback VCode verification and add tests for malformed allocator
-  output as well as valid outputs from the current allocator.
-
-#### Phase-1 Exit Criteria
-
-- [ ] Pass new spill tests and focused functional cases
-  `functional/92_register_alloc.sy`, `functional/93_nested_calls.sy`, and
-  `functional/94_nested_loops.sy` at `-O0` and `-O1`.
-- [ ] Pass `cargo test -p taki_mir`, `cargo test -p anon_armv8`,
-  `cargo test --workspace`, and `cargo build -p soyo_compiler`.
-- [ ] Run `cargo fmt --check` and `git diff --check`; document any external tool
-  failure separately from compiler failures.
-- [ ] Freeze Phase-1 metrics as the Ion baseline. Do not require this phase to
-  reduce block-parameter stack traffic.
 
 ### Phase 2: Make VCode Valid Ion Input
 
@@ -155,8 +61,7 @@ historical measurements belong in commits, tests, or dedicated documentation.
 
 - [ ] Run the strict validator on every VCode function reached by unit tests,
   focused functional tests, and `make test`.
-- [ ] Keep the current allocator operational until all Phase-1 spill regressions
-  and Phase-2 validation pass together.
+- [ ] Keep the current allocator operational until Phase-2 validation passes.
 
 ### Phase 3: Port And Enable Ion
 

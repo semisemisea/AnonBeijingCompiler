@@ -1,11 +1,14 @@
 //! AArch64 selection from Raana HIR into generic VCode.
 
-use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind, arena::Arena};
+use raana_ir::ir::{
+    Binary, BinaryOp, Call, Cast, GetElemPtr, InstKind, Load, Return, Select, Store, Type as HirType,
+    TypeKind, arena::Arena, inst_kind::MemZero,
+};
 use taki_mir::{
     abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::{LoweredBlock, MirBlockIndex},
     lower::{LowerBackend, LowerContext, LoweredOutput},
-    prelude::HirFunctionData,
+    prelude::{ArenaContext, HirFunctionData, HirInst},
     reg_alloc::reg::PReg,
     register::Writable,
     vcode::MachInst,
@@ -24,15 +27,773 @@ use crate::{
 
 pub struct AArch64Backend;
 
+fn lower_binary(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    binary: &Binary,
+) -> LoweredOutput {
+    let result = ctx.result_reg(inst);
+    let dst = Writable::from_reg(result);
+    if matches!(arena.inst_data(binary.lhs()).ty().kind(), TypeKind::Float32) {
+        let lhs = ctx.put_value_in_reg(binary.lhs());
+        let rhs = ctx.put_value_in_reg(binary.rhs());
+        match binary.op() {
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+                ctx.emit(MInst::FAlu {
+                    op: float_alu_op(binary.op()),
+                    dst,
+                    lhs,
+                    rhs,
+                });
+            }
+            BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Gt
+            | BinaryOp::Lt
+            | BinaryOp::Ge
+            | BinaryOp::Le => {
+                ctx.emit(MInst::FCmp { lhs, rhs });
+                ctx.emit(MInst::CSet {
+                    cond: float_comparison_cond(binary.op()),
+                    dst,
+                });
+            }
+            op => {
+                ctx.lowering_panic(
+                    "AArch64 instruction selection",
+                    format!("floating binary operation {op:?} is unsupported"),
+                    Some(arena.inst_data(binary.lhs()).ty()),
+                    Some(arena.inst_data(inst).ty()),
+                );
+            }
+        }
+        return LoweredOutput::Value(result);
+    }
+    let size = operand_size(arena.inst_data(binary.lhs()).ty().kind());
+    if let Some((op, lhs, rhs, addend)) = fold_mul_add_sub(
+        ctx,
+        arena,
+        inst,
+        binary.op(),
+        binary.lhs(),
+        binary.rhs(),
+        size,
+    ) {
+        match op {
+            BinaryOp::Add => ctx.emit(MInst::MAdd {
+                size,
+                dst,
+                lhs,
+                rhs,
+                addend,
+            }),
+            BinaryOp::Sub => ctx.emit(MInst::MSub {
+                size,
+                dst,
+                lhs,
+                rhs,
+                subtrahend: addend,
+            }),
+            _ => unreachable!("multiply-accumulate folding only selects add or sub"),
+        }
+        return LoweredOutput::Value(result);
+    }
+    let lhs = ctx.put_value_in_reg(binary.lhs());
+    let rhs_imm = integer_constant(arena, binary.rhs());
+
+    if binary.op() == BinaryOp::Div && rhs_imm == Some(1) {
+        return LoweredOutput::Value(lhs);
+    }
+
+    if matches!(arena.inst_data(inst).ty().kind(), TypeKind::Int32)
+        && matches!(binary.op(), BinaryOp::Div | BinaryOp::Rem)
+        && rhs_imm.is_some_and(|divisor| {
+            lower_signed_div_rem_power_of_two(ctx, binary.op(), dst, lhs, divisor)
+        })
+    {
+        return LoweredOutput::Value(result);
+    }
+
+    match binary.op() {
+        BinaryOp::Add | BinaryOp::Sub => {
+            if binary.op() == BinaryOp::Add && integer_constant(arena, binary.lhs()) == Some(0) {
+                let rhs = ctx.put_value_in_reg(binary.rhs());
+                ctx.emit(MInst::Mov {
+                    size,
+                    dst,
+                    src: rhs,
+                });
+            } else if rhs_imm == Some(0) {
+                ctx.emit(MInst::Mov {
+                    size,
+                    dst,
+                    src: lhs,
+                });
+            } else if binary.op() == BinaryOp::Sub
+                && integer_constant(arena, binary.lhs()) == Some(0)
+            {
+                let rhs = ctx.put_value_in_reg(binary.rhs());
+                ctx.emit(MInst::AluRRR {
+                    op: AluOp::Sub,
+                    size,
+                    dst,
+                    lhs: RegOrZr::Zr,
+                    rhs: RegOrZr::Reg(rhs),
+                });
+            } else if let Some((op, imm)) = add_sub_immediate(binary.op(), rhs_imm) {
+                ctx.emit(MInst::AluRRImm12 {
+                    op,
+                    size,
+                    dst,
+                    src: Gpr::Reg(lhs),
+                    imm,
+                });
+            } else if let Some((rhs, shift, amount)) =
+                fold_shifted_rhs(ctx, arena, inst, binary.rhs(), size)
+            {
+                ctx.emit(MInst::AluRRRShift {
+                    op: alu_op(binary.op()),
+                    size,
+                    dst,
+                    lhs: RegOrZr::Reg(lhs),
+                    rhs: RegOrZr::Reg(rhs),
+                    shift,
+                    amount,
+                });
+            } else {
+                let rhs = ctx.put_value_in_reg(binary.rhs());
+                ctx.emit(MInst::AluRRR {
+                    op: alu_op(binary.op()),
+                    size,
+                    dst,
+                    lhs: RegOrZr::Reg(lhs),
+                    rhs: RegOrZr::Reg(rhs),
+                });
+            }
+        }
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
+            let lhs_imm = integer_constant(arena, binary.lhs());
+            if binary.op() == BinaryOp::And && (lhs_imm == Some(0) || rhs_imm == Some(0)) {
+                ctx.emit(MInst::MovFromZero { size, dst });
+            } else if matches!(binary.op(), BinaryOp::Or | BinaryOp::Xor) && lhs_imm == Some(0) {
+                let rhs = ctx.put_value_in_reg(binary.rhs());
+                ctx.emit(MInst::Mov {
+                    size,
+                    dst,
+                    src: rhs,
+                });
+            } else if matches!(binary.op(), BinaryOp::Or | BinaryOp::Xor) && rhs_imm == Some(0) {
+                ctx.emit(MInst::Mov {
+                    size,
+                    dst,
+                    src: lhs,
+                });
+            } else if let Some(imm) =
+                rhs_imm.and_then(|value| ImmLogic::new(integer_bits(value, size), size))
+            {
+                ctx.emit(MInst::AluRRImmLogic {
+                    op: alu_op(binary.op()),
+                    size,
+                    dst,
+                    src: RegOrZr::Reg(lhs),
+                    imm,
+                });
+            } else if let Some((rhs, shift, amount)) =
+                fold_shifted_rhs(ctx, arena, inst, binary.rhs(), size)
+            {
+                ctx.emit(MInst::AluRRRShift {
+                    op: alu_op(binary.op()),
+                    size,
+                    dst,
+                    lhs: RegOrZr::Reg(lhs),
+                    rhs: RegOrZr::Reg(rhs),
+                    shift,
+                    amount,
+                });
+            } else {
+                let rhs = ctx.put_value_in_reg(binary.rhs());
+                ctx.emit(MInst::AluRRR {
+                    op: alu_op(binary.op()),
+                    size,
+                    dst,
+                    lhs: RegOrZr::Reg(lhs),
+                    rhs: RegOrZr::Reg(rhs),
+                });
+            }
+        }
+        BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Sar => {
+            if let Some(shift) = rhs_imm
+                .and_then(|value| u8::try_from(value).ok())
+                .and_then(|value| ImmShift::new(value, size))
+            {
+                ctx.emit(MInst::AluRRImmShift {
+                    op: alu_op(binary.op()),
+                    size,
+                    dst,
+                    src: lhs,
+                    shift,
+                });
+            } else {
+                let rhs = ctx.put_value_in_reg(binary.rhs());
+                ctx.emit(MInst::AluRRR {
+                    op: alu_op(binary.op()),
+                    size,
+                    dst,
+                    lhs: RegOrZr::Reg(lhs),
+                    rhs: RegOrZr::Reg(rhs),
+                });
+            }
+        }
+        BinaryOp::Mul => {
+            let rhs = ctx.put_value_in_reg(binary.rhs());
+            ctx.emit(MInst::AluRRR {
+                op: alu_op(binary.op()),
+                size,
+                dst,
+                lhs: RegOrZr::Reg(lhs),
+                rhs: RegOrZr::Reg(rhs),
+            });
+        }
+        BinaryOp::Div => {
+            let rhs = ctx.put_value_in_reg(binary.rhs());
+            ctx.emit(MInst::SDiv {
+                size,
+                dst,
+                lhs,
+                rhs,
+            });
+        }
+        BinaryOp::Rem => {
+            let quotient = ctx.alloc_tmp(HirType::get_i32());
+            let rhs = ctx.put_value_in_reg(binary.rhs());
+            ctx.emit(MInst::SDiv {
+                size,
+                dst: Writable::from_reg(quotient),
+                lhs,
+                rhs,
+            });
+            ctx.emit(MInst::MSub {
+                size,
+                dst,
+                lhs: quotient,
+                rhs,
+                subtrahend: lhs,
+            });
+        }
+        BinaryOp::Eq
+        | BinaryOp::NotEq
+        | BinaryOp::Gt
+        | BinaryOp::Lt
+        | BinaryOp::Ge
+        | BinaryOp::Le => {
+            if let Some(imm) = rhs_imm.and_then(positive_imm12) {
+                ctx.emit(MInst::CmpImm { size, lhs, imm });
+            } else {
+                let rhs = ctx.put_value_in_reg(binary.rhs());
+                ctx.emit(MInst::CmpRR {
+                    size,
+                    lhs,
+                    rhs: RegOrZr::Reg(rhs),
+                });
+            }
+            ctx.emit(MInst::CSet {
+                cond: comparison_cond(binary.op()),
+                dst,
+            });
+        }
+    }
+    LoweredOutput::Value(result)
+}
+
+fn lower_cast(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    cast: &Cast,
+) -> LoweredOutput {
+    let src = cast.src();
+    let src_ty = arena.inst_data(src).ty().kind();
+    let dst_ty = arena.inst_data(inst).ty().kind();
+    let result = ctx.result_reg(inst);
+    let dst = Writable::from_reg(result);
+    let src_reg = ctx.put_value_in_reg(src);
+    match (src_ty, dst_ty) {
+        (TypeKind::Int32, TypeKind::Float32) => ctx.emit(MInst::Scvtf { dst, src: src_reg }),
+        (TypeKind::Float32, TypeKind::Int32) => ctx.emit(MInst::Fcvtzs { dst, src: src_reg }),
+        (src_ty, dst_ty) => {
+            ctx.lowering_panic(
+                "AArch64 instruction selection",
+                format!("cast from {src_ty:?} to {dst_ty:?} is unsupported"),
+                Some(arena.inst_data(src).ty()),
+                Some(arena.inst_data(inst).ty()),
+            );
+        }
+    }
+    LoweredOutput::Value(result)
+}
+
+fn lower_alloc(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+) -> LoweredOutput {
+    let result = ctx.result_reg(inst);
+    let dst = Writable::from_reg(result);
+    let pointee = arena.inst_data(inst).ty().derefernce();
+    let offset = i64::from(ctx.alloc_stackslot_or_get(inst, pointee));
+    ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
+        StackAMode::Slot(offset),
+        dst,
+    ));
+    LoweredOutput::Value(result)
+}
+
+fn lower_get_elem_ptr(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    gep: &GetElemPtr,
+) -> LoweredOutput {
+    let result = ctx.result_reg(inst);
+    let dst = Writable::from_reg(result);
+    let mut current_ty = arena.inst_data(gep.base()).ty().clone();
+    let mut address = ctx.put_value_in_reg(gep.base());
+
+    for &index in gep.offsets() {
+        let element_ty = if current_ty.is_pointer() {
+            current_ty.derefernce()
+        } else {
+            current_ty.get_array_elem_ty()
+        };
+        let stride = element_ty.size() as i64;
+        current_ty = element_ty;
+
+        if let Some(value) = integer_constant(arena, index) {
+            let byte_offset = i64::from(value) * stride;
+            let next = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+            emit_add_offset(ctx, Writable::from_reg(next), address, byte_offset);
+            address = next;
+        } else {
+            if let Some(shift) = stride_shift(stride) {
+                let next = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+                let index = ctx.put_value_in_reg(index);
+                ctx.emit(MInst::AluRRRExtend {
+                    op: AluOp::Add,
+                    size: OperandSize::Size64,
+                    dst: Writable::from_reg(next),
+                    lhs: Gpr::Reg(address),
+                    rhs: index,
+                    extend: ExtendOp::Sxtw,
+                    shift,
+                });
+                address = next;
+                continue;
+            }
+            // Indices are i32 in Raana IR. Sign-extend before the
+            // multiply so negative indices retain GEP semantics.
+            let extended = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+            ctx.emit(MInst::MovFromZero {
+                size: OperandSize::Size64,
+                dst: Writable::from_reg(extended),
+            });
+            let index = ctx.put_value_in_reg(index);
+            ctx.emit(MInst::AluRRRExtend {
+                op: AluOp::Add,
+                size: OperandSize::Size64,
+                dst: Writable::from_reg(extended),
+                lhs: Gpr::Reg(extended),
+                rhs: index,
+                extend: ExtendOp::Sxtw,
+                shift: 0,
+            });
+            let byte_offset = if stride == 1 {
+                extended
+            } else {
+                let scale = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+                ctx.emit(MInst::LoadImm {
+                    size: OperandSize::Size64,
+                    dst: Writable::from_reg(scale),
+                    value: stride as u64,
+                });
+                let product = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+                ctx.emit(MInst::AluRRR {
+                    op: AluOp::Mul,
+                    size: OperandSize::Size64,
+                    dst: Writable::from_reg(product),
+                    lhs: RegOrZr::Reg(extended),
+                    rhs: RegOrZr::Reg(scale),
+                });
+                product
+            };
+            let next = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+            ctx.emit(MInst::AluRRR {
+                op: AluOp::Add,
+                size: OperandSize::Size64,
+                dst: Writable::from_reg(next),
+                lhs: RegOrZr::Reg(address),
+                rhs: RegOrZr::Reg(byte_offset),
+            });
+            address = next;
+        }
+    }
+    assert_eq!(&current_ty.reference(), arena.inst_data(inst).ty());
+    ctx.emit(MInst::Mov {
+        size: OperandSize::Size64,
+        dst,
+        src: address,
+    });
+    LoweredOutput::Value(result)
+}
+
+fn lower_load(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    load: &Load,
+) -> LoweredOutput {
+    let result = ctx.result_reg(inst);
+    let dst = Writable::from_reg(result);
+    let src = ctx.put_value_in_reg(load.src());
+    ctx.emit(MInst::Load {
+        ty: memory_type(arena.inst_data(inst).ty().kind()),
+        dst,
+        addr: AMode::Reg {
+            base: Gpr::Reg(src),
+        },
+    });
+    LoweredOutput::Value(result)
+}
+
+fn lower_select(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    select: &Select,
+) -> LoweredOutput {
+    let result_ty = arena.inst_data(inst).ty().kind();
+    if !matches!(
+        result_ty,
+        TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String | TypeKind::Float32
+    ) {
+        ctx.lowering_panic(
+            "AArch64 instruction selection",
+            format!("select result type {result_ty:?} is unsupported"),
+            Some(arena.inst_data(select.cond()).ty()),
+            Some(arena.inst_data(inst).ty()),
+        );
+    }
+
+    let condition = select_comparison(ctx, arena, inst, select);
+    let (cmp, cond) = if let Some((binary, invert)) = condition {
+        let lhs_ty = arena.inst_data(binary.lhs()).ty().kind();
+        if matches!(lhs_ty, TypeKind::Float32) {
+            let cond = if invert {
+                invert_float_comparison_cond(binary.op())
+            } else {
+                float_comparison_cond(binary.op())
+            };
+            (
+                SelectCmp::Float {
+                    lhs: ctx.put_value_in_reg(binary.lhs()),
+                    rhs: ctx.put_value_in_reg(binary.rhs()),
+                },
+                cond,
+            )
+        } else {
+            let size = operand_size(lhs_ty);
+            let lhs = ctx.put_value_in_reg(binary.lhs());
+            let cmp = if let Some(imm) =
+                integer_constant(arena, binary.rhs()).and_then(positive_imm12)
+            {
+                SelectCmp::IntImm { size, lhs, imm }
+            } else {
+                SelectCmp::IntRR {
+                    size,
+                    lhs,
+                    rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
+                }
+            };
+            let cond = comparison_cond(binary.op());
+            (cmp, if invert { invert_cond(cond) } else { cond })
+        }
+    } else {
+        (
+            SelectCmp::IntImm {
+                size: OperandSize::Size32,
+                lhs: ctx.put_value_in_reg(select.cond()),
+                imm: Imm12::new(0, false).unwrap(),
+            },
+            Cond::Ne,
+        )
+    };
+
+    let result = ctx.result_reg(inst);
+    let dst = Writable::from_reg(result);
+    let true_constant = integer_constant(arena, select.if_true());
+    let false_constant = integer_constant(arena, select.if_false());
+    let (cond, value) = if matches!(result_ty, TypeKind::Int32)
+        && true_constant == Some(1)
+        && false_constant == Some(0)
+    {
+        (cond, SelectValue::Bool { dst })
+    } else if matches!(result_ty, TypeKind::Int32)
+        && true_constant == Some(0)
+        && false_constant == Some(1)
+    {
+        (invert_cond(cond), SelectValue::Bool { dst })
+    } else {
+        let if_true = ctx.put_value_in_reg(select.if_true());
+        let if_false = ctx.put_value_in_reg(select.if_false());
+        let value = match result_ty {
+            TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => SelectValue::Int {
+                size: operand_size(result_ty),
+                dst,
+                if_true,
+                if_false,
+            },
+            TypeKind::Float32 => SelectValue::Float {
+                dst,
+                if_true,
+                if_false,
+            },
+            _ => unreachable!("select result type checked above"),
+        };
+        (cond, value)
+    };
+
+    ctx.emit(MInst::CmpSelect { cmp, cond, value });
+    LoweredOutput::Value(result)
+}
+
+fn select_comparison(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    select: &Select,
+) -> Option<(Binary, bool)> {
+    let cond = select.cond();
+    if select.if_true() == cond || select.if_false() == cond || !has_only_user(ctx, cond, inst) {
+        return None;
+    }
+    let InstKind::Binary(outer) = arena.inst_data(cond).kind() else {
+        return None;
+    };
+
+    if is_comparison(outer.op()) {
+        if let Some((inner_inst, is_eq)) = zero_comparison(arena, outer) {
+            if let InstKind::Binary(inner) = arena.inst_data(inner_inst).kind() {
+                if is_comparison(inner.op())
+                    && has_only_user(ctx, inner_inst, cond)
+                    && ctx.sink_pure_single_use_chain(inner_inst, cond, inst)
+                {
+                    return Some((inner.clone(), is_eq));
+                }
+            }
+        }
+        if ctx.sink_pure_single_use_producer(cond, inst) {
+            return Some((outer.clone(), false));
+        }
+    }
+    None
+}
+
+fn lower_mem_zero(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    mem_zero: &MemZero,
+) -> LoweredOutput {
+    let inline_store_count = mem_zero.byte_len() / 4;
+    if runtime::mem_zero_is_inline(mem_zero.byte_len()) {
+        let alloc = matches!(arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
+            .then_some(mem_zero.dest());
+        let (dest, stack_offset) = if let Some(alloc) = alloc {
+            let pointee = arena.inst_data(alloc).ty().derefernce();
+            let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
+            (
+                ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
+                Some(offset),
+            )
+        } else {
+            (ctx.put_value_in_reg(mem_zero.dest()), None)
+        };
+        let zero = ctx.alloc_tmp(HirType::get_i32());
+        if let Some(offset) = stack_offset {
+            ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
+                StackAMode::Slot(offset),
+                Writable::from_reg(dest),
+            ));
+        }
+        ctx.emit(MInst::MovFromZero {
+            size: OperandSize::Size32,
+            dst: Writable::from_reg(zero),
+        });
+        for index in 0..inline_store_count {
+            emit_store_at(ctx, zero, &HirType::get_i32(), dest, (index * 4) as i64);
+        }
+        return LoweredOutput::None;
+    }
+
+    let alloc = matches!(arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
+        .then_some(mem_zero.dest());
+    let (dest, stack_offset) = if let Some(alloc) = alloc {
+        let pointee = arena.inst_data(alloc).ty().derefernce();
+        let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
+        (
+            ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
+            Some(offset),
+        )
+    } else {
+        (ctx.put_value_in_reg(mem_zero.dest()), None)
+    };
+    let byte_len = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+    if let Some(offset) = stack_offset {
+        ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
+            StackAMode::Slot(offset),
+            Writable::from_reg(dest),
+        ));
+    }
+    ctx.emit(MInst::LoadImm {
+        size: OperandSize::Size64,
+        dst: Writable::from_reg(byte_len),
+        value: mem_zero.byte_len() as u64,
+    });
+    ctx.emit(MInst::Call {
+        args: vec![
+            CallArgPair {
+                vreg: dest,
+                preg: regs::INT_ARG_REGS[0],
+            },
+            CallArgPair {
+                vreg: byte_len,
+                preg: regs::INT_ARG_REGS[1],
+            },
+        ],
+        ret: None,
+        clobbers: regs::DEFAULT_CLOBBERS,
+        label: Label::Embedded(EmbeddedSymbol::Memset),
+    });
+    ctx.vcode.vcode.abi.set_has_calls();
+    ctx.vcode.vcode.abi.set_outgoing_arg_size(0);
+    LoweredOutput::None
+}
+
+fn lower_call(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    call: &Call,
+) -> LoweredOutput {
+    let mut args = Vec::new();
+    let (mut int_index, mut float_index, mut stack_offset) = (0usize, 0usize, 0i64);
+    for &arg in call.args() {
+        let src = ctx.put_value_in_reg(arg);
+        match arena.inst_data(arg).ty().kind() {
+            TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => {
+                if let Some(&preg) = regs::INT_ARG_REGS.get(int_index) {
+                    args.push(CallArgPair { vreg: src, preg });
+                    int_index += 1;
+                } else {
+                    ctx.emit(MInst::Store {
+                        ty: memory_type(arena.inst_data(arg).ty().kind()),
+                        src,
+                        addr: AMode::OutgoingArg(stack_offset),
+                    });
+                    int_index += 1;
+                    stack_offset += 8;
+                }
+            }
+            TypeKind::Float32 => {
+                if let Some(&preg) = regs::FLOAT_ARG_REGS.get(float_index) {
+                    args.push(CallArgPair { vreg: src, preg });
+                    float_index += 1;
+                } else {
+                    ctx.emit(MInst::Store {
+                        ty: MemoryType::F32,
+                        src,
+                        addr: AMode::OutgoingArg(stack_offset),
+                    });
+                    float_index += 1;
+                    stack_offset += 8;
+                }
+            }
+            ty => {
+                ctx.lowering_panic(
+                    "AArch64 instruction selection",
+                    format!("call argument type {ty:?} is unsupported"),
+                    Some(arena.inst_data(arg).ty()),
+                    None,
+                );
+            }
+        }
+    }
+    let result = (!arena.inst_data(inst).ty().is_unit()).then(|| ctx.result_reg(inst));
+    let ret = match arena.inst_data(inst).ty().kind() {
+        TypeKind::Unit => None,
+        TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => Some(CallRetPair {
+            vreg: Writable::from_reg(result.unwrap()),
+            preg: regs::INT_RETURN_REG,
+        }),
+        TypeKind::Float32 => Some(CallRetPair {
+            vreg: Writable::from_reg(result.unwrap()),
+            preg: regs::FLOAT_RETURN_REG,
+        }),
+        ty => {
+            ctx.lowering_panic(
+                "AArch64 instruction selection",
+                format!("call return type {ty:?} is unsupported"),
+                None,
+                Some(arena.inst_data(inst).ty()),
+            );
+        }
+    };
+    ctx.emit(MInst::Call {
+        args,
+        ret,
+        clobbers: regs::DEFAULT_CLOBBERS,
+        label: Label::from_function(call.callee()),
+    });
+    ctx.vcode.vcode.abi.set_has_calls();
+    ctx.vcode
+        .vcode
+        .abi
+        .set_outgoing_arg_size(stack_offset as usize);
+    result.map_or(LoweredOutput::None, LoweredOutput::Value)
+}
+
+fn lower_return(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    ret: &Return,
+) -> LoweredOutput {
+    if let Some(value) = ret.value() {
+        let src = ctx.put_value_in_reg(value);
+        let preg = match arena.inst_data(value).ty().kind() {
+            TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => regs::INT_RETURN_REG,
+            TypeKind::Float32 => regs::FLOAT_RETURN_REG,
+            ty => {
+                ctx.lowering_panic(
+                    "AArch64 instruction selection",
+                    format!("return type {ty:?} is unsupported"),
+                    Some(arena.inst_data(value).ty()),
+                    None,
+                );
+            }
+        };
+        ctx.emit(MInst::RetVal {
+            pair: RetPair { vreg: src, preg },
+        });
+    }
+    ctx.emit(MInst::Ret);
+    LoweredOutput::None
+}
+
 impl LowerBackend for AArch64Backend {
     type MInst = MInst;
 
-    fn lower(
-        ctx: &mut LowerContext<Self::MInst>,
-        inst: raana_ir::opt::prelude::Inst,
-    ) -> LoweredOutput {
-        let kind = ctx.arena.inst_data(inst).kind().clone();
-        match kind {
+    fn lower(ctx: &mut LowerContext<Self::MInst>, inst: HirInst) -> LoweredOutput {
+        let arena = ctx.arena;
+        match arena.inst_data(inst).kind() {
             InstKind::BlockArgRef(..)
             | InstKind::FuncArgRef(..)
             | InstKind::Aggregate(..)
@@ -42,616 +803,17 @@ impl LowerBackend for AArch64Backend {
             | InstKind::Float(..) => {
                 unreachable!("constants and argument references are rematerialized by LowerContext")
             }
-            InstKind::Binary(binary) => {
-                let result = ctx.result_reg(inst);
-                let dst = Writable::from_reg(result);
-                if matches!(
-                    ctx.arena.inst_data(binary.lhs()).ty().kind(),
-                    TypeKind::Float32
-                ) {
-                    let lhs = ctx.put_value_in_reg(binary.lhs());
-                    let rhs = ctx.put_value_in_reg(binary.rhs());
-                    match binary.op() {
-                        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-                            ctx.emit(MInst::FAlu {
-                                op: float_alu_op(binary.op()),
-                                dst,
-                                lhs,
-                                rhs,
-                            });
-                        }
-                        BinaryOp::Eq
-                        | BinaryOp::NotEq
-                        | BinaryOp::Gt
-                        | BinaryOp::Lt
-                        | BinaryOp::Ge
-                        | BinaryOp::Le => {
-                            ctx.emit(MInst::FCmp { lhs, rhs });
-                            ctx.emit(MInst::CSet {
-                                cond: float_comparison_cond(binary.op()),
-                                dst,
-                            });
-                        }
-                        op => {
-                            ctx.lowering_panic(
-                                "AArch64 instruction selection",
-                                format!("floating binary operation {op:?} is unsupported"),
-                                Some(ctx.arena.inst_data(binary.lhs()).ty()),
-                                Some(ctx.arena.inst_data(inst).ty()),
-                            );
-                        }
-                    }
-                    return LoweredOutput::Value(result);
-                }
-                let size = operand_size(ctx.arena.inst_data(binary.lhs()).ty().kind());
-                if let Some((op, lhs, rhs, addend)) =
-                    fold_mul_add_sub(ctx, inst, binary.op(), binary.lhs(), binary.rhs(), size)
-                {
-                    match op {
-                        BinaryOp::Add => ctx.emit(MInst::MAdd {
-                            size,
-                            dst,
-                            lhs,
-                            rhs,
-                            addend,
-                        }),
-                        BinaryOp::Sub => ctx.emit(MInst::MSub {
-                            size,
-                            dst,
-                            lhs,
-                            rhs,
-                            subtrahend: addend,
-                        }),
-                        _ => unreachable!("multiply-accumulate folding only selects add or sub"),
-                    }
-                    return LoweredOutput::Value(result);
-                }
-                let lhs = ctx.put_value_in_reg(binary.lhs());
-                let rhs_imm = integer_constant(ctx, binary.rhs());
-
-                if binary.op() == BinaryOp::Div && rhs_imm == Some(1) {
-                    return LoweredOutput::Value(lhs);
-                }
-
-                if matches!(ctx.arena.inst_data(inst).ty().kind(), TypeKind::Int32)
-                    && matches!(binary.op(), BinaryOp::Div | BinaryOp::Rem)
-                    && rhs_imm.is_some_and(|divisor| {
-                        lower_signed_div_rem_power_of_two(ctx, binary.op(), dst, lhs, divisor)
-                    })
-                {
-                    return LoweredOutput::Value(result);
-                }
-
-                match binary.op() {
-                    BinaryOp::Add | BinaryOp::Sub => {
-                        if binary.op() == BinaryOp::Add
-                            && integer_constant(ctx, binary.lhs()) == Some(0)
-                        {
-                            let rhs = ctx.put_value_in_reg(binary.rhs());
-                            ctx.emit(MInst::Mov {
-                                size,
-                                dst,
-                                src: rhs,
-                            });
-                        } else if rhs_imm == Some(0) {
-                            ctx.emit(MInst::Mov {
-                                size,
-                                dst,
-                                src: lhs,
-                            });
-                        } else if binary.op() == BinaryOp::Sub
-                            && integer_constant(ctx, binary.lhs()) == Some(0)
-                        {
-                            let rhs = ctx.put_value_in_reg(binary.rhs());
-                            ctx.emit(MInst::AluRRR {
-                                op: AluOp::Sub,
-                                size,
-                                dst,
-                                lhs: RegOrZr::Zr,
-                                rhs: RegOrZr::Reg(rhs),
-                            });
-                        } else if let Some((op, imm)) = add_sub_immediate(binary.op(), rhs_imm) {
-                            ctx.emit(MInst::AluRRImm12 {
-                                op,
-                                size,
-                                dst,
-                                src: Gpr::Reg(lhs),
-                                imm,
-                            });
-                        } else if let Some((rhs, shift, amount)) =
-                            fold_shifted_rhs(ctx, inst, binary.rhs(), size)
-                        {
-                            ctx.emit(MInst::AluRRRShift {
-                                op: alu_op(binary.op()),
-                                size,
-                                dst,
-                                lhs: RegOrZr::Reg(lhs),
-                                rhs: RegOrZr::Reg(rhs),
-                                shift,
-                                amount,
-                            });
-                        } else {
-                            let rhs = ctx.put_value_in_reg(binary.rhs());
-                            ctx.emit(MInst::AluRRR {
-                                op: alu_op(binary.op()),
-                                size,
-                                dst,
-                                lhs: RegOrZr::Reg(lhs),
-                                rhs: RegOrZr::Reg(rhs),
-                            });
-                        }
-                    }
-                    BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
-                        let lhs_imm = integer_constant(ctx, binary.lhs());
-                        if binary.op() == BinaryOp::And
-                            && (lhs_imm == Some(0) || rhs_imm == Some(0))
-                        {
-                            ctx.emit(MInst::MovFromZero { size, dst });
-                        } else if matches!(binary.op(), BinaryOp::Or | BinaryOp::Xor)
-                            && lhs_imm == Some(0)
-                        {
-                            let rhs = ctx.put_value_in_reg(binary.rhs());
-                            ctx.emit(MInst::Mov {
-                                size,
-                                dst,
-                                src: rhs,
-                            });
-                        } else if matches!(binary.op(), BinaryOp::Or | BinaryOp::Xor)
-                            && rhs_imm == Some(0)
-                        {
-                            ctx.emit(MInst::Mov {
-                                size,
-                                dst,
-                                src: lhs,
-                            });
-                        } else if let Some(imm) =
-                            rhs_imm.and_then(|value| ImmLogic::new(integer_bits(value, size), size))
-                        {
-                            ctx.emit(MInst::AluRRImmLogic {
-                                op: alu_op(binary.op()),
-                                size,
-                                dst,
-                                src: RegOrZr::Reg(lhs),
-                                imm,
-                            });
-                        } else if let Some((rhs, shift, amount)) =
-                            fold_shifted_rhs(ctx, inst, binary.rhs(), size)
-                        {
-                            ctx.emit(MInst::AluRRRShift {
-                                op: alu_op(binary.op()),
-                                size,
-                                dst,
-                                lhs: RegOrZr::Reg(lhs),
-                                rhs: RegOrZr::Reg(rhs),
-                                shift,
-                                amount,
-                            });
-                        } else {
-                            let rhs = ctx.put_value_in_reg(binary.rhs());
-                            ctx.emit(MInst::AluRRR {
-                                op: alu_op(binary.op()),
-                                size,
-                                dst,
-                                lhs: RegOrZr::Reg(lhs),
-                                rhs: RegOrZr::Reg(rhs),
-                            });
-                        }
-                    }
-                    BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Sar => {
-                        if let Some(shift) = rhs_imm
-                            .and_then(|value| u8::try_from(value).ok())
-                            .and_then(|value| ImmShift::new(value, size))
-                        {
-                            ctx.emit(MInst::AluRRImmShift {
-                                op: alu_op(binary.op()),
-                                size,
-                                dst,
-                                src: lhs,
-                                shift,
-                            });
-                        } else {
-                            let rhs = ctx.put_value_in_reg(binary.rhs());
-                            ctx.emit(MInst::AluRRR {
-                                op: alu_op(binary.op()),
-                                size,
-                                dst,
-                                lhs: RegOrZr::Reg(lhs),
-                                rhs: RegOrZr::Reg(rhs),
-                            });
-                        }
-                    }
-                    BinaryOp::Mul => {
-                        let rhs = ctx.put_value_in_reg(binary.rhs());
-                        ctx.emit(MInst::AluRRR {
-                            op: alu_op(binary.op()),
-                            size,
-                            dst,
-                            lhs: RegOrZr::Reg(lhs),
-                            rhs: RegOrZr::Reg(rhs),
-                        });
-                    }
-                    BinaryOp::Div => {
-                        let rhs = ctx.put_value_in_reg(binary.rhs());
-                        ctx.emit(MInst::SDiv {
-                            size,
-                            dst,
-                            lhs,
-                            rhs,
-                        });
-                    }
-                    BinaryOp::Rem => {
-                        let quotient = ctx.alloc_tmp(HirType::get_i32());
-                        let rhs = ctx.put_value_in_reg(binary.rhs());
-                        ctx.emit(MInst::SDiv {
-                            size,
-                            dst: Writable::from_reg(quotient),
-                            lhs,
-                            rhs,
-                        });
-                        ctx.emit(MInst::MSub {
-                            size,
-                            dst,
-                            lhs: quotient,
-                            rhs,
-                            subtrahend: lhs,
-                        });
-                    }
-                    BinaryOp::Eq
-                    | BinaryOp::NotEq
-                    | BinaryOp::Gt
-                    | BinaryOp::Lt
-                    | BinaryOp::Ge
-                    | BinaryOp::Le => {
-                        if let Some(imm) = rhs_imm.and_then(positive_imm12) {
-                            ctx.emit(MInst::CmpImm { size, lhs, imm });
-                        } else {
-                            let rhs = ctx.put_value_in_reg(binary.rhs());
-                            ctx.emit(MInst::CmpRR {
-                                size,
-                                lhs,
-                                rhs: RegOrZr::Reg(rhs),
-                            });
-                        }
-                        ctx.emit(MInst::CSet {
-                            cond: comparison_cond(binary.op()),
-                            dst,
-                        });
-                    }
-                }
-                LoweredOutput::Value(result)
-            }
-            InstKind::Select(select) => {
-                lower_select(ctx, inst, &select);
-                LoweredOutput::Value(ctx.result_reg(inst))
-            }
-            InstKind::Cast(cast) => {
-                let src = cast.src();
-                let src_ty = ctx.arena.inst_data(src).ty().kind().clone();
-                let dst_ty = ctx.arena.inst_data(inst).ty().kind().clone();
-                let result = ctx.result_reg(inst);
-                let dst = Writable::from_reg(result);
-                let src_reg = ctx.put_value_in_reg(src);
-                match (src_ty, dst_ty) {
-                    (TypeKind::Int32, TypeKind::Float32) => {
-                        ctx.emit(MInst::Scvtf { dst, src: src_reg })
-                    }
-                    (TypeKind::Float32, TypeKind::Int32) => {
-                        ctx.emit(MInst::Fcvtzs { dst, src: src_reg })
-                    }
-                    (src_ty, dst_ty) => {
-                        ctx.lowering_panic(
-                            "AArch64 instruction selection",
-                            format!("cast from {src_ty:?} to {dst_ty:?} is unsupported"),
-                            Some(ctx.arena.inst_data(src).ty()),
-                            Some(ctx.arena.inst_data(inst).ty()),
-                        );
-                    }
-                }
-                LoweredOutput::Value(result)
-            }
-            InstKind::Alloc => {
-                let result = ctx.result_reg(inst);
-                let dst = Writable::from_reg(result);
-                let pointee = ctx.arena.inst_data(inst).ty().derefernce();
-                let offset = i64::from(ctx.alloc_stackslot_or_get(inst, pointee));
-                ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
-                    StackAMode::Slot(offset),
-                    dst,
-                ));
-                LoweredOutput::Value(result)
-            }
-            InstKind::GetElemPtr(gep) => {
-                let result = ctx.result_reg(inst);
-                let dst = Writable::from_reg(result);
-                let mut current_ty = ctx.arena.inst_data(gep.base()).ty().clone();
-                let mut address = ctx.put_value_in_reg(gep.base());
-
-                for &index in gep.offsets() {
-                    let element_ty = if current_ty.is_pointer() {
-                        current_ty.derefernce()
-                    } else {
-                        current_ty.get_array_elem_ty()
-                    };
-                    let stride = element_ty.size() as i64;
-                    current_ty = element_ty;
-
-                    if let Some(value) = integer_constant(ctx, index) {
-                        let byte_offset = i64::from(value) * stride;
-                        let next = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                        emit_add_offset(ctx, Writable::from_reg(next), address, byte_offset);
-                        address = next;
-                    } else {
-                        if let Some(shift) = stride_shift(stride) {
-                            let next = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                            let index = ctx.put_value_in_reg(index);
-                            ctx.emit(MInst::AluRRRExtend {
-                                op: AluOp::Add,
-                                size: OperandSize::Size64,
-                                dst: Writable::from_reg(next),
-                                lhs: Gpr::Reg(address),
-                                rhs: index,
-                                extend: ExtendOp::Sxtw,
-                                shift,
-                            });
-                            address = next;
-                            continue;
-                        }
-                        // Indices are i32 in Raana IR. Sign-extend before the
-                        // multiply so negative indices retain GEP semantics.
-                        let zero = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                        let extended = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                        ctx.emit(MInst::MovFromZero {
-                            size: OperandSize::Size64,
-                            dst: Writable::from_reg(zero),
-                        });
-                        let index = ctx.put_value_in_reg(index);
-                        ctx.emit(MInst::AluRRRExtend {
-                            op: AluOp::Add,
-                            size: OperandSize::Size64,
-                            dst: Writable::from_reg(extended),
-                            lhs: Gpr::Reg(zero),
-                            rhs: index,
-                            extend: ExtendOp::Sxtw,
-                            shift: 0,
-                        });
-                        let byte_offset = if stride == 1 {
-                            extended
-                        } else {
-                            let scale = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                            ctx.emit(MInst::LoadImm {
-                                size: OperandSize::Size64,
-                                dst: Writable::from_reg(scale),
-                                value: stride as u64,
-                            });
-                            let product = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                            ctx.emit(MInst::AluRRR {
-                                op: AluOp::Mul,
-                                size: OperandSize::Size64,
-                                dst: Writable::from_reg(product),
-                                lhs: RegOrZr::Reg(extended),
-                                rhs: RegOrZr::Reg(scale),
-                            });
-                            product
-                        };
-                        let next = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                        ctx.emit(MInst::AluRRR {
-                            op: AluOp::Add,
-                            size: OperandSize::Size64,
-                            dst: Writable::from_reg(next),
-                            lhs: RegOrZr::Reg(address),
-                            rhs: RegOrZr::Reg(byte_offset),
-                        });
-                        address = next;
-                    }
-                }
-                assert_eq!(
-                    current_ty.reference(),
-                    ctx.arena.inst_data(inst).ty().clone()
-                );
-                ctx.emit(MInst::Mov {
-                    size: OperandSize::Size64,
-                    dst,
-                    src: address,
-                });
-                LoweredOutput::Value(result)
-            }
-            InstKind::Load(load) => {
-                let result = ctx.result_reg(inst);
-                let dst = Writable::from_reg(result);
-                let src = ctx.put_value_in_reg(load.src());
-                ctx.emit(MInst::Load {
-                    ty: memory_type(ctx.arena.inst_data(inst).ty().kind()),
-                    dst,
-                    addr: AMode::Reg {
-                        base: Gpr::Reg(src),
-                    },
-                });
-                LoweredOutput::Value(result)
-            }
-            InstKind::Store(store) => {
-                lower_store(ctx, store.src(), store.dest());
-                LoweredOutput::None
-            }
-            InstKind::MemZero(mem_zero) => {
-                let inline_store_count = mem_zero.byte_len() / 4;
-                if runtime::mem_zero_is_inline(mem_zero.byte_len()) {
-                    let alloc =
-                        matches!(ctx.arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
-                            .then_some(mem_zero.dest());
-                    let (dest, stack_offset) = if let Some(alloc) = alloc {
-                        let pointee = ctx.arena.inst_data(alloc).ty().derefernce();
-                        let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
-                        (
-                            ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
-                            Some(offset),
-                        )
-                    } else {
-                        (ctx.put_value_in_reg(mem_zero.dest()), None)
-                    };
-                    let zero = ctx.alloc_tmp(HirType::get_i32());
-                    if let Some(offset) = stack_offset {
-                        ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
-                            StackAMode::Slot(offset),
-                            Writable::from_reg(dest),
-                        ));
-                    }
-                    ctx.emit(MInst::MovFromZero {
-                        size: OperandSize::Size32,
-                        dst: Writable::from_reg(zero),
-                    });
-                    for index in 0..inline_store_count {
-                        emit_store_at(ctx, zero, &HirType::get_i32(), dest, (index * 4) as i64);
-                    }
-                    return LoweredOutput::None;
-                }
-                let alloc = matches!(ctx.arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
-                    .then_some(mem_zero.dest());
-                let (dest, stack_offset) = if let Some(alloc) = alloc {
-                    let pointee = ctx.arena.inst_data(alloc).ty().derefernce();
-                    let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
-                    (
-                        ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
-                        Some(offset),
-                    )
-                } else {
-                    (ctx.put_value_in_reg(mem_zero.dest()), None)
-                };
-                let byte_len = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                if let Some(offset) = stack_offset {
-                    ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
-                        StackAMode::Slot(offset),
-                        Writable::from_reg(dest),
-                    ));
-                }
-                ctx.emit(MInst::LoadImm {
-                    size: OperandSize::Size64,
-                    dst: Writable::from_reg(byte_len),
-                    value: mem_zero.byte_len() as u64,
-                });
-                ctx.emit(MInst::Call {
-                    args: vec![
-                        CallArgPair {
-                            vreg: dest,
-                            preg: regs::INT_ARG_REGS[0],
-                        },
-                        CallArgPair {
-                            vreg: byte_len,
-                            preg: regs::INT_ARG_REGS[1],
-                        },
-                    ],
-                    ret: None,
-                    clobbers: regs::DEFAULT_CLOBBERS,
-                    label: Label::Embedded(EmbeddedSymbol::Memset),
-                });
-                ctx.vcode.vcode.abi.set_has_calls();
-                ctx.vcode.vcode.abi.set_outgoing_arg_size(0);
-                LoweredOutput::None
-            }
+            InstKind::Binary(binary) => lower_binary(ctx, arena, inst, binary),
+            InstKind::Select(select) => lower_select(ctx, arena, inst, select),
+            InstKind::Cast(cast) => lower_cast(ctx, arena, inst, cast),
+            InstKind::Alloc => lower_alloc(ctx, arena, inst),
+            InstKind::GetElemPtr(gep) => lower_get_elem_ptr(ctx, arena, inst, gep),
+            InstKind::Load(load) => lower_load(ctx, arena, inst, load),
+            InstKind::Store(store) => lower_store(ctx, arena, store),
+            InstKind::MemZero(mem_zero) => lower_mem_zero(ctx, arena, mem_zero),
             InstKind::ZeroInit => unreachable!("zero initialization is lowered by its store"),
-            InstKind::Call(call) => {
-                let mut args = Vec::new();
-                let (mut int_index, mut float_index, mut stack_offset) = (0usize, 0usize, 0i64);
-                for &arg in call.args() {
-                    let src = ctx.put_value_in_reg(arg);
-                    match ctx.arena.inst_data(arg).ty().kind() {
-                        TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => {
-                            if let Some(&preg) = regs::INT_ARG_REGS.get(int_index) {
-                                args.push(CallArgPair { vreg: src, preg });
-                                int_index += 1;
-                            } else {
-                                ctx.emit(MInst::Store {
-                                    ty: memory_type(ctx.arena.inst_data(arg).ty().kind()),
-                                    src,
-                                    addr: AMode::OutgoingArg(stack_offset),
-                                });
-                                int_index += 1;
-                                stack_offset += 8;
-                            }
-                        }
-                        TypeKind::Float32 => {
-                            if let Some(&preg) = regs::FLOAT_ARG_REGS.get(float_index) {
-                                args.push(CallArgPair { vreg: src, preg });
-                                float_index += 1;
-                            } else {
-                                ctx.emit(MInst::Store {
-                                    ty: MemoryType::F32,
-                                    src,
-                                    addr: AMode::OutgoingArg(stack_offset),
-                                });
-                                float_index += 1;
-                                stack_offset += 8;
-                            }
-                        }
-                        ty => {
-                            ctx.lowering_panic(
-                                "AArch64 instruction selection",
-                                format!("call argument type {ty:?} is unsupported"),
-                                Some(ctx.arena.inst_data(arg).ty()),
-                                None,
-                            );
-                        }
-                    }
-                }
-                let result =
-                    (!ctx.arena.inst_data(inst).ty().is_unit()).then(|| ctx.result_reg(inst));
-                let ret = match ctx.arena.inst_data(inst).ty().kind() {
-                    TypeKind::Unit => None,
-                    TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => {
-                        Some(CallRetPair {
-                            vreg: Writable::from_reg(result.unwrap()),
-                            preg: regs::INT_RETURN_REG,
-                        })
-                    }
-                    TypeKind::Float32 => Some(CallRetPair {
-                        vreg: Writable::from_reg(result.unwrap()),
-                        preg: regs::FLOAT_RETURN_REG,
-                    }),
-                    ty => {
-                        ctx.lowering_panic(
-                            "AArch64 instruction selection",
-                            format!("call return type {ty:?} is unsupported"),
-                            None,
-                            Some(ctx.arena.inst_data(inst).ty()),
-                        );
-                    }
-                };
-                ctx.emit(MInst::Call {
-                    args,
-                    ret,
-                    clobbers: regs::DEFAULT_CLOBBERS,
-                    label: Label::from_function(call.callee()),
-                });
-                ctx.vcode.vcode.abi.set_has_calls();
-                ctx.vcode
-                    .vcode
-                    .abi
-                    .set_outgoing_arg_size(stack_offset as usize);
-                result.map_or(LoweredOutput::None, LoweredOutput::Value)
-            }
-            InstKind::Return(ret) => {
-                if let Some(value) = ret.value() {
-                    let src = ctx.put_value_in_reg(value);
-                    let preg = match ctx.arena.inst_data(value).ty().kind() {
-                        TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => {
-                            regs::INT_RETURN_REG
-                        }
-                        TypeKind::Float32 => regs::FLOAT_RETURN_REG,
-                        ty => {
-                            ctx.lowering_panic(
-                                "AArch64 instruction selection",
-                                format!("return type {ty:?} is unsupported"),
-                                Some(ctx.arena.inst_data(value).ty()),
-                                None,
-                            );
-                        }
-                    };
-                    ctx.emit(MInst::RetVal {
-                        pair: RetPair { vreg: src, preg },
-                    });
-                }
-                ctx.emit(MInst::Ret);
-                LoweredOutput::None
-            }
+            InstKind::Call(call) => lower_call(ctx, arena, inst, call),
+            InstKind::Return(ret) => lower_return(ctx, arena, ret),
             InstKind::Jump(..) | InstKind::Branch(..) => {
                 unreachable!("terminators are lowered by LowerBackend::lower_branch")
             }
@@ -663,8 +825,8 @@ impl LowerBackend for AArch64Backend {
         inst: raana_ir::opt::prelude::Inst,
         target: &[MirBlockIndex],
     ) {
-        let kind = ctx.arena.inst_data(inst).kind().clone();
-        match kind {
+        let arena = ctx.arena;
+        match arena.inst_data(inst).kind() {
             InstKind::Jump(jump) => {
                 for &arg in jump.args() {
                     ctx.put_value_in_reg(arg);
@@ -702,7 +864,7 @@ impl LowerBackend for AArch64Backend {
                     "AArch64 branch selection",
                     format!("non-terminator HIR instruction {kind:?} cannot select a branch"),
                     None,
-                    Some(ctx.arena.inst_data(inst).ty()),
+                    Some(arena.inst_data(inst).ty()),
                 );
             }
         }
@@ -767,137 +929,6 @@ impl LowerBackend for AArch64Backend {
     }
 }
 
-fn lower_select(
-    ctx: &mut LowerContext<'_, MInst>,
-    inst: raana_ir::opt::prelude::Inst,
-    select: &raana_ir::ir::Select,
-) {
-    let result_ty = ctx.arena.inst_data(inst).ty().kind().clone();
-    if !matches!(
-        &result_ty,
-        TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String | TypeKind::Float32
-    ) {
-        ctx.lowering_panic(
-            "AArch64 instruction selection",
-            format!("select result type {result_ty:?} is unsupported"),
-            Some(ctx.arena.inst_data(select.cond()).ty()),
-            Some(ctx.arena.inst_data(inst).ty()),
-        );
-    }
-
-    // If the condition is a single-use comparison, consume its operands
-    // directly. This avoids cmp+cset+cmp+csel and, more importantly, keeps the
-    // final flag producer and consumer in one machine pseudo.
-    let condition = select_comparison(ctx, inst, select);
-    let (cmp, cond) = if let Some((binary, invert)) = condition {
-        let lhs_ty = ctx.arena.inst_data(binary.lhs()).ty().kind().clone();
-        if matches!(&lhs_ty, TypeKind::Float32) {
-            let cond = if invert {
-                invert_float_comparison_cond(binary.op())
-            } else {
-                float_comparison_cond(binary.op())
-            };
-            (
-                SelectCmp::Float {
-                    lhs: ctx.put_value_in_reg(binary.lhs()),
-                    rhs: ctx.put_value_in_reg(binary.rhs()),
-                },
-                cond,
-            )
-        } else {
-            let size = operand_size(&lhs_ty);
-            let lhs = ctx.put_value_in_reg(binary.lhs());
-            let cmp =
-                if let Some(imm) = integer_constant(ctx, binary.rhs()).and_then(positive_imm12) {
-                    SelectCmp::IntImm { size, lhs, imm }
-                } else {
-                    SelectCmp::IntRR {
-                        size,
-                        lhs,
-                        rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
-                    }
-                };
-            let cond = comparison_cond(binary.op());
-            (cmp, if invert { invert_cond(cond) } else { cond })
-        }
-    } else {
-        (
-            SelectCmp::IntImm {
-                size: OperandSize::Size32,
-                lhs: ctx.put_value_in_reg(select.cond()),
-                imm: Imm12::new(0, false).unwrap(),
-            },
-            Cond::Ne,
-        )
-    };
-
-    let dst = Writable::from_reg(ctx.result_reg(inst));
-    let true_constant = integer_constant(ctx, select.if_true());
-    let false_constant = integer_constant(ctx, select.if_false());
-    let (cond, value) = if matches!(&result_ty, TypeKind::Int32)
-        && true_constant == Some(1)
-        && false_constant == Some(0)
-    {
-        (cond, SelectValue::Bool { dst })
-    } else if matches!(&result_ty, TypeKind::Int32)
-        && true_constant == Some(0)
-        && false_constant == Some(1)
-    {
-        (invert_cond(cond), SelectValue::Bool { dst })
-    } else {
-        let if_true = ctx.put_value_in_reg(select.if_true());
-        let if_false = ctx.put_value_in_reg(select.if_false());
-        let value = match &result_ty {
-            TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => SelectValue::Int {
-                size: operand_size(&result_ty),
-                dst,
-                if_true,
-                if_false,
-            },
-            TypeKind::Float32 => SelectValue::Float {
-                dst,
-                if_true,
-                if_false,
-            },
-            _ => unreachable!("select result type checked above"),
-        };
-        (cond, value)
-    };
-
-    ctx.emit(MInst::CmpSelect { cmp, cond, value });
-}
-
-fn select_comparison(
-    ctx: &mut LowerContext<'_, MInst>,
-    inst: raana_ir::opt::prelude::Inst,
-    select: &raana_ir::ir::Select,
-) -> Option<(raana_ir::ir::Binary, bool)> {
-    let cond = select.cond();
-    if select.if_true() == cond || select.if_false() == cond || !has_only_user(ctx, cond, inst) {
-        return None;
-    }
-    let InstKind::Binary(outer) = ctx.arena.inst_data(cond).kind().clone() else {
-        return None;
-    };
-
-    if is_comparison(outer.op()) {
-        if let Some((inner_inst, is_eq)) = zero_comparison(ctx, &outer) {
-            if let InstKind::Binary(inner) = ctx.arena.inst_data(inner_inst).kind().clone() {
-                if is_comparison(inner.op())
-                    && has_only_user(ctx, inner_inst, cond)
-                    && ctx.sink_pure_single_use_chain(inner_inst, cond, inst)
-                {
-                    return Some((inner, is_eq));
-                }
-            }
-        }
-        if ctx.sink_pure_single_use_producer(cond, inst) {
-            return Some((outer, false));
-        }
-    }
-    None
-}
-
 /// Select a branch-local, pure condition tree.  Claims are made through the
 /// generic lowering context so reverse traversal never independently lowers a
 /// producer whose result is consumed here.
@@ -908,7 +939,8 @@ fn select_branch_condition(
     true_target: MirBlockIndex,
     false_target: MirBlockIndex,
 ) -> bool {
-    let InstKind::Binary(outer) = ctx.arena.inst_data(cond).kind().clone() else {
+    let arena = ctx.arena;
+    let InstKind::Binary(outer) = arena.inst_data(cond).kind() else {
         return false;
     };
     if !is_comparison(outer.op()) || !has_only_user(ctx, cond, branch) {
@@ -919,9 +951,9 @@ fn select_branch_condition(
         Label::from_block(true_target),
         Label::from_block(false_target),
     );
-    let zero_outer = zero_comparison(ctx, &outer);
+    let zero_outer = zero_comparison(arena, outer);
     if let Some((value, is_eq)) = zero_outer {
-        if let InstKind::Binary(inner) = ctx.arena.inst_data(value).kind().clone() {
+        if let InstKind::Binary(inner) = arena.inst_data(value).kind() {
             if is_comparison(inner.op()) && has_only_user(ctx, value, cond) {
                 // Claim the leaf first: a rejection must leave the outer
                 // condition available for the conservative fallback.
@@ -930,10 +962,10 @@ fn select_branch_condition(
                 {
                     return false;
                 }
-                emit_comparison_branch(ctx, &inner, !is_eq, labels);
+                emit_comparison_branch(ctx, arena, inner, !is_eq, labels);
                 return true;
             }
-            if let Some((tested, bit)) = single_bit_mask(ctx, &inner, value, cond) {
+            if let Some((tested, bit)) = single_bit_mask(ctx, arena, inner, value, cond) {
                 if !ctx.sink_pure_single_use_producer(value, cond)
                     || !ctx.sink_pure_single_use_producer(cond, branch)
                 {
@@ -962,16 +994,16 @@ fn select_branch_condition(
             }
         }
 
-        let ty = ctx.arena.inst_data(value).ty().kind().clone();
+        let ty = arena.inst_data(value).ty().kind();
         if matches!(
-            &ty,
+            ty,
             TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String
         ) {
             if !ctx.sink_pure_single_use_producer(cond, branch) {
                 return false;
             }
             let value = ctx.put_value_in_reg(value);
-            let size = operand_size(&ty);
+            let size = operand_size(ty);
             let (true_label, false_label) = labels;
             ctx.emit(if is_eq {
                 MInst::Cbz {
@@ -990,7 +1022,7 @@ fn select_branch_condition(
             });
             return true;
         }
-        if matches!(&ty, TypeKind::Float32) {
+        if matches!(ty, TypeKind::Float32) {
             if !ctx.sink_pure_single_use_producer(cond, branch) {
                 return false;
             }
@@ -1003,7 +1035,7 @@ fn select_branch_condition(
     if !ctx.sink_pure_single_use_producer(cond, branch) {
         return false;
     }
-    emit_comparison_branch(ctx, &outer, false, labels);
+    emit_comparison_branch(ctx, arena, outer, false, labels);
     true
 }
 
@@ -1016,18 +1048,15 @@ fn has_only_user(
     users.len() == 1 && users.contains(&user)
 }
 
-fn zero_comparison(
-    ctx: &LowerContext<'_, MInst>,
-    binary: &raana_ir::ir::Binary,
-) -> Option<(raana_ir::opt::prelude::Inst, bool)> {
+fn zero_comparison(arena: ArenaContext<'_>, binary: &Binary) -> Option<(HirInst, bool)> {
     let is_eq = match binary.op() {
         BinaryOp::Eq => true,
         BinaryOp::NotEq => false,
         _ => return None,
     };
-    if integer_constant(ctx, binary.lhs()) == Some(0) {
+    if integer_constant(arena, binary.lhs()) == Some(0) {
         Some((binary.rhs(), is_eq))
-    } else if integer_constant(ctx, binary.rhs()) == Some(0) {
+    } else if integer_constant(arena, binary.rhs()) == Some(0) {
         Some((binary.lhs(), is_eq))
     } else {
         None
@@ -1036,24 +1065,24 @@ fn zero_comparison(
 
 fn single_bit_mask(
     ctx: &LowerContext<'_, MInst>,
-    and: &raana_ir::ir::Binary,
-    and_inst: raana_ir::opt::prelude::Inst,
-    outer: raana_ir::opt::prelude::Inst,
-) -> Option<(raana_ir::opt::prelude::Inst, u8)> {
+    arena: ArenaContext<'_>,
+    and: &Binary,
+    and_inst: HirInst,
+    outer: HirInst,
+) -> Option<(HirInst, u8)> {
     if and.op() != BinaryOp::And
-        || !matches!(ctx.arena.inst_data(and_inst).ty().kind(), TypeKind::Int32)
+        || !matches!(arena.inst_data(and_inst).ty().kind(), TypeKind::Int32)
         || !has_only_user(ctx, and_inst, outer)
     {
         return None;
     }
-    let (value, mask) = if let Some(mask) = integer_constant(ctx, and.lhs()) {
+    let (value, mask) = if let Some(mask) = integer_constant(arena, and.lhs()) {
         (and.rhs(), mask)
     } else {
-        (and.lhs(), integer_constant(ctx, and.rhs())?)
+        (and.lhs(), integer_constant(arena, and.rhs())?)
     };
     let mask = u32::try_from(mask).ok()?;
-    if mask.count_ones() != 1 || !matches!(ctx.arena.inst_data(value).ty().kind(), TypeKind::Int32)
-    {
+    if mask.count_ones() != 1 || !matches!(arena.inst_data(value).ty().kind(), TypeKind::Int32) {
         return None;
     }
     Some((value, mask.trailing_zeros() as u8))
@@ -1061,20 +1090,21 @@ fn single_bit_mask(
 
 fn emit_comparison_branch(
     ctx: &mut LowerContext<'_, MInst>,
-    binary: &raana_ir::ir::Binary,
+    arena: ArenaContext<'_>,
+    binary: &Binary,
     invert: bool,
     (true_label, false_label): (Label, Label),
 ) {
-    let lhs_ty = ctx.arena.inst_data(binary.lhs()).ty().kind().clone();
-    let (cond, float_comparison) = if matches!(&lhs_ty, TypeKind::Float32) {
+    let lhs_ty = arena.inst_data(binary.lhs()).ty().kind();
+    let (cond, float_comparison) = if matches!(lhs_ty, TypeKind::Float32) {
         let lhs = ctx.put_value_in_reg(binary.lhs());
         let rhs = ctx.put_value_in_reg(binary.rhs());
         ctx.emit(MInst::FCmp { lhs, rhs });
         (float_comparison_cond(binary.op()), true)
     } else {
-        let size = operand_size(&lhs_ty);
+        let size = operand_size(lhs_ty);
         let lhs = ctx.put_value_in_reg(binary.lhs());
-        if let Some(imm) = integer_constant(ctx, binary.rhs()).and_then(positive_imm12) {
+        if let Some(imm) = integer_constant(arena, binary.rhs()).and_then(positive_imm12) {
             ctx.emit(MInst::CmpImm { size, lhs, imm });
         } else {
             let rhs = ctx.put_value_in_reg(binary.rhs());
@@ -1152,173 +1182,6 @@ fn invert_cond(cond: Cond) -> Cond {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use raana_ir::ir::{
-        BinaryOp, Program, Type,
-        builder_trait::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
-    };
-
-    use super::AArch64Backend;
-
-    #[test]
-    fn select_does_not_sink_a_condition_also_used_as_a_value() {
-        let mut program = Program::new();
-        let function = program.new_function(Type::get_i32(), "choose_bool".into(), vec![]);
-        let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
-
-        let one = data.new_local_inst().integer(1);
-        let two = data.new_local_inst().integer(2);
-        let cond = data.new_local_inst().binary(BinaryOp::Lt, one, two);
-        data.layout_mut().insert_inst(entry, cond);
-        let select = data.new_local_inst().select(cond, cond, one);
-        data.layout_mut().insert_inst(entry, select);
-        let ret = data.new_local_inst().ret(Some(select));
-        data.layout_mut().insert_inst(entry, ret);
-
-        let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
-        assert!(asm.contains("cset "), "{asm}");
-        assert!(asm.contains("csel "), "{asm}");
-    }
-
-    fn compile_nested_float_bool_select(
-        outer_op: BinaryOp,
-        true_value: i32,
-        false_value: i32,
-    ) -> String {
-        let mut program = Program::new();
-        let function = program.new_function(Type::get_i32(), "choose_float_bool".into(), vec![]);
-        let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
-
-        let nan = data.new_local_inst().float(f32::NAN);
-        let one_float = data.new_local_inst().float(1.0);
-        let inner = data.new_local_inst().binary(BinaryOp::Lt, nan, one_float);
-        data.layout_mut().insert_inst(entry, inner);
-        let zero = data.new_local_inst().integer(0);
-        let outer = data.new_local_inst().binary(outer_op, inner, zero);
-        data.layout_mut().insert_inst(entry, outer);
-        let if_true = data.new_local_inst().integer(true_value);
-        let if_false = data.new_local_inst().integer(false_value);
-        let select = data.new_local_inst().select(outer, if_true, if_false);
-        data.layout_mut().insert_inst(entry, select);
-        let ret = data.new_local_inst().ret(Some(select));
-        data.layout_mut().insert_inst(entry, ret);
-
-        taki_mir::compile::<AArch64Backend>(&program).unwrap()
-    }
-
-    #[test]
-    fn nested_float_bool_select_preserves_unordered_conditions() {
-        for (outer_op, true_value, false_value, expected) in [
-            (BinaryOp::Eq, 1, 0, "cset w0, hs"),
-            (BinaryOp::Eq, 0, 1, "cset w0, lo"),
-            (BinaryOp::NotEq, 1, 0, "cset w0, mi"),
-            (BinaryOp::NotEq, 0, 1, "cset w0, pl"),
-        ] {
-            let asm = compile_nested_float_bool_select(outer_op, true_value, false_value);
-            assert!(asm.contains(expected), "expected {expected} in:\n{asm}");
-        }
-    }
-
-    #[test]
-    fn lowers_large_mem_zero_to_embedded_helper_with_64_bit_length() {
-        let mut program = Program::new();
-        let function = program.new_function(Type::get_unit(), "clear".into(), vec![]);
-        let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
-        let alloc = data
-            .new_local_inst()
-            .alloc(Type::get_array(Type::get_i32(), 5));
-        let clear = data.new_local_inst().mem_zero(alloc, 20);
-        data.layout_mut().insert_inst(entry, clear);
-        let ret = data.new_local_inst().ret(None);
-        data.layout_mut().insert_inst(entry, ret);
-
-        let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
-        assert!(asm.contains("movz x1, #0x14"), "{asm}");
-        assert!(asm.contains("bl .Lsoyo_memzero"), "{asm}");
-        assert_eq!(asm.matches("\n.Lsoyo_memzero:\n").count(), 1, "{asm}");
-        assert!(asm.contains("mrs     x3, id_aa64isar2_el1"), "{asm}");
-        assert!(asm.contains("setp    [x0]!, x1!, xzr"), "{asm}");
-        assert!(asm.contains("setm    [x0]!, x1!, xzr"), "{asm}");
-        assert!(asm.contains("sete    [x0]!, x1!, xzr"), "{asm}");
-        assert!(asm.contains("mrs     x3, dczid_el0"), "{asm}");
-        assert!(asm.contains("dc      zva, x0"), "{asm}");
-        assert!(asm.contains(".Lsoyo_memzero_byte_loop:"), "{asm}");
-        assert!(!asm.contains("bl memset"), "{asm}");
-        assert!(!asm.contains(".globl memset"), "{asm}");
-        assert!(!asm.contains("\nmemset:\n"), "{asm}");
-    }
-
-    #[test]
-    fn lowers_small_mem_zero_to_inline_stores() {
-        let mut program = Program::new();
-        let function = program.new_function(Type::get_unit(), "clear".into(), vec![]);
-        let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
-        let alloc = data
-            .new_local_inst()
-            .alloc(Type::get_array(Type::get_i32(), 4));
-        let clear = data.new_local_inst().mem_zero(alloc, 16);
-        data.layout_mut().insert_inst(entry, clear);
-        let ret = data.new_local_inst().ret(None);
-        data.layout_mut().insert_inst(entry, ret);
-
-        let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
-        assert!(!asm.contains("bl memset"), "{asm}");
-        assert!(!asm.contains("bl .Lsoyo_memzero"), "{asm}");
-        assert!(!asm.contains("\n.Lsoyo_memzero:\n"), "{asm}");
-        assert_eq!(asm.matches("str w").count(), 4, "{asm}");
-    }
-
-    #[test]
-    fn embeds_memset_once_for_multiple_large_clears() {
-        let mut program = Program::new();
-        let function = program.new_function(Type::get_unit(), "clear_twice".into(), vec![]);
-        let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
-
-        for _ in 0..2 {
-            let alloc = data
-                .new_local_inst()
-                .alloc(Type::get_array(Type::get_i32(), 5));
-            let clear = data.new_local_inst().mem_zero(alloc, 20);
-            data.layout_mut().insert_inst(entry, clear);
-        }
-        let ret = data.new_local_inst().ret(None);
-        data.layout_mut().insert_inst(entry, ret);
-
-        let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
-        assert_eq!(asm.matches("bl .Lsoyo_memzero").count(), 2, "{asm}");
-        assert_eq!(asm.matches("\n.Lsoyo_memzero:\n").count(), 1, "{asm}");
-    }
-
-    #[test]
-    fn non_word_mem_zero_uses_embedded_helper() {
-        let mut program = Program::new();
-        let function = program.new_function(Type::get_unit(), "clear_tail".into(), vec![]);
-        let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
-        let alloc = data.new_local_inst().alloc(Type::get_i32());
-        let clear = data.new_local_inst().mem_zero(alloc, 3);
-        data.layout_mut().insert_inst(entry, clear);
-        let ret = data.new_local_inst().ret(None);
-        data.layout_mut().insert_inst(entry, ret);
-
-        let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
-        assert!(asm.contains("bl .Lsoyo_memzero"), "{asm}");
-        assert_eq!(asm.matches("\n.Lsoyo_memzero:\n").count(), 1, "{asm}");
-    }
-}
-
 fn invert_float_comparison_cond(op: BinaryOp) -> Cond {
     match op {
         BinaryOp::Eq => Cond::Ne,
@@ -1334,11 +1197,8 @@ fn invert_float_comparison_cond(op: BinaryOp) -> Cond {
     }
 }
 
-fn integer_constant(
-    ctx: &LowerContext<'_, MInst>,
-    inst: raana_ir::opt::prelude::Inst,
-) -> Option<i32> {
-    match ctx.arena.inst_data(inst).kind() {
+fn integer_constant(arena: ArenaContext<'_>, inst: HirInst) -> Option<i32> {
+    match arena.inst_data(inst).kind() {
         InstKind::Integer(value) => Some(value.value()),
         _ => None,
     }
@@ -1446,10 +1306,11 @@ fn lower_signed_div_rem_power_of_two(
 /// a rejected candidate follows normal instruction selection unchanged.
 fn fold_mul_add_sub(
     ctx: &mut LowerContext<'_, MInst>,
-    consumer: raana_ir::opt::prelude::Inst,
+    arena: ArenaContext<'_>,
+    consumer: HirInst,
     op: BinaryOp,
-    lhs: raana_ir::opt::prelude::Inst,
-    rhs: raana_ir::opt::prelude::Inst,
+    lhs: HirInst,
+    rhs: HirInst,
     size: OperandSize,
 ) -> Option<(
     BinaryOp,
@@ -1458,18 +1319,18 @@ fn fold_mul_add_sub(
     taki_mir::register::Reg,
 )> {
     let (mul_inst, addend) = match op {
-        BinaryOp::Add if !is_mul(ctx, lhs) && is_mul(ctx, rhs) => (rhs, lhs),
-        BinaryOp::Add if is_mul(ctx, lhs) && !is_mul(ctx, rhs) => (lhs, rhs),
-        BinaryOp::Sub if !is_mul(ctx, lhs) && is_mul(ctx, rhs) => (rhs, lhs),
+        BinaryOp::Add if !is_mul(arena, lhs) && is_mul(arena, rhs) => (rhs, lhs),
+        BinaryOp::Add if is_mul(arena, lhs) && !is_mul(arena, rhs) => (lhs, rhs),
+        BinaryOp::Sub if !is_mul(arena, lhs) && is_mul(arena, rhs) => (rhs, lhs),
         _ => return None,
     };
-    let InstKind::Binary(mul) = ctx.arena.inst_data(mul_inst).kind().clone() else {
+    let InstKind::Binary(mul) = arena.inst_data(mul_inst).kind() else {
         unreachable!("multiply candidate must be a binary instruction");
     };
 
     if mul.op() != BinaryOp::Mul
         || !fusion_types_match(
-            ctx,
+            arena,
             consumer,
             lhs,
             rhs,
@@ -1491,27 +1352,27 @@ fn fold_mul_add_sub(
     ))
 }
 
-fn is_mul(ctx: &LowerContext<'_, MInst>, inst: raana_ir::opt::prelude::Inst) -> bool {
+fn is_mul(arena: ArenaContext<'_>, inst: HirInst) -> bool {
     matches!(
-        ctx.arena.inst_data(inst).kind(),
+        arena.inst_data(inst).kind(),
         InstKind::Binary(binary) if binary.op() == BinaryOp::Mul
     )
 }
 
 fn fusion_types_match(
-    ctx: &LowerContext<'_, MInst>,
-    consumer: raana_ir::opt::prelude::Inst,
-    lhs: raana_ir::opt::prelude::Inst,
-    rhs: raana_ir::opt::prelude::Inst,
-    mul: raana_ir::opt::prelude::Inst,
-    mul_lhs: raana_ir::opt::prelude::Inst,
-    mul_rhs: raana_ir::opt::prelude::Inst,
+    arena: ArenaContext<'_>,
+    consumer: HirInst,
+    lhs: HirInst,
+    rhs: HirInst,
+    mul: HirInst,
+    mul_lhs: HirInst,
+    mul_rhs: HirInst,
     size: OperandSize,
 ) -> bool {
     [consumer, lhs, rhs, mul, mul_lhs, mul_rhs]
         .into_iter()
         .all(|inst| {
-            let ty = ctx.arena.inst_data(inst).ty().kind();
+            let ty = arena.inst_data(inst).ty().kind();
             matches!(ty, TypeKind::Int32 | TypeKind::Pointer(_)) && operand_size(ty) == size
         })
 }
@@ -1522,11 +1383,12 @@ fn fusion_types_match(
 /// input, preventing its later reverse-traversal lowering.
 fn fold_shifted_rhs(
     ctx: &mut LowerContext<'_, MInst>,
-    consumer: raana_ir::opt::prelude::Inst,
-    rhs: raana_ir::opt::prelude::Inst,
+    arena: ArenaContext<'_>,
+    consumer: HirInst,
+    rhs: HirInst,
     size: OperandSize,
 ) -> Option<(taki_mir::register::Reg, ShiftOp, ImmShift)> {
-    let InstKind::Binary(shift) = ctx.arena.inst_data(rhs).kind().clone() else {
+    let InstKind::Binary(shift) = arena.inst_data(rhs).kind() else {
         return None;
     };
     let shift_op = match shift.op() {
@@ -1535,7 +1397,7 @@ fn fold_shifted_rhs(
         BinaryOp::Sar => ShiftOp::Asr,
         _ => return None,
     };
-    let amount = integer_constant(ctx, shift.rhs())
+    let amount = integer_constant(arena, shift.rhs())
         .and_then(|value| u8::try_from(value).ok())
         .and_then(|value| ImmShift::new(value, size))?;
     if !ctx.sink_pure_single_use_producer(rhs, consumer) {
@@ -1604,34 +1466,35 @@ fn memory_type(ty: &TypeKind) -> MemoryType {
 
 fn lower_store(
     ctx: &mut LowerContext<'_, MInst>,
-    src: raana_ir::opt::prelude::Inst,
-    dest: raana_ir::opt::prelude::Inst,
-) {
+    arena: ArenaContext<'_>,
+    store: &Store,
+) -> LoweredOutput {
+    let src = store.src();
+    let dest = store.dest();
     let base = ctx.put_value_in_reg(dest);
-    match ctx.arena.inst_data(src).kind().clone() {
+    match arena.inst_data(src).kind() {
         InstKind::Aggregate(aggregate) => {
             let mut offset = 0i64;
-            for value in aggregate.flatten(&ctx.arena) {
-                let ty = ctx.arena.inst_data(value).ty().clone();
-                if matches!(ctx.arena.inst_data(value).kind(), InstKind::ZeroInit) {
-                    emit_zero_init(ctx, base, &ty, offset);
+            for value in aggregate.flatten(&arena) {
+                let ty = arena.inst_data(value).ty();
+                if matches!(arena.inst_data(value).kind(), InstKind::ZeroInit) {
+                    emit_zero_init(ctx, base, ty, offset);
                 } else {
                     let value = ctx.put_value_in_reg(value);
-                    emit_store_at(ctx, value, &ty, base, offset);
+                    emit_store_at(ctx, value, ty, base, offset);
                 }
                 offset += ty.size() as i64;
             }
         }
         InstKind::ZeroInit => {
-            let ty = ctx.arena.inst_data(src).ty().clone();
-            emit_zero_init(ctx, base, &ty, 0);
+            emit_zero_init(ctx, base, arena.inst_data(src).ty(), 0);
         }
         _ => {
-            let ty = ctx.arena.inst_data(src).ty().clone();
             let value = ctx.put_value_in_reg(src);
-            emit_store_at(ctx, value, &ty, base, 0);
+            emit_store_at(ctx, value, arena.inst_data(src).ty(), base, 0);
         }
     }
+    LoweredOutput::None
 }
 
 fn emit_zero_init(

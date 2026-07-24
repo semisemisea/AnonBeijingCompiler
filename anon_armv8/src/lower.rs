@@ -24,6 +24,8 @@ use crate::{
 
 pub struct AArch64Backend;
 
+const INLINE_MEMZERO_MAX_STORES: usize = 4;
+
 impl LowerBackend for AArch64Backend {
     type MInst = MInst;
 
@@ -446,6 +448,37 @@ impl LowerBackend for AArch64Backend {
             }
             InstKind::Store(store) => lower_store(ctx, store.src(), store.dest()),
             InstKind::MemZero(mem_zero) => {
+                let inline_store_count = mem_zero.byte_len() / 4;
+                if mem_zero.byte_len() % 4 == 0 && inline_store_count <= INLINE_MEMZERO_MAX_STORES {
+                    let alloc =
+                        matches!(ctx.arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
+                            .then_some(mem_zero.dest());
+                    let (dest, stack_offset) = if let Some(alloc) = alloc {
+                        let pointee = ctx.arena.inst_data(alloc).ty().derefernce();
+                        let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
+                        (
+                            ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
+                            Some(offset),
+                        )
+                    } else {
+                        (ctx.put_value_in_reg(mem_zero.dest()), None)
+                    };
+                    let zero = ctx.alloc_tmp(HirType::get_i32());
+                    if let Some(offset) = stack_offset {
+                        ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
+                            StackAMode::Slot(offset),
+                            Writable::from_reg(dest),
+                        ));
+                    }
+                    ctx.emit(MInst::MovFromZero {
+                        size: OperandSize::Size32,
+                        dst: Writable::from_reg(zero),
+                    });
+                    for index in 0..inline_store_count {
+                        emit_store_at(ctx, zero, &HirType::get_i32(), dest, (index * 4) as i64);
+                    }
+                    return Ok(());
+                }
                 let alloc = matches!(ctx.arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
                     .then_some(mem_zero.dest());
                 let (dest, stack_offset) = if let Some(alloc) = alloc {
@@ -1179,6 +1212,26 @@ mod tests {
         data.layout_mut().push_bb_back(entry);
         let alloc = data
             .new_local_inst()
+            .alloc(Type::get_array(Type::get_i32(), 5));
+        let clear = data.new_local_inst().mem_zero(alloc, 20);
+        data.layout_mut().insert_inst(entry, clear);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
+        assert!(asm.contains("movz x2, #0x14"), "{asm}");
+        assert!(asm.contains("bl memset"), "{asm}");
+    }
+
+    #[test]
+    fn lowers_small_mem_zero_to_inline_stores() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "clear".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let alloc = data
+            .new_local_inst()
             .alloc(Type::get_array(Type::get_i32(), 4));
         let clear = data.new_local_inst().mem_zero(alloc, 16);
         data.layout_mut().insert_inst(entry, clear);
@@ -1186,8 +1239,8 @@ mod tests {
         data.layout_mut().insert_inst(entry, ret);
 
         let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
-        assert!(asm.contains("movz x2, #0x10"), "{asm}");
-        assert!(asm.contains("bl memset"), "{asm}");
+        assert!(!asm.contains("bl memset"), "{asm}");
+        assert_eq!(asm.matches("str w").count(), 4, "{asm}");
     }
 }
 

@@ -914,6 +914,15 @@ mod tests {
     }
 
     #[test]
+    fn ion_allocation_output_verifies_for_basic_vcode() {
+        let vcode = vcode_with_integer_def();
+        let output = crate::reg_alloc::ion::run(&vcode, vcode.abi.machine_env())
+            .expect("Ion allocation should succeed");
+
+        assert!(vcode.verify_alloc_output(&output).is_ok());
+    }
+
+    #[test]
     fn strict_ssa_verifier_rejects_duplicate_definitions() {
         let mut program = Program::new();
         let func = program.new_function(HirType::get_unit(), "verify".to_owned(), vec![]);

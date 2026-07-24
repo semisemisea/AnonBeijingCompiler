@@ -1,28 +1,64 @@
 /*
- * Adapted from regalloc2 0.15.1 src/ion/requirement.rs.
+ * This file was initially derived from the files
+ * `js/src/jit/BacktrackingAllocator.h` and
+ * `js/src/jit/BacktrackingAllocator.cpp` in Mozilla Firefox, and was
+ * originally licensed under the Mozilla Public License 2.0. We
+ * subsequently relicensed it to Apache-2.0 WITH LLVM-exception (see
+ * https://github.com/bytecodealliance/regalloc2/issues/7).
  *
- * Released under the Apache License 2.0 with LLVM Exception. See the
- * repository LICENSE for the full license text.
+ * Since the initial port, the design has been substantially evolved
+ * and optimized.
+ *
+ * Local adaptation note: interfaces are mapped to `taki_mir::reg_alloc`.
  */
 
-use crate::reg_alloc::reg::{OperandConstraint, PReg, ProgPoint};
+//! Requirements computation.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use super::data_structures::{Env, LiveBundleIndex};
+use crate::reg_alloc::{
+    function::Function,
+    reg::{Operand, OperandConstraint, PReg, ProgPoint},
+};
+use log::trace;
+
 pub struct RequirementConflict;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+
+#[derive(Clone, Copy, Debug)]
 pub enum RequirementConflictAt {
+    /// A transition from a stack-constrained to a reg-constrained
+    /// segment. The suggested split point is late, to keep the
+    /// intervening region with the stackslot (which is cheaper).
     StackToReg(ProgPoint),
+    /// A transition from a reg-constraint to a stack-constrained
+    /// segment. Mirror of above: the suggested split point is early
+    /// (just after the last register use).
     RegToStack(ProgPoint),
+    /// Any other transition. The suggested split point is late (just
+    /// before the conflicting use), but the split will also trim the
+    /// ends and create a split bundle, so the intervening region will
+    /// not appear with either side. This is probably for the best
+    /// when e.g. the two sides of the split are both constrained to
+    /// different physical registers: the part in the middle should be
+    /// constrained to neither.
     Other(ProgPoint),
 }
+
 impl RequirementConflictAt {
-    pub fn suggested_split_point(self) -> ProgPoint {
+    #[inline(always)]
+    pub fn should_trim_edges_around_split(self) -> bool {
         match self {
-            Self::StackToReg(p) | Self::RegToStack(p) | Self::Other(p) => p,
+            RequirementConflictAt::RegToStack(..) | RequirementConflictAt::StackToReg(..) => false,
+            RequirementConflictAt::Other(..) => true,
         }
     }
-    pub fn should_trim_edges_around_split(self) -> bool {
-        matches!(self, Self::Other(_))
+
+    #[inline(always)]
+    pub fn suggested_split_point(self) -> ProgPoint {
+        match self {
+            RequirementConflictAt::RegToStack(pt)
+            | RequirementConflictAt::StackToReg(pt)
+            | RequirementConflictAt::Other(pt) => pt,
+        }
     }
 }
 
@@ -36,6 +72,7 @@ pub enum Requirement {
     FixedStack(PReg),
 }
 impl Requirement {
+    #[inline(always)]
     pub fn from_constraint(constraint: OperandConstraint, is_stack: impl Fn(PReg) -> bool) -> Self {
         match constraint {
             OperandConstraint::Any => Self::Any,
@@ -46,27 +83,117 @@ impl Requirement {
             OperandConstraint::FixedReg(reg) => Self::FixedReg(reg),
         }
     }
-    pub fn merge(self, other: Self) -> Result<Self, RequirementConflict> {
+    #[inline(always)]
+    pub fn merge(self, other: Requirement) -> Result<Requirement, RequirementConflict> {
         use Requirement::*;
+
         match (self, other) {
-            (Any, x) | (x, Any) => Ok(x),
-            (Register, Register) | (Stack, Stack) => Ok(self),
+            // `Any` matches anything.
+            (other, Any) | (Any, other) => Ok(other),
+            // Same kinds match.
+            (Register, Register) => Ok(self),
+            (Stack, Stack) => Ok(self),
             (Limit(a), Limit(b)) => Ok(Limit(a.min(b))),
-            (FixedReg(a), FixedReg(b)) if a == b => Ok(FixedReg(a)),
-            (FixedStack(a), FixedStack(b)) if a == b => Ok(FixedStack(a)),
+            (FixedReg(a), FixedReg(b)) if a == b => Ok(self),
+            (FixedStack(a), FixedStack(b)) if a == b => Ok(self),
+            // Limit a 'Register|FixedReg`.
             (Limit(a), Register) | (Register, Limit(a)) => Ok(Limit(a)),
-            (Limit(a), FixedReg(reg)) | (FixedReg(reg), Limit(a)) if reg.hw_enc() < a => {
-                Ok(FixedReg(reg))
+            (Limit(a), FixedReg(b)) | (FixedReg(b), Limit(a)) if usize::from(a) > b.hw_enc() => {
+                Ok(FixedReg(b))
             }
-            (Register, FixedReg(reg)) | (FixedReg(reg), Register) => Ok(FixedReg(reg)),
-            (Stack, FixedStack(reg)) | (FixedStack(reg), Stack) => Ok(FixedStack(reg)),
+            // Constrain `Register|Stack` to `Fixed{Reg|Stack}`.
+            (Register, FixedReg(preg)) | (FixedReg(preg), Register) => Ok(FixedReg(preg)),
+            (Stack, FixedStack(preg)) | (FixedStack(preg), Stack) => Ok(FixedStack(preg)),
+            // Fail otherwise.
             _ => Err(RequirementConflict),
         }
     }
+
+    #[inline(always)]
     pub fn is_stack(self) -> bool {
-        matches!(self, Self::Stack | Self::FixedStack(_))
+        match self {
+            Requirement::Stack | Requirement::FixedStack(..) => true,
+            Requirement::Register | Requirement::FixedReg(..) | Requirement::Limit(..) => false,
+            Requirement::Any => false,
+        }
     }
+
+    #[inline(always)]
     pub fn is_reg(self) -> bool {
-        matches!(self, Self::Register | Self::FixedReg(_) | Self::Limit(_))
+        match self {
+            Requirement::Register | Requirement::FixedReg(..) | Requirement::Limit(..) => true,
+            Requirement::Stack | Requirement::FixedStack(..) => false,
+            Requirement::Any => false,
+        }
+    }
+}
+
+impl<'a, F: Function> Env<'a, F> {
+    #[inline(always)]
+    pub fn requirement_from_operand(&self, op: Operand) -> Requirement {
+        match op.constraint() {
+            OperandConstraint::FixedReg(preg) => {
+                if self.pregs[preg.index()].is_stack {
+                    Requirement::FixedStack(preg)
+                } else {
+                    Requirement::FixedReg(preg)
+                }
+            }
+            OperandConstraint::Reg | OperandConstraint::Reuse(_) => Requirement::Register,
+            OperandConstraint::Limit(max) => Requirement::Limit(max),
+            OperandConstraint::Stack => Requirement::Stack,
+            OperandConstraint::Any => Requirement::Any,
+        }
+    }
+
+    pub fn compute_requirement(
+        &self,
+        bundle: LiveBundleIndex,
+    ) -> Result<Requirement, RequirementConflictAt> {
+        let mut req = Requirement::Any;
+        let mut last_pos = ProgPoint::before(0);
+        trace!("compute_requirement: {:?}", bundle);
+        let ranges = &self.bundles[bundle].ranges;
+        for entry in ranges {
+            trace!(" -> LR {:?}: {:?}", entry.index, entry.range);
+            for u in &self.ranges[entry.index].uses {
+                trace!("  -> use {:?}", u);
+                let r = self.requirement_from_operand(u.operand);
+                req = req.merge(r).map_err(|_| {
+                    trace!("     -> conflict");
+                    if req.is_stack() && r.is_reg() {
+                        // Suggested split point just before the reg (i.e., late split).
+                        RequirementConflictAt::StackToReg(u.pos)
+                    } else if req.is_reg() && r.is_stack() {
+                        // Suggested split point just after the stack
+                        // (i.e., early split). Note that splitting
+                        // with a use *right* at the beginning is
+                        // interpreted by `split_and_requeue_bundle`
+                        // as splitting off the first use.
+                        RequirementConflictAt::RegToStack(last_pos)
+                    } else {
+                        RequirementConflictAt::Other(u.pos)
+                    }
+                })?;
+                last_pos = u.pos;
+                trace!("     -> req {:?}", req);
+            }
+        }
+        trace!(" -> final: {:?}", req);
+        Ok(req)
+    }
+
+    pub fn merge_bundle_requirements(
+        &self,
+        a: LiveBundleIndex,
+        b: LiveBundleIndex,
+    ) -> Result<Requirement, RequirementConflict> {
+        let req_a = self
+            .compute_requirement(a)
+            .map_err(|_| RequirementConflict)?;
+        let req_b = self
+            .compute_requirement(b)
+            .map_err(|_| RequirementConflict)?;
+        req_a.merge(req_b)
     }
 }

@@ -1,414 +1,925 @@
 /*
- * Adapted from regalloc2 0.15.1 src/ion/liveranges.rs.
+ * This file was initially derived from the files
+ * `js/src/jit/BacktrackingAllocator.h` and
+ * `js/src/jit/BacktrackingAllocator.cpp` in Mozilla Firefox, and was
+ * originally licensed under the Mozilla Public License 2.0. We
+ * subsequently relicensed it to Apache-2.0 WITH LLVM-exception (see
+ * https://github.com/bytecodealliance/regalloc2/issues/7).
  *
- * Released under the Apache License 2.0 with LLVM Exception. See the
- * repository LICENSE for the full license text. This local port deliberately
- * stops after analysis; it does not allocate, spill, or emit moves.
+ * Since the initial port, the design has been substantially evolved
+ * and optimized.
+ *
+ * Local adaptation note: interfaces are mapped to `taki_mir::reg_alloc`.
  */
 
-use std::collections::VecDeque;
+//! Live-range computation.
 
+use super::IndexSet;
+use super::data_structures::{
+    BlockparamIn, BlockparamOut, CodeRange, Env, FixedRegFixupLevel, LiveRangeFlag, LiveRangeIndex,
+    LiveRangeKey, LiveRangeListEntry, LiveRangeSet, MultiFixedRegFixup, PRegData, PRegIndex, Use,
+    VRegData, VRegIndex,
+};
 use crate::reg_alloc::{
     function::Function,
     index::{Block, Inst},
-    reg::{InstPosition, Operand, OperandConstraint, OperandKind, OperandPos, ProgPoint, VReg},
+    reg::{
+        Allocation, InstPosition, Operand, OperandConstraint, OperandKind, OperandPos, PReg,
+        ProgPoint, RegClass, VReg,
+    },
 };
+use core::convert::TryFrom;
+use log::trace;
+use smallvec::{SmallVec, smallvec};
 
-use super::{BlockParamIn, BlockParamOut, CFGInfo, CodeRange, IndexSet, LiveRange, Use};
-
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A spill weight computed for a certain Use.
+#[derive(Clone, Copy, Debug)]
 pub struct SpillWeight(f32);
-impl SpillWeight {
-    pub fn zero() -> Self {
-        Self(0.0)
-    }
-    pub fn to_bits(self) -> u16 {
-        (self.0.to_bits() >> 15) as u16
-    }
-    pub fn from_bits(bits: u16) -> Self {
-        Self(f32::from_bits((bits as u32) << 15))
-    }
-    pub fn to_f32(self) -> f32 {
-        self.0
-    }
-}
-impl core::ops::Add for SpillWeight {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self {
-        Self(self.0 + rhs.0)
-    }
-}
 
+#[inline(always)]
 pub fn spill_weight_from_constraint(
     constraint: OperandConstraint,
-    loop_depth: u32,
+    loop_depth: usize,
     is_def: bool,
 ) -> SpillWeight {
-    let hot = 1000.0 * 4.0f32.powi(loop_depth.min(10) as i32);
-    let constraint = match constraint {
+    // A bonus of 1000 for one loop level, 4000 for two loop levels,
+    // 16000 for three loop levels, etc. Avoids exponentiation.
+    let loop_depth = core::cmp::min(10, loop_depth);
+    let hot_bonus: f32 = (0..loop_depth).fold(1000.0, |a, _| a * 4.0);
+    let def_bonus: f32 = if is_def { 2000.0 } else { 0.0 };
+    let constraint_bonus: f32 = match constraint {
         OperandConstraint::Any => 1000.0,
         OperandConstraint::Reg | OperandConstraint::FixedReg(_) => 2000.0,
         _ => 0.0,
     };
-    SpillWeight(hot + constraint + if is_def { 2000.0 } else { 0.0 })
+    SpillWeight(hot_bonus + def_bonus + constraint_bonus)
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct Liveness {
-    pub liveins: Vec<IndexSet>,
-    pub liveouts: Vec<IndexSet>,
-    pub blockparam_ins: Vec<BlockParamIn>,
-    pub blockparam_outs: Vec<BlockParamOut>,
-}
-
-/// Fixed-point live-in/live-out computation. Edge arguments are uses at the
-/// predecessor exit; successor block parameters are definitions at entry.
-pub fn compute_liveness<F: Function>(function: &F, cfg: &CFGInfo) -> Result<Liveness, String> {
-    let blocks = function.num_blocks();
-    let mut result = Liveness {
-        liveins: vec![IndexSet::new(); blocks],
-        liveouts: vec![IndexSet::new(); blocks],
-        ..Liveness::default()
-    };
-    let mut queued = vec![false; blocks];
-    let mut work: VecDeque<_> = cfg.postorder.iter().copied().collect();
-    for &block in &cfg.postorder {
-        queued[block.index()] = true;
+impl SpillWeight {
+    /// Convert a floating-point weight to a u16 that can be compactly
+    /// stored in a `Use`. We simply take the top 16 bits of the f32; this
+    /// is equivalent to the bfloat16 format
+    /// (https://en.wikipedia.org/wiki/Bfloat16_floating-point_format).
+    pub fn to_bits(self) -> u16 {
+        (self.0.to_bits() >> 15) as u16
     }
-    while let Some(block) = work.pop_front() {
-        queued[block.index()] = false;
-        let insns = function.block_insns(block);
-        if function.is_branch(insns.last()) {
-            for successor in 0..function.block_succs(block).len() {
-                for &arg in function.branch_blockparams(block, insns.last(), successor) {
-                    result.liveouts[block.index()].set(arg.vreg(), true);
-                }
+
+    /// Convert a value that was returned from
+    /// `SpillWeight::to_bits()` back into a `SpillWeight`. Note that
+    /// some precision may be lost when round-tripping from a spill
+    /// weight to packed bits and back.
+    pub fn from_bits(bits: u16) -> SpillWeight {
+        let x = f32::from_bits((bits as u32) << 15);
+        SpillWeight(x)
+    }
+
+    /// Get a zero spill weight.
+    pub fn zero() -> SpillWeight {
+        SpillWeight(0.0)
+    }
+
+    /// Convert to a raw floating-point value.
+    pub fn to_f32(self) -> f32 {
+        self.0
+    }
+
+    /// Create a `SpillWeight` from a raw floating-point value.
+    pub fn from_f32(x: f32) -> SpillWeight {
+        SpillWeight(x)
+    }
+
+    pub fn to_int(self) -> u32 {
+        self.0 as u32
+    }
+}
+
+impl core::ops::Add<SpillWeight> for SpillWeight {
+    type Output = SpillWeight;
+    fn add(self, other: SpillWeight) -> Self {
+        SpillWeight(self.0 + other.0)
+    }
+}
+
+fn slot_idx(i: usize) -> Result<u16, String> {
+    u16::try_from(i).map_err(|_| "too many instruction operands".to_owned())
+}
+
+impl<'a, F: Function> Env<'a, F> {
+    pub fn create_pregs_and_vregs(&mut self) {
+        // Create PRegs from the env.
+        self.pregs.resize(
+            PReg::NUM_INDEX,
+            PRegData {
+                allocations: LiveRangeSet::new(),
+                is_stack: false,
+            },
+        );
+        for &preg in &self.env.fixed_stack_slots {
+            self.pregs[preg.index()].is_stack = true;
+        }
+        for class in 0..self.preferred_victim_by_class.len() {
+            self.preferred_victim_by_class[class] = self.env.non_preferred_regs_by_class[class]
+                .max_preg()
+                .or(self.env.preferred_regs_by_class[class].max_preg())
+                .unwrap_or(PReg::invalid());
+        }
+        // Create VRegs from the vreg count.
+        for idx in 0..self.func.num_vregs() {
+            // We'll fill in the real details when we see the def.
+            self.ctx.vregs.add(
+                VReg::new(idx, RegClass::Int),
+                VRegData {
+                    ranges: Vec::new(),
+                    blockparam: Block::invalid(),
+                    // We'll learn the RegClass as we scan the code.
+                    class: None,
+                },
+            );
+        }
+        // Create allocations too.
+        for inst in 0..self.func.num_insts() {
+            let start = self.output.allocs.len() as u32;
+            self.output.inst_alloc_offsets.push(start);
+            for _ in 0..self.func.inst_operands(Inst::new(inst)).len() {
+                self.output.allocs.push(Allocation::none());
             }
         }
-        let mut live = result.liveouts[block.index()].clone();
-        for inst in insns.iter().rev() {
-            for position in [OperandPos::Late, OperandPos::Early] {
-                for &operand in function.inst_operands(inst) {
-                    if operand.as_fixed_nonallocatable().is_some() || operand.pos() != position {
-                        continue;
+    }
+
+    /// Mark `range` as live for the given `vreg`.
+    ///
+    /// Returns the liverange that contains the given range.
+    pub fn add_liverange_to_vreg(
+        &mut self,
+        vreg: VRegIndex,
+        mut range: CodeRange,
+    ) -> LiveRangeIndex {
+        trace!("add_liverange_to_vreg: vreg {:?} range {:?}", vreg, range);
+
+        // Invariant: as we are building liveness information, we
+        // *always* process instructions bottom-to-top, and as a
+        // consequence, new liveranges are always created before any
+        // existing liveranges for a given vreg. We assert this here,
+        // then use it to avoid an O(n) merge step (which would lead
+        // to O(n^2) liveness construction cost overall).
+        //
+        // We store liveranges in reverse order in the `.ranges`
+        // array, then reverse them at the end of
+        // `compute_liveness()`.
+
+        if !self.vregs[vreg].ranges.is_empty() {
+            let last_range_index = self.vregs[vreg].ranges.last().unwrap().index;
+            let last_range = self.ranges[last_range_index].range;
+            if self.func.allow_multiple_vreg_defs() {
+                if last_range.contains(&range) {
+                    // Special case (may occur when multiple defs of pinned
+                    // physical regs occur): if this new range overlaps the
+                    // existing range, return it.
+                    return last_range_index;
+                }
+                // If this range's end falls in the middle of the last
+                // range, truncate it to be contiguous so we can merge
+                // below.
+                if range.to >= last_range.from && range.to <= last_range.to {
+                    range.to = last_range.from;
+                }
+            }
+            debug_assert!(
+                range.to <= last_range.from,
+                "range {:?}, last_range {:?}",
+                range,
+                last_range
+            );
+        }
+
+        if self.vregs[vreg].ranges.is_empty()
+            || range.to
+                < self.ranges[self.vregs[vreg].ranges.last().unwrap().index]
+                    .range
+                    .from
+        {
+            // Is not contiguous with previously-added (immediately
+            // following) range; create a new range.
+            let lr = self.ctx.ranges.add(range);
+            self.ranges[lr].vreg = vreg;
+            self.vregs[vreg]
+                .ranges
+                .push(LiveRangeListEntry { range, index: lr });
+            lr
+        } else {
+            // Is contiguous with previously-added range; just extend
+            // its range and return it.
+            let lr = self.vregs[vreg].ranges.last().unwrap().index;
+            debug_assert!(range.to == self.ranges[lr].range.from);
+            self.ranges[lr].range.from = range.from;
+            lr
+        }
+    }
+
+    pub fn insert_use_into_liverange(&mut self, into: LiveRangeIndex, mut u: Use) {
+        let operand = u.operand;
+        let constraint = operand.constraint();
+        let block = self.cfginfo.insn_block[u.pos.inst() as usize];
+        let loop_depth = self.cfginfo.approx_loop_depth[block.index()] as usize;
+        let weight = spill_weight_from_constraint(
+            constraint,
+            loop_depth,
+            operand.kind() != OperandKind::Use,
+        );
+        u.weight = weight.to_bits();
+
+        trace!(
+            "insert use {:?} into lr {:?} with weight {:?}",
+            u, into, weight,
+        );
+
+        // N.B.: we do *not* update `requirement` on the range,
+        // because those will be computed during the multi-fixed-reg
+        // fixup pass later (after all uses are inserted).
+
+        self.ranges[into].uses.push(u);
+
+        // Update stats.
+        let range_weight = self.ranges[into].uses_spill_weight() + weight;
+        self.ranges[into].set_uses_spill_weight(range_weight);
+        trace!(
+            "  -> now range has weight {:?}",
+            self.ranges[into].uses_spill_weight(),
+        );
+    }
+
+    pub fn find_vreg_liverange_for_pos(
+        &self,
+        vreg: VRegIndex,
+        pos: ProgPoint,
+    ) -> Option<LiveRangeIndex> {
+        for entry in &self.vregs[vreg].ranges {
+            if entry.range.contains_point(pos) {
+                return Some(entry.index);
+            }
+        }
+        None
+    }
+
+    pub fn add_liverange_to_preg(&mut self, range: CodeRange, reg: PReg) {
+        trace!("adding liverange to preg: {:?} to {}", range, reg);
+        let preg_idx = PRegIndex::new(reg.index());
+        let res = self.pregs[preg_idx.index()]
+            .allocations
+            .btree
+            .insert(LiveRangeKey::from_range(&range), LiveRangeIndex::invalid());
+        debug_assert!(res.is_none());
+    }
+
+    pub fn is_live_in(&mut self, block: Block, vreg: VRegIndex) -> bool {
+        self.liveins[block.index()].get(vreg.index())
+    }
+
+    pub fn compute_liveness(&mut self) -> Result<(), String> {
+        // Create initial LiveIn and LiveOut bitsets.
+        for _ in 0..self.func.num_blocks() {
+            self.liveins.push(IndexSet::new());
+            self.liveouts.push(IndexSet::new());
+        }
+
+        // Run a worklist algorithm to precisely compute liveins and
+        // liveouts.
+        let mut workqueue = core::mem::take(&mut self.ctx.scratch_workqueue);
+        let mut workqueue_set = core::mem::take(&mut self.ctx.scratch_workqueue_set);
+        workqueue_set.clear();
+        // Initialize workqueue with postorder traversal.
+        for &block in &self.cfginfo.postorder[..] {
+            workqueue.push_back(block);
+            workqueue_set.insert(block);
+        }
+
+        while let Some(block) = workqueue.pop_front() {
+            workqueue_set.remove(&block);
+            let insns = self.func.block_insns(block);
+
+            trace!("computing liveins for block{}", block.index());
+
+            let mut live = self.liveouts[block.index()].clone();
+            trace!(" -> initial liveout set: {:?}", live);
+
+            // Include outgoing blockparams in the initial live set.
+            if self.func.is_branch(insns.last()) {
+                for i in 0..self.func.block_succs(block).len() {
+                    for &param in self.func.branch_blockparams(block, insns.last(), i) {
+                        live.set(param.vreg(), true);
+                        self.observe_vreg_class(param);
                     }
-                    live.set(operand.vreg().vreg(), operand.kind() == OperandKind::Use);
                 }
             }
-        }
-        for &param in function.block_params(block) {
-            live.set(param.vreg(), false);
-        }
-        for &pred in function.block_preds(block) {
-            if result.liveouts[pred.index()].union_with(&live) && !queued[pred.index()] {
-                queued[pred.index()] = true;
-                work.push_back(pred);
-            }
-        }
-        result.liveins[block.index()] = live;
-    }
-    if !result.liveins[function.entry_block().index()].is_empty() {
-        return Err("entry block has live-in virtual registers".into());
-    }
-    Ok(result)
-}
 
-/// Build per-vreg live ranges and record SSA edge copies for later coalescing.
-pub fn build_live_ranges<F: Function>(
-    function: &F,
-    cfg: &CFGInfo,
-    liveness: &mut Liveness,
-) -> Vec<Vec<LiveRange>> {
-    let mut result = vec![Vec::new(); function.num_vregs()];
-    liveness.blockparam_ins.clear();
-    liveness.blockparam_outs.clear();
-    for block_index in (0..function.num_blocks()).rev() {
-        let block = Block::new(block_index);
-        let insns = function.block_insns(block);
-        let mut live = liveness.liveouts[block_index].clone();
-        let mut current: Vec<Option<usize>> = vec![None; function.num_vregs()];
-        if function.is_branch(insns.last()) {
-            for (successor_index, &to_block) in function.block_succs(block).iter().enumerate() {
-                for (&to_vreg, &from_vreg) in function
-                    .block_params(to_block)
-                    .iter()
-                    .zip(function.branch_blockparams(block, insns.last(), successor_index))
-                {
-                    liveness.blockparam_outs.push(BlockParamOut {
-                        from_block: block,
-                        to_block,
-                        from_vreg,
-                        to_vreg,
-                    });
-                    live.set(from_vreg.vreg(), true);
+            for inst in insns.iter().rev() {
+                for pos in &[OperandPos::Late, OperandPos::Early] {
+                    for op in self.func.inst_operands(inst) {
+                        if op.as_fixed_nonallocatable().is_some() {
+                            continue;
+                        }
+                        if op.pos() == *pos {
+                            let was_live = live.get(op.vreg().vreg());
+                            trace!("op {:?} was_live = {}", op, was_live);
+                            match op.kind() {
+                                OperandKind::Use => {
+                                    live.set(op.vreg().vreg(), true);
+                                }
+                                OperandKind::Def => {
+                                    live.set(op.vreg().vreg(), false);
+                                }
+                            }
+                            self.observe_vreg_class(op.vreg());
+                        }
+                    }
                 }
             }
-        }
-        let whole_block = CodeRange {
-            from: cfg.block_entry[block_index],
-            to: cfg.block_exit[block_index].next(),
-        };
-        for vreg_index in live.iter() {
-            if vreg_index < result.len() {
-                current[vreg_index] = Some(push_range(
-                    &mut result[vreg_index],
-                    VReg::new(vreg_index, vreg_class(function, vreg_index)),
-                    whole_block,
-                ));
+            for &blockparam in self.func.block_params(block) {
+                live.set(blockparam.vreg(), false);
+                self.observe_vreg_class(blockparam);
             }
+
+            for &pred in self.func.block_preds(block) {
+                if self.ctx.liveouts[pred.index()].union_with(&live) {
+                    if !workqueue_set.contains(&pred) {
+                        workqueue_set.insert(pred);
+                        workqueue.push_back(pred);
+                    }
+                }
+            }
+
+            trace!("computed liveins at block{}: {:?}", block.index(), live);
+            self.liveins[block.index()] = live;
         }
-        for inst in insns.iter().rev() {
-            for phase in [InstPosition::After, InstPosition::Before] {
-                for (slot, &operand) in function.inst_operands(inst).iter().enumerate() {
+
+        // Check that there are no liveins to the entry block.
+        if !self.liveins[self.func.entry_block().index()].is_empty() {
+            trace!(
+                "non-empty liveins to entry block: {:?}",
+                self.liveins[self.func.entry_block().index()]
+            );
+            return Err("entry block has live-in virtual registers".to_owned());
+        }
+
+        self.ctx.scratch_workqueue = workqueue;
+        self.ctx.scratch_workqueue_set = workqueue_set;
+
+        Ok(())
+    }
+
+    pub fn build_liveranges(&mut self) -> Result<(), String> {
+        // Create Uses and Defs referring to VRegs, and place the Uses
+        // in LiveRanges.
+        //
+        // We already computed precise liveouts and liveins for every
+        // block above, so we don't need to run an iterative algorithm
+        // here; instead, every block's computation is purely local,
+        // from end to start.
+
+        // Track current LiveRange for each vreg.
+        //
+        // Invariant: a stale range may be present here; ranges are
+        // only valid if `live.get(vreg)` is true.
+        let mut vreg_ranges = core::mem::take(&mut self.ctx.scratch_vreg_ranges);
+        vreg_ranges.clear();
+        vreg_ranges.resize(self.func.num_vregs(), LiveRangeIndex::invalid());
+        let mut operand_rewrites = core::mem::take(&mut self.ctx.scratch_operand_rewrites);
+
+        for i in (0..self.func.num_blocks()).rev() {
+            let block = Block::new(i);
+            let insns = self.func.block_insns(block);
+
+            // Init our local live-in set.
+            let mut live = self.liveouts[block.index()].clone();
+
+            // If the last instruction is a branch (rather than
+            // return), create blockparam_out entries.
+            if self.func.is_branch(insns.last()) {
+                for (i, &succ) in self.func.block_succs(block).iter().enumerate() {
+                    let blockparams_in = self.func.block_params(succ);
+                    let blockparams_out = self.func.branch_blockparams(block, insns.last(), i);
+                    for (&blockparam_in, &blockparam_out) in
+                        blockparams_in.iter().zip(blockparams_out)
+                    {
+                        let blockparam_out = VRegIndex::new(blockparam_out.vreg());
+                        let blockparam_in = VRegIndex::new(blockparam_in.vreg());
+                        self.blockparam_outs.push(BlockparamOut {
+                            to_vreg: blockparam_in,
+                            to_block: succ,
+                            from_block: block,
+                            from_vreg: blockparam_out,
+                        });
+
+                        // Include outgoing blockparams in the initial live set.
+                        live.set(blockparam_out.index(), true);
+                    }
+                }
+            }
+
+            // Initially, registers are assumed live for the whole block.
+            for vreg in live.iter() {
+                let range = CodeRange {
+                    from: self.cfginfo.block_entry[block.index()],
+                    to: self.cfginfo.block_exit[block.index()].next(),
+                };
+                trace!(
+                    "vreg {:?} live at end of block --> create range {:?}",
+                    VRegIndex::new(vreg),
+                    range
+                );
+                let lr = self.add_liverange_to_vreg(VRegIndex::new(vreg), range);
+                vreg_ranges[vreg] = lr;
+            }
+
+            // Create vreg data for blockparams.
+            for &param in self.func.block_params(block) {
+                self.vregs[param].blockparam = block;
+            }
+
+            // For each instruction, in reverse order, process
+            // operands and clobbers.
+            for inst in insns.iter().rev() {
+                // Mark clobbers with CodeRanges on PRegs.
+                for clobber in self.func.inst_clobbers(inst) {
+                    // Clobber range is at After point only: an
+                    // instruction can still take an input in a reg
+                    // that it later clobbers. (In other words, the
+                    // clobber is like a normal def that never gets
+                    // used.)
+                    let range = CodeRange {
+                        from: ProgPoint::after(inst.raw_u32()),
+                        to: ProgPoint::before(inst.next().raw_u32()),
+                    };
+                    self.add_liverange_to_preg(range, clobber);
+                }
+
+                // Does the instruction have any input-reusing
+                // outputs? This is important below to establish
+                // proper interference wrt other inputs. We note the
+                // *vreg* that is reused, not the index.
+                let mut reused_input = None;
+                for op in self.func.inst_operands(inst) {
+                    if let OperandConstraint::Reuse(i) = op.constraint() {
+                        debug_assert!(
+                            self.func.inst_operands(inst)[i]
+                                .as_fixed_nonallocatable()
+                                .is_none()
+                        );
+                        reused_input = Some(self.func.inst_operands(inst)[i].vreg());
+                        break;
+                    }
+                }
+
+                // Preprocess defs and uses. Specifically, if there
+                // are any fixed-reg-constrained defs at Late position
+                // and fixed-reg-constrained uses at Early position
+                // with the same preg, we need to (i) add a fixup move
+                // for the use, (ii) rewrite the use to have an Any
+                // constraint, and (ii) move the def to Early position
+                // to reserve the register for the whole instruction.
+                //
+                // We don't touch any fixed-early-def or fixed-late-use
+                // constraints: the only situation where the same physical
+                // register can be used multiple times in the same
+                // instruction is with an early-use and a late-def. Anything
+                // else is a user error.
+                operand_rewrites.clear();
+                let mut late_def_fixed: SmallVec<[PReg; 8]> = smallvec![];
+                for &operand in self.func.inst_operands(inst) {
+                    if let OperandConstraint::FixedReg(preg) = operand.constraint() {
+                        match (operand.pos(), operand.kind()) {
+                            (OperandPos::Late, OperandKind::Def) => {
+                                late_def_fixed.push(preg);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                for (i, &operand) in self.func.inst_operands(inst).iter().enumerate() {
                     if operand.as_fixed_nonallocatable().is_some() {
                         continue;
                     }
-                    let pos = operand_point(function, inst, operand);
-                    if pos.pos() != phase {
-                        continue;
-                    }
-                    let index = operand.vreg().vreg();
-                    if index >= result.len() {
-                        continue;
-                    }
-                    match operand.kind() {
-                        OperandKind::Def => {
-                            let range = if live.get(index) {
-                                current[index].expect("live vreg must have a range")
-                            } else {
-                                let range = CodeRange {
-                                    from: pos,
-                                    to: ProgPoint::before(pos.inst() + 1),
-                                };
-                                let range = push_range(&mut result[index], operand.vreg(), range);
-                                current[index] = Some(range);
-                                live.set(index, true);
-                                range
-                            };
-                            result[index][range]
-                                .uses
-                                .push(make_use(operand, pos, slot, cfg, block));
-                            result[index][range].starts_at_def = true;
-                            if result[index][range].range.from == cfg.block_entry[block_index] {
-                                result[index][range].range.from = pos;
+                    if let OperandConstraint::FixedReg(preg) = operand.constraint() {
+                        match (operand.pos(), operand.kind()) {
+                            (OperandPos::Early, OperandKind::Use)
+                                if live.get(operand.vreg().vreg()) =>
+                            {
+                                // If we have a use constraint at the
+                                // Early point for a fixed preg, and
+                                // this preg is also constrained with
+                                // a *separate* def at Late or is
+                                // clobbered, and *if* the vreg is
+                                // live downward, we have to use the
+                                // multi-fixed-reg mechanism for a
+                                // fixup and rewrite here without the
+                                // constraint. See #53.
+                                //
+                                // We adjust the def liverange and Use
+                                // to an "early" position to reserve
+                                // the register, it still must not be
+                                // used by some other vreg at the
+                                // use-site.
+                                //
+                                // Note that we handle multiple
+                                // conflicting constraints for the
+                                // same vreg in a separate pass (see
+                                // `fixup_multi_fixed_vregs` below).
+                                if late_def_fixed.contains(&preg)
+                                    || self.func.inst_clobbers(inst).contains(preg)
+                                {
+                                    trace!(
+                                        concat!(
+                                            "-> operand {:?} is fixed to preg {:?}, ",
+                                            "is downward live, and there is also a ",
+                                            "def or clobber at this preg"
+                                        ),
+                                        operand, preg
+                                    );
+                                    let pos = ProgPoint::before(inst.raw_u32());
+                                    self.multi_fixed_reg_fixups.push(MultiFixedRegFixup {
+                                        pos,
+                                        from_slot: slot_idx(i)?,
+                                        to_slot: slot_idx(i)?,
+                                        to_preg: PRegIndex::new(preg.index()),
+                                        vreg: VRegIndex::new(operand.vreg().vreg()),
+                                        level: FixedRegFixupLevel::Initial,
+                                    });
+
+                                    // We need to insert a reservation
+                                    // at the before-point to reserve
+                                    // the reg for the use too.
+                                    let range = CodeRange::singleton(pos);
+                                    self.add_liverange_to_preg(range, preg);
+
+                                    // Remove the fixed-preg
+                                    // constraint from the Use.
+                                    operand_rewrites.insert(
+                                        i,
+                                        Operand::new(
+                                            operand.vreg(),
+                                            OperandConstraint::Any,
+                                            operand.kind(),
+                                            operand.pos(),
+                                        ),
+                                    );
+                                }
                             }
-                            live.set(index, false);
-                            current[index] = None;
+                            _ => {}
                         }
-                        OperandKind::Use => {
-                            let range = if live.get(index) {
-                                current[index].expect("live vreg must have a range")
-                            } else {
-                                let range = push_range(
-                                    &mut result[index],
-                                    operand.vreg(),
-                                    CodeRange {
-                                        from: cfg.block_entry[block_index],
-                                        to: pos.next(),
-                                    },
+                    }
+                }
+
+                // Process defs and uses.
+                for &cur_pos in &[InstPosition::After, InstPosition::Before] {
+                    for i in 0..self.func.inst_operands(inst).len() {
+                        // don't borrow `self`
+                        let operand = operand_rewrites
+                            .get(&i)
+                            .cloned()
+                            .unwrap_or(self.func.inst_operands(inst)[i]);
+                        let pos = match (operand.kind(), operand.pos()) {
+                            (OperandKind::Def, OperandPos::Early) => {
+                                ProgPoint::before(inst.raw_u32())
+                            }
+                            (OperandKind::Def, OperandPos::Late) => {
+                                ProgPoint::after(inst.raw_u32())
+                            }
+                            (OperandKind::Use, OperandPos::Late) => {
+                                ProgPoint::after(inst.raw_u32())
+                            }
+                            // If there are any reused inputs in this
+                            // instruction, and this is *not* the
+                            // reused vreg, force `pos` to
+                            // `After`. This ensures that we correctly
+                            // account for the interference between
+                            // the other inputs and the
+                            // input-that-is-reused/output.
+                            (OperandKind::Use, OperandPos::Early)
+                                if reused_input.is_some()
+                                    && reused_input.unwrap() != operand.vreg() =>
+                            {
+                                ProgPoint::after(inst.raw_u32())
+                            }
+                            (OperandKind::Use, OperandPos::Early) => {
+                                ProgPoint::before(inst.raw_u32())
+                            }
+                        };
+
+                        if pos.pos() != cur_pos {
+                            continue;
+                        }
+
+                        trace!(
+                            "processing inst{} operand at {:?}: {:?}",
+                            inst.index(),
+                            pos,
+                            operand
+                        );
+
+                        // If this is a "fixed non-allocatable
+                        // register" operand, set the alloc
+                        // immediately and then ignore the operand
+                        // hereafter.
+                        if let Some(preg) = operand.as_fixed_nonallocatable() {
+                            self.set_alloc(inst, i, Allocation::reg(preg));
+                            continue;
+                        }
+
+                        match operand.kind() {
+                            OperandKind::Def => {
+                                trace!("Def of {} at {:?}", operand.vreg(), pos);
+
+                                // Get or create the LiveRange.
+                                let mut lr = vreg_ranges[operand.vreg().vreg()];
+                                trace!(" -> has existing LR {:?}", lr);
+                                // If there was no liverange (dead def), create a trivial one.
+                                if !live.get(operand.vreg().vreg()) {
+                                    let from = pos;
+                                    // We want to we want to span
+                                    // until Before of the next
+                                    // inst. This ensures that early
+                                    // defs used for temps on an
+                                    // instruction are reserved across
+                                    // the whole instruction.
+                                    let to = ProgPoint::before(pos.inst() + 1);
+                                    lr = self.add_liverange_to_vreg(
+                                        VRegIndex::new(operand.vreg().vreg()),
+                                        CodeRange { from, to },
+                                    );
+                                    trace!(" -> invalid; created {:?}", lr);
+                                    vreg_ranges[operand.vreg().vreg()] = lr;
+                                    live.set(operand.vreg().vreg(), true);
+                                }
+                                // Create the use in the LiveRange.
+                                self.insert_use_into_liverange(
+                                    lr,
+                                    Use::new(operand, pos, slot_idx(i)?),
                                 );
-                                current[index] = Some(range);
-                                range
-                            };
-                            result[index][range]
-                                .uses
-                                .push(make_use(operand, pos, slot, cfg, block));
-                            live.set(index, true);
+                                // If def (not mod), this reg is now dead,
+                                // scanning backward; make it so.
+                                if operand.kind() == OperandKind::Def {
+                                    // Trim the range for this vreg to start
+                                    // at `pos` if it previously ended at the
+                                    // start of this block (i.e. was not
+                                    // merged into some larger LiveRange due
+                                    // to out-of-order blocks).
+                                    if self.ranges[lr].range.from
+                                        == self.cfginfo.block_entry[block.index()]
+                                    {
+                                        trace!(" -> started at block start; trimming to {:?}", pos);
+                                        self.ranges[lr].range.from = pos;
+                                    }
+
+                                    self.ranges[lr].set_flag(LiveRangeFlag::StartsAtDef);
+
+                                    // Remove from live-set.
+                                    live.set(operand.vreg().vreg(), false);
+                                    vreg_ranges[operand.vreg().vreg()] = LiveRangeIndex::invalid();
+                                }
+                            }
+                            OperandKind::Use => {
+                                // Create/extend the LiveRange if it
+                                // doesn't already exist, and add the use
+                                // to the range.
+                                let mut lr = vreg_ranges[operand.vreg().vreg()];
+                                if !live.get(operand.vreg().vreg()) {
+                                    let range = CodeRange {
+                                        from: self.cfginfo.block_entry[block.index()],
+                                        to: pos.next(),
+                                    };
+                                    lr = self.add_liverange_to_vreg(
+                                        VRegIndex::new(operand.vreg().vreg()),
+                                        range,
+                                    );
+                                    vreg_ranges[operand.vreg().vreg()] = lr;
+                                }
+                                debug_assert!(lr.is_valid());
+
+                                trace!("Use of {:?} at {:?} -> {:?}", operand, pos, lr,);
+
+                                self.insert_use_into_liverange(
+                                    lr,
+                                    Use::new(operand, pos, slot_idx(i)?),
+                                );
+
+                                // Add to live-set.
+                                live.set(operand.vreg().vreg(), true);
+                            }
                         }
                     }
                 }
             }
-        }
-        for &param in function.block_params(block) {
-            if param.vreg() < result.len() && !live.get(param.vreg()) {
-                push_range(
-                    &mut result[param.vreg()],
-                    param,
-                    CodeRange::singleton(cfg.block_entry[block_index]),
-                );
-            }
-            for &pred in function.block_preds(block) {
-                liveness.blockparam_ins.push(BlockParamIn {
-                    from_block: pred,
-                    to_block: block,
-                    to_vreg: param,
-                });
-            }
-        }
-    }
-    for ranges in &mut result {
-        ranges.sort_unstable_by_key(|range| range.range.from);
-        for range in ranges {
-            range.uses.sort_unstable_by_key(|use_| use_.pos);
-        }
-    }
-    liveness.blockparam_ins.sort_unstable();
-    liveness.blockparam_outs.sort_unstable();
-    result
-}
 
-fn push_range(ranges: &mut Vec<LiveRange>, vreg: VReg, range: CodeRange) -> usize {
-    if let Some((index, previous)) = ranges
-        .iter_mut()
-        .enumerate()
-        .find(|(_, previous)| previous.range.from == range.to)
-    {
-        previous.range.from = range.from;
-        index
-    } else {
-        ranges.push(LiveRange {
-            range,
-            vreg,
-            uses: Vec::new(),
-            starts_at_def: false,
-        });
-        ranges.len() - 1
-    }
-}
-fn vreg_class<F: Function>(function: &F, index: usize) -> crate::reg_alloc::reg::RegClass {
-    for block in 0..function.num_blocks() {
-        for &vreg in function.block_params(Block::new(block)) {
-            if vreg.vreg() == index {
-                return vreg.class();
+            // Block parameters define vregs at the very beginning of
+            // the block. Remove their live vregs from the live set
+            // here.
+            for vreg in self.func.block_params(block) {
+                if live.get(vreg.vreg()) {
+                    live.set(vreg.vreg(), false);
+                } else {
+                    // Create trivial liverange if blockparam is dead.
+                    let start = self.cfginfo.block_entry[block.index()];
+                    self.add_liverange_to_vreg(
+                        VRegIndex::new(vreg.vreg()),
+                        CodeRange {
+                            from: start,
+                            to: start.next(),
+                        },
+                    );
+                }
+                // add `blockparam_ins` entries.
+                let vreg_idx = VRegIndex::new(vreg.vreg());
+                for &pred in self.func.block_preds(block) {
+                    self.blockparam_ins.push(BlockparamIn {
+                        to_vreg: vreg_idx,
+                        to_block: block,
+                        from_block: pred,
+                    });
+                }
             }
         }
-        for inst in function.block_insns(Block::new(block)).iter() {
-            for &operand in function.inst_operands(inst) {
-                if operand.vreg().vreg() == index {
-                    return operand.vreg().class();
+
+        // Make ranges in each vreg and uses in each range appear in
+        // sorted order. We built them in reverse order above, so this
+        // is a simple reversal, *not* a full sort.
+        //
+        // The ordering invariant is always maintained for uses and
+        // always for ranges in bundles (which are initialized later),
+        // but not always for ranges in vregs; those are sorted only
+        // when needed, here and then again at the end of allocation
+        // when resolving moves.
+
+        for vreg in &mut self.ctx.vregs {
+            vreg.ranges.reverse();
+            let mut last = None;
+            for entry in &mut vreg.ranges {
+                // Ranges may have been truncated above at defs. We
+                // need to update with the final range here.
+                entry.range = self.ctx.ranges[entry.index].range;
+                // Assert in-order and non-overlapping.
+                debug_assert!(last.is_none() || last.unwrap() <= entry.range.from);
+                last = Some(entry.range.to);
+            }
+        }
+
+        for range in &mut self.ranges {
+            range.uses.reverse();
+            debug_assert!(range.uses.windows(2).all(|win| win[0].pos <= win[1].pos));
+        }
+
+        self.blockparam_ins.sort_unstable_by_key(|x| x.key());
+        self.blockparam_outs.sort_unstable_by_key(|x| x.key());
+
+        self.ctx.scratch_vreg_ranges = vreg_ranges;
+        self.ctx.scratch_operand_rewrites = operand_rewrites;
+
+        Ok(())
+    }
+
+    pub fn fixup_multi_fixed_vregs(&mut self) {
+        // Do a fixed-reg cleanup pass: if there are any LiveRanges with
+        // multiple uses at the same ProgPoint and there is
+        // more than one FixedReg constraint at that ProgPoint, we
+        // need to record all but one of them in a special fixup list
+        // and handle them later; otherwise, bundle-splitting to
+        // create minimal bundles becomes much more complex (we would
+        // have to split the multiple uses at the same progpoint into
+        // different bundles, which breaks invariants related to
+        // disjoint ranges and bundles).
+        let mut extra_clobbers: SmallVec<[(PReg, ProgPoint); 8]> = smallvec![];
+        for vreg in 0..self.vregs.len() {
+            let vreg = VRegIndex::new(vreg);
+            for range_idx in 0..self.vregs[vreg].ranges.len() {
+                let entry = self.vregs[vreg].ranges[range_idx];
+                let range = entry.index;
+                trace!("multi-fixed-reg cleanup: vreg {:?} range {:?}", vreg, range,);
+
+                // Find groups of uses that occur in at the same program point.
+                for uses in self.ctx.ranges[range]
+                    .uses
+                    .chunk_by_mut(|a, b| a.pos == b.pos)
+                {
+                    if uses.len() < 2 {
+                        continue;
+                    }
+
+                    // Search for conflicting constraints in the uses.
+                    let mut requires_reg = false;
+                    let mut num_fixed_reg = 0;
+                    let mut num_fixed_stack = 0;
+                    let mut first_reg_slot = None;
+                    let mut first_stack_slot = None;
+                    let mut min_limit = usize::MAX;
+                    let mut max_fixed_reg = usize::MIN;
+                    for u in uses.iter() {
+                        match u.operand.constraint() {
+                            OperandConstraint::Any => {
+                                first_reg_slot.get_or_insert(u.slot);
+                                first_stack_slot.get_or_insert(u.slot);
+                            }
+                            OperandConstraint::Reg | OperandConstraint::Reuse(_) => {
+                                first_reg_slot.get_or_insert(u.slot);
+                                requires_reg = true;
+                            }
+                            OperandConstraint::Limit(max) => {
+                                first_reg_slot.get_or_insert(u.slot);
+                                min_limit = min_limit.min(max);
+                                requires_reg = true;
+                            }
+                            OperandConstraint::FixedReg(preg) => {
+                                max_fixed_reg = max_fixed_reg.max(preg.hw_enc());
+                                if self.ctx.pregs[preg.index()].is_stack {
+                                    num_fixed_stack += 1;
+                                    first_stack_slot.get_or_insert(u.slot);
+                                } else {
+                                    requires_reg = true;
+                                    num_fixed_reg += 1;
+                                    first_reg_slot.get_or_insert(u.slot);
+                                }
+                            }
+                            // Maybe this could be supported in this future...
+                            OperandConstraint::Stack => panic!(
+                                "multiple uses of vreg with a Stack constraint are not supported"
+                            ),
+                        }
+                    }
+
+                    // Fast path if there are no conflicts.
+                    if num_fixed_reg + num_fixed_stack <= 1
+                        && !(requires_reg && num_fixed_stack != 0)
+                        && max_fixed_reg < min_limit
+                    {
+                        continue;
+                    }
+
+                    // We pick one constraint (in order: FixedReg, Reg, FixedStack)
+                    // and then rewrite any incompatible constraints to Any.
+                    // This allows register allocation to succeed and we will
+                    // later insert moves to satisfy the rewritten constraints.
+                    let source_slot = if requires_reg {
+                        first_reg_slot.unwrap()
+                    } else {
+                        first_stack_slot.unwrap()
+                    };
+                    let mut first_preg = None;
+                    for u in uses.iter_mut() {
+                        if let OperandConstraint::FixedReg(preg) = u.operand.constraint() {
+                            let vreg_idx = VRegIndex::new(u.operand.vreg().vreg());
+                            let preg_idx = PRegIndex::new(preg.index());
+                            trace!(
+                                "at pos {:?}, vreg {:?} has fixed constraint to preg {:?}",
+                                u.pos, vreg_idx, preg_idx
+                            );
+
+                            // FixedStack is incompatible if there are any
+                            // Reg/FixedReg constraints. FixedReg is
+                            // incompatible if there already is a different
+                            // FixedReg constraint. If either condition is true,
+                            // we edit the constraint below; otherwise, we can
+                            // skip this edit.
+                            if !(requires_reg && self.ctx.pregs[preg.index()].is_stack)
+                                && *first_preg.get_or_insert(preg) == preg
+                                && preg.hw_enc() < min_limit
+                            {
+                                continue;
+                            }
+
+                            trace!(" -> duplicate; switching to constraint Any");
+                            self.ctx.multi_fixed_reg_fixups.push(MultiFixedRegFixup {
+                                pos: u.pos,
+                                from_slot: source_slot,
+                                to_slot: u.slot,
+                                to_preg: preg_idx,
+                                vreg: vreg_idx,
+                                level: FixedRegFixupLevel::Secondary,
+                            });
+                            u.operand = Operand::new(
+                                u.operand.vreg(),
+                                OperandConstraint::Any,
+                                u.operand.kind(),
+                                u.operand.pos(),
+                            );
+                            trace!(" -> extra clobber {} at inst{}", preg, u.pos.inst());
+                            extra_clobbers.push((preg, u.pos));
+                        }
+                    }
+                }
+
+                for (clobber, pos) in extra_clobbers.drain(..) {
+                    let range = CodeRange {
+                        from: pos,
+                        to: pos.next(),
+                    };
+                    self.add_liverange_to_preg(range, clobber);
                 }
             }
         }
     }
-    crate::reg_alloc::reg::RegClass::Int
-}
-fn operand_point<F: Function>(function: &F, inst: Inst, operand: Operand) -> ProgPoint {
-    match (operand.kind(), operand.pos()) {
-        (OperandKind::Def, OperandPos::Early) => ProgPoint::before(inst.raw_u32()),
-        (OperandKind::Def, OperandPos::Late) | (OperandKind::Use, OperandPos::Late) => {
-            ProgPoint::after(inst.raw_u32())
-        }
-        (OperandKind::Use, OperandPos::Early) => {
-            let reused = function
-                .inst_operands(inst)
-                .iter()
-                .find_map(|op| match op.constraint() {
-                    OperandConstraint::Reuse(i) => Some(function.inst_operands(inst)[i].vreg()),
-                    _ => None,
-                });
-            if reused.is_some_and(|vreg| vreg != operand.vreg()) {
-                ProgPoint::after(inst.raw_u32())
-            } else {
-                ProgPoint::before(inst.raw_u32())
-            }
-        }
-    }
-}
-fn make_use(operand: Operand, pos: ProgPoint, slot: usize, cfg: &CFGInfo, block: Block) -> Use {
-    Use {
-        operand,
-        pos,
-        slot: u16::try_from(slot).expect("too many instruction operands"),
-        weight: spill_weight_from_constraint(
-            operand.constraint(),
-            cfg.approx_loop_depth[block.index()],
-            operand.kind() == OperandKind::Def,
-        )
-        .to_bits(),
-    }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::reg_alloc::{
-        function::Function,
-        index::{Block, Inst, InstRange},
-        reg::{Operand, PRegSet, RegClass, VReg},
-    };
-
-    use super::*;
-    use crate::reg_alloc::ion::{CFGInfo, merge_vreg_bundles};
-
-    struct EdgeFunction {
-        source: VReg,
-        operands: [Vec<Operand>; 2],
-        params: [Vec<VReg>; 2],
-        succs: [Vec<Block>; 2],
-        preds: [Vec<Block>; 2],
-    }
-
-    impl Function for EdgeFunction {
-        fn num_insts(&self) -> usize {
-            2
-        }
-        fn num_blocks(&self) -> usize {
-            2
-        }
-        fn entry_block(&self) -> Block {
-            Block::new(0)
-        }
-        fn block_insns(&self, block: Block) -> InstRange {
-            InstRange::new(Inst::new(block.index()), Inst::new(block.index() + 1))
-        }
-        fn block_succs(&self, block: Block) -> &[Block] {
-            &self.succs[block.index()]
-        }
-        fn block_preds(&self, block: Block) -> &[Block] {
-            &self.preds[block.index()]
-        }
-        fn block_params(&self, block: Block) -> &[VReg] {
-            &self.params[block.index()]
-        }
-        fn is_ret(&self, _inst: Inst) -> bool {
-            false
-        }
-        fn is_branch(&self, inst: Inst) -> bool {
-            inst == Inst::new(0)
-        }
-        fn branch_blockparams(&self, block: Block, _inst: Inst, _succ_idx: usize) -> &[VReg] {
-            if block == Block::new(0) {
-                core::slice::from_ref(&self.source)
-            } else {
-                &[]
-            }
-        }
-        fn inst_operands(&self, inst: Inst) -> &[Operand] {
-            &self.operands[inst.index()]
-        }
-        fn inst_clobbers(&self, _inst: Inst) -> PRegSet {
-            PRegSet::empty()
-        }
-        fn num_vregs(&self) -> usize {
-            2
-        }
-        fn spillslot_size(&self, _regclass: RegClass) -> usize {
-            1
-        }
-    }
-
-    #[test]
-    fn block_param_edge_is_live_out_and_coalesced() {
-        let source = VReg::new(0, RegClass::Int);
-        let param = VReg::new(1, RegClass::Int);
-        let function = EdgeFunction {
-            source,
-            operands: [
-                vec![Operand::reg_def(source)],
-                vec![Operand::reg_use(param)],
-            ],
-            params: [vec![], vec![param]],
-            succs: [vec![Block::new(1)], vec![]],
-            preds: [vec![], vec![Block::new(0)]],
-        };
-        let cfg = CFGInfo::new(&function).unwrap();
-        let mut liveness = compute_liveness(&function, &cfg).unwrap();
-        assert!(liveness.liveouts[0].get(source.vreg()));
-
-        let ranges = build_live_ranges(&function, &cfg, &mut liveness);
-        assert_eq!(liveness.blockparam_outs.len(), 1);
-        assert_eq!(liveness.blockparam_outs[0].from_vreg, source);
-        assert_eq!(liveness.blockparam_outs[0].to_vreg, param);
-        let bundles = merge_vreg_bundles(&function, &ranges, &liveness);
-        assert_eq!(bundles.bundle(source), bundles.bundle(param));
-    }
+/// Compatibility view retained for the analysis-only coalescing helper.
+#[derive(Clone, Debug, Default)]
+pub struct Liveness {
+    pub blockparam_ins: Vec<BlockparamIn>,
+    pub blockparam_outs: Vec<BlockparamOut>,
 }

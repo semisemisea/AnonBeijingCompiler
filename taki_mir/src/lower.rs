@@ -184,6 +184,11 @@ pub trait LowerBackend {
     fn format_block_label(lb: &LoweredBlock, func_data: &HirFunctionData) -> String;
 
     fn emit_long_jump(ctx: &mut LowerContext<Self::MInst>, target: MirBlockIndex);
+
+    /// Optional target-private assembly appended after all generated functions.
+    fn runtime_assembly(_program: &HirProgram) -> Option<&'static str> {
+        None
+    }
 }
 
 /// impl block for all backend specified operation

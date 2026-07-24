@@ -274,6 +274,17 @@ where
         log::debug!(target: "taki_mir::emit", "function={} final assembly: bytes={}, lines={}\n{}", func_data.name(), asm.len(), asm.lines().count(), asm);
     }
 
+    if let Some(runtime) = B::runtime_assembly(p) {
+        if !buf.ends_with('\n') {
+            buf.push('\n');
+        }
+        buf.push('\n');
+        buf.push_str(runtime);
+        if !runtime.ends_with('\n') {
+            buf.push('\n');
+        }
+    }
+
     Ok(buf)
 }
 pub mod libcall;

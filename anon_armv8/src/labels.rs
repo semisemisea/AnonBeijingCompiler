@@ -1,11 +1,29 @@
 use taki_mir::{block_order::MirBlockIndex, prelude::*, vcode::EmitContext};
 
+/// Compiler-provided symbols emitted into the same assembly unit as user code.
+///
+/// These are intentionally distinct from source-level functions and external
+/// libc/runtime symbols: every variant must have a private, collision-safe
+/// local assembly label and a matching runtime fragment when selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddedSymbol {
+    Memset,
+}
+
+impl EmbeddedSymbol {
+    pub const fn symbol(self) -> &'static str {
+        match self {
+            Self::Memset => ".Lsoyo_memset",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Label {
     Block(MirBlockIndex),
     Function(HirFunction),
     GlobalValue(HirInst),
-    ExternalSymbol(&'static str),
+    Embedded(EmbeddedSymbol),
 }
 
 impl Label {
@@ -22,16 +40,12 @@ impl Label {
         Self::Block(block)
     }
 
-    pub fn libcall(libcall: taki_mir::libcall::LibCall) -> Self {
-        Self::ExternalSymbol(libcall.symbol())
-    }
-
     pub fn emit(&self, ctx: &mut dyn EmitContext) -> core::fmt::Result {
         match self {
             Self::Block(block) => ctx.write_label_ref(*block),
             Self::Function(function) => ctx.write_function_label(*function),
             Self::GlobalValue(value) => ctx.write_global_label(*value),
-            Self::ExternalSymbol(symbol) => ctx.write_external_symbol(symbol),
+            Self::Embedded(symbol) => write!(ctx, "{}", symbol.symbol()),
         }
     }
 }

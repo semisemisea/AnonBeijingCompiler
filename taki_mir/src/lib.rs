@@ -21,6 +21,18 @@ pub mod riscv64;
 pub mod types;
 pub mod vcode;
 
+/// Allocation containers use this to reserve indexed storage without exposing
+/// a particular backing collection implementation.
+pub trait VecExt<T> {
+    fn preallocate(&mut self, capacity: usize);
+}
+
+impl<T> VecExt<T> for Vec<T> {
+    fn preallocate(&mut self, capacity: usize) {
+        self.reserve(capacity.saturating_sub(self.capacity()));
+    }
+}
+
 pub mod prelude {
     use std::collections::HashSet;
 
@@ -198,8 +210,8 @@ where
 
         let machine_env = vcode.abi.machine_env();
         let allocation_start = Instant::now();
-        let output =
-            crate::reg_alloc::alloc::run(&vcode, machine_env).expect("register allocation failed");
+        let output = crate::reg_alloc::ion::run(&vcode, machine_env)
+            .expect("register allocation failed");
         vcode.verify_alloc_output(&output).unwrap_or_else(|error| {
             log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
             panic!("function={} {error}", func_data.name());

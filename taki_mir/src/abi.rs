@@ -364,10 +364,20 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
         spill_size: u32,
         output: &crate::reg_alloc::reg::Output,
     ) -> Result<(), String> {
+        // Allocator edits may use a callee-saved register even when no
+        // instruction operand is assigned to it. This happens, for example,
+        // when Ion resolves a live-range split with a register-to-register
+        // move. Include both endpoints of every edit when deriving the
+        // callee-save set; otherwise a function can silently clobber a
+        // caller's preserved register.
         let mut callee_saved: Vec<PReg> = output
             .allocs
             .iter()
             .filter_map(|a| a.as_reg())
+            .chain(output.edits.iter().flat_map(|(_, edit)| {
+                let crate::reg_alloc::reg::Edit::Move { from, to, .. } = edit;
+                [from.as_reg(), to.as_reg()].into_iter().flatten()
+            }))
             .filter(|p| M::is_callee_saved(*p))
             .collect();
         callee_saved.sort_unstable();

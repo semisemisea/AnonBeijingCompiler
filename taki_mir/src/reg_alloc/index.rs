@@ -5,7 +5,7 @@ macro_rules! define_index {
 
         #[derive(Clone, Debug, Default)]
         pub struct $storage {
-            storage: Vec<$elem>,
+            pub(crate) storage: Vec<$elem>,
         }
 
         impl $storage {

@@ -3,13 +3,95 @@
 Only pending work belongs in this file. Completed implementation notes and
 historical measurements belong in commits, tests, or dedicated documentation.
 
-## Current Priority: Bulk Local Array Initialization Follow-Up
+## Current Priority: RISC-V Branch Layout And ABI Conformance
 
-- [ ] Validate RISC-V `MemZero` code generation after fixing the pre-existing
-  incoming-register argument spill model, which currently violates the allocator
-  contract for an allocatable physical argument register.
-- [ ] Run the full AArch64 and RISC-V acceptance matrix after the focused coverage
-  and RISC-V entry-argument repair are available.
+The Ion CFG invariant and atomic RISC-V CFG transfer milestone is complete:
+allocator-visible CFG targets are no longer held in allocatable virtual
+registers, and `make test-riscv h_functional -- -O1` passes. Remaining work is
+branch range/layout quality and a shared LP64D scalar argument layout.
+
+### 1. Lower Branch Range Expansion After Register Allocation
+
+- [ ] Keep logical `Jump` and conditional branch targets symbolic until after
+  register allocation and edge-edit insertion. Do not allocate a program VReg
+  merely to hold a static CFG label address.
+- [ ] Initially expand all logical RISC-V CFG jumps using the reserved post-RA
+  `x31` scratch register where a long form is required. `x31` and `x30` must
+  remain absent from allocatable register sets; `x31` may be reused only after
+  each spill/edit or long-jump sequence has consumed it.
+- [ ] Define an explicit long unconditional form and an explicit long
+  conditional form, with all control transfers contained in the expansion. Do
+  not rely on an allocator-visible `LoadAddr`/`JumpReg` pair remaining adjacent.
+- [ ] Add post-RA branch layout selection: direct conditional branch for B-type
+  in-range targets, direct `j`/`jal` for in-range unconditional targets, and an
+  inverted conditional over a fixed-scratch long jump when needed.
+- [ ] Implement monotonic iterative branch relaxation after allocator edits are
+  materialized. Recompute layout after every promotion because one long branch
+  can make a later branch out of range.
+- [ ] Test B-type and JAL boundary values in both directions, a second-pass
+  promotion case, long loop backedges, long value-carrying edge blocks, and safe
+  sequential reuse of `x31` by a stack-to-stack move followed by a long jump.
+- [ ] Add fallthrough-aware branch inversion and empty jump-only edge threading
+  only after correctness is established. Never thread through an edge block
+  containing semantic work or regalloc edits.
+- [ ] Defer Cranelift-style islands/veneers until the compiler has a structured
+  post-RA layout representation with known instruction sizes, label-use ranges,
+  and safe insertion points. Current direct text emission cannot safely port
+  `MachBuffer` deadlines piecemeal.
+
+### 2. Centralize RISC-V ABI Argument Locations
+
+- [ ] Replace duplicated caller, callee, and outgoing-size loops with one shared
+  RISC-V ABI argument-location computation. It must be consumed by
+  `compute_arg_loc`, call lowering, and outgoing-area precomputation.
+- [ ] Record per argument: integer or float register location, stack offset,
+  storage width, alignment, and lowered load/store type. Use this record rather
+  than independently maintaining integer/float counters in three locations.
+- [ ] Match the current Cranelift LP64D scalar stack policy for normal calls:
+  use independent `a0..a7` and `fa0..fa7` banks; use at least an XLEN-sized
+  stack slot for overflow scalar arguments; align each slot; round the complete
+  outgoing argument area to 16 bytes.
+- [ ] Preserve the correct value access width inside an ABI slot: `i32` uses
+  `sw`/`lw`, `f32` uses `fsw`/`flw`, and pointer values use `sd`/`ld`.
+- [ ] Verify that incoming `s0`-relative offsets and outgoing `sp`-relative
+  offsets are derived from the same signature and remain correct after frame
+  legalization.
+- [ ] Explicitly document unsupported RISC-V C psABI cases before claiming ABI
+  interoperability: variadic floating-point classification, aggregates,
+  register-pair alignment, split values, hidden return areas, and wider scalar
+  types. Implement them only with accepted source-level requirements and tests.
+- [ ] Add ABI unit and selector tests for 0/1/8/9 integer arguments, 0/1/8/9
+  float arguments, independent exhaustion of each bank, alternating mixed
+  arguments, and overflow pointer/i32/pointer/f32/pointer alignment.
+- [ ] Add high-pressure call tests for integer and float fixed-register cycles,
+  stack arguments, recursive calls, and values live across calls. Include a
+  reduced `params_f40_i24`-style fixture that validates every overflow argument.
+
+### 3. RISC-V Acceptance Gates
+
+- [ ] First pass focused regressions at `-O0` and `-O1`:
+  `h_functional/09_BFS.sy`, `10_DFS.sy`, `11_BST.sy`, `12_DSU.sy`,
+  `16_k_smallest.sy`, `17_maximal_clique.sy`, `18_prim.sy`, `19_search.sy`,
+  `20_sort.sy`, `21_union_find.sy`, `29_long_line.sy`, and `39_fp_params.sy`.
+- [ ] Require the focused cases to execute with exact stdout and return-code
+  agreement. Require `39_fp_params` to produce the expected
+  `8: 7 5 6 5 5 6 9 8` integer-array line before considering ABI work complete.
+- [ ] Verify generated assembly for focused regressions: no edge edit may occur
+  between a conditionally reachable control transfer and its logical false leg;
+  no allocator-visible CFG jump target may reside in an allocatable VReg; and
+  all overflow ABI slots meet the declared width/alignment policy.
+- [ ] Run `cargo fmt --check`, `git diff --check`, `cargo test -p taki_mir`,
+  `cargo test --workspace`, `make test-riscv h_functional`, and
+  `make test-riscv h_functional -- -O1`.
+- [ ] Only after `h_functional` is clean, run `make test-riscv functional` and
+  `make test-riscv functional -- -O1`, then record the exact pass/fail matrix
+  and any remaining target-specific unsupported feature.
+- [ ] Validate RISC-V `MemZero` only after the allocator and ABI gates above
+  pass; test both inline 4-word clears and large `memset` fallback under `-O0`
+  and `-O1`.
+- [ ] Run the full AArch64 matrix after shared allocator or ABI changes:
+  `make test`, `make test ARGS="-O 1"`, and `make test-llvm`. Treat any AArch64
+  regression as a blocker because Ion and generic ABI/frame code are shared.
 
 ### Follow-Up Optimization Work
 

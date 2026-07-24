@@ -73,7 +73,7 @@ fn run(args: cli::Arg) -> Result<(), String> {
         None
     };
     let asm = if needs_asm {
-        Some(dump_asm(&program, args.target)?)
+        Some(dump_asm(&program, args.target))
     } else {
         None
     };
@@ -113,14 +113,10 @@ fn dump_llvm(program: &raana_ir::ir::Program) -> String {
     raana_ir::llvm::write_llvm_ir(program)
 }
 
-fn dump_asm(program: &raana_ir::ir::Program, target: cli::Target) -> Result<String, String> {
+fn dump_asm(program: &raana_ir::ir::Program, target: cli::Target) -> String {
     match target {
-        cli::Target::Riscv64 => {
-            taki_mir::compile::<Riscv64Backend>(program).map_err(|error| error.to_string())
-        }
-        cli::Target::Aarch64 => {
-            taki_mir::compile::<AArch64Backend>(program).map_err(|error| error.to_string())
-        }
+        cli::Target::Riscv64 => taki_mir::compile::<Riscv64Backend>(program),
+        cli::Target::Aarch64 => taki_mir::compile::<AArch64Backend>(program),
     }
 }
 

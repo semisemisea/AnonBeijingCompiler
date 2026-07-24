@@ -42,6 +42,10 @@ impl ABIMachineSpec for Riscv64ABI {
     }
 
     fn spillslot_size(_regclass: RegClass) -> u32 {
+        1
+    }
+
+    fn spill_unit_bytes() -> u32 {
         8
     }
 
@@ -204,6 +208,52 @@ impl ABIMachineSpec for Riscv64ABI {
             }
         }
 
+        (args, stack_offset as u32)
+    }
+
+    fn compute_call_arg_loc(types: &[raana_ir::ir::Type]) -> (Vec<ArgSlot>, u32) {
+        use raana_ir::ir::TypeKind;
+
+        let mut args = Vec::with_capacity(types.len());
+        let mut int_arg_idx = 0;
+        let mut float_arg_idx = 0;
+        let mut stack_offset = 0usize;
+        for ty in types {
+            let size = ty.size();
+            match ty.kind() {
+                TypeKind::Int32 | TypeKind::Pointer(_) if int_arg_idx < 8 => {
+                    args.push(ArgSlot::Reg {
+                        reg: ARG_REG[int_arg_idx].to_physical_reg().unwrap(),
+                        ty: ty.clone(),
+                    });
+                    int_arg_idx += 1;
+                }
+                TypeKind::Float32 if float_arg_idx < 8 => {
+                    args.push(ArgSlot::Reg {
+                        reg: FARG_REG[float_arg_idx].to_physical_reg().unwrap(),
+                        ty: ty.clone(),
+                    });
+                    float_arg_idx += 1;
+                }
+                TypeKind::Int32 | TypeKind::Pointer(_) => {
+                    int_arg_idx += 1;
+                    args.push(ArgSlot::Stack {
+                        offset: stack_offset as i64,
+                        ty: ty.clone(),
+                    });
+                    stack_offset += size;
+                }
+                TypeKind::Float32 => {
+                    float_arg_idx += 1;
+                    args.push(ArgSlot::Stack {
+                        offset: stack_offset as i64,
+                        ty: ty.clone(),
+                    });
+                    stack_offset += size;
+                }
+                kind => panic!("unsupported RISC-V scalar argument type: {kind:?}"),
+            }
+        }
         (args, stack_offset as u32)
     }
 

@@ -134,7 +134,7 @@ fn lower_global_init(program: &HirProgram, init: HirInst) -> Vec<GlobalData> {
     }
 }
 
-pub fn compile<B: LowerBackend>(p: &HirProgram) -> Result<String, crate::lower::CodegenError>
+pub fn compile<B: LowerBackend>(p: &HirProgram) -> String
 where
     B::MInst: MachInstEmit,
 {
@@ -201,8 +201,8 @@ where
         };
         let lower_order = BlockLoweringOrder::new(arena);
         let abi = CalleeABI::new(arena);
-        let lower = LowerContext::new(p, func, abi, lower_order)?;
-        let mut vcode = lower.lower::<B>()?;
+        let lower = LowerContext::new(p, func, abi, lower_order);
+        let mut vcode = lower.lower::<B>();
         vcode.verify("post-lowering").unwrap_or_else(|error| {
             log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
             panic!("function={} {error}", func_data.name());
@@ -244,26 +244,29 @@ where
                 panic!("function={} {error}", func_data.name());
             });
 
-        let spill_units = u32::try_from(output.num_spillslots).map_err(|_| {
-            crate::lower::CodegenError::backend(
-                arena,
-                "frame layout",
-                "allocator spill-slot count exceeds frame range",
+        let spill_units = u32::try_from(output.num_spillslots).unwrap_or_else(|_| {
+            panic!(
+                "code generation invariant failed in function `{}`, phase `frame layout`: allocator spill-slot count exceeds frame range",
+                func_data.name()
             )
-        })?;
+        });
         let spill_size = spill_units
             .checked_mul(vcode.abi.spill_unit_bytes())
-            .ok_or_else(|| {
-                crate::lower::CodegenError::backend(
-                    arena,
-                    "frame layout",
-                    "allocator spill area exceeds frame range",
+            .unwrap_or_else(|| {
+                panic!(
+                    "code generation invariant failed in function `{}`, phase `frame layout`: allocator spill area exceeds frame range",
+                    func_data.name()
                 )
-            })?;
+            });
         vcode
             .abi
             .compute_frame_layout(spill_size, &output)
-            .map_err(|error| crate::lower::CodegenError::backend(arena, "frame layout", error))?;
+            .unwrap_or_else(|error| {
+                panic!(
+                    "code generation invariant failed in function `{}`, phase `frame layout`: {error}",
+                    func_data.name()
+                )
+            });
         log::debug!(target: "taki_mir::reg_alloc", "function={} frame: spill-units={}, spill-bytes={}, frame-bytes={}", func_data.name(), output.num_spillslots, spill_size, vcode.abi.frame_layout().total_size);
         log::debug!(target: "taki_mir::emit", "function={} frame layout={:?}", func_data.name(), vcode.abi.frame_layout());
 
@@ -285,6 +288,6 @@ where
         }
     }
 
-    Ok(buf)
+    buf
 }
 pub mod libcall;

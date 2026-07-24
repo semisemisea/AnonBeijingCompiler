@@ -1,12 +1,126 @@
 use itertools::Itertools;
+use rustc_hash::FxHashMap;
 
 use crate::ir::{
     BasicBlockBuilders, LocalBuilder,
     basic_block::{BasicBlock, BasicBlockArena, BasicBlockData},
     builder::ReplaceBuilder,
     function::{Function, FunctionArena, FunctionData},
+    inst_kind::{BinaryOp, InstKind},
     instruction::{GlobalInstArena, Inst, InstData, LocalInstArena},
 };
+
+const INST_EQUIV_DEPTH_LIMIT: usize = 32;
+
+#[derive(Clone, Copy)]
+enum InstEquivState {
+    Visiting,
+    Equivalent(bool),
+}
+
+struct InstEquivContext<'a, A: Arena + ?Sized> {
+    arena: &'a A,
+    cache: FxHashMap<(Inst, Inst), InstEquivState>,
+}
+
+impl<'a, A: Arena + ?Sized> InstEquivContext<'a, A> {
+    fn new(arena: &'a A) -> Self {
+        Self {
+            arena,
+            cache: FxHashMap::default(),
+        }
+    }
+
+    fn insts_equiv(&mut self, lhs: &[Inst], rhs: &[Inst]) -> bool {
+        insts_equiv_at(self.arena, &mut self.cache, lhs, rhs, 0)
+    }
+
+    fn inst_equiv(&mut self, lhs: Inst, rhs: Inst, depth: usize) -> bool {
+        inst_equiv(self.arena, &mut self.cache, lhs, rhs, depth)
+    }
+}
+
+fn insts_equiv_at<A: Arena + ?Sized>(
+    arena: &A,
+    cache: &mut FxHashMap<(Inst, Inst), InstEquivState>,
+    lhs: &[Inst],
+    rhs: &[Inst],
+    depth: usize,
+) -> bool {
+    lhs.len() == rhs.len()
+        && lhs
+            .iter()
+            .zip(rhs)
+            .all(|(&lhs, &rhs)| inst_equiv(arena, cache, lhs, rhs, depth))
+}
+
+fn inst_equiv<A: Arena + ?Sized>(
+    arena: &A,
+    cache: &mut FxHashMap<(Inst, Inst), InstEquivState>,
+    lhs: Inst,
+    rhs: Inst,
+    depth: usize,
+) -> bool {
+    if lhs == rhs {
+        return true;
+    }
+    if depth >= INST_EQUIV_DEPTH_LIMIT {
+        return false;
+    }
+    if let Some(state) = cache.get(&(lhs, rhs)) {
+        return matches!(state, InstEquivState::Equivalent(true));
+    }
+
+    let lhs_data = arena.inst_data(lhs);
+    let rhs_data = arena.inst_data(rhs);
+    if lhs_data.ty() != rhs_data.ty()
+        || std::mem::discriminant(lhs_data.kind()) != std::mem::discriminant(rhs_data.kind())
+    {
+        return false;
+    }
+
+    // Cycles are not valid value-expression trees. Reject them conservatively.
+    cache.insert((lhs, rhs), InstEquivState::Visiting);
+    cache.insert((rhs, lhs), InstEquivState::Visiting);
+    let equivalent = match (lhs_data.kind(), rhs_data.kind()) {
+        (InstKind::Integer(lhs), InstKind::Integer(rhs)) => lhs.value() == rhs.value(),
+        (InstKind::Float(lhs), InstKind::Float(rhs)) => {
+            lhs.value().to_bits() == rhs.value().to_bits()
+        }
+        (InstKind::ZeroInit, InstKind::ZeroInit) => true,
+        (InstKind::Binary(lhs), InstKind::Binary(rhs)) if lhs.op() == rhs.op() => {
+            let direct = inst_equiv(arena, cache, lhs.lhs(), rhs.lhs(), depth + 1)
+                && inst_equiv(arena, cache, lhs.rhs(), rhs.rhs(), depth + 1);
+            direct
+                || (is_commutative(lhs.op(), arena.inst_data(lhs.lhs()).ty().is_i32())
+                    && inst_equiv(arena, cache, lhs.lhs(), rhs.rhs(), depth + 1)
+                    && inst_equiv(arena, cache, lhs.rhs(), rhs.lhs(), depth + 1))
+        }
+        (InstKind::Cast(lhs), InstKind::Cast(rhs)) => {
+            inst_equiv(arena, cache, lhs.src(), rhs.src(), depth + 1)
+        }
+        (InstKind::GetElemPtr(lhs), InstKind::GetElemPtr(rhs)) => {
+            inst_equiv(arena, cache, lhs.base(), rhs.base(), depth + 1)
+                && insts_equiv_at(arena, cache, lhs.offsets(), rhs.offsets(), depth + 1)
+        }
+        (InstKind::Aggregate(lhs), InstKind::Aggregate(rhs)) => {
+            insts_equiv_at(arena, cache, lhs.value(), rhs.value(), depth + 1)
+        }
+        _ => false,
+    };
+    cache.insert((lhs, rhs), InstEquivState::Equivalent(equivalent));
+    cache.insert((rhs, lhs), InstEquivState::Equivalent(equivalent));
+    equivalent
+}
+
+fn is_commutative(op: BinaryOp, has_integer_operands: bool) -> bool {
+    matches!(op, BinaryOp::NotEq | BinaryOp::Eq)
+        || (has_integer_operands
+            && matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Mul | BinaryOp::And | BinaryOp::Or | BinaryOp::Xor
+            ))
+}
 
 pub struct LocalArena {
     pub(in crate::ir) bb_arena: BasicBlockArena,
@@ -65,6 +179,16 @@ pub trait Arena {
     fn global(&self) -> &GlobalArena;
     fn local_mut(&mut self) -> &mut LocalArena;
     fn global_mut(&mut self) -> &mut GlobalArena;
+
+    /// Conservatively checks whether two values represent the same expression.
+    fn equal(&self, lhs: Inst, rhs: Inst) -> bool {
+        InstEquivContext::new(self).inst_equiv(lhs, rhs, 0)
+    }
+
+    /// Checks value lists with a shared cache for recursive expression comparisons.
+    fn insts_equal(&self, lhs: &[Inst], rhs: &[Inst]) -> bool {
+        InstEquivContext::new(self).insts_equiv(lhs, rhs)
+    }
 
     #[must_use]
     #[inline]
@@ -195,5 +319,63 @@ pub trait Arena {
     #[inline]
     fn func_data_mut(&mut self, func: Function) -> &mut FunctionData {
         self.global_mut().func_arena.mut_data_of(func)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{
+        Type,
+        builder_trait::{LocalInstBuilder, ScalarInstBuilder},
+    };
+
+    #[test]
+    fn compares_structurally_equivalent_values() {
+        let mut function = FunctionData::new(Type::get_unit(), "equiv".into(), vec![]);
+        let one_a = function.new_local_inst().integer(1);
+        let one_b = function.new_local_inst().integer(1);
+        let two_a = function.new_local_inst().integer(2);
+        let two_b = function.new_local_inst().integer(2);
+        let add_a = function
+            .new_local_inst()
+            .binary(BinaryOp::Add, one_a, two_a);
+        let add_b = function
+            .new_local_inst()
+            .binary(BinaryOp::Add, two_b, one_b);
+
+        assert!(function.equal(one_a, one_b));
+        assert!(function.equal(add_a, add_b));
+        assert!(function.insts_equal(&[one_a, add_a], &[one_b, add_b]));
+    }
+
+    #[test]
+    fn keeps_order_for_non_commutative_values() {
+        let mut function = FunctionData::new(Type::get_unit(), "ordered".into(), vec![]);
+        let one_a = function.new_local_inst().integer(1);
+        let one_b = function.new_local_inst().integer(1);
+        let two_a = function.new_local_inst().integer(2);
+        let two_b = function.new_local_inst().integer(2);
+        let sub_a = function
+            .new_local_inst()
+            .binary(BinaryOp::Sub, one_a, two_a);
+        let sub_b = function
+            .new_local_inst()
+            .binary(BinaryOp::Sub, two_b, one_b);
+
+        assert!(!function.equal(sub_a, sub_b));
+    }
+
+    #[test]
+    fn conservatively_rejects_distinct_memory_values() {
+        let mut function = FunctionData::new(Type::get_unit(), "memory".into(), vec![]);
+        let alloc_a = function.new_local_inst().alloc(Type::get_i32());
+        let alloc_b = function.new_local_inst().alloc(Type::get_i32());
+        let load_a = function.new_local_inst().load(alloc_a);
+        let load_b = function.new_local_inst().load(alloc_a);
+
+        assert!(!function.equal(alloc_a, alloc_b));
+        assert!(!function.equal(load_a, load_b));
+        assert!(function.equal(load_a, load_a));
     }
 }

@@ -10,7 +10,7 @@ pub struct Layout {
 }
 
 pub struct BasicBlockLayout {
-    bb: BasicBlock,
+    pub bb: BasicBlock,
     insts: IndexList<Inst>,
     back: HashMap<Inst, Index>,
 }
@@ -34,6 +34,11 @@ impl BasicBlockLayout {
 
     pub fn bb(&self) -> BasicBlock {
         self.bb
+    }
+
+    #[inline(always)]
+    pub fn terminator(&self) -> Inst {
+        *self.insts.get_last().unwrap()
     }
 }
 

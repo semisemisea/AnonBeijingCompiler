@@ -9,6 +9,15 @@ pub struct ArenaContext<'a> {
     pub program: &'a mut Program,
     pub curr_func: Option<Function>,
 }
+impl ArenaContext<'_> {
+    pub fn curr_func_data(&self) -> &FunctionData {
+        self.func_data(self.curr_func.unwrap())
+    }
+
+    pub fn curr_func_data_mut(&mut self) -> &mut FunctionData {
+        self.func_data_mut(self.curr_func.unwrap())
+    }
+}
 impl std::ops::Deref for ArenaContext<'_> {
     type Target = FunctionData;
     fn deref(&self) -> &Self::Target {
@@ -124,6 +133,9 @@ impl PassesManager {
 
             let sccp = Box::new(const_prop::SparseConditionConstantPropagation);
             p.register(sccp);
+
+            let simplify_cfg = Box::new(simplify_cfg::SimplifyCFG);
+            p.register(simplify_cfg);
 
             let gvn = Box::new(gvn::GlobalInstNumbering);
             p.register(gvn);

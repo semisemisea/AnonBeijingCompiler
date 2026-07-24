@@ -220,7 +220,7 @@ impl From<PReg> for Reg {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Writable<T> {
-    pub(crate) reg: T,
+    pub reg: T,
 }
 
 impl<T> Writable<T> {

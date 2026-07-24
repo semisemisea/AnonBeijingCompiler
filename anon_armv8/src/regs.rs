@@ -191,6 +191,38 @@ fn preg_set(indices: &[u8], class: RegClass) -> PRegSet {
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn machine_environment_reserves_abi_and_post_ra_scratch_registers() {
+        let env = machine_env();
+        let allocatable = PRegSet::from(env);
+
+        for preg in [
+            int_preg(FP),
+            int_preg(LR),
+            int_preg(INT_ALLOCATOR_SCRATCH),
+            int_preg(INT_POST_RA_SCRATCH[0]),
+            int_preg(INT_POST_RA_SCRATCH[1]),
+            int_preg(INT_POST_RA_SCRATCH[3]),
+            float_preg(FLOAT_ALLOCATOR_SCRATCH),
+            float_preg(FLOAT_POST_RA_SCRATCH[0]),
+        ] {
+            assert!(!allocatable.contains(preg), "{preg:?} must be reserved");
+        }
+        assert_eq!(
+            env.scratch_by_class[0],
+            Some(int_preg(INT_ALLOCATOR_SCRATCH))
+        );
+        assert_eq!(
+            env.scratch_by_class[1],
+            Some(float_preg(FLOAT_ALLOCATOR_SCRATCH))
+        );
+    }
+}
+
 const INT_REG_NAMES: [&str; 31] = [
     "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
     "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27",

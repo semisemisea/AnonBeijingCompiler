@@ -17,6 +17,13 @@ pub enum ValueUseCount {
     Multiple = 2,
 }
 
+/// The register, if any, containing the result of a lowered HIR instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoweredOutput {
+    None,
+    Value(Reg),
+}
+
 /// A lowering context for a single function
 pub struct LowerContext<'prog, I: VCodeInst> {
     /// Arena to get everything you need about HirFunction
@@ -32,7 +39,7 @@ pub struct LowerContext<'prog, I: VCodeInst> {
     /// A map for instruction and register.
     /// INFO: Currently should be fixed map,
     /// since we allocate all the register in `new` function
-    pub reg_map: FxHashMap<HirInst, Reg>,
+    reg_map: FxHashMap<HirInst, Reg>,
 
     /// Current HirInstruction about to lower
     cur_inst: Option<HirInst>,
@@ -86,7 +93,7 @@ pub struct LowerContext<'prog, I: VCodeInst> {
 pub trait LowerBackend {
     type MInst: VCodeInst;
 
-    fn lower(ctx: &mut LowerContext<Self::MInst>, inst: HirInst);
+    fn lower(ctx: &mut LowerContext<Self::MInst>, inst: HirInst) -> LoweredOutput;
 
     fn lower_branch(ctx: &mut LowerContext<Self::MInst>, inst: HirInst, target: &[MirBlockIndex]);
 
@@ -587,7 +594,8 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             );
 
             if side_effect || value_needed {
-                B::lower(self, inst);
+                let output = B::lower(self, inst);
+                self.bind_lowered_output(inst, output);
             }
 
             self.finish_ir_inst();
@@ -627,6 +635,46 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 .alloc(self.arena.inst_data(inst).ty().into())
         });
         self.rematerialize_if_needed(inst, reg)
+    }
+
+    /// Return the virtual register preallocated for an HIR instruction result.
+    pub fn result_reg(&self, inst: HirInst) -> Reg {
+        let ty = self.arena.inst_data(inst).ty();
+        assert!(
+            !ty.is_unit(),
+            "unit instructions do not have result registers"
+        );
+        let reg = *self
+            .reg_map
+            .get(&inst)
+            .expect("value-producing instruction must have a preallocated result register");
+        assert!(reg.is_virtual(), "HIR result must use a virtual register");
+        reg
+    }
+
+    fn bind_lowered_output(&mut self, inst: HirInst, output: LoweredOutput) {
+        let ty = self.arena.inst_data(inst).ty();
+        match (ty.is_unit(), output) {
+            (true, LoweredOutput::None) => {}
+            (false, LoweredOutput::Value(selected)) => {
+                let result = self.result_reg(inst);
+                if result != selected {
+                    self.vregs_alloc.set_reg_alias(result, selected);
+                }
+            }
+            (true, LoweredOutput::Value(_)) => self.lowering_panic(
+                "generic instruction lowering",
+                "unit instruction returned a result register",
+                None,
+                Some(ty),
+            ),
+            (false, LoweredOutput::None) => self.lowering_panic(
+                "generic instruction lowering",
+                "value-producing instruction returned no result register",
+                None,
+                Some(ty),
+            ),
+        }
     }
 
     /// Mark a pure producer as consumed directly by `consumer`.

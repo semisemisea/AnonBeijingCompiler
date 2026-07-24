@@ -4,7 +4,7 @@ use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind, arena::Arena};
 use taki_mir::{
     abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::{LoweredBlock, MirBlockIndex},
-    lower::{LowerBackend, LowerContext},
+    lower::{LowerBackend, LowerContext, LoweredOutput},
     prelude::HirFunctionData,
     reg_alloc::reg::PReg,
     register::Writable,
@@ -27,7 +27,10 @@ pub struct AArch64Backend;
 impl LowerBackend for AArch64Backend {
     type MInst = MInst;
 
-    fn lower(ctx: &mut LowerContext<Self::MInst>, inst: raana_ir::opt::prelude::Inst) {
+    fn lower(
+        ctx: &mut LowerContext<Self::MInst>,
+        inst: raana_ir::opt::prelude::Inst,
+    ) -> LoweredOutput {
         let kind = ctx.arena.inst_data(inst).kind().clone();
         match kind {
             InstKind::BlockArgRef(..)
@@ -40,7 +43,8 @@ impl LowerBackend for AArch64Backend {
                 unreachable!("constants and argument references are rematerialized by LowerContext")
             }
             InstKind::Binary(binary) => {
-                let dst = Writable::from_reg(ctx.reg_map[&inst]);
+                let result = ctx.result_reg(inst);
+                let dst = Writable::from_reg(result);
                 if matches!(
                     ctx.arena.inst_data(binary.lhs()).ty().kind(),
                     TypeKind::Float32
@@ -77,7 +81,7 @@ impl LowerBackend for AArch64Backend {
                             );
                         }
                     }
-                    return;
+                    return LoweredOutput::Value(result);
                 }
                 let size = operand_size(ctx.arena.inst_data(binary.lhs()).ty().kind());
                 if let Some((op, lhs, rhs, addend)) =
@@ -100,10 +104,14 @@ impl LowerBackend for AArch64Backend {
                         }),
                         _ => unreachable!("multiply-accumulate folding only selects add or sub"),
                     }
-                    return;
+                    return LoweredOutput::Value(result);
                 }
                 let lhs = ctx.put_value_in_reg(binary.lhs());
                 let rhs_imm = integer_constant(ctx, binary.rhs());
+
+                if binary.op() == BinaryOp::Div && rhs_imm == Some(1) {
+                    return LoweredOutput::Value(lhs);
+                }
 
                 if matches!(ctx.arena.inst_data(inst).ty().kind(), TypeKind::Int32)
                     && matches!(binary.op(), BinaryOp::Div | BinaryOp::Rem)
@@ -111,7 +119,7 @@ impl LowerBackend for AArch64Backend {
                         lower_signed_div_rem_power_of_two(ctx, binary.op(), dst, lhs, divisor)
                     })
                 {
-                    return;
+                    return LoweredOutput::Value(result);
                 }
 
                 match binary.op() {
@@ -310,15 +318,18 @@ impl LowerBackend for AArch64Backend {
                         });
                     }
                 }
+                LoweredOutput::Value(result)
             }
             InstKind::Select(select) => {
                 lower_select(ctx, inst, &select);
+                LoweredOutput::Value(ctx.result_reg(inst))
             }
             InstKind::Cast(cast) => {
                 let src = cast.src();
                 let src_ty = ctx.arena.inst_data(src).ty().kind().clone();
                 let dst_ty = ctx.arena.inst_data(inst).ty().kind().clone();
-                let dst = Writable::from_reg(ctx.reg_map[&inst]);
+                let result = ctx.result_reg(inst);
+                let dst = Writable::from_reg(result);
                 let src_reg = ctx.put_value_in_reg(src);
                 match (src_ty, dst_ty) {
                     (TypeKind::Int32, TypeKind::Float32) => {
@@ -336,18 +347,22 @@ impl LowerBackend for AArch64Backend {
                         );
                     }
                 }
+                LoweredOutput::Value(result)
             }
             InstKind::Alloc => {
-                let dst = Writable::from_reg(ctx.reg_map[&inst]);
+                let result = ctx.result_reg(inst);
+                let dst = Writable::from_reg(result);
                 let pointee = ctx.arena.inst_data(inst).ty().derefernce();
                 let offset = i64::from(ctx.alloc_stackslot_or_get(inst, pointee));
                 ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
                     StackAMode::Slot(offset),
                     dst,
                 ));
+                LoweredOutput::Value(result)
             }
             InstKind::GetElemPtr(gep) => {
-                let dst = Writable::from_reg(ctx.reg_map[&inst]);
+                let result = ctx.result_reg(inst);
+                let dst = Writable::from_reg(result);
                 let mut current_ty = ctx.arena.inst_data(gep.base()).ty().clone();
                 let mut address = ctx.put_value_in_reg(gep.base());
 
@@ -438,9 +453,11 @@ impl LowerBackend for AArch64Backend {
                     dst,
                     src: address,
                 });
+                LoweredOutput::Value(result)
             }
             InstKind::Load(load) => {
-                let dst = Writable::from_reg(ctx.reg_map[&inst]);
+                let result = ctx.result_reg(inst);
+                let dst = Writable::from_reg(result);
                 let src = ctx.put_value_in_reg(load.src());
                 ctx.emit(MInst::Load {
                     ty: memory_type(ctx.arena.inst_data(inst).ty().kind()),
@@ -449,8 +466,12 @@ impl LowerBackend for AArch64Backend {
                         base: Gpr::Reg(src),
                     },
                 });
+                LoweredOutput::Value(result)
             }
-            InstKind::Store(store) => lower_store(ctx, store.src(), store.dest()),
+            InstKind::Store(store) => {
+                lower_store(ctx, store.src(), store.dest());
+                LoweredOutput::None
+            }
             InstKind::MemZero(mem_zero) => {
                 let inline_store_count = mem_zero.byte_len() / 4;
                 if runtime::mem_zero_is_inline(mem_zero.byte_len()) {
@@ -481,7 +502,7 @@ impl LowerBackend for AArch64Backend {
                     for index in 0..inline_store_count {
                         emit_store_at(ctx, zero, &HirType::get_i32(), dest, (index * 4) as i64);
                     }
-                    return;
+                    return LoweredOutput::None;
                 }
                 let alloc = matches!(ctx.arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
                     .then_some(mem_zero.dest());
@@ -524,6 +545,7 @@ impl LowerBackend for AArch64Backend {
                 });
                 ctx.vcode.vcode.abi.set_has_calls();
                 ctx.vcode.vcode.abi.set_outgoing_arg_size(0);
+                LoweredOutput::None
             }
             InstKind::ZeroInit => unreachable!("zero initialization is lowered by its store"),
             InstKind::Call(call) => {
@@ -570,16 +592,18 @@ impl LowerBackend for AArch64Backend {
                         }
                     }
                 }
+                let result =
+                    (!ctx.arena.inst_data(inst).ty().is_unit()).then(|| ctx.result_reg(inst));
                 let ret = match ctx.arena.inst_data(inst).ty().kind() {
                     TypeKind::Unit => None,
                     TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => {
                         Some(CallRetPair {
-                            vreg: Writable::from_reg(ctx.reg_map[&inst]),
+                            vreg: Writable::from_reg(result.unwrap()),
                             preg: regs::INT_RETURN_REG,
                         })
                     }
                     TypeKind::Float32 => Some(CallRetPair {
-                        vreg: Writable::from_reg(ctx.reg_map[&inst]),
+                        vreg: Writable::from_reg(result.unwrap()),
                         preg: regs::FLOAT_RETURN_REG,
                     }),
                     ty => {
@@ -602,6 +626,7 @@ impl LowerBackend for AArch64Backend {
                     .vcode
                     .abi
                     .set_outgoing_arg_size(stack_offset as usize);
+                result.map_or(LoweredOutput::None, LoweredOutput::Value)
             }
             InstKind::Return(ret) => {
                 if let Some(value) = ret.value() {
@@ -625,6 +650,7 @@ impl LowerBackend for AArch64Backend {
                     });
                 }
                 ctx.emit(MInst::Ret);
+                LoweredOutput::None
             }
             InstKind::Jump(..) | InstKind::Branch(..) => {
                 unreachable!("terminators are lowered by LowerBackend::lower_branch")
@@ -805,7 +831,7 @@ fn lower_select(
         )
     };
 
-    let dst = Writable::from_reg(ctx.reg_map[&inst]);
+    let dst = Writable::from_reg(ctx.result_reg(inst));
     let true_constant = integer_constant(ctx, select.if_true());
     let false_constant = integer_constant(ctx, select.if_false());
     let (cond, value) = if matches!(&result_ty, TypeKind::Int32)
@@ -1789,6 +1815,95 @@ fn float_comparison_cond(op: BinaryOp) -> Cond {
 #[cfg(test)]
 mod tests {
     use super::signed_power_of_two;
+    use crate::instructions::MInst;
+    use taki_mir::{
+        reg_alloc::reg::{PReg, RegClass, SpillSlot},
+        register::{Reg, VRegAllocator},
+        types::{F32, I32, I64},
+    };
+
+    #[test]
+    fn register_aliases_resolve_transitively() {
+        let mut allocator = VRegAllocator::<MInst>::with_capaticy(3);
+        let first = allocator.alloc(I32);
+        let second = allocator.alloc(I32);
+        let canonical = allocator.alloc(I32);
+
+        allocator.set_reg_alias(first, second);
+        allocator.set_reg_alias(second, canonical);
+
+        assert_eq!(
+            allocator.resolve_alias(first.to_virtual_reg().unwrap()),
+            canonical.to_virtual_reg().unwrap()
+        );
+        assert_eq!(
+            allocator.resolve_alias(second.to_virtual_reg().unwrap()),
+            canonical.to_virtual_reg().unwrap()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "register alias source was already assigned")]
+    fn register_alias_source_is_single_assignment() {
+        let mut allocator = VRegAllocator::<MInst>::with_capaticy(3);
+        let source = allocator.alloc(I32);
+        let first = allocator.alloc(I32);
+        let second = allocator.alloc(I32);
+
+        allocator.set_reg_alias(source, first);
+        allocator.set_reg_alias(source, second);
+    }
+
+    #[test]
+    #[should_panic(expected = "register alias would form a cycle")]
+    fn register_alias_cycles_are_rejected() {
+        let mut allocator = VRegAllocator::<MInst>::with_capaticy(2);
+        let first = allocator.alloc(I32);
+        let second = allocator.alloc(I32);
+
+        allocator.set_reg_alias(first, second);
+        allocator.set_reg_alias(second, first);
+    }
+
+    #[test]
+    #[should_panic(expected = "register aliases must have identical lowered types")]
+    fn register_aliases_reject_different_classes() {
+        let mut allocator = VRegAllocator::<MInst>::with_capaticy(2);
+        let integer = allocator.alloc(I32);
+        let float = allocator.alloc(F32);
+
+        allocator.set_reg_alias(integer, float);
+    }
+
+    #[test]
+    #[should_panic(expected = "register aliases must have identical lowered types")]
+    fn register_aliases_reject_different_widths_in_the_same_class() {
+        let mut allocator = VRegAllocator::<MInst>::with_capaticy(2);
+        let narrow = allocator.alloc(I32);
+        let wide = allocator.alloc(I64);
+
+        allocator.set_reg_alias(narrow, wide);
+    }
+
+    #[test]
+    #[should_panic(expected = "register alias target must be a virtual register")]
+    fn register_aliases_reject_physical_registers() {
+        let mut allocator = VRegAllocator::<MInst>::with_capaticy(1);
+        let source = allocator.alloc(I32);
+        let physical = Reg::from_physical_reg(PReg::new(0, RegClass::Int));
+
+        allocator.set_reg_alias(source, physical);
+    }
+
+    #[test]
+    #[should_panic(expected = "register alias target must be a virtual register")]
+    fn register_aliases_reject_spill_slots() {
+        let mut allocator = VRegAllocator::<MInst>::with_capaticy(1);
+        let source = allocator.alloc(I32);
+        let spill = Reg::from_spillslot(SpillSlot::new(0));
+
+        allocator.set_reg_alias(source, spill);
+    }
 
     #[test]
     fn classifies_signed_power_of_two_divisors() {

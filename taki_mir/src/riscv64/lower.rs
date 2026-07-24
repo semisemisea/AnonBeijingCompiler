@@ -124,7 +124,7 @@ impl LowerBackend for Riscv64Backend {
     fn lower(
         ctx: &mut crate::lower::LowerContext<Self::MInst>,
         inst: raana_ir::opt::prelude::Inst,
-    ) {
+    ) -> crate::lower::LoweredOutput {
         let func_data = ctx.arena.program.func_data(ctx.arena.curr_func.unwrap());
         let inst_data = func_data.inst_data(inst);
         match inst_data.kind() {
@@ -145,7 +145,7 @@ impl LowerBackend for Riscv64Backend {
                 let bop = binary.op();
                 let lhs = ctx.put_value_in_reg(binary.lhs());
                 let rhs = ctx.put_value_in_reg(binary.rhs());
-                let def = *ctx.reg_map.get(&inst).unwrap();
+                let def = ctx.result_reg(inst);
                 let rd = Writable::from_reg(def);
 
                 let lhs_ty = ctx.arena.inst_data(binary.lhs()).ty();
@@ -336,6 +336,7 @@ impl LowerBackend for Riscv64Backend {
                         }
                     }
                 }
+                crate::lower::LoweredOutput::Value(def)
             }
             raana_ir::ir::InstKind::Select(select) => {
                 let ty = inst_data.ty();
@@ -413,13 +414,14 @@ impl LowerBackend for Riscv64Backend {
                         dst: Writable::from_reg(def),
                     });
                 }
+                crate::lower::LoweredOutput::Value(def)
             }
             raana_ir::ir::InstKind::Cast(cast) => {
                 use crate::riscv64::instructions::FcvtMode;
                 let src = cast.src();
                 let rs = ctx.put_value_in_reg(src);
                 let into_ty = inst_data.ty();
-                let def = *ctx.reg_map.get(&inst).unwrap();
+                let def = ctx.result_reg(inst);
                 let rd = Writable::from_reg(def);
                 match into_ty.kind() {
                     raana_ir::ir::TypeKind::Int32 => {
@@ -438,9 +440,10 @@ impl LowerBackend for Riscv64Backend {
                     }
                     _ => unreachable!("cast only produce i32 or f32"),
                 }
+                crate::lower::LoweredOutput::Value(def)
             }
             raana_ir::ir::InstKind::Alloc => {
-                let def = *ctx.reg_map.get(&inst).unwrap();
+                let def = ctx.result_reg(inst);
                 let rd = Writable::from_reg(def);
                 let pointee_ty = inst_data.ty().derefernce();
                 let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(inst, pointee_ty) as i64;
@@ -448,6 +451,7 @@ impl LowerBackend for Riscv64Backend {
                     StackAMode::Slot(offset),
                     rd,
                 ));
+                crate::lower::LoweredOutput::Value(def)
             }
             raana_ir::ir::InstKind::GetElemPtr(get_elem_ptr) => {
                 let indices = get_elem_ptr.offsets();
@@ -455,7 +459,7 @@ impl LowerBackend for Riscv64Backend {
                 let mut src_ty = ctx.arena.inst_data(src).ty().clone();
                 let rs = ctx.put_value_in_reg(src);
 
-                let def = *ctx.reg_map.get(&inst).unwrap();
+                let def = ctx.result_reg(inst);
                 let rd = Writable::from_reg(def);
                 let acc = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
                 let wacc = Writable::from_reg(acc);
@@ -512,6 +516,7 @@ impl LowerBackend for Riscv64Backend {
                     rs1: rs,
                     rs2: acc,
                 });
+                crate::lower::LoweredOutput::Value(def)
             }
             raana_ir::ir::InstKind::Store(store) => {
                 let src = store.src();
@@ -603,6 +608,7 @@ impl LowerBackend for Riscv64Backend {
                         }
                     }
                 }
+                crate::lower::LoweredOutput::None
             }
             raana_ir::ir::InstKind::MemZero(mem_zero) => {
                 let inline_store_count = mem_zero.byte_len() / 4;
@@ -633,7 +639,7 @@ impl LowerBackend for Riscv64Backend {
                             addr: AMode::RegOffest(dest, (index * 4) as i64),
                         });
                     }
-                    return Ok(());
+                    return crate::lower::LoweredOutput::None;
                 }
                 let alloc = matches!(ctx.arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
                     .then_some(mem_zero.dest());
@@ -684,13 +690,14 @@ impl LowerBackend for Riscv64Backend {
                 });
                 ctx.vcode.vcode.abi.set_has_calls();
                 ctx.vcode.vcode.abi.set_outgoing_arg_size(0);
+                crate::lower::LoweredOutput::None
             }
             raana_ir::ir::InstKind::Load(load) => {
                 let src = load.src();
                 let src_ty = inst_data.ty().clone();
                 let m_type: LoweredType = src_ty.clone().into();
                 let op: LoadOP = m_type.into();
-                let def = *ctx.reg_map.get(&inst).unwrap();
+                let def = ctx.result_reg(inst);
                 let rd = Writable::from_reg(def);
                 if src.is_global() {
                     ctx.emit(MInst::LoadWord {
@@ -714,6 +721,7 @@ impl LowerBackend for Riscv64Backend {
                     let addr = normalize_amode(&AMode::SlotOffset(offset as i64), ctx);
                     ctx.emit(MInst::LoadWord { rd, op, addr });
                 }
+                crate::lower::LoweredOutput::Value(def)
             }
             raana_ir::ir::InstKind::Call(call) => {
                 let args = call.args();
@@ -744,14 +752,15 @@ impl LowerBackend for Riscv64Backend {
                         }
                     }
                 }
+                let result = (!inst_data.ty().is_unit()).then(|| ctx.result_reg(inst));
                 let ret_arg_pair = match inst_data.ty().kind() {
                     raana_ir::ir::TypeKind::Unit => None,
                     raana_ir::ir::TypeKind::Int32 => Some(CallRetPair {
-                        vreg: Writable::from_reg(*ctx.reg_map.get(&inst).unwrap()),
+                        vreg: Writable::from_reg(result.unwrap()),
                         preg: a0(),
                     }),
                     raana_ir::ir::TypeKind::Float32 => Some(CallRetPair {
-                        vreg: Writable::from_reg(*ctx.reg_map.get(&inst).unwrap()),
+                        vreg: Writable::from_reg(result.unwrap()),
                         preg: fa0(),
                     }),
                     _ => unreachable!(),
@@ -767,6 +776,10 @@ impl LowerBackend for Riscv64Backend {
                     .vcode
                     .abi
                     .set_outgoing_arg_size(layout.stack_size as usize);
+                result.map_or(
+                    crate::lower::LoweredOutput::None,
+                    crate::lower::LoweredOutput::Value,
+                )
             }
             raana_ir::ir::InstKind::Return(ret) => {
                 if let Some(val) = ret.value() {
@@ -781,6 +794,7 @@ impl LowerBackend for Riscv64Backend {
                     });
                 }
                 ctx.emit(MInst::Ret);
+                crate::lower::LoweredOutput::None
             }
             raana_ir::ir::InstKind::Jump(..) | raana_ir::ir::InstKind::Branch(..) => {
                 unreachable!("should not lower branch instruction in here.")

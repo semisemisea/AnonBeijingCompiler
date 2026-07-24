@@ -13,9 +13,21 @@
 //! the complete Ion pipeline is available.
 
 mod cfg;
+mod data_structures;
 mod domtree;
 mod function;
+mod indexset;
+mod liveranges;
+mod merge;
 mod postorder;
+mod reg_traversal;
+mod requirement;
 
 pub use cfg::{CFGInfo, CFGInfoCtx};
+pub use data_structures::{BlockParamIn, BlockParamOut, CodeRange, LiveBundle, LiveRange, Use};
 pub use function::DenseVRegFunction;
+pub use indexset::IndexSet;
+pub use liveranges::{Liveness, SpillWeight, build_live_ranges, compute_liveness};
+pub use merge::{BundleSet, merge_vreg_bundles};
+pub use reg_traversal::RegTraversalIter;
+pub use requirement::{Requirement, RequirementConflict, RequirementConflictAt};

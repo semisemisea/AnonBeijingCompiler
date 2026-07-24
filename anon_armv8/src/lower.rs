@@ -108,6 +108,15 @@ impl LowerBackend for AArch64Backend {
                 let lhs = ctx.put_value_in_reg(binary.lhs());
                 let rhs_imm = integer_constant(ctx, binary.rhs());
 
+                if matches!(ctx.arena.inst_data(inst).ty().kind(), TypeKind::Int32)
+                    && matches!(binary.op(), BinaryOp::Div | BinaryOp::Rem)
+                    && rhs_imm.is_some_and(|divisor| {
+                        lower_signed_div_rem_power_of_two(ctx, binary.op(), dst, lhs, divisor)
+                    })
+                {
+                    return Ok(());
+                }
+
                 match binary.op() {
                     BinaryOp::Add | BinaryOp::Sub => {
                         if binary.op() == BinaryOp::Add
@@ -1315,6 +1324,103 @@ fn integer_constant(
     }
 }
 
+fn signed_power_of_two(value: i32) -> Option<(u8, bool)> {
+    if value == 0 {
+        return None;
+    }
+    let magnitude = value.unsigned_abs();
+    magnitude
+        .is_power_of_two()
+        .then(|| (magnitude.trailing_zeros() as u8, value.is_negative()))
+}
+
+fn lower_signed_div_rem_power_of_two(
+    ctx: &mut LowerContext<'_, MInst>,
+    op: BinaryOp,
+    dst: Writable<taki_mir::register::Reg>,
+    lhs: taki_mir::register::Reg,
+    divisor: i32,
+) -> bool {
+    let Some((shift, negate_quotient)) = signed_power_of_two(divisor) else {
+        return false;
+    };
+    let size = OperandSize::Size32;
+
+    if shift == 0 {
+        match op {
+            BinaryOp::Div if negate_quotient => ctx.emit(MInst::AluRRR {
+                op: AluOp::Sub,
+                size,
+                dst,
+                lhs: RegOrZr::Zr,
+                rhs: RegOrZr::Reg(lhs),
+            }),
+            BinaryOp::Div => ctx.emit(MInst::Mov {
+                size,
+                dst,
+                src: lhs,
+            }),
+            BinaryOp::Rem => ctx.emit(MInst::MovFromZero { size, dst }),
+            _ => return false,
+        }
+        return true;
+    }
+
+    let sign = ctx.alloc_tmp(HirType::get_i32());
+    ctx.emit(MInst::AluRRImmShift {
+        op: AluOp::Asr,
+        size,
+        dst: Writable::from_reg(sign),
+        src: lhs,
+        shift: ImmShift::new(31, size).unwrap(),
+    });
+    let biased = ctx.alloc_tmp(HirType::get_i32());
+    ctx.emit(MInst::AluRRRShift {
+        op: AluOp::Add,
+        size,
+        dst: Writable::from_reg(biased),
+        lhs: RegOrZr::Reg(lhs),
+        rhs: RegOrZr::Reg(sign),
+        shift: ShiftOp::Lsr,
+        amount: ImmShift::new(32 - shift, size).unwrap(),
+    });
+
+    let quotient = if op == BinaryOp::Rem || negate_quotient {
+        ctx.alloc_tmp(HirType::get_i32())
+    } else {
+        dst.to_reg()
+    };
+    ctx.emit(MInst::AluRRImmShift {
+        op: AluOp::Asr,
+        size,
+        dst: Writable::from_reg(quotient),
+        src: biased,
+        shift: ImmShift::new(shift, size).unwrap(),
+    });
+
+    match op {
+        BinaryOp::Div if negate_quotient => ctx.emit(MInst::AluRRR {
+            op: AluOp::Sub,
+            size,
+            dst,
+            lhs: RegOrZr::Zr,
+            rhs: RegOrZr::Reg(quotient),
+        }),
+        BinaryOp::Div => {}
+        BinaryOp::Rem => ctx.emit(MInst::AluRRRShift {
+            op: AluOp::Sub,
+            size,
+            dst,
+            lhs: RegOrZr::Reg(lhs),
+            rhs: RegOrZr::Reg(quotient),
+            shift: ShiftOp::Lsl,
+            amount: ImmShift::new(shift, size).unwrap(),
+        }),
+        _ => return false,
+    }
+    true
+}
+
 /// Fold a single-use integer or pointer multiplication into an add/sub
 /// consumer. The sink claim happens only after all shape and type checks, so
 /// a rejected candidate follows normal instruction selection unchanged.
@@ -1683,5 +1789,59 @@ fn float_comparison_cond(op: BinaryOp) -> Cond {
         BinaryOp::Ge => Cond::Ge,
         BinaryOp::Le => Cond::Ls,
         _ => unreachable!("binary operation is not a floating comparison"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signed_power_of_two;
+
+    #[test]
+    fn classifies_signed_power_of_two_divisors() {
+        assert_eq!(signed_power_of_two(0), None);
+        assert_eq!(signed_power_of_two(1), Some((0, false)));
+        assert_eq!(signed_power_of_two(-1), Some((0, true)));
+        assert_eq!(signed_power_of_two(2), Some((1, false)));
+        assert_eq!(signed_power_of_two(-2), Some((1, true)));
+        assert_eq!(signed_power_of_two(1 << 30), Some((30, false)));
+        assert_eq!(signed_power_of_two(-(1 << 30)), Some((30, true)));
+        assert_eq!(signed_power_of_two(i32::MIN), Some((31, true)));
+        assert_eq!(signed_power_of_two(3), None);
+        assert_eq!(signed_power_of_two(-3), None);
+    }
+
+    #[test]
+    fn signed_power_of_two_formula_truncates_toward_zero() {
+        let dividends = [i32::MIN, -17, -9, -8, -7, -1, 0, 1, 7, 8, 9, 17, i32::MAX];
+        let divisors = [1, -1, 2, -2, 4, -4, 8, -8, 1 << 30, -(1 << 30), i32::MIN];
+
+        for dividend in dividends {
+            for divisor in divisors {
+                let (shift, negate) = signed_power_of_two(divisor).unwrap();
+                let positive_quotient = if shift == 0 {
+                    dividend
+                } else {
+                    let sign = dividend >> 31;
+                    let bias = ((sign as u32) >> (32 - shift)) as i32;
+                    dividend.wrapping_add(bias) >> shift
+                };
+                let quotient = if negate {
+                    positive_quotient.wrapping_neg()
+                } else {
+                    positive_quotient
+                };
+                let remainder =
+                    dividend.wrapping_sub(positive_quotient.wrapping_shl(u32::from(shift)));
+
+                let expected_quotient = if dividend == i32::MIN && divisor == -1 {
+                    i32::MIN
+                } else {
+                    dividend / divisor
+                };
+                let expected_remainder = if divisor == -1 { 0 } else { dividend % divisor };
+                assert_eq!(quotient, expected_quotient, "{dividend} / {divisor}");
+                assert_eq!(remainder, expected_remainder, "{dividend} % {divisor}");
+            }
+        }
     }
 }

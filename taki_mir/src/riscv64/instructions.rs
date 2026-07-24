@@ -26,6 +26,10 @@ impl MachInst for MInst {
                 collector.reg_use(rs);
                 collector.reg_def(rd);
             }
+            MInst::AluRRImmShift { rd, rs, .. } => {
+                collector.reg_use(rs);
+                collector.reg_def(rd);
+            }
             MInst::LoadImm { rd, .. } => {
                 collector.reg_def(rd);
             }
@@ -207,6 +211,13 @@ impl MachInstEmit for MInst {
                 ctx.write_reg(rs)?;
                 write!(ctx, ", {}", imm)
             }
+            MInst::AluRRImmShift { op, rd, rs, shamt } => {
+                write!(ctx, "{} ", op)?;
+                ctx.write_reg(&rd.reg)?;
+                write!(ctx, ", ")?;
+                ctx.write_reg(rs)?;
+                write!(ctx, ", {}", shamt.value())
+            }
             MInst::LoadImm { rd, value } => {
                 write!(ctx, "li ")?;
                 ctx.write_reg(&rd.reg)?;
@@ -348,6 +359,12 @@ pub enum MInst {
         rs: Reg,
         imm: Imm12,
     },
+    AluRRImmShift {
+        op: AluRRImmShiftOP,
+        rd: WritableReg,
+        rs: Reg,
+        shamt: ShiftImm,
+    },
     LoadImm {
         rd: WritableReg,
         value: u64,
@@ -482,6 +499,26 @@ pub enum AluRRImm12OP {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AluRRImmShiftOP {
+    SlliW,
+    SrliW,
+    SraiW,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShiftImm(u8);
+
+impl ShiftImm {
+    pub const fn new(value: u8) -> Option<Self> {
+        if value < 32 { Some(Self(value)) } else { None }
+    }
+
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AluRRROP {
     Add,
     Sub,
@@ -597,6 +634,16 @@ impl core::fmt::Display for AluRRImm12OP {
         match self {
             AluRRImm12OP::Addi => write!(f, "addi"),
             AluRRImm12OP::Xori => write!(f, "xori"),
+        }
+    }
+}
+
+impl core::fmt::Display for AluRRImmShiftOP {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            AluRRImmShiftOP::SlliW => write!(f, "slliw"),
+            AluRRImmShiftOP::SrliW => write!(f, "srliw"),
+            AluRRImmShiftOP::SraiW => write!(f, "sraiw"),
         }
     }
 }

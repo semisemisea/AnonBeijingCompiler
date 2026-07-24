@@ -17,7 +17,7 @@ pub mod inst_predicate;
 pub mod lower;
 pub mod reg_alloc;
 pub mod register;
-pub mod riscv64;
+// pub mod riscv64;
 pub mod types;
 pub mod vcode;
 

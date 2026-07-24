@@ -2,7 +2,7 @@ use anon_armv8::AArch64Backend;
 use clap::Parser;
 use raana_ir::fmt::writer::Writer;
 use std::path::Path;
-use taki_mir::riscv64::lower::Riscv64Backend;
+use uika_riscv::lower::Riscv64Backend;
 
 use crate::frontend::utils::AstGenContext;
 use frontend::utils::ToRaanaIR;

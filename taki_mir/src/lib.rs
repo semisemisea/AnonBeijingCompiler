@@ -6,7 +6,6 @@ use crate::{
     emit::AsmWriter,
     lower::{LowerBackend, LowerContext},
     reg_alloc::function::Function,
-    reg_alloc::reg::RegClass,
     vcode::MachInstEmit,
 };
 
@@ -199,6 +198,10 @@ where
         let machine_env = vcode.abi.machine_env();
         let output =
             crate::reg_alloc::alloc::run(&vcode, machine_env).expect("register allocation failed");
+        vcode.verify_alloc_output(&output).unwrap_or_else(|error| {
+            log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
+            panic!("function={} {error}", func_data.name());
+        });
         log::debug!(target: "taki_mir::reg_alloc", "function={} allocation complete: locations={}, spill-slots={}, edits={}", func_data.name(), output.allocs.len(), output.num_spillslots, output.edits.len());
         for (inst, allocs) in
             (0..vcode.num_insts()).map(|index| (index, output.inst_allocs(index as u32)))
@@ -216,7 +219,22 @@ where
                 panic!("function={} {error}", func_data.name());
             });
 
-        let spill_size = output.num_spillslots as u32 * vcode.abi.spillslot_size(RegClass::Int);
+        let spill_units = u32::try_from(output.num_spillslots).map_err(|_| {
+            crate::lower::CodegenError::backend(
+                arena,
+                "frame layout",
+                "allocator spill-slot count exceeds frame range",
+            )
+        })?;
+        let spill_size = spill_units
+            .checked_mul(vcode.abi.spill_unit_bytes())
+            .ok_or_else(|| {
+                crate::lower::CodegenError::backend(
+                    arena,
+                    "frame layout",
+                    "allocator spill area exceeds frame range",
+                )
+            })?;
         vcode.abi.compute_frame_layout(spill_size, &output);
         log::debug!(target: "taki_mir::emit", "function={} frame layout={:?}", func_data.name(), vcode.abi.frame_layout());
 

@@ -27,7 +27,14 @@ impl ABIMachineSpec for AArch64Abi {
     fn stack_align() -> u32 {
         16
     }
-    fn spillslot_size(_regclass: RegClass) -> u32 {
+    fn spillslot_size(regclass: RegClass) -> u32 {
+        match regclass {
+            RegClass::Int | RegClass::Float => 1,
+            RegClass::Vector => panic!("AArch64 vector spills are unsupported"),
+        }
+    }
+
+    fn spill_unit_bytes() -> u32 {
         8
     }
     fn is_callee_saved(preg: PReg) -> bool {

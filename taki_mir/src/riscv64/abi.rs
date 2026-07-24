@@ -41,7 +41,14 @@ impl ABIMachineSpec for Riscv64ABI {
         MInst::Args { pairs: args.into() }
     }
 
-    fn spillslot_size(_regclass: RegClass) -> u32 {
+    fn spillslot_size(regclass: RegClass) -> u32 {
+        match regclass {
+            RegClass::Int | RegClass::Float => 1,
+            RegClass::Vector => panic!("RISC-V vector spills are unsupported"),
+        }
+    }
+
+    fn spill_unit_bytes() -> u32 {
         8
     }
 

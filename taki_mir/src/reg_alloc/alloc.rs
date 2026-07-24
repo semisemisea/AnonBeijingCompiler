@@ -229,10 +229,22 @@ impl<'a, F: Function> Stack<'a, F> {
         }
     }
 
-    fn allocstack(&mut self, _class: RegClass) -> SpillSlot {
-        log::trace!("Allocating a spillslot for class {_class:?}");
-        let slot = self.num_spillslots;
-        self.num_spillslots += 1;
+    fn allocstack(&mut self, class: RegClass) -> SpillSlot {
+        let size = u32::try_from(self.func.spillslot_size(class))
+            .expect("spill-slot size exceeds allocator index range");
+        assert!(size > 0, "spill-slot size must be nonzero");
+        log::trace!("Allocating {size} spillslot units for class {class:?}");
+        let aligned = self.num_spillslots.next_multiple_of(size);
+        let end = aligned
+            .checked_add(size)
+            .expect("spill-slot allocation overflow");
+        assert!(end as usize <= SpillSlot::MAX, "spill-slot index overflow");
+        self.num_spillslots = end;
+        let slot = if self.func.multi_spillslot_named_by_last_slot() {
+            end - 1
+        } else {
+            aligned
+        };
         log::trace!("Allocated slot: {slot}");
         SpillSlot::new(slot as usize)
     }
@@ -926,9 +938,9 @@ impl<'a, F: Function> Env<'a, F> {
         let resolved_float = float_parallel_moves.resolve();
         let resolved_vec = vec_parallel_moves.resolve();
         let mut scratch_regs = self.scratch_regs.clone();
-        let mut num_spillslots = self.stack.num_spillslots;
         let mut avail_regs =
             self.available_pregs[OperandPos::Early] & self.available_pregs[OperandPos::Late];
+        let mut num_spillslots = self.stack.num_spillslots;
 
         log::trace!("Resolving parallel moves");
         for (resolved, class) in [
@@ -936,6 +948,12 @@ impl<'a, F: Function> Env<'a, F> {
             (resolved_float, RegClass::Float),
             (resolved_vec, RegClass::Vector),
         ] {
+            let borrowed_scratch_reg = self.preferred_victim[class];
+            let fixed_stack_slots = self.fixed_stack_slots;
+            let slot_size = u32::try_from(self.func.spillslot_size(class))
+                .expect("spill-slot size exceeds allocator index range");
+            assert!(slot_size > 0, "spill-slot size must be nonzero");
+            let named_by_last = self.func.multi_spillslot_named_by_last_slot();
             let scratch_resolver = MoveAndScratchResolver {
                 find_free_reg: || {
                     if let Some(reg) = scratch_regs[class] {
@@ -953,13 +971,22 @@ impl<'a, F: Function> Env<'a, F> {
                     }
                 },
                 get_stackslot: || {
-                    let slot = num_spillslots;
-                    num_spillslots += 1;
+                    let aligned = num_spillslots.next_multiple_of(slot_size);
+                    let end = aligned
+                        .checked_add(slot_size)
+                        .expect("spill-slot allocation overflow");
+                    assert!(end as usize <= SpillSlot::MAX, "spill-slot index overflow");
+                    num_spillslots = end;
+                    let slot = if named_by_last { end - 1 } else { aligned };
+                    let slot = SpillSlot::new(slot as usize);
                     log::trace!("Retrieved slot {slot} for scratch resolver");
-                    Allocation::stack(SpillSlot::new(slot as usize))
+                    Allocation::stack(slot)
                 },
-                is_stack_alloc: |alloc| self.is_stack(alloc),
-                borrowed_scratch_reg: self.preferred_victim[class],
+                is_stack_alloc: |alloc| {
+                    alloc.is_stack()
+                        || (alloc.is_reg() && fixed_stack_slots.contains(alloc.as_reg().unwrap()))
+                },
+                borrowed_scratch_reg,
             };
             let moves = scratch_resolver.compute(resolved);
             log::trace!("Resolved {class:?} parallel moves");

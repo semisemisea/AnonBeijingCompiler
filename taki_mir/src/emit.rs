@@ -94,8 +94,7 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
             .map(|lb| B::format_block_label(lb, self.func_data))
             .collect();
 
-        let spill_base = (frame.outgoing_args_size + frame.stackslots_size) as i64;
-        let slot_size = S::<B>::spillslot_size(crate::reg_alloc::reg::RegClass::Int) as i64;
+        let spill_unit_bytes = vcode.abi.spill_unit_bytes();
 
         for (bi, _lb) in block_order.lowered_order().iter().enumerate() {
             writeln!(self.buf, "{}:", self.block_labels[bi]).unwrap();
@@ -128,7 +127,7 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
                             }
                             (Some(from_reg), None) => {
                                 let slot = to.as_stack().unwrap();
-                                let offset = spill_base + slot.raw_bits() as i64 * slot_size;
+                                let offset = frame.spill_slot_offset(slot, spill_unit_bytes);
                                 let ty = match from_reg.class() {
                                     RegClass::Float => crate::types::F32,
                                     _ => crate::types::I64,
@@ -143,7 +142,7 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
                             }
                             (None, Some(to_reg)) => {
                                 let slot = from.as_stack().unwrap();
-                                let offset = spill_base + slot.raw_bits() as i64 * slot_size;
+                                let offset = frame.spill_slot_offset(slot, spill_unit_bytes);
                                 let ty = match to_reg.class() {
                                     RegClass::Float => crate::types::F32,
                                     _ => crate::types::I64,
@@ -162,8 +161,8 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
                                 let from_slot = from.as_stack().unwrap();
                                 let to_slot = to.as_stack().unwrap();
                                 let from_offset =
-                                    spill_base + from_slot.raw_bits() as i64 * slot_size;
-                                let to_offset = spill_base + to_slot.raw_bits() as i64 * slot_size;
+                                    frame.spill_slot_offset(from_slot, spill_unit_bytes);
+                                let to_offset = frame.spill_slot_offset(to_slot, spill_unit_bytes);
                                 for inst in S::<B>::gen_stack_to_stack_move(from_offset, to_offset)
                                 {
                                     self.write_inst(frame, &inst);

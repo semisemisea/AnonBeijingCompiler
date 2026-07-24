@@ -1010,4 +1010,33 @@ mod tests {
         writer.write().unwrap();
         assert!(writer.finish().contains("fcmp une float"));
     }
+
+    #[test]
+    fn writes_mem_zero_as_i64_memset() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "clear".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let alloc = data
+            .new_local_inst()
+            .alloc(Type::get_array(Type::get_i32(), 4));
+        let clear = data.new_local_inst().mem_zero(alloc, 16);
+        data.layout_mut().insert_inst(entry, clear);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let mut writer = LlvmWriter::new(&program);
+        writer.write().unwrap();
+        let llvm = writer.finish();
+        assert!(
+            llvm.contains("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)"),
+            "{llvm}"
+        );
+        assert!(
+            llvm.contains("call void @llvm.memset.p0.i64(ptr %"),
+            "{llvm}"
+        );
+        assert!(llvm.contains("i8 0, i64 16, i1 false)"), "{llvm}");
+    }
 }

@@ -1169,6 +1169,26 @@ mod tests {
             assert!(asm.contains(expected), "expected {expected} in:\n{asm}");
         }
     }
+
+    #[test]
+    fn lowers_mem_zero_to_memset_with_64_bit_length() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "clear".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let alloc = data
+            .new_local_inst()
+            .alloc(Type::get_array(Type::get_i32(), 4));
+        let clear = data.new_local_inst().mem_zero(alloc, 16);
+        data.layout_mut().insert_inst(entry, clear);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
+        assert!(asm.contains("movz x2, #0x10"), "{asm}");
+        assert!(asm.contains("bl memset"), "{asm}");
+    }
 }
 
 fn invert_float_comparison_cond(op: BinaryOp) -> Cond {

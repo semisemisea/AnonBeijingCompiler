@@ -8,7 +8,7 @@ use crate::{
         instructions::{AMode, AluRRImm12OP, Imm12, LoadOP, MInst, StoreOP},
         labels::Label,
         regs::{
-            ARG_REG, FARG_REG, fp_reg, link_reg, pf_reg, pv_reg, px_reg, stack_reg,
+            ARG_REG, FARG_REG, fp_reg, link_reg, pf_reg, pv_reg, px_reg, spilltmp_reg, stack_reg,
             writable_fp_reg, writable_link_reg, writable_spilltmp_reg, writable_spilltmp_reg2,
             writable_stack_reg,
         },
@@ -126,6 +126,12 @@ impl ABIMachineSpec for Riscv64ABI {
             op: ty.into(),
             addr,
         });
+        insts
+    }
+
+    fn gen_stack_to_stack_move(from: i64, to: i64) -> SmallVec<[MInst; 4]> {
+        let mut insts = Self::gen_spill_load(from, writable_spilltmp_reg(), crate::types::I64);
+        insts.extend(Self::gen_spill_store(spilltmp_reg(), to, crate::types::I64));
         insts
     }
 
@@ -436,6 +442,29 @@ mod tests {
             panic!("expected an immediate load");
         };
         assert_eq!(value, u64::MAX);
+    }
+
+    #[test]
+    fn stack_to_stack_spill_move_uses_the_reserved_scratch_register() {
+        let insts = Riscv64ABI::gen_stack_to_stack_move(16, 24);
+
+        assert_eq!(insts.len(), 2);
+        assert!(matches!(
+            insts[0],
+            MInst::LoadWord {
+                rd,
+                op: LoadOP::Ld,
+                addr: AMode::SPOffset(16),
+            } if rd.to_reg() == spilltmp_reg()
+        ));
+        assert!(matches!(
+            insts[1],
+            MInst::StoreWord {
+                rs,
+                op: StoreOP::Sd,
+                addr: AMode::SPOffset(24),
+            } if rs == spilltmp_reg()
+        ));
     }
 }
 

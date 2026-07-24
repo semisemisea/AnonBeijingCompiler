@@ -1,4 +1,5 @@
 use core::fmt::Write;
+use std::time::Instant;
 
 use crate::{
     abi::CalleeABI,
@@ -196,20 +197,32 @@ where
         });
 
         let machine_env = vcode.abi.machine_env();
+        let allocation_start = Instant::now();
         let output =
             crate::reg_alloc::alloc::run(&vcode, machine_env).expect("register allocation failed");
         vcode.verify_alloc_output(&output).unwrap_or_else(|error| {
             log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
             panic!("function={} {error}", func_data.name());
         });
-        log::debug!(target: "taki_mir::reg_alloc", "function={} allocation complete: locations={}, spill-slots={}, edits={}", func_data.name(), output.allocs.len(), output.num_spillslots, output.edits.len());
+        let (reg_to_reg_edits, reg_to_stack_edits, stack_to_reg_edits, stack_to_stack_edits) =
+            output.edits.iter().fold((0, 0, 0, 0), |counts, (_, edit)| {
+                let crate::reg_alloc::reg::Edit::Move { from, to, .. } = edit;
+                match (from.is_reg(), to.is_reg()) {
+                    (true, true) => (counts.0 + 1, counts.1, counts.2, counts.3),
+                    (true, false) => (counts.0, counts.1 + 1, counts.2, counts.3),
+                    (false, true) => (counts.0, counts.1, counts.2 + 1, counts.3),
+                    (false, false) => (counts.0, counts.1, counts.2, counts.3 + 1),
+                }
+            });
+        log::debug!(target: "taki_mir::reg_alloc", "function={} allocation complete: locations={}, spill-slots={}, edits={}, allocation-time-us={}", func_data.name(), output.allocs.len(), output.num_spillslots, output.edits.len(), allocation_start.elapsed().as_micros());
+        log::debug!(target: "taki_mir::reg_alloc", "function={} edit-kinds: reg-reg={}, reg-stack={}, stack-reg={}, stack-stack={}", func_data.name(), reg_to_reg_edits, reg_to_stack_edits, stack_to_reg_edits, stack_to_stack_edits);
         for (inst, allocs) in
             (0..vcode.num_insts()).map(|index| (index, output.inst_allocs(index as u32)))
         {
             log::trace!(target: "taki_mir::reg_alloc", "function={} inst={inst} allocations={allocs:?}", func_data.name());
         }
         for (point, edit) in &output.edits {
-            log::debug!(target: "taki_mir::reg_alloc", "function={} edit at {point:?}: {edit:?}", func_data.name());
+            log::trace!(target: "taki_mir::reg_alloc", "function={} edit at {point:?}: {edit:?}", func_data.name());
         }
         vcode.write_back_allocs(&output);
         vcode
@@ -235,7 +248,11 @@ where
                     "allocator spill area exceeds frame range",
                 )
             })?;
-        vcode.abi.compute_frame_layout(spill_size, &output);
+        vcode
+            .abi
+            .compute_frame_layout(spill_size, &output)
+            .map_err(|error| crate::lower::CodegenError::backend(arena, "frame layout", error))?;
+        log::debug!(target: "taki_mir::reg_alloc", "function={} frame: spill-units={}, spill-bytes={}, frame-bytes={}", func_data.name(), output.num_spillslots, spill_size, vcode.abi.frame_layout().total_size);
         log::debug!(target: "taki_mir::emit", "function={} frame layout={:?}", func_data.name(), vcode.abi.frame_layout());
 
         let asm_start = buf.len();

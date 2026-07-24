@@ -4,7 +4,6 @@ use crate::abi::{ABIMachineSpec, FrameLayout};
 use crate::block_order::MirBlockIndex;
 use crate::lower::LowerBackend;
 use crate::prelude::*;
-use crate::reg_alloc::function::Function;
 use crate::reg_alloc::reg::{InstOrEdit, Output, RegClass};
 use crate::register::Reg;
 use crate::vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator, VCodeContainer};
@@ -103,15 +102,16 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
             for item in output.block_insts_and_edits(vcode, block_idx) {
                 match item {
                     InstOrEdit::Edit(edit) => {
-                        let crate::reg_alloc::reg::Edit::Move { from, to } = edit;
+                        let crate::reg_alloc::reg::Edit::Move { from, to, class } = edit;
                         match (from.as_reg(), to.as_reg()) {
                             (Some(from_reg), Some(to_reg)) => {
                                 assert_eq!(
                                     from_reg.class(),
-                                    to_reg.class(),
+                                    *class,
                                     "register-to-register allocation moves cannot cross register classes"
                                 );
-                                let ty = match from_reg.class() {
+                                assert_eq!(to_reg.class(), *class);
+                                let ty = match class {
                                     RegClass::Float => crate::types::F32,
                                     RegClass::Int => crate::types::I64,
                                     RegClass::Vector => {
@@ -128,7 +128,7 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
                             (Some(from_reg), None) => {
                                 let slot = to.as_stack().unwrap();
                                 let offset = frame.spill_slot_offset(slot, spill_unit_bytes);
-                                let ty = match from_reg.class() {
+                                let ty = match class {
                                     RegClass::Float => crate::types::F32,
                                     _ => crate::types::I64,
                                 };
@@ -143,7 +143,7 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
                             (None, Some(to_reg)) => {
                                 let slot = from.as_stack().unwrap();
                                 let offset = frame.spill_slot_offset(slot, spill_unit_bytes);
-                                let ty = match to_reg.class() {
+                                let ty = match class {
                                     RegClass::Float => crate::types::F32,
                                     _ => crate::types::I64,
                                 };

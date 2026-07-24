@@ -137,6 +137,12 @@ impl<T: Clone + Copy + Default + PartialEq> ParallelMoves<T> {
 }
 
 impl<T> MoveVecWithScratch<T> {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::NoScratch(moves) | Self::Scratch(moves) => moves.is_empty(),
+        }
+    }
+
     pub fn with_scratch(self, scratch: Allocation) -> MoveVec<T> {
         match self {
             MoveVecWithScratch::NoScratch(moves) => moves,
@@ -348,6 +354,9 @@ mod tests {
         .compute(moves.resolve());
 
         assert_eq!(moves.as_slice(), &[(src, scratch, 7), (scratch, dst, 7)]);
+        let mut values = BTreeMap::from([(src, 10), (dst, 20), (scratch, 30)]);
+        apply(&moves, &mut values);
+        assert_eq!(values[&dst], 10);
     }
 
     #[test]
@@ -373,5 +382,51 @@ mod tests {
                 (save, borrowed, 0)
             ]
         );
+        let mut values = BTreeMap::from([(src, 10), (dst, 20), (borrowed, 30), (save, 40)]);
+        apply(&moves, &mut values);
+        assert_eq!(values[&dst], 10);
+        assert_eq!(values[&borrowed], 30);
+    }
+
+    #[test]
+    fn resolves_register_stack_and_stack_register_moves_semantically() {
+        let (a, b, c) = (reg(0), stack(0), reg(1));
+        let mut moves = ParallelMoves::new();
+        moves.add(a, b, 0);
+        moves.add(b, c, 0);
+
+        let moves = MoveAndScratchResolver {
+            find_free_reg: || Some(reg(2)),
+            get_stackslot: || panic!("moves do not require a temporary spill slot"),
+            is_stack_alloc: Allocation::is_stack,
+            borrowed_scratch_reg: PReg::new(3, RegClass::Int),
+        }
+        .compute(moves.resolve());
+
+        let mut values = BTreeMap::from([(a, 10), (b, 20), (c, 30), (reg(2), 40)]);
+        apply(&moves, &mut values);
+        assert_eq!(values[&b], 10);
+        assert_eq!(values[&c], 20);
+    }
+
+    #[test]
+    fn uses_temporary_slot_for_cycle_without_free_register() {
+        let (a, b, temp) = (reg(0), reg(1), stack(0));
+        let mut moves = ParallelMoves::new();
+        moves.add(a, b, 0);
+        moves.add(b, a, 0);
+
+        let moves = MoveAndScratchResolver {
+            find_free_reg: || None,
+            get_stackslot: || temp,
+            is_stack_alloc: Allocation::is_stack,
+            borrowed_scratch_reg: PReg::new(2, RegClass::Int),
+        }
+        .compute(moves.resolve());
+
+        let mut values = BTreeMap::from([(a, 10), (b, 20), (temp, 0)]);
+        apply(&moves, &mut values);
+        assert_eq!(values[&a], 20);
+        assert_eq!(values[&b], 10);
     }
 }

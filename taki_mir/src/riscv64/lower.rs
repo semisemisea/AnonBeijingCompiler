@@ -117,6 +117,8 @@ fn select_tmp_ty(ty: &HirType) -> HirType {
 
 pub struct Riscv64Backend;
 
+const INLINE_MEMZERO_MAX_STORES: usize = 4;
+
 impl LowerBackend for Riscv64Backend {
     type MInst = MInst;
     fn lower(
@@ -603,6 +605,36 @@ impl LowerBackend for Riscv64Backend {
                 }
             }
             raana_ir::ir::InstKind::MemZero(mem_zero) => {
+                let inline_store_count = mem_zero.byte_len() / 4;
+                if mem_zero.byte_len() % 4 == 0 && inline_store_count <= INLINE_MEMZERO_MAX_STORES {
+                    let alloc =
+                        matches!(ctx.arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
+                            .then_some(mem_zero.dest());
+                    let (dest, stack_offset) = if let Some(alloc) = alloc {
+                        let pointee = ctx.arena.inst_data(alloc).ty().derefernce();
+                        let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
+                        (
+                            ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
+                            Some(offset),
+                        )
+                    } else {
+                        (ctx.put_value_in_reg(mem_zero.dest()), None)
+                    };
+                    if let Some(offset) = stack_offset {
+                        ctx.emit(<Riscv64ABI as ABIMachineSpec>::gen_get_stack_addr(
+                            StackAMode::Slot(offset),
+                            Writable::from_reg(dest),
+                        ));
+                    }
+                    for index in 0..inline_store_count {
+                        ctx.emit(MInst::StoreWord {
+                            rs: zero_reg(),
+                            op: StoreOP::Sw,
+                            addr: AMode::RegOffest(dest, (index * 4) as i64),
+                        });
+                    }
+                    return Ok(());
+                }
                 let alloc = matches!(ctx.arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
                     .then_some(mem_zero.dest());
                 let (dest, stack_offset) = if let Some(alloc) = alloc {
@@ -1018,5 +1050,28 @@ mod tests {
         assert_eq!(asm.matches("xor ").count(), 2, "{asm}");
         assert!(!asm.contains("beqz "), "{asm}");
         assert!(!asm.contains("bnez "), "{asm}");
+    }
+
+    #[test]
+    fn lowers_small_mem_zero_to_inline_stores() {
+        let mut program = Program::new();
+        let function = program.new_function(HirType::get_unit(), "clear".to_string(), Vec::new());
+        let data = program.func_data_mut(function);
+        let entry = data
+            .new_basic_block()
+            .basic_block("entry".to_string(), Vec::new());
+        data.layout_mut().push_bb_back(entry);
+
+        let alloc = data
+            .new_local_inst()
+            .alloc(HirType::get_array(HirType::get_i32(), 4));
+        let clear = data.new_local_inst().mem_zero(alloc, 16);
+        data.layout_mut().insert_inst(entry, clear);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = crate::compile::<Riscv64Backend>(&program).unwrap();
+        assert!(!asm.contains("call memset"), "{asm}");
+        assert_eq!(asm.matches("sw zero").count(), 4, "{asm}");
     }
 }

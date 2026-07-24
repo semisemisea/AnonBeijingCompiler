@@ -5,8 +5,6 @@ historical measurements belong in commits, tests, or dedicated documentation.
 
 ## Current Priority: Bulk Local Array Initialization Follow-Up
 
-- [ ] Implement and measure a small-clear inline-store policy before replacing the
-  current target `memset` calls for small local arrays.
 - [ ] Validate RISC-V `MemZero` code generation after fixing the pre-existing
   incoming-register argument spill model, which currently violates the allocator
   contract for an allocatable physical argument register.

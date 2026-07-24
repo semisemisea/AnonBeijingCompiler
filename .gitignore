@@ -3,3 +3,4 @@
 /.docker-image
 .DS_Store
 __pycache__
+/.vscode/settings.json

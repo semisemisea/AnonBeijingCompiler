@@ -469,11 +469,6 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
                 ) {
                     insts.push(inst);
                 }
-                let arg = ArgPair {
-                    vreg: Writable::from_reg(into_reg),
-                    preg: preg.into(),
-                };
-                self.reg_args.push(arg);
             }
             ArgSlot::Stack { offset, ty } => {
                 for inst in

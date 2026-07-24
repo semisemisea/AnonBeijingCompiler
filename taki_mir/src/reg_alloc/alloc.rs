@@ -1396,7 +1396,6 @@ impl<'a, F: Function> DerefMut for Env<'a, F> {
 pub fn run<F: Function>(func: &F, mach_env: &MachineEnv) -> Result<Output, String> {
     let mut env = Env::new(func, mach_env);
     env.run()?;
-
     Ok(Output {
         allocs: env.allocs.allocs,
         inst_alloc_offsets: env.allocs.inst_alloc_offsets,

@@ -280,6 +280,30 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             bb_end_color.insert(bb_layout.bb(), acc_color);
         }
 
+        let mut value_lowered_use = FxHashMap::default();
+        // Branch arguments are VCode edge uses but are not necessarily present
+        // in HIR's ordinary instruction use lists. Seed them before lowering so
+        // a producer is retained regardless of block traversal order.
+        for bb_layout in data.layout().basicblocks() {
+            let terminator = *bb_layout
+                .insts()
+                .get_last()
+                .expect("every lowered HIR block has a terminator");
+            let args: &[HirInst] = match data.inst_data(terminator).kind() {
+                InstKind::Branch(branch) => {
+                    for &arg in branch.t_args().iter().chain(branch.f_args()) {
+                        *value_lowered_use.entry(arg).or_insert(0) += 1;
+                    }
+                    continue;
+                }
+                InstKind::Jump(jump) => jump.args(),
+                _ => &[],
+            };
+            for &arg in args {
+                *value_lowered_use.entry(arg).or_insert(0) += 1;
+            }
+        }
+
         Ok(LowerContext {
             arena,
             vcode,
@@ -291,7 +315,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             inst_color,
             cur_color: None,
             bb_end_color,
-            value_lowered_use: FxHashMap::default(),
+            value_lowered_use,
             ir_inst: Vec::new(),
         })
     }
@@ -430,10 +454,6 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 self.emit(inst);
             }
             self.finish_ir_inst();
-
-            if let Some(inst) = self.vcode.vcode.abi.take_args() {
-                self.emit(inst);
-            }
         }
 
         // Phase 2: Emit register-arg stores at the END of the VCode block.
@@ -605,14 +625,12 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 let inst = arg;
                 let uses = self.value_lowered_use.entry(inst).or_insert(0);
                 *uses += 1;
-                let use_count = *uses;
                 assert!(!self.inst_sunk.contains(&inst));
                 let reg = *self.reg_map.entry(inst).or_insert_with(|| {
                     self.vregs_alloc
                         .alloc(self.arena.inst_data(inst).ty().into())
                 });
-                self.rematerialize_if_needed(inst, reg, use_count);
-                reg
+                self.rematerialize_if_needed(inst, reg)
             };
             let param_reg = self.reg_map[&params[arg_idx]];
             assert_eq!(
@@ -688,6 +706,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
 
     fn is_value_needed(&self, inst: HirInst) -> bool {
         self.value_lowered_use.get(&inst).copied().unwrap_or(0) > 0
+            || !self.arena.inst_data(inst).used_by().is_empty()
     }
 
     fn finish_ir_inst(&mut self) {
@@ -704,16 +723,13 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     }
 
     pub fn put_value_in_reg(&mut self, inst: HirInst) -> Reg {
-        let uses = self.value_lowered_use.entry(inst).or_insert(0);
-        *uses += 1;
-        let use_count = *uses;
+        *self.value_lowered_use.entry(inst).or_insert(0) += 1;
         assert!(!self.inst_sunk.contains(&inst));
         let reg = *self.reg_map.entry(inst).or_insert_with(|| {
             self.vregs_alloc
                 .alloc(self.arena.inst_data(inst).ty().into())
         });
-        self.rematerialize_if_needed(inst, reg, use_count);
-        reg
+        self.rematerialize_if_needed(inst, reg)
     }
 
     /// Mark a pure producer as consumed directly by `consumer`.
@@ -773,48 +789,75 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         true
     }
 
-    fn rematerialize_if_needed(&mut self, inst: HirInst, reg: Reg, use_count: u32) {
+    fn rematerialize_if_needed(&mut self, inst: HirInst, reg: Reg) -> Reg {
         enum Remat {
             Int(i32),
             Float(u32),
             Global,
+            Undef,
         }
 
         let remat = match self.arena.inst_data(inst).kind() {
             InstKind::Integer(i) => Some(Remat::Int(i.value())),
             InstKind::Float(f) => Some(Remat::Float(f.value().to_bits())),
             InstKind::GlobalAlloc(..) => Some(Remat::Global),
+            InstKind::Undef => Some(Remat::Undef),
             _ => None,
         };
-        let is_rematerializable = remat.is_some();
-        if use_count != 1 && !is_rematerializable {
-            return;
-        }
-
         match remat {
             Some(Remat::Int(value)) => {
+                let reg = self.alloc_tmp(HirType::get_i32());
                 self.emit(<I::ABISpec as ABIMachineSpec>::gen_load_imm(
                     Writable::from_reg(reg),
                     value as u32 as u64,
                     I32,
                 ));
+                reg
             }
             Some(Remat::Float(bits)) => {
                 let tmp = self.alloc_tmp(HirType::get_i32());
+                let reg = self.alloc_tmp(HirType::get_f32());
                 self.emit(<I::ABISpec as ABIMachineSpec>::gen_load_imm(
                     Writable::from_reg(tmp),
                     bits as u64,
                     I32,
                 ));
                 self.emit(<I::ABISpec as ABIMachineSpec>::gen_move(tmp, reg, F32));
+                reg
             }
             Some(Remat::Global) => {
+                let reg = self.alloc_tmp(self.arena.inst_data(inst).ty().clone());
                 self.emit(<I::ABISpec as ABIMachineSpec>::gen_load_addr(
                     Writable::from_reg(reg),
                     inst,
                 ));
+                reg
             }
-            None => {}
+            Some(Remat::Undef) => {
+                let ty = self.arena.inst_data(inst).ty().clone();
+                let reg = self.alloc_tmp(ty.clone());
+                match ty.kind() {
+                    HirTypeKind::Float32 => {
+                        let bits = self.alloc_tmp(HirType::get_i32());
+                        self.emit(<I::ABISpec as ABIMachineSpec>::gen_load_imm(
+                            Writable::from_reg(bits),
+                            0,
+                            I32,
+                        ));
+                        self.emit(<I::ABISpec as ABIMachineSpec>::gen_move(bits, reg, F32));
+                    }
+                    HirTypeKind::Int32 | HirTypeKind::Pointer(_) => {
+                        self.emit(<I::ABISpec as ABIMachineSpec>::gen_load_imm(
+                            Writable::from_reg(reg),
+                            0,
+                            ty.into(),
+                        ));
+                    }
+                    kind => unreachable!("unsupported undefined value type {kind:?}"),
+                }
+                reg
+            }
+            None => reg,
         }
     }
 

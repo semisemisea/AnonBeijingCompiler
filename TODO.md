@@ -1,9 +1,35 @@
-# Backend TODO
+# Compiler TODO
 
 Only pending work belongs in this file. Completed implementation notes and
 historical measurements belong in commits, tests, or dedicated documentation.
 
-## Current Priority: Measure And Accept Ion
+## Current Priority: Bulk Local Array Initialization Follow-Up
+
+- [ ] Add focused RaanaIR, frontend, LLVM writer, and backend instruction-selection
+  tests for `MemZero`, including sparse nested initializers and side effects.
+- [ ] Implement and measure a small-clear inline-store policy before replacing the
+  current target `memset` calls for small local arrays.
+- [ ] Validate RISC-V `MemZero` code generation after fixing the pre-existing
+  incoming-register argument spill model, which currently violates the allocator
+  contract for an allocatable physical argument register.
+- [ ] Run the full AArch64 and RISC-V acceptance matrix after the focused coverage
+  and RISC-V entry-argument repair are available.
+
+### Follow-Up Optimization Work
+
+- [ ] Benchmark inline-clear thresholds on representative AArch64 and RISC-V
+  targets. Compare code size, runtime, call overhead, alignment, and library
+  implementation behavior; retain a threshold only with measurements.
+- [ ] Add target-specific paired/wider clear stores only after the generic
+  `MemZero` path is stable and verified.
+- [ ] Design general memory intrinsics (`Memset`, `Memcpy`, `Memmove`) only when
+  an accepted source feature needs arbitrary fill bytes, dynamic sizes, or bulk
+  copies. Define target-width integer and alias/effect semantics first.
+- [ ] Introduce target-aware data layout before supporting targets whose pointer
+  width differs from the compiler host. Current `Type::size()` derives pointer
+  size from the host and is not a complete target layout model.
+
+## Parallel Priority: Measure And Accept Ion
 
 - [ ] Re-run focused spill/call/loop/edge/large-frame/float cases at `-O0` and
   `-O1`, then run `cargo fmt --check`, `git diff --check`, crate tests, workspace

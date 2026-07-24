@@ -194,6 +194,15 @@ fn visit_and_replace_single(data: &mut ArenaContext<'_>, used_by: Inst, rep: Ins
             };
             data.replace_inst_with(used_by).store(src, dest);
         }
+        InstKind::MemZero(mem_zero) => {
+            let dest = if mem_zero.dest() == rep {
+                rep_with
+            } else {
+                mem_zero.dest()
+            };
+            let byte_len = mem_zero.byte_len();
+            data.replace_inst_with(used_by).mem_zero(dest, byte_len);
+        }
         InstKind::GetElemPtr(get_elem_ptr) => {
             if get_elem_ptr.base() == rep || get_elem_ptr.offsets().contains(&rep) {
                 let mut rep_with_vec = Vec::with_capacity(get_elem_ptr.offsets().len());

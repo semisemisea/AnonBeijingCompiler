@@ -280,6 +280,12 @@ impl Writer<'_> {
             }
             InstKind::Jump(jump) => self.visit_jump(jump),
             InstKind::Load(load) => self.visit_load(load),
+            InstKind::MemZero(mem_zero) => write!(
+                self.buffer,
+                "memzero {}, {}",
+                get_name!(self, mem_zero.dest()),
+                mem_zero.byte_len()
+            ),
             InstKind::Return(ret) => self.visit_return(ret),
             InstKind::Store(store) => self.visit_store(store),
             _ => panic!("invalid local instruction"),

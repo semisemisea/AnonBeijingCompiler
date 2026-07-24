@@ -359,6 +359,7 @@ impl<'a, F: Function> State<'a, F> {
                 Edit::Move {
                     from: scratch_alloc,
                     to,
+                    class,
                 },
             ));
             log::trace!("Move 2: {from:?} to {scratch_alloc:?}");
@@ -367,11 +368,14 @@ impl<'a, F: Function> State<'a, F> {
                 Edit::Move {
                     from,
                     to: scratch_alloc,
+                    class,
                 },
             ));
         } else {
-            self.edits
-                .push((ProgPoint::new(inst.raw_u32(), pos), Edit::Move { from, to }));
+            self.edits.push((
+                ProgPoint::new(inst.raw_u32(), pos),
+                Edit::Move { from, to, class },
+            ));
         }
         Ok(())
     }
@@ -948,6 +952,9 @@ impl<'a, F: Function> Env<'a, F> {
             (resolved_float, RegClass::Float),
             (resolved_vec, RegClass::Vector),
         ] {
+            if resolved.is_empty() {
+                continue;
+            }
             let borrowed_scratch_reg = self.preferred_victim[class];
             let fixed_stack_slots = self.fixed_stack_slots;
             let slot_size = u32::try_from(self.func.spillslot_size(class))
@@ -991,8 +998,10 @@ impl<'a, F: Function> Env<'a, F> {
             let moves = scratch_resolver.compute(resolved);
             log::trace!("Resolved {class:?} parallel moves");
             for (from, to, _) in moves.into_iter().rev() {
-                self.edits
-                    .push((ProgPoint::before(inst.raw_u32()), Edit::Move { from, to }))
+                self.edits.push((
+                    ProgPoint::before(inst.raw_u32()),
+                    Edit::Move { from, to, class },
+                ))
             }
             self.stack.num_spillslots = num_spillslots;
         }
@@ -1362,6 +1371,9 @@ impl<'a, F: Function> Env<'a, F> {
         for block in (0..self.func.num_blocks()).rev() {
             self.alloc_block(Block::new(block))?;
         }
+        // Allocation emits moves while walking backwards. Reversing once at the
+        // output boundary yields ascending program points and runtime order for
+        // edits that share a point.
         self.edits.reverse();
         Ok(())
     }
@@ -1391,4 +1403,110 @@ pub fn run<F: Function>(func: &F, mach_env: &MachineEnv) -> Result<Output, Strin
         edits: env.state.edits,
         num_spillslots: env.state.stack.num_spillslots as usize,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reg_alloc::index::InstRange;
+
+    struct TestFunction {
+        int_size: usize,
+        float_size: usize,
+        name_multi_unit_by_last_slot: bool,
+    }
+
+    impl Function for TestFunction {
+        fn num_insts(&self) -> usize {
+            0
+        }
+
+        fn num_blocks(&self) -> usize {
+            0
+        }
+
+        fn entry_block(&self) -> Block {
+            Block::invalid()
+        }
+
+        fn block_insns(&self, _block: Block) -> InstRange {
+            unreachable!()
+        }
+
+        fn block_succs(&self, _block: Block) -> &[Block] {
+            &[]
+        }
+
+        fn block_preds(&self, _block: Block) -> &[Block] {
+            &[]
+        }
+
+        fn block_params(&self, _block: Block) -> &[VReg] {
+            &[]
+        }
+
+        fn is_ret(&self, _insn: Inst) -> bool {
+            false
+        }
+
+        fn is_branch(&self, _insn: Inst) -> bool {
+            false
+        }
+
+        fn branch_blockparams(&self, _block: Block, _insn: Inst, _succ_idx: usize) -> &[VReg] {
+            &[]
+        }
+
+        fn inst_operands(&self, _insn: Inst) -> &[Operand] {
+            &[]
+        }
+
+        fn inst_clobbers(&self, _insn: Inst) -> PRegSet {
+            PRegSet::empty()
+        }
+
+        fn num_vregs(&self) -> usize {
+            0
+        }
+
+        fn spillslot_size(&self, class: RegClass) -> usize {
+            match class {
+                RegClass::Int => self.int_size,
+                RegClass::Float => self.float_size,
+                RegClass::Vector => unreachable!(),
+            }
+        }
+
+        fn multi_spillslot_named_by_last_slot(&self) -> bool {
+            self.name_multi_unit_by_last_slot
+        }
+    }
+
+    #[test]
+    fn stack_allocator_aligns_mixed_size_slots() {
+        let func = TestFunction {
+            int_size: 1,
+            float_size: 2,
+            name_multi_unit_by_last_slot: false,
+        };
+        let mut stack = Stack::new(&func);
+
+        assert_eq!(stack.allocstack(RegClass::Int), SpillSlot::new(0));
+        assert_eq!(stack.allocstack(RegClass::Float), SpillSlot::new(2));
+        assert_eq!(stack.allocstack(RegClass::Int), SpillSlot::new(4));
+        assert_eq!(stack.num_spillslots, 5);
+    }
+
+    #[test]
+    fn stack_allocator_can_name_multi_unit_slot_by_last_unit() {
+        let func = TestFunction {
+            int_size: 1,
+            float_size: 2,
+            name_multi_unit_by_last_slot: true,
+        };
+        let mut stack = Stack::new(&func);
+
+        assert_eq!(stack.allocstack(RegClass::Float), SpillSlot::new(1));
+        assert_eq!(stack.num_spillslots, 2);
+    }
 }

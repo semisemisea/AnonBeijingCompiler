@@ -373,7 +373,15 @@ impl core::fmt::Debug for ProgPoint {
 
 #[derive(Clone, Debug)]
 pub enum Edit {
-    Move { from: Allocation, to: Allocation },
+    /// One allocator move, executed in the order stored in `Output::edits`.
+    /// Edits are ordered by program point and in the exact execution order for
+    /// edits sharing a point.
+    /// Stack endpoints carry no class, so the move records it explicitly.
+    Move {
+        from: Allocation,
+        to: Allocation,
+        class: RegClass,
+    },
 }
 
 #[derive(Clone, Debug, Default)]

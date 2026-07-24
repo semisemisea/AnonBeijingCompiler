@@ -363,7 +363,7 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
         &mut self,
         spill_size: u32,
         output: &crate::reg_alloc::reg::Output,
-    ) {
+    ) -> Result<(), String> {
         let mut callee_saved: Vec<PReg> = output
             .allocs
             .iter()
@@ -375,7 +375,10 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
 
         let stackslots_size = self.total_stackslots_size;
         let outgoing_args_size = self.outgoing_arg_size;
-        let clobber_size = callee_saved.len() as u32 * M::word_bytes();
+        let clobber_size = u32::try_from(callee_saved.len())
+            .map_err(|_| "callee-save count exceeds frame range")?
+            .checked_mul(M::word_bytes())
+            .ok_or("callee-save area exceeds frame range")?;
         let setup_area_size = if self.has_calls
             || self.sized_stack_arg_size > 0
             || self.total_stackslots_size > 0
@@ -386,10 +389,17 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
         } else {
             0
         };
-        let mut total =
-            setup_area_size + clobber_size + spill_size + stackslots_size + outgoing_args_size;
+        let total = setup_area_size
+            .checked_add(clobber_size)
+            .and_then(|total| total.checked_add(spill_size))
+            .and_then(|total| total.checked_add(stackslots_size))
+            .and_then(|total| total.checked_add(outgoing_args_size))
+            .ok_or("frame size exceeds frame range")?;
         let align = M::stack_align();
-        total = total.next_multiple_of(align);
+        let total = total
+            .checked_add(align.checked_sub(1).ok_or("invalid stack alignment")?)
+            .map(|size| size / align * align)
+            .ok_or("aligned frame size exceeds frame range")?;
         let layout = FrameLayout {
             callee_saved,
             setup_area_size,
@@ -400,6 +410,7 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
             total_size: total,
         };
         self.frame_layout = Some(layout);
+        Ok(())
     }
 
     /// Pre-allocate spill slots for all register arguments without

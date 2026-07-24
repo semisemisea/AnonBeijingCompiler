@@ -280,7 +280,7 @@ impl<I: VCodeInst> VCodeContainer<I> {
             }
             previous_point = Some(*point);
 
-            let Edit::Move { from, to } = edit;
+            let Edit::Move { from, to, class } = edit;
             if from.is_none() || to.is_none() {
                 return Err(format!(
                     "allocator edit {edit_index} at {point:?} has an unresolved endpoint: {from} -> {to}"
@@ -296,11 +296,16 @@ impl<I: VCodeInst> VCodeContainer<I> {
                 }
             }
             if let (Some(from_reg), Some(to_reg)) = (from.as_reg(), to.as_reg()) {
-                if from_reg.class() != to_reg.class() {
+                if from_reg.class() != *class || to_reg.class() != *class {
                     return Err(format!(
                         "allocator edit {edit_index} at {point:?} crosses register classes: {from} -> {to}"
                     ));
                 }
+            }
+            if *class == RegClass::Vector {
+                return Err(format!(
+                    "allocator edit {edit_index} at {point:?} uses unsupported vector spill semantics: {from} -> {to}"
+                ));
             }
         }
         Ok(())
@@ -696,5 +701,151 @@ impl<I: VCodeInst> VCodeBuilder<I> {
         self.vcode.block_succ_range.reverse_index();
         self.vcode.insts.reverse();
         self.vcode.branch_block_arg_succ_range.reverse_index();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        abi::CalleeABI,
+        prelude::{ArenaContext, HirFunctionData, HirType},
+        register::{VRegAllocator, Writable},
+        riscv64::{abi::Riscv64ABI, instructions::MInst},
+        types::I64,
+    };
+    use raana_ir::{
+        ir::Program,
+        opt::prelude::{BasicBlockBuilder, LocalInstBuilder},
+    };
+
+    fn add_block(data: &mut HirFunctionData, name: &str) {
+        let block = data.new_basic_block().basic_block(name.to_owned(), vec![]);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().push_bb_back(block);
+        data.layout_mut().insert_inst(block, ret);
+    }
+
+    fn empty_vcode() -> VCodeContainer<MInst> {
+        let mut program = Program::new();
+        let func = program.new_function(HirType::get_unit(), "verify".to_owned(), vec![]);
+        add_block(program.func_data_mut(func), "entry");
+        let arena = ArenaContext {
+            program: &program,
+            curr_func: Some(func),
+        };
+        let abi = CalleeABI::<Riscv64ABI>::new(arena);
+        let order = BlockLoweringOrder::new(arena);
+        let mut builder = VCodeBuilder::new(abi, order);
+        builder.push(MInst::Ret);
+        builder.end_bb();
+        builder.build(VRegAllocator::with_capaticy(0))
+    }
+
+    fn vcode_with_integer_def() -> VCodeContainer<MInst> {
+        let mut program = Program::new();
+        let func = program.new_function(HirType::get_unit(), "verify".to_owned(), vec![]);
+        add_block(program.func_data_mut(func), "entry");
+        let arena = ArenaContext {
+            program: &program,
+            curr_func: Some(func),
+        };
+        let abi = CalleeABI::<Riscv64ABI>::new(arena);
+        let order = BlockLoweringOrder::new(arena);
+        let mut builder = VCodeBuilder::new(abi, order);
+        let mut vregs = VRegAllocator::with_capaticy(1);
+        let dst = Writable::from_reg(vregs.alloc(I64));
+        builder.push(MInst::Ret);
+        builder.push(MInst::LoadImm { rd: dst, value: 1 });
+        builder.end_bb();
+        builder.build(vregs)
+    }
+
+    #[test]
+    fn allocation_output_verifier_accepts_empty_return() {
+        let vcode = empty_vcode();
+        let output = Output {
+            inst_alloc_offsets: vec![0],
+            ..Output::default()
+        };
+
+        assert!(vcode.verify_alloc_output(&output).is_ok());
+    }
+
+    #[test]
+    fn allocation_output_verifier_rejects_out_of_range_edit_slot() {
+        let vcode = empty_vcode();
+        let output = Output {
+            inst_alloc_offsets: vec![0],
+            edits: vec![(
+                crate::reg_alloc::reg::ProgPoint::before(0),
+                Edit::Move {
+                    from: crate::reg_alloc::reg::Allocation::stack(
+                        crate::reg_alloc::reg::SpillSlot::new(0),
+                    ),
+                    to: crate::reg_alloc::reg::Allocation::reg(crate::riscv64::regs::px_reg(5)),
+                    class: RegClass::Int,
+                },
+            )],
+            ..Output::default()
+        };
+
+        let error = vcode.verify_alloc_output(&output).unwrap_err();
+        assert!(error.contains("out-of-range spill slot"), "{error}");
+    }
+
+    #[test]
+    fn allocation_output_verifier_rejects_vector_edit() {
+        let vcode = empty_vcode();
+        let output = Output {
+            inst_alloc_offsets: vec![0],
+            edits: vec![(
+                crate::reg_alloc::reg::ProgPoint::before(0),
+                Edit::Move {
+                    from: crate::reg_alloc::reg::Allocation::stack(
+                        crate::reg_alloc::reg::SpillSlot::new(0),
+                    ),
+                    to: crate::reg_alloc::reg::Allocation::stack(
+                        crate::reg_alloc::reg::SpillSlot::new(0),
+                    ),
+                    class: RegClass::Vector,
+                },
+            )],
+            num_spillslots: 1,
+            ..Output::default()
+        };
+
+        let error = vcode.verify_alloc_output(&output).unwrap_err();
+        assert!(
+            error.contains("unsupported vector spill semantics"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn allocation_output_verifier_rejects_instruction_arity_mismatch() {
+        let vcode = vcode_with_integer_def();
+        let output = Output {
+            inst_alloc_offsets: vec![0, 0],
+            ..Output::default()
+        };
+
+        let error = vcode.verify_alloc_output(&output).unwrap_err();
+        assert!(error.contains("expected 1"), "{error}");
+    }
+
+    #[test]
+    fn allocation_output_verifier_rejects_register_class_mismatch() {
+        let vcode = vcode_with_integer_def();
+        let output = Output {
+            inst_alloc_offsets: vec![0, 1],
+            allocs: vec![crate::reg_alloc::reg::Allocation::reg(
+                crate::riscv64::regs::pf_reg(0),
+            )],
+            ..Output::default()
+        };
+
+        let error = vcode.verify_alloc_output(&output).unwrap_err();
+        assert!(error.contains("assigned register"), "{error}");
     }
 }

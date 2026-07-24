@@ -162,6 +162,40 @@ impl DeadCodeElimination {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{DeadCodeElimination, Pass};
+    use crate::ir::{Program, Type, arena::Arena, builder_trait::*};
+
+    #[test]
+    fn preserves_mem_zero_and_its_allocation() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "clear".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let alloc = data
+            .new_local_inst()
+            .alloc(Type::get_array(Type::get_i32(), 4));
+        let clear = data.new_local_inst().mem_zero(alloc, 16);
+        data.layout_mut().insert_inst(entry, clear);
+        let one = data.new_local_inst().integer(1);
+        let dead = data
+            .new_local_inst()
+            .binary(crate::ir::BinaryOp::Add, one, one);
+        data.layout_mut().insert_inst(entry, dead);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        assert!(DeadCodeElimination.run(&mut program));
+        let data = program.func_data(function);
+        let insts = data.layout().basicblock(entry).insts();
+        assert!(insts.iter().any(|&inst| inst == clear));
+        assert!(!insts.iter().any(|&inst| inst == dead));
+        assert!(data.inst_data(alloc).used_by().contains(&clear));
+    }
+}
+
 impl Pass for DeadPhiElimination {
     fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
         let mut bb_allocator: IDAllocator<BasicBlock, BId> = IDAllocator::new(1);

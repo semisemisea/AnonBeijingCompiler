@@ -5,7 +5,7 @@ use taki_mir::{
     abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::{LoweredBlock, MirBlockIndex},
     lower::{CodegenError, LowerBackend, LowerContext},
-    prelude::{HirFunctionData, HirProgram},
+    prelude::HirFunctionData,
     reg_alloc::reg::PReg,
     register::Writable,
     vcode::MachInst,
@@ -17,34 +17,12 @@ use crate::{
         AMode, AluOp, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift, MInst, MemoryType,
         SelectCmp, SelectValue, ShiftOp,
     },
-    labels::{EmbeddedSymbol, Label},
+    labels::Label,
     regs::{self, Gpr, OperandSize, RegOrZr},
+    runtime::{self, EmbeddedSymbol},
 };
 
 pub struct AArch64Backend;
-
-const INLINE_MEMZERO_MAX_STORES: usize = 4;
-
-fn mem_zero_is_inline(byte_len: usize) -> bool {
-    byte_len % 4 == 0 && byte_len / 4 <= INLINE_MEMZERO_MAX_STORES
-}
-
-fn needs_embedded_memset(program: &HirProgram) -> bool {
-    program.function_layout().iter().any(|&function| {
-        program
-            .func_data(function)
-            .layout()
-            .basicblocks()
-            .iter()
-            .flat_map(|block| block.insts().iter())
-            .any(
-                |&inst| match program.func_data(function).inst_data(inst).kind() {
-                    InstKind::MemZero(mem_zero) => !mem_zero_is_inline(mem_zero.byte_len()),
-                    _ => false,
-                },
-            )
-    })
-}
 
 impl LowerBackend for AArch64Backend {
     type MInst = MInst;
@@ -469,7 +447,7 @@ impl LowerBackend for AArch64Backend {
             InstKind::Store(store) => lower_store(ctx, store.src(), store.dest()),
             InstKind::MemZero(mem_zero) => {
                 let inline_store_count = mem_zero.byte_len() / 4;
-                if mem_zero_is_inline(mem_zero.byte_len()) {
+                if runtime::mem_zero_is_inline(mem_zero.byte_len()) {
                     let alloc =
                         matches!(ctx.arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
                             .then_some(mem_zero.dest());
@@ -764,8 +742,8 @@ impl LowerBackend for AArch64Backend {
         ctx.emit(MInst::gen_jump(target));
     }
 
-    fn runtime_assembly(program: &HirProgram) -> Option<&'static str> {
-        needs_embedded_memset(program).then_some(include_str!("lib/memset.S"))
+    fn runtime_assembly(program: &taki_mir::prelude::HirProgram) -> Option<String> {
+        runtime::assembly(program)
     }
 }
 

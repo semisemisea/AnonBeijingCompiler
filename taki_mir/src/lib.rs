@@ -279,7 +279,7 @@ where
             buf.push('\n');
         }
         buf.push('\n');
-        buf.push_str(runtime);
+        buf.push_str(&runtime);
         if !runtime.ends_with('\n') {
             buf.push('\n');
         }

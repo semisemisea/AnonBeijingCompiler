@@ -186,7 +186,7 @@ pub trait LowerBackend {
     fn emit_long_jump(ctx: &mut LowerContext<Self::MInst>, target: MirBlockIndex);
 
     /// Optional target-private assembly appended after all generated functions.
-    fn runtime_assembly(_program: &HirProgram) -> Option<&'static str> {
+    fn runtime_assembly(_program: &HirProgram) -> Option<String> {
         None
     }
 }

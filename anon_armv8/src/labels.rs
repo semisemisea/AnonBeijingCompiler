@@ -1,22 +1,6 @@
 use taki_mir::{block_order::MirBlockIndex, prelude::*, vcode::EmitContext};
 
-/// Compiler-provided symbols emitted into the same assembly unit as user code.
-///
-/// These are intentionally distinct from source-level functions and external
-/// libc/runtime symbols: every variant must have a private, collision-safe
-/// local assembly label and a matching runtime fragment when selected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EmbeddedSymbol {
-    Memset,
-}
-
-impl EmbeddedSymbol {
-    pub const fn symbol(self) -> &'static str {
-        match self {
-            Self::Memset => ".Lsoyo_memset",
-        }
-    }
-}
+use crate::runtime::EmbeddedSymbol;
 
 #[derive(Debug, Clone)]
 pub enum Label {

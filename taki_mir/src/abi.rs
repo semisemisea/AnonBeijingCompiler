@@ -6,7 +6,7 @@ use smallvec::{SmallVec, smallvec};
 use tomori_utils::{PrimaryMap, SecondaryMap, entity_impl};
 
 use crate::prelude::*;
-use crate::reg_alloc::reg::{MachineEnv, PReg, RegClass};
+use crate::reg_alloc::reg::{MachineEnv, PReg, RegClass, SpillSlot};
 use crate::register::{Reg, Writable};
 use crate::types::LoweredType;
 use crate::vcode::VCodeInst;
@@ -54,7 +54,14 @@ pub trait ABIMachineSpec {
 
     fn stack_align() -> u32;
 
+    /// Number of logical allocator spill units needed by a value in `regclass`.
+    ///
+    /// `SpillSlot` values and `Output::num_spillslots` are expressed in these
+    /// units. Frame layout converts units to bytes with `spill_unit_bytes()`.
     fn spillslot_size(_regclass: RegClass) -> u32;
+
+    /// Physical byte width of one logical allocator spill unit.
+    fn spill_unit_bytes() -> u32;
 
     fn is_callee_saved(_preg: PReg) -> bool;
 
@@ -158,6 +165,76 @@ pub struct FrameLayout {
     pub stackslots_size: u32,
     pub outgoing_args_size: u32,
     pub total_size: u32,
+}
+
+impl FrameLayout {
+    /// Allocator spills follow outgoing arguments and normal frame objects.
+    pub fn spill_base_bytes(&self) -> u32 {
+        self.outgoing_args_size
+            .checked_add(self.stackslots_size)
+            .expect("spill base overflow")
+    }
+
+    pub fn spill_slot_offset(&self, slot: SpillSlot, unit_bytes: u32) -> i64 {
+        assert!(unit_bytes > 0, "spill unit size must be nonzero");
+        let offset = (slot.raw_bits() as u64)
+            .checked_mul(unit_bytes as u64)
+            .and_then(|offset| offset.checked_add(self.spill_base_bytes() as u64))
+            .expect("spill offset overflow");
+        let end = offset
+            .checked_add(unit_bytes as u64)
+            .expect("spill access end overflow");
+        assert!(
+            end <= self.spill_region_end() as u64,
+            "spill slot {slot} is outside the spill region"
+        );
+        i64::try_from(offset).expect("spill offset exceeds signed address range")
+    }
+
+    pub fn spill_region_end(&self) -> u32 {
+        self.spill_base_bytes()
+            .checked_add(self.spill_size)
+            .expect("spill region overflow")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spill_slots_follow_outgoing_and_local_stack_areas() {
+        let frame = FrameLayout {
+            callee_saved: vec![],
+            setup_area_size: 16,
+            clobber_size: 0,
+            spill_size: 24,
+            stackslots_size: 16,
+            outgoing_args_size: 32,
+            total_size: 96,
+        };
+
+        assert_eq!(frame.spill_base_bytes(), 48);
+        assert_eq!(frame.spill_slot_offset(SpillSlot::new(0), 8), 48);
+        assert_eq!(frame.spill_slot_offset(SpillSlot::new(2), 8), 64);
+        assert_eq!(frame.spill_region_end(), 72);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the spill region")]
+    fn spill_slot_offset_rejects_out_of_range_slot() {
+        let frame = FrameLayout {
+            callee_saved: vec![],
+            setup_area_size: 0,
+            clobber_size: 0,
+            spill_size: 8,
+            stackslots_size: 0,
+            outgoing_args_size: 0,
+            total_size: 16,
+        };
+
+        frame.spill_slot_offset(SpillSlot::new(1), 8);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +353,10 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
 
     pub fn spillslot_size(&self, regclass: RegClass) -> u32 {
         M::spillslot_size(regclass)
+    }
+
+    pub fn spill_unit_bytes(&self) -> u32 {
+        M::spill_unit_bytes()
     }
 
     pub fn compute_frame_layout(

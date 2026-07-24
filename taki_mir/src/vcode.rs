@@ -11,8 +11,8 @@ use crate::{
         function::Function,
         index::{Block, Inst, InstRange},
         reg::{
-            Operand, OperandCollector, OperandVisitor, OperandWriter, Output, PRegSet, RegClass,
-            VReg,
+            AllocationKind, Edit, Operand, OperandCollector, OperandConstraint, OperandVisitor,
+            OperandWriter, Output, PRegSet, RegClass, VReg,
         },
     },
     register::{Reg, VRegAllocator, Writable},
@@ -155,6 +155,155 @@ impl<I: VCodeInst> VCodeContainer<I> {
             let mut writer = OperandWriter::new(allocs);
             self.insts[i].get_operands(&mut writer);
         }
+    }
+
+    /// Check allocator output before applying it to mutable machine instructions.
+    pub fn verify_alloc_output(&self, output: &Output) -> Result<(), String> {
+        if output.inst_alloc_offsets.len() != self.insts.len() {
+            return Err(format!(
+                "allocator output has {} instruction offsets for {} instructions",
+                output.inst_alloc_offsets.len(),
+                self.insts.len()
+            ));
+        }
+
+        let mut previous = 0;
+        for (inst_index, &offset) in output.inst_alloc_offsets.iter().enumerate() {
+            let offset = offset as usize;
+            if offset < previous || offset > output.allocs.len() {
+                return Err(format!(
+                    "allocator output offset {offset} for instruction {inst_index} is outside the allocation table"
+                ));
+            }
+            previous = offset;
+        }
+
+        for inst_index in 0..self.insts.len() {
+            let allocations = output.inst_allocs(inst_index as u32);
+            let operands = self.inst_operands(Inst::new(inst_index));
+            if allocations.len() != operands.len() {
+                return Err(format!(
+                    "allocator output has {} locations for instruction {inst_index}, expected {}",
+                    allocations.len(),
+                    operands.len()
+                ));
+            }
+
+            for (operand_index, (&operand, &allocation)) in
+                operands.iter().zip(allocations).enumerate()
+            {
+                if operand.as_fixed_nonallocatable().is_some() {
+                    if !allocation.is_none() {
+                        return Err(format!(
+                            "allocator assigned {allocation} to fixed non-allocatable operand {operand_index} ({operand}) of instruction {inst_index}"
+                        ));
+                    }
+                    continue;
+                }
+
+                if allocation.is_none() {
+                    return Err(format!(
+                        "allocator left operand {operand_index} ({operand}) of instruction {inst_index} unresolved"
+                    ));
+                }
+                if let Some(preg) = allocation.as_reg() {
+                    if preg.class() != operand.class() {
+                        return Err(format!(
+                            "allocator assigned register {preg} to operand {operand_index} ({operand}) of instruction {inst_index}"
+                        ));
+                    }
+                }
+                if allocation.kind() == AllocationKind::Stack
+                    && allocation.index() >= output.num_spillslots
+                {
+                    return Err(format!(
+                        "allocator assigned out-of-range spill slot {} to operand {operand_index} ({operand}) of instruction {inst_index}; spill-slot count is {}",
+                        allocation.index(),
+                        output.num_spillslots
+                    ));
+                }
+
+                match operand.constraint() {
+                    OperandConstraint::Any => {}
+                    OperandConstraint::Reg if !allocation.is_reg() => {
+                        return Err(format!(
+                            "allocator assigned {allocation} to register operand {operand_index} ({operand}) of instruction {inst_index}"
+                        ));
+                    }
+                    OperandConstraint::Stack if !allocation.is_stack() => {
+                        return Err(format!(
+                            "allocator assigned {allocation} to stack operand {operand_index} ({operand}) of instruction {inst_index}"
+                        ));
+                    }
+                    OperandConstraint::FixedReg(preg) if allocation.as_reg() != Some(preg) => {
+                        return Err(format!(
+                            "allocator assigned {allocation} to fixed register operand {operand_index} ({operand}) of instruction {inst_index}"
+                        ));
+                    }
+                    OperandConstraint::Limit(limit)
+                        if !allocation.is_reg()
+                            || allocation.as_reg().unwrap().hw_enc() >= limit =>
+                    {
+                        return Err(format!(
+                            "allocator assigned {allocation} outside the register limit to operand {operand_index} ({operand}) of instruction {inst_index}"
+                        ));
+                    }
+                    OperandConstraint::Reuse(reuse_index) => {
+                        let Some(reused) = allocations.get(reuse_index).copied() else {
+                            return Err(format!(
+                                "allocator reuse operand {operand_index} ({operand}) references missing operand {reuse_index} of instruction {inst_index}"
+                            ));
+                        };
+                        if !allocation.is_reg() || allocation != reused {
+                            return Err(format!(
+                                "allocator assigned {allocation} to reuse operand {operand_index} ({operand}) of instruction {inst_index}; expected register {reused}"
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut previous_point = None;
+        for (edit_index, (point, edit)) in output.edits.iter().enumerate() {
+            if point.inst() as usize >= self.insts.len() {
+                return Err(format!(
+                    "allocator edit {edit_index} references instruction {} outside the function",
+                    point.inst()
+                ));
+            }
+            if previous_point.is_some_and(|previous| previous > *point) {
+                return Err(format!(
+                    "allocator edit {edit_index} at {point:?} is out of program-point order"
+                ));
+            }
+            previous_point = Some(*point);
+
+            let Edit::Move { from, to } = edit;
+            if from.is_none() || to.is_none() {
+                return Err(format!(
+                    "allocator edit {edit_index} at {point:?} has an unresolved endpoint: {from} -> {to}"
+                ));
+            }
+            for allocation in [*from, *to] {
+                if allocation.is_stack() && allocation.index() >= output.num_spillslots {
+                    return Err(format!(
+                        "allocator edit {edit_index} at {point:?} references out-of-range spill slot {} in {from} -> {to}; spill-slot count is {}",
+                        allocation.index(),
+                        output.num_spillslots
+                    ));
+                }
+            }
+            if let (Some(from_reg), Some(to_reg)) = (from.as_reg(), to.as_reg()) {
+                if from_reg.class() != to_reg.class() {
+                    return Err(format!(
+                        "allocator edit {edit_index} at {point:?} crosses register classes: {from} -> {to}"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn inst(&self, i: usize) -> &I {

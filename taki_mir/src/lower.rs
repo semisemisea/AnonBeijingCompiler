@@ -48,6 +48,22 @@ impl core::fmt::Display for CodegenError {
 impl std::error::Error for CodegenError {}
 
 impl CodegenError {
+    pub(crate) fn backend(
+        arena: ArenaContext<'_>,
+        phase: &'static str,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            function: arena.f().name().to_owned(),
+            block: None,
+            instruction: "backend".to_owned(),
+            source_type: None,
+            target_type: None,
+            phase,
+            reason: reason.into(),
+        }
+    }
+
     fn unsupported(
         arena: ArenaContext<'_>,
         inst: HirInst,

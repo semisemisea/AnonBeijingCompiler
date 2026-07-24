@@ -68,7 +68,7 @@ impl MachInst for MInst {
                 if let Some(ret_pair) = ret {
                     collector.reg_fixed_def(&mut ret_pair.vreg, ret_pair.preg);
                 }
-                collector.reg_clobbers(*clobbers);
+                collector.reg_clobbers(call_clobbers(*clobbers, ret.as_ref()));
             }
             MInst::Args { pairs } => {
                 for pair in pairs {
@@ -103,9 +103,7 @@ impl MachInst for MInst {
 
     fn is_term(&self) -> crate::vcode::MachTerminator {
         match self {
-            MInst::LongBnez { .. } | MInst::Jump { .. } | MInst::JumpReg { .. } => {
-                MachTerminator::Branch
-            }
+            MInst::Jump { .. } | MInst::JumpReg { .. } => MachTerminator::Branch,
             MInst::Ret => MachTerminator::Return,
             _ => MachTerminator::None,
         }
@@ -140,6 +138,49 @@ impl MachInst for MInst {
         MInst::Jump {
             label: crate::riscv64::labels::Label::Block(target),
         }
+    }
+}
+
+fn call_clobbers(mut clobbers: PRegSet, ret: Option<&CallRetPair>) -> PRegSet {
+    if let Some(ret) = ret {
+        clobbers.remove(ret.preg.to_real_reg().unwrap());
+    }
+    clobbers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::call_clobbers;
+    use crate::{
+        abi::CallRetPair,
+        register::Writable,
+        riscv64::{
+            abi::DEFAULT_CLOBBERS,
+            regs::{a0, f_reg, fa0, pf_reg, px_reg, x_reg},
+        },
+    };
+
+    #[test]
+    fn call_clobbers_exclude_the_fixed_return_register() {
+        let int = call_clobbers(
+            DEFAULT_CLOBBERS,
+            Some(&CallRetPair {
+                vreg: Writable::from_reg(x_reg(5)),
+                preg: a0(),
+            }),
+        );
+        let float = call_clobbers(
+            DEFAULT_CLOBBERS,
+            Some(&CallRetPair {
+                vreg: Writable::from_reg(f_reg(5)),
+                preg: fa0(),
+            }),
+        );
+
+        assert!(!int.contains(px_reg(10)));
+        assert!(!float.contains(pf_reg(10)));
+        assert!(int.contains(px_reg(11)));
+        assert!(float.contains(pf_reg(11)));
     }
 }
 

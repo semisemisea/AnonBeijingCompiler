@@ -466,6 +466,21 @@ mod tests {
             } if rs == spilltmp_reg()
         ));
     }
+
+    #[test]
+    fn machine_environment_reserves_abi_and_frame_offset_scratch_registers() {
+        let env = create_reg_environment();
+        let allocatable = PRegSet::from(&env);
+
+        for preg in [px_reg(1), px_reg(2), px_reg(8), px_reg(30), px_reg(31)] {
+            assert!(!allocatable.contains(preg), "{preg:?} must be reserved");
+        }
+        assert_eq!(env.scratch_by_class[0], Some(px_reg(31)));
+        assert_eq!(
+            env.post_ra_scratch_by_class[0],
+            vec![px_reg(30), px_reg(31)]
+        );
+    }
 }
 
 fn store_stack_imm12(insts: &mut SmallVec<[MInst; 16]>, rs: Reg, op: StoreOP, sp_offset: i64) {
@@ -686,7 +701,7 @@ fn create_reg_environment() -> MachineEnv {
         preferred_regs_by_class,
         non_preferred_regs_by_class,
         fixed_stack_slots: vec![],
-        scratch_by_class: [None, None, None],
-        post_ra_scratch_by_class: [vec![], vec![], vec![]],
+        scratch_by_class: [Some(px_reg(31)), None, None],
+        post_ra_scratch_by_class: [vec![px_reg(30), px_reg(31)], vec![], vec![]],
     }
 }

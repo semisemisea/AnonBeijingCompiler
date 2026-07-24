@@ -845,7 +845,7 @@ impl MachInst for MInst {
                 if let Some(pair) = ret {
                     collector.reg_fixed_def(&mut pair.vreg, pair.preg);
                 }
-                collector.reg_clobbers(*clobbers | crate::regs::DEFAULT_CLOBBERS);
+                collector.reg_clobbers(call_clobbers(*clobbers, ret.as_ref()));
             }
             Self::RetVal { pair } => collector.reg_fixed_use(&mut pair.vreg, pair.preg),
             Self::CondBr { .. } => {}
@@ -897,6 +897,14 @@ impl MachInst for MInst {
             label: Label::from_block(target),
         }
     }
+}
+
+fn call_clobbers(mut clobbers: PRegSet, ret: Option<&CallRetPair>) -> PRegSet {
+    clobbers.union_from(crate::regs::DEFAULT_CLOBBERS);
+    if let Some(ret) = ret {
+        clobbers.remove(ret.preg.to_real_reg().unwrap());
+    }
+    clobbers
 }
 
 fn use_gpr(collector: &mut impl OperandVisitor, gpr: &mut Gpr) {
@@ -1887,7 +1895,7 @@ mod tests {
         vcode::{EmitContext, MachInstEmit},
     };
 
-    use super::{Cond, Imm12, MInst, SelectCmp, SelectValue};
+    use super::{Cond, Imm12, MInst, SelectCmp, SelectValue, call_clobbers};
     use crate::regs::{OperandSize, float_reg, int_reg};
 
     #[derive(Default)]
@@ -1941,6 +1949,29 @@ mod tests {
             },
         });
         assert_eq!(text, "cmp w1, #0\n    csel w0, w2, w3, ne");
+    }
+
+    #[test]
+    fn call_clobbers_exclude_the_fixed_return_register() {
+        let int = call_clobbers(
+            crate::regs::DEFAULT_CLOBBERS,
+            Some(&taki_mir::abi::CallRetPair {
+                vreg: Writable::from_reg(int_reg(1)),
+                preg: int_reg(0),
+            }),
+        );
+        let float = call_clobbers(
+            crate::regs::DEFAULT_CLOBBERS,
+            Some(&taki_mir::abi::CallRetPair {
+                vreg: Writable::from_reg(float_reg(1)),
+                preg: float_reg(0),
+            }),
+        );
+
+        assert!(!int.contains(crate::regs::int_preg(0)));
+        assert!(!float.contains(crate::regs::float_preg(0)));
+        assert!(int.contains(crate::regs::int_preg(1)));
+        assert!(float.contains(crate::regs::float_preg(1)));
     }
 
     #[test]

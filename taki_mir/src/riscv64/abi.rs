@@ -18,6 +18,100 @@ use raana_ir::ir::arena::Arena;
 
 pub struct Riscv64ABI;
 
+const RISCV_ARG_REGS: usize = 8;
+const RISCV_STACK_SLOT_BYTES: u32 = 8;
+const RISCV_STACK_ALIGN: u32 = 16;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RiscvArgLoc {
+    Reg {
+        reg: Reg,
+        ty: raana_ir::ir::Type,
+    },
+    Stack {
+        offset: i64,
+        ty: raana_ir::ir::Type,
+        slot_size: u32,
+        align: u32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RiscvArgLayout {
+    pub locations: Vec<RiscvArgLoc>,
+    pub stack_size: u32,
+}
+
+impl Riscv64ABI {
+    /// SysY supports only scalar fixed-signature calls. Aggregates, variadics,
+    /// register pairs, split values, hidden returns, and wider scalars need
+    /// dedicated C psABI rules before this layout can support them.
+    pub(crate) fn arg_layout(types: &[raana_ir::ir::Type]) -> RiscvArgLayout {
+        use raana_ir::ir::TypeKind;
+
+        let mut locations = Vec::with_capacity(types.len());
+        let mut int_arg_idx = 0;
+        let mut float_arg_idx = 0;
+        let mut stack_offset = 0u32;
+        for ty in types {
+            let reg = match ty.kind() {
+                TypeKind::Int32 | TypeKind::Pointer(_) if int_arg_idx < RISCV_ARG_REGS => {
+                    let reg = ARG_REG[int_arg_idx];
+                    int_arg_idx += 1;
+                    Some(reg)
+                }
+                TypeKind::Float32 if float_arg_idx < RISCV_ARG_REGS => {
+                    let reg = FARG_REG[float_arg_idx];
+                    float_arg_idx += 1;
+                    Some(reg)
+                }
+                TypeKind::Int32 | TypeKind::Pointer(_) => {
+                    int_arg_idx += 1;
+                    None
+                }
+                TypeKind::Float32 => {
+                    float_arg_idx += 1;
+                    None
+                }
+                kind => panic!("unsupported RISC-V scalar argument type: {kind:?}"),
+            };
+            if let Some(reg) = reg {
+                locations.push(RiscvArgLoc::Reg {
+                    reg,
+                    ty: ty.clone(),
+                });
+            } else {
+                stack_offset = stack_offset.next_multiple_of(RISCV_STACK_SLOT_BYTES);
+                locations.push(RiscvArgLoc::Stack {
+                    offset: i64::from(stack_offset),
+                    ty: ty.clone(),
+                    slot_size: RISCV_STACK_SLOT_BYTES,
+                    align: RISCV_STACK_SLOT_BYTES,
+                });
+                stack_offset += RISCV_STACK_SLOT_BYTES;
+            }
+        }
+        RiscvArgLayout {
+            locations,
+            stack_size: stack_offset.next_multiple_of(RISCV_STACK_ALIGN),
+        }
+    }
+
+    fn arg_slots(layout: RiscvArgLayout) -> Vec<ArgSlot> {
+        layout
+            .locations
+            .into_iter()
+            .map(|location| match location {
+                RiscvArgLoc::Reg { reg, ty } => ArgSlot::Reg {
+                    reg: reg.to_physical_reg().unwrap(),
+                    ty,
+                },
+                RiscvArgLoc::Stack { offset, ty, .. } => ArgSlot::Stack { offset, ty },
+            })
+            .collect()
+    }
+}
+
 impl ABIMachineSpec for Riscv64ABI {
     type I = MInst;
 
@@ -173,51 +267,19 @@ impl ABIMachineSpec for Riscv64ABI {
     }
 
     fn compute_arg_loc(arena: crate::prelude::ArenaContext<'_>) -> (Vec<ArgSlot>, u32) {
-        use raana_ir::ir::TypeKind;
-        let mut args = vec![];
-        let mut int_arg_idx = 0;
-        let mut float_arg_idx = 0;
-        let mut stack_offset = 0usize;
+        let types: Vec<_> = arena
+            .f()
+            .params()
+            .iter()
+            .map(|&param| arena.inst_data(param).ty().clone())
+            .collect();
+        Self::compute_call_arg_loc(&types)
+    }
 
-        for &param in arena.f().params() {
-            let ty = arena.inst_data(param).ty().clone();
-            let size = ty.size();
-            match ty.kind() {
-                TypeKind::Int32 | TypeKind::Pointer(_) => {
-                    if int_arg_idx < 8 {
-                        args.push(ArgSlot::Reg {
-                            reg: ARG_REG[int_arg_idx].to_physical_reg().unwrap(),
-                            ty,
-                        });
-                        int_arg_idx += 1;
-                    } else {
-                        args.push(ArgSlot::Stack {
-                            offset: stack_offset as i64,
-                            ty,
-                        });
-                        stack_offset += size;
-                    }
-                }
-                TypeKind::Float32 => {
-                    if float_arg_idx < 8 {
-                        args.push(ArgSlot::Reg {
-                            reg: FARG_REG[float_arg_idx].to_physical_reg().unwrap(),
-                            ty,
-                        });
-                        float_arg_idx += 1;
-                    } else {
-                        args.push(ArgSlot::Stack {
-                            offset: stack_offset as i64,
-                            ty,
-                        });
-                        stack_offset += size;
-                    }
-                }
-                _ => unreachable!("unexpected parameter type: {:?}", ty.kind()),
-            }
-        }
-
-        (args, stack_offset as u32)
+    fn compute_call_arg_loc(types: &[raana_ir::ir::Type]) -> (Vec<ArgSlot>, u32) {
+        let layout = Self::arg_layout(types);
+        let stack_size = layout.stack_size;
+        (Self::arg_slots(layout), stack_size)
     }
 
     fn get_machine_env() -> &'static MachineEnv {
@@ -426,6 +488,7 @@ fn reg_add_imm(insts: &mut SmallVec<[MInst; 16]>, rd: Writable<Reg>, rs: Reg, am
 mod tests {
     use super::*;
     use crate::{
+        prelude::HirType,
         riscv64::{instructions::MInst, regs::px_reg},
         types::I32,
     };
@@ -480,6 +543,53 @@ mod tests {
             env.post_ra_scratch_by_class[0],
             vec![px_reg(30), px_reg(31)]
         );
+    }
+
+    #[test]
+    fn argument_layout_uses_independent_register_banks() {
+        let types = vec![HirType::get_i32(); 8]
+            .into_iter()
+            .chain(vec![HirType::get_f32(); 8])
+            .collect::<Vec<_>>();
+        let layout = Riscv64ABI::arg_layout(&types);
+
+        assert_eq!(layout.stack_size, 0);
+        assert!(matches!(
+            layout.locations[7],
+            RiscvArgLoc::Reg { reg, .. } if reg == ARG_REG[7]
+        ));
+        assert!(matches!(
+            layout.locations[15],
+            RiscvArgLoc::Reg { reg, .. } if reg == FARG_REG[7]
+        ));
+    }
+
+    #[test]
+    fn argument_layout_uses_aligned_xlen_overflow_slots() {
+        let mut types = vec![HirType::get_pointer(HirType::get_i32()); 9];
+        types.extend(vec![HirType::get_i32(); 1]);
+        types.extend(vec![HirType::get_f32(); 9]);
+        types.extend(vec![HirType::get_pointer(HirType::get_i32()); 1]);
+        let layout = Riscv64ABI::arg_layout(&types);
+
+        let stack_locations: Vec<_> = layout
+            .locations
+            .iter()
+            .filter_map(|location| match location {
+                RiscvArgLoc::Stack {
+                    offset,
+                    slot_size,
+                    align,
+                    ..
+                } => Some((*offset, *slot_size, *align)),
+                RiscvArgLoc::Reg { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            stack_locations,
+            vec![(0, 8, 8), (8, 8, 8), (16, 8, 8), (24, 8, 8)]
+        );
+        assert_eq!(layout.stack_size, 32);
     }
 }
 

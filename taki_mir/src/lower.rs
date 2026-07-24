@@ -327,39 +327,13 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 let InstKind::Call(call) = arena.inst_data(inst).kind() else {
                     continue;
                 };
-                let mut int_arg_idx = 0usize;
-                let mut float_arg_idx = 0usize;
-                let mut outgoing_size = 0usize;
-                for &arg in call.args() {
-                    let ty = arena.inst_data(arg).ty();
-                    match ty.kind() {
-                        HirTypeKind::Int32 | HirTypeKind::Pointer(_) => {
-                            if int_arg_idx < 8 {
-                                int_arg_idx += 1;
-                            } else {
-                                outgoing_size += ty.size();
-                            }
-                        }
-                        HirTypeKind::Float32 => {
-                            if float_arg_idx < 8 {
-                                float_arg_idx += 1;
-                            } else {
-                                outgoing_size += ty.size();
-                            }
-                        }
-                        kind => {
-                            return Err(CodegenError::unsupported(
-                                arena,
-                                inst,
-                                "outgoing argument sizing",
-                                format!("call argument type {kind:?} is unsupported"),
-                                Some(ty),
-                                None,
-                            ));
-                        }
-                    }
-                }
-                max_size = max_size.max(outgoing_size);
+                let types: Vec<_> = call
+                    .args()
+                    .iter()
+                    .map(|&arg| arena.inst_data(arg).ty().clone())
+                    .collect();
+                let (_, outgoing_size) = I::ABISpec::compute_call_arg_loc(&types);
+                max_size = max_size.max(outgoing_size as usize);
             }
         }
         Ok(max_size)

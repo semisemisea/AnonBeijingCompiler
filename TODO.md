@@ -3,12 +3,15 @@
 Only pending work belongs in this file. Completed implementation notes and
 historical measurements belong in commits, tests, or dedicated documentation.
 
-## Current Priority: RISC-V Branch Layout And ABI Conformance
+## Current Priority: RISC-V Branch Layout And ABI Coverage
 
 The Ion CFG invariant and atomic RISC-V CFG transfer milestone is complete:
 allocator-visible CFG targets are no longer held in allocatable virtual
-registers, and `make test-riscv h_functional -- -O1` passes. Remaining work is
-branch range/layout quality and a shared LP64D scalar argument layout.
+registers, and `make test-riscv h_functional -- -O1` passes. RISC-V caller,
+callee, and outgoing-area sizing now share one LP64D scalar argument layout;
+overflow scalar values use 8-byte aligned slots while retaining their native
+access widths, and the complete outgoing area is 16-byte aligned. Remaining
+work is branch range/layout quality and broader ABI coverage.
 
 ### 1. Lower Branch Range Expansion After Register Allocation
 
@@ -39,23 +42,8 @@ branch range/layout quality and a shared LP64D scalar argument layout.
   and safe insertion points. Current direct text emission cannot safely port
   `MachBuffer` deadlines piecemeal.
 
-### 2. Centralize RISC-V ABI Argument Locations
+### 2. Extend RISC-V ABI Coverage
 
-- [ ] Replace duplicated caller, callee, and outgoing-size loops with one shared
-  RISC-V ABI argument-location computation. It must be consumed by
-  `compute_arg_loc`, call lowering, and outgoing-area precomputation.
-- [ ] Record per argument: integer or float register location, stack offset,
-  storage width, alignment, and lowered load/store type. Use this record rather
-  than independently maintaining integer/float counters in three locations.
-- [ ] Match the current Cranelift LP64D scalar stack policy for normal calls:
-  use independent `a0..a7` and `fa0..fa7` banks; use at least an XLEN-sized
-  stack slot for overflow scalar arguments; align each slot; round the complete
-  outgoing argument area to 16 bytes.
-- [ ] Preserve the correct value access width inside an ABI slot: `i32` uses
-  `sw`/`lw`, `f32` uses `fsw`/`flw`, and pointer values use `sd`/`ld`.
-- [ ] Verify that incoming `s0`-relative offsets and outgoing `sp`-relative
-  offsets are derived from the same signature and remain correct after frame
-  legalization.
 - [ ] Explicitly document unsupported RISC-V C psABI cases before claiming ABI
   interoperability: variadic floating-point classification, aggregates,
   register-pair alignment, split values, hidden return areas, and wider scalar

@@ -20,49 +20,6 @@ historical measurements belong in commits, tests, or dedicated documentation.
   Attribute edge-copy/frame improvements to register allocation separately from
   CFG cleanup, if-conversion, boolean simplification, and arithmetic lowering.
 
-### Phase 2: Make VCode Valid Ion Input
-
-#### Strict SSA And Dense Numbering
-
-- [ ] Add a strict VCode SSA/CFG validator: one definition per VReg, dominance of
-  every use, block parameters as block-entry definitions, no entry live-ins,
-  terminators at block ends, symmetric CFG metadata, and edge argument
-  arity/class agreement.
-- [ ] Repair repeated VReg definitions from rematerialized constants, floats, and
-  globals in `taki_mir/src/lower.rs`. Prefer a fresh use-site VReg for each
-  rematerialization unless a single dominating definition is required.
-- [ ] Repair register-argument double definitions: model fixed incoming-register
-  values and values loaded/copied from backing slots with distinct VRegs and
-  explicit dataflow.
-- [ ] Preserve operand order while making lowering SSA because reuse constraints
-  index earlier operands and write-back consumes allocations in that order.
-- [ ] Map the local pinned-PReg VReg representation to dense Ion VReg indices
-  beginning at zero, then map allocations back for local write-back. Keep this
-  mapping allocator-local rather than rewriting the repository-wide `Reg` format.
-
-#### CFG, Calls, And Target Environment
-
-- [ ] Split every critical edge before Ion; also retain dedicated edge blocks for
-  value-carrying multi-successor edges. Preserve successor-index identity for
-  distinct edges targeting the same block.
-- [ ] Add CFG tests for repeated targets, parameterized/non-parameterized critical
-  edges, edge-block copy ownership, loops, and backedges.
-- [ ] Remove a call's fixed late result register, such as AArch64 `x0` or RISC-V
-  `a0`, from that instruction's clobber set while preserving all other ABI
-  clobbers.
-- [ ] Assert that allocator scratch, post-RA scratch, SP/ZR/FP/LR, and fixed stack
-  pseudo-registers are excluded from allocatable sets according to their role.
-- [ ] Keep post-RA scratch metadata outside Ion's allocation environment; target
-  frame-offset legalization must not consume an allocated register.
-- [ ] Keep Ion SSA validation enabled while fixing input failures. Treat failures
-  as lowering, operand, CFG, or ABI bugs; do not weaken validation to proceed.
-
-#### Phase-2 Exit Criteria
-
-- [ ] Run the strict validator on every VCode function reached by unit tests,
-  focused functional tests, and `make test`.
-- [ ] Keep the current allocator operational until Phase-2 validation passes.
-
 ### Phase 3: Port And Enable Ion
 
 #### Porting Work
@@ -78,6 +35,9 @@ historical measurements belong in commits, tests, or dedicated documentation.
 - [ ] Reuse local `Function`, register/index, operand, allocation, `ProgPoint`,
   `Edit`, and `Output` semantics where they match Ion. Avoid a permanent
   regalloc2-to-local adapter layer.
+- [ ] Map the local pinned-PReg VReg representation to dense Ion VReg indices
+  beginning at zero, then map allocations back for local write-back. Keep this
+  mapping allocator-local rather than rewriting the repository-wide `Reg` format.
 - [ ] Keep exactly one parallel-move resolver after the port; migrate Ion's
   resolver or prove the existing one meets Ion's move contract, then delete the
   duplicate implementation.

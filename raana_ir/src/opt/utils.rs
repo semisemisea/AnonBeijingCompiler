@@ -313,3 +313,38 @@ fn visit_and_replace_single(data: &mut ArenaContext<'_>, used_by: Inst, rep: Ins
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::visit_and_replace;
+    use crate::{
+        ir::{Program, Type, arena::Arena, builder_trait::*},
+        opt::pass::ArenaContext,
+    };
+
+    #[test]
+    fn replacement_rebuilds_mem_zero_with_the_new_destination() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "clear".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let old_dest = data.new_local_inst().alloc(Type::get_i32());
+        let new_dest = data.new_local_inst().alloc(Type::get_i32());
+        let clear = data.new_local_inst().mem_zero(old_dest, 4);
+        data.layout_mut().insert_inst(entry, clear);
+
+        let mut context = ArenaContext {
+            program: &mut program,
+            curr_func: Some(function),
+        };
+        visit_and_replace(&mut context, old_dest, new_dest);
+
+        let crate::ir::InstKind::MemZero(mem_zero) = context.inst_data(clear).kind() else {
+            panic!("expected memzero")
+        };
+        assert_eq!(mem_zero.dest(), new_dest);
+        assert_eq!(mem_zero.byte_len(), 4);
+        assert!(context.inst_data(new_dest).used_by().contains(&clear));
+    }
+}

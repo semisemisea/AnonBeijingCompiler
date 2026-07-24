@@ -489,7 +489,6 @@ impl LowerBackend for AArch64Backend {
                 } else {
                     (ctx.put_value_in_reg(mem_zero.dest()), None)
                 };
-                let zero = ctx.alloc_tmp(HirType::get_i32());
                 let byte_len = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
                 if let Some(offset) = stack_offset {
                     ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
@@ -497,11 +496,6 @@ impl LowerBackend for AArch64Backend {
                         Writable::from_reg(dest),
                     ));
                 }
-                ctx.emit(MInst::LoadImm {
-                    size: OperandSize::Size32,
-                    dst: Writable::from_reg(zero),
-                    value: 0,
-                });
                 ctx.emit(MInst::LoadImm {
                     size: OperandSize::Size64,
                     dst: Writable::from_reg(byte_len),
@@ -514,12 +508,8 @@ impl LowerBackend for AArch64Backend {
                             preg: regs::INT_ARG_REGS[0],
                         },
                         CallArgPair {
-                            vreg: zero,
-                            preg: regs::INT_ARG_REGS[1],
-                        },
-                        CallArgPair {
                             vreg: byte_len,
-                            preg: regs::INT_ARG_REGS[2],
+                            preg: regs::INT_ARG_REGS[1],
                         },
                     ],
                     ret: None,
@@ -1221,9 +1211,16 @@ mod tests {
         data.layout_mut().insert_inst(entry, ret);
 
         let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
-        assert!(asm.contains("movz x2, #0x14"), "{asm}");
-        assert!(asm.contains("bl .Lsoyo_memset"), "{asm}");
-        assert_eq!(asm.matches("\n.Lsoyo_memset:\n").count(), 1, "{asm}");
+        assert!(asm.contains("movz x1, #0x14"), "{asm}");
+        assert!(asm.contains("bl .Lsoyo_memzero"), "{asm}");
+        assert_eq!(asm.matches("\n.Lsoyo_memzero:\n").count(), 1, "{asm}");
+        assert!(asm.contains("mrs     x3, id_aa64isar2_el1"), "{asm}");
+        assert!(asm.contains("setp    [x0]!, x1!, xzr"), "{asm}");
+        assert!(asm.contains("setm    [x0]!, x1!, xzr"), "{asm}");
+        assert!(asm.contains("sete    [x0]!, x1!, xzr"), "{asm}");
+        assert!(asm.contains("mrs     x3, dczid_el0"), "{asm}");
+        assert!(asm.contains("dc      zva, x0"), "{asm}");
+        assert!(asm.contains(".Lsoyo_memzero_byte_loop:"), "{asm}");
         assert!(!asm.contains("bl memset"), "{asm}");
         assert!(!asm.contains(".globl memset"), "{asm}");
         assert!(!asm.contains("\nmemset:\n"), "{asm}");
@@ -1246,8 +1243,8 @@ mod tests {
 
         let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
         assert!(!asm.contains("bl memset"), "{asm}");
-        assert!(!asm.contains("bl .Lsoyo_memset"), "{asm}");
-        assert!(!asm.contains("\n.Lsoyo_memset:\n"), "{asm}");
+        assert!(!asm.contains("bl .Lsoyo_memzero"), "{asm}");
+        assert!(!asm.contains("\n.Lsoyo_memzero:\n"), "{asm}");
         assert_eq!(asm.matches("str w").count(), 4, "{asm}");
     }
 
@@ -1270,8 +1267,8 @@ mod tests {
         data.layout_mut().insert_inst(entry, ret);
 
         let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
-        assert_eq!(asm.matches("bl .Lsoyo_memset").count(), 2, "{asm}");
-        assert_eq!(asm.matches("\n.Lsoyo_memset:\n").count(), 1, "{asm}");
+        assert_eq!(asm.matches("bl .Lsoyo_memzero").count(), 2, "{asm}");
+        assert_eq!(asm.matches("\n.Lsoyo_memzero:\n").count(), 1, "{asm}");
     }
 
     #[test]
@@ -1288,8 +1285,8 @@ mod tests {
         data.layout_mut().insert_inst(entry, ret);
 
         let asm = taki_mir::compile::<AArch64Backend>(&program).unwrap();
-        assert!(asm.contains("bl .Lsoyo_memset"), "{asm}");
-        assert_eq!(asm.matches("\n.Lsoyo_memset:\n").count(), 1, "{asm}");
+        assert!(asm.contains("bl .Lsoyo_memzero"), "{asm}");
+        assert_eq!(asm.matches("\n.Lsoyo_memzero:\n").count(), 1, "{asm}");
     }
 }
 

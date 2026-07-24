@@ -5,7 +5,7 @@ use crate::{
     abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::LoweredBlock,
     libcall::LibCall,
-    lower::{CodegenError, LowerBackend, LowerContext},
+    lower::{LowerBackend, LowerContext},
     prelude::HirFunctionData,
     reg_alloc::reg::PReg,
     register::Writable,
@@ -124,7 +124,7 @@ impl LowerBackend for Riscv64Backend {
     fn lower(
         ctx: &mut crate::lower::LowerContext<Self::MInst>,
         inst: raana_ir::opt::prelude::Inst,
-    ) -> Result<(), CodegenError> {
+    ) {
         let func_data = ctx.arena.program.func_data(ctx.arena.curr_func.unwrap());
         let inst_data = func_data.inst_data(inst);
         match inst_data.kind() {
@@ -340,12 +340,12 @@ impl LowerBackend for Riscv64Backend {
             raana_ir::ir::InstKind::Select(select) => {
                 let ty = inst_data.ty();
                 let Some(ops) = select_alu_ops(ty) else {
-                    return Err(ctx.unsupported(
+                    ctx.lowering_panic(
                         "RISC-V lowering",
                         "RaanaIR select supports only i32, f32, and pointer/string results",
                         None,
                         Some(ty),
-                    ));
+                    );
                 };
 
                 let cond = ctx.put_value_in_reg(select.cond());
@@ -786,14 +786,13 @@ impl LowerBackend for Riscv64Backend {
                 unreachable!("should not lower branch instruction in here.")
             }
         }
-        Ok(())
     }
 
     fn lower_branch(
         ctx: &mut crate::lower::LowerContext<Self::MInst>,
         inst: raana_ir::opt::prelude::Inst,
         target: &[crate::block_order::MirBlockIndex],
-    ) -> Result<(), CodegenError> {
+    ) {
         let inst_data = ctx
             .arena
             .program
@@ -829,7 +828,6 @@ impl LowerBackend for Riscv64Backend {
             }
             _ => unreachable!("should not lower non-branch isntruction in here."),
         }
-        Ok(())
     }
 
     fn data_section_directive() -> &'static str {

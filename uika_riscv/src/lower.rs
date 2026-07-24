@@ -14,7 +14,7 @@ use crate::{
 use taki_mir::{
     abi::{ABIMachineSpec, ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::LoweredBlock,
-    lower::{CodegenError, LowerBackend, LowerContext},
+    lower::{LowerBackend, LowerContext},
     prelude::HirFunctionData,
     reg_alloc::reg::PReg,
     register::Writable,
@@ -194,7 +194,7 @@ impl LowerBackend for Riscv64Backend {
     fn lower(
         ctx: &mut taki_mir::lower::LowerContext<Self::MInst>,
         inst: raana_ir::opt::prelude::Inst,
-    ) -> Result<(), CodegenError> {
+    ) {
         let func_data = ctx.arena.program.func_data(ctx.arena.curr_func.unwrap());
         let inst_data = func_data.inst_data(inst);
         match inst_data.kind() {
@@ -320,7 +320,7 @@ impl LowerBackend for Riscv64Backend {
                             lower_signed_div_rem_power_of_two(ctx, bop, rd, lhs, divisor)
                         })
                     {
-                        return Ok(());
+                        return;
                     }
                     let rhs = ctx.put_value_in_reg(binary.rhs());
                     let op = (!matches!(bop, BinaryOp::Eq | BinaryOp::NotEq))
@@ -726,14 +726,13 @@ impl LowerBackend for Riscv64Backend {
                 unreachable!("should not lower branch instruction in here.")
             }
         }
-        Ok(())
     }
 
     fn lower_branch(
         ctx: &mut taki_mir::lower::LowerContext<Self::MInst>,
         inst: raana_ir::opt::prelude::Inst,
         target: &[taki_mir::block_order::MirBlockIndex],
-    ) -> Result<(), CodegenError> {
+    ) {
         let inst_data = ctx
             .arena
             .program
@@ -779,7 +778,6 @@ impl LowerBackend for Riscv64Backend {
             }
             _ => unreachable!("should not lower non-branch isntruction in here."),
         }
-        Ok(())
     }
 
     fn data_section_directive() -> &'static str {

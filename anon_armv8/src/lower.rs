@@ -4,7 +4,7 @@ use raana_ir::ir::{BinaryOp, InstKind, Type as HirType, TypeKind, arena::Arena};
 use taki_mir::{
     abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::{LoweredBlock, MirBlockIndex},
-    lower::{CodegenError, LowerBackend, LowerContext},
+    lower::{LowerBackend, LowerContext},
     prelude::HirFunctionData,
     reg_alloc::reg::PReg,
     register::Writable,
@@ -27,10 +27,7 @@ pub struct AArch64Backend;
 impl LowerBackend for AArch64Backend {
     type MInst = MInst;
 
-    fn lower(
-        ctx: &mut LowerContext<Self::MInst>,
-        inst: raana_ir::opt::prelude::Inst,
-    ) -> Result<(), CodegenError> {
+    fn lower(ctx: &mut LowerContext<Self::MInst>, inst: raana_ir::opt::prelude::Inst) {
         let kind = ctx.arena.inst_data(inst).kind().clone();
         match kind {
             InstKind::BlockArgRef(..)
@@ -72,15 +69,15 @@ impl LowerBackend for AArch64Backend {
                             });
                         }
                         op => {
-                            return Err(ctx.unsupported(
+                            ctx.lowering_panic(
                                 "AArch64 instruction selection",
                                 format!("floating binary operation {op:?} is unsupported"),
                                 Some(ctx.arena.inst_data(binary.lhs()).ty()),
                                 Some(ctx.arena.inst_data(inst).ty()),
-                            ));
+                            );
                         }
                     }
-                    return Ok(());
+                    return;
                 }
                 let size = operand_size(ctx.arena.inst_data(binary.lhs()).ty().kind());
                 if let Some((op, lhs, rhs, addend)) =
@@ -103,7 +100,7 @@ impl LowerBackend for AArch64Backend {
                         }),
                         _ => unreachable!("multiply-accumulate folding only selects add or sub"),
                     }
-                    return Ok(());
+                    return;
                 }
                 let lhs = ctx.put_value_in_reg(binary.lhs());
                 let rhs_imm = integer_constant(ctx, binary.rhs());
@@ -114,7 +111,7 @@ impl LowerBackend for AArch64Backend {
                         lower_signed_div_rem_power_of_two(ctx, binary.op(), dst, lhs, divisor)
                     })
                 {
-                    return Ok(());
+                    return;
                 }
 
                 match binary.op() {
@@ -315,7 +312,7 @@ impl LowerBackend for AArch64Backend {
                 }
             }
             InstKind::Select(select) => {
-                lower_select(ctx, inst, &select)?;
+                lower_select(ctx, inst, &select);
             }
             InstKind::Cast(cast) => {
                 let src = cast.src();
@@ -331,12 +328,12 @@ impl LowerBackend for AArch64Backend {
                         ctx.emit(MInst::Fcvtzs { dst, src: src_reg })
                     }
                     (src_ty, dst_ty) => {
-                        return Err(ctx.unsupported(
+                        ctx.lowering_panic(
                             "AArch64 instruction selection",
-                            "cast is unsupported",
+                            format!("cast from {src_ty:?} to {dst_ty:?} is unsupported"),
                             Some(ctx.arena.inst_data(src).ty()),
                             Some(ctx.arena.inst_data(inst).ty()),
-                        ));
+                        );
                     }
                 }
             }
@@ -484,7 +481,7 @@ impl LowerBackend for AArch64Backend {
                     for index in 0..inline_store_count {
                         emit_store_at(ctx, zero, &HirType::get_i32(), dest, (index * 4) as i64);
                     }
-                    return Ok(());
+                    return;
                 }
                 let alloc = matches!(ctx.arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
                     .then_some(mem_zero.dest());
@@ -564,12 +561,12 @@ impl LowerBackend for AArch64Backend {
                             }
                         }
                         ty => {
-                            return Err(ctx.unsupported(
+                            ctx.lowering_panic(
                                 "AArch64 instruction selection",
                                 format!("call argument type {ty:?} is unsupported"),
                                 Some(ctx.arena.inst_data(arg).ty()),
                                 None,
-                            ));
+                            );
                         }
                     }
                 }
@@ -586,12 +583,12 @@ impl LowerBackend for AArch64Backend {
                         preg: regs::FLOAT_RETURN_REG,
                     }),
                     ty => {
-                        return Err(ctx.unsupported(
+                        ctx.lowering_panic(
                             "AArch64 instruction selection",
                             format!("call return type {ty:?} is unsupported"),
                             None,
                             Some(ctx.arena.inst_data(inst).ty()),
-                        ));
+                        );
                     }
                 };
                 ctx.emit(MInst::Call {
@@ -615,12 +612,12 @@ impl LowerBackend for AArch64Backend {
                         }
                         TypeKind::Float32 => regs::FLOAT_RETURN_REG,
                         ty => {
-                            return Err(ctx.unsupported(
+                            ctx.lowering_panic(
                                 "AArch64 instruction selection",
                                 format!("return type {ty:?} is unsupported"),
                                 Some(ctx.arena.inst_data(value).ty()),
                                 None,
-                            ));
+                            );
                         }
                     };
                     ctx.emit(MInst::RetVal {
@@ -633,14 +630,13 @@ impl LowerBackend for AArch64Backend {
                 unreachable!("terminators are lowered by LowerBackend::lower_branch")
             }
         }
-        Ok(())
     }
 
     fn lower_branch(
         ctx: &mut LowerContext<Self::MInst>,
         inst: raana_ir::opt::prelude::Inst,
         target: &[MirBlockIndex],
-    ) -> Result<(), CodegenError> {
+    ) {
         let kind = ctx.arena.inst_data(inst).kind().clone();
         match kind {
             InstKind::Jump(jump) => {
@@ -660,7 +656,7 @@ impl LowerBackend for AArch64Backend {
                     unreachable!("branch must have two lowered successors");
                 };
                 if select_branch_condition(ctx, inst, branch.cond(), true_target, false_target) {
-                    return Ok(());
+                    return;
                 }
 
                 let cond = ctx.put_value_in_reg(branch.cond());
@@ -676,15 +672,14 @@ impl LowerBackend for AArch64Backend {
                 });
             }
             kind => {
-                return Err(ctx.unsupported(
+                ctx.lowering_panic(
                     "AArch64 branch selection",
                     format!("non-terminator HIR instruction {kind:?} cannot select a branch"),
                     None,
                     Some(ctx.arena.inst_data(inst).ty()),
-                ));
+                );
             }
         }
-        Ok(())
     }
 
     fn data_section_directive() -> &'static str {
@@ -750,18 +745,18 @@ fn lower_select(
     ctx: &mut LowerContext<'_, MInst>,
     inst: raana_ir::opt::prelude::Inst,
     select: &raana_ir::ir::Select,
-) -> Result<(), CodegenError> {
+) {
     let result_ty = ctx.arena.inst_data(inst).ty().kind().clone();
     if !matches!(
         &result_ty,
         TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String | TypeKind::Float32
     ) {
-        return Err(ctx.unsupported(
+        ctx.lowering_panic(
             "AArch64 instruction selection",
             format!("select result type {result_ty:?} is unsupported"),
             Some(ctx.arena.inst_data(select.cond()).ty()),
             Some(ctx.arena.inst_data(inst).ty()),
-        ));
+        );
     }
 
     // If the condition is a single-use comparison, consume its operands
@@ -844,7 +839,6 @@ fn lower_select(
     };
 
     ctx.emit(MInst::CmpSelect { cmp, cond, value });
-    Ok(())
 }
 
 fn select_comparison(

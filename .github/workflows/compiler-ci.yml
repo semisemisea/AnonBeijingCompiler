@@ -1,0 +1,132 @@
+name: Compiler CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Test suite to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - quick
+          - perf
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compiler-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  quick:
+    name: Quick / ${{ matrix.name }}
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.suite != 'perf')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: AArch64
+            target: test
+          - name: LLVM
+            target: test-llvm
+          - name: RISC-V
+            target: test-riscv
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: compiler-ci
+          cache-targets: true
+
+      - name: Run ${{ matrix.name }} quick suite
+        run: make ${{ matrix.target }} TESTS="functional h_functional" ARGS="-j 2"
+
+      - name: Upload failure results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quick-${{ matrix.name }}-results
+          path: results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  pr-gate:
+    name: PR Gate
+    if: >-
+      always() &&
+      (github.event_name == 'pull_request' || github.event_name == 'push')
+    needs: quick
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require all quick suites
+        env:
+          QUICK_RESULT: ${{ needs.quick.result }}
+        run: test "$QUICK_RESULT" = success
+
+  perf:
+    name: Nightly Perf / ${{ matrix.name }}
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.suite != 'quick')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: AArch64
+            target: test
+          - name: LLVM
+            target: test-llvm
+          - name: RISC-V
+            target: test-riscv
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: compiler-ci
+          cache-targets: true
+
+      - name: Run ${{ matrix.name }} performance suite
+        run: make ${{ matrix.target }} TESTS=perf ARGS="-j 2"
+
+      - name: Upload failure results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-${{ matrix.name }}-results
+          path: results/
+          if-no-files-found: ignore
+          retention-days: 7

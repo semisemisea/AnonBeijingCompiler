@@ -12,6 +12,11 @@ TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
 $(eval $(TEST_ARGS):;@:)
 endif
 
+ifeq ($(firstword $(MAKECMDGOALS)),test-baseline)
+TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+$(eval $(TEST_ARGS):;@:)
+endif
+
 ifeq ($(firstword $(MAKECMDGOALS)),test-llvm)
 TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
 $(eval $(TEST_ARGS):;@:)
@@ -65,11 +70,12 @@ endif
 HOST_TARGET_DIR := $(CURDIR)/target/host-musl
 COMPILER := /work/target/$(MUSL_TARGET)/release/soyo_compiler
 
-.PHONY: help test test-llvm test-riscv run-elf run-elf-riscv debug-elf debug-elf-riscv test-image test-compiler build-lib build-lib-riscv clean-results
+.PHONY: help test test-baseline test-llvm test-riscv run-elf run-elf-riscv debug-elf debug-elf-riscv test-image test-compiler build-lib build-lib-riscv clean-results
 
 help:
 	@printf '%s\n' 'make test [functional/case.sy]      Build the AArch64 compiler and run the AArch64 harness.'
 	@printf '%s\n' 'make test ARGS="-O 1"             Pass compiler options to the AArch64 harness.'
+	@printf '%s\n' 'make test-baseline [functional/case.sy] Run the AArch64 harness using container clang.'
 	@printf '%s\n' 'make test-llvm [functional/case.sy] Validate the LLVM IR emitter through the harness.'
 	@printf '%s\n' 'make test-riscv [functional/case.sy] Build and run the RISC-V harness.'
 	@printf '%s\n' 'make run-elf path/to/program.elf  Execute an AArch64 ELF in the test container.'
@@ -87,6 +93,17 @@ test: test-compiler build-lib test-image
 		-v "$(CURDIR)/sysylib:/work/sysylib:ro" \
 		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
 		"$(IMAGE)" $(ARGS) $(TESTS) $(TEST_ARGS)
+
+test-baseline: build-lib .docker-image
+	mkdir -p "$(RESULTS)"
+	@cleanup() { $(DOCKER) rm -f "$(CONTAINER)" >/dev/null 2>&1 || true; }; \
+	trap cleanup EXIT INT TERM; \
+	cleanup; \
+	$(DOCKER) run -t --name "$(CONTAINER)" --network none \
+		-v "$(CURDIR)/tests:/work/tests:ro" \
+		-v "$(CURDIR)/sysylib:/work/sysylib:ro" \
+		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
+		"$(IMAGE)" --baseline $(ARGS) $(TESTS) $(TEST_ARGS)
 
 test-llvm: test-compiler build-lib test-image
 	mkdir -p "$(RESULTS)"
@@ -200,14 +217,14 @@ build-lib: test-image
 		-v "$(CURDIR)/sysylib:/work/sysylib" \
 		-w /work/sysylib \
 		--entrypoint /bin/sh \
-		"$(IMAGE)" -c 'aarch64-linux-gnu-gcc -c sylib.c -o sylib_arm.o && aarch64-linux-gnu-ar rcs libsysy_arm.a sylib_arm.o'
+		"$(IMAGE)" -c 'aarch64-linux-gnu-gcc -O9 -c sylib.c -o sylib_arm.o && rm -f libsysy_arm.a && aarch64-linux-gnu-ar rcs libsysy_arm.a sylib_arm.o'
 
 build-lib-riscv: test-image
 	$(DOCKER) run --rm -u "$$(id -u):$$(id -g)" \
 		-v "$(CURDIR)/sysylib:/work/sysylib" \
 		-w /work/sysylib \
 		--entrypoint /bin/sh \
-		"$(IMAGE)" -c 'riscv64-linux-gnu-gcc -c sylib.c -o sylib_riscv.o && riscv64-linux-gnu-ar rcs libsysy_riscv.a sylib_riscv.o'
+		"$(IMAGE)" -c 'riscv64-linux-gnu-gcc -O9 -c sylib.c -o sylib_riscv.o && rm -f libsysy_riscv.a && riscv64-linux-gnu-ar rcs libsysy_riscv.a sylib_riscv.o'
 
 clean-results:
 	rm -rf "$(RESULTS)"

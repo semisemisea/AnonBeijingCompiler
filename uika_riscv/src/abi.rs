@@ -698,7 +698,7 @@ fn create_reg_environment() -> MachineEnv {
         preferred_regs_by_class,
         non_preferred_regs_by_class,
         fixed_stack_slots: vec![],
-        scratch_by_class: [None, None, None],
-        post_ra_scratch_by_class: [vec![], vec![], vec![]],
+        scratch_by_class: [Some(px_reg(31)), None, None],
+        post_ra_scratch_by_class: [vec![px_reg(30), px_reg(31)], vec![], vec![]],
     }
 }

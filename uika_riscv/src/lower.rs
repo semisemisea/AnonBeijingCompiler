@@ -1,6 +1,6 @@
 use raana_ir::ir::{
-    Binary, BinaryOp, Call, Cast, GetElemPtr, InstKind, Load, Return, Store, Type as HirType,
-    TypeKind as HirTypeKind, arena::Arena,
+    Binary, BinaryOp, Call, Cast, GetElemPtr, InstKind, Load, Return, Select, Store,
+    Type as HirType, TypeKind as HirTypeKind, arena::Arena, inst_kind::MemZero,
 };
 use smallvec::smallvec;
 
@@ -11,18 +11,52 @@ use crate::{
         ShiftImm, StoreOP,
     },
     labels::Label,
-    regs::{ARG_REG, FARG_REG, a0, fa0, fp_reg, preg_name, stack_reg, zero_reg},
+    regs::{ARG_REG, FARG_REG, a0, a1, a2, fa0, fp_reg, preg_name, stack_reg, zero_reg},
 };
 
 use taki_mir::{
     abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::LoweredBlock,
+    libcall::LibCall,
     lower::{LowerBackend, LowerContext, LoweredOutput},
     prelude::{ArenaContext, HirFunctionData, HirInst},
     reg_alloc::reg::PReg,
     register::{Reg, Writable},
     types::LoweredType,
 };
+
+const INLINE_MEMZERO_MAX_STORES: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectAluOps {
+    sub: AluRRROP,
+    xor: AluRRROP,
+    and: AluRRROP,
+}
+
+fn select_alu_ops(ty: &HirType) -> Option<SelectAluOps> {
+    match ty.kind() {
+        HirTypeKind::Int32 | HirTypeKind::Float32 => Some(SelectAluOps {
+            sub: AluRRROP::SubW,
+            xor: AluRRROP::Xor,
+            and: AluRRROP::And,
+        }),
+        HirTypeKind::Pointer(_) | HirTypeKind::String => Some(SelectAluOps {
+            sub: AluRRROP::Sub,
+            xor: AluRRROP::Xor,
+            and: AluRRROP::And,
+        }),
+        _ => None,
+    }
+}
+
+fn select_tmp_ty(ty: &HirType) -> HirType {
+    match ty.kind() {
+        HirTypeKind::Int32 | HirTypeKind::Float32 => HirType::get_i32(),
+        HirTypeKind::Pointer(_) | HirTypeKind::String => HirType::get_pointer(HirType::get_i32()),
+        _ => unreachable!("unsupported RISC-V select type: {ty:?}"),
+    }
+}
 
 fn normalize_amode(amode: AMode, ctx: &mut LowerContext<'_, MInst>) -> AMode {
     // Slot offsets need the final outgoing-argument-area displacement, which
@@ -341,6 +375,88 @@ fn lower_cast(
     LoweredOutput::Value(def)
 }
 
+fn lower_select(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    select: &Select,
+) -> LoweredOutput {
+    let ty = arena.inst_data(inst).ty();
+    let Some(ops) = select_alu_ops(ty) else {
+        ctx.lowering_panic(
+            "RISC-V instruction selection",
+            "select supports only i32, f32, pointer, and string results",
+            None,
+            Some(ty),
+        );
+    };
+
+    let cond = ctx.put_value_in_reg(select.cond());
+    let if_true = ctx.put_value_in_reg(select.if_true());
+    let if_false = ctx.put_value_in_reg(select.if_false());
+    let def = ctx.result_reg(inst);
+    let tmp_ty = select_tmp_ty(ty);
+    let is_float = matches!(ty.kind(), HirTypeKind::Float32);
+    let (if_true, if_false, result) = if is_float {
+        let true_bits = ctx.alloc_tmp(HirType::get_i32());
+        let false_bits = ctx.alloc_tmp(HirType::get_i32());
+        let result_bits = ctx.alloc_tmp(HirType::get_i32());
+        ctx.emit(MInst::Mov {
+            src: if_true,
+            dst: Writable::from_reg(true_bits),
+        });
+        ctx.emit(MInst::Mov {
+            src: if_false,
+            dst: Writable::from_reg(false_bits),
+        });
+        (true_bits, false_bits, result_bits)
+    } else {
+        (if_true, if_false, def)
+    };
+    let is_nonzero = ctx.alloc_tmp(HirType::get_i32());
+    let mask = ctx.alloc_tmp(tmp_ty.clone());
+    let delta = ctx.alloc_tmp(tmp_ty.clone());
+    let masked_delta = ctx.alloc_tmp(tmp_ty);
+
+    ctx.emit(MInst::AluRRR {
+        op: AluRRROP::Snez,
+        rd: Writable::from_reg(is_nonzero),
+        rs1: cond,
+        rs2: zero_reg(),
+    });
+    ctx.emit(MInst::AluRRR {
+        op: ops.sub,
+        rd: Writable::from_reg(mask),
+        rs1: zero_reg(),
+        rs2: is_nonzero,
+    });
+    ctx.emit(MInst::AluRRR {
+        op: ops.xor,
+        rd: Writable::from_reg(delta),
+        rs1: if_true,
+        rs2: if_false,
+    });
+    ctx.emit(MInst::AluRRR {
+        op: ops.and,
+        rd: Writable::from_reg(masked_delta),
+        rs1: delta,
+        rs2: mask,
+    });
+    ctx.emit(MInst::AluRRR {
+        op: ops.xor,
+        rd: Writable::from_reg(result),
+        rs1: if_false,
+        rs2: masked_delta,
+    });
+    if is_float {
+        ctx.emit(MInst::Mov {
+            src: result,
+            dst: Writable::from_reg(def),
+        });
+    }
+    LoweredOutput::Value(def)
+}
+
 fn lower_alloc(
     ctx: &mut LowerContext<'_, MInst>,
     arena: ArenaContext<'_>,
@@ -368,11 +484,10 @@ fn lower_get_elem_ptr(
     let rs = ctx.put_value_in_reg(src);
     let def = ctx.result_reg(inst);
     let rd = Writable::from_reg(def);
-    let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-    let wtmp = Writable::from_reg(tmp);
     let acc = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
     let wacc = Writable::from_reg(acc);
     ctx.emit(MInst::LoadImm { rd: wacc, value: 0 });
+    let mut acc = acc;
     for &index in get_elem_ptr.offsets() {
         let elem_size = if ty.is_pointer() {
             let deref = ty.derefernce();
@@ -385,23 +500,27 @@ fn lower_get_elem_ptr(
             ty = elem_ty;
             size
         };
+        let factor = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
         ctx.emit(MInst::LoadImm {
-            rd: wtmp,
+            rd: Writable::from_reg(factor),
             value: elem_size as u64,
         });
         let rhs = ctx.put_value_in_reg(index);
+        let product = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
         ctx.emit(MInst::AluRRR {
             op: AluRRROP::Mul,
-            rd: wtmp,
-            rs1: tmp,
+            rd: Writable::from_reg(product),
+            rs1: factor,
             rs2: rhs,
         });
+        let next_acc = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
         ctx.emit(MInst::AluRRR {
             op: AluRRROP::Add,
-            rd: wacc,
+            rd: Writable::from_reg(next_acc),
             rs1: acc,
-            rs2: tmp,
+            rs2: product,
         });
+        acc = next_acc;
     }
     let final_ty = ty.reference();
     assert_eq!(
@@ -494,6 +613,93 @@ fn lower_store(
             }
         }
     }
+    LoweredOutput::None
+}
+
+fn lower_mem_zero(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    mem_zero: &MemZero,
+) -> LoweredOutput {
+    let inline_store_count = mem_zero.byte_len() / 4;
+    if mem_zero.byte_len() % 4 == 0 && inline_store_count <= INLINE_MEMZERO_MAX_STORES {
+        let alloc = matches!(arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
+            .then_some(mem_zero.dest());
+        let (dest, stack_offset) = if let Some(alloc) = alloc {
+            let pointee = arena.inst_data(alloc).ty().derefernce();
+            let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
+            (
+                ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
+                Some(offset),
+            )
+        } else {
+            (ctx.put_value_in_reg(mem_zero.dest()), None)
+        };
+        if let Some(offset) = stack_offset {
+            ctx.emit(<Riscv64ABI as ABIMachineSpec>::gen_get_stack_addr(
+                StackAMode::Slot(offset),
+                Writable::from_reg(dest),
+            ));
+        }
+        for index in 0..inline_store_count {
+            ctx.emit(MInst::StoreWord {
+                rs: zero_reg(),
+                op: StoreOP::Sw,
+                addr: AMode::RegOffest(dest, (index * 4) as i64),
+            });
+        }
+        return LoweredOutput::None;
+    }
+
+    let alloc = matches!(arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
+        .then_some(mem_zero.dest());
+    let (dest, stack_offset) = if let Some(alloc) = alloc {
+        let pointee = arena.inst_data(alloc).ty().derefernce();
+        let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
+        (
+            ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
+            Some(offset),
+        )
+    } else {
+        (ctx.put_value_in_reg(mem_zero.dest()), None)
+    };
+    let zero = ctx.alloc_tmp(HirType::get_i32());
+    let byte_len = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+    if let Some(offset) = stack_offset {
+        ctx.emit(<Riscv64ABI as ABIMachineSpec>::gen_get_stack_addr(
+            StackAMode::Slot(offset),
+            Writable::from_reg(dest),
+        ));
+    }
+    ctx.emit(MInst::LoadImm {
+        rd: Writable::from_reg(zero),
+        value: 0,
+    });
+    ctx.emit(MInst::LoadImm {
+        rd: Writable::from_reg(byte_len),
+        value: mem_zero.byte_len() as u64,
+    });
+    ctx.emit(MInst::Call {
+        arg_pairs: smallvec![
+            CallArgPair {
+                vreg: dest,
+                preg: a0(),
+            },
+            CallArgPair {
+                vreg: zero,
+                preg: a1(),
+            },
+            CallArgPair {
+                vreg: byte_len,
+                preg: a2(),
+            },
+        ],
+        ret: None,
+        clobbers: DEFAULT_CLOBBERS,
+        label: Label::LibCall(LibCall::Memset),
+    });
+    ctx.vcode.vcode.abi.set_has_calls();
+    ctx.vcode.vcode.abi.set_outgoing_arg_size(0);
     LoweredOutput::None
 }
 
@@ -653,12 +859,14 @@ impl LowerBackend for Riscv64Backend {
                 unreachable!("currently constants are not in layout")
             }
             InstKind::Binary(binary) => lower_binary(ctx, arena, inst, binary),
+            InstKind::Select(select) => lower_select(ctx, arena, inst, select),
             InstKind::Cast(cast) => lower_cast(ctx, arena, inst, cast),
             InstKind::Alloc => lower_alloc(ctx, arena, inst),
             InstKind::GetElemPtr(get_elem_ptr) => {
                 lower_get_elem_ptr(ctx, arena, inst, get_elem_ptr)
             }
             InstKind::Store(store) => lower_store(ctx, arena, store),
+            InstKind::MemZero(mem_zero) => lower_mem_zero(ctx, arena, mem_zero),
             InstKind::Load(load) => lower_load(ctx, arena, inst, load),
             InstKind::Call(call) => lower_call(ctx, arena, inst, call),
             InstKind::Return(ret) => lower_return(ctx, arena, ret),
@@ -685,12 +893,9 @@ impl LowerBackend for Riscv64Backend {
                     ctx.put_value_in_reg(arg);
                 }
                 let &[target] = target else { unreachable!() };
-                let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                ctx.emit(MInst::LoadAddr {
-                    rd: Writable::from_reg(tmp),
+                ctx.emit(MInst::Jump {
                     label: Label::Block(target),
                 });
-                ctx.emit(MInst::JumpReg { rs: tmp });
             }
             raana_ir::ir::InstKind::Branch(branch) => {
                 let cond = branch.cond();
@@ -703,18 +908,11 @@ impl LowerBackend for Riscv64Backend {
                 let &[t_target, f_target] = target else {
                     unreachable!()
                 };
-                let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                ctx.emit(MInst::LongBnez {
+                ctx.emit(MInst::CondBr {
                     cond,
-                    scratch: Writable::from_reg(tmp),
-                    label: Label::Block(t_target),
+                    true_label: Label::Block(t_target),
+                    false_label: Label::Block(f_target),
                 });
-                let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                ctx.emit(MInst::LoadAddr {
-                    rd: Writable::from_reg(tmp),
-                    label: Label::Block(f_target),
-                });
-                ctx.emit(MInst::JumpReg { rs: tmp });
             }
             _ => unreachable!("should not lower non-branch isntruction in here."),
         }
@@ -771,12 +969,9 @@ impl LowerBackend for Riscv64Backend {
         ctx: &mut taki_mir::lower::LowerContext<MInst>,
         target: taki_mir::block_order::MirBlockIndex,
     ) {
-        let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-        ctx.emit(MInst::LoadAddr {
-            rd: Writable::from_reg(tmp),
+        ctx.emit(MInst::Jump {
             label: Label::Block(target),
         });
-        ctx.emit(MInst::JumpReg { rs: tmp });
     }
 }
 

@@ -352,7 +352,7 @@ impl LowerBackend for Riscv64Backend {
                 let cond = ctx.put_value_in_reg(select.cond());
                 let if_true = ctx.put_value_in_reg(select.if_true());
                 let if_false = ctx.put_value_in_reg(select.if_false());
-                let def = *ctx.reg_map.get(&inst).unwrap();
+                let def = ctx.result_reg(inst);
                 let tmp_ty = select_tmp_ty(ty);
                 let is_float = matches!(ty.kind(), HirTypeKind::Float32);
                 let (if_true, if_false, result) = if is_float {
@@ -956,7 +956,7 @@ mod tests {
         let ret = data.new_local_inst().ret(Some(select));
         data.layout_mut().insert_inst(entry, ret);
 
-        let asm = crate::compile::<Riscv64Backend>(&program).unwrap();
+        let asm = crate::compile::<Riscv64Backend>(&program);
         assert!(asm.contains("snez "), "{asm}");
         assert!(asm.contains("subw "), "{asm}");
         assert!(asm.contains("and "), "{asm}");
@@ -987,7 +987,7 @@ mod tests {
         let ret = data.new_local_inst().ret(Some(select));
         data.layout_mut().insert_inst(entry, ret);
 
-        let asm = crate::compile::<Riscv64Backend>(&program).unwrap();
+        let asm = crate::compile::<Riscv64Backend>(&program);
         assert!(asm.contains("snez "), "{asm}");
         assert!(asm.contains("sub "), "{asm}");
         assert!(!asm.contains("subw "), "{asm}");
@@ -1014,7 +1014,7 @@ mod tests {
         let ret = data.new_local_inst().ret(Some(select));
         data.layout_mut().insert_inst(entry, ret);
 
-        let asm = crate::compile::<Riscv64Backend>(&program).unwrap();
+        let asm = crate::compile::<Riscv64Backend>(&program);
         assert_eq!(asm.matches("fmv.x.w ").count(), 2, "{asm}");
         assert!(asm.contains("fmv.w.x "), "{asm}");
         assert!(asm.contains("snez "), "{asm}");
@@ -1042,7 +1042,7 @@ mod tests {
         let ret = data.new_local_inst().ret(None);
         data.layout_mut().insert_inst(entry, ret);
 
-        let asm = crate::compile::<Riscv64Backend>(&program).unwrap();
+        let asm = crate::compile::<Riscv64Backend>(&program);
         assert!(!asm.contains("call memset"), "{asm}");
         assert_eq!(asm.matches("sw zero").count(), 4, "{asm}");
     }

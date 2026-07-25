@@ -73,7 +73,7 @@ impl MachInst for MInst {
                 if let Some(ret_pair) = ret {
                     collector.reg_fixed_def(&mut ret_pair.vreg, ret_pair.preg);
                 }
-                collector.reg_clobbers(*clobbers);
+                collector.reg_clobbers(call_clobbers(*clobbers, ret.as_ref()));
             }
             MInst::Args { pairs } => {
                 for pair in pairs {
@@ -88,9 +88,8 @@ impl MachInst for MInst {
             MInst::JumpReg { rs } => {
                 collector.reg_use(rs);
             }
-            MInst::LongBnez { cond, scratch, .. } => {
+            MInst::CondBr { cond, .. } => {
                 collector.reg_use(cond);
-                collector.reg_def(scratch);
             }
             MInst::Mov { src, dst } => {
                 collector.reg_use(src);
@@ -108,7 +107,7 @@ impl MachInst for MInst {
 
     fn is_term(&self) -> taki_mir::vcode::MachTerminator {
         match self {
-            MInst::LongBnez { .. } | MInst::Jump { .. } | MInst::JumpReg { .. } => {
+            MInst::CondBr { .. } | MInst::Jump { .. } | MInst::JumpReg { .. } => {
                 MachTerminator::Branch
             }
             MInst::Ret => MachTerminator::Return,
@@ -146,6 +145,13 @@ impl MachInst for MInst {
             label: crate::labels::Label::Block(target),
         }
     }
+}
+
+fn call_clobbers(mut clobbers: PRegSet, ret: Option<&CallRetPair>) -> PRegSet {
+    if let Some(ret) = ret {
+        clobbers.remove(ret.preg.to_real_reg().unwrap());
+    }
+    clobbers
 }
 
 impl MachInstEmit for MInst {
@@ -229,29 +235,30 @@ impl MachInstEmit for MInst {
             MInst::Ret => write!(ctx, "ret"),
             MInst::RetVal { .. } => Ok(()),
             MInst::Jump { label } => {
-                write!(ctx, "j ")?;
-                label.emit(ctx)
+                write!(ctx, "la t6, ")?;
+                label.emit(ctx)?;
+                write!(ctx, "\n    jr t6")
             }
             MInst::JumpReg { rs } => {
                 write!(ctx, "jr ")?;
                 ctx.write_reg(rs)
             }
-            MInst::LongBnez {
+            MInst::CondBr {
                 cond,
-                scratch,
-                label,
+                true_label,
+                false_label,
             } => {
                 write!(ctx, "beqz ")?;
                 ctx.write_reg(cond)?;
                 writeln!(ctx, ", 1f")?;
-                write!(ctx, "    la ")?;
-                ctx.write_reg(&scratch.reg)?;
-                write!(ctx, ", ")?;
-                label.emit(ctx)?;
+                write!(ctx, "    la t6, ")?;
+                true_label.emit(ctx)?;
                 writeln!(ctx, "")?;
-                write!(ctx, "    jr ")?;
-                ctx.write_reg(&scratch.reg)?;
-                write!(ctx, "\n1:")
+                writeln!(ctx, "    jr t6")?;
+                writeln!(ctx, "1:")?;
+                write!(ctx, "    la t6, ")?;
+                false_label.emit(ctx)?;
+                write!(ctx, "\n    jr t6")
             }
             MInst::Mov { src, dst } => {
                 let src_real = src.to_real_reg();
@@ -373,10 +380,10 @@ pub enum MInst {
     JumpReg {
         rs: Reg,
     },
-    LongBnez {
+    CondBr {
         cond: Reg,
-        scratch: WritableReg,
-        label: Label,
+        true_label: Label,
+        false_label: Label,
     },
     Mov {
         src: Reg,

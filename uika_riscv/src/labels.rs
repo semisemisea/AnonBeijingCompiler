@@ -1,10 +1,11 @@
-use taki_mir::{block_order::MirBlockIndex, prelude::*, vcode::EmitContext};
+use taki_mir::{block_order::MirBlockIndex, libcall::LibCall, prelude::*, vcode::EmitContext};
 
 #[derive(Debug, Clone)]
 pub enum Label {
     Block(MirBlockIndex),
     Function(HirFunction),
     GlobalValue(HirInst),
+    LibCall(LibCall),
 }
 
 impl Label {
@@ -26,6 +27,7 @@ impl Label {
             Label::Block(b) => ctx.write_label_ref(*b),
             Label::Function(f) => ctx.write_function_label(*f),
             Label::GlobalValue(gv) => ctx.write_global_label(*gv),
+            Label::LibCall(libcall) => write!(ctx, "{}", libcall.symbol()),
         }
     }
 }

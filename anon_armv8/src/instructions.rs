@@ -1345,7 +1345,7 @@ impl MachInstEmit for MInst {
                 write!(ctx, ", ")?;
                 emit_pair_amode(ctx, addr)
             }
-            Self::Args { .. } | Self::RetVal { .. } => write!(ctx, "// ABI register assignment"),
+            Self::Args { .. } | Self::RetVal { .. } => Ok(()),
             Self::Call { label, .. } => {
                 write!(ctx, "bl ")?;
                 label.emit(ctx)

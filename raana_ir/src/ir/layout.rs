@@ -79,6 +79,24 @@ impl Layout {
         self.basicblock_mut(bb).back.insert(inst, idx);
     }
 
+    pub fn insert_inst_before(&mut self, before: Inst, inst: Inst) {
+        let bb = *self
+            .parent
+            .get(&before)
+            .expect("anchor instruction must be in the layout");
+        let before_index = *self
+            .basicblock(bb)
+            .back
+            .get(&before)
+            .expect("anchor instruction must be indexed in its basic block");
+        self.parent.insert(inst, bb);
+        let index = self
+            .basicblock_mut(bb)
+            .insts
+            .insert_before(before_index, inst);
+        self.basicblock_mut(bb).back.insert(inst, index);
+    }
+
     pub fn remove_inst(&mut self, bb: BasicBlock, inst: Inst) {
         self.parent.remove(&inst);
         let idx = self.basicblock_mut(bb).back.remove(&inst).unwrap();
@@ -100,5 +118,69 @@ impl Layout {
 
     pub fn parent_bb(&self, inst: Inst) -> Option<BasicBlock> {
         self.parent.get(&inst).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ir::{builder::*, Program, Type};
+
+    #[test]
+    fn inserts_instructions_before_layout_anchors() {
+        let mut program = Program::new();
+        let function =
+            program.new_function(Type::get_i32(), "insert".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+
+        let x = data.params()[0];
+        let one = data.new_local_inst().integer(1);
+        let add = data
+            .new_local_inst()
+            .binary(crate::ir::BinaryOp::Add, x, one);
+        let ret = data.new_local_inst().ret(Some(add));
+        data.layout_mut().insert_inst(entry, add);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let first = data
+            .new_local_inst()
+            .binary(crate::ir::BinaryOp::Sub, x, one);
+        let middle = data
+            .new_local_inst()
+            .binary(crate::ir::BinaryOp::Mul, x, one);
+        let before_ret = data
+            .new_local_inst()
+            .binary(crate::ir::BinaryOp::And, x, one);
+        data.layout_mut().insert_inst_before(add, first);
+        data.layout_mut().insert_inst_before(ret, middle);
+        data.layout_mut().insert_inst_before(ret, before_ret);
+
+        assert_eq!(
+            data.layout()
+                .basicblock(entry)
+                .insts()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![first, add, middle, before_ret, ret]
+        );
+        for inst in [first, add, middle, before_ret, ret] {
+            assert_eq!(data.layout().parent_bb(inst), Some(entry));
+        }
+        assert_eq!(data.layout().basicblock(entry).terminator(), ret);
+
+        data.remove_layout_inst(entry, middle);
+        assert_eq!(data.layout().parent_bb(middle), None);
+        assert_eq!(
+            data.layout()
+                .basicblock(entry)
+                .insts()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![first, add, before_ret, ret]
+        );
+        assert_eq!(data.layout().basicblock(entry).terminator(), ret);
     }
 }

@@ -39,15 +39,6 @@ RaanaIR 当前指令集能够可靠表达、且不需要新增 `mulhi` 的部分
 
 ### 2. 支持多指令 Rewrite 的 Layout 基础设施
 
-- [ ] 在 `raana_ir/src/ir/layout.rs` 增加最小化的“在指定指令之前插入指令”
-  接口，用于在原 `Div`/`Rem` 前按依赖顺序构造中间值。接口预计采用
-  `insert_inst_before(before: Inst, inst: Inst)`，不要引入与当前任务无关的
-  通用 layout 重构。
-- [ ] 插入接口必须同时维护基本块内的 `IndexList<Inst>`、指令到基本块的
-  `parent` 映射，以及 `BasicBlockLayout::back` 中的指令索引；插入后现有
-  `parent_bb`、删除和遍历逻辑必须继续正确工作。
-- [ ] 为插入接口增加 layout 单元测试：在首条、中间和 terminator 前插入；
-  检查迭代顺序、`parent_bb`、后续删除、原指令索引和 terminator 均正确。
 - [ ] `StrengthReduction` 先收集候选指令，再执行改写，禁止在借用 layout
   迭代器时直接修改指令链表。新建的中间指令必须按照定义支配使用的顺序插入，
   且全部位于原指令之前。

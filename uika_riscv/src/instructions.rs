@@ -729,7 +729,12 @@ impl AMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShiftImm, ShiftImm64};
+    use super::{ShiftImm, ShiftImm64, call_clobbers};
+    use crate::{
+        abi::DEFAULT_CLOBBERS,
+        regs::{a0, f_reg, fa0, pf_reg, px_reg, x_reg},
+    };
+    use taki_mir::{abi::CallRetPair, register::Writable};
 
     #[test]
     fn shift_immediates_enforce_operand_width() {
@@ -742,5 +747,28 @@ mod tests {
         assert!(ShiftImm64::new(32).is_some());
         assert!(ShiftImm64::new(63).is_some());
         assert!(ShiftImm64::new(64).is_none());
+    }
+
+    #[test]
+    fn call_clobbers_exclude_the_fixed_return_register() {
+        let int = call_clobbers(
+            DEFAULT_CLOBBERS,
+            Some(&CallRetPair {
+                vreg: Writable::from_reg(x_reg(5)),
+                preg: a0(),
+            }),
+        );
+        let float = call_clobbers(
+            DEFAULT_CLOBBERS,
+            Some(&CallRetPair {
+                vreg: Writable::from_reg(f_reg(5)),
+                preg: fa0(),
+            }),
+        );
+
+        assert!(!int.contains(px_reg(10)));
+        assert!(!float.contains(pf_reg(10)));
+        assert!(int.contains(px_reg(11)));
+        assert!(float.contains(pf_reg(11)));
     }
 }

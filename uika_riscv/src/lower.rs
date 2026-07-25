@@ -1017,7 +1017,11 @@ impl LowerBackend for Riscv64Backend {
 
 #[cfg(test)]
 mod tests {
-    use super::signed_power_of_two;
+    use super::*;
+    use raana_ir::ir::{
+        Program,
+        builder_trait::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
+    };
 
     #[test]
     fn classifies_signed_power_of_two_divisors() {
@@ -1066,5 +1070,143 @@ mod tests {
                 assert_eq!(remainder, expected_remainder, "{dividend} % {divisor}");
             }
         }
+    }
+
+    #[test]
+    fn select_uses_word_mask_for_i32() {
+        let ops = select_alu_ops(&HirType::get_i32()).unwrap();
+        assert_eq!(ops.sub, AluRRROP::SubW);
+        assert_eq!(ops.xor, AluRRROP::Xor);
+        assert_eq!(ops.and, AluRRROP::And);
+    }
+
+    #[test]
+    fn select_uses_full_width_mask_for_pointer_and_string() {
+        for ty in [
+            HirType::get_pointer(HirType::get_i32()),
+            HirType::get_string(),
+        ] {
+            let ops = select_alu_ops(&ty).unwrap();
+            assert_eq!(ops.sub, AluRRROP::Sub);
+            assert_eq!(ops.xor, AluRRROP::Xor);
+            assert_eq!(ops.and, AluRRROP::And);
+        }
+    }
+
+    #[test]
+    fn select_uses_word_mask_for_f32_bits() {
+        let ops = select_alu_ops(&HirType::get_f32()).unwrap();
+        assert_eq!(ops.sub, AluRRROP::SubW);
+        assert_eq!(ops.xor, AluRRROP::Xor);
+        assert_eq!(ops.and, AluRRROP::And);
+    }
+
+    #[test]
+    fn lowers_noncanonical_i32_select_to_branchless_mask_sequence() {
+        let mut program = Program::new();
+        let function = program.new_function(HirType::get_i32(), "choose".to_string(), Vec::new());
+        let data = program.func_data_mut(function);
+        let entry = data
+            .new_basic_block()
+            .basic_block("entry".to_string(), Vec::new());
+        data.layout_mut().push_bb_back(entry);
+
+        let cond = data.new_local_inst().integer(2);
+        let if_true = data.new_local_inst().integer(10);
+        let if_false = data.new_local_inst().integer(20);
+        let select = data.new_local_inst().select(cond, if_true, if_false);
+        data.layout_mut().insert_inst(entry, select);
+        let ret = data.new_local_inst().ret(Some(select));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<Riscv64Backend>(&program);
+        assert!(asm.contains("snez "), "{asm}");
+        assert!(asm.contains("subw "), "{asm}");
+        assert!(asm.contains("and "), "{asm}");
+        assert_eq!(asm.matches("xor ").count(), 2, "{asm}");
+        assert!(!asm.contains("beqz "), "{asm}");
+        assert!(!asm.contains("bnez "), "{asm}");
+    }
+
+    #[test]
+    fn lowers_pointer_select_with_full_width_mask() {
+        let mut program = Program::new();
+        let pointer_ty = HirType::get_pointer(HirType::get_i32());
+        let function =
+            program.new_function(pointer_ty.clone(), "choose_pointer".to_string(), Vec::new());
+        let data = program.func_data_mut(function);
+        let entry = data
+            .new_basic_block()
+            .basic_block("entry".to_string(), Vec::new());
+        data.layout_mut().push_bb_back(entry);
+
+        let cond = data.new_local_inst().integer(2);
+        let if_true = data.new_local_inst().alloc(HirType::get_i32());
+        let if_false = data.new_local_inst().alloc(HirType::get_i32());
+        data.layout_mut().insert_inst(entry, if_true);
+        data.layout_mut().insert_inst(entry, if_false);
+        let select = data.new_local_inst().select(cond, if_true, if_false);
+        data.layout_mut().insert_inst(entry, select);
+        let ret = data.new_local_inst().ret(Some(select));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<Riscv64Backend>(&program);
+        assert!(asm.contains("snez "), "{asm}");
+        assert!(asm.contains("sub "), "{asm}");
+        assert!(!asm.contains("subw "), "{asm}");
+        assert!(!asm.contains("beqz "), "{asm}");
+        assert!(!asm.contains("bnez "), "{asm}");
+    }
+
+    #[test]
+    fn lowers_f32_select_through_integer_bit_mask() {
+        let mut program = Program::new();
+        let function =
+            program.new_function(HirType::get_f32(), "choose_float".to_string(), Vec::new());
+        let data = program.func_data_mut(function);
+        let entry = data
+            .new_basic_block()
+            .basic_block("entry".to_string(), Vec::new());
+        data.layout_mut().push_bb_back(entry);
+
+        let cond = data.new_local_inst().integer(-2);
+        let if_true = data.new_local_inst().float(1.5);
+        let if_false = data.new_local_inst().float(-0.0);
+        let select = data.new_local_inst().select(cond, if_true, if_false);
+        data.layout_mut().insert_inst(entry, select);
+        let ret = data.new_local_inst().ret(Some(select));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<Riscv64Backend>(&program);
+        assert_eq!(asm.matches("fmv.x.w ").count(), 2, "{asm}");
+        assert!(asm.contains("fmv.w.x "), "{asm}");
+        assert!(asm.contains("snez "), "{asm}");
+        assert!(asm.contains("subw "), "{asm}");
+        assert_eq!(asm.matches("xor ").count(), 2, "{asm}");
+        assert!(!asm.contains("beqz "), "{asm}");
+        assert!(!asm.contains("bnez "), "{asm}");
+    }
+
+    #[test]
+    fn lowers_small_mem_zero_to_inline_stores() {
+        let mut program = Program::new();
+        let function = program.new_function(HirType::get_unit(), "clear".to_string(), Vec::new());
+        let data = program.func_data_mut(function);
+        let entry = data
+            .new_basic_block()
+            .basic_block("entry".to_string(), Vec::new());
+        data.layout_mut().push_bb_back(entry);
+
+        let alloc = data
+            .new_local_inst()
+            .alloc(HirType::get_array(HirType::get_i32(), 4));
+        let clear = data.new_local_inst().mem_zero(alloc, 16);
+        data.layout_mut().insert_inst(entry, clear);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<Riscv64Backend>(&program);
+        assert!(!asm.contains("call memset"), "{asm}");
+        assert_eq!(asm.matches("sw zero").count(), 4, "{asm}");
     }
 }

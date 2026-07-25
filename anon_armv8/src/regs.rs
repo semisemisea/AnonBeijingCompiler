@@ -168,7 +168,7 @@ pub fn machine_env() -> &'static MachineEnv {
         ],
         non_preferred_regs_by_class: [
             preg_set(&[19, 20, 21, 22, 23, 24, 25, 26, 27, 28], RegClass::Int),
-            PRegSet::empty(),
+            preg_set(&[8, 9, 10, 11, 12, 13, 14, 15], RegClass::Float),
             PRegSet::empty(),
         ],
         scratch_by_class: [

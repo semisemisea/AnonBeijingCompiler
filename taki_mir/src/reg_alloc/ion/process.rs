@@ -18,8 +18,8 @@
 
 use super::{
     Env, LiveBundleIndex, LiveBundleVec, LiveRangeFlag, LiveRangeIndex, LiveRangeKey,
-    LiveRangeList, LiveRangeListEntry, PRegIndex, RegTraversalIter, Requirement, SpillWeight,
-    UseList, VRegIndex, spill_weight_from_constraint,
+    LiveRangeList, LiveRangeListEntry, PRegIndex, RegTraversalIter, Requirement, SpillSetIndex,
+    SpillWeight, UseList, VRegIndex, spill_weight_from_constraint,
 };
 use crate::reg_alloc::{
     function::Function,
@@ -433,6 +433,36 @@ impl<'a, F: Function> Env<'a, F> {
         }
     }
 
+    /// Create an independent bundle for a use-free live range that was
+    /// trimmed during splitting.
+    ///
+    /// Unlike `get_or_create_spill_bundle`, which accumulates *all*
+    /// trimmed ranges into one shared bundle, this creates a standalone
+    /// bundle per range.  Each standalone bundle is sent to the
+    /// second-chance allocation pass where it can be allocated to a
+    /// register independently.  This prevents the situation where
+    /// non-contiguous trimmed ranges collectively conflict with every
+    /// physical register even though individual ranges would fit.
+    ///
+    /// All independent bundles share the same `spillset` so that, if
+    /// second-chance allocation also fails, they fall back to the same
+    /// spill slot.
+    fn enqueue_isolated_range(
+        &mut self,
+        spillset: SpillSetIndex,
+        entry: LiveRangeListEntry,
+        vreg: VRegIndex,
+        _hint: PReg,
+    ) {
+        let new_bundle = self.ctx.bundles.add();
+        self.ctx.bundles[new_bundle].spillset = spillset;
+        self.ctx.ranges[entry.index].bundle = new_bundle;
+        self.ctx.bundles[new_bundle].ranges.push(entry);
+        self.ctx.vregs[vreg].ranges.push(entry);
+        self.recompute_bundle_properties(new_bundle);
+        self.ctx.spilled_bundles.push(new_bundle);
+    }
+
     pub fn split_and_requeue_bundle(
         &mut self,
         bundle: LiveBundleIndex,
@@ -659,36 +689,30 @@ impl<'a, F: Function> Env<'a, F> {
         self.ctx.bundles[new_bundle].ranges = new_lr_list;
 
         if trim_ends_into_spill_bundle {
-            // Finally, handle moving LRs to the spill bundle when
-            // appropriate: If the first range in `new_bundle` or last
-            // range in `bundle` has "empty space" beyond the first or
-            // last use (respectively), trim it and put an empty LR into
-            // the spill bundle.  (We are careful to treat the "starts at
-            // def" flag as an implicit first def even if no def-type Use
-            // is present.)
+            // Handle moving LRs to isolated bundles when appropriate:
+            // If the first range in `new_bundle` or last range in
+            // `bundle` has "empty space" beyond the first or last use
+            // (respectively), trim it and enqueue the empty LR as an
+            // independent bundle.  Each independent bundle can be
+            // allocated to a register on its own, avoiding the problem
+            // where a shared spill bundle accumulates non-contiguous
+            // ranges that collectively conflict with every register.
             while let Some(entry) = self.ctx.bundles[bundle].ranges.last().cloned() {
                 let end = entry.range.to;
                 let vreg = self.ctx.ranges[entry.index].vreg;
                 let last_use = self.ctx.ranges[entry.index].uses.last().map(|u| u.pos);
                 if last_use.is_none() {
-                    let spill = self
-                        .get_or_create_spill_bundle(bundle, /* create_if_absent = */ true)
-                        .unwrap();
                     trace!(
-                        " -> bundle {:?} range {:?}: no uses; moving to spill bundle {:?}",
-                        bundle, entry.index, spill
+                        " -> bundle {:?} range {:?}: no uses; isolating",
+                        bundle, entry.index
                     );
-                    self.ctx.bundles[spill].ranges.push(entry);
                     self.ctx.bundles[bundle].ranges.pop();
-                    self.ctx.ranges[entry.index].bundle = spill;
+                    self.enqueue_isolated_range(spillset, entry, vreg, hint);
                     continue;
                 }
                 let last_use = last_use.unwrap();
                 let split = ProgPoint::before(last_use.inst() + 1);
                 if split < end {
-                    let spill = self
-                        .get_or_create_spill_bundle(bundle, /* create_if_absent = */ true)
-                        .unwrap();
                     self.ctx.bundles[bundle].ranges.last_mut().unwrap().range.to = split;
                     self.ctx.ranges[self.ctx.bundles[bundle].ranges.last().unwrap().index]
                         .range
@@ -698,22 +722,19 @@ impl<'a, F: Function> Env<'a, F> {
                         to: end,
                     };
                     let empty_lr = self.ctx.ranges.add(range);
-                    self.ctx.bundles[spill].ranges.push(LiveRangeListEntry {
-                        range,
-                        index: empty_lr,
-                    });
-                    self.ctx.ranges[empty_lr].bundle = spill;
-                    self.ctx.vregs[vreg].ranges.push(LiveRangeListEntry {
-                        range,
-                        index: empty_lr,
-                    });
+                    self.ctx.ranges[empty_lr].vreg = vreg;
                     trace!(
                         " -> bundle {:?} range {:?}: last use implies split point {:?}",
                         bundle, entry.index, split
                     );
-                    trace!(
-                        " -> moving trailing empty region to new spill bundle {:?} with new LR {:?}",
-                        spill, empty_lr
+                    self.enqueue_isolated_range(
+                        spillset,
+                        LiveRangeListEntry {
+                            range,
+                            index: empty_lr,
+                        },
+                        vreg,
+                        hint,
                     );
                 }
                 break;
@@ -726,24 +747,17 @@ impl<'a, F: Function> Env<'a, F> {
                 let vreg = self.ctx.ranges[entry.index].vreg;
                 let first_use = self.ctx.ranges[entry.index].uses.first().map(|u| u.pos);
                 if first_use.is_none() {
-                    let spill = self
-                        .get_or_create_spill_bundle(new_bundle, /* create_if_absent = */ true)
-                        .unwrap();
                     trace!(
-                        " -> bundle {:?} range {:?}: no uses; moving to spill bundle {:?}",
-                        new_bundle, entry.index, spill
+                        " -> bundle {:?} range {:?}: no uses; isolating",
+                        new_bundle, entry.index
                     );
-                    self.ctx.bundles[spill].ranges.push(entry);
                     self.ctx.bundles[new_bundle].ranges.drain(..1);
-                    self.ctx.ranges[entry.index].bundle = spill;
+                    self.enqueue_isolated_range(spillset, entry, vreg, hint);
                     continue;
                 }
                 let first_use = first_use.unwrap();
                 let split = ProgPoint::before(first_use.inst());
                 if split > start {
-                    let spill = self
-                        .get_or_create_spill_bundle(new_bundle, /* create_if_absent = */ true)
-                        .unwrap();
                     self.ctx.bundles[new_bundle]
                         .ranges
                         .first_mut()
@@ -758,22 +772,19 @@ impl<'a, F: Function> Env<'a, F> {
                         to: split,
                     };
                     let empty_lr = self.ctx.ranges.add(range);
-                    self.ctx.bundles[spill].ranges.push(LiveRangeListEntry {
-                        range,
-                        index: empty_lr,
-                    });
-                    self.ctx.ranges[empty_lr].bundle = spill;
-                    self.ctx.vregs[vreg].ranges.push(LiveRangeListEntry {
-                        range,
-                        index: empty_lr,
-                    });
+                    self.ctx.ranges[empty_lr].vreg = vreg;
                     trace!(
                         " -> bundle {:?} range {:?}: first use implies split point {:?}",
                         bundle, entry.index, first_use,
                     );
-                    trace!(
-                        " -> moving leading empty region to new spill bundle {:?} with new LR {:?}",
-                        spill, empty_lr
+                    self.enqueue_isolated_range(
+                        spillset,
+                        LiveRangeListEntry {
+                            range,
+                            index: empty_lr,
+                        },
+                        vreg,
+                        hint,
                     );
                 }
                 break;
@@ -1007,27 +1018,6 @@ impl<'a, F: Function> Env<'a, F> {
             }
         };
 
-        // If no requirement at all (because no uses), and *if* a
-        // spill bundle is already present, then move the LRs over to
-        // the spill bundle right away.
-        match req {
-            Requirement::Any => {
-                if let Some(spill) =
-                    self.get_or_create_spill_bundle(bundle, /* create_if_absent = */ false)
-                {
-                    let empty_vec = LiveRangeList::new();
-                    let mut list =
-                        core::mem::replace(&mut self.ctx.bundles[bundle].ranges, empty_vec);
-                    for entry in &list {
-                        self.ctx.ranges[entry.index].bundle = spill;
-                    }
-                    self.ctx.bundles[spill].ranges.extend(list.drain(..));
-                    return Ok(());
-                }
-            }
-            _ => {}
-        }
-
         // Try to allocate!
         let mut attempts = 0;
         let mut scratch = core::mem::take(&mut self.ctx.scratch_conflicts);
@@ -1047,7 +1037,6 @@ impl<'a, F: Function> Env<'a, F> {
                     self.spillsets[spillset].required = true;
                     return Ok(());
                 }
-
                 Requirement::Any => {
                     self.ctx.spilled_bundles.push(bundle);
                     break;

@@ -861,16 +861,184 @@ impl<I: VCodeInst> VCodeBuilder<I> {
 mod tests {
     use super::*;
     use crate::{
-        abi::CalleeABI,
-        prelude::{ArenaContext, HirFunctionData, HirType},
-        register::{VRegAllocator, Writable},
-        riscv64::{abi::Riscv64ABI, instructions::MInst},
-        types::I64,
+        abi::{ABIMachineSpec, ArgSlot, CalleeABI, FrameLayout, StackAMode},
+        prelude::{ArenaContext, HirBasicBlock, HirFunctionData, HirInst, HirType},
+        reg_alloc::reg::{MachineEnv, OperandVisitorImpl, PReg},
+        register::{Reg, VRegAllocator, Writable},
+        types::{I64, LoweredType},
     };
     use raana_ir::{
         ir::Program,
         opt::prelude::{BasicBlockBuilder, LocalInstBuilder},
     };
+
+    #[derive(Clone, Debug)]
+    enum TestInst {
+        Ret,
+        LoadImm { rd: Writable<Reg> },
+        Mov { src: Reg, dst: Writable<Reg> },
+        Jump,
+        Nop,
+    }
+
+    struct TestABI;
+
+    impl MachInst for TestInst {
+        type ABISpec = TestABI;
+
+        fn get_operands(&mut self, collector: &mut impl OperandVisitor) {
+            match self {
+                Self::LoadImm { rd } => collector.reg_def(rd),
+                Self::Mov { src, dst } => {
+                    collector.reg_use(src);
+                    collector.reg_def(dst);
+                }
+                Self::Ret | Self::Jump | Self::Nop => {}
+            }
+        }
+
+        fn is_move(&self) -> Option<(Writable<Reg>, Reg)> {
+            match self {
+                Self::Mov { src, dst } => Some((*dst, *src)),
+                _ => None,
+            }
+        }
+
+        fn is_term(&self) -> MachTerminator {
+            match self {
+                Self::Ret => MachTerminator::Return,
+                Self::Jump => MachTerminator::Branch,
+                _ => MachTerminator::None,
+            }
+        }
+
+        fn call_type(&self) -> CallType {
+            CallType::None
+        }
+
+        fn is_mem_access(&self) -> bool {
+            false
+        }
+
+        fn rc_for_type(ty: LoweredType) -> (&'static [RegClass], &'static [LoweredType]) {
+            match ty {
+                I64 => (&[RegClass::Int], &[I64]),
+                _ => unreachable!(),
+            }
+        }
+
+        fn gen_jump(_target: MirBlockIndex) -> Self {
+            Self::Jump
+        }
+    }
+
+    impl MachInstEmit for TestInst {
+        fn emit(&self, _ctx: &mut dyn EmitContext) -> core::fmt::Result {
+            Ok(())
+        }
+    }
+
+    impl ABIMachineSpec for TestABI {
+        type I = TestInst;
+
+        fn stack_align() -> u32 {
+            16
+        }
+
+        fn spillslot_size(_regclass: RegClass) -> u32 {
+            1
+        }
+
+        fn spill_unit_bytes() -> u32 {
+            8
+        }
+
+        fn is_callee_saved(_preg: PReg) -> bool {
+            false
+        }
+
+        fn gen_load_stack(_mem: StackAMode, dst: Writable<Reg>, _ty: LoweredType) -> Self::I {
+            TestInst::LoadImm { rd: dst }
+        }
+
+        fn gen_load_imm(dst: Writable<Reg>, _value: u64, _ty: LoweredType) -> Self::I {
+            TestInst::LoadImm { rd: dst }
+        }
+
+        fn gen_load_addr(dst: Writable<Reg>, _label: HirInst) -> Self::I {
+            TestInst::LoadImm { rd: dst }
+        }
+
+        fn gen_get_stack_addr(_mem: StackAMode, dst: Writable<Reg>) -> Self::I {
+            TestInst::LoadImm { rd: dst }
+        }
+
+        fn gen_args(_args: Vec<crate::abi::ArgPair>) -> Self::I {
+            TestInst::Nop
+        }
+
+        fn gen_ret() -> Self::I {
+            TestInst::Ret
+        }
+
+        fn gen_store_stack(_src: Reg, _mem: StackAMode, _ty: LoweredType) -> Self::I {
+            TestInst::Nop
+        }
+
+        fn gen_jump(_block: HirBasicBlock) -> Self::I {
+            TestInst::Jump
+        }
+
+        fn gen_nop() -> Self::I {
+            TestInst::Nop
+        }
+
+        fn gen_move(src: Reg, dst: Reg, _ty: LoweredType) -> Self::I {
+            TestInst::Mov {
+                src,
+                dst: Writable::from_reg(dst),
+            }
+        }
+
+        fn compute_arg_loc(_arena: ArenaContext<'_>) -> (Vec<ArgSlot>, u32) {
+            (vec![], 0)
+        }
+
+        fn compute_call_arg_loc(_types: &[HirType]) -> (Vec<ArgSlot>, u32) {
+            (vec![], 0)
+        }
+
+        fn get_machine_env() -> &'static MachineEnv {
+            static ENV: std::sync::LazyLock<MachineEnv> = std::sync::LazyLock::new(|| MachineEnv {
+                preferred_regs_by_class: [
+                    PRegSet::empty().with(PReg::new(0, RegClass::Int)),
+                    PRegSet::empty().with(PReg::new(0, RegClass::Float)),
+                    PRegSet::empty(),
+                ],
+                non_preferred_regs_by_class: [PRegSet::empty(); 3],
+                scratch_by_class: [None; 3],
+                post_ra_scratch_by_class: [vec![], vec![], vec![]],
+                fixed_stack_slots: vec![],
+            });
+            &ENV
+        }
+
+        fn gen_prologue_frame_setup(_frame: &FrameLayout) -> smallvec::SmallVec<[Self::I; 16]> {
+            smallvec::SmallVec::new()
+        }
+
+        fn gen_epilogue_frame_restore(_frame: &FrameLayout) -> smallvec::SmallVec<[Self::I; 16]> {
+            smallvec::SmallVec::new()
+        }
+
+        fn gen_clobber_save(_frame: &FrameLayout) -> smallvec::SmallVec<[Self::I; 16]> {
+            smallvec::SmallVec::new()
+        }
+
+        fn gen_clobber_restore(_frame: &FrameLayout) -> smallvec::SmallVec<[Self::I; 16]> {
+            smallvec::SmallVec::new()
+        }
+    }
 
     fn add_block(data: &mut HirFunctionData, name: &str) {
         let block = data.new_basic_block().basic_block(name.to_owned(), vec![]);
@@ -879,7 +1047,7 @@ mod tests {
         data.layout_mut().insert_inst(block, ret);
     }
 
-    fn empty_vcode() -> VCodeContainer<MInst> {
+    fn empty_vcode() -> VCodeContainer<TestInst> {
         let mut program = Program::new();
         let func = program.new_function(HirType::get_unit(), "verify".to_owned(), vec![]);
         add_block(program.func_data_mut(func), "entry");
@@ -887,15 +1055,15 @@ mod tests {
             program: &program,
             curr_func: Some(func),
         };
-        let abi = CalleeABI::<Riscv64ABI>::new(arena);
+        let abi = CalleeABI::<TestABI>::new(arena);
         let order = BlockLoweringOrder::new(arena);
         let mut builder = VCodeBuilder::new(abi, order);
-        builder.push(MInst::Ret);
+        builder.push(TestInst::Ret);
         builder.end_bb();
         builder.build(VRegAllocator::with_capaticy(0))
     }
 
-    fn vcode_with_integer_def() -> VCodeContainer<MInst> {
+    fn vcode_with_integer_def() -> VCodeContainer<TestInst> {
         let mut program = Program::new();
         let func = program.new_function(HirType::get_unit(), "verify".to_owned(), vec![]);
         add_block(program.func_data_mut(func), "entry");
@@ -903,13 +1071,13 @@ mod tests {
             program: &program,
             curr_func: Some(func),
         };
-        let abi = CalleeABI::<Riscv64ABI>::new(arena);
+        let abi = CalleeABI::<TestABI>::new(arena);
         let order = BlockLoweringOrder::new(arena);
         let mut builder = VCodeBuilder::new(abi, order);
         let mut vregs = VRegAllocator::with_capaticy(1);
         let dst = Writable::from_reg(vregs.alloc(I64));
-        builder.push(MInst::Ret);
-        builder.push(MInst::LoadImm { rd: dst, value: 1 });
+        builder.push(TestInst::Ret);
+        builder.push(TestInst::LoadImm { rd: dst });
         builder.end_bb();
         builder.build(vregs)
     }
@@ -932,14 +1100,14 @@ mod tests {
             program: &program,
             curr_func: Some(func),
         };
-        let abi = CalleeABI::<Riscv64ABI>::new(arena);
+        let abi = CalleeABI::<TestABI>::new(arena);
         let order = BlockLoweringOrder::new(arena);
         let mut builder = VCodeBuilder::new(abi, order);
         let mut vregs = VRegAllocator::with_capaticy(1);
         let dst = Writable::from_reg(vregs.alloc(I64));
-        builder.push(MInst::Ret);
-        builder.push(MInst::LoadImm { rd: dst, value: 2 });
-        builder.push(MInst::LoadImm { rd: dst, value: 1 });
+        builder.push(TestInst::Ret);
+        builder.push(TestInst::LoadImm { rd: dst });
+        builder.push(TestInst::LoadImm { rd: dst });
         builder.end_bb();
 
         let error = builder.build(vregs).verify("test").unwrap_err();
@@ -955,14 +1123,14 @@ mod tests {
             program: &program,
             curr_func: Some(func),
         };
-        let abi = CalleeABI::<Riscv64ABI>::new(arena);
+        let abi = CalleeABI::<TestABI>::new(arena);
         let order = BlockLoweringOrder::new(arena);
         let mut builder = VCodeBuilder::new(abi, order);
         let mut vregs = VRegAllocator::with_capaticy(2);
         let undefined = vregs.alloc(I64);
         let dst = Writable::from_reg(vregs.alloc(I64));
-        builder.push(MInst::Ret);
-        builder.push(MInst::Mov {
+        builder.push(TestInst::Ret);
+        builder.push(TestInst::Mov {
             src: undefined,
             dst,
         });
@@ -981,11 +1149,11 @@ mod tests {
             program: &program,
             curr_func: Some(func),
         };
-        let abi = CalleeABI::<Riscv64ABI>::new(arena);
+        let abi = CalleeABI::<TestABI>::new(arena);
         let order = BlockLoweringOrder::new(arena);
         let mut builder = VCodeBuilder::new(abi, order);
         let mut vregs = VRegAllocator::with_capaticy(1);
-        builder.push(MInst::Ret);
+        builder.push(TestInst::Ret);
         builder.add_block_param(vregs.alloc(I64).into());
         builder.end_bb();
 
@@ -1005,16 +1173,16 @@ mod tests {
             program: &program,
             curr_func: Some(func),
         };
-        let abi = CalleeABI::<Riscv64ABI>::new(arena);
+        let abi = CalleeABI::<TestABI>::new(arena);
         let order = BlockLoweringOrder::new(arena);
         let mut builder = VCodeBuilder::new(abi, order);
         let mut vregs = VRegAllocator::with_capaticy(2);
         let param = vregs.alloc(I64);
         let undefined = vregs.alloc(I64);
-        builder.push(MInst::Ret);
+        builder.push(TestInst::Ret);
         builder.add_block_param(param.into());
         builder.end_bb();
-        builder.push(MInst::gen_jump(Block::new(1)));
+        builder.push(TestInst::gen_jump(Block::new(1)));
         builder.add_succ(Block::new(1), &[undefined]);
         builder.end_bb();
 
@@ -1028,7 +1196,7 @@ mod tests {
     #[test]
     fn vcode_verifier_rejects_non_final_terminator() {
         let mut vcode = empty_vcode();
-        vcode.insts.insert(0, MInst::Ret);
+        vcode.insts.insert(0, TestInst::Ret);
         vcode.operands_range = Ranges::default();
         vcode.operands_range.push_end(0);
         vcode.operands_range.push_end(0);
@@ -1063,7 +1231,7 @@ mod tests {
                     from: crate::reg_alloc::reg::Allocation::stack(
                         crate::reg_alloc::reg::SpillSlot::new(0),
                     ),
-                    to: crate::reg_alloc::reg::Allocation::reg(crate::riscv64::regs::px_reg(5)),
+                    to: crate::reg_alloc::reg::Allocation::reg(PReg::new(5, RegClass::Int)),
                     class: RegClass::Int,
                 },
             )],
@@ -1119,9 +1287,10 @@ mod tests {
         let vcode = vcode_with_integer_def();
         let output = Output {
             inst_alloc_offsets: vec![0, 1],
-            allocs: vec![crate::reg_alloc::reg::Allocation::reg(
-                crate::riscv64::regs::pf_reg(0),
-            )],
+            allocs: vec![crate::reg_alloc::reg::Allocation::reg(PReg::new(
+                0,
+                RegClass::Float,
+            ))],
             ..Output::default()
         };
 

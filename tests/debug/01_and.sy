@@ -1,0 +1,26 @@
+int _and(int a, int b) {
+    int bit_a, bit_b;
+    int len = 32, result = 0, power = 1;
+    
+    while (len) {
+        bit_a = a % 2;
+        bit_b = b % 2;
+        a = a / 2;
+        b = b / 2;
+        if (bit_a == 1 && bit_b == 1) {
+            result = result + power;
+        }
+        power = power * 2;
+        len = len - 1;
+    }
+
+    return result;
+}
+
+int main() {
+    int a = 12489;
+    int b = 21423;
+    int result = _and(a, b);
+    putint(result);
+    return 0;
+}

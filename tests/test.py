@@ -160,7 +160,7 @@ def copy_testcase_files(src, out_dir):
             shutil.copy2(path, dst_base.with_suffix(path.suffix))
 
 
-def run_test(src, out_dir, opt_level, compiler, backend, target):
+def run_test(src, out_dir, opt_level, compiler, backend, target, baseline):
     start = time.perf_counter()
     src_rel = rel_test(src)
     arch_config = TARGET_CONFIG[target]
@@ -183,20 +183,43 @@ def run_test(src, out_dir, opt_level, compiler, backend, target):
     runtime_returncode = out_dir / src_rel.with_suffix(".runtime.return")
     compile_artifact.parent.mkdir(parents=True, exist_ok=True)
 
-    compile_args = [str(compiler)]
-    if opt_level:
-        compile_args.append(f"-O{opt_level}")
-    if backend == "asm":
+    if baseline:
+        compile_args = [
+            "clang",
+            "-x",
+            "c",
+            "-fcommon",
+            "-ffp-contract=off",
+            "-fsingle-precision-constant",
+            "-Wno-incompatible-pointer-types",
+        ]
+        if opt_level:
+            compile_args.append(f"-O{opt_level}")
         compile_args += [
+            f"--target={arch_config['clang_target']}",
+            f"--sysroot={arch_config['sysroot']}",
+            "-include",
+            str(ROOT / "sysylib" / "sylib.h"),
             "-S",
-            "--target",
-            target,
             "-o",
             str(compile_artifact),
             str(src),
         ]
     else:
-        compile_args += ["--emit", "llvm", "-o", str(compile_artifact), str(src)]
+        compile_args = [str(compiler)]
+        if opt_level:
+            compile_args.append(f"-O{opt_level}")
+        if backend == "asm":
+            compile_args += [
+                "-S",
+                "--target",
+                target,
+                "-o",
+                str(compile_artifact),
+                str(src),
+            ]
+        else:
+            compile_args += ["--emit", "llvm", "-o", str(compile_artifact), str(src)]
 
     try:
         compile_proc = subprocess.run(
@@ -227,28 +250,29 @@ def run_test(src, out_dir, opt_level, compiler, backend, target):
             f"exit {compile_proc.returncode}\n{output or '(no output)'}",
         )
 
-    ir_args = [str(compiler)]
-    if opt_level:
-        ir_args.append(f"-O{opt_level}")
-    ir_args += ["--emit", "ir", "-o", str(ir), str(src)]
+    if not baseline:
+        ir_args = [str(compiler)]
+        if opt_level:
+            ir_args.append(f"-O{opt_level}")
+        ir_args += ["--emit", "ir", "-o", str(ir), str(src)]
 
-    try:
-        ir_proc = subprocess.run(
-            ir_args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=remaining_timeout(start),
-        )
-    except subprocess.TimeoutExpired as err:
-        write_timeout_output(err, compile_stdout, compile_stderr, compile_returncode)
-        return None, " TLE", f"ir timeout after {TEST_TIMEOUT}s"
-    if ir_proc.returncode:
-        output = (ir_proc.stdout + ir_proc.stderr).decode("utf-8", "replace").strip()
-        return (
-            None,
-            " CE ",
-            f"ir exit {ir_proc.returncode}\n{output or '(no output)'}",
-        )
+        try:
+            ir_proc = subprocess.run(
+                ir_args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=remaining_timeout(start),
+            )
+        except subprocess.TimeoutExpired as err:
+            write_timeout_output(err, compile_stdout, compile_stderr, compile_returncode)
+            return None, " TLE", f"ir timeout after {TEST_TIMEOUT}s"
+        if ir_proc.returncode:
+            output = (ir_proc.stdout + ir_proc.stderr).decode("utf-8", "replace").strip()
+            return (
+                None,
+                " CE ",
+                f"ir exit {ir_proc.returncode}\n{output or '(no output)'}",
+            )
 
     # LLVM backend: lower .ll to .o via llc before linking
     if backend == "llvm":
@@ -404,6 +428,11 @@ def parse_args(argv):
         help=f"compiler path in container (default: {DEFAULT_COMPILER})",
     )
     parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help="compile test cases with the container clang",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="show test case output details",
@@ -418,14 +447,19 @@ def parse_args(argv):
         parser.error("--jobs must be at least 1")
     if args.opt_level < 0:
         parser.error("--opt-level must be non-negative")
+    if args.baseline and args.backend != "asm":
+        parser.error("--baseline only supports the asm backend")
     return args
 
 
-def check_mounts(compiler, target):
+def check_mounts(compiler, target, baseline):
     arch_config = TARGET_CONFIG[target]
     sysylib = ROOT / "sysylib" / arch_config["sysylib"]
     missing = []
-    for path in (TESTS_ROOT, RESULTS_ROOT, sysylib, compiler):
+    paths = (TESTS_ROOT, RESULTS_ROOT, sysylib)
+    if not baseline:
+        paths += (compiler,)
+    for path in paths:
         if not path.exists():
             missing.append(str(path))
     if missing:
@@ -438,7 +472,7 @@ def check_mounts(compiler, target):
 
 def run_tests(args):
     compiler = args.compiler.resolve()
-    if not check_mounts(compiler, args.target):
+    if not check_mounts(compiler, args.target, args.baseline):
         return 1
 
     try:
@@ -506,6 +540,7 @@ def run_tests(args):
                 compiler,
                 args.backend,
                 args.target,
+                args.baseline,
             ): src
             for src in files
         }

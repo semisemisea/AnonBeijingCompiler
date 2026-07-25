@@ -456,7 +456,7 @@ impl LowerBackend for Riscv64Backend {
             raana_ir::ir::InstKind::GetElemPtr(get_elem_ptr) => {
                 let indices = get_elem_ptr.offsets();
                 let src = get_elem_ptr.base();
-                let mut src_ty = ctx.arena.inst_data(src).ty().clone();
+                let src_ty = ctx.arena.inst_data(src).ty().clone();
                 let rs = ctx.put_value_in_reg(src);
 
                 let def = ctx.result_reg(inst);

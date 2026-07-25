@@ -404,7 +404,7 @@ impl<'a, F: Function> Env<'a, F> {
                                 from_vreg.index(),
                                 from_block.index(),
                                 to_vreg.index(),
-                                to_vreg.index()
+                                to_block.index()
                             );
 
                             let key = BlockparamSourceKey::new(from_block, to_vreg);

@@ -491,13 +491,10 @@ impl<'a, F: Function> Env<'a, F> {
         // the bundle.
         if split_at == bundle_start {
             // Find any uses; if none, just chop off one instruction.
-            let mut first_use = None;
-            'outer: for entry in &self.ctx.bundles[bundle].ranges {
-                for u in &self.ctx.ranges[entry.index].uses {
-                    first_use = Some(u.pos);
-                    break 'outer;
-                }
-            }
+            let first_use = self.ctx.bundles[bundle]
+                .ranges
+                .iter()
+                .find_map(|entry| self.ctx.ranges[entry.index].uses.first().map(|u| u.pos));
             trace!(" -> first use loc is {:?}", first_use);
             split_at = match first_use {
                 Some(pos) => {

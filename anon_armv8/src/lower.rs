@@ -7,7 +7,7 @@ use raana_ir::ir::{
 use taki_mir::{
     abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::{LoweredBlock, MirBlockIndex},
-    lower::{LowerBackend, LowerContext, LoweredOutput},
+    lower::{LowerBackend, LowerContext, LoweredOutput, analyze_gep},
     prelude::{ArenaContext, HirFunctionData, HirInst},
     reg_alloc::reg::PReg,
     register::Writable,
@@ -355,50 +355,37 @@ fn lower_get_elem_ptr(
     inst: HirInst,
     gep: &GetElemPtr,
 ) -> LoweredOutput {
-    let result = ctx.result_reg(inst);
-    let dst = Writable::from_reg(result);
-    let mut current_ty = arena.inst_data(gep.base()).ty().clone();
-    let mut address = ctx.put_value_in_reg(gep.base());
+    let analysis = analyze_gep(arena, inst, gep).unwrap_or_else(|error| {
+        ctx.lowering_panic(
+            "GEP analysis",
+            error,
+            Some(arena.inst_data(gep.base()).ty()),
+            Some(arena.inst_data(inst).ty()),
+        )
+    });
+    let pointer_ty = HirType::get_pointer(HirType::get_i32());
+    let mut address = ctx.put_value_in_reg(analysis.base);
 
-    for &index in gep.offsets() {
-        let element_ty = if current_ty.is_pointer() {
-            current_ty.derefernce()
+    for term in analysis.dynamic_terms {
+        let index = ctx.put_value_in_reg(term.index);
+        let next = ctx.alloc_tmp(pointer_ty.clone());
+        if let Some(shift) = extended_index_shift(term.stride) {
+            ctx.emit(MInst::AluRRRExtend {
+                op: AluOp::Add,
+                size: OperandSize::Size64,
+                dst: Writable::from_reg(next),
+                lhs: Gpr::Reg(address),
+                rhs: index,
+                extend: ExtendOp::Sxtw,
+                shift,
+            });
         } else {
-            current_ty.get_array_elem_ty()
-        };
-        let stride = element_ty.size() as i64;
-        current_ty = element_ty;
-
-        if let Some(value) = integer_constant(arena, index) {
-            let byte_offset = i64::from(value) * stride;
-            let next = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-            emit_add_offset(ctx, Writable::from_reg(next), address, byte_offset);
-            address = next;
-        } else {
-            if let Some(shift) = stride_shift(stride) {
-                let next = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                let index = ctx.put_value_in_reg(index);
-                ctx.emit(MInst::AluRRRExtend {
-                    op: AluOp::Add,
-                    size: OperandSize::Size64,
-                    dst: Writable::from_reg(next),
-                    lhs: Gpr::Reg(address),
-                    rhs: index,
-                    extend: ExtendOp::Sxtw,
-                    shift,
-                });
-                address = next;
-                continue;
-            }
-            // Indices are i32 in Raana IR. Sign-extend before the
-            // multiply so negative indices retain GEP semantics.
-            let zero = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+            let zero = ctx.alloc_tmp(pointer_ty.clone());
             ctx.emit(MInst::MovFromZero {
                 size: OperandSize::Size64,
                 dst: Writable::from_reg(zero),
             });
-            let extended = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-            let index = ctx.put_value_in_reg(index);
+            let extended = ctx.alloc_tmp(pointer_ty.clone());
             ctx.emit(MInst::AluRRRExtend {
                 op: AluOp::Add,
                 size: OperandSize::Size64,
@@ -408,42 +395,49 @@ fn lower_get_elem_ptr(
                 extend: ExtendOp::Sxtw,
                 shift: 0,
             });
-            let byte_offset = if stride == 1 {
-                extended
+            if term.stride.is_power_of_two() {
+                let shift = u8::try_from(term.stride.trailing_zeros())
+                    .expect("u64 trailing-zero count fits u8");
+                ctx.emit(MInst::AluRRRShift {
+                    op: AluOp::Add,
+                    size: OperandSize::Size64,
+                    dst: Writable::from_reg(next),
+                    lhs: RegOrZr::Reg(address),
+                    rhs: RegOrZr::Reg(extended),
+                    shift: ShiftOp::Lsl,
+                    amount: ImmShift::new(shift, OperandSize::Size64)
+                        .expect("u64 power-of-two shift is encodable"),
+                });
             } else {
-                let scale = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+                let stride = ctx.alloc_tmp(pointer_ty.clone());
                 ctx.emit(MInst::LoadImm {
                     size: OperandSize::Size64,
-                    dst: Writable::from_reg(scale),
-                    value: stride as u64,
+                    dst: Writable::from_reg(stride),
+                    value: term.stride,
                 });
-                let product = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-                ctx.emit(MInst::AluRRR {
-                    op: AluOp::Mul,
+                ctx.emit(MInst::MAdd {
                     size: OperandSize::Size64,
-                    dst: Writable::from_reg(product),
-                    lhs: RegOrZr::Reg(extended),
-                    rhs: RegOrZr::Reg(scale),
+                    dst: Writable::from_reg(next),
+                    lhs: extended,
+                    rhs: stride,
+                    addend: address,
                 });
-                product
-            };
-            let next = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-            ctx.emit(MInst::AluRRR {
-                op: AluOp::Add,
-                size: OperandSize::Size64,
-                dst: Writable::from_reg(next),
-                lhs: RegOrZr::Reg(address),
-                rhs: RegOrZr::Reg(byte_offset),
-            });
-            address = next;
+            }
         }
+        address = next;
     }
-    assert_eq!(&current_ty.reference(), arena.inst_data(inst).ty());
-    ctx.emit(MInst::Mov {
-        size: OperandSize::Size64,
-        dst,
-        src: address,
-    });
+
+    if analysis.constant_offset == 0 {
+        return LoweredOutput::Value(address);
+    }
+
+    let result = ctx.result_reg(inst);
+    emit_add_offset(
+        ctx,
+        Writable::from_reg(result),
+        address,
+        analysis.constant_offset,
+    );
     LoweredOutput::Value(result)
 }
 
@@ -1407,7 +1401,7 @@ fn fold_shifted_rhs(
     Some((ctx.put_value_in_reg(shift.lhs()), shift_op, amount))
 }
 
-fn stride_shift(stride: i64) -> Option<u8> {
+fn extended_index_shift(stride: u64) -> Option<u8> {
     match stride {
         1 => Some(0),
         2 => Some(1),

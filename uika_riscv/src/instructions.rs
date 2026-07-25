@@ -31,6 +31,10 @@ impl MachInst for MInst {
                 collector.reg_use(rs);
                 collector.reg_def(rd);
             }
+            MInst::Slli { rd, rs, .. } => {
+                collector.reg_use(rs);
+                collector.reg_def(rd);
+            }
             MInst::LoadImm { rd, .. } => {
                 collector.reg_def(rd);
             }
@@ -183,6 +187,13 @@ impl MachInstEmit for MInst {
                 ctx.write_reg(rs)?;
                 write!(ctx, ", {}", shamt.value())
             }
+            MInst::Slli { rd, rs, shamt } => {
+                write!(ctx, "slli ")?;
+                ctx.write_reg(&rd.reg)?;
+                write!(ctx, ", ")?;
+                ctx.write_reg(rs)?;
+                write!(ctx, ", {}", shamt.value())
+            }
             MInst::LoadImm { rd, value } => {
                 write!(ctx, "li ")?;
                 ctx.write_reg(&rd.reg)?;
@@ -327,6 +338,11 @@ pub enum MInst {
         rd: WritableReg,
         rs: Reg,
         shamt: ShiftImm,
+    },
+    Slli {
+        rd: WritableReg,
+        rs: Reg,
+        shamt: ShiftImm64,
     },
     LoadImm {
         rd: WritableReg,
@@ -474,6 +490,19 @@ pub struct ShiftImm(u8);
 impl ShiftImm {
     pub const fn new(value: u8) -> Option<Self> {
         if value < 32 { Some(Self(value)) } else { None }
+    }
+
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShiftImm64(u8);
+
+impl ShiftImm64 {
+    pub const fn new(value: u8) -> Option<Self> {
+        if value < 64 { Some(Self(value)) } else { None }
     }
 
     pub const fn value(self) -> u8 {
@@ -695,5 +724,23 @@ impl AMode {
             rs2: tmp2.to_reg(),
         });
         (AMode::RegOffest(tmp.to_reg(), 0), extra)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ShiftImm, ShiftImm64};
+
+    #[test]
+    fn shift_immediates_enforce_operand_width() {
+        assert!(ShiftImm::new(0).is_some());
+        assert!(ShiftImm::new(31).is_some());
+        assert!(ShiftImm::new(32).is_none());
+
+        assert!(ShiftImm64::new(0).is_some());
+        assert!(ShiftImm64::new(31).is_some());
+        assert!(ShiftImm64::new(32).is_some());
+        assert!(ShiftImm64::new(63).is_some());
+        assert!(ShiftImm64::new(64).is_none());
     }
 }

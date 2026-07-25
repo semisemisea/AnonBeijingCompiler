@@ -8,7 +8,7 @@ use crate::{
     abi::{DEFAULT_CLOBBERS, Riscv64ABI},
     instructions::{
         AMode, AluRRImm12OP, AluRRImmShiftOP, AluRRROP, FcvtMode, FpuRRROP, Imm12, LoadOP, MInst,
-        ShiftImm, StoreOP,
+        ShiftImm, ShiftImm64, StoreOP,
     },
     labels::Label,
     regs::{ARG_REG, FARG_REG, a0, a1, a2, fa0, fp_reg, preg_name, stack_reg, zero_reg},
@@ -18,7 +18,7 @@ use taki_mir::{
     abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::LoweredBlock,
     libcall::LibCall,
-    lower::{LowerBackend, LowerContext, LoweredOutput},
+    lower::{LowerBackend, LowerContext, LoweredOutput, analyze_gep},
     prelude::{ArenaContext, HirFunctionData, HirInst},
     reg_alloc::reg::PReg,
     register::{Reg, Writable},
@@ -255,14 +255,22 @@ fn lower_binary(
         } else {
             (lhs, rhs)
         };
-        ctx.emit(MInst::FpuRRR { op, rd, rs1, rs2 });
         if bop == BinaryOp::NotEq {
+            let equal = ctx.alloc_tmp(HirType::get_i32());
+            ctx.emit(MInst::FpuRRR {
+                op,
+                rd: Writable::from_reg(equal),
+                rs1,
+                rs2,
+            });
             ctx.emit(MInst::AluRRImm12 {
                 op: AluRRImm12OP::Xori,
                 rd,
-                rs: def,
+                rs: equal,
                 imm: Imm12::ONE,
             });
+        } else {
+            ctx.emit(MInst::FpuRRR { op, rd, rs1, rs2 });
         }
     } else {
         if bop == BinaryOp::Div && integer_constant(arena, binary.rhs()) == Some(1) {
@@ -282,30 +290,32 @@ fn lower_binary(
         let sub_op = alu_op_for_hir_binary(BinaryOp::Sub, inst_ty);
         match bop {
             BinaryOp::NotEq => {
+                let difference = ctx.alloc_tmp(HirType::get_i32());
                 ctx.emit(MInst::AluRRR {
                     op: sub_op,
-                    rd,
+                    rd: Writable::from_reg(difference),
                     rs1: lhs,
                     rs2: rhs,
                 });
                 ctx.emit(MInst::AluRRR {
                     op: AluRRROP::Snez,
                     rd,
-                    rs1: def,
+                    rs1: difference,
                     rs2: zero_reg(),
                 });
             }
             BinaryOp::Eq => {
+                let difference = ctx.alloc_tmp(HirType::get_i32());
                 ctx.emit(MInst::AluRRR {
                     op: sub_op,
-                    rd,
+                    rd: Writable::from_reg(difference),
                     rs1: lhs,
                     rs2: rhs,
                 });
                 ctx.emit(MInst::AluRRR {
                     op: AluRRROP::Seqz,
                     rd,
-                    rs1: def,
+                    rs1: difference,
                     rs2: zero_reg(),
                 });
             }
@@ -338,16 +348,17 @@ fn lower_binary(
                 } else {
                     (rhs, lhs)
                 };
+                let less = ctx.alloc_tmp(HirType::get_i32());
                 ctx.emit(MInst::AluRRR {
                     op: op.unwrap(),
-                    rd,
+                    rd: Writable::from_reg(less),
                     rs1,
                     rs2,
                 });
                 ctx.emit(MInst::AluRRImm12 {
                     op: AluRRImm12OP::Xori,
                     rd,
-                    rs: def,
+                    rs: less,
                     imm: Imm12::ONE,
                 });
             }
@@ -477,68 +488,97 @@ fn lower_get_elem_ptr(
     ctx: &mut LowerContext<'_, MInst>,
     arena: ArenaContext<'_>,
     inst: HirInst,
-    get_elem_ptr: &GetElemPtr,
+    gep: &GetElemPtr,
 ) -> LoweredOutput {
-    let src = get_elem_ptr.base();
-    let mut ty = arena.inst_data(src).ty().clone();
-    let rs = ctx.put_value_in_reg(src);
-    let def = ctx.result_reg(inst);
-    let rd = Writable::from_reg(def);
-    let acc = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-    let wacc = Writable::from_reg(acc);
-    ctx.emit(MInst::LoadImm { rd: wacc, value: 0 });
-    let mut acc = acc;
-    for &index in get_elem_ptr.offsets() {
-        let elem_size = if ty.is_pointer() {
-            let deref = ty.derefernce();
-            let size = deref.size();
-            ty = deref;
-            size
-        } else {
-            let (elem_ty, _len) = ty.get_array_info();
-            let size = elem_ty.size();
-            ty = elem_ty;
-            size
-        };
-        let factor = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-        ctx.emit(MInst::LoadImm {
-            rd: Writable::from_reg(factor),
-            value: elem_size as u64,
-        });
-        let rhs = ctx.put_value_in_reg(index);
-        let product = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+    let analysis = analyze_gep(arena, inst, gep).unwrap_or_else(|error| {
+        ctx.lowering_panic(
+            "GEP analysis",
+            error,
+            Some(arena.inst_data(gep.base()).ty()),
+            Some(arena.inst_data(inst).ty()),
+        )
+    });
+    let pointer_ty = HirType::get_pointer(HirType::get_i32());
+    let mut address = ctx.put_value_in_reg(analysis.base);
+
+    for term in analysis.dynamic_terms {
+        let index = ctx.put_value_in_reg(term.index);
+        let extended = ctx.alloc_tmp(pointer_ty.clone());
         ctx.emit(MInst::AluRRR {
-            op: AluRRROP::Mul,
-            rd: Writable::from_reg(product),
-            rs1: factor,
-            rs2: rhs,
+            op: AluRRROP::AddW,
+            rd: Writable::from_reg(extended),
+            rs1: index,
+            rs2: zero_reg(),
         });
-        let next_acc = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+
+        let scaled = if term.stride == 1 {
+            extended
+        } else if term.stride.is_power_of_two() {
+            let shift = u8::try_from(term.stride.trailing_zeros())
+                .expect("u64 trailing-zero count fits u8");
+            let scaled = ctx.alloc_tmp(pointer_ty.clone());
+            ctx.emit(MInst::Slli {
+                rd: Writable::from_reg(scaled),
+                rs: extended,
+                shamt: ShiftImm64::new(shift).expect("u64 power-of-two shift is encodable"),
+            });
+            scaled
+        } else {
+            let stride = ctx.alloc_tmp(pointer_ty.clone());
+            ctx.emit(MInst::LoadImm {
+                rd: Writable::from_reg(stride),
+                value: term.stride,
+            });
+            let scaled = ctx.alloc_tmp(pointer_ty.clone());
+            ctx.emit(MInst::AluRRR {
+                op: AluRRROP::Mul,
+                rd: Writable::from_reg(scaled),
+                rs1: extended,
+                rs2: stride,
+            });
+            scaled
+        };
+
+        let next = ctx.alloc_tmp(pointer_ty.clone());
         ctx.emit(MInst::AluRRR {
             op: AluRRROP::Add,
-            rd: Writable::from_reg(next_acc),
-            rs1: acc,
-            rs2: product,
+            rd: Writable::from_reg(next),
+            rs1: address,
+            rs2: scaled,
         });
-        acc = next_acc;
+        address = next;
     }
-    let final_ty = ty.reference();
-    assert_eq!(
-        final_ty,
-        *arena.inst_data(inst).ty(),
-        "GEP type mismatch for {:?}: computed={:?}, declared={:?}, base_idx={:?}",
-        inst,
-        final_ty,
-        arena.inst_data(inst).ty(),
-        get_elem_ptr.base(),
-    );
+
+    if analysis.constant_offset == 0 {
+        return LoweredOutput::Value(address);
+    }
+
+    let result = ctx.result_reg(inst);
+    if let Some(imm) = i32::try_from(analysis.constant_offset)
+        .ok()
+        .and_then(Imm12::from_i32)
+    {
+        ctx.emit(MInst::AluRRImm12 {
+            op: AluRRImm12OP::Addi,
+            rd: Writable::from_reg(result),
+            rs: address,
+            imm,
+        });
+        return LoweredOutput::Value(result);
+    }
+
+    let offset = ctx.alloc_tmp(pointer_ty);
+    ctx.emit(MInst::LoadImm {
+        rd: Writable::from_reg(offset),
+        value: analysis.constant_offset as u64,
+    });
     ctx.emit(MInst::AluRRR {
         op: AluRRROP::Add,
-        rd,
-        rs1: rs,
-        rs2: acc,
+        rd: Writable::from_reg(result),
+        rs1: address,
+        rs2: offset,
     });
-    LoweredOutput::Value(def)
+    LoweredOutput::Value(result)
 }
 
 fn lower_store(

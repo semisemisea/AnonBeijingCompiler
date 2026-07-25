@@ -24,6 +24,93 @@ pub enum LoweredOutput {
     Value(Reg),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GepDynamicTerm {
+    pub index: HirInst,
+    pub stride: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GepAddress {
+    pub base: HirInst,
+    pub constant_offset: i64,
+    pub dynamic_terms: SmallVec<[GepDynamicTerm; 4]>,
+}
+
+pub fn analyze_gep(
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    gep: &GetElemPtr,
+) -> Result<GepAddress, String> {
+    fn checked_size(ty: &HirType) -> Option<usize> {
+        match ty.kind() {
+            HirTypeKind::ArgList | HirTypeKind::Unit => Some(0),
+            HirTypeKind::Int32 | HirTypeKind::Float32 => Some(4),
+            HirTypeKind::Array(element, len) => checked_size(element)?.checked_mul(*len),
+            HirTypeKind::String | HirTypeKind::Pointer(_) | HirTypeKind::Function(_, _) => {
+                Some(core::mem::size_of::<*const ()>())
+            }
+        }
+    }
+
+    let mut current_ty = arena.inst_data(gep.base()).ty().clone();
+    let mut constant_offset = 0_i64;
+    let mut dynamic_terms = SmallVec::new();
+
+    for (position, &index) in gep.offsets().iter().enumerate() {
+        let index_ty = arena.inst_data(index).ty();
+        if !index_ty.is_i32() {
+            return Err(format!(
+                "GEP index {position} must be i32, received {index_ty}"
+            ));
+        }
+
+        current_ty = match current_ty.kind() {
+            HirTypeKind::Pointer(element) | HirTypeKind::Array(element, _) => element.clone(),
+            _ => {
+                return Err(format!(
+                    "GEP index {position} cannot traverse type {current_ty}"
+                ));
+            }
+        };
+
+        let stride = checked_size(&current_ty).ok_or_else(|| {
+            format!("GEP stride overflows for index {position} type {current_ty}")
+        })?;
+        let stride = u64::try_from(stride)
+            .map_err(|_| format!("GEP stride does not fit u64 for index {position}"))?;
+
+        if let HirInstKind::Integer(value) = arena.inst_data(index).kind() {
+            let stride = i64::try_from(stride)
+                .map_err(|_| format!("GEP constant stride does not fit i64 at index {position}"))?;
+            let contribution = i64::from(value.value())
+                .checked_mul(stride)
+                .ok_or_else(|| {
+                    format!("GEP constant multiplication overflows at index {position}")
+                })?;
+            constant_offset = constant_offset
+                .checked_add(contribution)
+                .ok_or_else(|| format!("GEP constant offset overflows at index {position}"))?;
+        } else {
+            dynamic_terms.push(GepDynamicTerm { index, stride });
+        }
+    }
+
+    let computed_ty = current_ty.reference();
+    let declared_ty = arena.inst_data(inst).ty();
+    if &computed_ty != declared_ty {
+        return Err(format!(
+            "GEP result type mismatch: computed {computed_ty}, declared {declared_ty}"
+        ));
+    }
+
+    Ok(GepAddress {
+        base: gep.base(),
+        constant_offset,
+        dynamic_terms,
+    })
+}
+
 /// A lowering context for a single function
 pub struct LowerContext<'prog, I: VCodeInst> {
     /// Arena to get everything you need about HirFunction
@@ -859,4 +946,50 @@ fn lowered_hir_block(lb: LoweredBlock) -> HirBasicBlock {
     lb.succ_block()
         .or_else(|| lb.orig_block())
         .expect("lowered successor has an HIR block")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GepDynamicTerm, analyze_gep};
+    use crate::prelude::ArenaContext;
+    use raana_ir::ir::{InstKind, Program, Type, arena::Arena, builder_trait::*};
+
+    #[test]
+    fn analyzes_mixed_multidimensional_gep() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "gep_analysis".to_owned(),
+            vec![Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let dynamic = data.params()[0];
+        let inner = Type::get_array(Type::get_i32(), 7);
+        let outer = Type::get_array(inner, 5);
+        let base = data.new_local_inst().alloc(outer);
+        let zero = data.new_local_inst().integer(0);
+        let three = data.new_local_inst().integer(3);
+        let gep = data
+            .new_local_inst()
+            .get_elem_ptr(base, vec![zero, dynamic, three]);
+
+        let arena = ArenaContext {
+            program: &program,
+            curr_func: Some(function),
+        };
+        let InstKind::GetElemPtr(gep_data) = arena.inst_data(gep).kind() else {
+            panic!("expected GEP instruction");
+        };
+        let analysis = analyze_gep(arena, gep, gep_data).unwrap();
+
+        assert_eq!(analysis.base, base);
+        assert_eq!(analysis.constant_offset, 12);
+        assert_eq!(
+            analysis.dynamic_terms.as_slice(),
+            &[GepDynamicTerm {
+                index: dynamic,
+                stride: 28,
+            }]
+        );
+    }
 }

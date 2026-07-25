@@ -247,7 +247,7 @@ impl ABIMachineSpec for Riscv64ABI {
         insts
     }
 
-    fn gen_jump(block: raana_ir::opt::prelude::BasicBlock) -> Self::I {
+    fn gen_jump(_block: raana_ir::opt::prelude::BasicBlock) -> Self::I {
         todo!()
     }
 

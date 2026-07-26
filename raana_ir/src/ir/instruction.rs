@@ -101,23 +101,26 @@ const LOCAL_ID_START_FROM: u32 = 0x00000001;
 
 const GLOBAL_ID_START_FROM: u32 = 0x40000000;
 
+/// Instruction storage handing out ids counting up from `START_ID`.
+///
+/// Local and global instructions live in arenas seeded from non-overlapping id
+/// ranges, so that [`Inst::is_global`] alone tells which arena owns an id. The
+/// seed is a const parameter so that the two aliases below stay distinct types.
 #[derive(Debug, Clone)]
-pub struct LocalInstArena {
+pub struct InstArena<const START_ID: u32> {
     data: HashMap<Inst, InstData>,
     next_id: u32,
 }
 
-#[derive(Debug, Clone)]
-pub struct GlobalInstArena {
-    data: HashMap<Inst, InstData>,
-    next_id: u32,
-}
+pub type LocalInstArena = InstArena<LOCAL_ID_START_FROM>;
 
-impl LocalInstArena {
-    pub fn new() -> LocalInstArena {
-        LocalInstArena {
+pub type GlobalInstArena = InstArena<GLOBAL_ID_START_FROM>;
+
+impl<const START_ID: u32> InstArena<START_ID> {
+    pub fn new() -> Self {
+        Self {
             data: HashMap::new(),
-            next_id: LOCAL_ID_START_FROM,
+            next_id: START_ID,
         }
     }
 
@@ -142,42 +145,6 @@ impl LocalInstArena {
 
     pub fn insert(&mut self, inst: Inst, new_data: InstData) {
         self.data.insert(inst, new_data);
-    }
-
-    pub fn datas(&self) -> std::collections::hash_map::Iter<'_, Inst, InstData> {
-        self.data.iter()
-    }
-}
-
-impl GlobalInstArena {
-    pub fn new() -> GlobalInstArena {
-        GlobalInstArena {
-            data: HashMap::new(),
-            next_id: GLOBAL_ID_START_FROM,
-        }
-    }
-
-    pub fn alloc(&mut self, data: InstData) -> Inst {
-        let inst = Inst(NonZeroU32::new(self.next_id).unwrap());
-        self.next_id += 1;
-        self.data.insert(inst, data);
-        inst
-    }
-
-    pub fn data_of(&self, inst: Inst) -> &InstData {
-        self.data.get(&inst).unwrap()
-    }
-
-    pub fn mut_data_of(&mut self, inst: Inst) -> &mut InstData {
-        self.data.get_mut(&inst).unwrap()
-    }
-
-    pub fn remove(&mut self, inst: Inst) -> InstData {
-        self.data.remove(&inst).unwrap()
-    }
-
-    pub fn insert(&mut self, inst: Inst, data: InstData) {
-        self.data.insert(inst, data);
     }
 
     pub fn datas(&self) -> std::collections::hash_map::Iter<'_, Inst, InstData> {

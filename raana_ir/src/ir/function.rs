@@ -1,4 +1,7 @@
-use std::num::NonZeroU32;
+use tomori_utils::{
+    PrimaryMap, entity_impl,
+    iter::{Iter, IterMut, Keys},
+};
 
 use crate::ir::{
     arena::{Arena, LocalArena},
@@ -160,51 +163,41 @@ impl FunctionData {
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub struct Function(NonZeroU32);
-// pub type Function = NonZeroU32;
+pub struct Function(u32);
+entity_impl!(Function);
 
 pub struct FunctionArena {
-    data: Vec<FunctionData>,
+    data: PrimaryMap<Function, FunctionData>,
 }
 
 impl FunctionArena {
     pub fn new() -> FunctionArena {
-        FunctionArena { data: Vec::new() }
+        FunctionArena {
+            data: PrimaryMap::new(),
+        }
     }
 
     pub fn data_of(&self, func: Function) -> &FunctionData {
-        &self.data[(func.0.get() - 1) as usize]
+        &self.data[func]
     }
 
     pub fn mut_data_of(&mut self, func: Function) -> &mut FunctionData {
-        &mut self.data[(func.0.get() - 1) as usize]
+        &mut self.data[func]
     }
 
     pub fn alloc(&mut self, func_data: FunctionData) -> Function {
-        let id = (self.data.len() + 1) as u32;
-        self.data.push(func_data);
-        Function(NonZeroU32::new(id).unwrap())
+        self.data.push(func_data)
     }
 
-    pub fn functions(&self) -> impl Iterator<Item = (Function, &FunctionData)> {
-        self.data.iter().enumerate().map(|(i, data)| {
-            (
-                unsafe { Function(NonZeroU32::new_unchecked(i as u32 + 1)) },
-                data,
-            )
-        })
+    pub fn functions(&self) -> Iter<'_, Function, FunctionData> {
+        self.data.iter()
     }
 
-    pub fn functions_mut(&mut self) -> impl Iterator<Item = (Function, &mut FunctionData)> {
-        self.data.iter_mut().enumerate().map(|(i, data)| {
-            (
-                unsafe { Function(NonZeroU32::new_unchecked(i as u32 + 1)) },
-                data,
-            )
-        })
+    pub fn functions_mut(&mut self) -> IterMut<'_, Function, FunctionData> {
+        self.data.iter_mut()
     }
 
-    pub fn funcs(&self) -> impl Iterator<Item = Function> + use<> {
-        (1..=self.data.len() as u32).map(|n| Function(NonZeroU32::new(n).unwrap()))
+    pub fn funcs(&self) -> Keys<Function> {
+        self.data.keys()
     }
 }

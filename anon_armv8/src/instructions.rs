@@ -4,7 +4,6 @@ use taki_mir::{
     abi::{CallArgPair, CallRetPair, RetPair, StackAMode},
     reg_alloc::reg::{OperandVisitor, OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
-    types::{F32, I32, I64, LoweredType},
     vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
 };
 
@@ -893,14 +892,6 @@ impl MachInst for MInst {
             | Self::CondBr { .. }
             | Self::Jump { .. } => MachTerminator::Branch,
             _ => MachTerminator::None,
-        }
-    }
-    fn rc_for_type(ty: LoweredType) -> (&'static [RegClass], &'static [LoweredType]) {
-        match ty {
-            I32 => (&[RegClass::Int], &[I32]),
-            I64 => (&[RegClass::Int], &[I64]),
-            F32 => (&[RegClass::Float], &[F32]),
-            _ => unreachable!("unsupported AArch64 lowered type"),
         }
     }
     fn gen_jump(target: taki_mir::block_order::MirBlockIndex) -> Self {

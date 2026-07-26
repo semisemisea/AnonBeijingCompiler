@@ -4,14 +4,15 @@ use raana_ir::ir::{
     Binary, BinaryOp, Call, Cast, GetElemPtr, InstKind, Load, Return, Select, Store, Type as HirType,
     TypeKind, arena::Arena, inst_kind::MemZero,
 };
+use raana_ir::opt::utils::{integer_constant, signed_power_of_two};
 use taki_mir::{
     abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
-    block_order::{LoweredBlock, MirBlockIndex},
+    block_order::MirBlockIndex,
     div_magic::{MagicCorrection, signed_magic_i32},
     lower::{LowerBackend, LowerContext, LoweredOutput, analyze_gep},
-    prelude::{ArenaContext, HirFunctionData, HirInst},
+    prelude::{ArenaContext, HirInst},
     reg_alloc::reg::PReg,
-    register::Writable,
+    register::{Reg, Writable},
     vcode::MachInst,
 };
 
@@ -101,7 +102,7 @@ fn lower_binary(
         return LoweredOutput::Value(result);
     }
     let lhs = ctx.put_value_in_reg(binary.lhs());
-    let rhs_imm = integer_constant(arena, binary.rhs());
+    let rhs_imm = integer_constant(&arena, binary.rhs());
 
     if binary.op() == BinaryOp::Div && rhs_imm == Some(1) {
         return LoweredOutput::Value(lhs);
@@ -119,7 +120,7 @@ fn lower_binary(
 
     match binary.op() {
         BinaryOp::Add | BinaryOp::Sub => {
-            if binary.op() == BinaryOp::Add && integer_constant(arena, binary.lhs()) == Some(0) {
+            if binary.op() == BinaryOp::Add && integer_constant(&arena, binary.lhs()) == Some(0) {
                 let rhs = ctx.put_value_in_reg(binary.rhs());
                 ctx.emit(MInst::Mov {
                     size,
@@ -133,7 +134,7 @@ fn lower_binary(
                     src: lhs,
                 });
             } else if binary.op() == BinaryOp::Sub
-                && integer_constant(arena, binary.lhs()) == Some(0)
+                && integer_constant(&arena, binary.lhs()) == Some(0)
             {
                 let rhs = ctx.put_value_in_reg(binary.rhs());
                 ctx.emit(MInst::AluRRR {
@@ -175,7 +176,7 @@ fn lower_binary(
             }
         }
         BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
-            let lhs_imm = integer_constant(arena, binary.lhs());
+            let lhs_imm = integer_constant(&arena, binary.lhs());
             if binary.op() == BinaryOp::And && (lhs_imm == Some(0) || rhs_imm == Some(0)) {
                 ctx.emit(MInst::MovFromZero { size, dst });
             } else if matches!(binary.op(), BinaryOp::Or | BinaryOp::Xor) && lhs_imm == Some(0) {
@@ -501,7 +502,7 @@ fn lower_select(
             let size = operand_size(lhs_ty);
             let lhs = ctx.put_value_in_reg(binary.lhs());
             let cmp = if let Some(imm) =
-                integer_constant(arena, binary.rhs()).and_then(positive_imm12)
+                integer_constant(&arena, binary.rhs()).and_then(positive_imm12)
             {
                 SelectCmp::IntImm { size, lhs, imm }
             } else {
@@ -512,7 +513,7 @@ fn lower_select(
                 }
             };
             let cond = comparison_cond(binary.op());
-            (cmp, if invert { invert_cond(cond) } else { cond })
+            (cmp, if invert { cond.invert() } else { cond })
         }
     } else {
         (
@@ -527,8 +528,8 @@ fn lower_select(
 
     let result = ctx.result_reg(inst);
     let dst = Writable::from_reg(result);
-    let true_constant = integer_constant(arena, select.if_true());
-    let false_constant = integer_constant(arena, select.if_false());
+    let true_constant = integer_constant(&arena, select.if_true());
+    let false_constant = integer_constant(&arena, select.if_false());
     let (cond, value) = if matches!(result_ty, TypeKind::Int32)
         && true_constant == Some(1)
         && false_constant == Some(0)
@@ -538,7 +539,7 @@ fn lower_select(
         && true_constant == Some(0)
         && false_constant == Some(1)
     {
-        (invert_cond(cond), SelectValue::Bool { dst })
+        (cond.invert(), SelectValue::Bool { dst })
     } else {
         let if_true = ctx.put_value_in_reg(select.if_true());
         let if_false = ctx.put_value_in_reg(select.if_false());
@@ -577,10 +578,10 @@ fn select_comparison(
         return None;
     };
 
-    if is_comparison(outer.op()) {
+    if outer.op().is_compare() {
         if let Some((inner_inst, is_eq)) = zero_comparison(arena, outer) {
             if let InstKind::Binary(inner) = arena.inst_data(inner_inst).kind() {
-                if is_comparison(inner.op())
+                if inner.op().is_compare()
                     && has_only_user(ctx, inner_inst, cond)
                     && ctx.sink_pure_single_use_chain(inner_inst, cond, inst)
                 {
@@ -600,56 +601,36 @@ fn lower_mem_zero(
     arena: ArenaContext<'_>,
     mem_zero: &MemZero,
 ) -> LoweredOutput {
-    let inline_store_count = mem_zero.byte_len() / 4;
+    // Both expansions need the destination as a pointer register: an `Alloc`
+    // names a frame slot whose address is materialized here, anything else is
+    // already a pointer value.
+    let dest_inst = mem_zero.dest();
+    let dest = if let InstKind::Alloc = arena.inst_data(dest_inst).kind() {
+        let pointee = arena.inst_data(dest_inst).ty().derefernce();
+        let offset = i64::from(ctx.alloc_stackslot_or_get(dest_inst, pointee));
+        let dest = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+        ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
+            StackAMode::Slot(offset),
+            Writable::from_reg(dest),
+        ));
+        dest
+    } else {
+        ctx.put_value_in_reg(dest_inst)
+    };
+
     if runtime::mem_zero_is_inline(mem_zero.byte_len()) {
-        let alloc = matches!(arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
-            .then_some(mem_zero.dest());
-        let (dest, stack_offset) = if let Some(alloc) = alloc {
-            let pointee = arena.inst_data(alloc).ty().derefernce();
-            let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
-            (
-                ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
-                Some(offset),
-            )
-        } else {
-            (ctx.put_value_in_reg(mem_zero.dest()), None)
-        };
         let zero = ctx.alloc_tmp(HirType::get_i32());
-        if let Some(offset) = stack_offset {
-            ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
-                StackAMode::Slot(offset),
-                Writable::from_reg(dest),
-            ));
-        }
         ctx.emit(MInst::MovFromZero {
             size: OperandSize::Size32,
             dst: Writable::from_reg(zero),
         });
-        for index in 0..inline_store_count {
+        for index in 0..mem_zero.byte_len() / 4 {
             emit_store_at(ctx, zero, &HirType::get_i32(), dest, (index * 4) as i64);
         }
         return LoweredOutput::None;
     }
 
-    let alloc = matches!(arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
-        .then_some(mem_zero.dest());
-    let (dest, stack_offset) = if let Some(alloc) = alloc {
-        let pointee = arena.inst_data(alloc).ty().derefernce();
-        let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
-        (
-            ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
-            Some(offset),
-        )
-    } else {
-        (ctx.put_value_in_reg(mem_zero.dest()), None)
-    };
     let byte_len = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-    if let Some(offset) = stack_offset {
-        ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
-            StackAMode::Slot(offset),
-            Writable::from_reg(dest),
-        ));
-    }
     ctx.emit(MInst::LoadImm {
         size: OperandSize::Size64,
         dst: Writable::from_reg(byte_len),
@@ -681,80 +662,19 @@ fn lower_call(
     inst: HirInst,
     call: &Call,
 ) -> LoweredOutput {
-    let mut args = Vec::new();
-    let (mut int_index, mut float_index, mut stack_offset) = (0usize, 0usize, 0i64);
-    for &arg in call.args() {
-        let src = ctx.put_value_in_reg(arg);
-        match arena.inst_data(arg).ty().kind() {
-            TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => {
-                if let Some(&preg) = regs::INT_ARG_REGS.get(int_index) {
-                    args.push(CallArgPair { vreg: src, preg });
-                    int_index += 1;
-                } else {
-                    ctx.emit(MInst::Store {
-                        ty: memory_type(arena.inst_data(arg).ty().kind()),
-                        src,
-                        addr: AMode::OutgoingArg(stack_offset),
-                    });
-                    int_index += 1;
-                    stack_offset += 8;
-                }
-            }
-            TypeKind::Float32 => {
-                if let Some(&preg) = regs::FLOAT_ARG_REGS.get(float_index) {
-                    args.push(CallArgPair { vreg: src, preg });
-                    float_index += 1;
-                } else {
-                    ctx.emit(MInst::Store {
-                        ty: MemoryType::F32,
-                        src,
-                        addr: AMode::OutgoingArg(stack_offset),
-                    });
-                    float_index += 1;
-                    stack_offset += 8;
-                }
-            }
-            ty => {
-                ctx.lowering_panic(
-                    "AArch64 instruction selection",
-                    format!("call argument type {ty:?} is unsupported"),
-                    Some(arena.inst_data(arg).ty()),
-                    None,
-                );
-            }
-        }
-    }
-    let result = (!arena.inst_data(inst).ty().is_unit()).then(|| ctx.result_reg(inst));
-    let ret = match arena.inst_data(inst).ty().kind() {
-        TypeKind::Unit => None,
-        TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => Some(CallRetPair {
-            vreg: Writable::from_reg(result.unwrap()),
-            preg: regs::INT_RETURN_REG,
-        }),
-        TypeKind::Float32 => Some(CallRetPair {
-            vreg: Writable::from_reg(result.unwrap()),
-            preg: regs::FLOAT_RETURN_REG,
-        }),
-        ty => {
-            ctx.lowering_panic(
-                "AArch64 instruction selection",
-                format!("call return type {ty:?} is unsupported"),
-                None,
-                Some(arena.inst_data(inst).ty()),
-            );
-        }
-    };
+    let args = ctx.lower_call_args(call.args());
+    let result_ty = arena.inst_data(inst).ty();
+    let result = (!result_ty.is_unit()).then(|| ctx.result_reg(inst));
+    let ret = <AArch64Abi as ABIMachineSpec>::ret_reg_for_type(result_ty).map(|preg| CallRetPair {
+        vreg: Writable::from_reg(result.unwrap()),
+        preg: Reg::from_physical_reg(preg),
+    });
     ctx.emit(MInst::Call {
         args,
         ret,
         clobbers: regs::DEFAULT_CLOBBERS,
         label: Label::from_function(call.callee()),
     });
-    ctx.vcode.vcode.abi.set_has_calls();
-    ctx.vcode
-        .vcode
-        .abi
-        .set_outgoing_arg_size(stack_offset as usize);
     result.map_or(LoweredOutput::None, LoweredOutput::Value)
 }
 
@@ -765,20 +685,13 @@ fn lower_return(
 ) -> LoweredOutput {
     if let Some(value) = ret.value() {
         let src = ctx.put_value_in_reg(value);
-        let preg = match arena.inst_data(value).ty().kind() {
-            TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => regs::INT_RETURN_REG,
-            TypeKind::Float32 => regs::FLOAT_RETURN_REG,
-            ty => {
-                ctx.lowering_panic(
-                    "AArch64 instruction selection",
-                    format!("return type {ty:?} is unsupported"),
-                    Some(arena.inst_data(value).ty()),
-                    None,
-                );
-            }
-        };
+        let preg = <AArch64Abi as ABIMachineSpec>::ret_reg_for_type(arena.inst_data(value).ty())
+            .expect("a returned value occupies a return register");
         ctx.emit(MInst::RetVal {
-            pair: RetPair { vreg: src, preg },
+            pair: RetPair {
+                vreg: src,
+                preg: Reg::from_physical_reg(preg),
+            },
         });
     }
     ctx.emit(MInst::Ret);
@@ -867,54 +780,8 @@ impl LowerBackend for AArch64Backend {
         }
     }
 
-    fn data_section_directive() -> &'static str {
-        ".section .data"
-    }
-
-    fn bss_section_directive() -> &'static str {
-        ".section .bss"
-    }
-
-    fn text_section_directive() -> &'static str {
-        ".section .text"
-    }
-
-    fn global_directive() -> &'static str {
-        ".globl"
-    }
-
-    fn word_directive() -> &'static str {
-        ".word"
-    }
-
-    fn zero_directive() -> &'static str {
-        ".zero"
-    }
-
     fn preg_name(preg: PReg) -> &'static str {
         regs::preg_name(preg)
-    }
-
-    fn format_block_label(lb: &LoweredBlock, func_data: &HirFunctionData) -> String {
-        let function = func_data.name().replace('%', "_");
-        match lb {
-            LoweredBlock::Orig { block } => {
-                format!(
-                    ".L_{function}_{}",
-                    func_data.bb_data(*block).name().replace('%', "_")
-                )
-            }
-            LoweredBlock::Edge {
-                pred,
-                succ,
-                succ_idx,
-            } => format!(
-                ".L_{function}_{}_to_{}_edge_{}",
-                func_data.bb_data(*pred).name().replace('%', "_"),
-                func_data.bb_data(*succ).name().replace('%', "_"),
-                succ_idx
-            ),
-        }
     }
 
     fn emit_long_jump(ctx: &mut LowerContext<Self::MInst>, target: MirBlockIndex) {
@@ -940,7 +807,7 @@ fn select_branch_condition(
     let InstKind::Binary(outer) = arena.inst_data(cond).kind() else {
         return false;
     };
-    if !is_comparison(outer.op()) || !has_only_user(ctx, cond, branch) {
+    if !outer.op().is_compare() || !has_only_user(ctx, cond, branch) {
         return false;
     }
 
@@ -951,7 +818,7 @@ fn select_branch_condition(
     let zero_outer = zero_comparison(arena, outer);
     if let Some((value, is_eq)) = zero_outer {
         if let InstKind::Binary(inner) = arena.inst_data(value).kind() {
-            if is_comparison(inner.op()) && has_only_user(ctx, value, cond) {
+            if inner.op().is_compare() && has_only_user(ctx, value, cond) {
                 // Claim the leaf first: a rejection must leave the outer
                 // condition available for the conservative fallback.
                 if !ctx.sink_pure_single_use_producer(value, cond)
@@ -1051,9 +918,9 @@ fn zero_comparison(arena: ArenaContext<'_>, binary: &Binary) -> Option<(HirInst,
         BinaryOp::NotEq => false,
         _ => return None,
     };
-    if integer_constant(arena, binary.lhs()) == Some(0) {
+    if integer_constant(&arena, binary.lhs()) == Some(0) {
         Some((binary.rhs(), is_eq))
-    } else if integer_constant(arena, binary.rhs()) == Some(0) {
+    } else if integer_constant(&arena, binary.rhs()) == Some(0) {
         Some((binary.lhs(), is_eq))
     } else {
         None
@@ -1073,10 +940,10 @@ fn single_bit_mask(
     {
         return None;
     }
-    let (value, mask) = if let Some(mask) = integer_constant(arena, and.lhs()) {
+    let (value, mask) = if let Some(mask) = integer_constant(&arena, and.lhs()) {
         (and.rhs(), mask)
     } else {
-        (and.lhs(), integer_constant(arena, and.rhs())?)
+        (and.lhs(), integer_constant(&arena, and.rhs())?)
     };
     let mask = u32::try_from(mask).ok()?;
     if mask.count_ones() != 1 || !matches!(arena.inst_data(value).ty().kind(), TypeKind::Int32) {
@@ -1101,7 +968,7 @@ fn emit_comparison_branch(
     } else {
         let size = operand_size(lhs_ty);
         let lhs = ctx.put_value_in_reg(binary.lhs());
-        if let Some(imm) = integer_constant(arena, binary.rhs()).and_then(positive_imm12) {
+        if let Some(imm) = integer_constant(&arena, binary.rhs()).and_then(positive_imm12) {
             ctx.emit(MInst::CmpImm { size, lhs, imm });
         } else {
             let rhs = ctx.put_value_in_reg(binary.rhs());
@@ -1122,7 +989,7 @@ fn emit_comparison_branch(
             if float_comparison {
                 invert_float_comparison_cond(binary.op())
             } else {
-                invert_cond(cond)
+                cond.invert()
             }
         } else {
             cond
@@ -1153,32 +1020,6 @@ fn emit_float_zero_branch(
     });
 }
 
-fn is_comparison(op: BinaryOp) -> bool {
-    matches!(
-        op,
-        BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Gt | BinaryOp::Lt | BinaryOp::Ge | BinaryOp::Le
-    )
-}
-
-fn invert_cond(cond: Cond) -> Cond {
-    match cond {
-        Cond::Eq => Cond::Ne,
-        Cond::Ne => Cond::Eq,
-        Cond::Hs => Cond::Lo,
-        Cond::Lo => Cond::Hs,
-        Cond::Mi => Cond::Pl,
-        Cond::Pl => Cond::Mi,
-        Cond::Vs => Cond::Vc,
-        Cond::Vc => Cond::Vs,
-        Cond::Hi => Cond::Ls,
-        Cond::Ls => Cond::Hi,
-        Cond::Ge => Cond::Lt,
-        Cond::Lt => Cond::Ge,
-        Cond::Gt => Cond::Le,
-        Cond::Le => Cond::Gt,
-    }
-}
-
 fn invert_float_comparison_cond(op: BinaryOp) -> Cond {
     match op {
         BinaryOp::Eq => Cond::Ne,
@@ -1192,23 +1033,6 @@ fn invert_float_comparison_cond(op: BinaryOp) -> Cond {
         BinaryOp::Le => Cond::Hi,
         _ => unreachable!("binary operation is not a floating comparison"),
     }
-}
-
-fn integer_constant(arena: ArenaContext<'_>, inst: HirInst) -> Option<i32> {
-    match arena.inst_data(inst).kind() {
-        InstKind::Integer(value) => Some(value.value()),
-        _ => None,
-    }
-}
-
-fn signed_power_of_two(value: i32) -> Option<(u8, bool)> {
-    if value == 0 {
-        return None;
-    }
-    let magnitude = value.unsigned_abs();
-    magnitude
-        .is_power_of_two()
-        .then(|| (magnitude.trailing_zeros() as u8, value.is_negative()))
 }
 
 fn lower_signed_div_rem_power_of_two(
@@ -1512,7 +1336,7 @@ fn fold_shifted_rhs(
         BinaryOp::Sar => ShiftOp::Asr,
         _ => return None,
     };
-    let amount = integer_constant(arena, shift.rhs())
+    let amount = integer_constant(&arena, shift.rhs())
         .and_then(|value| u8::try_from(value).ok())
         .and_then(|value| ImmShift::new(value, size))?;
     if !ctx.sink_pure_single_use_producer(rhs, consumer) {
@@ -1792,7 +1616,6 @@ fn float_comparison_cond(op: BinaryOp) -> Cond {
 
 #[cfg(test)]
 mod tests {
-    use super::signed_power_of_two;
     use crate::instructions::MInst;
     use raana_ir::ir::{BinaryOp, Program, Type};
     use taki_mir::{
@@ -1963,54 +1786,5 @@ mod tests {
 
         let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
         assert!(assembly.contains("sdiv"), "{assembly}");
-    }
-
-    #[test]
-    fn classifies_signed_power_of_two_divisors() {
-        assert_eq!(signed_power_of_two(0), None);
-        assert_eq!(signed_power_of_two(1), Some((0, false)));
-        assert_eq!(signed_power_of_two(-1), Some((0, true)));
-        assert_eq!(signed_power_of_two(2), Some((1, false)));
-        assert_eq!(signed_power_of_two(-2), Some((1, true)));
-        assert_eq!(signed_power_of_two(1 << 30), Some((30, false)));
-        assert_eq!(signed_power_of_two(-(1 << 30)), Some((30, true)));
-        assert_eq!(signed_power_of_two(i32::MIN), Some((31, true)));
-        assert_eq!(signed_power_of_two(3), None);
-        assert_eq!(signed_power_of_two(-3), None);
-    }
-
-    #[test]
-    fn signed_power_of_two_formula_truncates_toward_zero() {
-        let dividends = [i32::MIN, -17, -9, -8, -7, -1, 0, 1, 7, 8, 9, 17, i32::MAX];
-        let divisors = [1, -1, 2, -2, 4, -4, 8, -8, 1 << 30, -(1 << 30), i32::MIN];
-
-        for dividend in dividends {
-            for divisor in divisors {
-                let (shift, negate) = signed_power_of_two(divisor).unwrap();
-                let positive_quotient = if shift == 0 {
-                    dividend
-                } else {
-                    let sign = dividend >> 31;
-                    let bias = ((sign as u32) >> (32 - shift)) as i32;
-                    dividend.wrapping_add(bias) >> shift
-                };
-                let quotient = if negate {
-                    positive_quotient.wrapping_neg()
-                } else {
-                    positive_quotient
-                };
-                let remainder =
-                    dividend.wrapping_sub(positive_quotient.wrapping_shl(u32::from(shift)));
-
-                let expected_quotient = if dividend == i32::MIN && divisor == -1 {
-                    i32::MIN
-                } else {
-                    dividend / divisor
-                };
-                let expected_remainder = if divisor == -1 { 0 } else { dividend % divisor };
-                assert_eq!(quotient, expected_quotient, "{dividend} / {divisor}");
-                assert_eq!(remainder, expected_remainder, "{dividend} % {divisor}");
-            }
-        }
     }
 }

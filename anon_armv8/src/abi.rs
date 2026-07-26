@@ -207,6 +207,18 @@ impl ABIMachineSpec for AArch64Abi {
         (slots, stack_offset)
     }
 
+    fn ret_reg_for_type(ty: &taki_mir::prelude::HirType) -> Option<PReg> {
+        use raana_ir::ir::TypeKind;
+
+        let reg = match ty.kind() {
+            TypeKind::Unit => return None,
+            TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => regs::INT_RETURN_REG,
+            TypeKind::Float32 => regs::FLOAT_RETURN_REG,
+            kind => unreachable!("non-scalar AAPCS64 return value: {kind:?}"),
+        };
+        Some(reg.to_physical_reg().unwrap())
+    }
+
     fn get_machine_env() -> &'static MachineEnv {
         regs::machine_env()
     }

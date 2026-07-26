@@ -5,9 +5,6 @@ pub struct DeadCodeElimination;
 pub struct UnreachableBasicBlock;
 pub struct JumpOnlyElimination;
 
-#[allow(dead_code)]
-const REMOVE_FLAG: bool = true;
-
 /// Mark and sweep algorithm
 /// To start the process, we mark all the useful instructions, including:
 /// I/O

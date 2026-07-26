@@ -260,38 +260,20 @@ impl ABIMachineSpec for AArch64Abi {
         insts
     }
 
-    fn gen_clobber_save(frame: &FrameLayout) -> SmallVec<[MInst; 16]> {
-        let mut insts = smallvec![];
-        let base = i64::from(frame.total_size - frame.setup_area_size);
-        for (index, preg) in frame.callee_saved.iter().enumerate() {
-            insts.push(MInst::Store {
-                ty: if preg.class() == RegClass::Float {
-                    MemoryType::F64
-                } else {
-                    MemoryType::I64
-                },
-                src: Reg::from_physical_reg(*preg),
-                addr: AMode::SpOffset(base - (index as i64 + 1) * 8),
-            });
-        }
-        insts
+    fn gen_callee_save_store(preg: PReg, offset: i64) -> SmallVec<[MInst; 4]> {
+        smallvec![MInst::Store {
+            ty: callee_save_type(preg),
+            src: Reg::from_physical_reg(preg),
+            addr: AMode::SpOffset(offset),
+        }]
     }
 
-    fn gen_clobber_restore(frame: &FrameLayout) -> SmallVec<[MInst; 16]> {
-        let mut insts = smallvec![];
-        let base = i64::from(frame.total_size - frame.setup_area_size);
-        for (index, preg) in frame.callee_saved.iter().enumerate() {
-            insts.push(MInst::Load {
-                ty: if preg.class() == RegClass::Float {
-                    MemoryType::F64
-                } else {
-                    MemoryType::I64
-                },
-                dst: Writable::from_reg(Reg::from_physical_reg(*preg)),
-                addr: AMode::SpOffset(base - (index as i64 + 1) * 8),
-            });
-        }
-        insts
+    fn gen_callee_save_load(preg: PReg, offset: i64) -> SmallVec<[MInst; 4]> {
+        smallvec![MInst::Load {
+            ty: callee_save_type(preg),
+            dst: Writable::from_reg(Reg::from_physical_reg(preg)),
+            addr: AMode::SpOffset(offset),
+        }]
     }
 
     fn legalize_inst(frame: &FrameLayout, inst: MInst) -> SmallVec<[MInst; 4]> {
@@ -347,6 +329,16 @@ fn operand_size(ty: LoweredType) -> OperandSize {
         OperandSize::Size64
     }
 }
+
+/// Callee-saves occupy a whole eight-byte frame word regardless of class.
+fn callee_save_type(preg: PReg) -> MemoryType {
+    if preg.class() == RegClass::Float {
+        MemoryType::F64
+    } else {
+        MemoryType::I64
+    }
+}
+
 fn memory_type(ty: LoweredType) -> MemoryType {
     if ty == F32 {
         MemoryType::F32

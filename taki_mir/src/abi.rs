@@ -8,7 +8,7 @@ use tomori_utils::{PrimaryMap, SecondaryMap, entity_impl};
 use crate::prelude::*;
 use crate::reg_alloc::reg::{MachineEnv, PReg, RegClass, SpillSlot};
 use crate::register::{Reg, Writable};
-use crate::types::LoweredType;
+use crate::types::{F32, I64, LoweredType};
 use crate::vcode::VCodeInst;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +62,17 @@ pub trait ABIMachineSpec {
 
     /// Physical byte width of one logical allocator spill unit.
     fn spill_unit_bytes() -> u32;
+
+    /// Machine type for a raw copy of a whole register of `class`, as needed by
+    /// allocator edits that carry no type information. Spill slots are
+    /// eight-byte units, so the integer width also preserves f32 values (see
+    /// `gen_stack_to_stack_move`).
+    fn ty_for_regclass(class: RegClass) -> LoweredType {
+        match class {
+            RegClass::Float => F32,
+            _ => I64,
+        }
+    }
 
     fn is_callee_saved(_preg: PReg) -> bool;
 
@@ -135,9 +146,29 @@ pub trait ABIMachineSpec {
 
     fn gen_epilogue_frame_restore(frame: &FrameLayout) -> SmallVec<[Self::I; 16]>;
 
-    fn gen_clobber_save(frame: &FrameLayout) -> SmallVec<[Self::I; 16]>;
+    /// Preserve one callee-saved register at `offset` bytes from the
+    /// post-prologue stack pointer. Backends choose only the access width.
+    fn gen_callee_save_store(_preg: PReg, _offset: i64) -> SmallVec<[Self::I; 4]> {
+        panic!("target does not implement callee-save spills")
+    }
 
-    fn gen_clobber_restore(frame: &FrameLayout) -> SmallVec<[Self::I; 16]>;
+    fn gen_callee_save_load(_preg: PReg, _offset: i64) -> SmallVec<[Self::I; 4]> {
+        panic!("target does not implement callee-save reloads")
+    }
+
+    fn gen_clobber_save(frame: &FrameLayout) -> SmallVec<[Self::I; 16]> {
+        frame
+            .callee_save_slots(Self::word_bytes())
+            .flat_map(|(preg, offset)| Self::gen_callee_save_store(preg, offset))
+            .collect()
+    }
+
+    fn gen_clobber_restore(frame: &FrameLayout) -> SmallVec<[Self::I; 16]> {
+        frame
+            .callee_save_slots(Self::word_bytes())
+            .flat_map(|(preg, offset)| Self::gen_callee_save_load(preg, offset))
+            .collect()
+    }
 
     /// Expand frame-dependent pseudo addressing after allocation. Implementations
     /// must use only `MachineEnv::post_ra_scratch_by_class` registers.
@@ -186,6 +217,19 @@ impl FrameLayout {
             "spill slot {slot} is outside the spill region"
         );
         i64::try_from(offset).expect("spill offset exceeds signed address range")
+    }
+
+    /// Each callee-saved register paired with its frame offset. The clobber area
+    /// grows downward from the base of the setup area, one `word_bytes` slot per
+    /// register in `callee_saved` order; `compute_frame_layout` sizes
+    /// `clobber_size` from the same word width.
+    pub fn callee_save_slots(&self, word_bytes: u32) -> impl Iterator<Item = (PReg, i64)> + '_ {
+        let base = i64::from(self.total_size) - i64::from(self.setup_area_size);
+        let word = i64::from(word_bytes);
+        self.callee_saved
+            .iter()
+            .enumerate()
+            .map(move |(index, preg)| (*preg, base - (index as i64 + 1) * word))
     }
 
     pub fn spill_region_end(&self) -> u32 {

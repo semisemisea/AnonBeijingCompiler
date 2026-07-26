@@ -107,6 +107,7 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
                 match item {
                     InstOrEdit::Edit(edit) => {
                         let crate::reg_alloc::reg::Edit::Move { from, to, class } = edit;
+                        let ty = S::<B>::ty_for_regclass(*class);
                         match (from.as_reg(), to.as_reg()) {
                             (Some(from_reg), Some(to_reg)) => {
                                 assert_eq!(
@@ -115,13 +116,11 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
                                     "register-to-register allocation moves cannot cross register classes"
                                 );
                                 assert_eq!(to_reg.class(), *class);
-                                let ty = match class {
-                                    RegClass::Float => crate::types::F32,
-                                    RegClass::Int => crate::types::I64,
-                                    RegClass::Vector => {
-                                        unreachable!("vector register moves are unsupported")
-                                    }
-                                };
+                                assert_ne!(
+                                    *class,
+                                    RegClass::Vector,
+                                    "vector register moves are unsupported"
+                                );
                                 let mv = S::<B>::gen_move(
                                     Reg::from_physical_reg(from_reg),
                                     Reg::from_physical_reg(to_reg),
@@ -132,10 +131,6 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
                             (Some(from_reg), None) => {
                                 let slot = to.as_stack().unwrap();
                                 let offset = frame.spill_slot_offset(slot, spill_unit_bytes);
-                                let ty = match class {
-                                    RegClass::Float => crate::types::F32,
-                                    _ => crate::types::I64,
-                                };
                                 for inst in S::<B>::gen_spill_store_at_sp(
                                     Reg::from_physical_reg(from_reg),
                                     offset,
@@ -147,10 +142,6 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
                             (None, Some(to_reg)) => {
                                 let slot = from.as_stack().unwrap();
                                 let offset = frame.spill_slot_offset(slot, spill_unit_bytes);
-                                let ty = match class {
-                                    RegClass::Float => crate::types::F32,
-                                    _ => crate::types::I64,
-                                };
                                 for inst in S::<B>::gen_spill_load_at_sp(
                                     offset,
                                     crate::register::Writable::from_reg(Reg::from_physical_reg(

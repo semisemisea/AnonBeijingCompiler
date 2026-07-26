@@ -139,17 +139,7 @@ impl ABIMachineSpec for Riscv64ABI {
         spill_off: i64,
         ty: taki_mir::types::LoweredType,
     ) -> SmallVec<[MInst; 4]> {
-        let mut insts: SmallVec<[MInst; 4]> = smallvec![];
-        let (addr, extras) = AMode::SPOffset(spill_off).normalize_imm12();
-        for inst in extras {
-            insts.push(inst);
-        }
-        insts.push(MInst::StoreWord {
-            rs: src,
-            op: ty.into(),
-            addr,
-        });
-        insts
+        store_stack_imm12(src, ty.into(), spill_off)
     }
 
     fn gen_spill_load(
@@ -157,17 +147,7 @@ impl ABIMachineSpec for Riscv64ABI {
         dst: Writable<taki_mir::register::Reg>,
         ty: taki_mir::types::LoweredType,
     ) -> SmallVec<[MInst; 4]> {
-        let mut insts: SmallVec<[MInst; 4]> = smallvec![];
-        let (addr, extras) = AMode::SPOffset(spill_off).normalize_imm12();
-        for inst in extras {
-            insts.push(inst);
-        }
-        insts.push(MInst::LoadWord {
-            rd: dst,
-            op: ty.into(),
-            addr,
-        });
-        insts
+        load_stack_imm12(dst, ty.into(), spill_off)
     }
 
     fn gen_stack_to_stack_move(from: i64, to: i64) -> SmallVec<[MInst; 4]> {
@@ -243,8 +223,8 @@ impl ABIMachineSpec for Riscv64ABI {
         if frame.setup_area_size > 0 {
             let base = frame.total_size as i64;
             sp_adjust(&mut insts, -total);
-            store_stack_imm12(&mut insts, link_reg(), StoreOP::Sd, base - 8);
-            store_stack_imm12(&mut insts, fp_reg(), StoreOP::Sd, base - 16);
+            insts.extend(store_stack_imm12(link_reg(), StoreOP::Sd, base - 8));
+            insts.extend(store_stack_imm12(fp_reg(), StoreOP::Sd, base - 16));
             reg_add_imm(&mut insts, writable_fp_reg(), stack_reg(), base);
         } else if total > 0 {
             sp_adjust(&mut insts, -total);
@@ -256,8 +236,8 @@ impl ABIMachineSpec for Riscv64ABI {
         let mut insts = smallvec![];
         if frame.setup_area_size > 0 {
             let base = frame.total_size as i64;
-            load_stack_imm12(&mut insts, writable_link_reg(), LoadOP::Ld, base - 8);
-            load_stack_imm12(&mut insts, writable_fp_reg(), LoadOP::Ld, base - 16);
+            insts.extend(load_stack_imm12(writable_link_reg(), LoadOP::Ld, base - 8));
+            insts.extend(load_stack_imm12(writable_fp_reg(), LoadOP::Ld, base - 16));
         }
         if frame.total_size > 0 {
             sp_adjust(&mut insts, i64::from(frame.total_size));
@@ -265,34 +245,20 @@ impl ABIMachineSpec for Riscv64ABI {
         insts
     }
 
-    fn gen_clobber_save(frame: &FrameLayout) -> SmallVec<[MInst; 16]> {
-        let mut insts = smallvec![];
-        let base = frame.total_size as i64 - frame.setup_area_size as i64;
-        for (i, preg) in frame.callee_saved.iter().enumerate() {
-            let offset = base - (i as i64 + 1) * 8;
-            let rs = Reg::from_physical_reg(*preg);
-            let op = match preg.class() {
-                RegClass::Int => StoreOP::Sd,
-                _ => StoreOP::Fsw,
-            };
-            store_stack_imm12(&mut insts, rs, op, offset);
-        }
-        insts
+    fn gen_callee_save_store(preg: PReg, offset: i64) -> SmallVec<[MInst; 4]> {
+        let op = match preg.class() {
+            RegClass::Int => StoreOP::Sd,
+            _ => StoreOP::Fsw,
+        };
+        store_stack_imm12(Reg::from_physical_reg(preg), op, offset)
     }
 
-    fn gen_clobber_restore(frame: &FrameLayout) -> SmallVec<[MInst; 16]> {
-        let mut insts = smallvec![];
-        let base = frame.total_size as i64 - frame.setup_area_size as i64;
-        for (i, preg) in frame.callee_saved.iter().enumerate() {
-            let offset = base - (i as i64 + 1) * 8;
-            let rd = Writable::from_reg(Reg::from_physical_reg(*preg));
-            let op = match preg.class() {
-                RegClass::Int => LoadOP::Ld,
-                _ => LoadOP::Flw,
-            };
-            load_stack_imm12(&mut insts, rd, op, offset);
-        }
-        insts
+    fn gen_callee_save_load(preg: PReg, offset: i64) -> SmallVec<[MInst; 4]> {
+        let op = match preg.class() {
+            RegClass::Int => LoadOP::Ld,
+            _ => LoadOP::Flw,
+        };
+        load_stack_imm12(Writable::from_reg(Reg::from_physical_reg(preg)), op, offset)
     }
 
     fn legalize_inst(frame: &FrameLayout, inst: MInst) -> SmallVec<[MInst; 4]> {
@@ -527,25 +493,20 @@ mod tests {
     }
 }
 
-fn store_stack_imm12(insts: &mut SmallVec<[MInst; 16]>, rs: Reg, op: StoreOP, sp_offset: i64) {
+/// Store to `sp + sp_offset`, materializing the address first when the offset
+/// does not fit the imm12 form.
+fn store_stack_imm12(rs: Reg, op: StoreOP, sp_offset: i64) -> SmallVec<[MInst; 4]> {
     let (addr, extras) = AMode::SPOffset(sp_offset).normalize_imm12();
-    for inst in extras {
-        insts.push(inst);
-    }
+    let mut insts: SmallVec<[MInst; 4]> = extras.into_iter().collect();
     insts.push(MInst::StoreWord { rs, op, addr });
+    insts
 }
 
-fn load_stack_imm12(
-    insts: &mut SmallVec<[MInst; 16]>,
-    rd: Writable<Reg>,
-    op: LoadOP,
-    sp_offset: i64,
-) {
+fn load_stack_imm12(rd: Writable<Reg>, op: LoadOP, sp_offset: i64) -> SmallVec<[MInst; 4]> {
     let (addr, extras) = AMode::SPOffset(sp_offset).normalize_imm12();
-    for inst in extras {
-        insts.push(inst);
-    }
+    let mut insts: SmallVec<[MInst; 4]> = extras.into_iter().collect();
     insts.push(MInst::LoadWord { rd, op, addr });
+    insts
 }
 
 pub const DEFAULT_CLOBBERS: PRegSet = PRegSet::empty()

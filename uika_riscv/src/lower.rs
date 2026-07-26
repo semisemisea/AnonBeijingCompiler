@@ -2,6 +2,7 @@ use raana_ir::ir::{
     Binary, BinaryOp, Call, Cast, GetElemPtr, InstKind, Load, Return, Select, Store,
     Type as HirType, TypeKind as HirTypeKind, arena::Arena, inst_kind::MemZero,
 };
+use raana_ir::opt::utils::{integer_constant, signed_power_of_two};
 use smallvec::smallvec;
 
 use crate::{
@@ -11,16 +12,15 @@ use crate::{
         ShiftImm, ShiftImm64, StoreOP,
     },
     labels::Label,
-    regs::{ARG_REG, FARG_REG, a0, a1, a2, fa0, fp_reg, preg_name, stack_reg, zero_reg},
+    regs::{a0, a1, a2, preg_name, zero_reg},
 };
 
 use taki_mir::{
     abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
-    block_order::LoweredBlock,
     div_magic::{MagicCorrection, signed_magic_i32},
     libcall::LibCall,
     lower::{LowerBackend, LowerContext, LoweredOutput, analyze_gep},
-    prelude::{ArenaContext, HirFunctionData, HirInst},
+    prelude::{ArenaContext, HirInst},
     reg_alloc::reg::PReg,
     register::{Reg, Writable},
     types::LoweredType,
@@ -59,35 +59,6 @@ fn select_tmp_ty(ty: &HirType) -> HirType {
     }
 }
 
-fn normalize_amode(amode: AMode, ctx: &mut LowerContext<'_, MInst>) -> AMode {
-    // Slot offsets need the final outgoing-argument-area displacement, which
-    // is unavailable during lowering. Keep them symbolic for ABI legalization.
-    if matches!(amode, AMode::SlotOffset(_)) {
-        return amode;
-    }
-    let (off, base) = match &amode {
-        AMode::SPOffset(o) | AMode::OutgoingArg(o) => (*o, stack_reg()),
-        AMode::FPOffset(o) | AMode::IncomingArg(o) => (*o, fp_reg()),
-        _ => return amode,
-    };
-    if (-2048..2048).contains(&off) {
-        return amode;
-    }
-    let tmp_off = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-    ctx.emit(MInst::LoadImm {
-        rd: Writable::from_reg(tmp_off),
-        value: off as u64,
-    });
-    let tmp_addr = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-    ctx.emit(MInst::AluRRR {
-        op: AluRRROP::Add,
-        rd: Writable::from_reg(tmp_addr),
-        rs1: base,
-        rs2: tmp_off,
-    });
-    AMode::RegOffest(tmp_addr, 0)
-}
-
 fn alu_op_for_hir_binary(op: BinaryOp, ty: &HirType) -> AluRRROP {
     let is_i32 = matches!(ty.kind(), HirTypeKind::Int32);
     match (op, is_i32) {
@@ -115,23 +86,6 @@ fn alu_op_for_hir_binary(op: BinaryOp, ty: &HirType) -> AluRRROP {
             unreachable!("eq/ne lower through sub + seqz/snez")
         }
     }
-}
-
-fn integer_constant(arena: ArenaContext<'_>, inst: HirInst) -> Option<i32> {
-    match arena.inst_data(inst).kind() {
-        InstKind::Integer(value) => Some(value.value()),
-        _ => None,
-    }
-}
-
-fn signed_power_of_two(value: i32) -> Option<(u8, bool)> {
-    if value == 0 {
-        return None;
-    }
-    let magnitude = value.unsigned_abs();
-    magnitude
-        .is_power_of_two()
-        .then(|| (magnitude.trailing_zeros() as u8, value.is_negative()))
 }
 
 fn lower_signed_div_rem_power_of_two(
@@ -395,12 +349,12 @@ fn lower_binary(
             ctx.emit(MInst::FpuRRR { op, rd, rs1, rs2 });
         }
     } else {
-        if bop == BinaryOp::Div && integer_constant(arena, binary.rhs()) == Some(1) {
+        if bop == BinaryOp::Div && integer_constant(&arena, binary.rhs()) == Some(1) {
             return LoweredOutput::Value(lhs);
         }
         if matches!(inst_ty.kind(), HirTypeKind::Int32)
             && matches!(bop, BinaryOp::Div | BinaryOp::Rem)
-            && integer_constant(arena, binary.rhs()).is_some_and(|divisor| {
+            && integer_constant(&arena, binary.rhs()).is_some_and(|divisor| {
                 lower_signed_div_rem_power_of_two(ctx, bop, rd, lhs, divisor)
                     || lower_signed_div_rem_magic(ctx, bop, rd, lhs, divisor)
             })
@@ -599,7 +553,7 @@ fn lower_alloc(
     let def = ctx.result_reg(inst);
     let rd = Writable::from_reg(def);
     let pointee_ty = arena.inst_data(inst).ty().derefernce();
-    let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(inst, pointee_ty) as i64;
+    let offset = ctx.alloc_stackslot_or_get(inst, pointee_ty) as i64;
     ctx.emit(<Riscv64ABI as ABIMachineSpec>::gen_get_stack_addr(
         StackAMode::Slot(offset),
         rd,
@@ -716,14 +670,14 @@ fn lower_store(
         let elems = agg.flatten(&arena);
         assert!(matches!(arena.inst_data(dst).kind(), InstKind::Alloc));
         let dst_pointee = arena.inst_data(dst).ty().derefernce();
-        let base_offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(dst, dst_pointee) as i64;
+        let base_offset = ctx.alloc_stackslot_or_get(dst, dst_pointee) as i64;
         let mut elem_offset: i64 = 0;
         for elem in elems {
             let rs = ctx.put_value_in_reg(elem);
             let elem_ty = arena.inst_data(elem).ty();
             let m_type: LoweredType = elem_ty.into();
             let op: StoreOP = m_type.into();
-            let addr = normalize_amode(AMode::SlotOffset(base_offset + elem_offset), ctx);
+            let addr = AMode::SlotOffset(base_offset + elem_offset);
             ctx.emit(MInst::StoreWord { rs, op, addr });
             elem_offset += elem_ty.size() as i64;
         }
@@ -732,9 +686,9 @@ fn lower_store(
         let total = src_ty.array_flatten_length();
         let elem_size = src_ty.array_base_scalar_type().size() as i64;
         let dst_pointee = arena.inst_data(dst).ty().derefernce();
-        let base_offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(dst, dst_pointee) as i64;
+        let base_offset = ctx.alloc_stackslot_or_get(dst, dst_pointee) as i64;
         for i in 0..total {
-            let addr = normalize_amode(AMode::SlotOffset(base_offset + i as i64 * elem_size), ctx);
+            let addr = AMode::SlotOffset(base_offset + i as i64 * elem_size);
             ctx.emit(MInst::StoreWord {
                 rs: zero_reg(),
                 op: StoreOP::Sw,
@@ -768,8 +722,8 @@ fn lower_store(
                 }
                 InstKind::Alloc => {
                     let pointee_ty = arena.inst_data(dst).ty().derefernce();
-                    let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(dst, pointee_ty);
-                    let addr = normalize_amode(AMode::SlotOffset(offset as i64), ctx);
+                    let offset = ctx.alloc_stackslot_or_get(dst, pointee_ty);
+                    let addr = AMode::SlotOffset(offset as i64);
                     ctx.emit(MInst::StoreWord { rs, op, addr });
                 }
                 _ => unreachable!("should not store in instruction other than GEP or Alloc"),
@@ -784,26 +738,23 @@ fn lower_mem_zero(
     arena: ArenaContext<'_>,
     mem_zero: &MemZero,
 ) -> LoweredOutput {
+    // A destination naming a stack object has no register of its own, so its
+    // address is materialized here; both clearing strategies below need it.
+    let dest = if let InstKind::Alloc = arena.inst_data(mem_zero.dest()).kind() {
+        let pointee = arena.inst_data(mem_zero.dest()).ty().derefernce();
+        let offset = i64::from(ctx.alloc_stackslot_or_get(mem_zero.dest(), pointee));
+        let dest = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+        ctx.emit(<Riscv64ABI as ABIMachineSpec>::gen_get_stack_addr(
+            StackAMode::Slot(offset),
+            Writable::from_reg(dest),
+        ));
+        dest
+    } else {
+        ctx.put_value_in_reg(mem_zero.dest())
+    };
+
     let inline_store_count = mem_zero.byte_len() / 4;
     if mem_zero.byte_len() % 4 == 0 && inline_store_count <= INLINE_MEMZERO_MAX_STORES {
-        let alloc = matches!(arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
-            .then_some(mem_zero.dest());
-        let (dest, stack_offset) = if let Some(alloc) = alloc {
-            let pointee = arena.inst_data(alloc).ty().derefernce();
-            let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
-            (
-                ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
-                Some(offset),
-            )
-        } else {
-            (ctx.put_value_in_reg(mem_zero.dest()), None)
-        };
-        if let Some(offset) = stack_offset {
-            ctx.emit(<Riscv64ABI as ABIMachineSpec>::gen_get_stack_addr(
-                StackAMode::Slot(offset),
-                Writable::from_reg(dest),
-            ));
-        }
         for index in 0..inline_store_count {
             ctx.emit(MInst::StoreWord {
                 rs: zero_reg(),
@@ -814,26 +765,8 @@ fn lower_mem_zero(
         return LoweredOutput::None;
     }
 
-    let alloc = matches!(arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
-        .then_some(mem_zero.dest());
-    let (dest, stack_offset) = if let Some(alloc) = alloc {
-        let pointee = arena.inst_data(alloc).ty().derefernce();
-        let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
-        (
-            ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
-            Some(offset),
-        )
-    } else {
-        (ctx.put_value_in_reg(mem_zero.dest()), None)
-    };
     let zero = ctx.alloc_tmp(HirType::get_i32());
     let byte_len = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-    if let Some(offset) = stack_offset {
-        ctx.emit(<Riscv64ABI as ABIMachineSpec>::gen_get_stack_addr(
-            StackAMode::Slot(offset),
-            Writable::from_reg(dest),
-        ));
-    }
     ctx.emit(MInst::LoadImm {
         rd: Writable::from_reg(zero),
         value: 0,
@@ -895,8 +828,8 @@ fn lower_load(
         // For SysY, this branch only happen when SSA is disabled.
         // All load from integer/float is translated into SSA from.
         let alloc_ty = arena.inst_data(src).ty().derefernce();
-        let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(src, alloc_ty);
-        let addr = normalize_amode(AMode::SlotOffset(offset as i64), ctx);
+        let offset = ctx.alloc_stackslot_or_get(src, alloc_ty);
+        let addr = AMode::SlotOffset(offset as i64);
         ctx.emit(MInst::LoadWord { rd, op, addr });
     }
     LoweredOutput::Value(def)
@@ -908,76 +841,19 @@ fn lower_call(
     inst: HirInst,
     call: &Call,
 ) -> LoweredOutput {
-    let mut outgoing_arg_size = 0usize;
-    let mut call_arg_pairs = smallvec![];
-    let mut int_arg_idx = 0;
-    let mut float_arg_idx = 0;
-    for &arg in call.args() {
-        let arg_reg = ctx.put_value_in_reg(arg);
-        let arg_ty = arena.inst_data(arg).ty();
-        let m_type: LoweredType = arg_ty.into();
-        match arg_ty.kind() {
-            HirTypeKind::Int32 | HirTypeKind::Pointer(_) => {
-                if int_arg_idx < 8 {
-                    call_arg_pairs.push(CallArgPair {
-                        vreg: arg_reg,
-                        preg: ARG_REG[int_arg_idx],
-                    });
-                    int_arg_idx += 1;
-                } else {
-                    let op: StoreOP = m_type.into();
-                    let addr = normalize_amode(AMode::OutgoingArg(outgoing_arg_size as i64), ctx);
-                    ctx.emit(MInst::StoreWord {
-                        rs: arg_reg,
-                        op,
-                        addr,
-                    });
-                    outgoing_arg_size += arg_ty.size();
-                }
-            }
-            HirTypeKind::Float32 => {
-                if float_arg_idx < 8 {
-                    call_arg_pairs.push(CallArgPair {
-                        vreg: arg_reg,
-                        preg: FARG_REG[float_arg_idx],
-                    });
-                    float_arg_idx += 1;
-                } else {
-                    let op: StoreOP = m_type.into();
-                    let addr = normalize_amode(AMode::OutgoingArg(outgoing_arg_size as i64), ctx);
-                    ctx.emit(MInst::StoreWord {
-                        rs: arg_reg,
-                        op,
-                        addr,
-                    });
-                    outgoing_arg_size += arg_ty.size();
-                }
-            }
-            _ => unreachable!("unexpected call argument type: {:?}", arg_ty.kind()),
-        }
-    }
+    let arg_pairs = ctx.lower_call_args(call.args());
     let result_ty = arena.inst_data(inst).ty();
     let result = (!result_ty.is_unit()).then(|| ctx.result_reg(inst));
-    let ret_arg_pair = match result_ty.kind() {
-        HirTypeKind::Unit => None,
-        HirTypeKind::Int32 => Some(CallRetPair {
-            vreg: Writable::from_reg(result.unwrap()),
-            preg: a0(),
-        }),
-        HirTypeKind::Float32 => Some(CallRetPair {
-            vreg: Writable::from_reg(result.unwrap()),
-            preg: fa0(),
-        }),
-        _ => unreachable!(),
-    };
+    let ret = <Riscv64ABI as ABIMachineSpec>::ret_reg_for_type(result_ty).map(|preg| CallRetPair {
+        vreg: Writable::from_reg(result.expect("a call returning a value has a result register")),
+        preg: Reg::from_physical_reg(preg),
+    });
     ctx.emit(MInst::Call {
-        arg_pairs: call_arg_pairs,
-        ret: ret_arg_pair,
+        arg_pairs: arg_pairs.into(),
+        ret,
         clobbers: DEFAULT_CLOBBERS,
         label: Label::Function(call.callee()),
     });
-    ctx.vcode.vcode.abi.set_has_calls();
-    ctx.vcode.vcode.abi.set_outgoing_arg_size(outgoing_arg_size);
     result.map_or(LoweredOutput::None, LoweredOutput::Value)
 }
 
@@ -987,14 +863,14 @@ fn lower_return(
     ret: &Return,
 ) -> LoweredOutput {
     if let Some(val) = ret.value() {
-        let preg = match arena.inst_data(val).ty().kind() {
-            HirTypeKind::Int32 | HirTypeKind::Pointer(_) => a0(),
-            HirTypeKind::Float32 => fa0(),
-            ty => unreachable!("unexpected return type: {ty:?}"),
-        };
+        let preg = <Riscv64ABI as ABIMachineSpec>::ret_reg_for_type(arena.inst_data(val).ty())
+            .expect("a returned value has a return register");
         let src = ctx.put_value_in_reg(val);
         ctx.emit(MInst::RetVal {
-            pair: RetPair { vreg: src, preg },
+            pair: RetPair {
+                vreg: src,
+                preg: Reg::from_physical_reg(preg),
+            },
         });
     }
     ctx.emit(MInst::Ret);
@@ -1081,51 +957,8 @@ impl LowerBackend for Riscv64Backend {
         }
     }
 
-    fn data_section_directive() -> &'static str {
-        ".section .data"
-    }
-
-    fn bss_section_directive() -> &'static str {
-        ".section .bss"
-    }
-
-    fn text_section_directive() -> &'static str {
-        ".section .text"
-    }
-
-    fn global_directive() -> &'static str {
-        ".globl"
-    }
-
-    fn word_directive() -> &'static str {
-        ".word"
-    }
-
-    fn zero_directive() -> &'static str {
-        ".zero"
-    }
-
     fn preg_name(preg: PReg) -> &'static str {
         preg_name(preg)
-    }
-
-    fn format_block_label(lb: &LoweredBlock, func_data: &HirFunctionData) -> String {
-        let function = func_data.name().replace('%', "_");
-        match lb {
-            LoweredBlock::Orig { block } => {
-                let bb_name = func_data.bb_data(*block).name().replace('%', "_");
-                format!(".L_{function}_{bb_name}")
-            }
-            LoweredBlock::Edge {
-                pred,
-                succ,
-                succ_idx,
-            } => {
-                let p = func_data.bb_data(*pred).name().replace('%', "_");
-                let s = func_data.bb_data(*succ).name().replace('%', "_");
-                format!(".L_{function}_{p}_to_{s}_edge_{succ_idx}")
-            }
-        }
     }
 
     fn emit_long_jump(
@@ -1145,55 +978,6 @@ mod tests {
         Program,
         builder_trait::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
     };
-
-    #[test]
-    fn classifies_signed_power_of_two_divisors() {
-        assert_eq!(signed_power_of_two(0), None);
-        assert_eq!(signed_power_of_two(1), Some((0, false)));
-        assert_eq!(signed_power_of_two(-1), Some((0, true)));
-        assert_eq!(signed_power_of_two(2), Some((1, false)));
-        assert_eq!(signed_power_of_two(-2), Some((1, true)));
-        assert_eq!(signed_power_of_two(1 << 30), Some((30, false)));
-        assert_eq!(signed_power_of_two(-(1 << 30)), Some((30, true)));
-        assert_eq!(signed_power_of_two(i32::MIN), Some((31, true)));
-        assert_eq!(signed_power_of_two(3), None);
-        assert_eq!(signed_power_of_two(-3), None);
-    }
-
-    #[test]
-    fn signed_power_of_two_formula_truncates_toward_zero() {
-        let dividends = [i32::MIN, -17, -9, -8, -7, -1, 0, 1, 7, 8, 9, 17, i32::MAX];
-        let divisors = [1, -1, 2, -2, 4, -4, 8, -8, 1 << 30, -(1 << 30), i32::MIN];
-
-        for dividend in dividends {
-            for divisor in divisors {
-                let (shift, negate) = signed_power_of_two(divisor).unwrap();
-                let positive_quotient = if shift == 0 {
-                    dividend
-                } else {
-                    let sign = dividend >> 31;
-                    let bias = ((sign as u32) >> (32 - shift)) as i32;
-                    dividend.wrapping_add(bias) >> shift
-                };
-                let quotient = if negate {
-                    positive_quotient.wrapping_neg()
-                } else {
-                    positive_quotient
-                };
-                let remainder =
-                    dividend.wrapping_sub(positive_quotient.wrapping_shl(u32::from(shift)));
-
-                let expected_quotient = if dividend == i32::MIN && divisor == -1 {
-                    i32::MIN
-                } else {
-                    dividend / divisor
-                };
-                let expected_remainder = if divisor == -1 { 0 } else { dividend % divisor };
-                assert_eq!(quotient, expected_quotient, "{dividend} / {divisor}");
-                assert_eq!(remainder, expected_remainder, "{dividend} % {divisor}");
-            }
-        }
-    }
 
     /// Emits `parameter <op> divisor` as a whole function and returns its
     /// RISC-V assembly.
@@ -1393,6 +1177,79 @@ mod tests {
         assert_eq!(asm.matches("xor ").count(), 2, "{asm}");
         assert!(!asm.contains("beqz "), "{asm}");
         assert!(!asm.contains("bnez "), "{asm}");
+    }
+
+    /// Every `offset(sp)` and `offset(s0)` displacement in `asm`. RISC-V
+    /// encodes these in a signed 12-bit immediate.
+    fn frame_displacements(asm: &str) -> Vec<i64> {
+        asm.lines()
+            .filter_map(|line| {
+                let head = line
+                    .trim_end()
+                    .strip_suffix("(sp)")
+                    .or_else(|| line.trim_end().strip_suffix("(s0)"))?;
+                head.rsplit(|c: char| !c.is_ascii_digit() && c != '-')
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .collect()
+    }
+
+    /// A call whose outgoing-argument area escapes imm12. Nothing in `tests/`
+    /// reaches that far, and the shared `lower_call_args` leaves the address
+    /// symbolic, so the encoding rests entirely on `Riscv64ABI::legalize_inst`.
+    #[test]
+    fn outgoing_arguments_past_imm12_stay_encodable() {
+        // Eight pointers travel in registers and the rest sit eight bytes
+        // apart in the outgoing area.
+        const ARGS: usize = 272;
+        let pointer_ty = HirType::get_pointer(HirType::get_i32());
+        let (_, outgoing_size) =
+            <Riscv64ABI as ABIMachineSpec>::compute_call_arg_loc(&vec![pointer_ty.clone(); ARGS]);
+        assert!(
+            outgoing_size > 2048,
+            "the call must overflow imm12, got {outgoing_size}"
+        );
+
+        let mut program = Program::new();
+        let callee = program.new_function(
+            HirType::get_unit(),
+            "sink".to_string(),
+            vec![pointer_ty.clone(); ARGS],
+        );
+        let caller = program.new_function(HirType::get_unit(), "spread".to_string(), Vec::new());
+        let data = program.func_data_mut(caller);
+        let entry = data
+            .new_basic_block()
+            .basic_block("entry".to_string(), Vec::new());
+        data.layout_mut().push_bb_back(entry);
+
+        let args: Vec<_> = (0..ARGS)
+            .map(|_| {
+                let alloc = data.new_local_inst().alloc(HirType::get_i32());
+                data.layout_mut().insert_inst(entry, alloc);
+                alloc
+            })
+            .collect();
+        let call = data
+            .new_local_inst()
+            .call_with_type(callee, args, HirType::get_unit());
+        data.layout_mut().insert_inst(entry, call);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<Riscv64Backend>(&program);
+        for offset in frame_displacements(&asm) {
+            assert!(
+                (-2048..2048).contains(&offset),
+                "displacement {offset} does not fit imm12:\n{asm}"
+            );
+        }
+        // The arguments past the boundary are reached through the post-RA
+        // scratch register rather than a wider displacement.
+        assert!(asm.contains("sd a"), "{asm}");
+        assert!(asm.contains("0(t6)"), "{asm}");
     }
 
     #[test]

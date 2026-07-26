@@ -11,9 +11,9 @@ use crate::{
     instructions::{AMode, AluRRImm12OP, Imm12, LoadOP, MInst, StoreOP},
     labels::Label,
     regs::{
-        ARG_REG, FARG_REG, fp_reg, link_reg, pf_reg, pv_reg, px_reg, spilltmp_reg, stack_reg,
-        writable_fp_reg, writable_link_reg, writable_spilltmp_reg, writable_spilltmp_reg2,
-        writable_stack_reg,
+        ARG_REG, FARG_REG, a0, fa0, fp_reg, link_reg, pf_reg, pv_reg, px_reg, spilltmp_reg,
+        stack_reg, writable_fp_reg, writable_link_reg, writable_spilltmp_reg,
+        writable_spilltmp_reg2, writable_stack_reg,
     },
 };
 
@@ -203,6 +203,18 @@ impl ABIMachineSpec for Riscv64ABI {
         Self::arg_layout(types)
     }
 
+    fn ret_reg_for_type(ty: &raana_ir::ir::Type) -> Option<PReg> {
+        use raana_ir::ir::TypeKind;
+
+        let reg = match ty.kind() {
+            TypeKind::Unit => return None,
+            TypeKind::Int32 | TypeKind::Pointer(_) => a0(),
+            TypeKind::Float32 => fa0(),
+            kind => panic!("unsupported RISC-V return type: {kind:?}"),
+        };
+        Some(reg.to_physical_reg().unwrap())
+    }
+
     fn get_machine_env() -> &'static MachineEnv {
         static MACHINE_ENV: std::sync::LazyLock<MachineEnv> =
             std::sync::LazyLock::new(create_reg_environment);
@@ -290,21 +302,13 @@ impl ABIMachineSpec for Riscv64ABI {
                     ]
                 }
             }
-            MInst::LoadWord {
-                rd,
-                op,
-                addr: AMode::SlotOffset(offset),
-            } => {
-                let (addr, mut insts) = legalize_slot_amode(frame, offset);
+            MInst::LoadWord { rd, op, addr } => {
+                let (addr, mut insts) = legalize_frame_amode(frame, addr);
                 insts.push(MInst::LoadWord { rd, op, addr });
                 insts
             }
-            MInst::StoreWord {
-                rs,
-                op,
-                addr: AMode::SlotOffset(offset),
-            } => {
-                let (addr, mut insts) = legalize_slot_amode(frame, offset);
+            MInst::StoreWord { rs, op, addr } => {
+                let (addr, mut insts) = legalize_frame_amode(frame, addr);
                 insts.push(MInst::StoreWord { rs, op, addr });
                 insts
             }
@@ -313,8 +317,19 @@ impl ABIMachineSpec for Riscv64ABI {
     }
 }
 
-fn legalize_slot_amode(frame: &FrameLayout, offset: i64) -> (AMode, SmallVec<[MInst; 4]>) {
-    let offset = offset + i64::from(frame.outgoing_args_size);
+/// Resolve a frame-dependent address to a stack-pointer-relative one,
+/// materializing it when the displacement escapes imm12.
+///
+/// Stack objects are addressed above the outgoing-argument area, whose final
+/// size is only known here; outgoing arguments are written from the stack
+/// pointer itself. Addresses that already name a register or a label are
+/// returned untouched.
+fn legalize_frame_amode(frame: &FrameLayout, addr: AMode) -> (AMode, SmallVec<[MInst; 4]>) {
+    let offset = match addr {
+        AMode::SlotOffset(offset) => offset + i64::from(frame.outgoing_args_size),
+        AMode::OutgoingArg(offset) => offset,
+        addr => return (addr, smallvec![]),
+    };
     if i32::try_from(offset)
         .ok()
         .and_then(Imm12::from_i32)
@@ -436,6 +451,51 @@ mod tests {
                 op: StoreOP::Sd,
                 addr: AMode::SPOffset(24),
             } if rs == spilltmp_reg()
+        ));
+    }
+
+    /// Outgoing arguments are addressed from the stack pointer itself, so
+    /// unlike stack slots they take no outgoing-area correction. Both forms
+    /// must still leave `emit` with an encodable displacement.
+    #[test]
+    fn outgoing_argument_stores_are_legalized_against_the_stack_pointer() {
+        let frame = FrameLayout {
+            callee_saved: vec![],
+            setup_area_size: 16,
+            clobber_size: 0,
+            spill_size: 0,
+            stackslots_size: 0,
+            outgoing_args_size: 4096,
+            total_size: 4112,
+        };
+        let store = |offset| MInst::StoreWord {
+            rs: Reg::from_physical_reg(px_reg(10)),
+            op: StoreOP::Sd,
+            addr: AMode::OutgoingArg(offset),
+        };
+
+        let insts = Riscv64ABI::legalize_inst(&frame, store(16));
+        assert_eq!(insts.len(), 1);
+        assert!(matches!(
+            insts[0],
+            MInst::StoreWord {
+                addr: AMode::SPOffset(16),
+                ..
+            }
+        ));
+
+        let insts = Riscv64ABI::legalize_inst(&frame, store(2048));
+        assert_eq!(insts.len(), 3);
+        assert!(matches!(
+            insts[0],
+            MInst::LoadImm { rd, value: 2048 } if rd == writable_spilltmp_reg2()
+        ));
+        assert!(matches!(
+            insts[2],
+            MInst::StoreWord {
+                addr: AMode::RegOffest(base, 0),
+                ..
+            } if base == spilltmp_reg()
         ));
     }
 

@@ -102,20 +102,6 @@ impl MachInst for MInst {
         }
     }
 
-    fn rc_for_type(
-        ty: taki_mir::types::LoweredType,
-    ) -> (
-        &'static [taki_mir::reg_alloc::reg::RegClass],
-        &'static [taki_mir::types::LoweredType],
-    ) {
-        match ty {
-            I32 => (&[RegClass::Int], &[I32]),
-            I64 => (&[RegClass::Int], &[I64]),
-            F32 => (&[RegClass::Float], &[F32]),
-            _ => unreachable!(),
-        }
-    }
-
     fn gen_jump(target: taki_mir::block_order::MirBlockIndex) -> Self {
         MInst::Jump {
             label: crate::labels::Label::Block(target),

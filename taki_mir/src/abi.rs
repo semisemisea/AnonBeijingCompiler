@@ -80,10 +80,6 @@ pub trait ABIMachineSpec {
     /// final outgoing-argument area is known.
     fn gen_get_stack_addr(mem: StackAMode, dst: Writable<Reg>) -> Self::I;
 
-    fn gen_args(args: Vec<ArgPair>) -> Self::I;
-
-    fn gen_ret() -> Self::I;
-
     fn gen_store_stack(src: Reg, mem: StackAMode, ty: LoweredType) -> Self::I;
 
     fn gen_spill_store(src: Reg, spill_off: i64, ty: LoweredType) -> SmallVec<[Self::I; 4]> {
@@ -123,10 +119,6 @@ pub trait ABIMachineSpec {
             ty,
         )]
     }
-
-    fn gen_jump(block: HirBasicBlock) -> Self::I;
-
-    fn gen_nop() -> Self::I;
 
     fn gen_move(src: Reg, dst: Reg, ty: LoweredType) -> Self::I;
 
@@ -243,12 +235,6 @@ mod tests {
 }
 
 #[derive(Debug, Clone)]
-pub struct ArgPair {
-    pub vreg: Writable<Reg>,
-    pub preg: Reg,
-}
-
-#[derive(Debug, Clone)]
 pub struct RetPair {
     pub vreg: Reg,
     pub preg: Reg,
@@ -271,9 +257,6 @@ pub struct CallRetPair {
 /// It will gradually build during the lowering process.
 pub struct CalleeABI<M: ABIMachineSpec> {
     args: Vec<ArgSlot>,
-
-    /// Await for filling.
-    reg_args: Vec<ArgPair>,
 
     /// Await for filling.
     total_stackslots_size: u32,
@@ -307,7 +290,6 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
         let num_args = args.len();
         CalleeABI {
             args,
-            reg_args: vec![],
             total_stackslots_size: 0,
             sized_stack_arg_size,
             outgoing_arg_size: 0,
@@ -494,14 +476,6 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
             }
         }
         insts
-    }
-
-    pub fn take_args(&mut self) -> Option<M::I> {
-        if !self.reg_args.is_empty() {
-            Some(M::gen_args(std::mem::take(&mut self.reg_args)))
-        } else {
-            None
-        }
     }
 
     pub fn frame_layout(&self) -> &FrameLayout {

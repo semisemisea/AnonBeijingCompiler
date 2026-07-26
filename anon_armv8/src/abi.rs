@@ -100,21 +100,6 @@ impl ABIMachineSpec for AArch64Abi {
         }
     }
 
-    fn gen_args(args: Vec<taki_mir::abi::ArgPair>) -> MInst {
-        MInst::Args { pairs: args }
-    }
-    fn gen_ret() -> MInst {
-        MInst::Ret
-    }
-    fn gen_jump(block: taki_mir::prelude::HirBasicBlock) -> MInst {
-        // HIR blocks require BlockLoweringOrder's edge-block mapping before
-        // they can become MIR block labels. This ABI hook has no such map.
-        panic!("AArch64 ABI jump generation requires BlockLoweringOrder mapping: {block:?}")
-    }
-    fn gen_nop() -> MInst {
-        MInst::Nop
-    }
-
     fn gen_move(src: Reg, dst: Reg, ty: LoweredType) -> MInst {
         if ty == F32 {
             MInst::FMov {

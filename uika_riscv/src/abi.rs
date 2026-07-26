@@ -89,20 +89,12 @@ impl ABIMachineSpec for Riscv64ABI {
         }
     }
 
-    fn gen_args(args: Vec<taki_mir::abi::ArgPair>) -> Self::I {
-        MInst::Args { pairs: args.into() }
-    }
-
     fn spillslot_size(_regclass: RegClass) -> u32 {
         1
     }
 
     fn spill_unit_bytes() -> u32 {
         8
-    }
-
-    fn gen_ret() -> Self::I {
-        MInst::Ret
     }
 
     fn gen_load_imm(dst: Writable<Reg>, value: u64, ty: taki_mir::types::LoweredType) -> Self::I {
@@ -204,14 +196,6 @@ impl ABIMachineSpec for Riscv64ABI {
             addr,
         });
         insts
-    }
-
-    fn gen_jump(_block: raana_ir::opt::prelude::BasicBlock) -> Self::I {
-        todo!()
-    }
-
-    fn gen_nop() -> Self::I {
-        MInst::Nop
     }
 
     fn gen_move(

@@ -412,6 +412,14 @@ pub enum MInst {
         lhs: Reg,
         rhs: Reg,
     },
+    /// `smull xd, wn, wm`: the full 64-bit product of two 32-bit signed
+    /// operands. Division by a constant needs the high half of the product,
+    /// which a 32-bit multiply discards.
+    SMulL {
+        dst: WritableReg,
+        lhs: Reg,
+        rhs: Reg,
+    },
     MAdd {
         size: OperandSize,
         dst: WritableReg,
@@ -676,7 +684,9 @@ impl MachInst for MInst {
                 use_reg_or_zr(collector, rhs);
                 collector.reg_def(dst);
             }
-            Self::SDiv { dst, lhs, rhs, .. } | Self::FAlu { dst, lhs, rhs, .. } => {
+            Self::SDiv { dst, lhs, rhs, .. }
+            | Self::SMulL { dst, lhs, rhs }
+            | Self::FAlu { dst, lhs, rhs, .. } => {
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
                 collector.reg_def(dst);
@@ -1037,6 +1047,14 @@ impl MachInstEmit for MInst {
                 lhs,
                 rhs,
             } => emit_sized_rrr(ctx, "sdiv", *size, dst.to_reg(), lhs, rhs),
+            Self::SMulL { dst, lhs, rhs } => {
+                write!(ctx, "smull ")?;
+                emit_reg(ctx, dst.to_reg(), OperandSize::Size64)?;
+                write!(ctx, ", ")?;
+                emit_reg(ctx, *lhs, OperandSize::Size32)?;
+                write!(ctx, ", ")?;
+                emit_reg(ctx, *rhs, OperandSize::Size32)
+            }
             Self::MAdd {
                 size,
                 dst,

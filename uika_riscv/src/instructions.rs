@@ -31,7 +31,7 @@ impl MachInst for MInst {
                 collector.reg_use(rs);
                 collector.reg_def(rd);
             }
-            MInst::Slli { rd, rs, .. } => {
+            MInst::Slli { rd, rs, .. } | MInst::Srai { rd, rs, .. } => {
                 collector.reg_use(rs);
                 collector.reg_def(rd);
             }
@@ -187,6 +187,13 @@ impl MachInstEmit for MInst {
                 ctx.write_reg(rs)?;
                 write!(ctx, ", {}", shamt.value())
             }
+            MInst::Srai { rd, rs, shamt } => {
+                write!(ctx, "srai ")?;
+                ctx.write_reg(&rd.reg)?;
+                write!(ctx, ", ")?;
+                ctx.write_reg(rs)?;
+                write!(ctx, ", {}", shamt.value())
+            }
             MInst::LoadImm { rd, value } => {
                 write!(ctx, "li ")?;
                 ctx.write_reg(&rd.reg)?;
@@ -332,6 +339,13 @@ pub enum MInst {
         shamt: ShiftImm,
     },
     Slli {
+        rd: WritableReg,
+        rs: Reg,
+        shamt: ShiftImm64,
+    },
+    /// The 64-bit arithmetic shift right. Division by a constant needs it to
+    /// reach the high half of a 64-bit product, which the `W` shifts cannot.
+    Srai {
         rd: WritableReg,
         rs: Reg,
         shamt: ShiftImm64,

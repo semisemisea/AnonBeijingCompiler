@@ -17,6 +17,7 @@ use crate::{
 use taki_mir::{
     abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::LoweredBlock,
+    div_magic::{MagicCorrection, signed_magic_i32},
     libcall::LibCall,
     lower::{LowerBackend, LowerContext, LoweredOutput, analyze_gep},
     prelude::{ArenaContext, HirFunctionData, HirInst},
@@ -221,6 +222,127 @@ fn lower_signed_div_rem_power_of_two(
     true
 }
 
+/// Selects a signed division or remainder by a constant that is neither a
+/// power of two nor `0`, `1` or `-1`, replacing `divw`/`remw` with the
+/// multiply-high sequence of [`signed_magic_i32`].
+///
+/// The backend keeps `i32` values sign-extended in 64-bit registers, so a
+/// plain `mul` yields the exact 64-bit product and `srai` reaches its high
+/// half. When the multiplier needs no correction term, that same `srai`
+/// absorbs the magic-number shift.
+fn lower_signed_div_rem_magic(
+    ctx: &mut LowerContext<'_, MInst>,
+    op: BinaryOp,
+    rd: Writable<Reg>,
+    lhs: Reg,
+    divisor: i32,
+) -> bool {
+    if !matches!(op, BinaryOp::Div | BinaryOp::Rem) {
+        return false;
+    }
+    let Some(magic) = signed_magic_i32(divisor) else {
+        return false;
+    };
+
+    let multiplier = ctx.alloc_tmp(HirType::get_i32());
+    ctx.emit(MInst::LoadImm {
+        rd: Writable::from_reg(multiplier),
+        value: i64::from(magic.multiplier) as u64,
+    });
+    let product = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+    ctx.emit(MInst::AluRRR {
+        op: AluRRROP::Mul,
+        rd: Writable::from_reg(product),
+        rs1: lhs,
+        rs2: multiplier,
+    });
+
+    // Every value below the product fits in 32 bits, so the temporaries stay
+    // `i32` even where an instruction writes the whole 64-bit register.
+    let shifted = ctx.alloc_tmp(HirType::get_i32());
+    match magic.correction {
+        MagicCorrection::None => ctx.emit(MInst::Srai {
+            rd: Writable::from_reg(shifted),
+            rs: product,
+            shamt: ShiftImm64::new(32 + magic.shift).unwrap(),
+        }),
+        correction => {
+            let high = ctx.alloc_tmp(HirType::get_i32());
+            ctx.emit(MInst::Srai {
+                rd: Writable::from_reg(high),
+                rs: product,
+                shamt: ShiftImm64::new(32).unwrap(),
+            });
+            let corrected = if magic.shift == 0 {
+                shifted
+            } else {
+                ctx.alloc_tmp(HirType::get_i32())
+            };
+            ctx.emit(MInst::AluRRR {
+                op: if correction == MagicCorrection::AddNumerator {
+                    AluRRROP::AddW
+                } else {
+                    AluRRROP::SubW
+                },
+                rd: Writable::from_reg(corrected),
+                rs1: high,
+                rs2: lhs,
+            });
+            if magic.shift != 0 {
+                ctx.emit(MInst::AluRRImmShift {
+                    op: AluRRImmShiftOP::SraiW,
+                    rd: Writable::from_reg(shifted),
+                    rs: corrected,
+                    shamt: ShiftImm::new(magic.shift).unwrap(),
+                });
+            }
+        }
+    }
+
+    // The shifts round toward negative infinity; adding the sign bit turns
+    // that into the truncating quotient SysY requires.
+    let sign = ctx.alloc_tmp(HirType::get_i32());
+    ctx.emit(MInst::AluRRImmShift {
+        op: AluRRImmShiftOP::SrliW,
+        rd: Writable::from_reg(sign),
+        rs: shifted,
+        shamt: ShiftImm::new(31).unwrap(),
+    });
+    let quotient = if op == BinaryOp::Rem {
+        ctx.alloc_tmp(HirType::get_i32())
+    } else {
+        rd.to_reg()
+    };
+    ctx.emit(MInst::AluRRR {
+        op: AluRRROP::AddW,
+        rd: Writable::from_reg(quotient),
+        rs1: shifted,
+        rs2: sign,
+    });
+
+    if op == BinaryOp::Rem {
+        let divisor_reg = ctx.alloc_tmp(HirType::get_i32());
+        ctx.emit(MInst::LoadImm {
+            rd: Writable::from_reg(divisor_reg),
+            value: i64::from(divisor) as u64,
+        });
+        let scaled = ctx.alloc_tmp(HirType::get_i32());
+        ctx.emit(MInst::AluRRR {
+            op: AluRRROP::MulW,
+            rd: Writable::from_reg(scaled),
+            rs1: quotient,
+            rs2: divisor_reg,
+        });
+        ctx.emit(MInst::AluRRR {
+            op: AluRRROP::SubW,
+            rd,
+            rs1: lhs,
+            rs2: scaled,
+        });
+    }
+    true
+}
+
 fn lower_binary(
     ctx: &mut LowerContext<'_, MInst>,
     arena: ArenaContext<'_>,
@@ -280,6 +402,7 @@ fn lower_binary(
             && matches!(bop, BinaryOp::Div | BinaryOp::Rem)
             && integer_constant(arena, binary.rhs()).is_some_and(|divisor| {
                 lower_signed_div_rem_power_of_two(ctx, bop, rd, lhs, divisor)
+                    || lower_signed_div_rem_magic(ctx, bop, rd, lhs, divisor)
             })
         {
             return LoweredOutput::Value(def);
@@ -1070,6 +1193,91 @@ mod tests {
                 assert_eq!(remainder, expected_remainder, "{dividend} % {divisor}");
             }
         }
+    }
+
+    /// Emits `parameter <op> divisor` as a whole function and returns its
+    /// RISC-V assembly.
+    fn compile_constant_binary(op: BinaryOp, divisor: i32) -> String {
+        let mut program = Program::new();
+        let function = program.new_function(
+            HirType::get_i32(),
+            "constant".to_string(),
+            vec![HirType::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data
+            .new_basic_block()
+            .basic_block("entry".to_string(), Vec::new());
+        data.layout_mut().push_bb_back(entry);
+        let numerator = data.params()[0];
+        let constant = data.new_local_inst().integer(divisor);
+        let binary = data.new_local_inst().binary(op, numerator, constant);
+        let ret = data.new_local_inst().ret(Some(binary));
+        data.layout_mut().insert_inst(entry, binary);
+        data.layout_mut().insert_inst(entry, ret);
+        taki_mir::compile::<Riscv64Backend>(&program)
+    }
+
+    #[test]
+    fn division_by_a_constant_replaces_divw_with_a_multiply_high() {
+        for divisor in [3, 7, -7, 100, 1000000007, i32::MAX] {
+            let asm = compile_constant_binary(BinaryOp::Div, divisor);
+            assert!(!asm.contains("divw "), "{divisor}:\n{asm}");
+            assert!(asm.contains("mul "), "{divisor}:\n{asm}");
+            assert!(asm.contains("srai "), "{divisor}:\n{asm}");
+        }
+    }
+
+    #[test]
+    fn remainder_by_a_constant_multiplies_the_quotient_back() {
+        let asm = compile_constant_binary(BinaryOp::Rem, 7);
+        assert!(!asm.contains("remw "), "{asm}");
+        assert!(!asm.contains("divw "), "{asm}");
+        assert!(asm.contains("mulw "), "{asm}");
+        assert!(asm.contains("subw "), "{asm}");
+    }
+
+    #[test]
+    fn cheaper_divisors_keep_their_existing_sequences() {
+        // Powers of two stay on the shift sequence, and a divisor of one
+        // disappears entirely.
+        for divisor in [2, -8, i32::MIN] {
+            for op in [BinaryOp::Div, BinaryOp::Rem] {
+                let asm = compile_constant_binary(op, divisor);
+                assert!(!asm.contains("srai "), "{op:?} {divisor}:\n{asm}");
+                assert!(!asm.contains("divw "), "{op:?} {divisor}:\n{asm}");
+                assert!(!asm.contains("remw "), "{op:?} {divisor}:\n{asm}");
+            }
+        }
+        let asm = compile_constant_binary(BinaryOp::Div, 1);
+        assert!(!asm.contains("srai "), "{asm}");
+        assert!(!asm.contains("divw "), "{asm}");
+    }
+
+    #[test]
+    fn division_by_a_variable_still_uses_divw() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            HirType::get_i32(),
+            "variable".to_string(),
+            vec![HirType::get_i32(), HirType::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data
+            .new_basic_block()
+            .basic_block("entry".to_string(), Vec::new());
+        data.layout_mut().push_bb_back(entry);
+        let numerator = data.params()[0];
+        let divisor = data.params()[1];
+        let binary = data
+            .new_local_inst()
+            .binary(BinaryOp::Div, numerator, divisor);
+        let ret = data.new_local_inst().ret(Some(binary));
+        data.layout_mut().insert_inst(entry, binary);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<Riscv64Backend>(&program);
+        assert!(asm.contains("divw "), "{asm}");
     }
 
     #[test]

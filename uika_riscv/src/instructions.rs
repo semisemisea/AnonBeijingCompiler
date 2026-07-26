@@ -60,7 +60,7 @@ impl MachInst for MInst {
                 collector.reg_def(rd);
             }
             MInst::StoreWord { rs, addr, .. } => {
-                collector.reg_use(rs);
+                use_store_src(collector, rs);
                 if let AMode::RegOffest(base, _) = addr {
                     collector.reg_use(base);
                 }
@@ -132,6 +132,15 @@ impl MachInst for MInst {
         MInst::Jump {
             label: crate::labels::Label::Block(target),
         }
+    }
+}
+
+/// The ABI saves incoming register arguments with stores whose source is the
+/// fixed physical argument register, which the allocator neither renames nor
+/// tracks. Only virtual sources become operands, mirroring the AArch64 backend.
+fn use_store_src(collector: &mut impl taki_mir::reg_alloc::reg::OperandVisitor, reg: &mut Reg) {
+    if reg.is_virtual() {
+        collector.reg_use(reg);
     }
 }
 

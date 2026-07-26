@@ -1,11 +1,11 @@
 //! Typed AArch64 instruction forms and encoding-valid operands.
 
 use taki_mir::{
-    abi::{ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
+    abi::{CallArgPair, CallRetPair, RetPair, StackAMode},
     reg_alloc::reg::{OperandVisitor, OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
     types::{F32, I32, I64, LoweredType},
-    vcode::{CallType, EmitContext, MachInst, MachInstEmit, MachTerminator},
+    vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
 };
 
 use crate::{
@@ -578,9 +578,6 @@ pub enum MInst {
         src2: Reg,
         addr: PairAMode,
     },
-    Args {
-        pairs: Vec<ArgPair>,
-    },
     Call {
         args: Vec<CallArgPair>,
         ret: Option<CallRetPair>,
@@ -828,11 +825,6 @@ impl MachInst for MInst {
                 collector.reg_use(src2);
                 visit_pair_amode(collector, addr);
             }
-            Self::Args { pairs } => {
-                for pair in pairs {
-                    collector.reg_fixed_def(&mut pair.vreg, pair.preg);
-                }
-            }
             Self::Call {
                 args,
                 ret,
@@ -870,19 +862,6 @@ impl MachInst for MInst {
             | Self::Jump { .. } => MachTerminator::Branch,
             _ => MachTerminator::None,
         }
-    }
-    fn call_type(&self) -> CallType {
-        if matches!(self, Self::Call { .. }) {
-            CallType::Call
-        } else {
-            CallType::None
-        }
-    }
-    fn is_mem_access(&self) -> bool {
-        matches!(
-            self,
-            Self::Load { .. } | Self::Store { .. } | Self::LoadPair { .. } | Self::StorePair { .. }
-        )
     }
     fn rc_for_type(ty: LoweredType) -> (&'static [RegClass], &'static [LoweredType]) {
         match ty {
@@ -962,7 +941,7 @@ impl MachInstEmit for MInst {
                 dst,
                 lhs,
                 rhs,
-            } => emit_sized_data_rrr(ctx, alu_name(*op, *size), *size, dst.to_reg(), lhs, rhs),
+            } => emit_sized_data_rrr(ctx, alu_name(*op), *size, dst.to_reg(), lhs, rhs),
             Self::AluRRRR {
                 op,
                 size,
@@ -970,15 +949,7 @@ impl MachInstEmit for MInst {
                 lhs,
                 rhs,
                 carry,
-            } => emit_sized_rrrr(
-                ctx,
-                alu_name(*op, *size),
-                *size,
-                dst.to_reg(),
-                lhs,
-                rhs,
-                carry,
-            ),
+            } => emit_sized_rrrr(ctx, alu_name(*op), *size, dst.to_reg(), lhs, rhs, carry),
             Self::AluRRImm12 {
                 op,
                 size,
@@ -986,7 +957,7 @@ impl MachInstEmit for MInst {
                 src,
                 imm,
             } => {
-                write!(ctx, "{} ", alu_name(*op, *size))?;
+                write!(ctx, "{} ", alu_name(*op))?;
                 emit_reg(ctx, dst.to_reg(), *size)?;
                 write!(ctx, ", ")?;
                 emit_gpr(ctx, src, *size)?;
@@ -1003,7 +974,7 @@ impl MachInstEmit for MInst {
                 src,
                 imm,
             } => {
-                write!(ctx, "{} ", alu_name(*op, *size))?;
+                write!(ctx, "{} ", alu_name(*op))?;
                 emit_reg(ctx, dst.to_reg(), *size)?;
                 write!(ctx, ", ")?;
                 emit_reg_or_zr(ctx, src, *size)?;
@@ -1016,7 +987,7 @@ impl MachInstEmit for MInst {
                 src,
                 shift,
             } => {
-                write!(ctx, "{} ", alu_name(*op, *size))?;
+                write!(ctx, "{} ", alu_name(*op))?;
                 emit_reg(ctx, dst.to_reg(), *size)?;
                 write!(ctx, ", ")?;
                 emit_reg(ctx, *src, *size)?;
@@ -1031,7 +1002,7 @@ impl MachInstEmit for MInst {
                 shift,
                 amount,
             } => {
-                write!(ctx, "{} ", alu_name(*op, *size))?;
+                write!(ctx, "{} ", alu_name(*op))?;
                 emit_reg(ctx, dst.to_reg(), *size)?;
                 write!(ctx, ", ")?;
                 emit_reg_or_zr(ctx, lhs, *size)?;
@@ -1048,7 +1019,7 @@ impl MachInstEmit for MInst {
                 extend,
                 shift,
             } => {
-                write!(ctx, "{} ", alu_name(*op, *size))?;
+                write!(ctx, "{} ", alu_name(*op))?;
                 emit_reg(ctx, dst.to_reg(), *size)?;
                 write!(ctx, ", ")?;
                 emit_gpr(ctx, lhs, *size)?;
@@ -1065,18 +1036,7 @@ impl MachInstEmit for MInst {
                 dst,
                 lhs,
                 rhs,
-            } => emit_sized_rrr(
-                ctx,
-                if *size == OperandSize::Size32 {
-                    "sdiv"
-                } else {
-                    "sdiv"
-                },
-                *size,
-                dst.to_reg(),
-                lhs,
-                rhs,
-            ),
+            } => emit_sized_rrr(ctx, "sdiv", *size, dst.to_reg(), lhs, rhs),
             Self::MAdd {
                 size,
                 dst,
@@ -1308,13 +1268,13 @@ impl MachInstEmit for MInst {
                 emit_float_reg(ctx, *src, false)
             }
             Self::Load { ty, dst, addr } => {
-                write!(ctx, "{} ", load_name(*ty))?;
+                write!(ctx, "ldr ")?;
                 emit_data_reg(ctx, dst.to_reg(), *ty)?;
                 write!(ctx, ", ")?;
                 emit_amode(ctx, addr)
             }
             Self::Store { ty, src, addr } => {
-                write!(ctx, "{} ", store_name(*ty))?;
+                write!(ctx, "str ")?;
                 emit_data_reg(ctx, *src, *ty)?;
                 write!(ctx, ", ")?;
                 emit_amode(ctx, addr)
@@ -1345,7 +1305,7 @@ impl MachInstEmit for MInst {
                 write!(ctx, ", ")?;
                 emit_pair_amode(ctx, addr)
             }
-            Self::Args { .. } | Self::RetVal { .. } => Ok(()),
+            Self::RetVal { .. } => Ok(()),
             Self::Call { label, .. } => {
                 write!(ctx, "bl ")?;
                 label.emit(ctx)
@@ -1376,18 +1336,6 @@ fn emit_select_cmp(ctx: &mut dyn EmitContext, cmp: &SelectCmp) -> core::fmt::Res
     }
 }
 
-fn emit_rr(
-    ctx: &mut dyn EmitContext,
-    op: &str,
-    dst: Reg,
-    src: &Reg,
-    size: OperandSize,
-) -> core::fmt::Result {
-    write!(ctx, "{op} ")?;
-    emit_reg(ctx, dst, size)?;
-    write!(ctx, ", ")?;
-    emit_reg(ctx, *src, size)
-}
 fn emit_load_imm(
     ctx: &mut dyn EmitContext,
     dst: Reg,
@@ -1443,20 +1391,6 @@ fn emit_load_imm(
         }
     }
     Ok(())
-}
-fn emit_rrr(
-    ctx: &mut dyn EmitContext,
-    op: &str,
-    dst: Reg,
-    lhs: &Reg,
-    rhs: &Reg,
-) -> core::fmt::Result {
-    write!(ctx, "{op} ")?;
-    ctx.write_reg(&dst)?;
-    write!(ctx, ", ")?;
-    ctx.write_reg(lhs)?;
-    write!(ctx, ", ")?;
-    ctx.write_reg(rhs)
 }
 fn emit_float_rr(ctx: &mut dyn EmitContext, op: &str, dst: Reg, src: &Reg) -> core::fmt::Result {
     write!(ctx, "{op} ")?;
@@ -1678,7 +1612,7 @@ fn emit_pair_amode(ctx: &mut dyn EmitContext, addr: &PairAMode) -> core::fmt::Re
         }
     }
 }
-fn alu_name(op: AluOp, _size: OperandSize) -> &'static str {
+fn alu_name(op: AluOp) -> &'static str {
     match op {
         AluOp::Add => "add",
         AluOp::Sub => "sub",
@@ -1823,17 +1757,6 @@ fn fpu_name(op: FpuOp) -> &'static str {
         FpuOp::Div => "fdiv",
     }
 }
-fn load_name(ty: MemoryType) -> &'static str {
-    match ty {
-        MemoryType::I32 | MemoryType::I64 | MemoryType::F32 | MemoryType::F64 => "ldr",
-    }
-}
-fn store_name(ty: MemoryType) -> &'static str {
-    match ty {
-        MemoryType::I32 | MemoryType::I64 | MemoryType::F32 | MemoryType::F64 => "str",
-    }
-}
-
 fn pair_access_size(addr: &PairAMode) -> u8 {
     match addr {
         PairAMode::SignedOffset { offset, .. }

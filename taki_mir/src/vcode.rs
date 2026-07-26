@@ -30,16 +30,6 @@ pub enum MachTerminator {
     Branch,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum CallType {
-    /// Not a call
-    None,
-    /// Normal call
-    Call,
-    /// Tail Call
-    TailCall,
-}
-
 pub trait MachInst: Clone + Debug {
     type ABISpec: ABIMachineSpec<I = Self>;
 
@@ -49,10 +39,6 @@ pub trait MachInst: Clone + Debug {
     fn is_move(&self) -> Option<(Writable<Reg>, Reg)>;
 
     fn is_term(&self) -> MachTerminator;
-
-    fn call_type(&self) -> CallType;
-
-    fn is_mem_access(&self) -> bool;
 
     fn rc_for_type(ty: LoweredType) -> (&'static [RegClass], &'static [LoweredType]);
 
@@ -912,14 +898,6 @@ mod tests {
             }
         }
 
-        fn call_type(&self) -> CallType {
-            CallType::None
-        }
-
-        fn is_mem_access(&self) -> bool {
-            false
-        }
-
         fn rc_for_type(ty: LoweredType) -> (&'static [RegClass], &'static [LoweredType]) {
             match ty {
                 I64 => (&[RegClass::Int], &[I64]),
@@ -973,23 +951,7 @@ mod tests {
             TestInst::LoadImm { rd: dst }
         }
 
-        fn gen_args(_args: Vec<crate::abi::ArgPair>) -> Self::I {
-            TestInst::Nop
-        }
-
-        fn gen_ret() -> Self::I {
-            TestInst::Ret
-        }
-
         fn gen_store_stack(_src: Reg, _mem: StackAMode, _ty: LoweredType) -> Self::I {
-            TestInst::Nop
-        }
-
-        fn gen_jump(_block: HirBasicBlock) -> Self::I {
-            TestInst::Jump
-        }
-
-        fn gen_nop() -> Self::I {
             TestInst::Nop
         }
 

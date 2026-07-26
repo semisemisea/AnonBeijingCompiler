@@ -1,11 +1,11 @@
 use smallvec::SmallVec;
 
 use taki_mir::{
-    abi::{ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
+    abi::{CallArgPair, CallRetPair, RetPair, StackAMode},
     reg_alloc::reg::{OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
     types::{F32, I32, I64, LoweredType},
-    vcode::{CallType, EmitContext, MachInst, MachInstEmit, MachTerminator},
+    vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
 };
 
 use crate::{abi::Riscv64ABI, labels::Label};
@@ -79,11 +79,6 @@ impl MachInst for MInst {
                 }
                 collector.reg_clobbers(call_clobbers(*clobbers, ret.as_ref()));
             }
-            MInst::Args { pairs } => {
-                for pair in pairs {
-                    collector.reg_fixed_def(&mut pair.vreg, pair.preg);
-                }
-            }
             MInst::Ret => {}
             MInst::RetVal { pair } => {
                 collector.reg_fixed_use(&mut pair.vreg, pair.preg);
@@ -117,17 +112,6 @@ impl MachInst for MInst {
             MInst::Ret => MachTerminator::Return,
             _ => MachTerminator::None,
         }
-    }
-
-    fn call_type(&self) -> taki_mir::vcode::CallType {
-        match self {
-            MInst::Call { .. } => CallType::Call,
-            _ => CallType::None,
-        }
-    }
-
-    fn is_mem_access(&self) -> bool {
-        matches!(self, MInst::LoadWord { .. } | MInst::StoreWord { .. })
     }
 
     fn rc_for_type(
@@ -242,7 +226,6 @@ impl MachInstEmit for MInst {
                 write!(ctx, "call ")?;
                 label.emit(ctx)
             }
-            MInst::Args { .. } => write!(ctx, "# args"),
             MInst::Ret => write!(ctx, "ret"),
             MInst::RetVal { .. } => Ok(()),
             MInst::Jump { label } => {
@@ -382,9 +365,6 @@ pub enum MInst {
         ret: Option<CallRetPair>,
         clobbers: PRegSet,
         label: Label,
-    },
-    Args {
-        pairs: SmallVec<[ArgPair; 8]>,
     },
     Ret,
     RetVal {

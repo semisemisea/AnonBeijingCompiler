@@ -110,8 +110,6 @@ type EdgeSet = HashSet<(BId, BId)>;
 type FlowWorklist = VecDeque<(BId, BId)>;
 type SSAWorklist = VecDeque<Inst>;
 
-const REMOVE_FLAG: bool = true;
-
 impl Pass for SparseConditionConstantPropagation {
     fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
         let Some(entry_bb) = data.layout().entry_bb() else {
@@ -177,154 +175,150 @@ impl Pass for SparseConditionConstantPropagation {
             }
         }
 
-        if REMOVE_FLAG {
-            let replace_list = data
-                .layout()
-                .basicblocks()
-                .iter()
-                .flat_map(|layout| layout.insts().iter())
-                .filter(|&&inst| value_status_map.get_safe(inst).is_some())
-                .copied()
-                .collect_vec();
+        let replace_list = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|layout| layout.insts().iter())
+            .filter(|&&inst| value_status_map.get_safe(inst).is_some())
+            .copied()
+            .collect_vec();
 
-            let mut changed = false;
-            for inst in replace_list.into_iter().rev() {
-                let Some(constant) = value_status_map.get(inst).as_const() else {
-                    continue;
-                };
-                data.replace_inst_with(inst).integer(constant);
-                let parent_bb = data.layout().parent_bb(inst).unwrap();
-                data.detach_layout_inst(parent_bb, inst);
-                changed = true;
-            }
-
-            let mut useless_unconditional_list = Vec::new();
-            for layout in data.layout().basicblocks() {
-                let &terminator_inst = layout.insts().get_last().unwrap();
-                if let InstKind::Branch(branch) = data.inst_data(terminator_inst).kind() {
-                    if let InstKind::Integer(..) = data.inst_data(branch.cond()).kind() {
-                        useless_unconditional_list.push(terminator_inst);
-                    }
-                }
-            }
-
-            for t_inst in useless_unconditional_list {
-                let InstKind::Branch(branch) = data.inst_data(t_inst).kind() else {
-                    unreachable!()
-                };
-                let InstKind::Integer(int) = data.inst_data(branch.cond()).kind() else {
-                    unreachable!()
-                };
-                let (target, args) = if int.value() == 0 {
-                    (branch.f_target(), branch.f_args().to_vec())
-                } else {
-                    (branch.t_target(), branch.t_args().to_vec())
-                };
-                data.replace_inst_with(t_inst).jump(target, args);
-                changed = true;
-            }
-
-            let remove_list = data
-                .layout()
-                .basicblocks()
-                .iter()
-                .map(|l| l.bb())
-                .filter(|&bb| {
-                    bb != data.layout().entry_bb().unwrap().bb()
-                        && data.bb_data(bb).used_by().is_empty()
-                })
-                .collect::<Vec<_>>();
-            for bb in remove_list {
-                data.remove_layout_basicblock(bb);
-                // data.remove_bb(bb);
-                changed = true;
-            }
-
-            let ubb = super::dce::UnreachableBasicBlock;
-            changed |= ubb.run_on(data);
-
-            let mut useless_phi_list = Vec::new();
-            for layout in data.layout().basicblocks() {
-                let bb_data = data.bb_data(layout.bb());
-                if !bb_data.params().is_empty() {
-                    let jump_insts = bb_data
-                        .used_by()
-                        .iter()
-                        .filter(|&&inst| {
-                            data.layout().parent_bb(inst).is_some_and(|bb| {
-                                data.layout()
-                                    .basicblocks()
-                                    .iter()
-                                    .map(|l| l.bb())
-                                    .contains(&bb)
-                            })
-                        })
-                        .copied()
-                        .collect::<Vec<_>>();
-                    if jump_insts.len() == 1 {
-                        useless_phi_list.push((layout.bb(), jump_insts[0]));
-                    }
-                }
-            }
-
-            for (bb, jump_inst) in useless_phi_list {
-                let params = data.bb_data(bb).params().to_vec();
-                let args = match data.inst_data(jump_inst).kind() {
-                    InstKind::Jump(jump) => jump.args(),
-                    InstKind::Branch(branch) => {
-                        if branch.t_target() == bb {
-                            branch.t_args()
-                        } else {
-                            branch.f_args()
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-                .to_vec();
-                for (arg, param) in args.into_iter().zip(params) {
-                    visit_and_replace(data, param, arg);
-                    // data.bb_data_mut(bb).params_mut().retain(|&x| x != param);
-                }
-                // TODO: Is this correct for used_by?
-                data.bb_data_mut(bb).params_mut().clear();
-                match data.inst_data(jump_inst).kind() {
-                    InstKind::Jump(jump) => {
-                        let target_bb = jump.target();
-                        data.replace_inst_with(jump_inst).jump(target_bb, vec![]);
-                    }
-                    InstKind::Branch(branch) => {
-                        if branch.t_target() == bb {
-                            let f_args = branch.f_args().to_vec();
-                            let f_target = branch.f_target();
-                            let cond = branch.cond();
-                            data.replace_inst_with(jump_inst).branch(
-                                cond,
-                                bb,
-                                vec![],
-                                f_target,
-                                f_args,
-                            );
-                        } else {
-                            let t_args = branch.t_args().to_vec();
-                            let t_target = branch.t_target();
-                            let cond = branch.cond();
-                            data.replace_inst_with(jump_inst).branch(
-                                cond,
-                                t_target,
-                                t_args,
-                                bb,
-                                vec![],
-                            );
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-                changed = true;
-            }
-            changed
-        } else {
-            false
+        let mut changed = false;
+        for inst in replace_list.into_iter().rev() {
+            let Some(constant) = value_status_map.get(inst).as_const() else {
+                continue;
+            };
+            data.replace_inst_with(inst).integer(constant);
+            let parent_bb = data.layout().parent_bb(inst).unwrap();
+            data.detach_layout_inst(parent_bb, inst);
+            changed = true;
         }
+
+        let mut useless_unconditional_list = Vec::new();
+        for layout in data.layout().basicblocks() {
+            let &terminator_inst = layout.insts().get_last().unwrap();
+            if let InstKind::Branch(branch) = data.inst_data(terminator_inst).kind() {
+                if let InstKind::Integer(..) = data.inst_data(branch.cond()).kind() {
+                    useless_unconditional_list.push(terminator_inst);
+                }
+            }
+        }
+
+        for t_inst in useless_unconditional_list {
+            let InstKind::Branch(branch) = data.inst_data(t_inst).kind() else {
+                unreachable!()
+            };
+            let InstKind::Integer(int) = data.inst_data(branch.cond()).kind() else {
+                unreachable!()
+            };
+            let (target, args) = if int.value() == 0 {
+                (branch.f_target(), branch.f_args().to_vec())
+            } else {
+                (branch.t_target(), branch.t_args().to_vec())
+            };
+            data.replace_inst_with(t_inst).jump(target, args);
+            changed = true;
+        }
+
+        let remove_list = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .map(|l| l.bb())
+            .filter(|&bb| {
+                bb != data.layout().entry_bb().unwrap().bb()
+                    && data.bb_data(bb).used_by().is_empty()
+            })
+            .collect::<Vec<_>>();
+        for bb in remove_list {
+            data.remove_layout_basicblock(bb);
+            // data.remove_bb(bb);
+            changed = true;
+        }
+
+        let ubb = super::dce::UnreachableBasicBlock;
+        changed |= ubb.run_on(data);
+
+        let mut useless_phi_list = Vec::new();
+        for layout in data.layout().basicblocks() {
+            let bb_data = data.bb_data(layout.bb());
+            if !bb_data.params().is_empty() {
+                let jump_insts = bb_data
+                    .used_by()
+                    .iter()
+                    .filter(|&&inst| {
+                        data.layout().parent_bb(inst).is_some_and(|bb| {
+                            data.layout()
+                                .basicblocks()
+                                .iter()
+                                .map(|l| l.bb())
+                                .contains(&bb)
+                        })
+                    })
+                    .copied()
+                    .collect::<Vec<_>>();
+                if jump_insts.len() == 1 {
+                    useless_phi_list.push((layout.bb(), jump_insts[0]));
+                }
+            }
+        }
+
+        for (bb, jump_inst) in useless_phi_list {
+            let params = data.bb_data(bb).params().to_vec();
+            let args = match data.inst_data(jump_inst).kind() {
+                InstKind::Jump(jump) => jump.args(),
+                InstKind::Branch(branch) => {
+                    if branch.t_target() == bb {
+                        branch.t_args()
+                    } else {
+                        branch.f_args()
+                    }
+                }
+                _ => unreachable!(),
+            }
+            .to_vec();
+            for (arg, param) in args.into_iter().zip(params) {
+                visit_and_replace(data, param, arg);
+                // data.bb_data_mut(bb).params_mut().retain(|&x| x != param);
+            }
+            // TODO: Is this correct for used_by?
+            data.bb_data_mut(bb).params_mut().clear();
+            match data.inst_data(jump_inst).kind() {
+                InstKind::Jump(jump) => {
+                    let target_bb = jump.target();
+                    data.replace_inst_with(jump_inst).jump(target_bb, vec![]);
+                }
+                InstKind::Branch(branch) => {
+                    if branch.t_target() == bb {
+                        let f_args = branch.f_args().to_vec();
+                        let f_target = branch.f_target();
+                        let cond = branch.cond();
+                        data.replace_inst_with(jump_inst).branch(
+                            cond,
+                            bb,
+                            vec![],
+                            f_target,
+                            f_args,
+                        );
+                    } else {
+                        let t_args = branch.t_args().to_vec();
+                        let t_target = branch.t_target();
+                        let cond = branch.cond();
+                        data.replace_inst_with(jump_inst).branch(
+                            cond,
+                            t_target,
+                            t_args,
+                            bb,
+                            vec![],
+                        );
+                    }
+                }
+                _ => unreachable!(),
+            }
+            changed = true;
+        }
+        changed
     }
 }
 

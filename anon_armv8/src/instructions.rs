@@ -301,6 +301,28 @@ pub enum Cond {
     Le,
 }
 
+impl Cond {
+    /// The condition that holds exactly when `self` does not.
+    pub fn invert(self) -> Cond {
+        match self {
+            Cond::Eq => Cond::Ne,
+            Cond::Ne => Cond::Eq,
+            Cond::Hs => Cond::Lo,
+            Cond::Lo => Cond::Hs,
+            Cond::Mi => Cond::Pl,
+            Cond::Pl => Cond::Mi,
+            Cond::Vs => Cond::Vc,
+            Cond::Vc => Cond::Vs,
+            Cond::Hi => Cond::Ls,
+            Cond::Ls => Cond::Hi,
+            Cond::Ge => Cond::Lt,
+            Cond::Lt => Cond::Ge,
+            Cond::Gt => Cond::Le,
+            Cond::Le => Cond::Gt,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FpuOp {
     Add,
@@ -1097,31 +1119,10 @@ impl MachInstEmit for MInst {
                 emit_gpr(ctx, src, *size)
             }
             Self::LoadImm { size, dst, value } => emit_load_imm(ctx, dst.to_reg(), *value, *size),
-            Self::MovZ { size, dst, imm } | Self::MovN { size, dst, imm } => {
-                write!(
-                    ctx,
-                    "{} ",
-                    if matches!(self, Self::MovZ { .. }) {
-                        "movz"
-                    } else {
-                        "movn"
-                    }
-                )?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
-                write!(ctx, ", #0x{:x}", imm.bits())?;
-                if imm.shift() != 0 {
-                    write!(ctx, ", lsl #{}", imm.shift())?;
-                }
-                Ok(())
-            }
+            Self::MovZ { size, dst, imm } => emit_move_wide(ctx, "movz", dst.to_reg(), *size, imm),
+            Self::MovN { size, dst, imm } => emit_move_wide(ctx, "movn", dst.to_reg(), *size, imm),
             Self::MovK { size, dst, imm, .. } => {
-                write!(ctx, "movk ")?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
-                write!(ctx, ", #0x{:x}", imm.bits())?;
-                if imm.shift() != 0 {
-                    write!(ctx, ", lsl #{}", imm.shift())?;
-                }
-                Ok(())
+                emit_move_wide(ctx, "movk", dst.to_reg(), *size, imm)
             }
             Self::MovFromZero { size, dst } => {
                 write!(ctx, "mov ")?;
@@ -1148,70 +1149,48 @@ impl MachInstEmit for MInst {
                 write!(ctx, "b.{} ", cond_name(*cond))?;
                 label.emit(ctx)
             }
+            // The mnemonics below are inverted on purpose: the short-reach
+            // branch only skips over the long jump to the taken target.
             Self::Cbz {
                 size,
                 reg,
                 true_label,
                 false_label,
-            }
-            | Self::Cbnz {
+            } => emit_compare_branch(ctx, "cbnz", *reg, *size, None, true_label, false_label),
+            Self::Cbnz {
                 size,
                 reg,
                 true_label,
                 false_label,
-            } => {
-                write!(
-                    ctx,
-                    "{} ",
-                    if matches!(self, Self::Cbz { .. }) {
-                        "cbnz"
-                    } else {
-                        "cbz"
-                    }
-                )?;
-                emit_reg(ctx, *reg, *size)?;
-                // Conditional branches have shorter reach than `b`; skip the
-                // first long jump locally, then use long jumps for both arms.
-                write!(ctx, ", 1f\n    b ")?;
-                true_label.emit(ctx)?;
-                write!(ctx, "\n1:\n    b ")?;
-                false_label.emit(ctx)
-            }
+            } => emit_compare_branch(ctx, "cbz", *reg, *size, None, true_label, false_label),
             Self::Tbz {
                 size,
                 reg,
                 bit,
                 true_label,
                 false_label,
-            }
-            | Self::Tbnz {
+            } => emit_compare_branch(
+                ctx,
+                "tbnz",
+                *reg,
+                *size,
+                Some(*bit),
+                true_label,
+                false_label,
+            ),
+            Self::Tbnz {
                 size,
                 reg,
                 bit,
                 true_label,
                 false_label,
-            } => {
-                write!(
-                    ctx,
-                    "{} ",
-                    if matches!(self, Self::Tbz { .. }) {
-                        "tbnz"
-                    } else {
-                        "tbz"
-                    }
-                )?;
-                emit_reg(ctx, *reg, *size)?;
-                write!(ctx, ", #{bit}, 1f\n    b ")?;
-                true_label.emit(ctx)?;
-                write!(ctx, "\n1:\n    b ")?;
-                false_label.emit(ctx)
-            }
+            } => emit_compare_branch(ctx, "tbz", *reg, *size, Some(*bit), true_label, false_label),
             Self::CondBr {
                 cond,
                 true_label,
                 false_label,
             } => {
-                write!(ctx, "b.{} 1f\n    b ", cond_name(invert_cond(*cond)))?;
+                write!(ctx, "b.{} 1f\n    b ", cond_name(cond.invert()))?;
                 true_label.emit(ctx)?;
                 write!(ctx, "\n1:\n    b ")?;
                 false_label.emit(ctx)
@@ -1354,6 +1333,47 @@ fn emit_select_cmp(ctx: &mut dyn EmitContext, cmp: &SelectCmp) -> core::fmt::Res
     }
 }
 
+/// Emits a `mov{z,n,k}`-shaped instruction: destination, 16-bit immediate and
+/// its optional `lsl` slot.
+fn emit_move_wide(
+    ctx: &mut dyn EmitContext,
+    op: &str,
+    dst: Reg,
+    size: OperandSize,
+    imm: &MoveWideConst,
+) -> core::fmt::Result {
+    write!(ctx, "{op} ")?;
+    emit_reg(ctx, dst, size)?;
+    write!(ctx, ", #0x{:x}", imm.bits())?;
+    if imm.shift() != 0 {
+        write!(ctx, ", lsl #{}", imm.shift())?;
+    }
+    Ok(())
+}
+/// Emits a compare-and-branch pseudo (`cbz`/`cbnz`, or `tbz`/`tbnz` when `bit`
+/// is set) as a local skip over the long jump to the taken target.
+///
+/// Conditional branches have shorter reach than `b`, so `op` must already be
+/// the *inverse* of the tested condition.
+fn emit_compare_branch(
+    ctx: &mut dyn EmitContext,
+    op: &str,
+    reg: Reg,
+    size: OperandSize,
+    bit: Option<u8>,
+    true_label: &Label,
+    false_label: &Label,
+) -> core::fmt::Result {
+    write!(ctx, "{op} ")?;
+    emit_reg(ctx, reg, size)?;
+    if let Some(bit) = bit {
+        write!(ctx, ", #{bit}")?;
+    }
+    write!(ctx, ", 1f\n    b ")?;
+    true_label.emit(ctx)?;
+    write!(ctx, "\n1:\n    b ")?;
+    false_label.emit(ctx)
+}
 fn emit_load_imm(
     ctx: &mut dyn EmitContext,
     dst: Reg,
@@ -1381,30 +1401,14 @@ fn emit_load_imm(
                 emit_gpr(ctx, &Gpr::Zr, size)?;
                 write!(ctx, ", #0x{:x}", imm.value())?;
             }
-            crate::constants::ConstantStep::MovZ(imm)
-            | crate::constants::ConstantStep::MovN(imm) => {
-                write!(
-                    ctx,
-                    "{} ",
-                    if matches!(step, crate::constants::ConstantStep::MovZ(_)) {
-                        "movz"
-                    } else {
-                        "movn"
-                    }
-                )?;
-                emit_reg(ctx, dst, size)?;
-                write!(ctx, ", #0x{:x}", imm.bits())?;
-                if imm.shift() != 0 {
-                    write!(ctx, ", lsl #{}", imm.shift())?;
-                }
+            crate::constants::ConstantStep::MovZ(imm) => {
+                emit_move_wide(ctx, "movz", dst, size, imm)?
+            }
+            crate::constants::ConstantStep::MovN(imm) => {
+                emit_move_wide(ctx, "movn", dst, size, imm)?
             }
             crate::constants::ConstantStep::MovK(imm) => {
-                write!(ctx, "movk ")?;
-                emit_reg(ctx, dst, size)?;
-                write!(ctx, ", #0x{:x}", imm.bits())?;
-                if imm.shift() != 0 {
-                    write!(ctx, ", lsl #{}", imm.shift())?;
-                }
+                emit_move_wide(ctx, "movk", dst, size, imm)?
             }
         }
     }
@@ -1749,24 +1753,6 @@ fn cond_name(cond: Cond) -> &'static str {
     }
 }
 
-fn invert_cond(cond: Cond) -> Cond {
-    match cond {
-        Cond::Eq => Cond::Ne,
-        Cond::Ne => Cond::Eq,
-        Cond::Hs => Cond::Lo,
-        Cond::Lo => Cond::Hs,
-        Cond::Mi => Cond::Pl,
-        Cond::Pl => Cond::Mi,
-        Cond::Vs => Cond::Vc,
-        Cond::Vc => Cond::Vs,
-        Cond::Hi => Cond::Ls,
-        Cond::Ls => Cond::Hi,
-        Cond::Ge => Cond::Lt,
-        Cond::Lt => Cond::Ge,
-        Cond::Gt => Cond::Le,
-        Cond::Le => Cond::Gt,
-    }
-}
 fn fpu_name(op: FpuOp) -> &'static str {
     match op {
         FpuOp::Add => "fadd",

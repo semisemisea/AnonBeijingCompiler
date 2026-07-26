@@ -23,25 +23,17 @@ impl MachInst for MInst {
                 collector.reg_use(rs2);
                 collector.reg_def(rd);
             }
-            MInst::AluRRImm12 { rd, rs, .. } => {
+            MInst::AluRRImm12 { rd, rs, .. }
+            | MInst::AluRRImmShift { rd, rs, .. }
+            | MInst::Slli { rd, rs, .. }
+            | MInst::Srai { rd, rs, .. }
+            | MInst::Fcvt { rd, rs, .. } => {
                 collector.reg_use(rs);
                 collector.reg_def(rd);
             }
-            MInst::AluRRImmShift { rd, rs, .. } => {
-                collector.reg_use(rs);
-                collector.reg_def(rd);
-            }
-            MInst::Slli { rd, rs, .. } | MInst::Srai { rd, rs, .. } => {
-                collector.reg_use(rs);
-                collector.reg_def(rd);
-            }
-            MInst::LoadImm { rd, .. } => {
-                collector.reg_def(rd);
-            }
-            MInst::LoadAddr { rd, .. } => {
-                collector.reg_def(rd);
-            }
-            MInst::StackAddr { rd, .. } => {
+            MInst::LoadImm { rd, .. }
+            | MInst::LoadAddr { rd, .. }
+            | MInst::StackAddr { rd, .. } => {
                 collector.reg_def(rd);
             }
             MInst::LoadWord { rd, addr, .. } => {
@@ -49,10 +41,6 @@ impl MachInst for MInst {
                 if let AMode::RegOffest(base, _) = addr {
                     collector.reg_use(base);
                 }
-            }
-            MInst::Fcvt { rd, rs, .. } => {
-                collector.reg_use(rs);
-                collector.reg_def(rd);
             }
             MInst::FpuRRR { rd, rs1, rs2, .. } => {
                 collector.reg_use(rs1);

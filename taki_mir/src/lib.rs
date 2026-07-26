@@ -12,6 +12,7 @@ use crate::{
 
 pub mod abi;
 pub mod block_order;
+pub mod div_magic;
 pub mod emit;
 pub mod inst_predicate;
 pub mod lower;

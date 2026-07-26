@@ -7,6 +7,7 @@ use raana_ir::ir::{
 use taki_mir::{
     abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::{LoweredBlock, MirBlockIndex},
+    div_magic::{MagicCorrection, signed_magic_i32},
     lower::{LowerBackend, LowerContext, LoweredOutput, analyze_gep},
     prelude::{ArenaContext, HirFunctionData, HirInst},
     reg_alloc::reg::PReg,
@@ -110,6 +111,7 @@ fn lower_binary(
         && matches!(binary.op(), BinaryOp::Div | BinaryOp::Rem)
         && rhs_imm.is_some_and(|divisor| {
             lower_signed_div_rem_power_of_two(ctx, binary.op(), dst, lhs, divisor)
+                || lower_signed_div_rem_magic(ctx, binary.op(), dst, lhs, divisor)
         })
     {
         return LoweredOutput::Value(result);
@@ -1296,6 +1298,124 @@ fn lower_signed_div_rem_power_of_two(
     true
 }
 
+/// Selects a signed division or remainder by a constant that is neither a
+/// power of two nor `0`, `1` or `-1`, replacing `sdiv` with the multiply-high
+/// sequence of [`signed_magic_i32`].
+///
+/// `smull` keeps the full 64-bit product, so the multiply-high and the
+/// magic-number shift collapse into a single arithmetic shift whenever the
+/// multiplier needs no correction term.
+fn lower_signed_div_rem_magic(
+    ctx: &mut LowerContext<'_, MInst>,
+    op: BinaryOp,
+    dst: Writable<taki_mir::register::Reg>,
+    lhs: taki_mir::register::Reg,
+    divisor: i32,
+) -> bool {
+    if !matches!(op, BinaryOp::Div | BinaryOp::Rem) {
+        return false;
+    }
+    let Some(magic) = signed_magic_i32(divisor) else {
+        return false;
+    };
+    let size = OperandSize::Size32;
+
+    let multiplier = ctx.alloc_tmp(HirType::get_i32());
+    ctx.emit(MInst::LoadImm {
+        size,
+        dst: Writable::from_reg(multiplier),
+        value: u64::from(magic.multiplier as u32),
+    });
+    let product = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+    ctx.emit(MInst::SMulL {
+        dst: Writable::from_reg(product),
+        lhs,
+        rhs: multiplier,
+    });
+
+    // Every value below the product fits in 32 bits, so the temporaries stay
+    // `i32` even where an instruction writes the whole 64-bit register.
+    let shifted = ctx.alloc_tmp(HirType::get_i32());
+    match magic.correction {
+        MagicCorrection::None => ctx.emit(MInst::AluRRImmShift {
+            op: AluOp::Asr,
+            size: OperandSize::Size64,
+            dst: Writable::from_reg(shifted),
+            src: product,
+            shift: ImmShift::new(32 + magic.shift, OperandSize::Size64).unwrap(),
+        }),
+        correction => {
+            let high = ctx.alloc_tmp(HirType::get_i32());
+            ctx.emit(MInst::AluRRImmShift {
+                op: AluOp::Asr,
+                size: OperandSize::Size64,
+                dst: Writable::from_reg(high),
+                src: product,
+                shift: ImmShift::new(32, OperandSize::Size64).unwrap(),
+            });
+            let corrected = if magic.shift == 0 {
+                shifted
+            } else {
+                ctx.alloc_tmp(HirType::get_i32())
+            };
+            ctx.emit(MInst::AluRRR {
+                op: if correction == MagicCorrection::AddNumerator {
+                    AluOp::Add
+                } else {
+                    AluOp::Sub
+                },
+                size,
+                dst: Writable::from_reg(corrected),
+                lhs: RegOrZr::Reg(high),
+                rhs: RegOrZr::Reg(lhs),
+            });
+            if magic.shift != 0 {
+                ctx.emit(MInst::AluRRImmShift {
+                    op: AluOp::Asr,
+                    size,
+                    dst: Writable::from_reg(shifted),
+                    src: corrected,
+                    shift: ImmShift::new(magic.shift, size).unwrap(),
+                });
+            }
+        }
+    }
+
+    // The shifts round toward negative infinity; adding the sign bit turns
+    // that into the truncating quotient SysY requires.
+    let quotient = if op == BinaryOp::Rem {
+        ctx.alloc_tmp(HirType::get_i32())
+    } else {
+        dst.to_reg()
+    };
+    ctx.emit(MInst::AluRRRShift {
+        op: AluOp::Add,
+        size,
+        dst: Writable::from_reg(quotient),
+        lhs: RegOrZr::Reg(shifted),
+        rhs: RegOrZr::Reg(shifted),
+        shift: ShiftOp::Lsr,
+        amount: ImmShift::new(31, size).unwrap(),
+    });
+
+    if op == BinaryOp::Rem {
+        let divisor_reg = ctx.alloc_tmp(HirType::get_i32());
+        ctx.emit(MInst::LoadImm {
+            size,
+            dst: Writable::from_reg(divisor_reg),
+            value: u64::from(divisor as u32),
+        });
+        ctx.emit(MInst::MSub {
+            size,
+            dst,
+            lhs: quotient,
+            rhs: divisor_reg,
+            subtrahend: lhs,
+        });
+    }
+    true
+}
+
 /// Fold a single-use integer or pointer multiplication into an add/sub
 /// consumer. The sink claim happens only after all shape and type checks, so
 /// a rejected candidate follows normal instruction selection unchanged.
@@ -1674,6 +1794,7 @@ fn float_comparison_cond(op: BinaryOp) -> Cond {
 mod tests {
     use super::signed_power_of_two;
     use crate::instructions::MInst;
+    use raana_ir::ir::{BinaryOp, Program, Type};
     use taki_mir::{
         reg_alloc::reg::{PReg, RegClass, SpillSlot},
         register::{Reg, VRegAllocator},
@@ -1761,6 +1882,87 @@ mod tests {
         let spill = Reg::from_spillslot(SpillSlot::new(0));
 
         allocator.set_reg_alias(source, spill);
+    }
+
+    /// Emits `parameter <op> divisor` as a whole function and returns its
+    /// AArch64 assembly.
+    fn compile_constant_binary(op: BinaryOp, divisor: i32) -> String {
+        use raana_ir::ir::arena::Arena;
+        use raana_ir::ir::builder_trait::*;
+
+        let mut program = Program::new();
+        let function =
+            program.new_function(Type::get_i32(), "constant".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let numerator = data.params()[0];
+        let constant = data.new_local_inst().integer(divisor);
+        let binary = data.new_local_inst().binary(op, numerator, constant);
+        let ret = data.new_local_inst().ret(Some(binary));
+        data.layout_mut().insert_inst(entry, binary);
+        data.layout_mut().insert_inst(entry, ret);
+        taki_mir::compile::<crate::lower::AArch64Backend>(&program)
+    }
+
+    #[test]
+    fn division_by_a_constant_replaces_sdiv_with_a_multiply_high() {
+        for divisor in [3, 7, -7, 100, 1000000007, i32::MAX] {
+            let assembly = compile_constant_binary(BinaryOp::Div, divisor);
+            assert!(!assembly.contains("sdiv"), "{divisor}:\n{assembly}");
+            assert!(assembly.contains("smull"), "{divisor}:\n{assembly}");
+        }
+    }
+
+    #[test]
+    fn remainder_by_a_constant_multiplies_the_quotient_back() {
+        let assembly = compile_constant_binary(BinaryOp::Rem, 7);
+        assert!(!assembly.contains("sdiv"), "{assembly}");
+        assert!(assembly.contains("smull"), "{assembly}");
+        assert!(assembly.contains("msub"), "{assembly}");
+    }
+
+    #[test]
+    fn cheaper_divisors_keep_their_existing_sequences() {
+        // Powers of two stay on the shift sequence, and a divisor of one
+        // disappears entirely.
+        for divisor in [2, -8, i32::MIN] {
+            for op in [BinaryOp::Div, BinaryOp::Rem] {
+                let assembly = compile_constant_binary(op, divisor);
+                assert!(!assembly.contains("smull"), "{op:?} {divisor}:\n{assembly}");
+                assert!(!assembly.contains("sdiv"), "{op:?} {divisor}:\n{assembly}");
+            }
+        }
+        let assembly = compile_constant_binary(BinaryOp::Div, 1);
+        assert!(!assembly.contains("smull"), "{assembly}");
+        assert!(!assembly.contains("sdiv"), "{assembly}");
+    }
+
+    #[test]
+    fn division_by_a_variable_still_uses_sdiv() {
+        use raana_ir::ir::arena::Arena;
+        use raana_ir::ir::builder_trait::*;
+
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "variable".into(),
+            vec![Type::get_i32(), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let numerator = data.params()[0];
+        let divisor = data.params()[1];
+        let binary = data
+            .new_local_inst()
+            .binary(BinaryOp::Div, numerator, divisor);
+        let ret = data.new_local_inst().ret(Some(binary));
+        data.layout_mut().insert_inst(entry, binary);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+        assert!(assembly.contains("sdiv"), "{assembly}");
     }
 
     #[test]

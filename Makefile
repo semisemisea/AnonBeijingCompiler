@@ -1,4 +1,6 @@
 IMAGE ?= soyo-test-tools
+IMAGE_STAMP ?= .docker-image
+DOCKERFILE_CHECKSUM := $(shell cksum Dockerfile)
 CONTAINER ?= soyo-test
 RESULTS ?= results
 ARGS ?=
@@ -73,7 +75,7 @@ help:
 	@printf '%s\n' 'make run-elf path/to/program.elf  Execute an AArch64 ELF in the test container.'
 	@printf '%s\n' 'make debug-elf path/to/program.elf Start the AArch64 QEMU/GDB workflow.'
 
-test: test-compiler build-lib .docker-image
+test: test-compiler build-lib test-image
 	mkdir -p "$(RESULTS)"
 	@cleanup() { $(DOCKER) rm -f "$(CONTAINER)" >/dev/null 2>&1 || true; }; \
 	trap cleanup EXIT INT TERM; \
@@ -86,7 +88,7 @@ test: test-compiler build-lib .docker-image
 		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
 		"$(IMAGE)" $(ARGS) $(TESTS) $(TEST_ARGS)
 
-test-llvm: test-compiler build-lib .docker-image
+test-llvm: test-compiler build-lib test-image
 	mkdir -p "$(RESULTS)"
 	@cleanup() { $(DOCKER) rm -f "$(CONTAINER)" >/dev/null 2>&1 || true; }; \
 	trap cleanup EXIT INT TERM; \
@@ -100,7 +102,7 @@ test-llvm: test-compiler build-lib .docker-image
 		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
 		"$(IMAGE)" --backend llvm $(ARGS) $(TESTS) $(TEST_ARGS)
 
-test-riscv: test-compiler build-lib-riscv .docker-image
+test-riscv: test-compiler build-lib-riscv test-image
 	mkdir -p "$(RESULTS)"
 	@cleanup() { $(DOCKER) rm -f "$(CONTAINER)" >/dev/null 2>&1 || true; }; \
 	trap cleanup EXIT INT TERM; \
@@ -113,7 +115,7 @@ test-riscv: test-compiler build-lib-riscv .docker-image
 		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
 		"$(IMAGE)" --target riscv64 $(ARGS) $(TESTS) $(TEST_ARGS)
 
-run-elf: .docker-image
+run-elf: test-image
 	@if [ -z "$(RUN_ELF)" ]; then \
 		printf 'usage: make run-elf path/to/program.elf\n' >&2; \
 		exit 2; \
@@ -127,7 +129,7 @@ run-elf: .docker-image
 		--entrypoint qemu-aarch64-static \
 		"$(IMAGE)" "/work/program.elf"
 
-debug-elf: .docker-image
+debug-elf: test-image
 	@if [ -z "$(DEBUG_ELF)" ]; then \
 		printf 'usage: make debug-elf path/to/program.elf\n' >&2; \
 		exit 2; \
@@ -144,7 +146,7 @@ debug-elf: .docker-image
 			-ex "layout asm" \
 			-ex "focus cmd"'
 
-run-elf-riscv: .docker-image
+run-elf-riscv: test-image
 	@if [ -z "$(RUN_ELF_RISCV)" ]; then \
 		printf 'usage: make run-elf-riscv path/to/program.elf\n' >&2; \
 		exit 2; \
@@ -158,7 +160,7 @@ run-elf-riscv: .docker-image
 		--entrypoint qemu-riscv64-static \
 		"$(IMAGE)" "/work/program.elf"
 
-debug-elf-riscv: .docker-image
+debug-elf-riscv: test-image
 	@if [ -z "$(DEBUG_ELF_RISCV)" ]; then \
 		printf 'usage: make debug-elf-riscv path/to/program.elf\n' >&2; \
 		exit 2; \
@@ -175,26 +177,32 @@ debug-elf-riscv: .docker-image
 			-ex "layout asm" \
 			-ex "focus cmd"'
 
-# Build the test image if it doesn't exist or if Dockerfile/tests/test.py have changed
-test-image: .docker-image
-
-.docker-image: Dockerfile tests/test.py
-	$(DOCKER) build -f Dockerfile -t "$(IMAGE)" .
-	date '+%Y-%m-%dT%H:%M%z' > .docker-image
+# Build the test image if the tag is missing or the Dockerfile has changed.
+# The stamp records a checksum rather than a timestamp: cloning the repository
+# or switching branches rewrites file mtimes, which used to leave a stale image
+# in place while `make` believed it was current. The harness itself is no longer
+# baked into the image, so editing tests/test.py needs no rebuild.
+test-image:
+	@if [ "$$(cat "$(IMAGE_STAMP)" 2>/dev/null)" = "$(DOCKERFILE_CHECKSUM)" ] \
+		&& $(DOCKER) image inspect "$(IMAGE)" >/dev/null 2>&1; then \
+		exit 0; \
+	fi; \
+	$(DOCKER) build -f Dockerfile -t "$(IMAGE)" . \
+		&& printf '%s\n' "$(DOCKERFILE_CHECKSUM)" > "$(IMAGE_STAMP)"
 
 test-compiler:
 	@echo "Building soyo_compiler..."
 	@$(CARGO_TARGET_LINKER) cargo build -p soyo_compiler --release --target "$(MUSL_TARGET)" --target-dir "$(HOST_TARGET_DIR)" --quiet >/dev/null 2>&1
 	@echo "Built soyo_compiler at $(COMPILER)"
 
-build-lib: .docker-image
+build-lib: test-image
 	$(DOCKER) run --rm -u "$$(id -u):$$(id -g)" \
 		-v "$(CURDIR)/sysylib:/work/sysylib" \
 		-w /work/sysylib \
 		--entrypoint /bin/sh \
 		"$(IMAGE)" -c 'aarch64-linux-gnu-gcc -c sylib.c -o sylib_arm.o && aarch64-linux-gnu-ar rcs libsysy_arm.a sylib_arm.o'
 
-build-lib-riscv: .docker-image
+build-lib-riscv: test-image
 	$(DOCKER) run --rm -u "$$(id -u):$$(id -g)" \
 		-v "$(CURDIR)/sysylib:/work/sysylib" \
 		-w /work/sysylib \

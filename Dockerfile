@@ -22,7 +22,6 @@ RUN apt-get update \
 
 WORKDIR /work
 
-COPY ./tests/test.py /usr/local/bin/soyo-test
-RUN chmod +x /usr/local/bin/soyo-test
-
-ENTRYPOINT ["/usr/local/bin/soyo-test"]
+# The harness runs from the mounted tests directory instead of a baked-in copy,
+# so editing tests/test.py takes effect without rebuilding this image.
+ENTRYPOINT ["python3", "/work/tests/test.py"]

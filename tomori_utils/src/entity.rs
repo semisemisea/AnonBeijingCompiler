@@ -4,6 +4,14 @@ pub trait EntityRef: Copy + Eq {
     fn index(self) -> usize;
 }
 
+/// Types that have a reserved value which can't be created any other way.
+pub trait ReservedValue {
+    /// Create an instance of the reserved value.
+    fn reserved_value() -> Self;
+    /// Checks whether value is the reserved one.
+    fn is_reserved_value(&self) -> bool;
+}
+
 #[macro_export]
 macro_rules! entity_impl {
     // Basic traits.
@@ -21,7 +29,7 @@ macro_rules! entity_impl {
             }
         }
 
-        impl $crate::packed_option::ReservedValue for $entity {
+        impl $crate::entity::ReservedValue for $entity {
             #[inline]
             fn reserved_value() -> $entity {
                 $entity(::core::u32::MAX)
@@ -100,7 +108,7 @@ macro_rules! entity_impl {
             }
         }
 
-        impl $crate::packed_option::ReservedValue for $entity {
+        impl $crate::entity::ReservedValue for $entity {
             #[inline]
             fn reserved_value() -> $entity {
                 $entity::from_u32(::core::u32::MAX)

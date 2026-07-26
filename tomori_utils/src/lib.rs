@@ -1,7 +1,5 @@
 pub mod entity;
 pub mod iter;
-pub mod list;
-pub mod packed_option;
 pub mod primary_map;
 pub mod ranges;
 pub mod secondary_map;

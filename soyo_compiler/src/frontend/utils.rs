@@ -6,7 +6,11 @@
 pub trait ToRaanaIR {
     fn convert(&self, ctx: &mut AstGenContext);
 
-    fn global_convert(&self, ctx: &mut AstGenContext);
+    /// Most nodes only appear inside function bodies, so the default is to
+    /// reject them; nodes that can occur at global scope override this.
+    fn global_convert(&self, _ctx: &mut AstGenContext) {
+        unreachable!("No corresponding syntax")
+    }
 }
 
 use super::items::*;
@@ -356,55 +360,17 @@ impl AstGenContext {
         self.insert_func(std::rc::Rc::from("stoptime"), stoptime);
     }
 
-    #[inline]
-    fn local_val_as_i32(&self, inst: Inst) -> Option<i32> {
-        debug_assert!(!inst.is_global());
-        match self.inst_data(inst).kind() {
-            InstKind::Integer(int) => Some(int.value()),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn global_val_as_i32(&self, inst: Inst) -> Option<i32> {
-        debug_assert!(inst.is_global());
-        match self.inst_data(inst).kind() {
-            InstKind::Integer(int) => Some(int.value()),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn local_val_as_f32(&self, inst: Inst) -> Option<f32> {
-        debug_assert!(!inst.is_global());
-        match self.inst_data(inst).kind() {
-            InstKind::Float(float) => Some(float.value()),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn global_val_as_f32(&self, inst: Inst) -> Option<f32> {
-        debug_assert!(inst.is_global());
-        match self.inst_data(inst).kind() {
-            InstKind::Float(float) => Some(float.value()),
-            _ => None,
-        }
-    }
-
     pub fn as_i32(&self, val: Inst) -> Option<i32> {
-        if val.is_global() {
-            self.global_val_as_i32(val)
-        } else {
-            self.local_val_as_i32(val)
+        match self.inst_data(val).kind() {
+            InstKind::Integer(int) => Some(int.value()),
+            _ => None,
         }
     }
 
     pub fn as_f32(&self, val: Inst) -> Option<f32> {
-        if val.is_global() {
-            self.global_val_as_f32(val)
-        } else {
-            self.local_val_as_f32(val)
+        match self.inst_data(val).kind() {
+            InstKind::Float(float) => Some(float.value()),
+            _ => None,
         }
     }
 
@@ -448,30 +414,44 @@ impl AstGenContext {
         }
     }
 
-    pub fn coerce_local(&mut self, val: Inst, ty: &Type) -> Inst {
+    /// The part of `coerce_local` / `coerce_global` that needs no `cast`: `val`
+    /// already has type `ty`, or it is a constant that can be folded into the
+    /// global or local arena. Returns `None` when a real conversion is needed.
+    fn coerce_const(&mut self, val: Inst, ty: &Type, global: bool) -> Option<Inst> {
         let from_ty = self.inst_data(val).ty().clone();
         if from_ty == *ty {
-            return val;
+            return Some(val);
         }
         assert!(
             from_ty.is_scalar() && ty.is_scalar(),
             "Cannot convert {from_ty} to {ty}"
         );
         if ty.is_i32() {
-            if let Some(int) = self.as_i32(val) {
-                return self.new_local_value().integer(int);
-            }
-            if let Some(float) = self.as_f32(val) {
-                return self.new_local_value().integer(float as i32);
-            }
+            let int = self
+                .as_i32(val)
+                .or_else(|| self.as_f32(val).map(|float| float as i32))?;
+            return Some(if global {
+                self.new_global_value().integer(int)
+            } else {
+                self.new_local_value().integer(int)
+            });
         }
         if ty.is_f32() {
-            if let Some(float) = self.as_f32(val) {
-                return self.new_local_value().float(float);
-            }
-            if let Some(int) = self.as_i32(val) {
-                return self.new_local_value().float(int as f32);
-            }
+            let float = self
+                .as_f32(val)
+                .or_else(|| self.as_i32(val).map(|int| int as f32))?;
+            return Some(if global {
+                self.new_global_value().float(float)
+            } else {
+                self.new_local_value().float(float)
+            });
+        }
+        None
+    }
+
+    pub fn coerce_local(&mut self, val: Inst, ty: &Type) -> Inst {
+        if let Some(folded) = self.coerce_const(val, ty, false) {
+            return folded;
         }
         let cast = self.new_local_value().cast(val, ty.clone());
         self.push_inst(cast);
@@ -479,31 +459,8 @@ impl AstGenContext {
     }
 
     pub fn coerce_global(&mut self, val: Inst, ty: &Type) -> Inst {
-        let from_ty = self.inst_data(val).ty().clone();
-        if from_ty == *ty {
-            return val;
-        }
-        assert!(
-            from_ty.is_scalar() && ty.is_scalar(),
-            "Cannot convert {from_ty} to {ty}"
-        );
-        if ty.is_i32() {
-            if let Some(int) = self.as_i32(val) {
-                return self.new_global_value().integer(int);
-            }
-            if let Some(float) = self.as_f32(val) {
-                return self.new_global_value().integer(float as i32);
-            }
-        }
-        if ty.is_f32() {
-            if let Some(float) = self.as_f32(val) {
-                return self.new_global_value().float(float);
-            }
-            if let Some(int) = self.as_i32(val) {
-                return self.new_global_value().float(int as f32);
-            }
-        }
-        unreachable!("global values must be compile-time constants")
+        self.coerce_const(val, ty, true)
+            .unwrap_or_else(|| unreachable!("global values must be compile-time constants"))
     }
 
     pub fn truthy_local(&mut self, val: Inst) -> Inst {

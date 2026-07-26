@@ -16,35 +16,10 @@ fn binary_requires_int(op: BinaryOp) -> bool {
 }
 
 fn eval_i32_binary(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
-    match op {
-        BinaryOp::NotEq => (lhs != rhs) as i32,
-        BinaryOp::Eq => (lhs == rhs) as i32,
-        BinaryOp::Gt => (lhs > rhs) as i32,
-        BinaryOp::Lt => (lhs < rhs) as i32,
-        BinaryOp::Ge => (lhs >= rhs) as i32,
-        BinaryOp::Le => (lhs <= rhs) as i32,
-        BinaryOp::Add => lhs.wrapping_add(rhs),
-        BinaryOp::Sub => lhs.wrapping_sub(rhs),
-        BinaryOp::Mul => lhs.wrapping_mul(rhs),
-        BinaryOp::Div => {
-            if rhs == 0 {
-                panic!("Division by zero");
-            }
-            lhs.wrapping_div(rhs)
-        }
-        BinaryOp::Rem => {
-            if rhs == 0 {
-                panic!("Modulo by zero");
-            }
-            lhs.wrapping_rem(rhs)
-        }
-        BinaryOp::And => lhs & rhs,
-        BinaryOp::Or => lhs | rhs,
-        BinaryOp::Xor => lhs ^ rhs,
-        BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
-        BinaryOp::Shr => (lhs as u32).wrapping_shr(rhs as u32) as i32,
-        BinaryOp::Sar => lhs.wrapping_shr(rhs as u32),
-    }
+    op.eval_i32(lhs, rhs).unwrap_or_else(|| match op {
+        BinaryOp::Rem => panic!("Modulo by zero"),
+        _ => panic!("Division by zero"),
+    })
 }
 
 fn eval_f32_binary(op: BinaryOp, lhs: f32, rhs: f32) -> items::Number {
@@ -96,10 +71,6 @@ impl ToRaanaIR for items::CompUnits {
             comp_unit.convert(ctx);
         }
     }
-
-    fn global_convert(&self, _ctx: &mut AstGenContext) {
-        unreachable!("No corresponding syntax")
-    }
 }
 
 impl ToRaanaIR for items::CompUnit {
@@ -109,10 +80,6 @@ impl ToRaanaIR for items::CompUnit {
             items::CompUnit::FuncDef(func_def) => func_def.convert(ctx),
             items::CompUnit::Decl(decl) => decl.global_convert(ctx),
         }
-    }
-
-    fn global_convert(&self, _ctx: &mut AstGenContext) {
-        unreachable!("No corresponding syntax")
     }
 }
 
@@ -172,10 +139,6 @@ impl ToRaanaIR for items::FuncDef {
         ctx.reset_curr_bb();
         ctx.pop_func();
     }
-
-    fn global_convert(&self, _ctx: &mut AstGenContext) {
-        unreachable!("No corresponding syntax")
-    }
 }
 
 impl ToRaanaIR for items::Block {
@@ -190,10 +153,6 @@ impl ToRaanaIR for items::Block {
         }
         ctx.del_scope();
     }
-
-    fn global_convert(&self, _ctx: &mut AstGenContext) {
-        unreachable!("No corresponding syntax")
-    }
 }
 
 impl ToRaanaIR for items::BlockItem {
@@ -206,10 +165,6 @@ impl ToRaanaIR for items::BlockItem {
             items::BlockItem::Decl(decl) => decl.convert(ctx),
             items::BlockItem::Stmt(stmt) => stmt.convert(ctx),
         }
-    }
-
-    fn global_convert(&self, _ctx: &mut AstGenContext) {
-        unreachable!("No corresponding syntax")
     }
 }
 
@@ -632,10 +587,6 @@ impl ToRaanaIR for items::Stmt {
             items::Stmt::Continue(continue_stmt) => continue_stmt.convert(ctx),
         }
     }
-
-    fn global_convert(&self, _ctx: &mut AstGenContext) {
-        unreachable!("No corresponding syntax")
-    }
 }
 
 impl ToRaanaIR for items::Break {
@@ -650,10 +601,6 @@ impl ToRaanaIR for items::Break {
         let jump_to_loop_end = ctx.new_local_value().jump(loop_end, vec![]);
         ctx.push_inst(jump_to_loop_end);
     }
-
-    fn global_convert(&self, _ctx: &mut AstGenContext) {
-        unreachable!("No corresponding syntax")
-    }
 }
 
 impl ToRaanaIR for items::Continue {
@@ -667,10 +614,6 @@ impl ToRaanaIR for items::Continue {
             .0;
         let jump_to_loop_start = ctx.new_local_value().jump(loop_start, vec![]);
         ctx.push_inst(jump_to_loop_start);
-    }
-
-    fn global_convert(&self, _ctx: &mut AstGenContext) {
-        unreachable!("No corresponding syntax")
     }
 }
 
@@ -715,10 +658,6 @@ impl ToRaanaIR for items::WhileStmt {
         ctx.pop_loop();
         ctx.set_curr_bb(end);
     }
-
-    fn global_convert(&self, _ctx: &mut AstGenContext) {
-        unreachable!("No corresponding syntax")
-    }
 }
 
 impl ToRaanaIR for items::ReturnStmt {
@@ -737,10 +676,6 @@ impl ToRaanaIR for items::ReturnStmt {
         };
         let ret = ctx.new_local_value().ret(v_ret);
         ctx.push_inst(ret);
-    }
-
-    fn global_convert(&self, _ctx: &mut AstGenContext) {
-        unreachable!("No corresponding syntax")
     }
 }
 
@@ -785,10 +720,6 @@ impl ToRaanaIR for items::IfStmt {
 
         ctx.set_curr_bb(end_bb);
     }
-
-    fn global_convert(&self, _ctx: &mut AstGenContext) {
-        unreachable!("No corresponding syntax")
-    }
 }
 
 impl ToRaanaIR for items::AssignStmt {
@@ -815,10 +746,6 @@ impl ToRaanaIR for items::AssignStmt {
         );
         let store = ctx.new_local_value().store(rhs_exp, lhs_l_val);
         ctx.push_inst(store);
-    }
-
-    fn global_convert(&self, _ctx: &mut AstGenContext) {
-        unreachable!("No corresponding syntax")
     }
 }
 
@@ -1210,10 +1137,6 @@ impl ToRaanaIR for items::FuncCall {
         if !ctx.inst_data(call).ty().is_unit() {
             ctx.push_val(call);
         }
-    }
-
-    fn global_convert(&self, _ctx: &mut AstGenContext) {
-        unreachable!("No corresponding syntax")
     }
 }
 

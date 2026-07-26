@@ -6,7 +6,7 @@ use crate::ir::arena::Arena;
 use crate::opt::pass::{ArenaContext, Pass};
 
 use crate::ir::{
-    BasicBlock, BinaryOp, FunctionData, Inst, InstKind,
+    BasicBlock, FunctionData, Inst, InstKind,
     builder_trait::{LocalInstBuilder, ScalarInstBuilder},
 };
 
@@ -381,7 +381,10 @@ fn process_instruction(
                 }
                 let lhs = get_constant_or_continue!(binary.lhs());
                 let rhs = get_constant_or_continue!(binary.rhs());
-                let outcome = mathematic_operation(binary.op(), lhs, rhs);
+                let outcome = binary
+                    .op()
+                    .eval_i32(lhs, rhs)
+                    .expect("constant divisor must not be zero");
                 value_status_map
                     .insert_or_merge(inst, VariableStatus::new_with_const(outcome))
                     .then_some(ret_with!(inst))
@@ -498,33 +501,5 @@ fn process_instruction(
             InstKind::Return(..) => None,
             _ => unreachable!(),
         },
-    }
-}
-
-fn mathematic_operation(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
-    match op {
-        BinaryOp::NotEq => (lhs != rhs) as i32,
-        BinaryOp::Eq => (lhs == rhs) as i32,
-        BinaryOp::Gt => (lhs > rhs) as i32,
-        BinaryOp::Lt => (lhs < rhs) as i32,
-        BinaryOp::Ge => (lhs >= rhs) as i32,
-        BinaryOp::Le => (lhs <= rhs) as i32,
-        BinaryOp::Add => lhs.wrapping_add(rhs),
-        BinaryOp::Sub => lhs.wrapping_sub(rhs),
-        BinaryOp::Mul => lhs.wrapping_mul(rhs),
-        BinaryOp::Div => {
-            assert_ne!(rhs, 0);
-            lhs.wrapping_div(rhs)
-        }
-        BinaryOp::Rem => {
-            assert_ne!(rhs, 0);
-            lhs.wrapping_rem(rhs)
-        }
-        BinaryOp::And => lhs & rhs,
-        BinaryOp::Or => lhs | rhs,
-        BinaryOp::Xor => lhs ^ rhs,
-        BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
-        BinaryOp::Shr => (lhs as u32).wrapping_shr(rhs as u32) as i32,
-        BinaryOp::Sar => lhs.wrapping_shr(rhs as u32),
     }
 }

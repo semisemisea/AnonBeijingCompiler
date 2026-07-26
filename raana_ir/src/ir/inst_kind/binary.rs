@@ -80,6 +80,34 @@ impl BinaryOp {
         })
     }
 
+    /// Folds the operator over two `i32` operands, using wrapping arithmetic
+    /// and treating shift amounts modulo the operand width.
+    ///
+    /// Returns `None` for division or remainder by zero; callers decide how to
+    /// report that.
+    pub fn eval_i32(self, lhs: i32, rhs: i32) -> Option<i32> {
+        Some(match self {
+            BinaryOp::NotEq => (lhs != rhs) as i32,
+            BinaryOp::Eq => (lhs == rhs) as i32,
+            BinaryOp::Gt => (lhs > rhs) as i32,
+            BinaryOp::Lt => (lhs < rhs) as i32,
+            BinaryOp::Ge => (lhs >= rhs) as i32,
+            BinaryOp::Le => (lhs <= rhs) as i32,
+            BinaryOp::Add => lhs.wrapping_add(rhs),
+            BinaryOp::Sub => lhs.wrapping_sub(rhs),
+            BinaryOp::Mul => lhs.wrapping_mul(rhs),
+            BinaryOp::Div | BinaryOp::Rem if rhs == 0 => return None,
+            BinaryOp::Div => lhs.wrapping_div(rhs),
+            BinaryOp::Rem => lhs.wrapping_rem(rhs),
+            BinaryOp::And => lhs & rhs,
+            BinaryOp::Or => lhs | rhs,
+            BinaryOp::Xor => lhs ^ rhs,
+            BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
+            BinaryOp::Shr => (lhs as u32).wrapping_shr(rhs as u32) as i32,
+            BinaryOp::Sar => lhs.wrapping_shr(rhs as u32),
+        })
+    }
+
     /// Returns the comparison equivalent to swapping the operands.
     pub fn swap_compare_args(&self) -> Option<Self> {
         Some(match self {
@@ -154,5 +182,15 @@ mod tests {
             assert_eq!(op.swap_compare_args(), Some(swapped));
         }
         assert_eq!(BinaryOp::Add.swap_compare_args(), None);
+    }
+
+    #[test]
+    fn folds_integer_operands() {
+        assert_eq!(BinaryOp::Add.eval_i32(i32::MAX, 1), Some(i32::MIN));
+        assert_eq!(BinaryOp::Div.eval_i32(i32::MIN, -1), Some(i32::MIN));
+        assert_eq!(BinaryOp::Shr.eval_i32(-1, 1), Some(i32::MAX));
+        assert_eq!(BinaryOp::Sar.eval_i32(-1, 1), Some(-1));
+        assert_eq!(BinaryOp::Div.eval_i32(1, 0), None);
+        assert_eq!(BinaryOp::Rem.eval_i32(1, 0), None);
     }
 }

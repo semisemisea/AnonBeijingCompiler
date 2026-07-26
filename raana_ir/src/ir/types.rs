@@ -150,6 +150,17 @@ impl Type {
         }
     }
 
+    /// Same as [`Type::size`], but reports overflow instead of panicking or
+    /// wrapping on absurdly large array types.
+    pub fn checked_size(&self) -> Option<usize> {
+        match self.0.as_ref() {
+            TypeKind::ArgList | TypeKind::Unit => Some(0),
+            TypeKind::Int32 | TypeKind::Float32 => Some(4),
+            TypeKind::Array(base, len) => base.checked_size()?.checked_mul(*len),
+            TypeKind::String | TypeKind::Pointer(..) | TypeKind::Function(..) => Some(POINTER_SIZE),
+        }
+    }
+
     pub fn alignment(&self) -> usize {
         match self.0.as_ref() {
             TypeKind::Int32 | TypeKind::Float32 => 4,

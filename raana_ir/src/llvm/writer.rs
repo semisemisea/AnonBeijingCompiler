@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::fmt::Write;
 
+use crate::fmt::writer::ProgramWrapper;
 use crate::ir::BasicBlock;
 use crate::ir::arena::Arena;
 use crate::ir::{
@@ -20,35 +21,6 @@ pub struct LlvmWriter<'a> {
     name_counter: usize,
     bb_counter: usize,
     used_memset: bool,
-}
-
-struct ProgramWrapper<'a> {
-    program: &'a Program,
-    curr_func: Option<Function>,
-}
-
-impl std::ops::Deref for ProgramWrapper<'_> {
-    type Target = Program;
-    fn deref(&self) -> &Self::Target {
-        self.program
-    }
-}
-
-impl Arena for ProgramWrapper<'_> {
-    fn local(&self) -> &crate::ir::arena::LocalArena {
-        self.program
-            .func_data(self.curr_func.unwrap())
-            .local_arena()
-    }
-    fn global(&self) -> &crate::ir::arena::GlobalArena {
-        self.program.global_arena()
-    }
-    fn local_mut(&mut self) -> &mut crate::ir::arena::LocalArena {
-        unimplemented!()
-    }
-    fn global_mut(&mut self) -> &mut crate::ir::arena::GlobalArena {
-        unimplemented!()
-    }
 }
 
 /// Mutable: assign a name if the inst doesn't have one yet.
@@ -153,10 +125,7 @@ impl<'a> LlvmWriter<'a> {
     pub fn new(program: &'a Program) -> Self {
         LlvmWriter {
             buffer: String::new(),
-            arena: ProgramWrapper {
-                program,
-                curr_func: None,
-            },
+            arena: ProgramWrapper::new(program),
             local_names: HashMap::new(),
             global_names: HashMap::new(),
             bb_labels: HashMap::new(),
@@ -172,7 +141,7 @@ impl<'a> LlvmWriter<'a> {
         writeln!(self.buffer)?;
 
         // Pre-collect to avoid borrow conflicts during iteration
-        let global_insts: Vec<Inst> = self.arena.global_inst_layout().to_vec();
+        let global_insts: Vec<Inst> = self.arena.program.global_inst_layout().to_vec();
         for &global_inst in &global_insts {
             put_name!(self, global_inst);
             self.visit_global(global_inst)?;
@@ -185,7 +154,7 @@ impl<'a> LlvmWriter<'a> {
             "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)"
         )?;
 
-        let funcs: Vec<Function> = self.arena.function_layout().to_vec();
+        let funcs: Vec<Function> = self.arena.program.function_layout().to_vec();
         for &func in &funcs {
             self.arena.curr_func = Some(func);
             let is_decl = self.arena.func_data(func).layout().is_decl();
@@ -284,19 +253,14 @@ impl<'a> LlvmWriter<'a> {
     // ─── Define ───
 
     fn visit_define(&mut self, func: Function) -> std::fmt::Result {
-        // Phase 1: grab params list (drop data ref before mutating)
-        let params: Vec<Inst> = {
-            let data = self.arena.func_data(func);
-            data.params().to_vec()
-        };
-        for &param in &params {
-            put_name!(self, param);
-        }
+        // Phase 1: grab params list
+        let params: Vec<Inst> = self.arena.func_data(func).params().to_vec();
 
-        // Phase 2: collect phi incoming values and pre-assign instruction/param names
+        // Phase 2: collect phi incoming values
         self.collect_phi_incoming(func);
 
-        // Phase 3: pre-assign block labels and inst names, collect all Alloc insts
+        // Phase 3: snapshot the block layout and name the globals it references.
+        // Local names and block labels are assigned by the renumbering below.
         let all_bbs_and_insts: Vec<(BasicBlock, Vec<Inst>, Vec<Inst>)> = {
             let data = self.arena.func_data(func);
             data.layout()
@@ -305,17 +269,14 @@ impl<'a> LlvmWriter<'a> {
                 .map(|layout| {
                     let bb = layout.bb();
                     let params = self.arena.bb_data(bb).params().to_vec();
-                    for &param in &params {
-                        put_name!(self, param);
-                    }
                     let insts = layout.insts().iter().copied().collect::<Vec<_>>();
                     for &inst in &insts {
-                        put_name!(self, inst);
                         for used in self.arena.inst_data(inst).inst_usage() {
-                            put_name!(self, used);
+                            if used.is_global() {
+                                put_name!(self, used);
+                            }
                         }
                     }
-                    bb_label!(self, bb);
                     (bb, params, insts)
                 })
                 .collect()
@@ -489,17 +450,8 @@ impl<'a> LlvmWriter<'a> {
         }
 
         let alloca_set: std::collections::HashSet<Inst> = alloca_insts.iter().copied().collect();
-        let func = self.arena.curr_func.unwrap();
-        let insts: Vec<Inst> = self
-            .arena
-            .func_data(func)
-            .layout()
-            .basicblock(bb)
-            .insts()
-            .iter()
-            .copied()
-            .collect();
-        for inst in insts {
+        let insts = self.arena.curr_func_data().layout().basicblock(bb).insts();
+        for &inst in insts.iter() {
             if !alloca_set.contains(&inst) {
                 self.visit_inst(inst)?;
             }
@@ -597,15 +549,11 @@ impl<'a> LlvmWriter<'a> {
                         get_name!(self, val)
                     )
                 } else {
-                    let func_ret_ty = self
-                        .arena
-                        .func_data(self.arena.curr_func.unwrap())
-                        .ret_ty()
-                        .clone();
+                    let func_ret_ty = self.arena.curr_func_data().ret_ty();
                     if func_ret_ty.is_unit() {
                         writeln!(self.buffer, "ret void")
                     } else {
-                        writeln!(self.buffer, "ret {} undef", self.type_to_llvm(&func_ret_ty))
+                        writeln!(self.buffer, "ret {} undef", self.type_to_llvm(func_ret_ty))
                     }
                 }
             }
@@ -620,7 +568,7 @@ impl<'a> LlvmWriter<'a> {
                 };
                 if let Some((agg, src_ty)) = maybe_agg {
                     if self.is_all_zeroinit(&agg) {
-                        let size = self.type_size_bytes(&src_ty);
+                        let size = src_ty.size();
                         writeln!(
                             self.buffer,
                             "call void @llvm.memset.p0.i64(ptr {}, i8 0, i64 {}, i1 false)",
@@ -842,15 +790,6 @@ impl<'a> LlvmWriter<'a> {
             "getelementptr inbounds {}, ptr {}, {}",
             src_elem_ty, base, indices
         )
-    }
-
-    fn type_size_bytes(&self, ty: &Type) -> usize {
-        match ty.kind() {
-            TypeKind::Int32 | TypeKind::Float32 => 4,
-            TypeKind::Pointer(_) | TypeKind::String => 8,
-            TypeKind::Array(elem, len) => (*len as usize) * self.type_size_bytes(elem),
-            _ => 0,
-        }
     }
 
     fn is_all_zeroinit(&self, agg: &crate::ir::Aggregate) -> bool {

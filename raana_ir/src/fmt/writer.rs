@@ -7,7 +7,7 @@ const VERBOSE: bool = false;
 use crate::ir::BasicBlock;
 use crate::ir::{
     Aggregate, Function, FunctionData, InstKind, Program, Type,
-    arena::Arena,
+    arena::{Arena, GlobalArena, LocalArena},
     inst_kind::{Binary, Branch, Call, Cast, GetElemPtr, Jump, Load, Return, Select, Store},
     instruction::{Inst, InstData},
     layout::BasicBlockLayout,
@@ -20,32 +20,42 @@ pub struct Writer<'a> {
     bb_name: HashMap<BasicBlock, String>,
     counter: u32,
 }
-struct ProgramWrapper<'a> {
+
+/// Read-only [`Arena`] view of a whole [`Program`], remembering which function
+/// is currently being visited so that local instructions resolve. Shared by the
+/// RaanaIR and the LLVM writers.
+pub(crate) struct ProgramWrapper<'a> {
     pub program: &'a Program,
     pub curr_func: Option<Function>,
 }
 
-impl<'a> std::ops::Deref for ProgramWrapper<'a> {
-    type Target = &'a Program;
-    fn deref(&self) -> &Self::Target {
-        &self.program
+impl<'a> ProgramWrapper<'a> {
+    pub fn new(program: &'a Program) -> Self {
+        ProgramWrapper {
+            program,
+            curr_func: None,
+        }
+    }
+
+    /// Data of the function currently being visited. The result borrows the
+    /// program rather than `self`, so callers may keep it across writer updates.
+    pub fn curr_func_data(&self) -> &'a FunctionData {
+        self.program.func_data(self.curr_func.unwrap())
     }
 }
 
 impl Arena for ProgramWrapper<'_> {
-    fn local(&self) -> &crate::ir::arena::LocalArena {
-        self.program
-            .func_data(self.curr_func.unwrap())
-            .local_arena()
+    fn local(&self) -> &LocalArena {
+        self.curr_func_data().local_arena()
     }
-    fn global(&self) -> &crate::ir::arena::GlobalArena {
+    fn global(&self) -> &GlobalArena {
         self.program.global_arena()
     }
 
-    fn local_mut(&mut self) -> &mut crate::ir::arena::LocalArena {
+    fn local_mut(&mut self) -> &mut LocalArena {
         unimplemented!()
     }
-    fn global_mut(&mut self) -> &mut crate::ir::arena::GlobalArena {
+    fn global_mut(&mut self) -> &mut GlobalArena {
         unimplemented!()
     }
 }
@@ -109,10 +119,7 @@ impl Writer<'_> {
     pub fn new(program: &Program) -> Writer {
         Writer {
             buffer: String::new(),
-            arena: ProgramWrapper {
-                program,
-                curr_func: None,
-            },
+            arena: ProgramWrapper::new(program),
             symbol: HashMap::new(),
             bb_name: HashMap::new(),
             counter: 0,
@@ -120,14 +127,13 @@ impl Writer<'_> {
     }
 
     pub fn write(&mut self) -> std::fmt::Result {
-        for &global_inst in self.arena.global_inst_layout() {
+        for &global_inst in self.arena.program.global_inst_layout() {
             self.visit_global_inst(global_inst)?;
         }
 
-        for &func in self.arena.function_layout() {
+        for &func in self.arena.program.function_layout() {
             self.arena.curr_func.replace(func);
-            let data = self.arena.program.func_data(func);
-            self.visit_func(data)?;
+            self.visit_func(self.arena.curr_func_data())?;
         }
         Ok(())
     }
@@ -249,11 +255,7 @@ impl Writer<'_> {
         writeln!(self.buffer, ":")?;
         for &inst in layout.insts() {
             write!(self.buffer, "    ")?;
-            let data = self
-                .arena
-                .program
-                .func_data(self.arena.curr_func.unwrap())
-                .inst_data(inst);
+            let data = self.arena.curr_func_data().inst_data(inst);
             self.visit_local_inst(inst, data)?
         }
         Ok(())

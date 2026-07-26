@@ -792,7 +792,7 @@ fn lower_mem_zero(
         ],
         ret: None,
         clobbers: DEFAULT_CLOBBERS,
-        label: Label::LibCall(LibCall::Memset),
+        label: Label::Symbol(LibCall::Memset),
     });
     ctx.vcode.vcode.abi.set_has_calls();
     ctx.vcode.vcode.abi.set_outgoing_arg_size(0);

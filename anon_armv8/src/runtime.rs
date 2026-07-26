@@ -1,5 +1,8 @@
 use raana_ir::ir::InstKind;
-use taki_mir::prelude::{Arena, HirProgram};
+use taki_mir::{
+    labels::TargetSymbol,
+    prelude::{Arena, HirProgram},
+};
 
 const INLINE_MEMZERO_MAX_STORES: usize = 4;
 
@@ -13,8 +16,8 @@ pub enum EmbeddedSymbol {
     Memset,
 }
 
-impl EmbeddedSymbol {
-    pub const fn symbol(self) -> &'static str {
+impl TargetSymbol for EmbeddedSymbol {
+    fn symbol(self) -> &'static str {
         match self {
             Self::Memset => ".Lsoyo_memzero",
         }

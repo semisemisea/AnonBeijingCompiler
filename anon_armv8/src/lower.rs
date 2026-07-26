@@ -649,7 +649,7 @@ fn lower_mem_zero(
         ],
         ret: None,
         clobbers: regs::DEFAULT_CLOBBERS,
-        label: Label::Embedded(EmbeddedSymbol::Memset),
+        label: Label::Symbol(EmbeddedSymbol::Memset),
     });
     ctx.vcode.vcode.abi.set_has_calls();
     ctx.vcode.vcode.abi.set_outgoing_arg_size(0);

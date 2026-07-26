@@ -15,6 +15,8 @@ pub mod block_order;
 pub mod div_magic;
 pub mod emit;
 pub mod inst_predicate;
+pub mod labels;
+pub mod libcall;
 pub mod lower;
 pub mod reg_alloc;
 pub mod register;
@@ -290,4 +292,3 @@ where
 
     buf
 }
-pub mod libcall;

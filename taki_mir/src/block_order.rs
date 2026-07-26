@@ -98,7 +98,7 @@ impl BlockLoweringOrder {
         for bb_layout in arena.f().layout().basicblocks() {
             let succ_start_index = block_succ.len();
             let bb = bb_layout.bb();
-            let terminator = *bb_layout.insts().get_last().unwrap();
+            let terminator = bb_layout.terminator();
             let term_data = arena.inst_data(terminator);
 
             out_degree.entry(bb).or_insert(0);
@@ -123,13 +123,7 @@ impl BlockLoweringOrder {
                 let succs = block_succ[range].iter_mut().enumerate();
                 for (succ_idx, lowered_block) in succs {
                     let orig = lowered_block.orig_block().unwrap();
-                    let terminator = *arena
-                        .f()
-                        .layout()
-                        .basicblock(bb)
-                        .insts()
-                        .get_last()
-                        .unwrap();
+                    let terminator = arena.f().layout().basicblock(bb).terminator();
                     let args = outgoing_block_args(arena, terminator, succ_idx, orig);
                     let params = arena.f().bb_data(orig).params();
                     assert_eq!(
@@ -180,13 +174,7 @@ impl BlockLoweringOrder {
                     let range = block_succ_range[&block].clone();
                     lowered_succ_indices
                         .extend(block_succ[range].iter().map(|lb| lb_index_map[lb]));
-                    let last = *arena
-                        .f()
-                        .layout()
-                        .basicblock(block)
-                        .insts()
-                        .get_last()
-                        .unwrap();
+                    let last = arena.f().layout().basicblock(block).terminator();
 
                     arena.is_branch(last).then_some(last)
                 }

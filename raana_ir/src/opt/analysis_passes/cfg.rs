@@ -4,7 +4,7 @@ use log::debug;
 
 use crate::{
     ir::{BasicBlock, FunctionData, InstKind, arena::Arena},
-    opt::utils::{IDAllocator, get_terminator_inst, type_alias::*},
+    opt::utils::{IDAllocator, type_alias::*},
 };
 
 pub fn rpo_path(g: &CFGGraph) -> GPath {
@@ -44,7 +44,7 @@ pub fn build_cfg_both(
         }
         visited.insert(node);
         let id = bb_alloc.check_or_alloc_id_same(node);
-        let val = get_terminator_inst(data, node);
+        let val = data.layout().basicblock(node).terminator();
         match data.inst_data(val).kind() {
             InstKind::Jump(jump) => {
                 let target_id = bb_alloc.check_or_alloc_id_same(jump.target());

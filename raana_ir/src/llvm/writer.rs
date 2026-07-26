@@ -382,7 +382,7 @@ impl<'a> LlvmWriter<'a> {
         self.phi_incoming.clear();
         for layout in data.layout().basicblocks() {
             let bb = layout.bb();
-            let Some(&last_inst) = layout.insts().get_last() else {
+            let Some(last_inst) = layout.try_terminator() else {
                 continue;
             };
             let inst_data = self.arena.inst_data(last_inst);

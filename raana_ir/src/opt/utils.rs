@@ -2,7 +2,7 @@ use std::collections::{HashMap, hash_map::Entry};
 
 use crate::{
     ir::{
-        BasicBlock, FunctionData, Inst, InstKind, Type, TypeKind,
+        FunctionData, Inst, InstKind, Type, TypeKind,
         arena::Arena,
         builder_trait::{LocalInstBuilder, ScalarInstBuilder},
     },
@@ -130,11 +130,6 @@ where
     // pub fn keys(&self) -> impl Iterator<Item = &K> {
     //     self.id_pos.keys()
     // }
-}
-
-#[inline]
-pub fn get_terminator_inst(data: &FunctionData, bb: BasicBlock) -> Inst {
-    *data.layout().basicblock(bb).insts().get_last().unwrap()
 }
 
 /// The `i32` an instruction denotes, when it is an integer literal.

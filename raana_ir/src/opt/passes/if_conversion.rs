@@ -49,7 +49,7 @@ impl Pass for IfConversion {
 
 impl IfConversion {
     fn candidate(&self, data: &ArenaContext<'_>, head: BasicBlock) -> Option<Candidate> {
-        let terminator = *data.layout().basicblock(head).insts().get_last()?;
+        let terminator = data.layout().basicblock(head).try_terminator()?;
         let InstKind::Branch(branch) = data.inst_data(terminator).kind() else {
             return None;
         };
@@ -261,8 +261,7 @@ impl IfConversion {
             if block == target {
                 return true;
             }
-            let Some(terminator) = data.layout().basicblock(block).insts().get_last().copied()
-            else {
+            let Some(terminator) = data.layout().basicblock(block).try_terminator() else {
                 continue;
             };
             work.extend(data.inst_data(terminator).bb_usage());
@@ -275,11 +274,11 @@ impl IfConversion {
         data: &ArenaContext<'_>,
         bb: BasicBlock,
     ) -> Option<(Inst, BasicBlock, Vec<Inst>)> {
-        let insts = data.layout().basicblock(bb).insts();
-        if insts.len() != 1 {
+        let bb_layout = data.layout().basicblock(bb);
+        if bb_layout.insts().len() != 1 {
             return None;
         }
-        let jump_inst = *insts.get_last()?;
+        let jump_inst = bb_layout.try_terminator()?;
         let InstKind::Jump(jump) = data.inst_data(jump_inst).kind() else {
             return None;
         };
@@ -291,7 +290,7 @@ impl IfConversion {
         data: &ArenaContext<'_>,
         bb: BasicBlock,
     ) -> Option<(Inst, BasicBlock, Vec<Inst>)> {
-        let jump_inst = *data.layout().basicblock(bb).insts().get_last()?;
+        let jump_inst = data.layout().basicblock(bb).try_terminator()?;
         let InstKind::Jump(jump) = data.inst_data(jump_inst).kind() else {
             return None;
         };
@@ -334,9 +333,9 @@ impl IfConversion {
             return false;
         };
         if def_bb == head {
-            let insts = data.layout().basicblock(head).insts();
-            return insts.iter().any(|&inst| inst == value)
-                && insts.get_last().is_some_and(|&term| term != value);
+            let bb_layout = data.layout().basicblock(head);
+            return bb_layout.insts().iter().any(|&inst| inst == value)
+                && bb_layout.try_terminator().is_some_and(|term| term != value);
         }
         self.dominates(data, def_bb, head)
     }
@@ -364,13 +363,7 @@ impl IfConversion {
             if current == block {
                 return false;
             }
-            let Some(terminator) = data
-                .layout()
-                .basicblock(current)
-                .insts()
-                .get_last()
-                .copied()
-            else {
+            let Some(terminator) = data.layout().basicblock(current).try_terminator() else {
                 continue;
             };
             for successor in data.inst_data(terminator).bb_usage() {
@@ -499,7 +492,7 @@ mod tests {
         assert_eq!(blocks(data).len(), 2);
         assert_eq!(select_count(data), 1);
         assert!(data.bb_data(merge).params().is_empty());
-        let terminator = utils::get_terminator_inst(data, head);
+        let terminator = data.layout().basicblock(head).terminator();
         assert!(
             matches!(data.inst_data(terminator).kind(), InstKind::Jump(j) if j.target() == merge && j.args().is_empty())
         );

@@ -197,7 +197,7 @@ impl Pass for SparseConditionConstantPropagation {
 
         let mut useless_unconditional_list = Vec::new();
         for layout in data.layout().basicblocks() {
-            let &terminator_inst = layout.insts().get_last().unwrap();
+            let terminator_inst = layout.terminator();
             if let InstKind::Branch(branch) = data.inst_data(terminator_inst).kind() {
                 if let InstKind::Integer(..) = data.inst_data(branch.cond()).kind() {
                     useless_unconditional_list.push(terminator_inst);

@@ -231,7 +231,7 @@ mod tests {
     }
 
     fn returned_value(data: &FunctionData, bb: BasicBlock) -> Inst {
-        let ret = utils::get_terminator_inst(data, bb);
+        let ret = data.layout().basicblock(bb).terminator();
         let InstKind::Return(ret) = data.inst_data(ret).kind() else {
             panic!("expected return");
         };

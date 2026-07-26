@@ -36,9 +36,27 @@ impl BasicBlockLayout {
         self.bb
     }
 
+    /// The block's terminator, i.e. its last instruction.
+    ///
+    /// This is the canonical way to reach a terminator: it keeps the intrusive
+    /// instruction list an implementation detail instead of something every
+    /// caller re-derives. Panics on a block with no instructions at all, which
+    /// only happens on a malformed or still-under-construction function; use
+    /// [`try_terminator`](Self::try_terminator) where that case is expected.
     #[inline(always)]
     pub fn terminator(&self) -> Inst {
-        *self.insts.get_last().unwrap()
+        self.try_terminator()
+            .expect("basic block has no terminator")
+    }
+
+    /// The block's terminator, or `None` when the block is empty.
+    ///
+    /// The fallible companion to [`terminator`](Self::terminator), for callers
+    /// that legitimately see incomplete blocks: the frontend while it is still
+    /// filling a block in, and analyses that walk blocks a pass has emptied.
+    #[inline(always)]
+    pub fn try_terminator(&self) -> Option<Inst> {
+        self.insts.get_last().copied()
     }
 }
 

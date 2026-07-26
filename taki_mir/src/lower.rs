@@ -335,10 +335,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         // in HIR's ordinary instruction use lists. Seed them before lowering so
         // a producer is retained regardless of block traversal order.
         for bb_layout in data.layout().basicblocks() {
-            let terminator = *bb_layout
-                .insts()
-                .get_last()
-                .expect("every lowered HIR block has a terminator");
+            let terminator = bb_layout.terminator();
             let args: &[HirInst] = match data.inst_data(terminator).kind() {
                 InstKind::Branch(branch) => {
                     for &arg in branch.t_args().iter().chain(branch.f_args()) {
@@ -575,25 +572,11 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             ) => {
                 assert_eq!(edge_succ, target, "edge must target its recorded successor");
                 assert_eq!(succ_idx, 0, "edge block must have one successor");
-                let branch = *self
-                    .arena
-                    .f()
-                    .layout()
-                    .basicblock(pred)
-                    .insts()
-                    .get_last()
-                    .unwrap();
+                let branch = self.arena.f().layout().basicblock(pred).terminator();
                 (branch, source_succ_idx as usize)
             }
             (LoweredBlock::Orig { block: orig }, _) => {
-                let branch = *self
-                    .arena
-                    .f()
-                    .layout()
-                    .basicblock(orig)
-                    .insts()
-                    .get_last()
-                    .unwrap();
+                let branch = self.arena.f().layout().basicblock(orig).terminator();
                 (branch, succ_idx)
             }
         };

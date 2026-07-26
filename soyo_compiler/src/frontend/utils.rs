@@ -191,9 +191,8 @@ impl AstGenContext {
         self.curr_func_data()
             .layout()
             .basicblock(curr_bb)
-            .insts()
-            .get_last()
-            .is_some_and(|&inst| {
+            .try_terminator()
+            .is_some_and(|inst| {
                 matches!(
                     self.inst_data(inst).kind(),
                     InstKind::Branch(_) | InstKind::Jump(_) | InstKind::Return(_)

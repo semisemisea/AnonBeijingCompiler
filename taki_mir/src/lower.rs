@@ -2,7 +2,7 @@ use log::{debug, trace};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 
-use crate::abi::{ABIMachineSpec, CalleeABI};
+use crate::abi::{ABIMachineSpec, ArgSlot, CallArgPair, CalleeABI, StackAMode};
 use crate::block_order::{BlockLoweringOrder, LoweredBlock, MirBlockIndex};
 use crate::prelude::*;
 use crate::reg_alloc::function::Function;
@@ -42,17 +42,6 @@ pub fn analyze_gep(
     inst: HirInst,
     gep: &GetElemPtr,
 ) -> Result<GepAddress, String> {
-    fn checked_size(ty: &HirType) -> Option<usize> {
-        match ty.kind() {
-            HirTypeKind::ArgList | HirTypeKind::Unit => Some(0),
-            HirTypeKind::Int32 | HirTypeKind::Float32 => Some(4),
-            HirTypeKind::Array(element, len) => checked_size(element)?.checked_mul(*len),
-            HirTypeKind::String | HirTypeKind::Pointer(_) | HirTypeKind::Function(_, _) => {
-                Some(core::mem::size_of::<*const ()>())
-            }
-        }
-    }
-
     let mut current_ty = arena.inst_data(gep.base()).ty().clone();
     let mut constant_offset = 0_i64;
     let mut dynamic_terms = SmallVec::new();
@@ -74,7 +63,7 @@ pub fn analyze_gep(
             }
         };
 
-        let stride = checked_size(&current_ty).ok_or_else(|| {
+        let stride = current_ty.checked_size().ok_or_else(|| {
             format!("GEP stride overflows for index {position} type {current_ty}")
         })?;
         let stride = u64::try_from(stride)
@@ -184,21 +173,60 @@ pub trait LowerBackend {
 
     fn lower_branch(ctx: &mut LowerContext<Self::MInst>, inst: HirInst, target: &[MirBlockIndex]);
 
-    fn data_section_directive() -> &'static str;
+    // The directives below name ELF/GAS assembler syntax, not machine
+    // encodings, so every supported target shares them. A target that emits a
+    // different object format overrides only the ones it changes.
 
-    fn bss_section_directive() -> &'static str;
+    fn data_section_directive() -> &'static str {
+        ".section .data"
+    }
 
-    fn text_section_directive() -> &'static str;
+    fn bss_section_directive() -> &'static str {
+        ".section .bss"
+    }
 
-    fn global_directive() -> &'static str;
+    fn text_section_directive() -> &'static str {
+        ".section .text"
+    }
 
-    fn word_directive() -> &'static str;
+    fn global_directive() -> &'static str {
+        ".globl"
+    }
 
-    fn zero_directive() -> &'static str;
+    fn word_directive() -> &'static str {
+        ".word"
+    }
+
+    fn zero_directive() -> &'static str {
+        ".zero"
+    }
 
     fn preg_name(preg: PReg) -> &'static str;
 
-    fn format_block_label(lb: &LoweredBlock, func_data: &HirFunctionData) -> String;
+    /// Assembler label for a lowered block.
+    ///
+    /// Labels are derived from HIR names, which may carry the `%` sigil that
+    /// GAS reserves; it is replaced so the label is a valid local symbol. Edge
+    /// blocks have no HIR name of their own and are identified by the edge they
+    /// split.
+    fn format_block_label(lb: &LoweredBlock, func_data: &HirFunctionData) -> String {
+        let function = func_data.name().replace('%', "_");
+        match lb {
+            LoweredBlock::Orig { block } => {
+                let block = func_data.bb_data(*block).name().replace('%', "_");
+                format!(".L_{function}_{block}")
+            }
+            LoweredBlock::Edge {
+                pred,
+                succ,
+                succ_idx,
+            } => {
+                let pred = func_data.bb_data(*pred).name().replace('%', "_");
+                let succ = func_data.bb_data(*succ).name().replace('%', "_");
+                format!(".L_{function}_{pred}_to_{succ}_edge_{succ_idx}")
+            }
+        }
+    }
 
     fn emit_long_jump(ctx: &mut LowerContext<Self::MInst>, target: MirBlockIndex);
 
@@ -903,6 +931,58 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     /// that stack-frame ownership remains part of the generic lowering API.
     pub fn alloc_stackslot_or_get(&mut self, alloc: HirInst, ty: HirType) -> u32 {
         self.vcode.vcode.abi.alloc_stackslot_or_get(alloc, ty)
+    }
+
+    /// Place a call's outgoing arguments and return its register arguments.
+    ///
+    /// Argument placement is decided once, by
+    /// [`ABIMachineSpec::compute_call_arg_loc`]: register arguments come back as
+    /// `CallArgPair`s for the backend's call instruction, stack arguments are
+    /// stored into the outgoing area, and the outgoing area is reserved from the
+    /// very same layout. A backend that re-derived the classification could
+    /// reserve an area of one size and write arguments at offsets of another;
+    /// routing both through one walk makes that disagreement unrepresentable.
+    ///
+    /// Values are placed in registers in argument order, so any rematerialization
+    /// a backend would have emitted for `put_value_in_reg` is emitted here in the
+    /// same order. The caller still builds the call instruction itself, including
+    /// its return pair (see [`ABIMachineSpec::ret_reg_for_type`]) and clobbers.
+    pub fn lower_call_args(&mut self, args: &[HirInst]) -> Vec<CallArgPair> {
+        let types: Vec<HirType> = args
+            .iter()
+            .map(|&arg| self.arena.inst_data(arg).ty().clone())
+            .collect();
+        let (slots, outgoing_size) = <I::ABISpec as ABIMachineSpec>::compute_call_arg_loc(&types);
+        assert_eq!(
+            slots.len(),
+            args.len(),
+            "call argument placement must cover every argument"
+        );
+
+        let mut pairs = Vec::new();
+        for (&arg, slot) in args.iter().zip(slots.iter()) {
+            let src = self.put_value_in_reg(arg);
+            match slot {
+                ArgSlot::Reg { reg, .. } => pairs.push(CallArgPair {
+                    vreg: src,
+                    preg: Reg::from_physical_reg(*reg),
+                }),
+                ArgSlot::Stack { offset, ty } => {
+                    self.emit(<I::ABISpec as ABIMachineSpec>::gen_store_stack(
+                        src,
+                        StackAMode::OutgoingArg(*offset),
+                        ty.into(),
+                    ));
+                }
+            }
+        }
+
+        self.vcode
+            .vcode
+            .abi
+            .set_outgoing_arg_size(outgoing_size as usize);
+        self.vcode.vcode.abi.set_has_calls();
+        pairs
     }
 
     pub fn emit(&mut self, mach_inst: I) {

@@ -52,7 +52,7 @@ impl BooleanSimplification {
         let Some((value, expected)) = self.boolean_comparison(data, &binary) else {
             return false;
         };
-        if !self.is_canonical_bool(data, value, &mut HashSet::new()) {
+        if !Self::is_canonical_bool(data, value, &mut HashSet::new()) {
             return false;
         }
 
@@ -129,7 +129,7 @@ impl BooleanSimplification {
         }
 
         if !data.inst_data(inst).ty().is_i32()
-            || !self.is_canonical_bool(data, select.cond(), &mut HashSet::new())
+            || !Self::is_canonical_bool(data, select.cond(), &mut HashSet::new())
         {
             return false;
         }
@@ -171,12 +171,12 @@ impl BooleanSimplification {
         if !matches!(binary.op(), BinaryOp::Eq | BinaryOp::NotEq) {
             return None;
         }
-        if let Some(value) = self.integer_constant(data, binary.lhs()) {
+        if let Some(value) = utils::integer_constant(data, binary.lhs()) {
             if matches!(value, 0 | 1) {
                 return Some((binary.rhs(), value));
             }
         }
-        if let Some(value) = self.integer_constant(data, binary.rhs()) {
+        if let Some(value) = utils::integer_constant(data, binary.rhs()) {
             if matches!(value, 0 | 1) {
                 return Some((binary.lhs(), value));
             }
@@ -185,7 +185,6 @@ impl BooleanSimplification {
     }
 
     fn is_canonical_bool(
-        &self,
         data: &ArenaContext<'_>,
         value: Inst,
         visiting: &mut HashSet<Inst>,
@@ -193,28 +192,21 @@ impl BooleanSimplification {
         if !visiting.insert(value) {
             return false;
         }
-        let result = matches!(self.integer_constant(data, value), Some(0 | 1))
+        let result = matches!(utils::integer_constant(data, value), Some(0 | 1))
             || matches!(data.inst_data(value).kind(), InstKind::Binary(binary) if binary.op().is_compare())
             || matches!(data.inst_data(value).kind(), InstKind::Select(select)
-                if self.is_canonical_bool(data, select.if_true(), visiting)
-                    && self.is_canonical_bool(data, select.if_false(), visiting));
+                if Self::is_canonical_bool(data, select.if_true(), visiting)
+                    && Self::is_canonical_bool(data, select.if_false(), visiting));
         visiting.remove(&value);
         result
     }
 
-    fn integer_constant(&self, data: &ArenaContext<'_>, inst: Inst) -> Option<i32> {
-        let InstKind::Integer(integer) = data.inst_data(inst).kind() else {
-            return None;
-        };
-        Some(integer.value())
-    }
-
     fn is_zero(&self, data: &ArenaContext<'_>, inst: Inst) -> bool {
-        self.integer_constant(data, inst) == Some(0)
+        utils::integer_constant(data, inst) == Some(0)
     }
 
     fn is_one(&self, data: &ArenaContext<'_>, inst: Inst) -> bool {
-        self.integer_constant(data, inst) == Some(1)
+        utils::integer_constant(data, inst) == Some(1)
     }
 
     fn replace_value(&self, data: &mut ArenaContext<'_>, inst: Inst, replacement: Inst) {

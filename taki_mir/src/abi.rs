@@ -140,6 +140,16 @@ pub trait ABIMachineSpec {
     /// padding for the complete outgoing argument area.
     fn compute_call_arg_loc(types: &[HirType]) -> (Vec<ArgSlot>, u32);
 
+    /// The register holding a returned value of `ty`, or `None` for a unit
+    /// return.
+    ///
+    /// Callers and callees must agree, so returning a value and receiving one
+    /// from a call read the same mapping: `lower_return` builds a `RetPair` from
+    /// it and `lower_call` a `CallRetPair`.
+    fn ret_reg_for_type(_ty: &HirType) -> Option<PReg> {
+        panic!("target does not implement return-value registers")
+    }
+
     fn get_machine_env() -> &'static MachineEnv;
 
     fn gen_prologue_frame_setup(frame: &FrameLayout) -> SmallVec<[Self::I; 16]>;

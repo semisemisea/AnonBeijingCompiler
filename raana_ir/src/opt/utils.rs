@@ -137,6 +137,35 @@ pub fn get_terminator_inst(data: &FunctionData, bb: BasicBlock) -> Inst {
     *data.layout().basicblock(bb).insts().get_last().unwrap()
 }
 
+/// The `i32` an instruction denotes, when it is an integer literal.
+///
+/// Generic over the arena so that IR passes and machine-code backends ask the
+/// question exactly once: `taki_mir` and the targets hold a read-only
+/// `ArenaContext`, passes hold a mutable one, and both satisfy [`Arena`].
+#[inline]
+pub fn integer_constant<A: Arena + ?Sized>(arena: &A, inst: Inst) -> Option<i32> {
+    let InstKind::Integer(integer) = arena.inst_data(inst).kind() else {
+        return None;
+    };
+    Some(integer.value())
+}
+
+/// Classify `value` as `±(1 << shift)`, returning `(shift, is_negative)`.
+///
+/// Division and remainder by such a constant have shift-and-mask forms in both
+/// the IR (strength reduction) and the backends, so the classification lives
+/// here rather than being restated per consumer. `0` is rejected because it is
+/// not a power of two; `i32::MIN` classifies as `-(1 << 31)`.
+pub fn signed_power_of_two(value: i32) -> Option<(u8, bool)> {
+    if value == 0 {
+        return None;
+    }
+    let magnitude = value.unsigned_abs();
+    magnitude
+        .is_power_of_two()
+        .then(|| (magnitude.trailing_zeros() as u8, value.is_negative()))
+}
+
 pub fn alloc_ty(val: Inst, data: &FunctionData) -> &Type {
     use TypeKind;
     let val_data = data.inst_data(val);
@@ -316,11 +345,60 @@ fn visit_and_replace_single(data: &mut ArenaContext<'_>, used_by: Inst, rep: Ins
 
 #[cfg(test)]
 mod tests {
-    use super::visit_and_replace;
+    use super::{signed_power_of_two, visit_and_replace};
     use crate::{
         ir::{Program, Type, arena::Arena, builder_trait::*},
         opt::pass::ArenaContext,
     };
+
+    #[test]
+    fn classifies_signed_power_of_two_divisors() {
+        assert_eq!(signed_power_of_two(0), None);
+        assert_eq!(signed_power_of_two(1), Some((0, false)));
+        assert_eq!(signed_power_of_two(-1), Some((0, true)));
+        assert_eq!(signed_power_of_two(2), Some((1, false)));
+        assert_eq!(signed_power_of_two(-2), Some((1, true)));
+        assert_eq!(signed_power_of_two(1 << 30), Some((30, false)));
+        assert_eq!(signed_power_of_two(-(1 << 30)), Some((30, true)));
+        assert_eq!(signed_power_of_two(i32::MIN), Some((31, true)));
+        assert_eq!(signed_power_of_two(3), None);
+        assert_eq!(signed_power_of_two(-3), None);
+    }
+
+    #[test]
+    fn signed_power_of_two_formula_truncates_toward_zero() {
+        let dividends = [i32::MIN, -17, -9, -8, -7, -1, 0, 1, 7, 8, 9, 17, i32::MAX];
+        let divisors = [1, -1, 2, -2, 4, -4, 8, -8, 1 << 30, -(1 << 30), i32::MIN];
+
+        for dividend in dividends {
+            for divisor in divisors {
+                let (shift, negate) = signed_power_of_two(divisor).unwrap();
+                let positive_quotient = if shift == 0 {
+                    dividend
+                } else {
+                    let sign = dividend >> 31;
+                    let bias = ((sign as u32) >> (32 - shift)) as i32;
+                    dividend.wrapping_add(bias) >> shift
+                };
+                let quotient = if negate {
+                    positive_quotient.wrapping_neg()
+                } else {
+                    positive_quotient
+                };
+                let remainder =
+                    dividend.wrapping_sub(positive_quotient.wrapping_shl(u32::from(shift)));
+
+                let expected_quotient = if dividend == i32::MIN && divisor == -1 {
+                    i32::MIN
+                } else {
+                    dividend / divisor
+                };
+                let expected_remainder = if divisor == -1 { 0 } else { dividend % divisor };
+                assert_eq!(quotient, expected_quotient, "{dividend} / {divisor}");
+                assert_eq!(remainder, expected_remainder, "{dividend} % {divisor}");
+            }
+        }
+    }
 
     #[test]
     fn replacement_rebuilds_mem_zero_with_the_new_destination() {

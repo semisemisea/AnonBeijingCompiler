@@ -64,13 +64,13 @@ impl StrengthReduction {
         remainder: Inst,
         constant: Inst,
     ) -> Option<(Inst, i32, i32)> {
-        let compared = Self::integer_constant(data, constant)?;
+        let compared = utils::integer_constant(data, constant)?;
         let InstKind::Binary(rem) = data.inst_data(remainder).kind() else {
             return None;
         };
         if rem.op() != BinaryOp::Rem
             || !data.inst_data(remainder).ty().is_i32()
-            || !matches!(Self::integer_constant(data, rem.rhs()), Some(2 | -2))
+            || !matches!(utils::integer_constant(data, rem.rhs()), Some(2 | -2))
         {
             return None;
         }
@@ -106,8 +106,8 @@ impl StrengthReduction {
 
     fn reduce_mul(&self, data: &mut ArenaContext<'_>, inst: Inst, lhs: Inst, rhs: Inst) -> bool {
         let (value, constant) = match (
-            Self::integer_constant(data, lhs),
-            Self::integer_constant(data, rhs),
+            utils::integer_constant(data, lhs),
+            utils::integer_constant(data, rhs),
         ) {
             (Some(constant), None) => (rhs, Some(constant)),
             (_, Some(constant)) => (lhs, Some(constant)),
@@ -155,15 +155,15 @@ impl StrengthReduction {
         };
         (shift.op() == BinaryOp::Shl
             && data.inst_data(inst).ty().is_i32()
-            && Self::integer_constant(data, shift.lhs()) == Some(1))
+            && utils::integer_constant(data, shift.lhs()) == Some(1))
         .then(|| shift.rhs())
     }
 
     fn reduce_div(&self, data: &mut ArenaContext<'_>, inst: Inst, lhs: Inst, rhs: Inst) -> bool {
-        let Some(divisor) = Self::integer_constant(data, rhs) else {
+        let Some(divisor) = utils::integer_constant(data, rhs) else {
             return false;
         };
-        let Some((shift, negative)) = Self::signed_power_of_two(divisor) else {
+        let Some((shift, negative)) = utils::signed_power_of_two(divisor) else {
             return false;
         };
         if shift == 0 {
@@ -198,10 +198,10 @@ impl StrengthReduction {
         if data.inst_data(inst).used_by().is_empty() {
             return false;
         }
-        let Some(divisor) = Self::integer_constant(data, rhs) else {
+        let Some(divisor) = utils::integer_constant(data, rhs) else {
             return false;
         };
-        let Some((shift, _)) = Self::signed_power_of_two(divisor) else {
+        let Some((shift, _)) = utils::signed_power_of_two(divisor) else {
             return false;
         };
         if shift == 0 {
@@ -247,7 +247,8 @@ impl StrengthReduction {
         lhs: Inst,
         rhs: Inst,
     ) -> bool {
-        let Some(outer) = Self::integer_constant(data, rhs).map(|value| (value as u32) & 31) else {
+        let Some(outer) = utils::integer_constant(data, rhs).map(|value| (value as u32) & 31)
+        else {
             return false;
         };
         if outer == 0 {
@@ -261,7 +262,7 @@ impl StrengthReduction {
             return false;
         }
         let Some(inner_amount) =
-            Self::integer_constant(data, inner.rhs()).map(|value| (value as u32) & 31)
+            utils::integer_constant(data, inner.rhs()).map(|value| (value as u32) & 31)
         else {
             return false;
         };
@@ -295,23 +296,6 @@ impl StrengthReduction {
         utils::visit_and_replace(data, inst, replacement);
         let bb = data.layout().parent_bb(inst).unwrap();
         data.remove_layout_inst(bb, inst);
-    }
-
-    fn signed_power_of_two(value: i32) -> Option<(u8, bool)> {
-        if value == 0 {
-            return None;
-        }
-        let magnitude = value.unsigned_abs();
-        magnitude
-            .is_power_of_two()
-            .then(|| (magnitude.trailing_zeros() as u8, value.is_negative()))
-    }
-
-    fn integer_constant(data: &ArenaContext<'_>, inst: Inst) -> Option<i32> {
-        let InstKind::Integer(integer) = data.inst_data(inst).kind() else {
-            return None;
-        };
-        Some(integer.value())
     }
 }
 
@@ -655,7 +639,7 @@ mod tests {
     fn signed_power_of_two_formulas_match_wrapping_operations() {
         let values = [0, 1, -1, 2, -2, 3, -3, i32::MAX, i32::MIN];
         for divisor in [1, -1, 2, -2, 4, -4, 8, -8, i32::MIN] {
-            let (shift, negative) = StrengthReduction::signed_power_of_two(divisor).unwrap();
+            let (shift, negative) = utils::signed_power_of_two(divisor).unwrap();
             for value in values {
                 let quotient = if shift == 0 {
                     if negative {

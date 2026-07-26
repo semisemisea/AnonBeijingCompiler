@@ -40,7 +40,21 @@ pub trait MachInst: Clone + Debug {
 
     fn is_term(&self) -> MachTerminator;
 
-    fn rc_for_type(ty: LoweredType) -> (&'static [RegClass], &'static [LoweredType]);
+    /// Register classes a value of `ty` occupies, paired with the type of each
+    /// class's part.
+    ///
+    /// The scalar mapping is a property of `LoweredType` rather than of any one
+    /// target: integers and addresses live in integer registers, floats in float
+    /// registers. A target that splits a wide value across several registers
+    /// overrides this.
+    fn rc_for_type(ty: LoweredType) -> (&'static [RegClass], &'static [LoweredType]) {
+        match ty {
+            crate::types::I32 => (&[RegClass::Int], &[crate::types::I32]),
+            crate::types::I64 => (&[RegClass::Int], &[crate::types::I64]),
+            crate::types::F32 => (&[RegClass::Float], &[crate::types::F32]),
+            _ => unreachable!("no register class for lowered type {ty:?}"),
+        }
+    }
 
     fn gen_jump(target: MirBlockIndex) -> Self;
 

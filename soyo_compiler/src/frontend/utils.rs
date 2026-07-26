@@ -68,29 +68,6 @@ impl AstGenContext {
         }
     }
 
-    pub fn _get_val(&self, ident: &Ident) -> Option<i32> {
-        let sym = self.global_scope().get(ident);
-        sym.map(|&x| match x {
-            Symbol::Constant(int) => {
-                let InstKind::Integer(int) = self.inst_data(int).kind() else {
-                    unreachable!();
-                };
-                int.value()
-            }
-            Symbol::Variable(var) => {
-                let InstKind::GlobalAlloc(glob_alloc) = self.inst_data(var).kind() else {
-                    unreachable!();
-                };
-                match self.inst_data(glob_alloc.init()).kind() {
-                    InstKind::Integer(int) => int.value(),
-                    InstKind::ZeroInit => 0,
-                    _ => unreachable!(),
-                }
-            }
-            Symbol::Callable(_) => unreachable!(),
-        })
-    }
-
     pub fn push_loop(&mut self, entry_bb: BasicBlock, end_bb: BasicBlock) {
         self.loop_stack.push((entry_bb, end_bb));
     }
@@ -428,26 +405,6 @@ impl AstGenContext {
             self.global_val_as_f32(val)
         } else {
             self.local_val_as_f32(val)
-        }
-    }
-
-    #[inline]
-    #[allow(unused)]
-    fn global_val_as_i32_val(&mut self, inst: Inst) -> Inst {
-        assert!(inst.is_global());
-        let int = match self.inst_data(inst).kind() {
-            InstKind::Integer(int) => int.value(),
-            _ => unreachable!(),
-        };
-        self.curr_func_data_mut().new_local_inst().integer(int)
-    }
-
-    #[allow(unused)]
-    pub fn as_i32_val(&mut self, val: Inst) -> Inst {
-        if val.is_global() {
-            self.global_val_as_i32_val(val)
-        } else {
-            val
         }
     }
 

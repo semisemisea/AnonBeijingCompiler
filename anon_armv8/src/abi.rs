@@ -219,7 +219,7 @@ impl ABIMachineSpec for AArch64Abi {
                 src1: regs::int_reg(regs::FP),
                 src2: regs::int_reg(regs::LR),
                 addr: PairAMode::PreIndex {
-                    base: Gpr::Sp,
+                    base: Gpr::Reg(regs::stack_reg()),
                     offset: SImm7Scaled::new(-16, 8).unwrap(),
                 },
             });
@@ -233,7 +233,7 @@ impl ABIMachineSpec for AArch64Abi {
             append_add_constant(
                 &mut insts,
                 Writable::from_reg(regs::int_reg(regs::FP)),
-                Gpr::Sp,
+                Gpr::Reg(regs::stack_reg()),
                 i64::from(frame.total_size),
             );
         }
@@ -252,7 +252,7 @@ impl ABIMachineSpec for AArch64Abi {
                 dst1: Writable::from_reg(regs::int_reg(regs::FP)),
                 dst2: Writable::from_reg(regs::int_reg(regs::LR)),
                 addr: PairAMode::PostIndex {
-                    base: Gpr::Sp,
+                    base: Gpr::Reg(regs::stack_reg()),
                     offset: SImm7Scaled::new(16, 8).unwrap(),
                 },
             });
@@ -304,7 +304,7 @@ impl ABIMachineSpec for AArch64Abi {
                 append_add_constant(
                     &mut insts,
                     dst,
-                    Gpr::Sp,
+                    Gpr::Reg(regs::stack_reg()),
                     i64::from(frame.outgoing_args_size) + offset,
                 );
                 insts.into_iter().collect()
@@ -367,9 +367,9 @@ fn legalize_amode(
     store_src: Option<Reg>,
 ) -> (AMode, SmallVec<[MInst; 4]>) {
     let (base, offset) = match addr {
-        AMode::FrameSlot(offset) => (Gpr::Sp, i64::from(frame.outgoing_args_size) + offset),
-        AMode::SpOffset(offset) => (Gpr::Sp, offset),
-        AMode::OutgoingArg(offset) => (Gpr::Sp, offset),
+        AMode::FrameSlot(offset) => (Gpr::Reg(regs::stack_reg()), i64::from(frame.outgoing_args_size) + offset),
+        AMode::SpOffset(offset) => (Gpr::Reg(regs::stack_reg()), offset),
+        AMode::OutgoingArg(offset) => (Gpr::Reg(regs::stack_reg()), offset),
         AMode::IncomingArg(offset) => (Gpr::Reg(regs::int_reg(regs::FP)), offset),
         addr => return (addr, smallvec![]),
     };
@@ -391,15 +391,15 @@ fn legalize_amode(
     let offset_reg = Writable::from_reg(scratches.next().expect("two integer post-RA scratches"));
     let mut insts = materialize_integer_constant(offset as u64, OperandSize::Size64, offset_reg);
     let base = match base {
-        Gpr::Reg(reg) => reg,
-        Gpr::Sp => {
+        Gpr::Reg(reg) if reg == regs::stack_reg() => {
             insts.push(MInst::MovPhys {
                 size: OperandSize::Size64,
                 dst: Gpr::Reg(address.to_reg()),
-                src: Gpr::Sp,
+                src: Gpr::Reg(regs::stack_reg()),
             });
             address.to_reg()
         }
+        Gpr::Reg(reg) => reg,
         Gpr::Zr => unreachable!("stack address cannot use zero register as base"),
     };
     insts.push(MInst::AluRRR {
@@ -426,12 +426,12 @@ fn append_sp_adjust(insts: &mut SmallVec<[MInst; 16]>, amount: i64) {
     append_add_constant(
         insts,
         Writable::from_reg(regs::int_reg(17)),
-        Gpr::Sp,
+        Gpr::Reg(regs::stack_reg()),
         amount,
     );
     insts.push(MInst::MovPhys {
         size: OperandSize::Size64,
-        dst: Gpr::Sp,
+        dst: Gpr::Reg(regs::stack_reg()),
         src: Gpr::Reg(regs::int_reg(17)),
     });
 }
@@ -455,16 +455,16 @@ fn append_add_constant(
         }
     }
     let base = match base {
-        Gpr::Reg(reg) => reg,
-        Gpr::Sp => {
+        Gpr::Reg(reg) if reg == regs::stack_reg() => {
             let copy = Writable::from_reg(regs::int_reg(17));
             insts.push(MInst::MovPhys {
                 size: OperandSize::Size64,
                 dst: Gpr::Reg(copy.to_reg()),
-                src: Gpr::Sp,
+                src: Gpr::Reg(regs::stack_reg()),
             });
             copy.to_reg()
         }
+        Gpr::Reg(reg) => reg,
         Gpr::Zr => unreachable!("frame arithmetic cannot use the zero register as its base"),
     };
     let scratch = Writable::from_reg(regs::int_reg(regs::INT_POST_RA_SCRATCH[0]));

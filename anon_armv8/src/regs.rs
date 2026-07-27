@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 
 use taki_mir::{
     reg_alloc::reg::{MachineEnv, PReg, PRegSet, RegClass},
-    register::Reg,
+    register::{Reg, Writable},
 };
 
 pub const FP: u8 = 29;
@@ -33,12 +33,17 @@ impl OperandSize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gpr {
     Reg(Reg),
-    Sp,
     Zr,
 }
 
 /// A general-purpose data operand. Unlike [`Gpr`], this deliberately cannot
 /// name SP: in data-processing encodings register 31 denotes ZR, not SP.
+///
+/// Note: since SP now flows through the regular `Reg` type (see
+/// [`stack_reg`]), the only purpose of the `Gpr`/`RegOrZr` split is to
+/// distinguish "encoding 31 means SP" positions from "encoding 31 means ZR"
+/// positions at the type level. SP itself is always wrapped in `Gpr::Reg`
+/// or passed as a plain `Reg`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegOrZr {
     Reg(Reg),
@@ -61,6 +66,24 @@ pub const fn int_reg(index: u8) -> Reg {
 
 pub const fn float_reg(index: u8) -> Reg {
     Reg::from_physical_reg(float_preg(index))
+}
+
+/// Internal PReg encoding for the stack pointer. Uses hw_enc 63 in the Int
+/// class (mirroring cranelift's `PReg::new(31 + 32, RegClass::Int)`), which
+/// `emit_reg` collapses to the hardware encoding 31 (`sp`) at assembly emit
+/// time. Slot 63 was freed by relocating `PReg::INVALID` to `(Int, 62)`.
+pub const SP_HW_ENC: u8 = 63;
+
+pub const fn stack_preg() -> PReg {
+    PReg::new(SP_HW_ENC as usize, RegClass::Int)
+}
+
+pub const fn stack_reg() -> Reg {
+    Reg::from_physical_reg(stack_preg())
+}
+
+pub const fn writable_stack_reg() -> Writable<Reg> {
+    Writable::from_reg(stack_reg())
 }
 
 pub const INT_ARG_REGS: [Reg; 8] = [

@@ -898,7 +898,9 @@ fn call_clobbers(mut clobbers: PRegSet, ret: Option<&CallRetPair>) -> PRegSet {
 
 fn use_gpr(collector: &mut impl OperandVisitor, gpr: &mut Gpr) {
     if let Gpr::Reg(reg) = gpr {
-        collector.reg_use(reg);
+        if *reg != crate::regs::stack_reg() {
+            collector.reg_use(reg);
+        }
     }
 }
 fn use_reg_or_zr(collector: &mut impl OperandVisitor, reg: &mut RegOrZr) {
@@ -913,7 +915,9 @@ fn use_store_src(collector: &mut impl OperandVisitor, reg: &mut Reg) {
 }
 fn def_gpr(collector: &mut impl OperandVisitor, gpr: &mut Gpr) {
     if let Gpr::Reg(reg) = gpr {
-        collector.reg_def_reg(reg);
+        if *reg != crate::regs::stack_reg() {
+            collector.reg_def_reg(reg);
+        }
     }
 }
 fn visit_amode(collector: &mut impl OperandVisitor, addr: &mut AMode) {
@@ -1499,6 +1503,9 @@ fn emit_sized_rrrr(
     emit_reg(ctx, *c, size)
 }
 fn emit_reg(ctx: &mut dyn EmitContext, reg: Reg, size: OperandSize) -> core::fmt::Result {
+    if reg.to_real_reg() == Some(crate::regs::stack_preg()) {
+        return write!(ctx, "sp");
+    }
     match (reg.to_real_reg(), size) {
         (Some(preg), OperandSize::Size32) if preg.class() == RegClass::Int => {
             write!(ctx, "w{}", preg.hw_enc())
@@ -1532,7 +1539,6 @@ fn emit_float_reg(ctx: &mut dyn EmitContext, reg: Reg, is_double: bool) -> core:
 fn emit_gpr(ctx: &mut dyn EmitContext, reg: &Gpr, size: OperandSize) -> core::fmt::Result {
     match reg {
         Gpr::Reg(reg) => emit_reg(ctx, *reg, size),
-        Gpr::Sp => write!(ctx, "sp"),
         Gpr::Zr => write!(
             ctx,
             "{}zr",

@@ -34,7 +34,7 @@ pub(crate) struct Arg {
     #[arg(
         long = "target",
         value_enum,
-        default_value_t = Target::Aarch64
+        default_value_t = Target::Riscv64
     )]
     pub(crate) target: Target,
 }

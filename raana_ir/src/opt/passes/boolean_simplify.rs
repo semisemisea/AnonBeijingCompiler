@@ -7,7 +7,7 @@ use crate::opt::prelude::*;
 pub struct BooleanSimplification;
 
 impl Pass for BooleanSimplification {
-    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
+    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
         let mut changed = false;
         loop {
             let insts = data
@@ -25,7 +25,7 @@ impl Pass for BooleanSimplification {
 }
 
 impl BooleanSimplification {
-    fn simplify_inst(&self, data: &mut ArenaContext<'_>, inst: Inst) -> bool {
+    fn simplify_inst(&self, data: &mut ArenaContextMut<'_>, inst: Inst) -> bool {
         match data.inst_data(inst).kind().clone() {
             InstKind::Binary(binary) => self.simplify_binary(data, inst, binary),
             InstKind::Branch(branch) => self.simplify_branch(data, inst, branch),
@@ -34,7 +34,7 @@ impl BooleanSimplification {
         }
     }
 
-    fn simplify_binary(&self, data: &mut ArenaContext<'_>, inst: Inst, binary: Binary) -> bool {
+    fn simplify_binary(&self, data: &mut ArenaContextMut<'_>, inst: Inst, binary: Binary) -> bool {
         if binary.op().is_compare()
             && data.inst_data(binary.lhs()).ty().is_i32()
             && binary.lhs() == binary.rhs()
@@ -78,7 +78,7 @@ impl BooleanSimplification {
         true
     }
 
-    fn simplify_branch(&self, data: &mut ArenaContext<'_>, inst: Inst, branch: Branch) -> bool {
+    fn simplify_branch(&self, data: &mut ArenaContextMut<'_>, inst: Inst, branch: Branch) -> bool {
         let Some((value, expected)) = self.zero_comparison(data, branch.cond()) else {
             return false;
         };
@@ -105,7 +105,7 @@ impl BooleanSimplification {
         true
     }
 
-    fn simplify_select(&self, data: &mut ArenaContext<'_>, inst: Inst, select: Select) -> bool {
+    fn simplify_select(&self, data: &mut ArenaContextMut<'_>, inst: Inst, select: Select) -> bool {
         if select.if_true() == select.if_false() {
             self.replace_value(data, inst, select.if_true());
             return true;
@@ -147,7 +147,7 @@ impl BooleanSimplification {
     }
 
     /// Returns `(value, is_eq)` for `value == 0` / `value != 0`.
-    fn zero_comparison(&self, data: &ArenaContext<'_>, inst: Inst) -> Option<(Inst, bool)> {
+    fn zero_comparison(&self, data: &ArenaContextMut<'_>, inst: Inst) -> Option<(Inst, bool)> {
         let InstKind::Binary(binary) = data.inst_data(inst).kind() else {
             return None;
         };
@@ -167,7 +167,11 @@ impl BooleanSimplification {
 
     /// Returns `(canonical_boolean, expected_value)` for equality-like tests
     /// against 0 or 1.
-    fn boolean_comparison(&self, data: &ArenaContext<'_>, binary: &Binary) -> Option<(Inst, i32)> {
+    fn boolean_comparison(
+        &self,
+        data: &ArenaContextMut<'_>,
+        binary: &Binary,
+    ) -> Option<(Inst, i32)> {
         if !matches!(binary.op(), BinaryOp::Eq | BinaryOp::NotEq) {
             return None;
         }
@@ -186,7 +190,7 @@ impl BooleanSimplification {
 
     fn is_canonical_bool(
         &self,
-        data: &ArenaContext<'_>,
+        data: &ArenaContextMut<'_>,
         value: Inst,
         visiting: &mut HashSet<Inst>,
     ) -> bool {
@@ -202,22 +206,22 @@ impl BooleanSimplification {
         result
     }
 
-    fn integer_constant(&self, data: &ArenaContext<'_>, inst: Inst) -> Option<i32> {
+    fn integer_constant(&self, data: &ArenaContextMut<'_>, inst: Inst) -> Option<i32> {
         let InstKind::Integer(integer) = data.inst_data(inst).kind() else {
             return None;
         };
         Some(integer.value())
     }
 
-    fn is_zero(&self, data: &ArenaContext<'_>, inst: Inst) -> bool {
+    fn is_zero(&self, data: &ArenaContextMut<'_>, inst: Inst) -> bool {
         self.integer_constant(data, inst) == Some(0)
     }
 
-    fn is_one(&self, data: &ArenaContext<'_>, inst: Inst) -> bool {
+    fn is_one(&self, data: &ArenaContextMut<'_>, inst: Inst) -> bool {
         self.integer_constant(data, inst) == Some(1)
     }
 
-    fn replace_value(&self, data: &mut ArenaContext<'_>, inst: Inst, replacement: Inst) {
+    fn replace_value(&self, data: &mut ArenaContextMut<'_>, inst: Inst, replacement: Inst) {
         utils::visit_and_replace(data, inst, replacement);
         assert!(data.inst_data(inst).used_by().is_empty());
         let bb = data.layout().parent_bb(inst).unwrap();

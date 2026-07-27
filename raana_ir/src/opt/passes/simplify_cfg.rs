@@ -3,7 +3,7 @@ use crate::opt::prelude::*;
 pub struct SimplifyCFG;
 
 impl Pass for SimplifyCFG {
-    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
+    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
         if data.layout().entry_bb().is_none() {
             return false;
         }
@@ -27,7 +27,7 @@ impl Pass for SimplifyCFG {
 impl SimplifyCFG {
     /// br 1, t_target, t_args, f_target, f_args => jump t_target, t_args
     /// br 0, t_target, t_args, f_target, f_args => jump f_target, f_args
-    pub fn fold_const_condition_branch(data: &mut ArenaContext<'_>) -> bool {
+    pub fn fold_const_condition_branch(data: &mut ArenaContextMut<'_>) -> bool {
         struct Edit {
             branch: Inst,
             target: BasicBlock,
@@ -67,7 +67,7 @@ impl SimplifyCFG {
         changed
     }
 
-    pub fn fold_branch_same_target_and_args(data: &mut ArenaContext<'_>) -> bool {
+    pub fn fold_branch_same_target_and_args(data: &mut ArenaContextMut<'_>) -> bool {
         struct Edit {
             branch: Inst,
             target: BasicBlock,
@@ -102,7 +102,7 @@ impl SimplifyCFG {
         changed
     }
 
-    pub fn remove_trivial_jump_block(data: &mut ArenaContext<'_>) -> bool {
+    pub fn remove_trivial_jump_block(data: &mut ArenaContextMut<'_>) -> bool {
         enum Edit {
             Jump {
                 to_modify: Inst,

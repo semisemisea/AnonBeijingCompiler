@@ -19,7 +19,7 @@ type ValStack = Vec<Vec<Inst>>;
 impl Pass for SSATransform {
     fn run(&self, program: &mut crate::ir::Program) -> bool {
         let funcs = program.global_arena().func_arena().funcs();
-        let mut arena_context = ArenaContext {
+        let mut arena_context = ArenaContextMut {
             program,
             curr_func: None,
         };
@@ -33,7 +33,7 @@ impl Pass for SSATransform {
         changed
     }
 
-    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
+    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
         // function declaration. skip.
         if data.layout().entry_bb().is_none() {
             return false;
@@ -158,7 +158,7 @@ fn dfs(
     st: &mut ValStack,
     val_id: &IDAllocator<Inst, VId>,
     bb_id: &IDAllocator<BasicBlock, BId>,
-    data: &mut ArenaContext<'_>,
+    data: &mut ArenaContextMut<'_>,
     insert_table: &InsertTable,
     remove_list: &mut Vec<(Inst, BasicBlock)>,
 ) {

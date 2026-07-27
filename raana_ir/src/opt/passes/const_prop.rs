@@ -3,7 +3,7 @@ use std::collections::{HashSet, VecDeque};
 use itertools::Itertools;
 
 use crate::ir::arena::Arena;
-use crate::opt::pass::{ArenaContext, Pass};
+use crate::opt::pass::{ArenaContextMut, Pass};
 
 use crate::ir::{
     BasicBlock, BinaryOp, FunctionData, Inst, InstKind,
@@ -29,6 +29,10 @@ impl VariableStatus {
 
     fn new_variable() -> VariableStatus {
         VariableStatus::Bottom
+    }
+
+    fn new_top() -> VariableStatus {
+        VariableStatus::Top
     }
 
     #[must_use]
@@ -111,7 +115,7 @@ type FlowWorklist = VecDeque<(BId, BId)>;
 type SSAWorklist = VecDeque<Inst>;
 
 impl Pass for SparseConditionConstantPropagation {
-    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
+    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
         let Some(entry_bb) = data.layout().entry_bb() else {
             return false;
         };
@@ -422,10 +426,7 @@ fn process_instruction(
                 let worklist = match condition_value_status {
                     // A later pipeline iteration can expose a value that was
                     // not visited by this SCCP walk. Treat it conservatively.
-                    VariableStatus::Top => [
-                        Some((branch.t_target(), branch.t_args())),
-                        Some((branch.f_target(), branch.f_args())),
-                    ],
+                    VariableStatus::Top => [None, None],
                     VariableStatus::Constant(constant) => [
                         Some(if *constant != 0 {
                             (branch.t_target(), branch.t_args())

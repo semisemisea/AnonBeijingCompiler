@@ -3,6 +3,7 @@ pub mod const_prop;
 pub mod dce;
 pub mod gvn;
 pub mod if_conversion;
+pub mod ipsccp;
 pub mod simplify_cfg;
 pub mod sr;
 pub mod ssa;

@@ -3,7 +3,7 @@ use crate::opt::prelude::*;
 pub struct StrengthReduction;
 
 impl Pass for StrengthReduction {
-    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
+    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
         let mut changed = self.specialize_remainder_comparisons(data);
         loop {
             let mut iteration_changed = false;
@@ -21,7 +21,7 @@ impl Pass for StrengthReduction {
 }
 
 impl StrengthReduction {
-    fn layout_insts(data: &ArenaContext<'_>) -> Vec<Inst> {
+    fn layout_insts(data: &ArenaContextMut<'_>) -> Vec<Inst> {
         data.layout()
             .basicblocks()
             .iter()
@@ -29,7 +29,7 @@ impl StrengthReduction {
             .collect()
     }
 
-    fn specialize_remainder_comparisons(&self, data: &mut ArenaContext<'_>) -> bool {
+    fn specialize_remainder_comparisons(&self, data: &mut ArenaContextMut<'_>) -> bool {
         let mut changed = false;
         for inst in Self::layout_insts(data) {
             let InstKind::Binary(compare) = data.inst_data(inst).kind().clone() else {
@@ -60,7 +60,7 @@ impl StrengthReduction {
 
     fn remainder_comparison(
         &self,
-        data: &ArenaContext<'_>,
+        data: &ArenaContextMut<'_>,
         remainder: Inst,
         constant: Inst,
     ) -> Option<(Inst, i32, i32)> {
@@ -83,7 +83,7 @@ impl StrengthReduction {
         Some((rem.lhs(), expected, mask))
     }
 
-    fn reduce_binary(&self, data: &mut ArenaContext<'_>, inst: Inst) -> bool {
+    fn reduce_binary(&self, data: &mut ArenaContextMut<'_>, inst: Inst) -> bool {
         let InstKind::Binary(binary) = data.inst_data(inst).kind().clone() else {
             return false;
         };
@@ -104,7 +104,7 @@ impl StrengthReduction {
         }
     }
 
-    fn reduce_mul(&self, data: &mut ArenaContext<'_>, inst: Inst, lhs: Inst, rhs: Inst) -> bool {
+    fn reduce_mul(&self, data: &mut ArenaContextMut<'_>, inst: Inst, lhs: Inst, rhs: Inst) -> bool {
         let (value, constant) = match (
             Self::integer_constant(data, lhs),
             Self::integer_constant(data, rhs),
@@ -149,7 +149,7 @@ impl StrengthReduction {
         true
     }
 
-    fn one_shift(&self, data: &ArenaContext<'_>, inst: Inst) -> Option<Inst> {
+    fn one_shift(&self, data: &ArenaContextMut<'_>, inst: Inst) -> Option<Inst> {
         let InstKind::Binary(shift) = data.inst_data(inst).kind() else {
             return None;
         };
@@ -159,7 +159,7 @@ impl StrengthReduction {
         .then(|| shift.rhs())
     }
 
-    fn reduce_div(&self, data: &mut ArenaContext<'_>, inst: Inst, lhs: Inst, rhs: Inst) -> bool {
+    fn reduce_div(&self, data: &mut ArenaContextMut<'_>, inst: Inst, lhs: Inst, rhs: Inst) -> bool {
         let Some(divisor) = Self::integer_constant(data, rhs) else {
             return false;
         };
@@ -194,7 +194,7 @@ impl StrengthReduction {
         true
     }
 
-    fn reduce_rem(&self, data: &mut ArenaContext<'_>, inst: Inst, lhs: Inst, rhs: Inst) -> bool {
+    fn reduce_rem(&self, data: &mut ArenaContextMut<'_>, inst: Inst, lhs: Inst, rhs: Inst) -> bool {
         if data.inst_data(inst).used_by().is_empty() {
             return false;
         }
@@ -225,7 +225,7 @@ impl StrengthReduction {
 
     fn insert_signed_pow2_quotient(
         &self,
-        data: &mut ArenaContext<'_>,
+        data: &mut ArenaContextMut<'_>,
         before: Inst,
         value: Inst,
         shift: u8,
@@ -241,7 +241,7 @@ impl StrengthReduction {
 
     fn reduce_shift(
         &self,
-        data: &mut ArenaContext<'_>,
+        data: &mut ArenaContextMut<'_>,
         inst: Inst,
         op: BinaryOp,
         lhs: Inst,
@@ -280,7 +280,7 @@ impl StrengthReduction {
 
     fn insert_binary_before(
         &self,
-        data: &mut ArenaContext<'_>,
+        data: &mut ArenaContextMut<'_>,
         before: Inst,
         op: BinaryOp,
         lhs: Inst,
@@ -291,7 +291,7 @@ impl StrengthReduction {
         inst
     }
 
-    fn replace_with_value(&self, data: &mut ArenaContext<'_>, inst: Inst, replacement: Inst) {
+    fn replace_with_value(&self, data: &mut ArenaContextMut<'_>, inst: Inst, replacement: Inst) {
         utils::visit_and_replace(data, inst, replacement);
         let bb = data.layout().parent_bb(inst).unwrap();
         data.remove_layout_inst(bb, inst);
@@ -307,7 +307,7 @@ impl StrengthReduction {
             .then(|| (magnitude.trailing_zeros() as u8, value.is_negative()))
     }
 
-    fn integer_constant(data: &ArenaContext<'_>, inst: Inst) -> Option<i32> {
+    fn integer_constant(data: &ArenaContextMut<'_>, inst: Inst) -> Option<i32> {
         let InstKind::Integer(integer) = data.inst_data(inst).kind() else {
             return None;
         };

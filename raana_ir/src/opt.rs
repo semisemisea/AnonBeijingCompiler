@@ -22,7 +22,7 @@ pub mod prelude {
     // Analysis pass
     pub use super::analysis_passes::*;
     // Pass trait object
-    pub use super::pass::{ArenaContext, Pass};
+    pub use super::pass::{ArenaContext, ArenaContextMut, Pass};
     // Pass
     pub use super::passes::*;
     // Type alias

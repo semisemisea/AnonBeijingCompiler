@@ -13,6 +13,7 @@ pub struct Program {
     global_arena: GlobalArena,
     function_layout: Vec<Function>,
     global_inst_layout: Vec<Inst>,
+    main_function: Option<Function>,
 }
 
 impl Arena for Program {
@@ -47,6 +48,7 @@ impl Program {
             global_arena: GlobalArena::new(),
             function_layout: Vec::new(),
             global_inst_layout: Vec::new(),
+            main_function: None,
         }
     }
 
@@ -83,12 +85,20 @@ impl Program {
     }
 
     pub fn new_function(&mut self, ret_ty: Type, name: String, params_ty: Vec<Type>) -> Function {
+        let set_flag = name.eq("main");
         let id = self
             .global_arena
             .func_arena
             .alloc(FunctionData::new(ret_ty, name, params_ty));
         self.func_layout_push(id);
+        if set_flag {
+            self.main_function = Some(id);
+        }
         id
+    }
+
+    pub fn get_main_function(&self) -> Function {
+        self.main_function.unwrap()
     }
 
     pub fn function_layout(&self) -> &[Function] {

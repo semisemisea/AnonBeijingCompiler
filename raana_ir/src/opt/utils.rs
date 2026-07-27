@@ -6,7 +6,7 @@ use crate::{
         arena::Arena,
         builder_trait::{LocalInstBuilder, ScalarInstBuilder},
     },
-    opt::pass::ArenaContext,
+    opt::pass::ArenaContextMut,
 };
 
 use itertools::Itertools;
@@ -148,14 +148,19 @@ pub fn alloc_ty(val: Inst, data: &FunctionData) -> &Type {
     pointee
 }
 
-pub fn visit_and_replace(data: &mut ArenaContext<'_>, rep: Inst, rep_with: Inst) {
+pub fn visit_and_replace(data: &mut ArenaContextMut<'_>, rep: Inst, rep_with: Inst) {
     let list = data.inst_data(rep).used_by().iter().copied().collect_vec();
     for used_by in list {
         visit_and_replace_single(data, used_by, rep, rep_with);
     }
 }
 
-fn visit_and_replace_single(data: &mut ArenaContext<'_>, used_by: Inst, rep: Inst, rep_with: Inst) {
+fn visit_and_replace_single(
+    data: &mut ArenaContextMut<'_>,
+    used_by: Inst,
+    rep: Inst,
+    rep_with: Inst,
+) {
     let rep_val_data = data.inst_data(used_by);
     #[allow(unused_variables)]
     match rep_val_data.kind() {
@@ -319,7 +324,7 @@ mod tests {
     use super::visit_and_replace;
     use crate::{
         ir::{Program, Type, arena::Arena, builder_trait::*},
-        opt::pass::ArenaContext,
+        opt::pass::ArenaContextMut,
     };
 
     #[test]
@@ -334,7 +339,7 @@ mod tests {
         let clear = data.new_local_inst().mem_zero(old_dest, 4);
         data.layout_mut().insert_inst(entry, clear);
 
-        let mut context = ArenaContext {
+        let mut context = ArenaContextMut {
             program: &mut program,
             curr_func: Some(function),
         };

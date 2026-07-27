@@ -10,7 +10,7 @@ impl ArenaContext<'_> {
             || inst.is_load()
             || inst.is_store()
             || inst.is_mem_zero()
-            || matches!(inst, InstKind::Return(..))
+            || matches!(inst, InstKind::Return(..) | InstKind::TailCall(..))
     }
 
     pub fn is_terminator(&self, inst: HirInst) -> bool {

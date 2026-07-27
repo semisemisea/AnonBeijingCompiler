@@ -368,9 +368,10 @@ fn legalize_amode(
     store_src: Option<Reg>,
 ) -> (AMode, SmallVec<[MInst; 4]>) {
     let (base, offset) = match addr {
-        AMode::FrameSlot(offset) => {
-            (regs::stack_reg(), i64::from(frame.outgoing_args_size) + offset)
-        }
+        AMode::FrameSlot(offset) => (
+            regs::stack_reg(),
+            i64::from(frame.outgoing_args_size) + offset,
+        ),
         AMode::SpOffset(offset) => (regs::stack_reg(), offset),
         AMode::OutgoingArg(offset) => (regs::stack_reg(), offset),
         AMode::IncomingArg(offset) => (regs::int_reg(regs::FP), offset),

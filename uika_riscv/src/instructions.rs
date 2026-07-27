@@ -80,6 +80,16 @@ impl MachInst for MInst {
                 collector.reg_clobbers(call_clobbers(*clobbers, ret.as_ref()));
             }
             MInst::Ret => {}
+            MInst::TailCall {
+                arg_pairs,
+                clobbers,
+                ..
+            } => {
+                for arg_pair in arg_pairs {
+                    collector.reg_fixed_use(&mut arg_pair.vreg, arg_pair.preg);
+                }
+                collector.reg_clobbers(call_clobbers(*clobbers, None));
+            }
             MInst::RetVal { pair } => {
                 collector.reg_fixed_use(&mut pair.vreg, pair.preg);
             }
@@ -109,7 +119,7 @@ impl MachInst for MInst {
             MInst::CondBr { .. } | MInst::Jump { .. } | MInst::JumpReg { .. } => {
                 MachTerminator::Branch
             }
-            MInst::Ret => MachTerminator::Return,
+            MInst::Ret | MInst::TailCall { .. } => MachTerminator::Return,
             _ => MachTerminator::None,
         }
     }
@@ -241,6 +251,11 @@ impl MachInstEmit for MInst {
             MInst::Call { label, .. } => {
                 write!(ctx, "call ")?;
                 label.emit(ctx)
+            }
+            MInst::TailCall { label, .. } => {
+                write!(ctx, "la t6, ")?;
+                label.emit(ctx)?;
+                write!(ctx, "\n    jr t6")
             }
             MInst::Ret => write!(ctx, "ret"),
             MInst::RetVal { .. } => Ok(()),
@@ -386,6 +401,13 @@ pub enum MInst {
     Call {
         arg_pairs: SmallVec<[CallArgPair; 8]>,
         ret: Option<CallRetPair>,
+        clobbers: PRegSet,
+        label: Label,
+    },
+    /// Tail call: the epilogue (frame restore) is emitted ahead of this, then
+    /// control jumps to `label` without linking, reusing the caller's frame.
+    TailCall {
+        arg_pairs: SmallVec<[CallArgPair; 8]>,
         clobbers: PRegSet,
         label: Label,
     },

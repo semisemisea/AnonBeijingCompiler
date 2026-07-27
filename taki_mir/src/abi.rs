@@ -484,6 +484,13 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
             .expect("compute_frame_layout must be called before gen_prologue/gen_epilogue")
     }
 
+    /// The ABI slot (register or incoming-stack) for the `idx`-th function
+    /// parameter. Used by tail-call lowering to place each argument exactly
+    /// where the callee will read it.
+    pub fn arg_slot(&self, idx: usize) -> ArgSlot {
+        self.args[idx].clone()
+    }
+
     pub fn gen_prologue(&self) -> SmallVec<[M::I; 16]> {
         let frame = self.frame_layout();
         let mut insts = smallvec![];

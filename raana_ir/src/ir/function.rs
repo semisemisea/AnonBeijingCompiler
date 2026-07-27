@@ -173,7 +173,7 @@ impl FunctionData {
         }
     }
 
-    fn has_inst_data(&self, inst: Inst) -> bool {
+    pub fn has_inst_data(&self, inst: Inst) -> bool {
         !inst.is_global()
             && self
                 .local_arena()

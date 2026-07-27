@@ -1,11 +1,11 @@
 //! AArch64 selection from Raana HIR into generic VCode.
 
 use raana_ir::ir::{
-    Binary, BinaryOp, Call, Cast, GetElemPtr, InstKind, Load, Return, Select, Store, Type as HirType,
-    TypeKind, arena::Arena, inst_kind::MemZero,
+    Binary, BinaryOp, Call, Cast, GetElemPtr, InstKind, Load, Return, Select, Store, TailCall,
+    Type as HirType, TypeKind, arena::Arena, inst_kind::MemZero,
 };
 use taki_mir::{
-    abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
+    abi::{ABIMachineSpec, ArgSlot, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::{LoweredBlock, MirBlockIndex},
     div_magic::{MagicCorrection, signed_magic_i32},
     lower::{LowerBackend, LowerContext, LoweredOutput, analyze_gep},
@@ -455,9 +455,7 @@ fn lower_load(
     ctx.emit(MInst::Load {
         ty: memory_type(arena.inst_data(inst).ty().kind()),
         dst,
-        addr: AMode::Reg {
-            base: src,
-        },
+        addr: AMode::Reg { base: src },
     });
     LoweredOutput::Value(result)
 }
@@ -500,17 +498,16 @@ fn lower_select(
         } else {
             let size = operand_size(lhs_ty);
             let lhs = ctx.put_value_in_reg(binary.lhs());
-            let cmp = if let Some(imm) =
-                integer_constant(arena, binary.rhs()).and_then(positive_imm12)
-            {
-                SelectCmp::IntImm { size, lhs, imm }
-            } else {
-                SelectCmp::IntRR {
-                    size,
-                    lhs,
-                    rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
-                }
-            };
+            let cmp =
+                if let Some(imm) = integer_constant(arena, binary.rhs()).and_then(positive_imm12) {
+                    SelectCmp::IntImm { size, lhs, imm }
+                } else {
+                    SelectCmp::IntRR {
+                        size,
+                        lhs,
+                        rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
+                    }
+                };
             let cond = comparison_cond(binary.op());
             (cmp, if invert { invert_cond(cond) } else { cond })
         }
@@ -758,6 +755,46 @@ fn lower_call(
     result.map_or(LoweredOutput::None, LoweredOutput::Value)
 }
 
+/// Lower a tail call. Each argument is placed where the callee will read it:
+/// register arguments are forced into the ABI argument registers via the
+/// `TailCall` instruction's fixed-register operands, and stack arguments are
+/// stored to the incoming-argument slots ahead of it. The emitter prepends the
+/// epilogue (frame restore) to the `TailCall`, after which it emits `b callee`
+/// — reusing the caller's frame so the recursion runs in constant stack space.
+///
+/// Only self-tail-calls are produced (by tail-call elimination), so the
+/// callee's ABI matches the current function's and `abi.arg_slot(idx)` gives
+/// the correct destination for every argument.
+fn lower_tail_call(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    tail_call: &TailCall,
+) -> LoweredOutput {
+    let mut args = Vec::new();
+    for (idx, &arg) in tail_call.args().iter().enumerate() {
+        let src = ctx.put_value_in_reg(arg);
+        let ty = memory_type(arena.inst_data(arg).ty().kind());
+        match ctx.vcode.vcode.abi.arg_slot(idx) {
+            ArgSlot::Reg { reg, .. } => args.push(CallArgPair {
+                vreg: src,
+                preg: reg.into(),
+            }),
+            ArgSlot::Stack { offset, .. } => ctx.emit(MInst::Store {
+                ty,
+                src,
+                addr: AMode::IncomingArg(offset),
+            }),
+        }
+    }
+    ctx.vcode.vcode.abi.set_has_calls();
+    ctx.emit(MInst::TailCall {
+        args,
+        clobbers: regs::DEFAULT_CLOBBERS,
+        label: Label::from_function(tail_call.callee()),
+    });
+    LoweredOutput::None
+}
+
 fn lower_return(
     ctx: &mut LowerContext<'_, MInst>,
     arena: ArenaContext<'_>,
@@ -792,7 +829,6 @@ impl LowerBackend for AArch64Backend {
         let arena = ctx.arena;
         match arena.inst_data(inst).kind() {
             InstKind::BlockArgRef(..)
-            | InstKind::FuncArgRef(..)
             | InstKind::Aggregate(..)
             | InstKind::GlobalAlloc(..)
             | InstKind::Undef
@@ -810,6 +846,7 @@ impl LowerBackend for AArch64Backend {
             InstKind::MemZero(mem_zero) => lower_mem_zero(ctx, arena, mem_zero),
             InstKind::ZeroInit => unreachable!("zero initialization is lowered by its store"),
             InstKind::Call(call) => lower_call(ctx, arena, inst, call),
+            InstKind::TailCall(tail_call) => lower_tail_call(ctx, arena, tail_call),
             InstKind::Return(ret) => lower_return(ctx, arena, ret),
             InstKind::Jump(..) | InstKind::Branch(..) => {
                 unreachable!("terminators are lowered by LowerBackend::lower_branch")
@@ -1671,33 +1708,23 @@ fn memory_address(
     ty: MemoryType,
 ) -> AMode {
     if offset == 0 {
-        return AMode::Reg {
-            base: base,
-        };
+        return AMode::Reg { base: base };
     }
     if offset > 0 {
         if let Some(offset) = crate::instructions::UImm12Scaled::new(offset as u64, ty.byte_size())
         {
-            return AMode::UnsignedOffset {
-                base: base,
-                offset,
-            };
+            return AMode::UnsignedOffset { base: base, offset };
         }
     }
     if let Ok(offset) = i16::try_from(offset) {
         if let Some(offset) = crate::instructions::SImm9::new(offset) {
-            return AMode::SignedOffset {
-                base: base,
-                offset,
-            };
+            return AMode::SignedOffset { base: base, offset };
         }
     }
 
     let address = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
     emit_add_offset(ctx, Writable::from_reg(address), base, offset);
-    AMode::Reg {
-        base: address,
-    }
+    AMode::Reg { base: address }
 }
 
 fn emit_add_offset(
@@ -1894,8 +1921,7 @@ mod tests {
         let function =
             program.new_function(Type::get_i32(), "constant".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let numerator = data.params()[0];
         let constant = data.new_local_inst().integer(divisor);
         let binary = data.new_local_inst().binary(op, numerator, constant);
@@ -1950,8 +1976,7 @@ mod tests {
             vec![Type::get_i32(), Type::get_i32()],
         );
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let numerator = data.params()[0];
         let divisor = data.params()[1];
         let binary = data

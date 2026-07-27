@@ -400,7 +400,9 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 self.process_block_param(bb);
             }
 
-            // Entry block
+            // Entry block: the backend lowers the once-per-call ABI argument
+            // setup here. Entry block parameters are materialized as arg-copy
+            // vregs (see `process_block_param`), never as live-in block params.
             if block_index.index() == 0 {
                 self.gen_arg_setup();
                 self.finish_ir_inst();
@@ -436,8 +438,11 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
 
         // Phase 1: Emit loads for all parameters (in .rev() order so that
         // register loads come last in VCode, first after reverse_and_finalize).
-        for &(i, param) in params.iter().rev() {
-            if self.arena.inst_data(param).used_by().is_empty() {
+        for (i, param) in params.into_iter().rev() {
+            // A function parameter may have no ordinary HIR users yet still
+            // feed the entry block parameters via the prologue edge (tracked
+            // by `value_lowered_use`); keep such parameters live.
+            if !self.is_value_needed(param) {
                 continue;
             }
             for inst in self
@@ -445,7 +450,6 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 .vcode
                 .abi
                 .gen_copy_arg_to_reg(i, self.reg_map[&param])
-                .into_iter()
             {
                 self.emit(inst);
             }
@@ -708,6 +712,20 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     }
 
     fn process_block_param(&mut self, block: HirBasicBlock) {
+        // The entry block's parameters are the function arguments. They are
+        // materialized once per call by `gen_arg_setup` (as arg-copy vregs),
+        // not by the blockparam/phi machinery, so they must NOT be registered
+        // as live-in block parameters (the entry has no CFG predecessor and
+        // the register allocator forbids entry block parameters).
+        let is_entry = self
+            .arena
+            .f()
+            .layout()
+            .entry_bb()
+            .is_some_and(|e| e.bb() == block);
+        if is_entry {
+            return;
+        }
         for param in self.arena.bb_data(block).params() {
             let vreg = self.reg_map[param].to_virtual_reg().unwrap();
             self.vcode.add_block_param(vreg);
@@ -963,6 +981,7 @@ mod tests {
             vec![Type::get_i32()],
         );
         let data = program.func_data_mut(function);
+        data.add_entry_block();
         let dynamic = data.params()[0];
         let inner = Type::get_array(Type::get_i32(), 7);
         let outer = Type::get_array(inner, 5);

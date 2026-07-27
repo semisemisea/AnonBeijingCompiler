@@ -73,6 +73,12 @@ impl DeadCodeElimination {
 
         // 1.2 Mark: Grow
         while let Some(inst) = worklist.pop_front() {
+            // An earlier pass (e.g. interprocedural SCCP) may have replaced
+            // an instruction and left a dangling reference in another inst's
+            // operand list. Skip insts that no longer exist.
+            if !data.has_inst_data(inst) && !inst.is_global() {
+                continue;
+            }
             match data.inst_data(inst).kind() {
                 InstKind::GlobalAlloc(..)
                 | InstKind::Alloc
@@ -201,8 +207,17 @@ impl Pass for DeadPhiElimination {
         let mut bb_allocator: IDAllocator<BasicBlock, BId> = IDAllocator::new(1);
         let mut unused_params_indices = Vec::with_capacity(data.layout().basicblocks().len());
 
+        let entry_bb = data.layout().entry_bb().map(|l| l.bb());
         for (assert_id, layout) in data.layout().basicblocks().iter().enumerate() {
             assert_eq!(bb_allocator.check_or_alloc_id_same(layout.bb()), assert_id);
+            // Entry block parameters are the function's ABI parameters and are
+            // tracked by FunctionData::params independently of the block's
+            // params list. Removing one here would desynchronize the two,
+            // leaving a dangling reference. Keep them all.
+            if Some(layout.bb()) == entry_bb {
+                unused_params_indices.push(Vec::new());
+                continue;
+            }
             let params = data.bb_data(layout.bb()).params();
             let unused_params_index = (0..params.len())
                 .filter(|&index| data.inst_data(params[index]).used_by().is_empty())

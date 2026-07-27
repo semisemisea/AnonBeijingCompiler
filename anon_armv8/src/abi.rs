@@ -16,7 +16,7 @@ use crate::{
         AMode, AluOp, Imm12, MInst, MemoryType, PairAMode, SImm7Scaled, SImm9, UImm12Scaled,
     },
     labels::Label,
-    regs::{self, Gpr, OperandSize, RegOrZr},
+    regs::{self, OperandSize, RegOrZr},
 };
 
 pub struct AArch64Abi;
@@ -219,7 +219,7 @@ impl ABIMachineSpec for AArch64Abi {
                 src1: regs::int_reg(regs::FP),
                 src2: regs::int_reg(regs::LR),
                 addr: PairAMode::PreIndex {
-                    base: Gpr::Reg(regs::stack_reg()),
+                    base: regs::stack_reg(),
                     offset: SImm7Scaled::new(-16, 8).unwrap(),
                 },
             });
@@ -233,7 +233,7 @@ impl ABIMachineSpec for AArch64Abi {
             append_add_constant(
                 &mut insts,
                 Writable::from_reg(regs::int_reg(regs::FP)),
-                Gpr::Reg(regs::stack_reg()),
+                regs::stack_reg(),
                 i64::from(frame.total_size),
             );
         }
@@ -252,7 +252,7 @@ impl ABIMachineSpec for AArch64Abi {
                 dst1: Writable::from_reg(regs::int_reg(regs::FP)),
                 dst2: Writable::from_reg(regs::int_reg(regs::LR)),
                 addr: PairAMode::PostIndex {
-                    base: Gpr::Reg(regs::stack_reg()),
+                    base: regs::stack_reg(),
                     offset: SImm7Scaled::new(16, 8).unwrap(),
                 },
             });
@@ -304,7 +304,7 @@ impl ABIMachineSpec for AArch64Abi {
                 append_add_constant(
                     &mut insts,
                     dst,
-                    Gpr::Reg(regs::stack_reg()),
+                    regs::stack_reg(),
                     i64::from(frame.outgoing_args_size) + offset,
                 );
                 insts.into_iter().collect()
@@ -367,10 +367,12 @@ fn legalize_amode(
     store_src: Option<Reg>,
 ) -> (AMode, SmallVec<[MInst; 4]>) {
     let (base, offset) = match addr {
-        AMode::FrameSlot(offset) => (Gpr::Reg(regs::stack_reg()), i64::from(frame.outgoing_args_size) + offset),
-        AMode::SpOffset(offset) => (Gpr::Reg(regs::stack_reg()), offset),
-        AMode::OutgoingArg(offset) => (Gpr::Reg(regs::stack_reg()), offset),
-        AMode::IncomingArg(offset) => (Gpr::Reg(regs::int_reg(regs::FP)), offset),
+        AMode::FrameSlot(offset) => {
+            (regs::stack_reg(), i64::from(frame.outgoing_args_size) + offset)
+        }
+        AMode::SpOffset(offset) => (regs::stack_reg(), offset),
+        AMode::OutgoingArg(offset) => (regs::stack_reg(), offset),
+        AMode::IncomingArg(offset) => (regs::int_reg(regs::FP), offset),
         addr => return (addr, smallvec![]),
     };
 
@@ -390,17 +392,17 @@ fn legalize_amode(
     let address = Writable::from_reg(scratches.next().expect("two integer post-RA scratches"));
     let offset_reg = Writable::from_reg(scratches.next().expect("two integer post-RA scratches"));
     let mut insts = materialize_integer_constant(offset as u64, OperandSize::Size64, offset_reg);
-    let base = match base {
-        Gpr::Reg(reg) if reg == regs::stack_reg() => {
-            insts.push(MInst::MovPhys {
-                size: OperandSize::Size64,
-                dst: Gpr::Reg(address.to_reg()),
-                src: Gpr::Reg(regs::stack_reg()),
-            });
-            address.to_reg()
-        }
-        Gpr::Reg(reg) => reg,
-        Gpr::Zr => unreachable!("stack address cannot use zero register as base"),
+    // SP cannot be used as a base in the shifted-register `AluRRR` form
+    // (encoding 31 denotes XZR there); copy it to a scratch first.
+    let base = if base == regs::stack_reg() {
+        insts.push(MInst::MovPhys {
+            size: OperandSize::Size64,
+            dst: address,
+            src: regs::stack_reg(),
+        });
+        address.to_reg()
+    } else {
+        base
     };
     insts.push(MInst::AluRRR {
         op: AluOp::Add,
@@ -411,7 +413,7 @@ fn legalize_amode(
     });
     (
         AMode::Reg {
-            base: Gpr::Reg(address.to_reg()),
+            base: address.to_reg(),
         },
         insts,
     )
@@ -426,20 +428,20 @@ fn append_sp_adjust(insts: &mut SmallVec<[MInst; 16]>, amount: i64) {
     append_add_constant(
         insts,
         Writable::from_reg(regs::int_reg(17)),
-        Gpr::Reg(regs::stack_reg()),
+        regs::stack_reg(),
         amount,
     );
     insts.push(MInst::MovPhys {
         size: OperandSize::Size64,
-        dst: Gpr::Reg(regs::stack_reg()),
-        src: Gpr::Reg(regs::int_reg(17)),
+        dst: regs::writable_stack_reg(),
+        src: regs::int_reg(17),
     });
 }
 
 fn append_add_constant(
     insts: &mut SmallVec<[MInst; 16]>,
     dst: Writable<Reg>,
-    base: Gpr,
+    base: Reg,
     amount: i64,
 ) {
     if amount >= 0 {
@@ -454,18 +456,18 @@ fn append_add_constant(
             return;
         }
     }
-    let base = match base {
-        Gpr::Reg(reg) if reg == regs::stack_reg() => {
-            let copy = Writable::from_reg(regs::int_reg(17));
-            insts.push(MInst::MovPhys {
-                size: OperandSize::Size64,
-                dst: Gpr::Reg(copy.to_reg()),
-                src: Gpr::Reg(regs::stack_reg()),
-            });
-            copy.to_reg()
-        }
-        Gpr::Reg(reg) => reg,
-        Gpr::Zr => unreachable!("frame arithmetic cannot use the zero register as its base"),
+    // SP cannot be the base of a shifted-register `AluRRR` (encoding 31
+    // denotes XZR there); copy it to a scratch first.
+    let base = if base == regs::stack_reg() {
+        let copy = Writable::from_reg(regs::int_reg(17));
+        insts.push(MInst::MovPhys {
+            size: OperandSize::Size64,
+            dst: copy,
+            src: regs::stack_reg(),
+        });
+        copy.to_reg()
+    } else {
+        base
     };
     let scratch = Writable::from_reg(regs::int_reg(regs::INT_POST_RA_SCRATCH[0]));
     insts.extend(materialize_integer_constant(

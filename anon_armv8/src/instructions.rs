@@ -231,27 +231,27 @@ impl MemoryType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AMode {
     Reg {
-        base: Gpr,
+        base: Reg,
     },
     UnsignedOffset {
-        base: Gpr,
+        base: Reg,
         offset: UImm12Scaled,
     },
     SignedOffset {
-        base: Gpr,
+        base: Reg,
         offset: SImm9,
     },
     RegOffset {
-        base: Gpr,
+        base: Reg,
         index: Reg,
     },
     ScaledRegOffset {
-        base: Gpr,
+        base: Reg,
         index: Reg,
         shift: u8,
     },
     ExtendedRegOffset {
-        base: Gpr,
+        base: Reg,
         index: Reg,
         extend: ExtendOp,
         shift: u8,
@@ -265,9 +265,9 @@ pub enum AMode {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PairAMode {
-    SignedOffset { base: Gpr, offset: SImm7Scaled },
-    PreIndex { base: Gpr, offset: SImm7Scaled },
-    PostIndex { base: Gpr, offset: SImm7Scaled },
+    SignedOffset { base: Reg, offset: SImm7Scaled },
+    PreIndex { base: Reg, offset: SImm7Scaled },
+    PostIndex { base: Reg, offset: SImm7Scaled },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -371,7 +371,7 @@ pub enum MInst {
         op: AluOp,
         size: OperandSize,
         dst: WritableReg,
-        src: Gpr,
+        src: Reg,
         imm: Imm12,
     },
     AluRRImmLogic {
@@ -401,7 +401,7 @@ pub enum MInst {
         op: AluOp,
         size: OperandSize,
         dst: WritableReg,
-        lhs: Gpr,
+        lhs: Reg,
         rhs: Reg,
         extend: ExtendOp,
         shift: u8,
@@ -451,8 +451,8 @@ pub enum MInst {
     },
     MovPhys {
         size: OperandSize,
-        dst: Gpr,
-        src: Gpr,
+        dst: WritableReg,
+        src: Reg,
     },
     /// A typed pseudo-instruction expanded to encoding-valid move-wide forms
     /// by `MachInstEmit`. It keeps the ABI's single-instruction hook sound.
@@ -629,11 +629,10 @@ impl MInst {
             Self::AluRRRExtend {
                 op,
                 size,
-                lhs,
                 extend,
                 shift,
                 ..
-            } if matches!(lhs, Gpr::Zr) || !extended_alu_is_legal(*op, *size, *extend, *shift) => {
+            } if !extended_alu_is_legal(*op, *size, *extend, *shift) => {
                 Err("invalid AArch64 extended-register ALU form")
             }
             Self::Load { ty, addr, .. } | Self::Store { ty, addr, .. }
@@ -704,8 +703,8 @@ impl MachInst for MInst {
                 collector.reg_def(dst);
             }
             Self::AluRRImm12 { dst, src, .. } => {
-                use_gpr(collector, src);
-                collector.reg_def(dst);
+                use_sp_aware_reg(collector, src);
+                def_sp_aware_reg(collector, dst);
             }
             Self::AluRRImmLogic { dst, src, .. } => {
                 use_reg_or_zr(collector, src);
@@ -725,9 +724,9 @@ impl MachInst for MInst {
                 collector.reg_def(dst);
             }
             Self::AluRRRExtend { dst, lhs, rhs, .. } => {
-                use_gpr(collector, lhs);
+                use_sp_aware_reg(collector, lhs);
                 collector.reg_use(rhs);
-                collector.reg_def(dst);
+                def_sp_aware_reg(collector, dst);
             }
             Self::MAdd {
                 dst,
@@ -763,8 +762,8 @@ impl MachInst for MInst {
             | Self::Tbz { reg: lhs, .. }
             | Self::Tbnz { reg: lhs, .. } => collector.reg_use(lhs),
             Self::MovPhys { dst, src, .. } => {
-                use_gpr(collector, src);
-                def_gpr(collector, dst);
+                use_sp_aware_reg(collector, src);
+                def_sp_aware_reg(collector, dst);
             }
             Self::LoadImm { dst, .. }
             | Self::MovZ { dst, .. }
@@ -896,13 +895,6 @@ fn call_clobbers(mut clobbers: PRegSet, ret: Option<&CallRetPair>) -> PRegSet {
     clobbers
 }
 
-fn use_gpr(collector: &mut impl OperandVisitor, gpr: &mut Gpr) {
-    if let Gpr::Reg(reg) = gpr {
-        if *reg != crate::regs::stack_reg() {
-            collector.reg_use(reg);
-        }
-    }
-}
 fn use_reg_or_zr(collector: &mut impl OperandVisitor, reg: &mut RegOrZr) {
     if let RegOrZr::Reg(reg) = reg {
         collector.reg_use(reg);
@@ -913,22 +905,29 @@ fn use_store_src(collector: &mut impl OperandVisitor, reg: &mut Reg) {
         collector.reg_use(reg);
     }
 }
-fn def_gpr(collector: &mut impl OperandVisitor, gpr: &mut Gpr) {
-    if let Gpr::Reg(reg) = gpr {
-        if *reg != crate::regs::stack_reg() {
-            collector.reg_def_reg(reg);
-        }
+/// Like [`OperandVisitor::reg_use`] but silently skips the stack pointer,
+/// which is a fixed architectural register that does not participate in
+/// allocation.
+fn use_sp_aware_reg(collector: &mut impl OperandVisitor, reg: &mut Reg) {
+    if *reg != crate::regs::stack_reg() {
+        collector.reg_use(reg);
+    }
+}
+/// Like [`OperandVisitor::reg_def`] but silently skips the stack pointer.
+fn def_sp_aware_reg(collector: &mut impl OperandVisitor, reg: &mut WritableReg) {
+    if reg.to_reg() != crate::regs::stack_reg() {
+        collector.reg_def(reg);
     }
 }
 fn visit_amode(collector: &mut impl OperandVisitor, addr: &mut AMode) {
     match addr {
         AMode::Reg { base }
         | AMode::UnsignedOffset { base, .. }
-        | AMode::SignedOffset { base, .. } => use_gpr(collector, base),
+        | AMode::SignedOffset { base, .. } => use_sp_aware_reg(collector, base),
         AMode::RegOffset { base, index }
         | AMode::ScaledRegOffset { base, index, .. }
         | AMode::ExtendedRegOffset { base, index, .. } => {
-            use_gpr(collector, base);
+            use_sp_aware_reg(collector, base);
             collector.reg_use(index);
         }
         AMode::FrameSlot(_)
@@ -941,7 +940,7 @@ fn visit_pair_amode(collector: &mut impl OperandVisitor, addr: &mut PairAMode) {
     match addr {
         PairAMode::SignedOffset { base, .. }
         | PairAMode::PreIndex { base, .. }
-        | PairAMode::PostIndex { base, .. } => use_gpr(collector, base),
+        | PairAMode::PostIndex { base, .. } => use_sp_aware_reg(collector, base),
     }
 }
 
@@ -974,7 +973,7 @@ impl MachInstEmit for MInst {
                 write!(ctx, "{} ", alu_name(*op))?;
                 emit_reg(ctx, dst.to_reg(), *size)?;
                 write!(ctx, ", ")?;
-                emit_gpr(ctx, src, *size)?;
+                emit_reg(ctx, *src, *size)?;
                 write!(ctx, ", #{}", imm.value())?;
                 if imm.shift12() {
                     write!(ctx, ", lsl #12")?;
@@ -1036,7 +1035,7 @@ impl MachInstEmit for MInst {
                 write!(ctx, "{} ", alu_name(*op))?;
                 emit_reg(ctx, dst.to_reg(), *size)?;
                 write!(ctx, ", ")?;
-                emit_gpr(ctx, lhs, *size)?;
+                emit_reg(ctx, *lhs, *size)?;
                 write!(ctx, ", ")?;
                 emit_reg(ctx, *rhs, extend_source_size(*extend, *size))?;
                 write!(ctx, ", {}", extend_name(*extend))?;
@@ -1096,9 +1095,9 @@ impl MachInstEmit for MInst {
             }
             Self::MovPhys { size, dst, src } => {
                 write!(ctx, "mov ")?;
-                emit_gpr(ctx, dst, *size)?;
+                emit_reg(ctx, dst.to_reg(), *size)?;
                 write!(ctx, ", ")?;
-                emit_gpr(ctx, src, *size)
+                emit_reg(ctx, *src, *size)
             }
             Self::LoadImm { size, dst, value } => emit_load_imm(ctx, dst.to_reg(), *value, *size),
             Self::MovZ { size, dst, imm } | Self::MovN { size, dst, imm } => {
@@ -1564,29 +1563,29 @@ fn emit_amode(ctx: &mut dyn EmitContext, addr: &AMode) -> core::fmt::Result {
     match addr {
         AMode::Reg { base } => {
             write!(ctx, "[")?;
-            emit_gpr(ctx, base, OperandSize::Size64)?;
+            emit_reg(ctx, *base, OperandSize::Size64)?;
             write!(ctx, "]")
         }
         AMode::UnsignedOffset { base, offset } => {
             write!(ctx, "[")?;
-            emit_gpr(ctx, base, OperandSize::Size64)?;
+            emit_reg(ctx, *base, OperandSize::Size64)?;
             write!(ctx, ", #{}]", offset.byte_offset())
         }
         AMode::SignedOffset { base, offset } => {
             write!(ctx, "[")?;
-            emit_gpr(ctx, base, OperandSize::Size64)?;
+            emit_reg(ctx, *base, OperandSize::Size64)?;
             write!(ctx, ", #{}]", offset.value())
         }
         AMode::RegOffset { base, index } => {
             write!(ctx, "[")?;
-            emit_gpr(ctx, base, OperandSize::Size64)?;
+            emit_reg(ctx, *base, OperandSize::Size64)?;
             write!(ctx, ", ")?;
             emit_reg(ctx, *index, OperandSize::Size64)?;
             write!(ctx, "]")
         }
         AMode::ScaledRegOffset { base, index, shift } => {
             write!(ctx, "[")?;
-            emit_gpr(ctx, base, OperandSize::Size64)?;
+            emit_reg(ctx, *base, OperandSize::Size64)?;
             write!(ctx, ", ")?;
             emit_reg(ctx, *index, OperandSize::Size64)?;
             write!(ctx, ", lsl #{shift}]")
@@ -1598,7 +1597,7 @@ fn emit_amode(ctx: &mut dyn EmitContext, addr: &AMode) -> core::fmt::Result {
             shift,
         } => {
             write!(ctx, "[")?;
-            emit_gpr(ctx, base, OperandSize::Size64)?;
+            emit_reg(ctx, *base, OperandSize::Size64)?;
             write!(ctx, ", ")?;
             emit_reg(
                 ctx,
@@ -1621,17 +1620,17 @@ fn emit_pair_amode(ctx: &mut dyn EmitContext, addr: &PairAMode) -> core::fmt::Re
     match addr {
         PairAMode::SignedOffset { base, offset } => {
             write!(ctx, "[")?;
-            emit_gpr(ctx, base, OperandSize::Size64)?;
+            emit_reg(ctx, *base, OperandSize::Size64)?;
             write!(ctx, ", #{}]", offset.byte_offset())
         }
         PairAMode::PreIndex { base, offset } => {
             write!(ctx, "[")?;
-            emit_gpr(ctx, base, OperandSize::Size64)?;
+            emit_reg(ctx, *base, OperandSize::Size64)?;
             write!(ctx, ", #{}]!", offset.byte_offset())
         }
         PairAMode::PostIndex { base, offset } => {
             write!(ctx, "[")?;
-            emit_gpr(ctx, base, OperandSize::Size64)?;
+            emit_reg(ctx, *base, OperandSize::Size64)?;
             write!(ctx, "], #{}", offset.byte_offset())
         }
     }
@@ -1705,36 +1704,30 @@ fn extended_alu_is_legal(op: AluOp, size: OperandSize, extend: ExtendOp, shift: 
 }
 fn amode_is_legal(addr: &AMode, ty: MemoryType) -> bool {
     match addr {
-        AMode::Reg { base }
-        | AMode::UnsignedOffset { base, .. }
-        | AMode::SignedOffset { base, .. }
-        | AMode::RegOffset { base, .. } => !matches!(base, Gpr::Zr),
-        AMode::ScaledRegOffset { base, shift, .. } => {
-            !matches!(base, Gpr::Zr) && *shift == ty.byte_size().trailing_zeros() as u8
-        }
+        AMode::Reg { .. }
+        | AMode::UnsignedOffset { .. }
+        | AMode::SignedOffset { .. }
+        | AMode::RegOffset { .. } => true,
+        AMode::ScaledRegOffset { shift, .. } => *shift == ty.byte_size().trailing_zeros() as u8,
         AMode::ExtendedRegOffset {
-            base,
             extend,
             shift,
             ..
         } => {
-            !matches!(base, Gpr::Zr)
-                && matches!(
-                    extend,
-                    ExtendOp::Uxtw | ExtendOp::Sxtw | ExtendOp::Uxtx | ExtendOp::Sxtx
-                )
-                && (*shift == 0 || *shift == ty.byte_size().trailing_zeros() as u8)
+            matches!(
+                extend,
+                ExtendOp::Uxtw | ExtendOp::Sxtw | ExtendOp::Uxtx | ExtendOp::Sxtx
+            ) && (*shift == 0 || *shift == ty.byte_size().trailing_zeros() as u8)
         }
         _ => true,
     }
 }
-fn pair_amode_is_legal(addr: &PairAMode) -> bool {
-    let base = match addr {
-        PairAMode::SignedOffset { base, .. }
-        | PairAMode::PreIndex { base, .. }
-        | PairAMode::PostIndex { base, .. } => base,
-    };
-    !matches!(base, Gpr::Zr)
+fn pair_amode_is_legal(_addr: &PairAMode) -> bool {
+    // A `Reg` base can always serve as a load/store base: it can name SP,
+    // FP, or any allocatable general-purpose register, and XZR (which A64
+    // excludes as a base register) is no longer representable in `Reg` now
+    // that `Gpr::Zr` has been split out into `RegOrZr`.
+    true
 }
 fn cond_name(cond: Cond) -> &'static str {
     match cond {

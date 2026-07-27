@@ -345,15 +345,19 @@ impl AstGenContext {
         );
         self.insert_func(std::rc::Rc::from("putf"), putf);
 
-        let starttime = self
-            .program
-            .new_function(Type::get_unit(), "starttime".into(), vec![]);
-        self.insert_func(std::rc::Rc::from("starttime"), starttime);
+        let starttime = self.program.new_function(
+            Type::get_unit(),
+            "_sysy_starttime".into(),
+            vec![Type::get_i32()],
+        );
+        self.insert_func(std::rc::Rc::from("_sysy_starttime"), starttime);
 
-        let stoptime = self
-            .program
-            .new_function(Type::get_unit(), "stoptime".into(), vec![]);
-        self.insert_func(std::rc::Rc::from("stoptime"), stoptime);
+        let stoptime = self.program.new_function(
+            Type::get_unit(),
+            "_sysy_stoptime".into(),
+            vec![Type::get_i32()],
+        );
+        self.insert_func(std::rc::Rc::from("_sysy_stoptime"), stoptime);
     }
 
     #[inline]

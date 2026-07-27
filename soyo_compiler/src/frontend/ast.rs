@@ -1,5 +1,5 @@
 use super::items;
-use crate::frontend::utils::{AstGenContext, Symbol, ToRaanaIR};
+use crate::frontend::utils::{AstGenContext, Ident, Symbol, ToRaanaIR};
 use raana_ir::ir::{arena::Arena, builder_trait::*, *};
 
 fn binary_requires_int(op: BinaryOp) -> bool {
@@ -1175,6 +1175,26 @@ impl ToRaanaIR for items::FuncCall {
         if ctx.is_complete_bb() {
             return;
         }
+
+        // handle the macro in the header
+        if (self.ident == "starttime".into() || self.ident == "stoptime".into())
+            && self.args.is_empty()
+        {
+            let func_name = format!("_sysy_{}", &*self.ident);
+            let func = Ident::from(func_name);
+            let Symbol::Callable(target_func) = ctx
+                .get_global(&func)
+                .unwrap_or_else(|| panic!("Can't find function {}", &*func))
+            else {
+                panic!("Not a function {}", &*self.ident)
+            };
+            // mock the line number for the macro function call, since we don't hold a line number.
+            let args = vec![ctx.new_local_value().integer(0)];
+            let call = ctx.new_local_value().call(target_func, args);
+            ctx.push_inst(call);
+            return;
+        }
+
         let Symbol::Callable(target_func) = ctx
             .get_global(&self.ident)
             .unwrap_or_else(|| panic!("Can't find function {}", &*self.ident))

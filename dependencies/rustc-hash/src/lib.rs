@@ -15,10 +15,10 @@
 //! ```
 
 #![no_std]
-// #![cfg_attr(feature = "nightly", feature(const_default))]
-// #![cfg_attr(feature = "nightly", feature(const_trait_impl))]
-// #![cfg_attr(feature = "nightly", feature(derive_const))]
-// #![cfg_attr(feature = "nightly", feature(hasher_prefixfree_extras))]
+#![cfg_attr(feature = "nightly", feature(const_default))]
+#![cfg_attr(feature = "nightly", feature(const_trait_impl))]
+#![cfg_attr(feature = "nightly", feature(derive_const))]
+#![cfg_attr(feature = "nightly", feature(hasher_prefixfree_extras))]
 #![allow(rustc::default_hash_types)]
 
 #[cfg(feature = "std")]
@@ -60,6 +60,8 @@ pub use seeded_state::{FxHashMapSeed, FxHashSetSeed};
 /// The current implementation is a fast polynomial hash with a single
 /// bit rotation as a finishing step designed by Orson Peters.
 #[derive(Clone)]
+#[cfg_attr(not(feature = "nightly"), derive(Default))]
+#[cfg_attr(feature = "nightly", derive_const(Default))]
 pub struct FxHasher {
     hash: usize,
 }
@@ -89,33 +91,6 @@ impl FxHasher {
         FxHasher { hash: 0 }
     }
 }
-
-macro_rules! default_impl {
-    () => {
-        impl Default for FxHasher {
-            #[inline]
-            fn default() -> FxHasher {
-                Self::default()
-            }
-        }
-    };
-}
-
-// In order to use the nightly-only `const` syntax, we gate the definition behind a macro so that
-// parsing still succeeds on stable.
-// #[cfg(feature = "nightly")]
-// macro_rules! default_impl {
-//     () => {
-//         impl const Default for FxHasher {
-//             #[inline]
-//             fn default() -> FxHasher {
-//                 Self::default()
-//             }
-//         }
-//     };
-// }
-
-// default_impl!();
 
 impl FxHasher {
     #[inline]
@@ -168,24 +143,24 @@ impl Hasher for FxHasher {
         self.add_to_hash(i);
     }
 
-    // #[cfg(feature = "nightly")]
-    // #[inline]
-    // fn write_length_prefix(&mut self, _len: usize) {
-    //     // Most cases will specialize hash_slice to call write(), which encodes
-    //     // the length already in a more efficient manner than we could here. For
-    //     // HashDoS-resistance you would still need to include this for the
-    //     // non-slice collection hashes, but for the purposes of rustc we do not
-    //     // care and do not wish to pay the performance penalty of mixing in len
-    //     // for those collections.
-    // }
-    //
-    // #[cfg(feature = "nightly")]
-    // #[inline]
-    // fn write_str(&mut self, s: &str) {
-    //     // Similarly here, write already encodes the length, so nothing special
-    //     // is needed.
-    //     self.write(s.as_bytes())
-    // }
+    #[cfg(feature = "nightly")]
+    #[inline]
+    fn write_length_prefix(&mut self, _len: usize) {
+        // Most cases will specialize hash_slice to call write(), which encodes
+        // the length already in a more efficient manner than we could here. For
+        // HashDoS-resistance you would still need to include this for the
+        // non-slice collection hashes, but for the purposes of rustc we do not
+        // care and do not wish to pay the performance penalty of mixing in len
+        // for those collections.
+    }
+
+    #[cfg(feature = "nightly")]
+    #[inline]
+    fn write_str(&mut self, s: &str) {
+        // Similarly here, write already encodes the length, so nothing special
+        // is needed.
+        self.write(s.as_bytes())
+    }
 
     #[inline]
     fn finish(&self) -> u64 {
@@ -339,7 +314,9 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 /// use rustc_hash::FxBuildHasher;
 /// assert_ne!(FxBuildHasher.hash_one(1), FxBuildHasher.hash_one(2));
 /// ```
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone)]
+#[cfg_attr(not(feature = "nightly"), derive(Default))]
+#[cfg_attr(feature = "nightly", derive_const(Default))]
 pub struct FxBuildHasher;
 
 impl BuildHasher for FxBuildHasher {

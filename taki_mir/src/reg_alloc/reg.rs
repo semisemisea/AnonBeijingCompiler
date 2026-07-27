@@ -29,7 +29,12 @@ impl PReg {
     pub const MAX_BITS: usize = 6;
     pub const MAX: usize = (1 << Self::MAX_BITS) - 1;
     pub const NUM_INDEX: usize = 1 << (Self::MAX_BITS + 2); // including RegClass bits
-    pub const INVALID: u8 = ((RegClass::Int as u8) << Self::MAX_BITS) | (Self::MAX as u8);
+    /// Sentinel "no register" value. Encoded as `(Int, MAX-1)` = `(Int, 62)`
+    /// so that the `(Int, MAX)` = `(Int, 63)` slot remains available for a
+    /// special architectural register (the AArch64 stack pointer, mirroring
+    /// cranelift's `PReg::new(31 + 32, RegClass::Int)` convention). Neither
+    /// backend uses Int hw_enc 62 as a real register, so this slot is free.
+    pub const INVALID: u8 = ((RegClass::Int as u8) << Self::MAX_BITS) | ((Self::MAX - 1) as u8);
 
     /// Create a new PReg. The `hw_enc` range is 6 bits.
     #[inline(always)]
@@ -1557,5 +1562,17 @@ mod tests {
 
         let cursor = AllocationCursor::new(&allocations);
         assert!(cursor.finish("test instruction").is_err());
+    }
+
+    /// `(Int, 63)` is reserved for the AArch64 stack pointer (mirroring
+    /// cranelift's `PReg::new(31 + 32, RegClass::Int)`), so the "invalid
+    /// register" sentinel must live elsewhere. It currently occupies
+    /// `(Int, 62)`; neither backend uses that slot for a real register.
+    #[test]
+    fn preg_invalid_does_not_collide_with_int_slot_63() {
+        let slot_63 = PReg::new(63, RegClass::Int);
+        assert_ne!(PReg::invalid(), slot_63);
+        assert!(slot_63.as_valid().is_some());
+        assert!(PReg::invalid().as_valid().is_none());
     }
 }

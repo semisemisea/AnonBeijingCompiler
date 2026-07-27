@@ -124,7 +124,7 @@ RISC-V/AArch64 实际使用的 Int 编码最大到 31，因此 62 安全。
 
 ## 五、分阶段实施计划
 
-### Phase 1 ── `taki_mir` 核心：腾出 PReg(Int, 63)
+### Phase 1 ── `taki_mir` 核心：腾出 PReg(Int, 63)  ✅ DONE
 
 **文件：`taki_mir/src/reg_alloc/reg.rs:32`**
 

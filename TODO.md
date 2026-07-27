@@ -240,7 +240,7 @@ fn def_gpr(collector: &mut impl OperandVisitor, gpr: &mut Gpr) {
 }
 ```
 
-### Phase 3 ── `anon_armv8`：放宽指令字段类型
+### Phase 3 ── `anon_armv8`：放宽指令字段类型  ✅ DONE
 
 把所有 `dst: WritableReg` + `src/lhs: Gpr` 的组合里，**`src/lhs` 改成普通 `Reg`**
 （SP 由此可流入）。

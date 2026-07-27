@@ -22,7 +22,7 @@ use crate::{
         SelectCmp, SelectValue, ShiftOp,
     },
     labels::Label,
-    regs::{self, Gpr, OperandSize, RegOrZr},
+    regs::{self, OperandSize, RegOrZr},
     runtime::{self, EmbeddedSymbol},
 };
 
@@ -148,7 +148,7 @@ fn lower_binary(
                     op,
                     size,
                     dst,
-                    src: Gpr::Reg(lhs),
+                    src: lhs,
                     imm,
                 });
             } else if let Some((rhs, shift, amount)) =
@@ -376,7 +376,7 @@ fn lower_get_elem_ptr(
                 op: AluOp::Add,
                 size: OperandSize::Size64,
                 dst: Writable::from_reg(next),
-                lhs: Gpr::Reg(address),
+                lhs: address,
                 rhs: index,
                 extend: ExtendOp::Sxtw,
                 shift,
@@ -392,7 +392,7 @@ fn lower_get_elem_ptr(
                 op: AluOp::Add,
                 size: OperandSize::Size64,
                 dst: Writable::from_reg(extended),
-                lhs: Gpr::Reg(zero),
+                lhs: zero,
                 rhs: index,
                 extend: ExtendOp::Sxtw,
                 shift: 0,
@@ -456,7 +456,7 @@ fn lower_load(
         ty: memory_type(arena.inst_data(inst).ty().kind()),
         dst,
         addr: AMode::Reg {
-            base: Gpr::Reg(src),
+            base: src,
         },
     });
     LoweredOutput::Value(result)
@@ -1672,14 +1672,14 @@ fn memory_address(
 ) -> AMode {
     if offset == 0 {
         return AMode::Reg {
-            base: Gpr::Reg(base),
+            base: base,
         };
     }
     if offset > 0 {
         if let Some(offset) = crate::instructions::UImm12Scaled::new(offset as u64, ty.byte_size())
         {
             return AMode::UnsignedOffset {
-                base: Gpr::Reg(base),
+                base: base,
                 offset,
             };
         }
@@ -1687,7 +1687,7 @@ fn memory_address(
     if let Ok(offset) = i16::try_from(offset) {
         if let Some(offset) = crate::instructions::SImm9::new(offset) {
             return AMode::SignedOffset {
-                base: Gpr::Reg(base),
+                base: base,
                 offset,
             };
         }
@@ -1696,7 +1696,7 @@ fn memory_address(
     let address = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
     emit_add_offset(ctx, Writable::from_reg(address), base, offset);
     AMode::Reg {
-        base: Gpr::Reg(address),
+        base: address,
     }
 }
 
@@ -1711,7 +1711,7 @@ fn emit_add_offset(
             op,
             size: OperandSize::Size64,
             dst,
-            src: Gpr::Reg(base),
+            src: base,
             imm,
         });
     } else {

@@ -2,6 +2,7 @@
 name = "soyo_compiler"
 version = "0.1.0"
 edition = "2024"
+autobins = false
 
 [dependencies]
 itertools = "0.14.0"
@@ -18,6 +19,6 @@ num_enum = "0.7.6"
 [build-dependencies]
 lalrpop = "0.22.1"
 
-[profile.release]
-debug = true
-incremental = true
+[[bin]]
+name = "compiler"
+path = "./src/main.rs"

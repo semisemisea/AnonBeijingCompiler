@@ -31,7 +31,7 @@ fn main() {
     logger.init();
 
     if let Err(error) = run(args) {
-        eprintln!("soyo_compiler: {error}");
+        eprintln!("compiler: {error}");
         std::process::exit(1);
     }
 }

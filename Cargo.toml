@@ -8,6 +8,7 @@ members = [
     "tomori_utils",
     "uika_riscv",
 ]
+default-members = ["soyo_compiler"]
 
 [profile.release]
 debug = true

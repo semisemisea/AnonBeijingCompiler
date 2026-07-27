@@ -24,7 +24,7 @@ struct Candidate {
 }
 
 impl Pass for IfConversion {
-    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
+    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
         // Re-scan after every rewrite. Apart from keeping the analysis simple,
         // this permits an exposed outer candidate to be converted as well.
         let mut changed = false;
@@ -48,7 +48,7 @@ impl Pass for IfConversion {
 }
 
 impl IfConversion {
-    fn candidate(&self, data: &ArenaContext<'_>, head: BasicBlock) -> Option<Candidate> {
+    fn candidate(&self, data: &ArenaContextMut<'_>, head: BasicBlock) -> Option<Candidate> {
         let terminator = *data.layout().basicblock(head).insts().get_last()?;
         let InstKind::Branch(branch) = data.inst_data(terminator).kind() else {
             return None;
@@ -202,7 +202,7 @@ impl IfConversion {
     #[allow(clippy::too_many_arguments)]
     fn finish_candidate(
         &self,
-        data: &ArenaContext<'_>,
+        data: &ArenaContextMut<'_>,
         head: BasicBlock,
         terminator: Inst,
         merge: BasicBlock,
@@ -251,7 +251,7 @@ impl IfConversion {
         })
     }
 
-    fn reaches(&self, data: &ArenaContext<'_>, from: BasicBlock, target: BasicBlock) -> bool {
+    fn reaches(&self, data: &ArenaContextMut<'_>, from: BasicBlock, target: BasicBlock) -> bool {
         let mut seen = HashSet::new();
         let mut work = VecDeque::from([from]);
         while let Some(block) = work.pop_front() {
@@ -272,7 +272,7 @@ impl IfConversion {
 
     fn empty_arm(
         &self,
-        data: &ArenaContext<'_>,
+        data: &ArenaContextMut<'_>,
         bb: BasicBlock,
     ) -> Option<(Inst, BasicBlock, Vec<Inst>)> {
         let insts = data.layout().basicblock(bb).insts();
@@ -288,7 +288,7 @@ impl IfConversion {
 
     fn arm(
         &self,
-        data: &ArenaContext<'_>,
+        data: &ArenaContextMut<'_>,
         bb: BasicBlock,
     ) -> Option<(Inst, BasicBlock, Vec<Inst>)> {
         let jump_inst = *data.layout().basicblock(bb).insts().get_last()?;
@@ -300,7 +300,7 @@ impl IfConversion {
 
     fn safe_arm_binary(
         &self,
-        data: &ArenaContext<'_>,
+        data: &ArenaContextMut<'_>,
         inst: Inst,
         jump: Inst,
         head: BasicBlock,
@@ -322,7 +322,7 @@ impl IfConversion {
             && data.inst_data(inst).used_by().contains(&jump)
     }
 
-    fn available_at(&self, data: &ArenaContext<'_>, value: Inst, head: BasicBlock) -> bool {
+    fn available_at(&self, data: &ArenaContextMut<'_>, value: Inst, head: BasicBlock) -> bool {
         if value.is_global()
             || data.inst_data(value).is_const()
             || matches!(data.inst_data(value).kind(), InstKind::FuncArgRef(..))
@@ -341,7 +341,12 @@ impl IfConversion {
         self.dominates(data, def_bb, head)
     }
 
-    fn dominates(&self, data: &ArenaContext<'_>, dominator: BasicBlock, block: BasicBlock) -> bool {
+    fn dominates(
+        &self,
+        data: &ArenaContextMut<'_>,
+        dominator: BasicBlock,
+        block: BasicBlock,
+    ) -> bool {
         if dominator == block {
             return true;
         }
@@ -382,7 +387,7 @@ impl IfConversion {
         true
     }
 
-    fn exact_users(&self, data: &ArenaContext<'_>, bb: BasicBlock, expected: &[Inst]) -> bool {
+    fn exact_users(&self, data: &ArenaContextMut<'_>, bb: BasicBlock, expected: &[Inst]) -> bool {
         let users = data
             .bb_data(bb)
             .used_by()
@@ -393,7 +398,7 @@ impl IfConversion {
         users.len() == expected.len() && expected.iter().all(|inst| users.contains(inst))
     }
 
-    fn apply(&self, data: &mut ArenaContext<'_>, candidate: Candidate) {
+    fn apply(&self, data: &mut ArenaContextMut<'_>, candidate: Candidate) {
         let params = data.bb_data(candidate.merge).params().clone();
 
         // Remove the old terminator first so newly inserted values naturally

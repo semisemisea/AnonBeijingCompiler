@@ -96,7 +96,7 @@ fn is_op_commutative(op: BinaryOp) -> bool {
 
 impl InstType {
     fn build_from_value(
-        data: &ArenaContext<'_>,
+        data: &ArenaContextMut<'_>,
         value: Inst,
         val_id: &mut VIDAlloc,
     ) -> Option<InstType> {
@@ -193,7 +193,7 @@ impl LayeredMap {
 }
 
 impl Pass for GlobalInstNumbering {
-    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
+    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
         // function declaration. we just have to skip it.
         if data.layout().entry_bb().is_none() {
             return false;
@@ -219,7 +219,7 @@ impl Pass for GlobalInstNumbering {
             layered_type_map: &mut LayeredMap,
             val_alloc: &mut VIDAlloc,
             bb_alloc: &mut BIDAlloc,
-            data: &mut ArenaContext<'_>,
+            data: &mut ArenaContextMut<'_>,
         ) -> bool {
             layered_type_map.new_scope();
             let bb = bb_alloc.search_id(bb_id);

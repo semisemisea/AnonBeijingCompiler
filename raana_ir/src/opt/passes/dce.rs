@@ -11,7 +11,7 @@ pub struct JumpOnlyElimination;
 /// Function (call to function)
 /// Branches and Return
 impl Pass for DeadCodeElimination {
-    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
+    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
         self.run_on_func(data)
     }
 }
@@ -49,7 +49,7 @@ fn is_critical(value: Inst, data: &FunctionData) -> bool {
 }
 
 impl DeadCodeElimination {
-    pub(crate) fn run_on_func(&self, data: &mut ArenaContext<'_>) -> bool {
+    pub(crate) fn run_on_func(&self, data: &mut ArenaContextMut<'_>) -> bool {
         let mut worklist = VecDeque::new();
         let mut live_inst = HashSet::new();
 
@@ -194,7 +194,7 @@ mod tests {
 }
 
 impl Pass for DeadPhiElimination {
-    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
+    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
         let mut bb_allocator: IDAllocator<BasicBlock, BId> = IDAllocator::new(1);
         let mut unused_params_indices = Vec::with_capacity(data.layout().basicblocks().len());
 
@@ -264,7 +264,7 @@ impl Pass for DeadPhiElimination {
 }
 
 impl Pass for UnreachableBasicBlock {
-    fn run_on(&self, data: &mut ArenaContext<'_>) -> bool {
+    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
         if data.layout().entry_bb().is_none() {
             return false;
         }

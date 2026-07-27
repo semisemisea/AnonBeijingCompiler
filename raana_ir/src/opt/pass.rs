@@ -6,10 +6,41 @@ use crate::{
 };
 
 pub struct ArenaContext<'a> {
+    pub program: &'a Program,
+    pub curr_func: Option<Function>,
+}
+
+impl ArenaContext<'_> {
+    pub fn curr_func_data(&self) -> &FunctionData {
+        self.func_data(self.curr_func.unwrap())
+    }
+}
+
+impl Arena for ArenaContext<'_> {
+    fn local(&self) -> &crate::ir::arena::LocalArena {
+        self.program
+            .func_data(self.curr_func.unwrap())
+            .local_arena()
+    }
+
+    fn local_mut(&mut self) -> &mut crate::ir::arena::LocalArena {
+        unimplemented!()
+    }
+
+    fn global(&self) -> &crate::ir::arena::GlobalArena {
+        self.program.global_arena()
+    }
+
+    fn global_mut(&mut self) -> &mut crate::ir::arena::GlobalArena {
+        unimplemented!()
+    }
+}
+
+pub struct ArenaContextMut<'a> {
     pub program: &'a mut Program,
     pub curr_func: Option<Function>,
 }
-impl ArenaContext<'_> {
+impl ArenaContextMut<'_> {
     pub fn curr_func_data(&self) -> &FunctionData {
         self.func_data(self.curr_func.unwrap())
     }
@@ -18,20 +49,20 @@ impl ArenaContext<'_> {
         self.func_data_mut(self.curr_func.unwrap())
     }
 }
-impl std::ops::Deref for ArenaContext<'_> {
+impl std::ops::Deref for ArenaContextMut<'_> {
     type Target = FunctionData;
     fn deref(&self) -> &Self::Target {
         self.program.func_data(self.curr_func.unwrap())
     }
 }
 
-impl std::ops::DerefMut for ArenaContext<'_> {
+impl std::ops::DerefMut for ArenaContextMut<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.program.func_data_mut(self.curr_func.unwrap())
     }
 }
 
-impl Arena for ArenaContext<'_> {
+impl Arena for ArenaContextMut<'_> {
     fn local(&self) -> &crate::ir::arena::LocalArena {
         self.program
             .func_data(self.curr_func.unwrap())
@@ -57,7 +88,7 @@ pub trait Pass: Send + Sync {
     /// Runs this pass over every function once and reports whether it changed IR.
     fn run(&self, program: &mut Program) -> bool {
         let funcs = program.global_arena().func_arena().funcs();
-        let mut arena_context = ArenaContext {
+        let mut arena_context = ArenaContextMut {
             program,
             curr_func: None,
         };
@@ -73,7 +104,7 @@ pub trait Pass: Send + Sync {
     /// Normally you should not !only! implement this function
     /// But you can implement both function at same time.
     /// Runs this pass on one function and reports whether it changed IR.
-    fn run_on(&self, _data: &mut ArenaContext<'_>) -> bool {
+    fn run_on(&self, _data: &mut ArenaContextMut<'_>) -> bool {
         false
     }
 }
@@ -131,8 +162,10 @@ impl PassesManager {
             let ssa = Box::new(ssa::SSATransform);
             p.register_initial(ssa);
 
-            let sccp = Box::new(const_prop::SparseConditionConstantPropagation);
-            p.register(sccp);
+            // let sccp = Box::new(const_prop::SparseConditionConstantPropagation);
+            // p.register(sccp);
+            let ipsccp = Box::new(ipsccp::IPSCCP);
+            p.register(ipsccp);
 
             let simplify_cfg = Box::new(simplify_cfg::SimplifyCFG);
             p.register(simplify_cfg);
@@ -173,7 +206,7 @@ mod tests {
     struct Pass(AtomicUsize);
 
     impl super::Pass for Pass {
-        fn run_on(&self, _data: &mut ArenaContext<'_>) -> bool {
+        fn run_on(&self, _data: &mut ArenaContextMut<'_>) -> bool {
             self.0.fetch_add(1, Ordering::Relaxed) == 0
         }
     }
@@ -181,7 +214,7 @@ mod tests {
     struct FirstPass(Arc<AtomicUsize>);
 
     impl super::Pass for FirstPass {
-        fn run_on(&self, _data: &mut ArenaContext<'_>) -> bool {
+        fn run_on(&self, _data: &mut ArenaContextMut<'_>) -> bool {
             self.0
                 .compare_exchange(1, 2, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
@@ -191,7 +224,7 @@ mod tests {
     struct SecondPass(Arc<AtomicUsize>);
 
     impl super::Pass for SecondPass {
-        fn run_on(&self, _data: &mut ArenaContext<'_>) -> bool {
+        fn run_on(&self, _data: &mut ArenaContextMut<'_>) -> bool {
             self.0
                 .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()

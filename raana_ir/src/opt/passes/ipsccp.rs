@@ -187,8 +187,7 @@ impl Pass for IPSCCP {
                     | InstKind::ZeroInit
                     | InstKind::Integer(..)
                     | InstKind::Float(..)
-                    | InstKind::BlockArgRef(..)
-                    | InstKind::FuncArgRef(..) => unreachable!(
+                    | InstKind::BlockArgRef(..) => unreachable!(
                         "instruction {:?} with data {:?} should never appear in the layout",
                         inst,
                         data.inst_data(inst)
@@ -278,7 +277,7 @@ impl Pass for IPSCCP {
                         }
                         merge_and_extend(node, Lattice::Bottom, &mut lattice_map);
                     }
-                    InstKind::Store(..) | InstKind::MemZero(..) => {}
+                    InstKind::Store(..) | InstKind::MemZero(..) | InstKind::TailCall(..) => {}
                     InstKind::Call(call) => {
                         let callee = call.callee();
                         let callee_data = program.func_data(callee);
@@ -340,7 +339,7 @@ impl Pass for IPSCCP {
                             .map(construct_edge)
                             .for_each(push_edge);
                     }
-                    InstKind::Return(..) => {}
+                    InstKind::Return(..) | InstKind::TailCall(..) => {}
                     _ => {
                         icfg.outgoing_edges_of(Node::new(func, inst))
                             .for_each(push_edge);

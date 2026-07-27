@@ -611,6 +611,14 @@ pub enum MInst {
         clobbers: PRegSet,
         label: Label,
     },
+    /// A tail call: the epilogue (frame restore) is emitted ahead of this
+    /// instruction, then control transfers to `label` with `b`, reusing the
+    /// caller's frame. `args` are forced into the ABI argument registers.
+    TailCall {
+        args: Vec<CallArgPair>,
+        clobbers: PRegSet,
+        label: Label,
+    },
     RetVal {
         pair: RetPair,
     },
@@ -868,6 +876,12 @@ impl MachInst for MInst {
                 collector.reg_clobbers(call_clobbers(*clobbers, ret.as_ref()));
             }
             Self::RetVal { pair } => collector.reg_fixed_use(&mut pair.vreg, pair.preg),
+            Self::TailCall { args, clobbers, .. } => {
+                for pair in args {
+                    collector.reg_fixed_use(&mut pair.vreg, pair.preg);
+                }
+                collector.reg_clobbers(*clobbers);
+            }
             Self::CondBr { .. } => {}
         }
     }
@@ -880,7 +894,7 @@ impl MachInst for MInst {
     }
     fn is_term(&self) -> MachTerminator {
         match self {
-            Self::Ret => MachTerminator::Return,
+            Self::Ret | Self::TailCall { .. } => MachTerminator::Return,
             Self::BCond { .. }
             | Self::Cbz { .. }
             | Self::Cbnz { .. }
@@ -1350,6 +1364,10 @@ impl MachInstEmit for MInst {
                 write!(ctx, "bl ")?;
                 label.emit(ctx)
             }
+            Self::TailCall { label, .. } => {
+                write!(ctx, "b ")?;
+                label.emit(ctx)
+            }
             Self::Ret => write!(ctx, "ret"),
         }
     }
@@ -1728,11 +1746,7 @@ fn amode_is_legal(addr: &AMode, ty: MemoryType) -> bool {
         | AMode::SignedOffset { .. }
         | AMode::RegOffset { .. } => true,
         AMode::ScaledRegOffset { shift, .. } => *shift == ty.byte_size().trailing_zeros() as u8,
-        AMode::ExtendedRegOffset {
-            extend,
-            shift,
-            ..
-        } => {
+        AMode::ExtendedRegOffset { extend, shift, .. } => {
             matches!(
                 extend,
                 ExtendOp::Uxtw | ExtendOp::Sxtw | ExtendOp::Uxtx | ExtendOp::Sxtx

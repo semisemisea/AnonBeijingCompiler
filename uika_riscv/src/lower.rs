@@ -1,8 +1,8 @@
 use raana_ir::ir::{
-    Binary, BinaryOp, Call, Cast, GetElemPtr, InstKind, Load, Return, Select, Store,
+    Binary, BinaryOp, Call, Cast, GetElemPtr, InstKind, Load, Return, Select, Store, TailCall,
     Type as HirType, TypeKind as HirTypeKind, arena::Arena, inst_kind::MemZero,
 };
-use smallvec::smallvec;
+use smallvec::{SmallVec, smallvec};
 
 use crate::{
     abi::{DEFAULT_CLOBBERS, Riscv64ABI},
@@ -15,7 +15,7 @@ use crate::{
 };
 
 use taki_mir::{
-    abi::{ABIMachineSpec, CallArgPair, CallRetPair, RetPair, StackAMode},
+    abi::{ABIMachineSpec, ArgSlot, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::LoweredBlock,
     div_magic::{MagicCorrection, signed_magic_i32},
     libcall::LibCall,
@@ -981,6 +981,45 @@ fn lower_call(
     result.map_or(LoweredOutput::None, LoweredOutput::Value)
 }
 
+/// Lower a tail call (self-recursion). Register arguments are forced into the
+/// ABI argument registers via the `TailCall` operands; stack arguments are
+/// stored to the incoming-argument slots. The emitter prepends the epilogue
+/// (frame restore) to the `TailCall`, which then jumps without linking.
+fn lower_tail_call(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    tail_call: &TailCall,
+) -> LoweredOutput {
+    let mut call_arg_pairs: SmallVec<[CallArgPair; 8]> = smallvec![];
+    for (idx, &arg) in tail_call.args().iter().enumerate() {
+        let arg_reg = ctx.put_value_in_reg(arg);
+        let arg_ty = arena.inst_data(arg).ty();
+        let m_type: LoweredType = arg_ty.into();
+        match ctx.vcode.vcode.abi.arg_slot(idx) {
+            ArgSlot::Reg { reg, .. } => call_arg_pairs.push(CallArgPair {
+                vreg: arg_reg,
+                preg: reg.into(),
+            }),
+            ArgSlot::Stack { offset, .. } => {
+                let op: StoreOP = m_type.into();
+                let addr = normalize_amode(AMode::IncomingArg(offset), ctx);
+                ctx.emit(MInst::StoreWord {
+                    rs: arg_reg,
+                    op,
+                    addr,
+                });
+            }
+        }
+    }
+    ctx.vcode.vcode.abi.set_has_calls();
+    ctx.emit(MInst::TailCall {
+        arg_pairs: call_arg_pairs,
+        clobbers: DEFAULT_CLOBBERS,
+        label: Label::Function(tail_call.callee()),
+    });
+    LoweredOutput::None
+}
+
 fn lower_return(
     ctx: &mut LowerContext<'_, MInst>,
     arena: ArenaContext<'_>,
@@ -1009,7 +1048,6 @@ impl LowerBackend for Riscv64Backend {
         let arena = ctx.arena;
         match arena.inst_data(inst).kind() {
             InstKind::BlockArgRef(..)
-            | InstKind::FuncArgRef(..)
             | InstKind::Aggregate(..)
             | InstKind::GlobalAlloc(..)
             | InstKind::Undef
@@ -1032,6 +1070,7 @@ impl LowerBackend for Riscv64Backend {
             InstKind::MemZero(mem_zero) => lower_mem_zero(ctx, arena, mem_zero),
             InstKind::Load(load) => lower_load(ctx, arena, inst, load),
             InstKind::Call(call) => lower_call(ctx, arena, inst, call),
+            InstKind::TailCall(tail_call) => lower_tail_call(ctx, arena, tail_call),
             InstKind::Return(ret) => lower_return(ctx, arena, ret),
             InstKind::Jump(..) | InstKind::Branch(..) => {
                 unreachable!("should not lower branch instruction in here.")
@@ -1205,10 +1244,7 @@ mod tests {
             vec![HirType::get_i32()],
         );
         let data = program.func_data_mut(function);
-        let entry = data
-            .new_basic_block()
-            .basic_block("entry".to_string(), Vec::new());
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let numerator = data.params()[0];
         let constant = data.new_local_inst().integer(divisor);
         let binary = data.new_local_inst().binary(op, numerator, constant);
@@ -1263,10 +1299,7 @@ mod tests {
             vec![HirType::get_i32(), HirType::get_i32()],
         );
         let data = program.func_data_mut(function);
-        let entry = data
-            .new_basic_block()
-            .basic_block("entry".to_string(), Vec::new());
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let numerator = data.params()[0];
         let divisor = data.params()[1];
         let binary = data
@@ -1314,10 +1347,7 @@ mod tests {
         let mut program = Program::new();
         let function = program.new_function(HirType::get_i32(), "choose".to_string(), Vec::new());
         let data = program.func_data_mut(function);
-        let entry = data
-            .new_basic_block()
-            .basic_block("entry".to_string(), Vec::new());
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
 
         let cond = data.new_local_inst().integer(2);
         let if_true = data.new_local_inst().integer(10);
@@ -1343,10 +1373,7 @@ mod tests {
         let function =
             program.new_function(pointer_ty.clone(), "choose_pointer".to_string(), Vec::new());
         let data = program.func_data_mut(function);
-        let entry = data
-            .new_basic_block()
-            .basic_block("entry".to_string(), Vec::new());
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
 
         let cond = data.new_local_inst().integer(2);
         let if_true = data.new_local_inst().alloc(HirType::get_i32());
@@ -1372,10 +1399,7 @@ mod tests {
         let function =
             program.new_function(HirType::get_f32(), "choose_float".to_string(), Vec::new());
         let data = program.func_data_mut(function);
-        let entry = data
-            .new_basic_block()
-            .basic_block("entry".to_string(), Vec::new());
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
 
         let cond = data.new_local_inst().integer(-2);
         let if_true = data.new_local_inst().float(1.5);
@@ -1400,10 +1424,7 @@ mod tests {
         let mut program = Program::new();
         let function = program.new_function(HirType::get_unit(), "clear".to_string(), Vec::new());
         let data = program.func_data_mut(function);
-        let entry = data
-            .new_basic_block()
-            .basic_block("entry".to_string(), Vec::new());
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
 
         let alloc = data
             .new_local_inst()

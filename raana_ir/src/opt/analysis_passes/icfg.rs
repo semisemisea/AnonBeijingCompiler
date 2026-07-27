@@ -312,7 +312,7 @@ impl ICFG {
                     );
                 };
                 match inst_data.kind() {
-                    InstKind::Return(..) => {
+                    InstKind::Return(..) | InstKind::TailCall(..) => {
                         return_sites.push(last_inst);
                     }
                     InstKind::Jump(jump) => {

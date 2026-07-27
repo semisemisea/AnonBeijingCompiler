@@ -32,7 +32,7 @@ TARGET_CONFIG = {
     },
 }
 DEFAULT_COMPILER = Path(
-    os.environ.get("SOYO_COMPILER", "/work/target/release/soyo_compiler")
+    os.environ.get("SOYO_COMPILER", "/work/target/release/compiler")
 )
 
 COLOR = sys.stdout.isatty()

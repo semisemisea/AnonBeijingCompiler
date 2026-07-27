@@ -74,7 +74,7 @@ CARGO_TARGET_LINKER := CARGO_TARGET_$(shell echo $(MUSL_TARGET) | tr 'a-z-' 'A-Z
 endif
 
 HOST_TARGET_DIR := $(CURDIR)/target/host-musl
-COMPILER := /work/target/$(MUSL_TARGET)/release/soyo_compiler
+COMPILER := /work/target/$(MUSL_TARGET)/release/compiler
 
 .PHONY: help test test-baseline test-llvm test-riscv run-elf run-elf-riscv debug-elf debug-elf-riscv mca test-image test-compiler build-lib build-lib-riscv clean-results
 
@@ -229,9 +229,9 @@ test-image:
 		&& printf '%s\n' "$(DOCKERFILE_CHECKSUM)" > "$(IMAGE_STAMP)"
 
 test-compiler:
-	@echo "Building soyo_compiler..."
-	@$(CARGO_TARGET_LINKER) cargo build -p soyo_compiler --release --target "$(MUSL_TARGET)" --target-dir "$(HOST_TARGET_DIR)" --quiet >/dev/null 2>&1
-	@echo "Built soyo_compiler at $(COMPILER)"
+	@echo "Building compiler..."
+	@$(CARGO_TARGET_LINKER) cargo build -p soyo_compiler --bin compiler --release --target "$(MUSL_TARGET)" --target-dir "$(HOST_TARGET_DIR)" --quiet >/dev/null 2>&1
+	@echo "Built compiler at $(COMPILER)"
 
 build-lib: test-image
 	$(DOCKER) run --rm -u "$$(id -u):$$(id -g)" \

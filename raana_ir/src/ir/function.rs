@@ -4,7 +4,6 @@ use crate::ir::{
     arena::{Arena, LocalArena},
     basic_block::BasicBlock,
     builder::{BasicBlockBuilders, LocalBuilder},
-    inst_kind::FuncArgRef,
     instruction::Inst,
     layout::Layout,
     types::Type,
@@ -13,6 +12,10 @@ use crate::ir::{
 pub struct FunctionData {
     ret_ty: Type,
     name: String,
+    params_ty: Vec<Type>,
+    /// Function-parameter values. For a definition these are the entry block's
+    /// block parameters (set by `set_params` when the entry is created); for a
+    /// declaration this is empty and the signature comes from `params_ty`.
     params: Vec<Inst>,
     layout: Layout,
     local_arena: LocalArena,
@@ -38,21 +41,14 @@ impl Arena for FunctionData {
 
 impl FunctionData {
     pub fn new(ret_ty: Type, name: String, params_ty: Vec<Type>) -> FunctionData {
-        let local_arena = LocalArena::new();
-        let mut fd = FunctionData {
+        FunctionData {
             ret_ty,
             name,
+            params_ty,
             params: vec![],
             layout: Layout::new(),
-            local_arena,
-        };
-        let params = params_ty
-            .iter()
-            .enumerate()
-            .map(|(i, ty)| fd.alloc_local_inst(FuncArgRef::new_data(i, ty.clone())))
-            .collect();
-        fd.params = params;
-        fd
+            local_arena: LocalArena::new(),
+        }
     }
 
     pub fn layout(&self) -> &Layout {
@@ -71,6 +67,27 @@ impl FunctionData {
         BasicBlockBuilders { arena: self }
     }
 
+    /// Create the function's entry block with one block parameter per
+    /// function parameter (matching the signature), push it to the layout,
+    /// and record those parameters. This is the IR's structural convention:
+    /// the function's parameters *are* the entry block's parameters.
+    pub fn add_entry_block(&mut self) -> BasicBlock {
+        use crate::ir::builder::BasicBlockBuilder;
+        let params_ty = self.params_ty().to_vec();
+        let entry = self
+            .new_basic_block()
+            .basic_block("entry".into(), params_ty);
+        self.layout_mut().push_bb_back(entry);
+        let params = self
+            .local_arena()
+            .bb_arena()
+            .data_of(entry)
+            .params()
+            .to_vec();
+        self.params = params;
+        entry
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -81,6 +98,24 @@ impl FunctionData {
 
     pub fn params(&self) -> &[Inst] {
         &self.params
+    }
+
+    /// The function's parameter types (the signature). Always available, even
+    /// for declarations which have no entry block and therefore no `params()`.
+    pub fn params_ty(&self) -> &[Type] {
+        &self.params_ty
+    }
+
+    /// Record the entry block parameters as this function's parameter values.
+    /// Called by the frontend once the entry block (whose block parameters
+    /// mirror `params_ty`) has been created.
+    pub fn set_params(&mut self, params: Vec<Inst>) {
+        debug_assert_eq!(
+            params.len(),
+            self.params_ty.len(),
+            "entry block parameter count must match the function signature"
+        );
+        self.params = params;
     }
 
     pub fn local_arena(&self) -> &LocalArena {

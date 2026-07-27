@@ -141,7 +141,9 @@ impl ToRaanaIR for items::FuncDef {
 
         // Recursive conversion.
         ctx.add_scope();
-        let params = ctx.curr_func_data().params().to_vec();
+        // The function body references the entry block's parameters (which
+        // mirror the signature).
+        let params = ctx.curr_func_data().bb_data(entry_bb).params().to_vec();
         let ty_name_and_val = self.params.iter().cloned().zip(params.iter());
         for (param_slot, &param_val) in ty_name_and_val {
             let ty = param_slot.ty_global(ctx);

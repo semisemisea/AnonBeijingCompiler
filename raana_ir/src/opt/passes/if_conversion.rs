@@ -325,10 +325,19 @@ impl IfConversion {
     fn available_at(&self, data: &ArenaContextMut<'_>, value: Inst, head: BasicBlock) -> bool {
         if value.is_global()
             || data.inst_data(value).is_const()
-            || matches!(data.inst_data(value).kind(), InstKind::FuncArgRef(..))
             || data.bb_data(head).params().contains(&value)
         {
             return true;
+        }
+        // Block parameters are not part of the instruction layout, so the
+        // `parent_bb` lookup below cannot place them. Resolve their defining
+        // block explicitly and apply ordinary dominance. This lets values
+        // derived from the entry-block parameters (which mirror the function
+        // arguments and dominate the whole body) be hoisted anywhere.
+        if matches!(data.inst_data(value).kind(), InstKind::BlockArgRef(..)) {
+            return self.block_of_param(data, value).is_some_and(|def_block| {
+                def_block == head || self.dominates(data, def_block, head)
+            });
         }
         let Some(def_bb) = data.layout().parent_bb(value) else {
             return false;
@@ -339,6 +348,14 @@ impl IfConversion {
                 && insts.get_last().is_some_and(|&term| term != value);
         }
         self.dominates(data, def_bb, head)
+    }
+
+    fn block_of_param(&self, data: &ArenaContextMut<'_>, value: Inst) -> Option<BasicBlock> {
+        data.layout()
+            .basicblocks()
+            .iter()
+            .find(|layout| data.bb_data(layout.bb()).params().contains(&value))
+            .map(|layout| layout.bb())
     }
 
     fn dominates(
@@ -478,7 +495,11 @@ mod tests {
         let mut program = Program::new();
         let function = program.new_function(Type::get_i32(), "same".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
-        let head = data.new_basic_block().basic_block("head".into(), vec![]);
+        let __pty = data.params_ty().to_vec();
+        let head = data.new_basic_block().basic_block("head".into(), __pty);
+        let __params = data.bb_data(head).params().to_vec();
+
+        data.set_params(__params);
         let merge = data
             .new_basic_block()
             .basic_block("merge".into(), vec![Type::get_i32(), Type::get_i32()]);
@@ -516,7 +537,11 @@ mod tests {
         let function =
             program.new_function(Type::get_i32(), "diamond".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
-        let head = data.new_basic_block().basic_block("head".into(), vec![]);
+        let __pty = data.params_ty().to_vec();
+        let head = data.new_basic_block().basic_block("head".into(), __pty);
+        let __params = data.bb_data(head).params().to_vec();
+
+        data.set_params(__params);
         let yes = data.new_basic_block().basic_block("yes".into(), vec![]);
         let no = data.new_basic_block().basic_block("no".into(), vec![]);
         let merge = data
@@ -550,7 +575,11 @@ mod tests {
         let mut program = Program::new();
         let function = program.new_function(Type::get_i32(), "abs".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
-        let head = data.new_basic_block().basic_block("head".into(), vec![]);
+        let __pty = data.params_ty().to_vec();
+        let head = data.new_basic_block().basic_block("head".into(), __pty);
+        let __params = data.bb_data(head).params().to_vec();
+
+        data.set_params(__params);
         let neg = data.new_basic_block().basic_block("neg".into(), vec![]);
         let merge = data
             .new_basic_block()
@@ -583,7 +612,11 @@ mod tests {
         let function =
             program.new_function(Type::get_i32(), "external".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
-        let head = data.new_basic_block().basic_block("head".into(), vec![]);
+        let __pty = data.params_ty().to_vec();
+        let head = data.new_basic_block().basic_block("head".into(), __pty);
+        let __params = data.bb_data(head).params().to_vec();
+
+        data.set_params(__params);
         let arm = data.new_basic_block().basic_block("arm".into(), vec![]);
         let merge = data
             .new_basic_block()
@@ -621,7 +654,11 @@ mod tests {
         let function =
             program.new_function(Type::get_i32(), "negative".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
-        let head = data.new_basic_block().basic_block("head".into(), vec![]);
+        let __pty = data.params_ty().to_vec();
+        let head = data.new_basic_block().basic_block("head".into(), __pty);
+        let __params = data.bb_data(head).params().to_vec();
+
+        data.set_params(__params);
         let arm = data.new_basic_block().basic_block("arm".into(), vec![]);
         let extra = data.new_basic_block().basic_block("extra".into(), vec![]);
         let merge = data
@@ -655,7 +692,11 @@ mod tests {
         let mut program = Program::new();
         let function = program.new_function(Type::get_unit(), "loop".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
-        let head = data.new_basic_block().basic_block("head".into(), vec![]);
+        let __pty = data.params_ty().to_vec();
+        let head = data.new_basic_block().basic_block("head".into(), __pty);
+        let __params = data.bb_data(head).params().to_vec();
+
+        data.set_params(__params);
         let merge = data
             .new_basic_block()
             .basic_block("merge".into(), vec![Type::get_i32()]);
@@ -669,7 +710,7 @@ mod tests {
             .new_local_inst()
             .branch(cond, merge, vec![one], merge, vec![two]);
         data.layout_mut().insert_inst(head, branch);
-        let backedge = data.new_local_inst().jump(head, vec![]);
+        let backedge = data.new_local_inst().jump(head, vec![cond]);
         data.layout_mut().insert_inst(merge, backedge);
 
         run(&mut program);

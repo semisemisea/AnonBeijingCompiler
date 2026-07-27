@@ -123,7 +123,7 @@ impl Layout {
 
 #[cfg(test)]
 mod tests {
-    use crate::ir::{builder::*, Program, Type};
+    use crate::ir::{Program, Type, builder::*};
 
     #[test]
     fn inserts_instructions_before_layout_anchors() {
@@ -131,8 +131,7 @@ mod tests {
         let function =
             program.new_function(Type::get_i32(), "insert".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
 
         let x = data.params()[0];
         let one = data.new_local_inst().integer(1);

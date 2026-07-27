@@ -463,14 +463,14 @@ impl<'a> LlvmWriter<'a> {
 
         writeln!(self.buffer, "{}:", label_def)?;
 
-        if !params.is_empty() {
+        if !params.is_empty() && !is_entry {
             let incoming_list = incomings.map(|v| v.as_slice()).unwrap_or(&[]);
             for (i, &param_inst) in params.iter().enumerate() {
                 let param_ty = self.type_to_llvm(self.arena.inst_data(param_inst).ty());
                 let phi_name = get_name!(self, param_inst);
                 let mut parts = String::new();
-                for (j, (pred_bb, args)) in incoming_list.iter().enumerate() {
-                    if j > 0 {
+                for (pred_bb, args) in incoming_list.iter() {
+                    if !parts.is_empty() {
                         parts.push_str(", ");
                     }
                     let pred_label = bb_label!(self, *pred_bb);
@@ -565,6 +565,50 @@ impl<'a> LlvmWriter<'a> {
             }
             InstKind::Cast(cast) => self.visit_cast(cast, &ty),
             InstKind::Call(call) => self.visit_call(call, &ty),
+            InstKind::TailCall(tail_call) => {
+                let callee_data = self.arena.func_data(tail_call.callee());
+                let args_str: Vec<String> = tail_call
+                    .args()
+                    .iter()
+                    .map(|&a| {
+                        format!(
+                            "{} {}",
+                            self.type_to_llvm(self.arena.inst_data(a).ty()),
+                            get_name!(self, a)
+                        )
+                    })
+                    .collect();
+                let ret_ty = callee_data.ret_ty().clone();
+                if ret_ty.is_unit() {
+                    writeln!(
+                        self.buffer,
+                        "musttail call void @{}({})",
+                        callee_data.name(),
+                        args_str.join(", ")
+                    )?;
+                    writeln!(self.buffer, "  ret void")
+                } else {
+                    // Reuse the tail-call instruction's own (block-ordered)
+                    // name for the musttail result so LLVM's unnamed-value
+                    // numbering stays monotonic.
+                    let result = get_name!(self, inst);
+                    writeln!(
+                        self.buffer,
+                        "{} = musttail call {} @{}({})",
+                        result,
+                        self.type_to_llvm(&ret_ty),
+                        callee_data.name(),
+                        args_str.join(", ")
+                    )?;
+                    write!(
+                        self.buffer,
+                        "  ret {} {}",
+                        self.type_to_llvm(&ret_ty),
+                        result
+                    )?;
+                    writeln!(self.buffer)
+                }
+            }
             InstKind::GetElemPtr(gep) => self.visit_get_elem_ptr(gep),
             InstKind::Jump(jump) => {
                 writeln!(self.buffer, "br label {}", bb_label!(self, jump.target()))
@@ -648,7 +692,6 @@ impl<'a> LlvmWriter<'a> {
             | InstKind::ZeroInit
             | InstKind::Undef
             | InstKind::Aggregate(_)
-            | InstKind::FuncArgRef(_)
             | InstKind::BlockArgRef(_)
             | InstKind::GlobalAlloc(_) => {
                 writeln!(self.buffer, "; value")?;
@@ -967,8 +1010,7 @@ mod tests {
         let mut program = Program::new();
         let function = program.new_function(Type::get_i32(), "choose".into(), vec![]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
 
         let cond = data.new_local_inst().integer(2);
         let if_true = data.new_local_inst().integer(10);
@@ -995,8 +1037,7 @@ mod tests {
             vec![Type::get_f32(), Type::get_f32()],
         );
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let lhs = data.params()[0];
         let rhs = data.params()[1];
         let not_equal = data
@@ -1016,8 +1057,7 @@ mod tests {
         let mut program = Program::new();
         let function = program.new_function(Type::get_unit(), "clear".into(), vec![]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let alloc = data
             .new_local_inst()
             .alloc(Type::get_array(Type::get_i32(), 4));

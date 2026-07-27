@@ -354,7 +354,6 @@ fn process_instruction(
         | InstKind::Aggregate(..)
         | InstKind::Integer(..)
         | InstKind::BlockArgRef(..)
-        | InstKind::FuncArgRef(..)
         | InstKind::GlobalAlloc(..) => unreachable!(),
         InstKind::Store(..) | InstKind::MemZero(..) => None,
         left => match left {
@@ -496,7 +495,7 @@ fn process_instruction(
                     .insert_or_merge(inst, VariableStatus::Bottom)
                     .then_some(ret_with!(inst))
             }
-            InstKind::Return(..) => None,
+            InstKind::Return(..) | InstKind::TailCall(..) => None,
             _ => unreachable!(),
         },
     }

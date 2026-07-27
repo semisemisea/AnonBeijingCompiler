@@ -12,10 +12,10 @@ pub mod r3turn;
 pub mod scalar;
 pub mod select;
 pub mod stack_mem;
+pub mod tail_call;
 
 pub use aggregate::Aggregate;
 pub use arg_ref::BlockArgRef;
-pub use arg_ref::FuncArgRef;
 pub use binary::Binary;
 pub use binary::BinaryOp;
 pub use branch::Branch;
@@ -31,6 +31,7 @@ pub use scalar::Integer;
 pub use select::Select;
 pub use stack_mem::Load;
 pub use stack_mem::Store;
+pub use tail_call::TailCall;
 
 use crate::ir::basic_block::BasicBlock;
 use crate::ir::instruction::Inst;
@@ -54,8 +55,8 @@ pub enum InstKind {
     MemZero(MemZero),
     Load(Load),
     Call(Call),
+    TailCall(TailCall),
     BlockArgRef(BlockArgRef),
-    FuncArgRef(FuncArgRef),
     Aggregate(Aggregate),
 }
 
@@ -86,7 +87,10 @@ impl InstKind {
     pub fn is_terminator(&self) -> bool {
         matches!(
             self,
-            InstKind::Jump(..) | InstKind::Branch(..) | InstKind::Return(..)
+            InstKind::Jump(..)
+                | InstKind::Branch(..)
+                | InstKind::Return(..)
+                | InstKind::TailCall(..)
         )
     }
 
@@ -122,7 +126,6 @@ impl Iterator for InstUsage<'_> {
         }
         match self.data {
             InstKind::BlockArgRef(..)
-            | InstKind::FuncArgRef(..)
             | InstKind::Float(..)
             | InstKind::Integer(..)
             | InstKind::Alloc
@@ -161,6 +164,7 @@ impl Iterator for InstUsage<'_> {
             InstKind::Load(load) => field_use!(load.src()),
             InstKind::Cast(cast) => field_use!(cast.src()),
             InstKind::Call(call) => call.args().get(cur_index).copied(),
+            InstKind::TailCall(tail_call) => tail_call.args().get(cur_index).copied(),
             InstKind::Aggregate(aggregate) => aggregate.value().get(cur_index).copied(),
             InstKind::Binary(binary) => field_use!(binary.lhs(), binary.rhs()),
             InstKind::Select(select) => {

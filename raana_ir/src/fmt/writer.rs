@@ -8,7 +8,9 @@ use crate::ir::BasicBlock;
 use crate::ir::{
     Aggregate, Function, FunctionData, InstKind, Program, Type,
     arena::Arena,
-    inst_kind::{Binary, Branch, Call, Cast, GetElemPtr, Jump, Load, Return, Select, Store},
+    inst_kind::{
+        Binary, Branch, Call, Cast, GetElemPtr, Jump, Load, Return, Select, Store, TailCall,
+    },
     instruction::{Inst, InstData},
     layout::BasicBlockLayout,
 };
@@ -275,6 +277,7 @@ impl Writer<'_> {
             InstKind::Branch(branch) => self.visit_branch(branch),
             InstKind::Cast(cast) => self.visit_cast(cast, data.ty()),
             InstKind::Call(call) => self.visit_call(call),
+            InstKind::TailCall(tail_call) => self.visit_tail_call(tail_call),
             InstKind::GetElemPtr(get_elem_ptr) => {
                 self.visit_get_elem_ptr(get_elem_ptr, data.ty().clone())
             }
@@ -379,6 +382,22 @@ impl Writer<'_> {
         if !call.args().is_empty() {
             write!(self.buffer, ", args = (")?;
             let Some((&last, rest)) = call.args().split_last() else {
+                unreachable!();
+            };
+            for &inst in rest {
+                write!(self.buffer, "{}, ", get_name!(self, inst))?;
+            }
+            write!(self.buffer, "{})", get_name!(self, last))?;
+        }
+        write!(self.buffer, ">")
+    }
+
+    fn visit_tail_call(&mut self, tail_call: &TailCall) -> std::fmt::Result {
+        let callee_data = self.arena.func_data(tail_call.callee());
+        write!(self.buffer, "tail_call <name = {}", callee_data.name())?;
+        if !tail_call.args().is_empty() {
+            write!(self.buffer, ", args = (")?;
+            let Some((&last, rest)) = tail_call.args().split_last() else {
                 unreachable!();
             };
             for &inst in rest {

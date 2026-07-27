@@ -5,7 +5,7 @@ use crate::ir::{
     function::Function,
     inst_kind::{
         Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Cast, Float, GetElemPtr,
-        GlobalAlloc, InstKind, Integer, Jump, Load, MemZero, Return, Select, Store,
+        GlobalAlloc, InstKind, Integer, Jump, Load, MemZero, Return, Select, Store, TailCall,
     },
     instruction::{Inst, InstData},
     types::Type,
@@ -127,6 +127,12 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
     /// the Program-owned callee arena.
     fn call_with_type(&mut self, callee: Function, args: Vec<Inst>, ret_ty: Type) -> Inst {
         self.insert_inst(Call::new_data(callee, args, ret_ty))
+    }
+
+    /// A tail call: reuses the current frame and transfers the return value of
+    /// `callee(args)` straight to this function's caller. Must end a block.
+    fn tail_call(&mut self, callee: Function, args: Vec<Inst>) -> Inst {
+        self.insert_inst(TailCall::new_data(callee, args))
     }
 
     fn cast(&mut self, src: Inst, ty: Type) -> Inst {
@@ -340,8 +346,7 @@ mod tests {
         let mut program = Program::new();
         let function = program.new_function(Type::get_unit(), "clear".into(), vec![]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let alloc = data
             .new_local_inst()
             .alloc(Type::get_array(Type::get_i32(), 4));

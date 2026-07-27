@@ -166,10 +166,10 @@ fn visit_and_replace_single(
     match rep_val_data.kind() {
         InstKind::ZeroInit
         | InstKind::Undef
-        | InstKind::FuncArgRef(..)
         | InstKind::BlockArgRef(..)
         | InstKind::Alloc
-        | InstKind::GlobalAlloc(..) => unreachable!("Encountered kind: {:?}", rep_val_data.kind()),
+        | InstKind::GlobalAlloc(..)
+        | InstKind::TailCall(..) => unreachable!("Encountered kind: {:?}", rep_val_data.kind()),
         InstKind::Integer(..) | InstKind::Float(..) => {}
         InstKind::Aggregate(agg) => {
             let value = agg
@@ -311,6 +311,15 @@ fn visit_and_replace_single(
             let callee = call.callee();
             data.replace_inst_with(used_by).call(callee, args);
         }
+        InstKind::TailCall(tail_call) => {
+            let args = tail_call
+                .args()
+                .iter()
+                .map(|&val| if val == rep { rep_with } else { val })
+                .collect();
+            let callee = tail_call.callee();
+            data.replace_inst_with(used_by).tail_call(callee, args);
+        }
         InstKind::Return(ret) => {
             if ret.value() == Some(rep) {
                 data.replace_inst_with(used_by).ret(Some(rep_with));
@@ -332,8 +341,7 @@ mod tests {
         let mut program = Program::new();
         let function = program.new_function(Type::get_unit(), "clear".into(), vec![]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let old_dest = data.new_local_inst().alloc(Type::get_i32());
         let new_dest = data.new_local_inst().alloc(Type::get_i32());
         let clear = data.new_local_inst().mem_zero(old_dest, 4);

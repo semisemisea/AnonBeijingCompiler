@@ -256,8 +256,7 @@ mod tests {
         let function =
             program.new_function(Type::get_i32(), "truthy".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let x = data.params()[0];
         let zero = data.new_local_inst().integer(0);
         let compare = data.new_local_inst().binary(BinaryOp::Lt, x, zero);
@@ -277,8 +276,7 @@ mod tests {
         let function =
             program.new_function(Type::get_i32(), "inverse".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let x = data.params()[0];
         let zero = data.new_local_inst().integer(0);
         let compare = data.new_local_inst().binary(BinaryOp::Lt, x, zero);
@@ -303,8 +301,7 @@ mod tests {
         let mut program = Program::new();
         let function = program.new_function(Type::get_i32(), "float".into(), vec![Type::get_f32()]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let x = data.params()[0];
         let zero_float = data.new_local_inst().float(0.0);
         let zero_int = data.new_local_inst().integer(0);
@@ -332,10 +329,10 @@ mod tests {
         let function =
             program.new_function(Type::get_unit(), "branch".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        let entry = data.add_entry_block();
         let yes = data.new_basic_block().basic_block("yes".into(), vec![]);
         let no = data.new_basic_block().basic_block("no".into(), vec![]);
-        for bb in [entry, yes, no] {
+        for bb in [yes, no] {
             data.layout_mut().push_bb_back(bb);
         }
         let x = data.params()[0];
@@ -363,8 +360,7 @@ mod tests {
         let function =
             program.new_function(Type::get_i32(), "select".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let x = data.params()[0];
         let zero = data.new_local_inst().integer(0);
         let one = data.new_local_inst().integer(1);
@@ -390,8 +386,7 @@ mod tests {
         let function =
             program.new_function(Type::get_i32(), "select_zero".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let x = data.params()[0];
         let zero = data.new_local_inst().integer(0);
         let if_true = data.new_local_inst().integer(10);

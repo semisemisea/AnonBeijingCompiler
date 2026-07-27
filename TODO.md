@@ -154,7 +154,7 @@ fn preg_invalid_does_not_collide_with_sp_slot() {
 
 **验证：** `cargo test -p taki_mir` 全绿。
 
-### Phase 2 ── `anon_armv8`：引入 SP 为普通 Reg
+### Phase 2 ── `anon_armv8`：引入 SP 为普通 Reg  ✅ DONE
 
 #### 2.1 `anon_armv8/src/regs.rs` 新增
 

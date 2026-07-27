@@ -13,7 +13,8 @@ use taki_mir::{
 use crate::{
     constants::materialize_integer_constant,
     instructions::{
-        AMode, AluOp, Imm12, MInst, MemoryType, PairAMode, SImm7Scaled, SImm9, UImm12Scaled,
+        AMode, AluOp, ExtendOp, Imm12, MInst, MemoryType, PairAMode, SImm7Scaled, SImm9,
+        UImm12Scaled,
     },
     labels::Label,
     regs::{self, OperandSize, RegOrZr},
@@ -419,22 +420,40 @@ fn legalize_amode(
     )
 }
 
+/// Adjust the stack pointer by a signed amount. Mirrors cranelift's
+/// `gen_sp_reg_adjust`: emit a single `add/sub sp, sp, #imm12` whenever the
+/// magnitude fits an [`Imm12`] (possibly with `lsl #12`), and otherwise
+/// materialize the constant in a post-RA scratch and use the extended-register
+/// form `add/sub sp, sp, tmp, uxtx`.
 fn append_sp_adjust(insts: &mut SmallVec<[MInst; 16]>, amount: i64) {
     if amount == 0 {
         return;
     }
-    // x0 carries an integer return value at epilogue time, so frame teardown
-    // must use a caller-saved temporary outside the result registers.
-    append_add_constant(
-        insts,
-        Writable::from_reg(regs::int_reg(17)),
-        regs::stack_reg(),
-        amount,
-    );
-    insts.push(MInst::MovPhys {
+    let (abs, op) = if amount < 0 {
+        (amount.unsigned_abs(), AluOp::Sub)
+    } else {
+        (amount as u64, AluOp::Add)
+    };
+    if let Some(imm) = Imm12::maybe_from_u64(abs) {
+        insts.push(MInst::AluRRImm12 {
+            op,
+            size: OperandSize::Size64,
+            dst: regs::writable_stack_reg(),
+            src: regs::stack_reg(),
+            imm,
+        });
+        return;
+    }
+    let tmp = Writable::from_reg(regs::int_reg(regs::INT_POST_RA_SCRATCH[0]));
+    insts.extend(materialize_integer_constant(abs, OperandSize::Size64, tmp));
+    insts.push(MInst::AluRRRExtend {
+        op,
         size: OperandSize::Size64,
         dst: regs::writable_stack_reg(),
-        src: regs::int_reg(17),
+        lhs: regs::stack_reg(),
+        rhs: tmp.to_reg(),
+        extend: ExtendOp::Uxtx,
+        shift: 0,
     });
 }
 
@@ -445,7 +464,7 @@ fn append_add_constant(
     amount: i64,
 ) {
     if amount >= 0 {
-        if let Some(imm) = Imm12::new(amount as u16, false).filter(|_| amount <= 0xfff) {
+        if let Some(imm) = Imm12::maybe_from_u64(amount as u64) {
             insts.push(MInst::AluRRImm12 {
                 op: AluOp::Add,
                 size: OperandSize::Size64,

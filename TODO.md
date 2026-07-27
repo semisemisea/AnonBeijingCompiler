@@ -279,7 +279,7 @@ ABI/lower 调用点（约 30 处）：
 - `:1130, 1375, 1381` `Gpr::Zr` 保留
 - `:1534-1536` `emit_gpr` 中 `Gpr::Sp` 分支删除（统一走 `emit_reg`）
 
-### Phase 4 ── `anon_armv8/abi.rs`：cranelift 同款 `gen_sp_reg_adjust`
+### Phase 4 ── `anon_armv8/abi.rs`：cranelift 同款 `gen_sp_reg_adjust`  ✅ DONE
 
 #### 4.1 新增 `Imm12::maybe_from_u64`
 

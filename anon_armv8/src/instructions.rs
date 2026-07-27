@@ -31,6 +31,25 @@ impl Imm12 {
         }
     }
 
+    /// Compute an [`Imm12`] from a raw value, using the unshifted form for
+    /// `0..=0xfff` and the `lsl #12` form for multiples of 4096 up to
+    /// `0xfff000`. Mirrors cranelift's `Imm12::maybe_from_u64`.
+    pub fn maybe_from_u64(val: u64) -> Option<Self> {
+        if val & !0xfff == 0 {
+            Some(Self {
+                value: val as u16,
+                shift12: false,
+            })
+        } else if val & !(0xfff << 12) == 0 {
+            Some(Self {
+                value: (val >> 12) as u16,
+                shift12: true,
+            })
+        } else {
+            None
+        }
+    }
+
     pub const fn value(self) -> u16 {
         self.value
     }
@@ -1972,5 +1991,54 @@ mod tests {
             },
         });
         assert_eq!(text, "cmp w1, w2\n    cset w0, eq");
+    }
+
+    #[test]
+    fn stack_pointer_prints_as_sp() {
+        let text = emit(MInst::MovPhys {
+            size: OperandSize::Size64,
+            dst: Writable::from_reg(int_reg(0)),
+            src: crate::regs::stack_reg(),
+        });
+        assert_eq!(text, "mov x0, sp");
+    }
+
+    #[test]
+    fn alu_rr_imm12_accepts_sp_as_source_and_destination() {
+        let text = emit(MInst::AluRRImm12 {
+            op: super::AluOp::Sub,
+            size: OperandSize::Size64,
+            dst: crate::regs::writable_stack_reg(),
+            src: crate::regs::stack_reg(),
+            imm: Imm12::new(32, false).unwrap(),
+        });
+        assert_eq!(text, "sub sp, sp, #32");
+    }
+
+    #[test]
+    fn imm12_maybe_from_u64_handles_unshifted_form() {
+        let imm = Imm12::maybe_from_u64(0xfff).unwrap();
+        assert_eq!(imm.value(), 0xfff);
+        assert!(!imm.shift12());
+        let imm = Imm12::maybe_from_u64(0).unwrap();
+        assert_eq!(imm.value(), 0);
+        assert!(!imm.shift12());
+    }
+
+    #[test]
+    fn imm12_maybe_from_u64_handles_shift12_form() {
+        let imm = Imm12::maybe_from_u64(4096).unwrap();
+        assert_eq!(imm.value(), 1);
+        assert!(imm.shift12());
+        let imm = Imm12::maybe_from_u64(0xfff000).unwrap();
+        assert_eq!(imm.value(), 0xfff);
+        assert!(imm.shift12());
+    }
+
+    #[test]
+    fn imm12_maybe_from_u64_rejects_unrepresentable_values() {
+        assert!(Imm12::maybe_from_u64(0xfff001).is_none());
+        assert!(Imm12::maybe_from_u64(0x1000_0000).is_none());
+        assert!(Imm12::maybe_from_u64(u64::MAX).is_none());
     }
 }

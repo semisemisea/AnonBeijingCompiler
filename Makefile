@@ -51,6 +51,12 @@ DEBUG_ELF_RISCV_PATH := $(abspath $(DEBUG_ELF_RISCV))
 $(eval $(DEBUG_ELF_RISCV):;@:)
 endif
 
+ifeq ($(firstword $(MAKECMDGOALS)),mca)
+MCA_FILE := $(word 2,$(MAKECMDGOALS))
+MCA_FILE_PATH := $(abspath $(MCA_FILE))
+$(eval $(MCA_FILE):;@:)
+endif
+
 HOST_ARCH := $(shell uname -m)
 ifeq ($(HOST_ARCH),x86_64)
 MUSL_TARGET := x86_64-unknown-linux-musl
@@ -70,7 +76,7 @@ endif
 HOST_TARGET_DIR := $(CURDIR)/target/host-musl
 COMPILER := /work/target/$(MUSL_TARGET)/release/soyo_compiler
 
-.PHONY: help test test-baseline test-llvm test-riscv run-elf run-elf-riscv debug-elf debug-elf-riscv test-image test-compiler build-lib build-lib-riscv clean-results
+.PHONY: help test test-baseline test-llvm test-riscv run-elf run-elf-riscv debug-elf debug-elf-riscv mca test-image test-compiler build-lib build-lib-riscv clean-results
 
 help:
 	@printf '%s\n' 'make test [functional/case.sy]      Build the AArch64 compiler and run the AArch64 harness.'
@@ -80,6 +86,7 @@ help:
 	@printf '%s\n' 'make test-riscv [functional/case.sy] Build and run the RISC-V harness.'
 	@printf '%s\n' 'make run-elf path/to/program.elf  Execute an AArch64 ELF in the test container.'
 	@printf '%s\n' 'make debug-elf path/to/program.elf Start the AArch64 QEMU/GDB workflow.'
+	@printf '%s\n' 'make mca path/to/target.s        Analyse AArch64 assembly with llvm-mca.'
 
 test: test-compiler build-lib test-image
 	mkdir -p "$(RESULTS)"
@@ -193,6 +200,20 @@ debug-elf-riscv: test-image
 			-ex "break main" \
 			-ex "layout asm" \
 			-ex "focus cmd"'
+
+mca: test-image
+	@if [ -z "$(MCA_FILE)" ]; then \
+		printf 'usage: make mca path/to/target.s\n' >&2; \
+		exit 2; \
+	fi; \
+	if [ ! -f "$(MCA_FILE_PATH)" ]; then \
+		printf 'assembly file not found: %s\n' "$(MCA_FILE)" >&2; \
+		exit 2; \
+	fi
+	$(DOCKER) run --rm -t --network none \
+		-v "$(MCA_FILE_PATH):/work/target.s:ro" \
+		--entrypoint llvm-mca \
+		"$(IMAGE)" -march=aarch64 -mcpu=cortex-a53 -timeline /work/target.s
 
 # Build the test image if the tag is missing or the Dockerfile has changed.
 # The stamp records a checksum rather than a timestamp: cloning the repository

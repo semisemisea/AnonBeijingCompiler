@@ -20,7 +20,7 @@ pub use builder::{BasicBlockBuilders, GlobalBuilder, LocalBuilder};
 pub use function::{Function, FunctionData};
 pub use inst_kind::{
     Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Cast, GetElemPtr, InstKind, Integer,
-    Jump, Load, Return, Select, Store,
+    Jump, Load, Return, Select, Store, TailCall,
 };
 pub use instruction::{Inst, InstData};
 pub use program::Program;

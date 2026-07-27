@@ -119,7 +119,6 @@ impl InstType {
             InstKind::Load(..)
             | InstKind::Alloc
             | InstKind::BlockArgRef(..)
-            | InstKind::FuncArgRef(..)
             | InstKind::Aggregate(..)
             | InstKind::Undef
             | InstKind::ZeroInit => Some(Self::Var(val_id.check_or_alloc_id_same(value))),
@@ -155,7 +154,10 @@ impl InstType {
                 if_true: val_id.check_or_alloc_id_same(select.if_true()),
                 if_false: val_id.check_or_alloc_id_same(select.if_false()),
             }),
-            InstKind::Return(..) | InstKind::Jump(..) | InstKind::Branch(..) => None,
+            InstKind::Return(..)
+            | InstKind::Jump(..)
+            | InstKind::Branch(..)
+            | InstKind::TailCall(..) => None,
         }
     }
 }

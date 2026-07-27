@@ -324,8 +324,7 @@ mod tests {
         let function =
             program.new_function(Type::get_i32(), "binary".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let x = data.params()[0];
         let constant = data.new_local_inst().integer(constant);
         let (lhs, rhs) = if constant_on_left {
@@ -413,8 +412,7 @@ mod tests {
                 vec![Type::get_i32(), Type::get_i32()],
             );
             let data = program.func_data_mut(function);
-            let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-            data.layout_mut().push_bb_back(entry);
+            let entry = data.add_entry_block();
             let x = data.params()[0];
             let amount = data.params()[1];
             let one = data.new_local_inst().integer(1);
@@ -456,8 +454,7 @@ mod tests {
         let mut program = Program::new();
         let function = program.new_function(Type::get_f32(), "float".into(), vec![Type::get_f32()]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let x = data.params()[0];
         let two = data.new_local_inst().float(2.0);
         let mul = data.new_local_inst().binary(BinaryOp::Mul, x, two);
@@ -526,8 +523,7 @@ mod tests {
             let function =
                 program.new_function(Type::get_i32(), "compare".into(), vec![Type::get_i32()]);
             let data = program.func_data_mut(function);
-            let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-            data.layout_mut().push_bb_back(entry);
+            let entry = data.add_entry_block();
             let x = data.params()[0];
             let divisor = data.new_local_inst().integer(divisor);
             let rem = data.new_local_inst().binary(BinaryOp::Rem, x, divisor);
@@ -560,8 +556,7 @@ mod tests {
         let mut program = Program::new();
         let function = program.new_function(Type::get_i32(), "mixed".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let x = data.params()[0];
         let two = data.new_local_inst().integer(2);
         let one = data.new_local_inst().integer(1);
@@ -603,8 +598,7 @@ mod tests {
             let function =
                 program.new_function(Type::get_i32(), "shifts".into(), vec![Type::get_i32()]);
             let data = program.func_data_mut(function);
-            let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-            data.layout_mut().push_bb_back(entry);
+            let entry = data.add_entry_block();
             let x = data.params()[0];
             let three = data.new_local_inst().integer(3);
             let four = data.new_local_inst().integer(4);
@@ -630,8 +624,7 @@ mod tests {
             let function =
                 program.new_function(Type::get_i32(), "wide_shift".into(), vec![Type::get_i32()]);
             let data = program.func_data_mut(function);
-            let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-            data.layout_mut().push_bb_back(entry);
+            let entry = data.add_entry_block();
             let x = data.params()[0];
             let sixteen = data.new_local_inst().integer(16);
             let inner = data.new_local_inst().binary(op, x, sixteen);

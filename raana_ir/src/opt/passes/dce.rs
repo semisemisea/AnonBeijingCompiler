@@ -28,10 +28,10 @@ fn is_critical(value: Inst, data: &FunctionData) -> bool {
         | InstKind::Jump(..)
         | InstKind::Store(..)
         | InstKind::MemZero(..)
-        | InstKind::Return(..) => true,
+        | InstKind::Return(..)
+        | InstKind::TailCall(..) => true,
         InstKind::GlobalAlloc(..)
         | InstKind::BlockArgRef(..)
-        | InstKind::FuncArgRef(..)
         | InstKind::Aggregate(..)
         | InstKind::Undef
         | InstKind::ZeroInit
@@ -77,7 +77,6 @@ impl DeadCodeElimination {
                 InstKind::GlobalAlloc(..)
                 | InstKind::Alloc
                 | InstKind::BlockArgRef(..)
-                | InstKind::FuncArgRef(..)
                 | InstKind::Undef
                 | InstKind::ZeroInit
                 | InstKind::Float(..)
@@ -136,6 +135,11 @@ impl DeadCodeElimination {
                         mark_live!(ca)
                     }
                 }
+                InstKind::TailCall(tail_call) => {
+                    for &arg in tail_call.args() {
+                        mark_live!(arg)
+                    }
+                }
             }
         }
 
@@ -169,8 +173,7 @@ mod tests {
         let mut program = Program::new();
         let function = program.new_function(Type::get_unit(), "clear".into(), vec![]);
         let data = program.func_data_mut(function);
-        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
-        data.layout_mut().push_bb_back(entry);
+        let entry = data.add_entry_block();
         let alloc = data
             .new_local_inst()
             .alloc(Type::get_array(Type::get_i32(), 4));

@@ -69,7 +69,7 @@ pub fn build_cfg_both(
 
                 dfs(branch.f_target(), data, bb_alloc, graph, prece, visited);
             }
-            InstKind::Return(..) => {
+            InstKind::Return(..) | InstKind::TailCall(..) => {
                 graph.entry(id).or_default();
             }
             _ => unreachable!(),

@@ -81,12 +81,7 @@ impl AstGenContext {
     }
 
     pub fn add_entry_bb(&mut self) -> BasicBlock {
-        let func_data = self.curr_func_data_mut();
-        let entry_bb = func_data
-            .new_basic_block()
-            .basic_block("entry".into(), vec![]);
-        func_data.layout_mut().push_bb_back(entry_bb);
-        entry_bb
+        self.curr_func_data_mut().add_entry_block()
     }
 
     pub fn add_scope(&mut self) {
@@ -529,11 +524,7 @@ impl AstGenContext {
     }
 
     pub fn func_param_tys(&self, func: Function) -> Vec<Type> {
-        let data = self.program.func_data(func);
-        data.params()
-            .iter()
-            .map(|&param| data.inst_data(param).ty().clone())
-            .collect()
+        self.program.func_data(func).params_ty().to_vec()
     }
 
     pub fn curr_func_ret_ty(&self) -> Type {

@@ -162,8 +162,9 @@ impl PassesManager {
             let ssa = Box::new(ssa::SSATransform);
             p.register_initial(ssa);
 
-            // let sccp = Box::new(const_prop::SparseConditionConstantPropagation);
-            // p.register(sccp);
+            let tco_initial = Box::new(tco::TailCallElim);
+            p.register_initial(tco_initial);
+
             let ipsccp = Box::new(ipsccp::IPSCCP);
             p.register(ipsccp);
 
@@ -178,6 +179,11 @@ impl PassesManager {
 
             let if_conversion = Box::new(if_conversion::IfConversion);
             p.register(if_conversion);
+
+            // A second TCO pass catches tail calls exposed by the
+            // simplification passes above.
+            let tco = Box::new(tco::TailCallElim);
+            p.register(tco);
 
             let boolean_simplification = Box::new(boolean_simplify::BooleanSimplification);
             p.register(boolean_simplification);

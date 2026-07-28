@@ -254,13 +254,6 @@ where
                 panic!("function={} {error}", func_data.name());
             });
 
-        if pipeline.run_post_ra(&mut vcode, arena) {
-            vcode.verify("post-post-RA-passes").unwrap_or_else(|error| {
-                log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
-                panic!("function={} {error}", func_data.name());
-            });
-        }
-
         let spill_units = u32::try_from(output.num_spillslots).unwrap_or_else(|_| {
             panic!(
                 "code generation invariant failed in function `{}`, phase `frame layout`: allocator spill-slot count exceeds frame range",
@@ -287,9 +280,21 @@ where
         log::debug!(target: "taki_mir::reg_alloc", "function={} frame: spill-units={}, spill-bytes={}, frame-bytes={}", func_data.name(), output.num_spillslots, spill_size, vcode.abi.frame_layout().total_size);
         log::debug!(target: "taki_mir::emit", "function={} frame layout={:?}", func_data.name(), vcode.abi.frame_layout());
 
+        // Materialize allocator edit-moves and legalize all pseudo-addressing
+        // modes into the VCode. After this the `output` is fully consumed and
+        // the emitter iterates the VCode directly.
+        vcode.finalize_for_emission(&output);
+
+        if pipeline.run_post_ra(&mut vcode, arena) {
+            vcode.verify("post-post-RA-passes").unwrap_or_else(|error| {
+                log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
+                panic!("function={} {error}", func_data.name());
+            });
+        }
+
         let asm_start = buf.len();
         let mut w = AsmWriter::<B>::new(&mut buf, func_data, p);
-        w.write_function(&vcode, &output);
+        w.write_function(&vcode);
         let asm = &buf[asm_start..];
         log::debug!(target: "taki_mir::emit", "function={} final assembly: bytes={}, lines={}\n{}", func_data.name(), asm.len(), asm.lines().count(), asm);
     }

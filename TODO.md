@@ -111,12 +111,32 @@ pub struct MIRPassPipeline<I: VCodeInst> {
 
 ### 4a. 把 legalization 从 emission 抽出来变成真正的 pass
 
-目前 `AsmWriter::write_inst`（`emit.rs:193-205`）在打印期间调用 `ABIMachineSpec::legalize_inst(frame, inst)`。副作用：合法化后的指令永不物化进 VCode，所以 scheduler 看不到它们，debug dump（`lib.rs:277`）显示的是 pre-legalize 形式。
+**状态：✅ 已完成 (M3，与 M7 合并实现)**
 
-**改造：**
-- 新增 `LegalizeFinal: MIRPass<I>`。在 post-RA 阶段运行。调用既有的 `legalize_inst`，但**把结果写回 VCode**。一条指令可能展开成多条（例如 AMode 物化）；`VCodeContainer` 新增 `replace_inst(at, Vec<I>)` 辅助函数。
-- `AsmWriter::write_inst` 不再调用 `legalize_inst`。
-- `legalize_inst` 签名变化：接收 `&FrameLayout`，返回 `SmallVec<[I; 2]>` 而不是 `(&str, I)`（某些 backend 目前返回文本片段——必须改成返回真实 inst）。
+已实现 `VCodeContainer::finalize_for_emission(&mut self, output: &Output)`，一步完成 MaterializeEdits + LegalizeFinal：
+
+1. 遍历每个 block，用 `output.block_insts_and_edits` 获取原始指令+edit 交错序列
+2. 对每条指令调用 `I::ABISpec::legalize_inst(frame, inst)` 物化伪地址
+3. 对每个 edit-move 生成真实的 move/spill/reload 指令并 legalize
+4. 构建新的 `insts` 数组和 `block_range`，重建 `inst_is_branch`/`inst_is_ret`
+5. 清理不再需要的 operand 表（`operands`、`operands_range`、`clobbers`）
+
+**compile() 流程变更：**
+- `compute_frame_layout` 移到 post-RA pipeline 之前（legalize 需要 frame offset）
+- `finalize_for_emission` 在 frame layout 之后调用，消费 `output`
+- post-RA pipeline（scheduler 等）在 finalize 之后运行，看到的是已物化+合法化的 VCode
+- `AsmWriter::write_function` 不再接收 `output`，直接迭代 VCode per-block
+
+**注意：M3 和 M7 合并的原因：**
+LegalizeFinal 可能改变指令数量（1→N 展开），这会使 regalloc Output 的 ProgPoint 索引失效。
+因此必须先物化 edits（消费 Output），再 legalize。两步共享同一个 Output 消费点，合并到
+`finalize_for_emission` 是最干净的设计。
+
+**emitter 简化：**
+- 移除了 ~90 行的 edit-interleaving 逻辑
+- `write_inst`（带 legalize）仅用于 prologue/epilogue（ABI 生成、含 SpOffset）
+- `print_inst`（无 legalize）用于 VCode 指令（已 finalized）
+- `verify()` 更新以支持 post-finalize 状态（operand 表已清空）
 
 ### 4b. 去重 AArch64 / RISC-V 之间重复的 ABI 代码
 

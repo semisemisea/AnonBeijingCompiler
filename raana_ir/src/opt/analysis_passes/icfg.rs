@@ -312,8 +312,25 @@ impl ICFG {
                     );
                 };
                 match inst_data.kind() {
-                    InstKind::Return(..) | InstKind::TailCall(..) => {
+                    InstKind::Return(..) => {
                         return_sites.push(last_inst);
+                    }
+                    InstKind::TailCall(tc) => {
+                        // A tail call is simultaneously a return site (the caller's
+                        // frame is gone) and a call site (control transfers to the
+                        // callee). Record it as a call site with a sentinel
+                        // `continuation == call` so the cross-function pass can
+                        // distinguish it from a regular call (which has a real
+                        // successor instruction as continuation).
+                        return_sites.push(last_inst);
+                        let callsite_index = call_sites.len();
+                        call_sites.push(last_inst, func, tc.callee(), last_inst);
+                        callsite_by_call.insert(Node::new(func, last_inst), callsite_index);
+                        // Deliberately NOT inserted into `callsite_by_continuation`:
+                        // a regular `Call` immediately preceding this terminator
+                        // would already map `last_inst` as its continuation, and
+                        // overwriting that entry would break the regular call's
+                        // return-edge resolution.
                     }
                     InstKind::Jump(jump) => {
                         add_edge(jump.target());
@@ -365,8 +382,17 @@ impl ICFG {
                     &mut backward,
                 );
                 cross_edge_callsite_map.insert(call_edge, call_index);
-                let call_to_return = *forward[&Node::new(func, call)].first().unwrap();
-                let return_to = edges.dsts[call_to_return];
+                // For a regular call, the continuation is the destination of its
+                // CallToReturn edge (the instruction right after the call). For a
+                // tail call there is no such edge — the sentinel
+                // `continuation == call` marks it, and the callee's return value
+                // lands at the tail-call instruction itself (the relay node).
+                let return_to = if call_sites.continuations[call_index] == call {
+                    call
+                } else {
+                    let call_to_return = *forward[&Node::new(func, call)].first().unwrap();
+                    edges.dsts[call_to_return]
+                };
                 for &return_site in returnsites {
                     let edge_len = edges.len();
                     insert_edge(
@@ -505,5 +531,84 @@ mod tests {
         assert_eq!(edges[0].edge_type, EdgeType::CallToReturn);
         assert_eq!(edges[0].src, Node::new(main, call));
         assert_eq!(icfg.call_site_at(edges[0].src).unwrap().callee, external);
+    }
+
+    #[test]
+    fn tail_call_creates_call_and_return_edges() {
+        let mut program = Program::new();
+
+        // g(x: i32) -> i32 — returns x
+        let g = program.new_function(Type::get_i32(), "g".into(), vec![Type::get_i32()]);
+        let (g_ret, g_entry) = {
+            let data = program.func_data_mut(g);
+            let entry = data.add_entry_block();
+            let param = data.bb_data(entry).params()[0];
+            let ret = data.new_local_inst().ret(Some(param));
+            data.layout_mut().insert_inst(entry, ret);
+            (
+                ret,
+                *data.layout().entry_bb().unwrap().insts().get_first().unwrap(),
+            )
+        };
+
+        // f(x: i32) -> i32 — tail-calls g(x)
+        let f = program.new_function(Type::get_i32(), "f".into(), vec![Type::get_i32()]);
+        let tail_call = {
+            let data = program.func_data_mut(f);
+            let entry = data.add_entry_block();
+            let param = data.bb_data(entry).params()[0];
+            let tc = data.new_local_inst().tail_call(g, vec![param]);
+            data.layout_mut().insert_inst(entry, tc);
+            tc
+        };
+
+        // main() -> i32 — calls f(42)
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let (call_f, main_cont) = {
+            let data = program.func_data_mut(main);
+            let entry = data.add_entry_block();
+            let val = data.new_local_inst().integer(42);
+            let call = data.new_local_inst().call_with_type(f, vec![val], Type::get_i32());
+            let ret = data.new_local_inst().ret(Some(call));
+            data.layout_mut().insert_inst(entry, call);
+            data.layout_mut().insert_inst(entry, ret);
+            (call, ret)
+        };
+
+        let icfg = ICFG::new(&program);
+
+        // The tail call is recorded as a call site.
+        let cs = icfg.call_site_at(Node::new(f, tail_call)).unwrap();
+        assert_eq!(cs.caller, f);
+        assert_eq!(cs.callee, g);
+
+        // Call edge: (f, tail_call) -> (g, g_entry)
+        let f_out = icfg.outgoing_edges_of(Node::new(f, tail_call)).collect::<Vec<_>>();
+        let call_edge = f_out
+            .iter()
+            .find(|e| e.edge_type == EdgeType::Call)
+            .unwrap();
+        assert_eq!(call_edge.dst, Node::new(g, g_entry));
+
+        // Return edge (relay input): (g, g_ret) -> (f, tail_call)
+        let g_out = icfg.outgoing_edges_of(Node::new(g, g_ret)).collect::<Vec<_>>();
+        let return_edge = g_out
+            .iter()
+            .find(|e| e.edge_type == EdgeType::Return)
+            .unwrap();
+        assert_eq!(return_edge.dst, Node::new(f, tail_call));
+
+        // The tail-call node is deliberately absent from
+        // callsite_by_continuation (collision avoidance with a preceding
+        // regular Call whose continuation would be this terminator).
+        assert_eq!(icfg.call_site_before(Node::new(f, tail_call)), None);
+
+        // The tail-call node is also a return site of f, so f's caller sees a
+        // Return edge from it (relay output).
+        let relay = f_out
+            .iter()
+            .find(|e| e.edge_type == EdgeType::Return && e.dst.func == main)
+            .unwrap();
+        assert_eq!(relay.dst, Node::new(main, main_cont));
     }
 }

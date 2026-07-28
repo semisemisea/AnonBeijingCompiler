@@ -168,8 +168,7 @@ fn visit_and_replace_single(
         | InstKind::Undef
         | InstKind::BlockArgRef(..)
         | InstKind::Alloc
-        | InstKind::GlobalAlloc(..)
-        | InstKind::TailCall(..) => unreachable!("Encountered kind: {:?}", rep_val_data.kind()),
+        | InstKind::GlobalAlloc(..) => unreachable!("Encountered kind: {:?}", rep_val_data.kind()),
         InstKind::Integer(..) | InstKind::Float(..) => {}
         InstKind::Aggregate(agg) => {
             let value = agg

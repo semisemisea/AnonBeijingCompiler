@@ -92,6 +92,15 @@ impl BinaryOp {
             _ => return None,
         })
     }
+
+    pub fn is_commutative_for(&self, operand_ty: &Type) -> bool {
+        matches!(self, BinaryOp::NotEq | BinaryOp::Eq)
+            || (operand_ty.is_i32()
+                && matches!(
+                    self,
+                    BinaryOp::Add | BinaryOp::Mul | BinaryOp::And | BinaryOp::Or | BinaryOp::Xor
+                ))
+    }
 }
 
 impl std::fmt::Display for BinaryOp {
@@ -124,7 +133,7 @@ impl std::fmt::Display for BinaryOp {
 
 #[cfg(test)]
 mod tests {
-    use super::BinaryOp;
+    use super::{BinaryOp, Type};
 
     #[test]
     fn complements_integer_comparisons() {
@@ -154,5 +163,36 @@ mod tests {
             assert_eq!(op.swap_compare_args(), Some(swapped));
         }
         assert_eq!(BinaryOp::Add.swap_compare_args(), None);
+    }
+
+    #[test]
+    fn classifies_commutativity_by_operand_type() {
+        let i32_ty = Type::get_i32();
+        let f32_ty = Type::get_f32();
+
+        for op in [
+            BinaryOp::Add,
+            BinaryOp::Mul,
+            BinaryOp::And,
+            BinaryOp::Or,
+            BinaryOp::Xor,
+        ] {
+            assert!(op.is_commutative_for(&i32_ty));
+            assert!(!op.is_commutative_for(&f32_ty));
+        }
+        for op in [BinaryOp::Eq, BinaryOp::NotEq] {
+            assert!(op.is_commutative_for(&i32_ty));
+            assert!(op.is_commutative_for(&f32_ty));
+        }
+        for op in [
+            BinaryOp::Sub,
+            BinaryOp::Div,
+            BinaryOp::Rem,
+            BinaryOp::Lt,
+            BinaryOp::Shl,
+        ] {
+            assert!(!op.is_commutative_for(&i32_ty));
+            assert!(!op.is_commutative_for(&f32_ty));
+        }
     }
 }

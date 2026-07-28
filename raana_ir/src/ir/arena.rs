@@ -6,7 +6,7 @@ use crate::ir::{
     basic_block::{BasicBlock, BasicBlockArena, BasicBlockData},
     builder::ReplaceBuilder,
     function::{Function, FunctionArena, FunctionData},
-    inst_kind::{BinaryOp, InstKind},
+    inst_kind::InstKind,
     instruction::{GlobalInstArena, Inst, InstData, LocalInstArena},
 };
 
@@ -92,7 +92,7 @@ fn inst_equiv<A: Arena + ?Sized>(
             let direct = inst_equiv(arena, cache, lhs.lhs(), rhs.lhs(), depth + 1)
                 && inst_equiv(arena, cache, lhs.rhs(), rhs.rhs(), depth + 1);
             direct
-                || (is_commutative(lhs.op(), arena.inst_data(lhs.lhs()).ty().is_i32())
+                || (lhs.op().is_commutative_for(arena.inst_data(lhs.lhs()).ty())
                     && inst_equiv(arena, cache, lhs.lhs(), rhs.rhs(), depth + 1)
                     && inst_equiv(arena, cache, lhs.rhs(), rhs.lhs(), depth + 1))
         }
@@ -111,15 +111,6 @@ fn inst_equiv<A: Arena + ?Sized>(
     cache.insert((lhs, rhs), InstEquivState::Equivalent(equivalent));
     cache.insert((rhs, lhs), InstEquivState::Equivalent(equivalent));
     equivalent
-}
-
-fn is_commutative(op: BinaryOp, has_integer_operands: bool) -> bool {
-    matches!(op, BinaryOp::NotEq | BinaryOp::Eq)
-        || (has_integer_operands
-            && matches!(
-                op,
-                BinaryOp::Add | BinaryOp::Mul | BinaryOp::And | BinaryOp::Or | BinaryOp::Xor
-            ))
 }
 
 pub struct LocalArena {
@@ -326,7 +317,7 @@ pub trait Arena {
 mod tests {
     use super::*;
     use crate::ir::{
-        Type,
+        BinaryOp, Type,
         builder_trait::{LocalInstBuilder, ScalarInstBuilder},
     };
 
@@ -364,6 +355,27 @@ mod tests {
             .binary(BinaryOp::Sub, two_b, one_b);
 
         assert!(!function.equal(sub_a, sub_b));
+    }
+
+    #[test]
+    fn keeps_float_arithmetic_operand_order() {
+        let mut function = FunctionData::new(Type::get_unit(), "float_ordered".into(), vec![]);
+        let one_a = function.new_local_inst().float(1.0);
+        let one_b = function.new_local_inst().float(1.0);
+        let two_a = function.new_local_inst().float(2.0);
+        let two_b = function.new_local_inst().float(2.0);
+        let direct_a = function
+            .new_local_inst()
+            .binary(BinaryOp::Add, one_a, two_a);
+        let direct_b = function
+            .new_local_inst()
+            .binary(BinaryOp::Add, one_b, two_b);
+        let swapped = function
+            .new_local_inst()
+            .binary(BinaryOp::Add, two_b, one_b);
+
+        assert!(function.equal(direct_a, direct_b));
+        assert!(!function.equal(direct_a, swapped));
     }
 
     #[test]

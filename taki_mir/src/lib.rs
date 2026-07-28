@@ -212,6 +212,7 @@ where
         });
 
         if pipeline.run_pre_ra(&mut vcode, arena) {
+            vcode.rebuild_operand_tables();
             vcode.verify("post-pre-RA-passes").unwrap_or_else(|error| {
                 log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
                 panic!("function={} {error}", func_data.name());

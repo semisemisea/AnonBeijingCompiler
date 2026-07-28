@@ -6,5 +6,6 @@ pub mod lower;
 pub mod passes;
 pub mod regs;
 pub mod runtime;
+pub mod sched;
 
 pub use lower::AArch64Backend;

@@ -16,6 +16,7 @@ pub mod div_magic;
 pub mod emit;
 pub mod inst_predicate;
 pub mod lower;
+pub mod passes;
 pub mod reg_alloc;
 pub mod register;
 pub mod types;
@@ -189,6 +190,8 @@ where
 
     writeln!(buf, "{}", B::text_section_directive()).unwrap();
 
+    let pipeline = B::mir_pipeline();
+
     for &func in p.function_layout() {
         let func_data = p.func_data(func);
         if func_data.layout().entry_bb().is_none() {
@@ -207,6 +210,13 @@ where
             log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
             panic!("function={} {error}", func_data.name());
         });
+
+        if pipeline.run_pre_ra(&mut vcode, arena) {
+            vcode.verify("post-pre-RA-passes").unwrap_or_else(|error| {
+                log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
+                panic!("function={} {error}", func_data.name());
+            });
+        }
 
         let machine_env = vcode.abi.machine_env();
         let allocation_start = Instant::now();
@@ -243,6 +253,13 @@ where
                 log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
                 panic!("function={} {error}", func_data.name());
             });
+
+        if pipeline.run_post_ra(&mut vcode, arena) {
+            vcode.verify("post-post-RA-passes").unwrap_or_else(|error| {
+                log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
+                panic!("function={} {error}", func_data.name());
+            });
+        }
 
         let spill_units = u32::try_from(output.num_spillslots).unwrap_or_else(|_| {
             panic!(

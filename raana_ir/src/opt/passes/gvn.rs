@@ -1,202 +1,210 @@
-use itertools::Itertools;
+use rustc_hash::FxHashMap;
 
-use crate::opt::prelude::{pure_function::is_pure_function, *};
-use std::{
-    cell::RefCell,
-    collections::hash_map::Entry::{Occupied, Vacant},
-};
+use crate::opt::prelude::*;
 
 pub struct GlobalInstNumbering;
 
-type InstNumber = usize;
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+struct ValueNumber(u32);
 
-#[derive(Debug, Hash, Clone, PartialEq, Eq)]
-pub enum Purity {
-    Pure,
-    Impure(u32),
-}
-
-impl Purity {
-    thread_local! {
-        static POOL: RefCell<HashMap<Function, u32>> = RefCell::new(HashMap::new());
-    }
-
-    fn new(program: &Program, func: Function) -> Purity {
-        Self::POOL.with(|pool| match pool.borrow_mut().entry(func) {
-            Vacant(e) => {
-                if is_pure_function(program, func) {
-                    e.insert(0);
-                    Purity::Pure
-                } else {
-                    e.insert(1);
-                    Purity::Impure(1)
-                }
-            }
-            Occupied(mut e) => {
-                if *e.get() > 0 {
-                    *e.get_mut() += 1;
-                    Purity::Impure(*e.get())
-                } else {
-                    Purity::Pure
-                }
-            }
-        })
-    }
-}
-
-#[derive(Debug, Hash, Clone, PartialEq, Eq)]
-enum InstType {
-    Int(i32),
-    // Bit-representation of a f32 value.
-    Float(u32),
-    // in the SSA-form, everything is constant.
-    // Here variable means: We can't easily know the value at comptime.
-    Var(InstNumber),
-    Cast {
-        src: InstNumber,
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum ValueKey {
+    Integer {
+        ty: Type,
+        value: i32,
+    },
+    Float {
+        ty: Type,
+        bits: u32,
     },
     Binary {
+        operand_ty: Type,
+        result_ty: Type,
         op: BinaryOp,
-        lhs: InstNumber,
-        rhs: InstNumber,
+        lhs: ValueNumber,
+        rhs: ValueNumber,
+    },
+    Cast {
+        src_ty: Type,
+        result_ty: Type,
+        src: ValueNumber,
     },
     Select {
-        cond: InstNumber,
-        if_true: InstNumber,
-        if_false: InstNumber,
+        result_ty: Type,
+        cond: ValueNumber,
+        if_true: ValueNumber,
+        if_false: ValueNumber,
     },
     GetElemPtr {
-        source: InstNumber,
-        index: Vec<InstNumber>,
+        base_ty: Type,
+        result_ty: Type,
+        base: ValueNumber,
+        offsets: Vec<ValueNumber>,
     },
-    // Call can also be seen as the same in certain condition.
-    // This can be identified through:
-    // - If the callee is pure function
-    // - If the arguments are all the same.
-    // But in simplified GVN pass, we will ingnore this
-    Call {
-        purity: Purity,
-        callee: Function,
-        args: Vec<InstNumber>,
-    },
-}
-
-fn is_op_commutative(op: BinaryOp) -> bool {
-    matches!(
-        op,
-        BinaryOp::Add
-            | BinaryOp::Mul
-            | BinaryOp::NotEq
-            | BinaryOp::And
-            | BinaryOp::Or
-            | BinaryOp::Xor
-            | BinaryOp::Eq
-    )
-}
-
-impl InstType {
-    fn build_from_value(
-        data: &ArenaContextMut<'_>,
+    Identity {
+        ty: Type,
         value: Inst,
-        val_id: &mut VIDAlloc,
-    ) -> Option<InstType> {
-        match data.inst_data(value).kind() {
-            InstKind::Integer(integer) => Some(Self::Int(integer.value())),
-            InstKind::Float(float) => Some(Self::Float(float.value().to_bits())),
-            InstKind::Cast(cast) => Some(Self::Cast {
-                src: val_id.check_or_alloc_id_same(cast.src()),
-            }),
-            InstKind::Call(call) => Some(Self::Call {
-                purity: Purity::new(data.program, call.callee()),
-                callee: call.callee(),
-                args: call
-                    .args()
-                    .iter()
-                    .copied()
-                    .map(|inst| val_id.check_or_alloc_id_same(inst))
-                    .collect_vec(),
-            }),
+    },
+}
+
+#[derive(Clone, Copy)]
+struct NumberedValue {
+    number: ValueNumber,
+    eliminable: bool,
+}
+
+struct ValueNumbering {
+    next: u32,
+    by_inst: FxHashMap<Inst, NumberedValue>,
+    by_key: FxHashMap<ValueKey, ValueNumber>,
+}
+
+impl ValueNumbering {
+    fn new() -> Self {
+        Self {
+            next: 0,
+            by_inst: FxHashMap::default(),
+            by_key: FxHashMap::default(),
+        }
+    }
+
+    fn number(&mut self, data: &ArenaContextMut<'_>, value: Inst) -> NumberedValue {
+        if let Some(&numbered) = self.by_inst.get(&value) {
+            return numbered;
+        }
+
+        let ty = data.inst_data(value).ty().clone();
+        let (key, eliminable) = match data.inst_data(value).kind() {
+            InstKind::Integer(integer) => (
+                ValueKey::Integer {
+                    ty,
+                    value: integer.value(),
+                },
+                true,
+            ),
+            InstKind::Float(float) => (
+                ValueKey::Float {
+                    ty,
+                    bits: float.value().to_bits(),
+                },
+                true,
+            ),
+            InstKind::Binary(binary) => {
+                let operand_ty = data.inst_data(binary.lhs()).ty().clone();
+                let mut op = binary.op();
+                let mut lhs = self.number(data, binary.lhs()).number;
+                let mut rhs = self.number(data, binary.rhs()).number;
+                if lhs > rhs {
+                    if op.is_commutative_for(&operand_ty) {
+                        std::mem::swap(&mut lhs, &mut rhs);
+                    } else if let Some(swapped) = op.swap_compare_args() {
+                        op = swapped;
+                        std::mem::swap(&mut lhs, &mut rhs);
+                    }
+                }
+                (
+                    ValueKey::Binary {
+                        operand_ty,
+                        result_ty: ty,
+                        op,
+                        lhs,
+                        rhs,
+                    },
+                    true,
+                )
+            }
+            InstKind::Cast(cast) => (
+                ValueKey::Cast {
+                    src_ty: data.inst_data(cast.src()).ty().clone(),
+                    result_ty: ty,
+                    src: self.number(data, cast.src()).number,
+                },
+                true,
+            ),
+            InstKind::Select(select) => (
+                ValueKey::Select {
+                    result_ty: ty,
+                    cond: self.number(data, select.cond()).number,
+                    if_true: self.number(data, select.if_true()).number,
+                    if_false: self.number(data, select.if_false()).number,
+                },
+                true,
+            ),
+            InstKind::GetElemPtr(gep) => (
+                ValueKey::GetElemPtr {
+                    base_ty: data.inst_data(gep.base()).ty().clone(),
+                    result_ty: ty,
+                    base: self.number(data, gep.base()).number,
+                    offsets: gep
+                        .offsets()
+                        .iter()
+                        .map(|&offset| self.number(data, offset).number)
+                        .collect(),
+                },
+                true,
+            ),
             InstKind::Load(..)
+            | InstKind::Call(..)
             | InstKind::Alloc
+            | InstKind::GlobalAlloc(..)
             | InstKind::BlockArgRef(..)
             | InstKind::Aggregate(..)
             | InstKind::Undef
-            | InstKind::ZeroInit => Some(Self::Var(val_id.check_or_alloc_id_same(value))),
-            InstKind::GlobalAlloc(_global_alloc) => unreachable!(),
-            InstKind::Store(..) | InstKind::MemZero(..) => None,
-            InstKind::GetElemPtr(get_elem_ptr) => Some(Self::GetElemPtr {
-                source: val_id.check_or_alloc_id_same(get_elem_ptr.base()),
-                index: get_elem_ptr
-                    .offsets()
-                    .iter()
-                    .map(|&inst| val_id.check_or_alloc_id_same(inst))
-                    .collect(),
-            }),
-            InstKind::Binary(binary) => {
-                let lhs = val_id.check_or_alloc_id_same(binary.lhs());
-                let rhs = val_id.check_or_alloc_id_same(binary.rhs());
-                if is_op_commutative(binary.op()) {
-                    Some(Self::Binary {
-                        op: binary.op(),
-                        lhs: lhs.min(rhs),
-                        rhs: rhs.max(lhs),
-                    })
-                } else {
-                    Some(Self::Binary {
-                        op: binary.op(),
-                        lhs,
-                        rhs,
-                    })
-                }
-            }
-            InstKind::Select(select) => Some(Self::Select {
-                cond: val_id.check_or_alloc_id_same(select.cond()),
-                if_true: val_id.check_or_alloc_id_same(select.if_true()),
-                if_false: val_id.check_or_alloc_id_same(select.if_false()),
-            }),
-            InstKind::Return(..)
+            | InstKind::ZeroInit
+            | InstKind::Store(..)
+            | InstKind::MemZero(..)
+            | InstKind::Return(..)
             | InstKind::Jump(..)
             | InstKind::Branch(..)
-            | InstKind::TailCall(..) => None,
-        }
+            | InstKind::TailCall(..) => (ValueKey::Identity { ty, value }, false),
+        };
+
+        let number = *self.by_key.entry(key).or_insert_with(|| {
+            let number = ValueNumber(self.next);
+            self.next += 1;
+            number
+        });
+        let numbered = NumberedValue { number, eliminable };
+        self.by_inst.insert(value, numbered);
+        numbered
     }
 }
 
-type Map = HashMap<InstType, Inst>;
+struct ScopedLeaders {
+    leaders: FxHashMap<ValueNumber, Inst>,
+    scopes: Vec<Vec<ValueNumber>>,
+}
 
-struct LayeredMap(Vec<Map>);
-
-impl LayeredMap {
-    #[inline]
-    fn new() -> LayeredMap {
-        LayeredMap(Default::default())
+impl ScopedLeaders {
+    fn new() -> Self {
+        Self {
+            leaders: FxHashMap::default(),
+            scopes: Vec::new(),
+        }
     }
 
-    #[inline]
-    fn new_scope(&mut self) {
-        self.0.push(HashMap::default())
+    fn enter_scope(&mut self) {
+        self.scopes.push(Vec::new());
     }
 
-    #[inline]
-    fn pop_scope(&mut self) -> Option<Map> {
-        self.0.pop()
+    fn get(&self, number: ValueNumber) -> Option<Inst> {
+        self.leaders.get(&number).copied()
     }
 
-    fn get(&self, key: &InstType) -> Option<Inst> {
-        self.0
-            .iter()
-            .rev()
-            .find_map(|scope| scope.get(key).copied())
+    fn insert(&mut self, number: ValueNumber, leader: Inst) {
+        assert!(self.leaders.insert(number, leader).is_none());
+        self.scopes.last_mut().unwrap().push(number);
     }
 
-    fn insert(&mut self, key: InstType, value: Inst) -> Option<Inst> {
-        self.0.last_mut().unwrap().insert(key, value)
+    fn exit_scope(&mut self) {
+        for number in self.scopes.pop().unwrap() {
+            self.leaders.remove(&number);
+        }
     }
 }
 
 impl Pass for GlobalInstNumbering {
     fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
-        // function declaration. we just have to skip it.
         if data.layout().entry_bb().is_none() {
             return false;
         }
@@ -204,75 +212,363 @@ impl Pass for GlobalInstNumbering {
         debug!("gvn start: {:?}", data.name());
 
         let mut bb_alloc = IDAllocator::new(1);
-        let mut val_alloc = IDAllocator::new(1);
-        let mut layered_type_map = LayeredMap::new();
-        let (graph, prece) = cfg::build_cfg_both(data, &mut bb_alloc);
-
-        // entry bb must be the first to be allocated.
-        assert!(bb_alloc.get_id(&data.layout().entry_bb().unwrap().bb()) == 0);
-
-        let rpo_path = cfg::rpo_path(&graph);
-        let idom_map = dom_tree::idom(&prece, &rpo_path);
-        let donimnace_tree = dom_tree::build_dominance_tree(&idom_map, rpo_path.len());
+        let (graph, predecessors) = cfg::build_cfg_both(data, &mut bb_alloc);
+        assert_eq!(bb_alloc.get_id(&data.layout().entry_bb().unwrap().bb()), 0);
+        let rpo = cfg::rpo_path(&graph);
+        let idom = dom_tree::idom(&predecessors, &rpo);
+        let dominance_tree = dom_tree::build_dominance_tree(&idom, rpo.len());
+        let mut numbers = ValueNumbering::new();
+        let mut leaders = ScopedLeaders::new();
 
         fn dfs(
             bb_id: BId,
-            dom_tree: &DomTree,
-            layered_type_map: &mut LayeredMap,
-            val_alloc: &mut VIDAlloc,
-            bb_alloc: &mut BIDAlloc,
+            dominance_tree: &DomTree,
+            leaders: &mut ScopedLeaders,
+            numbers: &mut ValueNumbering,
+            bb_alloc: &BIDAlloc,
             data: &mut ArenaContextMut<'_>,
         ) -> bool {
-            layered_type_map.new_scope();
+            leaders.enter_scope();
             let bb = bb_alloc.search_id(bb_id);
-
-            let mut to_replace = Vec::new();
-            let iter = data
+            let values = data
                 .bb_data(bb)
                 .params()
                 .iter()
                 .chain(data.layout().basicblock(bb).insts().iter())
-                .copied();
+                .copied()
+                .collect::<Vec<_>>();
+            let mut changed = false;
 
-            for val in iter {
-                // DCE intentionally keeps calls even after their result is
-                // unused. Replacing such a value again cannot change IR and
-                // would keep a fixed-point pipeline alive forever.
-                if data.inst_data(val).used_by().is_empty() {
+            for value in values {
+                let numbered = numbers.number(data, value);
+                if !numbered.eliminable {
                     continue;
                 }
-                if let Some(expr) = InstType::build_from_value(data, val, val_alloc) {
-                    debug!("epxr: {:?}", expr);
-                    if let Some(rep_with) = layered_type_map.get(&expr) {
-                        to_replace.push((val, rep_with))
-                    } else {
-                        layered_type_map.insert(expr, val);
+                if let Some(leader) = leaders.get(numbered.number) {
+                    assert_eq!(data.inst_data(value).ty(), data.inst_data(leader).ty());
+                    if value != leader && !data.inst_data(value).used_by().is_empty() {
+                        trace!(
+                            "gvn replace function={} value={value:?} leader={leader:?} number={:?}",
+                            data.name(),
+                            numbered.number
+                        );
+                        utils::visit_and_replace(data, value, leader);
+                        changed = true;
                     }
+                } else {
+                    leaders.insert(numbered.number, value);
                 }
             }
 
-            let changed = !to_replace.is_empty();
-            for (rep, rep_with) in to_replace {
-                utils::visit_and_replace(data, rep, rep_with);
+            for &child in &dominance_tree[bb_id] {
+                changed |= dfs(child, dominance_tree, leaders, numbers, bb_alloc, data);
             }
-
-            let changed = dom_tree[bb_id].iter().fold(changed, |changed, &child| {
-                dfs(child, dom_tree, layered_type_map, val_alloc, bb_alloc, data) || changed
-            });
-
-            layered_type_map.pop_scope();
+            leaders.exit_scope();
             changed
         }
+
         let changed = dfs(
             0,
-            &donimnace_tree,
-            &mut layered_type_map,
-            &mut val_alloc,
-            &mut bb_alloc,
+            &dominance_tree,
+            &mut leaders,
+            &mut numbers,
+            &bb_alloc,
             data,
         );
-
         debug!("----------------------------------------------------");
         changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Program, arena::Arena, builder_trait::*};
+
+    fn return_value(data: &FunctionData, bb: BasicBlock) -> Inst {
+        let terminator = data.layout().basicblock(bb).terminator();
+        let InstKind::Return(ret) = data.inst_data(terminator).kind() else {
+            panic!("expected return")
+        };
+        ret.value().unwrap()
+    }
+
+    fn binary_operands(data: &FunctionData, value: Inst) -> (Inst, Inst) {
+        let InstKind::Binary(binary) = data.inst_data(value).kind() else {
+            panic!("expected binary")
+        };
+        (binary.lhs(), binary.rhs())
+    }
+
+    #[test]
+    fn eliminates_transitive_congruence_in_one_run() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "transitive".into(),
+            vec![Type::get_i32(), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let (x, y) = (data.params()[0], data.params()[1]);
+        let one_a = data.new_local_inst().integer(1);
+        let one_b = data.new_local_inst().integer(1);
+        let add_a = data.new_local_inst().binary(BinaryOp::Add, x, one_a);
+        let add_b = data.new_local_inst().binary(BinaryOp::Add, x, one_b);
+        let mul_a = data.new_local_inst().binary(BinaryOp::Mul, add_a, y);
+        let mul_b = data.new_local_inst().binary(BinaryOp::Mul, add_b, y);
+        let difference = data.new_local_inst().binary(BinaryOp::Sub, mul_a, mul_b);
+        let ret = data.new_local_inst().ret(Some(difference));
+        for value in [one_a, one_b, add_a, add_b, mul_a, mul_b, difference, ret] {
+            data.layout_mut().insert_inst(entry, value);
+        }
+
+        assert!(GlobalInstNumbering.run(&mut program));
+        assert!(!GlobalInstNumbering.run(&mut program));
+        let data = program.func_data(function);
+        assert_eq!(binary_operands(data, difference), (mul_a, mul_a));
+        assert!(data.inst_data(mul_b).used_by().is_empty());
+        assert!(data.inst_data(mul_a).used_by().contains(&difference));
+    }
+
+    #[test]
+    fn keeps_cast_result_types_separate() {
+        let mut program = Program::new();
+        let function =
+            program.new_function(Type::get_i32(), "typed_cast".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let source = data.params()[0];
+        let cast_i32 = data.new_local_inst().cast(source, Type::get_i32());
+        let cast_f32 = data.new_local_inst().cast(source, Type::get_f32());
+        let duplicate_i32 = data.new_local_inst().cast(source, Type::get_i32());
+        let zero_i32 = data.new_local_inst().integer(0);
+        let zero_f32 = data.new_local_inst().float(0.0);
+        let int_use = data
+            .new_local_inst()
+            .binary(BinaryOp::Add, duplicate_i32, zero_i32);
+        let float_use = data
+            .new_local_inst()
+            .binary(BinaryOp::Add, cast_f32, zero_f32);
+        let ret = data.new_local_inst().ret(Some(int_use));
+        for value in [
+            cast_i32,
+            cast_f32,
+            duplicate_i32,
+            zero_i32,
+            zero_f32,
+            int_use,
+            float_use,
+            ret,
+        ] {
+            data.layout_mut().insert_inst(entry, value);
+        }
+
+        assert!(GlobalInstNumbering.run(&mut program));
+        let data = program.func_data(function);
+        assert_eq!(binary_operands(data, int_use).0, cast_i32);
+        assert_eq!(binary_operands(data, float_use).0, cast_f32);
+        assert!(data.inst_data(cast_f32).ty().is_f32());
+    }
+
+    #[test]
+    fn commutes_integer_but_not_float_arithmetic() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "commutativity".into(),
+            vec![
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_f32(),
+                Type::get_f32(),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let (x, y, a, b) = (
+            data.params()[0],
+            data.params()[1],
+            data.params()[2],
+            data.params()[3],
+        );
+        let int_xy = data.new_local_inst().binary(BinaryOp::Add, x, y);
+        let int_yx = data.new_local_inst().binary(BinaryOp::Add, y, x);
+        let float_ab = data.new_local_inst().binary(BinaryOp::Add, a, b);
+        let float_ba = data.new_local_inst().binary(BinaryOp::Add, b, a);
+        let float_difference = data
+            .new_local_inst()
+            .binary(BinaryOp::Sub, float_ab, float_ba);
+        let result = data.new_local_inst().binary(BinaryOp::Sub, int_xy, int_yx);
+        let ret = data.new_local_inst().ret(Some(result));
+        for value in [
+            int_xy,
+            int_yx,
+            float_ab,
+            float_ba,
+            float_difference,
+            result,
+            ret,
+        ] {
+            data.layout_mut().insert_inst(entry, value);
+        }
+
+        assert!(GlobalInstNumbering.run(&mut program));
+        let data = program.func_data(function);
+        assert_eq!(binary_operands(data, result), (int_xy, int_xy));
+        assert_eq!(
+            binary_operands(data, float_difference),
+            (float_ab, float_ba)
+        );
+    }
+
+    #[test]
+    fn uses_dominating_leaders_without_crossing_siblings() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "dominance".into(),
+            vec![Type::get_i32(), Type::get_i32(), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let left = data.new_basic_block().basic_block("left".into(), vec![]);
+        let right = data.new_basic_block().basic_block("right".into(), vec![]);
+        for bb in [left, right] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let (cond, x, y) = (data.params()[0], data.params()[1], data.params()[2]);
+        let branch = data
+            .new_local_inst()
+            .branch(cond, left, vec![], right, vec![]);
+        data.layout_mut().insert_inst(entry, branch);
+
+        let left_first = data.new_local_inst().binary(BinaryOp::Add, x, y);
+        let left_second = data.new_local_inst().binary(BinaryOp::Add, y, x);
+        let left_ret = data.new_local_inst().ret(Some(left_second));
+        for value in [left_first, left_second, left_ret] {
+            data.layout_mut().insert_inst(left, value);
+        }
+
+        let right_first = data.new_local_inst().binary(BinaryOp::Add, x, y);
+        let right_second = data.new_local_inst().binary(BinaryOp::Add, y, x);
+        let right_ret = data.new_local_inst().ret(Some(right_second));
+        for value in [right_first, right_second, right_ret] {
+            data.layout_mut().insert_inst(right, value);
+        }
+
+        assert!(GlobalInstNumbering.run(&mut program));
+        let data = program.func_data(function);
+        assert_eq!(return_value(data, left), left_first);
+        assert_eq!(return_value(data, right), right_first);
+        assert_ne!(return_value(data, right), left_first);
+    }
+
+    #[test]
+    fn reuses_a_parent_block_leader() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "parent".into(),
+            vec![Type::get_i32(), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let child = data.new_basic_block().basic_block("child".into(), vec![]);
+        data.layout_mut().push_bb_back(child);
+        let (x, y) = (data.params()[0], data.params()[1]);
+        let leader = data.new_local_inst().binary(BinaryOp::Add, x, y);
+        let jump = data.new_local_inst().jump(child, vec![]);
+        data.layout_mut().insert_inst(entry, leader);
+        data.layout_mut().insert_inst(entry, jump);
+        let duplicate = data.new_local_inst().binary(BinaryOp::Add, y, x);
+        let ret = data.new_local_inst().ret(Some(duplicate));
+        data.layout_mut().insert_inst(child, duplicate);
+        data.layout_mut().insert_inst(child, ret);
+
+        assert!(GlobalInstNumbering.run(&mut program));
+        assert_eq!(return_value(program.func_data(function), child), leader);
+    }
+
+    #[test]
+    fn does_not_cse_memory_or_calls() {
+        let mut program = Program::new();
+        let callee = program.new_function(Type::get_i32(), "callee".into(), vec![]);
+        let function = program.new_function(Type::get_i32(), "effects".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let alloc = data.new_local_inst().alloc(Type::get_i32());
+        let load_a = data.new_local_inst().load(alloc);
+        let load_b = data.new_local_inst().load(alloc);
+        let call_a = data
+            .new_local_inst()
+            .call_with_type(callee, vec![], Type::get_i32());
+        let call_b = data
+            .new_local_inst()
+            .call_with_type(callee, vec![], Type::get_i32());
+        let loads = data.new_local_inst().binary(BinaryOp::Add, load_a, load_b);
+        let calls = data.new_local_inst().binary(BinaryOp::Add, call_a, call_b);
+        let result = data.new_local_inst().binary(BinaryOp::Add, loads, calls);
+        let ret = data.new_local_inst().ret(Some(result));
+        for value in [
+            alloc, load_a, load_b, call_a, call_b, loads, calls, result, ret,
+        ] {
+            data.layout_mut().insert_inst(entry, value);
+        }
+
+        assert!(!GlobalInstNumbering.run(&mut program));
+        let data = program.func_data(function);
+        assert_eq!(binary_operands(data, loads), (load_a, load_b));
+        assert_eq!(binary_operands(data, calls), (call_a, call_b));
+    }
+
+    #[test]
+    fn keeps_tail_calls_unique_and_rewrites_their_arguments() {
+        let mut program = Program::new();
+        let function =
+            program.new_function(Type::get_i32(), "tail_call".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let one_a = data.new_local_inst().integer(1);
+        let one_b = data.new_local_inst().integer(1);
+        let tail_call = data.new_local_inst().tail_call(function, vec![one_b]);
+        for value in [one_a, one_b, tail_call] {
+            data.layout_mut().insert_inst(entry, value);
+        }
+
+        assert!(GlobalInstNumbering.run(&mut program));
+        assert!(!GlobalInstNumbering.run(&mut program));
+        let data = program.func_data(function);
+        let InstKind::TailCall(tail_call_data) = data.inst_data(tail_call).kind() else {
+            panic!("expected tail call")
+        };
+        assert_eq!(tail_call_data.args(), &[one_a]);
+    }
+
+    #[test]
+    fn canonicalizes_swapped_comparisons() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "compare".into(),
+            vec![Type::get_i32(), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let (x, y) = (data.params()[0], data.params()[1]);
+        let less = data.new_local_inst().binary(BinaryOp::Lt, x, y);
+        let greater = data.new_local_inst().binary(BinaryOp::Gt, y, x);
+        let result = data.new_local_inst().binary(BinaryOp::Sub, less, greater);
+        let ret = data.new_local_inst().ret(Some(result));
+        for value in [less, greater, result, ret] {
+            data.layout_mut().insert_inst(entry, value);
+        }
+
+        assert!(GlobalInstNumbering.run(&mut program));
+        assert_eq!(
+            binary_operands(program.func_data(function), result),
+            (less, less)
+        );
     }
 }

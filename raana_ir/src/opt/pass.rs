@@ -188,6 +188,9 @@ impl PassesManager {
             let boolean_simplification = Box::new(boolean_simplify::BooleanSimplification);
             p.register(boolean_simplification);
 
+            let gvn_pre = Box::new(gvn_pre::GVNPRE);
+            p.register(gvn_pre);
+
             let dpe = dce::DeadPhiElimination;
             p.register(Box::new(dpe));
             let dce = dce::DeadCodeElimination;

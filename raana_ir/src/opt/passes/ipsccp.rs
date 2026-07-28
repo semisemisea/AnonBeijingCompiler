@@ -151,6 +151,14 @@ impl Pass for IPSCCP {
                 }
             }
 
+            // Tail-call relay nodes whose lattice was updated by the Return arm
+            // need re-scheduling so their TailCall arm can forward the callee's
+            // return value upward. They cannot be pushed to `node_worklist`
+            // directly inside the node-processing block because the closures
+            // (`merge_and_extend` et al.) hold a mutable borrow of it; collect
+            // them here and drain after those closures are dropped.
+            let mut relay_targets: Vec<Node> = Vec::new();
+
             if let Some(node) = node_worklist.pop_front() {
                 let push_edge = |edge: Edge| {
                     edge_visited
@@ -174,9 +182,12 @@ impl Pass for IPSCCP {
                     );
                 };
                 let mut merge_and_extend =
-                    |node: Node, status: Lattice, lattice_map: &mut LatticeMap| {
+                    |node: Node, status: Lattice, lattice_map: &mut LatticeMap| -> bool {
                         if lattice_map.insert_or_update(node, status) {
                             extend_affected_node_used_by(node);
+                            true
+                        } else {
+                            false
                         }
                     };
                 match data.inst_data(inst).kind() {
@@ -299,6 +310,27 @@ impl Pass for IPSCCP {
                                 );
                             }
                         }
+                        // Relay: a tail call forwards the callee's return value
+                        // directly to the current function's caller (the frame is
+                        // reused). The callee's Return arm deposits its return value
+                        // into *this* node's lattice (see the Return arm below);
+                        // propagate it further along this node's outgoing Return
+                        // edges, which connect to the caller's call site.
+                        let node_status = lattice_map.get(node);
+                        for Edge { dst, edge_type, .. } in
+                            icfg.outgoing_edges_of(node)
+                        {
+                            if edge_type != EdgeType::Return {
+                                continue;
+                            }
+                            if let Some(cs) = icfg.call_site_before(dst) {
+                                merge_and_extend(
+                                    Node::new(dst.func, cs.call),
+                                    node_status,
+                                    &mut lattice_map,
+                                );
+                            }
+                        }
                     }
                     InstKind::Call(call) => {
                         let callee = call.callee();
@@ -321,12 +353,37 @@ impl Pass for IPSCCP {
                             let ret_val_status = lattice_map.get(Node::new(func, ret_val));
                             let outgoing_edges = icfg.outgoing_edges_of(node);
                             for Edge { dst, .. } in outgoing_edges {
-                                let call_site = icfg.call_site_before(dst).unwrap();
-                                merge_and_extend(
-                                    Node::new(dst.func, call_site.call),
+                                // For a regular call, the Return edge lands at the
+                                // call's continuation and `call_site_before` resolves
+                                // the call site whose `.call` node receives the value.
+                                // For a tail call, the edge lands at the tail-call
+                                // instruction itself (the relay node), which is
+                                // deliberately absent from `callsite_by_continuation`
+                                // — deposit the value directly into that node.
+                                let target = match icfg.call_site_before(dst) {
+                                    Some(cs) => Node::new(dst.func, cs.call),
+                                    None => dst,
+                                };
+                                if merge_and_extend(
+                                    target,
                                     ret_val_status,
                                     &mut lattice_map,
-                                )
+                                ) {
+                                    // The relay node's lattice was set externally
+                                    // (by us, not by its own evaluation), so it will
+                                    // not be revisited through `used_by`. Re-schedule
+                                    // it so its TailCall arm can forward the value
+                                    // upward along the tail-call chain.
+                                    if matches!(
+                                        program
+                                            .func_data(target.func)
+                                            .inst_data(target.inst)
+                                            .kind(),
+                                        InstKind::TailCall(..)
+                                    ) {
+                                        relay_targets.push(target);
+                                    }
+                                }
                             }
                         }
                     }
@@ -361,13 +418,23 @@ impl Pass for IPSCCP {
                             .map(construct_edge)
                             .for_each(push_edge);
                     }
-                    InstKind::Return(..) | InstKind::TailCall(..) => {}
+                    InstKind::Return(..) => {}
+                    InstKind::TailCall(..) => {
+                        // Push the Call edge so the callee's entry becomes
+                        // reachable. Return edges are consumed by the relay logic
+                        // in the TailCall lattice arm, not pushed here.
+                        icfg.outgoing_edges_of(Node::new(func, inst))
+                            .filter(|e| e.edge_type == EdgeType::Call)
+                            .for_each(push_edge);
+                    }
                     _ => {
                         icfg.outgoing_edges_of(Node::new(func, inst))
                             .for_each(push_edge);
                     }
                 }
             }
+            // Closures borrowing `node_worklist` are now dropped; safe to extend.
+            node_worklist.extend(relay_targets.drain(..));
         }
 
         let mut changed = false;
@@ -486,5 +553,110 @@ fn mathematic_operation(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
         BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
         BinaryOp::Shr => (lhs as u32).wrapping_shr(rhs as u32) as i32,
         BinaryOp::Sar => lhs.wrapping_shr(rhs as u32),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{
+        BinaryOp,
+        builder::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
+    };
+
+    /// Build a self-recursive tail-call function and verify that IPSCCP does
+    /// not mis-propagate a parameter that varies across recursive tail calls.
+    ///
+    /// ```text
+    /// fun(n: i32, dep: i32) -> i32:
+    ///     if n == 0: return dep      // base case — dep must stay variable
+    ///     else: tail_call fun(n - 1, dep + 1)
+    /// main(): return fun(2, 0)
+    /// ```
+    ///
+    /// With correct tail-call argument propagation, `dep` receives both
+    /// `Constant(0)` (from main) and `Constant(1)` (from the recursive
+    /// `dep+1`), converging to `Bottom`. Without the fix, IPSCCP would only
+    /// see the non-tail call `fun(2, 0)` and constant-propagate `dep` to `0`,
+    /// replacing the `ret dep` with `ret 0`.
+    #[test]
+    fn tail_call_args_prevent_constant_mispropagation() {
+        let mut program = Program::new();
+
+        // fun(n: i32, dep: i32) -> i32
+        let fun = program.new_function(
+            Type::get_i32(),
+            "fun".into(),
+            vec![Type::get_i32(), Type::get_i32()],
+        );
+        let dep_param = {
+            let data = program.func_data_mut(fun);
+            let entry = data.add_entry_block();
+            let params = data.bb_data(entry).params();
+            let n = params[0];
+            let dep = params[1];
+
+            let base = data.new_basic_block().basic_block("base".into(), vec![]);
+            let rec = data.new_basic_block().basic_block("rec".into(), vec![]);
+            data.layout_mut().push_bb_back(base);
+            data.layout_mut().push_bb_back(rec);
+
+            // entry: br (n == 0), base, rec
+            // (Integer constants are not placed in the layout — IPSCCP
+            // initialises their lattice in Stage 0.1.)
+            let zero = data.new_local_inst().integer(0);
+            let cond = data.new_local_inst().binary(BinaryOp::Eq, n, zero);
+            let br = data
+                .new_local_inst()
+                .branch(cond, base, vec![], rec, vec![]);
+            data.layout_mut().insert_inst(entry, cond);
+            data.layout_mut().insert_inst(entry, br);
+
+            // base: ret dep
+            let ret_dep = data.new_local_inst().ret(Some(dep));
+            data.layout_mut().insert_inst(base, ret_dep);
+
+            // rec: tail_call fun(n - 1, dep + 1)
+            let one = data.new_local_inst().integer(1);
+            let nm1 = data.new_local_inst().binary(BinaryOp::Sub, n, one);
+            let one2 = data.new_local_inst().integer(1);
+            let depp1 = data.new_local_inst().binary(BinaryOp::Add, dep, one2);
+            let tc = data.new_local_inst().tail_call(fun, vec![nm1, depp1]);
+            data.layout_mut().insert_inst(rec, nm1);
+            data.layout_mut().insert_inst(rec, depp1);
+            data.layout_mut().insert_inst(rec, tc);
+
+            dep
+        };
+
+        // main() -> i32: return fun(2, 0)
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        {
+            let data = program.func_data_mut(main);
+            let entry = data.add_entry_block();
+            let two = data.new_local_inst().integer(2);
+            let zero = data.new_local_inst().integer(0);
+            let call = data
+                .new_local_inst()
+                .call_with_type(fun, vec![two, zero], Type::get_i32());
+            let ret = data.new_local_inst().ret(Some(call));
+            data.layout_mut().insert_inst(entry, call);
+            data.layout_mut().insert_inst(entry, ret);
+        }
+
+        IPSCCP.run(&mut program);
+
+        // After IPSCCP, `dep` must still be a BlockArgRef (not folded to an
+        // Integer constant). If the tail-call arm were missing, dep's lattice
+        // would be Constant(0) and `replace_inst_with` would have mutated its
+        // data to Integer(0).
+        let data = program.func_data(fun);
+        assert!(
+            matches!(
+                data.inst_data(dep_param).kind(),
+                InstKind::BlockArgRef(..)
+            ),
+            "dep parameter was constant-propagated — tail-call arg propagation is broken"
+        );
     }
 }

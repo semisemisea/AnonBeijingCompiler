@@ -277,7 +277,29 @@ impl Pass for IPSCCP {
                         }
                         merge_and_extend(node, Lattice::Bottom, &mut lattice_map);
                     }
-                    InstKind::Store(..) | InstKind::MemZero(..) | InstKind::TailCall(..) => {}
+                    InstKind::Store(..) | InstKind::MemZero(..) => {}
+                    InstKind::TailCall(tail_call) => {
+                        // A tail call transfers control to the callee just like a
+                        // regular call, so its actual arguments must flow into the
+                        // callee's formal parameters. Without this, the only
+                        // argument source IPSCCP would see is the (non-tail) call
+                        // site, causing parameters that vary across recursive tail
+                        // calls to be mis-propagated as constants.
+                        let callee = tail_call.callee();
+                        let callee_data = program.func_data(callee);
+                        if !callee_data.layout().is_decl() {
+                            for (&arg, &param) in
+                                tail_call.args().iter().zip(callee_data.params())
+                            {
+                                let arg_status = lattice_map.get(Node::new(func, arg));
+                                merge_and_extend(
+                                    Node::new(callee, param),
+                                    arg_status,
+                                    &mut lattice_map,
+                                );
+                            }
+                        }
+                    }
                     InstKind::Call(call) => {
                         let callee = call.callee();
                         let callee_data = program.func_data(callee);

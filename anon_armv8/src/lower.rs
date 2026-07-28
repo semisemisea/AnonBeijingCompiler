@@ -667,8 +667,8 @@ fn lower_mem_zero(
         clobbers: regs::DEFAULT_CLOBBERS,
         label: Label::Embedded(EmbeddedSymbol::Memset),
     });
-    ctx.vcode.vcode.abi.set_has_calls();
-    ctx.vcode.vcode.abi.set_outgoing_arg_size(0);
+    ctx.set_has_calls();
+    ctx.set_outgoing_arg_size(0);
     LoweredOutput::None
 }
 
@@ -747,11 +747,8 @@ fn lower_call(
         clobbers: regs::DEFAULT_CLOBBERS,
         label: Label::from_function(call.callee()),
     });
-    ctx.vcode.vcode.abi.set_has_calls();
-    ctx.vcode
-        .vcode
-        .abi
-        .set_outgoing_arg_size(stack_offset as usize);
+    ctx.set_has_calls();
+    ctx.set_outgoing_arg_size(stack_offset as usize);
     result.map_or(LoweredOutput::None, LoweredOutput::Value)
 }
 
@@ -774,7 +771,7 @@ fn lower_tail_call(
     for (idx, &arg) in tail_call.args().iter().enumerate() {
         let src = ctx.put_value_in_reg(arg);
         let ty = memory_type(arena.inst_data(arg).ty().kind());
-        match ctx.vcode.vcode.abi.arg_slot(idx) {
+        match ctx.arg_slot(idx) {
             ArgSlot::Reg { reg, .. } => args.push(CallArgPair {
                 vreg: src,
                 preg: reg.into(),
@@ -786,7 +783,7 @@ fn lower_tail_call(
             }),
         }
     }
-    ctx.vcode.vcode.abi.set_has_calls();
+    ctx.set_has_calls();
     ctx.emit(MInst::TailCall {
         args,
         clobbers: regs::DEFAULT_CLOBBERS,

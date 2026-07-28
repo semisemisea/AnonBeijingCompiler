@@ -599,7 +599,7 @@ fn lower_alloc(
     let def = ctx.result_reg(inst);
     let rd = Writable::from_reg(def);
     let pointee_ty = arena.inst_data(inst).ty().derefernce();
-    let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(inst, pointee_ty) as i64;
+    let offset = ctx.alloc_stackslot_or_get(inst, pointee_ty) as i64;
     ctx.emit(<Riscv64ABI as ABIMachineSpec>::gen_get_stack_addr(
         StackAMode::Slot(offset),
         rd,
@@ -716,7 +716,7 @@ fn lower_store(
         let elems = agg.flatten(&arena);
         assert!(matches!(arena.inst_data(dst).kind(), InstKind::Alloc));
         let dst_pointee = arena.inst_data(dst).ty().derefernce();
-        let base_offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(dst, dst_pointee) as i64;
+        let base_offset = ctx.alloc_stackslot_or_get(dst, dst_pointee) as i64;
         let mut elem_offset: i64 = 0;
         for elem in elems {
             let rs = ctx.put_value_in_reg(elem);
@@ -732,7 +732,7 @@ fn lower_store(
         let total = src_ty.array_flatten_length();
         let elem_size = src_ty.array_base_scalar_type().size() as i64;
         let dst_pointee = arena.inst_data(dst).ty().derefernce();
-        let base_offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(dst, dst_pointee) as i64;
+        let base_offset = ctx.alloc_stackslot_or_get(dst, dst_pointee) as i64;
         for i in 0..total {
             let addr = normalize_amode(AMode::SlotOffset(base_offset + i as i64 * elem_size), ctx);
             ctx.emit(MInst::StoreWord {
@@ -768,7 +768,7 @@ fn lower_store(
                 }
                 InstKind::Alloc => {
                     let pointee_ty = arena.inst_data(dst).ty().derefernce();
-                    let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(dst, pointee_ty);
+                    let offset = ctx.alloc_stackslot_or_get(dst, pointee_ty);
                     let addr = normalize_amode(AMode::SlotOffset(offset as i64), ctx);
                     ctx.emit(MInst::StoreWord { rs, op, addr });
                 }
@@ -861,8 +861,8 @@ fn lower_mem_zero(
         clobbers: DEFAULT_CLOBBERS,
         label: Label::LibCall(LibCall::Memset),
     });
-    ctx.vcode.vcode.abi.set_has_calls();
-    ctx.vcode.vcode.abi.set_outgoing_arg_size(0);
+    ctx.set_has_calls();
+    ctx.set_outgoing_arg_size(0);
     LoweredOutput::None
 }
 
@@ -895,7 +895,7 @@ fn lower_load(
         // For SysY, this branch only happen when SSA is disabled.
         // All load from integer/float is translated into SSA from.
         let alloc_ty = arena.inst_data(src).ty().derefernce();
-        let offset = ctx.vcode.vcode.abi.alloc_stackslot_or_get(src, alloc_ty);
+        let offset = ctx.alloc_stackslot_or_get(src, alloc_ty);
         let addr = normalize_amode(AMode::SlotOffset(offset as i64), ctx);
         ctx.emit(MInst::LoadWord { rd, op, addr });
     }
@@ -976,8 +976,8 @@ fn lower_call(
         clobbers: DEFAULT_CLOBBERS,
         label: Label::Function(call.callee()),
     });
-    ctx.vcode.vcode.abi.set_has_calls();
-    ctx.vcode.vcode.abi.set_outgoing_arg_size(outgoing_arg_size);
+    ctx.set_has_calls();
+    ctx.set_outgoing_arg_size(outgoing_arg_size);
     result.map_or(LoweredOutput::None, LoweredOutput::Value)
 }
 
@@ -995,7 +995,7 @@ fn lower_tail_call(
         let arg_reg = ctx.put_value_in_reg(arg);
         let arg_ty = arena.inst_data(arg).ty();
         let m_type: LoweredType = arg_ty.into();
-        match ctx.vcode.vcode.abi.arg_slot(idx) {
+        match ctx.arg_slot(idx) {
             ArgSlot::Reg { reg, .. } => call_arg_pairs.push(CallArgPair {
                 vreg: arg_reg,
                 preg: reg.into(),
@@ -1011,7 +1011,7 @@ fn lower_tail_call(
             }
         }
     }
-    ctx.vcode.vcode.abi.set_has_calls();
+    ctx.set_has_calls();
     ctx.emit(MInst::TailCall {
         arg_pairs: call_arg_pairs,
         clobbers: DEFAULT_CLOBBERS,

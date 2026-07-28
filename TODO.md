@@ -128,15 +128,20 @@ pub struct MIRPassPipeline<I: VCodeInst> {
 
 ### 4c. 修复 `LowerContext` 的封装泄漏
 
-Backend 可以 reach-through 到 `ctx.vcode.vcode.abi.…`（`anon_armv8/src/lower.rs:670-671, 750-754, 789`）。把 `VCodeBuilder.vcode` 改成 `pub(crate)`，并增加有意的访问器：
-- `ctx.alloc_stackslot(hir, ty)`（已存在）
-- `ctx.outgoing_arg_size()`（新增，替换直接访问 `ctx.vcode.vcode.abi.outgoing_args_size`）
-- `ctx.frame_layout()`（仅 post-RA 阶段用）
-- `LowerContext.vcode` 改 `pub(crate)`。
+**状态：✅ 已完成 (M2)**
+
+已实现：
+- `LowerContext.vcode` 改为 `pub(crate)`，`VCodeBuilder.vcode` 改为 `pub(crate)`
+- 新增 `LowerContext` 上的封装方法：`set_has_calls()`、`set_outgoing_arg_size(size)`、`arg_slot(idx)`
+- 已有封装方法：`alloc_stackslot_or_get()`、`alloc_tmp()`、`emit()`、`put_value_in_reg()`、`result_reg()`
+- AArch64 后端 5 处 + RISC-V 后端 11 处 `ctx.vcode.vcode.abi.*` 直接访问全部替换为封装方法
+- 验证：`rg "ctx\.vcode\.vcode"` 在两个后端目录中返回零结果
 
 ### 4d. 修正 README
 
-第 46-50 行改为："寄存器分配是 regalloc2 Ion 回溯分配器的移植"，并更新 §8 的 pass 列表。
+**状态：✅ 已完成 (M2)**
+
+第 46-50 行改为："寄存器分配是 regalloc2 Ion 回溯分配器的移植"，并更新 §8 的 pass 列表，新增 MIR Pass pipeline 说明。
 
 ---
 

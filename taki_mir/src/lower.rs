@@ -2,7 +2,7 @@ use log::{debug, trace};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 
-use crate::abi::{ABIMachineSpec, CalleeABI};
+use crate::abi::{ABIMachineSpec, ArgSlot, CalleeABI};
 use crate::block_order::{BlockLoweringOrder, LoweredBlock, MirBlockIndex};
 use crate::prelude::*;
 use crate::reg_alloc::function::Function;
@@ -117,7 +117,7 @@ pub struct LowerContext<'prog, I: VCodeInst> {
     pub arena: ArenaContext<'prog>,
 
     /// The VCode Container we currently building.
-    pub vcode: VCodeBuilder<I>,
+    pub(crate) vcode: VCodeBuilder<I>,
 
     /// A virtural register allocator.
     /// Allocate each instruction a register.
@@ -932,6 +932,24 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     /// that stack-frame ownership remains part of the generic lowering API.
     pub fn alloc_stackslot_or_get(&mut self, alloc: HirInst, ty: HirType) -> u32 {
         self.vcode.vcode.abi.alloc_stackslot_or_get(alloc, ty)
+    }
+
+    /// Mark this function as containing (tail) calls so that the ABI preserves
+    /// the caller-save area / LR in the prologue.
+    pub fn set_has_calls(&mut self) {
+        self.vcode.vcode.abi.set_has_calls();
+    }
+
+    /// Record the outgoing-argument-area size needed by the largest call site
+    /// in this function. Takes the max so multiple calls keep the area stable.
+    pub fn set_outgoing_arg_size(&mut self, size: usize) {
+        self.vcode.vcode.abi.set_outgoing_arg_size(size);
+    }
+
+    /// Look up the calling-convention slot (register or stack offset) for the
+    /// `idx`-th incoming function parameter.
+    pub fn arg_slot(&self, idx: usize) -> ArgSlot {
+        self.vcode.vcode.abi.arg_slot(idx)
     }
 
     pub fn emit(&mut self, mach_inst: I) {

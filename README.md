@@ -45,13 +45,20 @@ For more information please go to the crate `taki_mir`
 
 #### Register Allocation
 
-The register allocation is the simple linear one-pass scan allocation.
-It could be upgrade to `Linear Greedy Scan` that `LLVM` adopted.
+The register allocation is a port of regalloc2's **Ion backtracking allocator**.
+It operates on the flat `VCode` operand array through an abstract `Function`
+trait, supports spilling, live-range splitting, and parallel-copy resolution.
 
 ### Opt
 
-At this time, we have 5 passes working.
+At this time, we have 5 IR-level passes working.
 See the Appendix(i)
+
+The backend (`taki_mir`) also exposes a MIR-level pass pipeline
+(`MIRPass` / `MIRPassPipeline`) split into pre-RA and post-RA phases,
+mirroring the IR-level `Pass` / `PassesManager`. This framework will host
+peephole combining, instruction scheduling, and other machine-code
+optimizations.
 
 ## Current Progress
 

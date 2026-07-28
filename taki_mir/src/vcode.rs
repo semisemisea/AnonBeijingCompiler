@@ -679,7 +679,7 @@ pub struct VCodeBuilder<I>
 where
     I: VCodeInst,
 {
-    pub vcode: VCodeContainer<I>,
+    pub(crate) vcode: VCodeContainer<I>,
 }
 
 impl<I: VCodeInst> VCodeBuilder<I> {

@@ -4,7 +4,6 @@ use crate::abi::{ABIMachineSpec, FrameLayout};
 use crate::block_order::MirBlockIndex;
 use crate::lower::LowerBackend;
 use crate::prelude::*;
-use crate::reg_alloc::reg::{InstOrEdit, Output, RegClass};
 use crate::register::Reg;
 use crate::vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator, VCodeContainer};
 
@@ -75,11 +74,11 @@ impl<B: LowerBackend> EmitContext for AsmWriter<'_, B> {
 }
 
 impl<B: LowerBackend> AsmWriter<'_, B> {
-    pub fn write_function(&mut self, vcode: &VCodeContainer<B::MInst>, output: &Output)
+    pub fn write_function(&mut self, vcode: &VCodeContainer<B::MInst>)
     where
         B::MInst: MachInstEmit,
     {
-        type S<B: LowerBackend> = <<B as LowerBackend>::MInst as MachInst>::ABISpec;
+        type S<B> = <<B as LowerBackend>::MInst as MachInst>::ABISpec;
 
         let name = self.func_data.name();
         writeln!(self.buf, "{} {name}", B::global_directive()).unwrap();
@@ -97,110 +96,40 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
             .map(|lb| B::format_block_label(lb, self.func_data))
             .collect();
 
-        let spill_unit_bytes = vcode.abi.spill_unit_bytes();
-
         for (bi, _lb) in block_order.lowered_order().iter().enumerate() {
             writeln!(self.buf, "{}:", self.block_labels[bi]).unwrap();
 
-            let block_idx = MirBlockIndex::new(bi);
-            for item in output.block_insts_and_edits(vcode, block_idx) {
-                match item {
-                    InstOrEdit::Edit(edit) => {
-                        let crate::reg_alloc::reg::Edit::Move { from, to, class } = edit;
-                        match (from.as_reg(), to.as_reg()) {
-                            (Some(from_reg), Some(to_reg)) => {
-                                assert_eq!(
-                                    from_reg.class(),
-                                    *class,
-                                    "register-to-register allocation moves cannot cross register classes"
-                                );
-                                assert_eq!(to_reg.class(), *class);
-                                let ty = match class {
-                                    RegClass::Float => crate::types::F32,
-                                    RegClass::Int => crate::types::I64,
-                                    RegClass::Vector => {
-                                        unreachable!("vector register moves are unsupported")
-                                    }
-                                };
-                                let mv = S::<B>::gen_move(
-                                    Reg::from_physical_reg(from_reg),
-                                    Reg::from_physical_reg(to_reg),
-                                    ty,
-                                );
-                                self.write_inst(frame, &mv);
-                            }
-                            (Some(from_reg), None) => {
-                                let slot = to.as_stack().unwrap();
-                                let offset = frame.spill_slot_offset(slot, spill_unit_bytes);
-                                let ty = match class {
-                                    RegClass::Float => crate::types::F32,
-                                    _ => crate::types::I64,
-                                };
-                                for inst in S::<B>::gen_spill_store_at_sp(
-                                    Reg::from_physical_reg(from_reg),
-                                    offset,
-                                    ty,
-                                ) {
-                                    self.write_inst(frame, &inst);
-                                }
-                            }
-                            (None, Some(to_reg)) => {
-                                let slot = from.as_stack().unwrap();
-                                let offset = frame.spill_slot_offset(slot, spill_unit_bytes);
-                                let ty = match class {
-                                    RegClass::Float => crate::types::F32,
-                                    _ => crate::types::I64,
-                                };
-                                for inst in S::<B>::gen_spill_load_at_sp(
-                                    offset,
-                                    crate::register::Writable::from_reg(Reg::from_physical_reg(
-                                        to_reg,
-                                    )),
-                                    ty,
-                                ) {
-                                    self.write_inst(frame, &inst);
-                                }
-                            }
-                            (None, None) => {
-                                let from_slot = from.as_stack().unwrap();
-                                let to_slot = to.as_stack().unwrap();
-                                let from_offset =
-                                    frame.spill_slot_offset(from_slot, spill_unit_bytes);
-                                let to_offset = frame.spill_slot_offset(to_slot, spill_unit_bytes);
-                                for inst in S::<B>::gen_stack_to_stack_move(from_offset, to_offset)
-                                {
-                                    self.write_inst(frame, &inst);
-                                }
-                            }
-                        }
-                    }
-                    InstOrEdit::Inst(inst_idx) => {
-                        let inst = vcode.inst(inst_idx.index());
-
-                        if matches!(inst.is_term(), MachTerminator::Return) {
-                            for epi in &vcode.abi.gen_epilogue() {
-                                self.write_inst(frame, epi);
-                            }
-                        }
-                        self.write_inst(frame, inst);
+            for inst in vcode.block_insts(bi) {
+                if matches!(inst.is_term(), MachTerminator::Return) {
+                    for epi in &vcode.abi.gen_epilogue() {
+                        self.write_inst(frame, epi);
                     }
                 }
+                self.print_inst(inst);
             }
         }
         writeln!(self.buf).unwrap();
     }
 
+    /// Legalize and print an ABI-generated instruction (prologue, epilogue).
+    /// VCode instructions are already finalized and use [`print_inst`] instead.
     fn write_inst<I: crate::vcode::VCodeInst + MachInstEmit>(
         &mut self,
         frame: &FrameLayout,
         inst: &I,
     ) {
         let legalized = I::ABISpec::legalize_inst(frame, inst.clone());
-        log::trace!(target: "taki_mir::emit", "legalize original={inst:?} legalized={legalized:?}");
         for inst in legalized {
             write!(self.buf, "    ").unwrap();
             inst.emit(self).unwrap();
             writeln!(self.buf).unwrap();
         }
+    }
+
+    /// Print a finalized VCode instruction directly — no legalization needed.
+    fn print_inst<I: MachInstEmit>(&mut self, inst: &I) {
+        write!(self.buf, "    ").unwrap();
+        inst.emit(self).unwrap();
+        writeln!(self.buf).unwrap();
     }
 }

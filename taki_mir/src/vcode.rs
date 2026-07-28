@@ -10,8 +10,8 @@ use crate::{
         function::Function,
         index::{Block, Inst, InstRange},
         reg::{
-            AllocationKind, Edit, Operand, OperandCollector, OperandConstraint, OperandKind,
-            OperandVisitor, OperandWriter, Output, PRegSet, RegClass, VReg,
+            AllocationKind, Edit, InstOrEdit, Operand, OperandCollector, OperandConstraint,
+            OperandKind, OperandVisitor, OperandWriter, Output, PRegSet, RegClass, VReg,
         },
     },
     register::{Reg, VRegAllocator, Writable},
@@ -141,6 +141,147 @@ impl<I: VCodeInst> VCodeContainer<I> {
             let mut writer = OperandWriter::new(allocs);
             self.insts[i].get_operands(&mut writer);
         }
+    }
+
+    /// Materialize allocator edit-moves into the instruction stream and legalize
+    /// every frame-dependent pseudo-addressing mode in-place.
+    ///
+    /// After this call:
+    /// - Every instruction in `self.insts` has a concrete, encodable addressing
+    ///   mode (no `FrameSlot`, `SpOffset`, `IncomingArg`, or `OutgoingArg`).
+    /// - Allocator `Edit::Move`s from `output.edits` have been expanded into real
+    ///   move/spill/reload instructions interleaved at their program points.
+    /// - The `output` is fully consumed; the emitter no longer needs it.
+    /// - The `operands`, `operands_range`, and `clobbers` tables are cleared
+    ///   (they were only needed for register allocation).
+    ///
+    /// Block structure (block ranges, successors, predecessors, params) is
+    /// preserved; only the per-block instruction count may grow.
+    pub fn finalize_for_emission(&mut self, output: &Output) {
+        use crate::types::{F32, I64};
+
+        let frame = self
+            .abi
+            .frame_layout()
+            .clone();
+        let spill_unit_bytes = self.abi.spill_unit_bytes();
+        let num_blocks = self.block_range.len();
+
+        let mut new_insts: Vec<I> = Vec::new();
+        let mut new_block_range = Ranges::default();
+
+        for block_index in 0..num_blocks {
+            let block_start = new_insts.len();
+
+            for item in output.block_insts_and_edits(self, Block::new(block_index)) {
+                match item {
+                    InstOrEdit::Inst(inst_idx) => {
+                        let inst = self.insts[inst_idx.index()].clone();
+                        let legalized = I::ABISpec::legalize_inst(&frame, inst);
+                        for inst in legalized {
+                            new_insts.push(inst);
+                        }
+                    }
+                    InstOrEdit::Edit(edit) => {
+                        let Edit::Move { from, to, class } = edit;
+                        match (from.as_reg(), to.as_reg()) {
+                            (Some(from_reg), Some(to_reg)) => {
+                                let ty = match class {
+                                    RegClass::Float => F32,
+                                    RegClass::Int => I64,
+                                    RegClass::Vector => unreachable!(
+                                        "vector register moves are unsupported"
+                                    ),
+                                };
+                                let mv = I::ABISpec::gen_move(
+                                    Reg::from_physical_reg(from_reg),
+                                    Reg::from_physical_reg(to_reg),
+                                    ty,
+                                );
+                                for inst in I::ABISpec::legalize_inst(&frame, mv) {
+                                    new_insts.push(inst);
+                                }
+                            }
+                            (Some(from_reg), None) => {
+                                let slot = to.as_stack().unwrap();
+                                let offset = frame.spill_slot_offset(slot, spill_unit_bytes);
+                                let ty = match class {
+                                    RegClass::Float => F32,
+                                    _ => I64,
+                                };
+                                for inst in I::ABISpec::gen_spill_store_at_sp(
+                                    Reg::from_physical_reg(from_reg),
+                                    offset,
+                                    ty,
+                                ) {
+                                    for inst in I::ABISpec::legalize_inst(&frame, inst) {
+                                        new_insts.push(inst);
+                                    }
+                                }
+                            }
+                            (None, Some(to_reg)) => {
+                                let slot = from.as_stack().unwrap();
+                                let offset = frame.spill_slot_offset(slot, spill_unit_bytes);
+                                let ty = match class {
+                                    RegClass::Float => F32,
+                                    _ => I64,
+                                };
+                                for inst in I::ABISpec::gen_spill_load_at_sp(
+                                    offset,
+                                    Writable::from_reg(Reg::from_physical_reg(to_reg)),
+                                    ty,
+                                ) {
+                                    for inst in I::ABISpec::legalize_inst(&frame, inst) {
+                                        new_insts.push(inst);
+                                    }
+                                }
+                            }
+                            (None, None) => {
+                                let from_slot = from.as_stack().unwrap();
+                                let to_slot = to.as_stack().unwrap();
+                                let from_offset =
+                                    frame.spill_slot_offset(from_slot, spill_unit_bytes);
+                                let to_offset =
+                                    frame.spill_slot_offset(to_slot, spill_unit_bytes);
+                                for inst in I::ABISpec::gen_stack_to_stack_move(
+                                    from_offset,
+                                    to_offset,
+                                ) {
+                                    for inst in I::ABISpec::legalize_inst(&frame, inst) {
+                                        new_insts.push(inst);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            new_block_range.push_end(new_insts.len());
+            let _ = block_start;
+        }
+
+        let mut new_inst_is_branch = Vec::with_capacity(new_insts.len());
+        let mut new_inst_is_ret = Vec::with_capacity(new_insts.len());
+        for inst in &new_insts {
+            let term = inst.is_term();
+            new_inst_is_branch.push(matches!(
+                term,
+                MachTerminator::Branch | MachTerminator::TailReturn
+            ));
+            new_inst_is_ret.push(matches!(term, MachTerminator::Return));
+        }
+
+        self.insts = new_insts;
+        self.block_range = new_block_range;
+        self.inst_is_branch = new_inst_is_branch;
+        self.inst_is_ret = new_inst_is_ret;
+
+        // The operand tables and clobber map were only needed for register
+        // allocation. Clear them so stale data can't confuse later passes.
+        self.operands.clear();
+        self.operands_range = Ranges::default();
+        self.clobbers.clear();
     }
 
     /// Check allocator output before applying it to mutable machine instructions.
@@ -301,6 +442,12 @@ impl<I: VCodeInst> VCodeContainer<I> {
         &self.insts[i]
     }
 
+    /// Returns the instruction slice for a block, indexed in lowered-order.
+    pub fn block_insts(&self, block_index: usize) -> &[I] {
+        let range = self.block_range.get(block_index);
+        &self.insts[range]
+    }
+
     pub fn block_order(&self) -> &BlockLoweringOrder {
         &self.block_order
     }
@@ -330,7 +477,11 @@ impl<I: VCodeInst> VCodeContainer<I> {
                 self.block_succ.len()
             ));
         }
-        if self.operands_range.len() != self.insts.len()
+        // After finalize_for_emission, the operand tables are intentionally
+        // cleared (they were only needed for register allocation). Accept that
+        // state as long as both operands and operands_range are empty.
+        let operands_finalized = self.operands.is_empty() && self.operands_range.is_empty();
+        if (!operands_finalized && self.operands_range.len() != self.insts.len())
             || self.inst_is_branch.len() != self.insts.len()
             || self.inst_is_ret.len() != self.insts.len()
         {
@@ -356,12 +507,19 @@ impl<I: VCodeInst> VCodeContainer<I> {
                     "instruction {inst_index} terminator metadata disagrees with {term:?}"
                 ));
             }
-            log::trace!(
-                target: "taki_mir::verify",
-                "stage={stage} inst={inst_index} operands={:?} instruction={inst:?} clobbers={:?}",
-                &self.operands[self.operands_range.get(inst_index)],
-                self.clobbers.get(&(inst_index as u32))
-            );
+            if !operands_finalized {
+                log::trace!(
+                    target: "taki_mir::verify",
+                    "stage={stage} inst={inst_index} operands={:?} instruction={inst:?} clobbers={:?}",
+                    &self.operands[self.operands_range.get(inst_index)],
+                    self.clobbers.get(&(inst_index as u32))
+                );
+            } else {
+                log::trace!(
+                    target: "taki_mir::verify",
+                    "stage={stage} inst={inst_index} instruction={inst:?}",
+                );
+            }
         }
 
         for block_index in 0..blocks {

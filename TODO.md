@@ -167,29 +167,24 @@ LegalizeFinal 可能改变指令数量（1→N 展开），这会使 regalloc Ou
 
 ## 5. Phase 3 — Pre-RA PeepholeCombine Pass（~2-3 天）
 
-**新文件：** `anon_armv8/src/passes/peephole_combine.rs`。在虚拟寄存器上工作（pre-regalloc），紧接 lowering 之后运行。
+**状态：✅ 已完成 (M5，MAC 部分)**
 
-目前**内联在 `lower.rs` 中**、Phase 3 要**抽取/迁移**的 folding：
+**新文件：**
+- `anon_armv8/src/passes/mod.rs` — pass 模块根，`build_pipeline()` 注册 `PeepholeCombine`
+- `anon_armv8/src/passes/peephole_combine.rs` — MAC folding pass
 
-| 模式 | 当前来源 | Pre-RA 形式 |
-|------|---------|-------------|
-| `mul + add/sub → madd/msub` | `fold_mul_add_sub`（`lower.rs:1459`） | 匹配 `MInst::Mul` producer 紧接着 `AluRRR{Add,Sub}` consumer；发射 `MAdd`/`MSub` |
-| `alu rR, rR, imm12` / `ImmShift` / `ImmLogic` 的选择 | `lower.rs:146-225` | **留在 lowering**（这是选择问题，依赖 HIR 操作数） |
-| `alu + shifted-RHS` | `fold_shifted_rhs`（`lower.rs:1536`） | 匹配 `Shl`/`Lsr`/`Asr` producer；合并为 `AluRRRShift` |
-| `LDP/STP 形成 | （不存在） | 匹配相邻 `Load`/`Store`、偏移为成对（±8 同 base reg）→ `LoadPair`/`StorePair`。**对 Cortex-A53 收益巨大**（单 LSU 周期）。 |
-| `Cbz/Cbnz/Tbz/Tbnz` 条件树 | `select_branch_condition`（`lower.rs:969-…`） | **留在 lowering**（在 branch lowering 的入口） |
-| 常量池 / `movz`+`movk` 合并 | `constants.rs::plan_integer_constant` | 已经很干净；不动 |
+**已实现：**
+- `PeepholeCombine: MIRPass<MInst>` 注册为 AArch64 pre-RA pass
+- MAC folding 规则：`AluRRR{Mul} + AluRRR{Add} → MAdd`，`AluRRR{Mul} + AluRRR{Sub,rhs=mul_dst} → MSub`
+- 安全检查：producer 的 dst 虚拟寄存器在整个函数中仅被使用一次（通过 `build_vreg_use_counts` 遍历所有指令的 `get_operands` 构建 use-count map）
+- `VCodeContainer::rebuild_operand_tables()` — pre-RA pass 改变指令后重建 operand/clobber/terminator 表
+- `compile()` 在 `run_pre_ra` 后调用 `rebuild_operand_tables()` 确保 regalloc 看到准确的 operand 信息
+- 新增 VCodeContainer 访问器：`inst_mut()`, `num_blocks()`, `block_inst_range()`, `num_insts()`
 
-Peephole pass 模式：**两指令工作表扫描**。对每个 block 顺序扫描；对每个 `(producer, consumer)` 对尝试 combine 规则。Combine 后把 producer 替换为 `Nop`（随后被消除）或 `MInst::Nop` 占位，consumer 替换为合并形式。
-
-Pre-RA combine 接口：
-```rust
-trait PeepholeRule<I: VCodeInst> {
-    fn matches(producer: &I, consumer: &I) -> bool;
-    fn apply(producer: I, consumer: I) -> SmallVec<[I; 2]>;   // 1 = 只改 consumer；2 = 两者合一
-}
-```
-规则表位于 `anon_armv8/src/passes/peephole_rules.rs`。
+**注意事项：**
+- HIR 层的 `fold_mul_add_sub` 已经在 lowering 时捕获大部分 MAC 模式
+- MIR 层的 peephole 补充了 lowering 遗漏的情况（如 IR 优化后新出现的 Mul+Add 模式）
+- `vreg_alias` 在本项目中从未使用（`add_alias` 从未被调用），所以 `rebuild_operand_tables` 使用 identity resolver
 
 ---
 

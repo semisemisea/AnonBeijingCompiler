@@ -442,10 +442,67 @@ impl<I: VCodeInst> VCodeContainer<I> {
         &self.insts[i]
     }
 
+    /// Mutable access to a single instruction. Used by MIR passes that rewrite
+    /// instructions in place (e.g. peephole combine).
+    pub fn inst_mut(&mut self, i: usize) -> &mut I {
+        &mut self.insts[i]
+    }
+
     /// Returns the instruction slice for a block, indexed in lowered-order.
     pub fn block_insts(&self, block_index: usize) -> &[I] {
         let range = self.block_range.get(block_index);
         &self.insts[range]
+    }
+
+    /// Number of basic blocks in lowered order.
+    pub fn num_blocks(&self) -> usize {
+        self.block_range.len()
+    }
+
+    /// Instruction index range `[start..end)` for a given block.
+    pub fn block_inst_range(&self, block_index: usize) -> core::ops::Range<usize> {
+        self.block_range.get(block_index)
+    }
+
+    /// Total instruction count.
+    pub fn num_insts(&self) -> usize {
+        self.insts.len()
+    }
+
+    /// Rebuild operand tables, terminator metadata, and clobber maps from the
+    /// current instruction stream. Pre-RA passes that mutate instruction
+    /// operand structures (e.g. peephole combine) must call this before
+    /// register allocation so that `operands`/`operands_range`/`clobbers`
+    /// reflect the post-pass instruction stream.
+    pub fn rebuild_operand_tables(&mut self) {
+        self.operands.clear();
+        self.operands_range = Ranges::default();
+        self.clobbers.clear();
+
+        let allocatable = PRegSet::from(self.abi.machine_env());
+        let num_insts = self.insts.len();
+        self.inst_is_branch = vec![false; num_insts];
+        self.inst_is_ret = vec![false; num_insts];
+
+        for (i, inst) in self.insts.iter_mut().enumerate() {
+            match inst.is_term() {
+                MachTerminator::Branch | MachTerminator::TailReturn => {
+                    self.inst_is_branch[i] = true;
+                }
+                MachTerminator::Return => {
+                    self.inst_is_ret[i] = true;
+                }
+                MachTerminator::None => {}
+            }
+            let mut op_collector =
+                OperandCollector::new(&mut self.operands, allocatable, |vreg| vreg);
+            inst.get_operands(&mut op_collector);
+            let (ops, clobbers) = op_collector.finish();
+            self.operands_range.push_end(ops);
+            if clobbers != PRegSet::default() {
+                self.clobbers.insert(i as u32, clobbers);
+            }
+        }
     }
 
     pub fn block_order(&self) -> &BlockLoweringOrder {

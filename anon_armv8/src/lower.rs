@@ -958,6 +958,10 @@ impl LowerBackend for AArch64Backend {
     fn runtime_assembly(program: &taki_mir::prelude::HirProgram) -> Option<String> {
         runtime::assembly(program)
     }
+
+    fn mir_pipeline() -> taki_mir::passes::MIRPassPipeline<Self::MInst> {
+        crate::passes::build_pipeline()
+    }
 }
 
 /// Select a branch-local, pure condition tree.  Claims are made through the

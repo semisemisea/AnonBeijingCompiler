@@ -452,14 +452,21 @@ impl Pass for IPSCCP {
             .collect::<Vec<_>>();
 
         for (node, val) in const_replace_list {
-            // TODO: Waiting for call analysis
             let mut arena = ArenaContextMut {
                 program,
                 curr_func: Some(node.func),
             };
-            if let InstKind::Call(..) = arena.inst_data(node.inst).kind() {
+            if matches!(
+                arena.inst_data(node.inst).kind(),
+                InstKind::Call(..) | InstKind::BlockArgRef(..)
+            ) {
+                let has_uses = !arena.inst_data(node.inst).used_by().is_empty();
+                if !has_uses {
+                    continue;
+                }
                 let integer = arena.new_local_inst().integer(val);
                 visit_and_replace(&mut arena, node.inst, integer);
+                changed = true;
             } else {
                 arena.replace_inst_with(node.inst).integer(val);
                 let data = program.func_data_mut(node.func);
@@ -559,9 +566,12 @@ fn mathematic_operation(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{
-        BinaryOp,
-        builder::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
+    use crate::{
+        ir::{
+            builder::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
+            BinaryOp,
+        },
+        llvm::LlvmWriter,
     };
 
     /// Build a self-recursive tail-call function and verify that IPSCCP does
@@ -651,12 +661,103 @@ mod tests {
         // would be Constant(0) and `replace_inst_with` would have mutated its
         // data to Integer(0).
         let data = program.func_data(fun);
-        assert!(
-            matches!(
-                data.inst_data(dep_param).kind(),
-                InstKind::BlockArgRef(..)
-            ),
+        assert!(matches!(
+            data.inst_data(dep_param).kind(),
+            InstKind::BlockArgRef(..)
+        ),
             "dep parameter was constant-propagated — tail-call arg propagation is broken"
         );
+    }
+
+    #[test]
+    fn constant_block_param_replaces_uses_without_mutating_param() {
+        let mut program = Program::new();
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let (param, ret) = {
+            let data = program.func_data_mut(main);
+            let entry = data.add_entry_block();
+            let target = data
+                .new_basic_block()
+                .basic_block("target".into(), vec![Type::get_i32()]);
+            data.layout_mut().push_bb_back(target);
+
+            let seven = data.new_local_inst().integer(7);
+            let jump = data.new_local_inst().jump(target, vec![seven]);
+            data.layout_mut().insert_inst(entry, jump);
+
+            let param = data.bb_data(target).params()[0];
+            let ret = data.new_local_inst().ret(Some(param));
+            data.layout_mut().insert_inst(target, ret);
+            (param, ret)
+        };
+
+        assert!(IPSCCP.run(&mut program));
+
+        let data = program.func_data(main);
+        assert!(matches!(
+            data.inst_data(param).kind(),
+            InstKind::BlockArgRef(..)
+        ));
+        let InstKind::Return(ret_data) = data.inst_data(ret).kind() else {
+            panic!("expected return instruction")
+        };
+        let value = ret_data.value().expect("return should have a value");
+        assert!(matches!(data.inst_data(value).kind(), InstKind::Integer(int) if int.value() == 7));
+
+        let mut writer = LlvmWriter::new(&program);
+        writer.write().unwrap();
+        let llvm = writer.finish();
+        assert!(llvm.contains("phi i32 [ 7,"), "{llvm}");
+        assert!(!llvm.contains("  7 = phi"), "{llvm}");
+    }
+
+    #[test]
+    fn constant_function_param_replaces_uses_without_mutating_abi_param() {
+        let mut program = Program::new();
+        let callee = program.new_function(Type::get_i32(), "callee".into(), vec![Type::get_i32()]);
+        let (param, ret) = {
+            let data = program.func_data_mut(callee);
+            let entry = data.add_entry_block();
+            let param = data.params()[0];
+            let ret = data.new_local_inst().ret(Some(param));
+            data.layout_mut().insert_inst(entry, ret);
+            (param, ret)
+        };
+
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        {
+            let data = program.func_data_mut(main);
+            let entry = data.add_entry_block();
+            let seven = data.new_local_inst().integer(7);
+            let call = data
+                .new_local_inst()
+                .call_with_type(callee, vec![seven], Type::get_i32());
+            let ret = data.new_local_inst().ret(Some(call));
+            data.layout_mut().insert_inst(entry, call);
+            data.layout_mut().insert_inst(entry, ret);
+        }
+
+        assert!(IPSCCP.run(&mut program));
+
+        let data = program.func_data(callee);
+        assert!(matches!(
+            data.inst_data(param).kind(),
+            InstKind::BlockArgRef(..)
+        ));
+        assert!(matches!(
+            data.inst_data(data.params()[0]).kind(),
+            InstKind::BlockArgRef(..)
+        ));
+        let InstKind::Return(ret_data) = data.inst_data(ret).kind() else {
+            panic!("expected return instruction")
+        };
+        let value = ret_data.value().expect("return should have a value");
+        assert!(matches!(data.inst_data(value).kind(), InstKind::Integer(int) if int.value() == 7));
+
+        let mut writer = LlvmWriter::new(&program);
+        writer.write().unwrap();
+        let llvm = writer.finish();
+        assert!(llvm.contains("define i32 @callee(i32 %"), "{llvm}");
+        assert!(!llvm.contains("define i32 @callee(i32 7)"), "{llvm}");
     }
 }

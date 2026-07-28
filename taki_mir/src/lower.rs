@@ -206,6 +206,17 @@ pub trait LowerBackend {
     fn runtime_assembly(_program: &HirProgram) -> Option<String> {
         None
     }
+
+    /// Build the MIR pass pipeline for this backend.
+    ///
+    /// Pre-RA passes run after `LowerContext::lower` produces the VCode and
+    /// before register allocation. Post-RA passes run after
+    /// `write_back_allocs` and before frame-layout / emission. The default
+    /// returns an empty pipeline; backends override this to register
+    /// peephole, scheduling, and other machine-code passes.
+    fn mir_pipeline() -> crate::passes::MIRPassPipeline<Self::MInst> {
+        crate::passes::MIRPassPipeline::new()
+    }
 }
 
 /// impl block for all backend specified operation

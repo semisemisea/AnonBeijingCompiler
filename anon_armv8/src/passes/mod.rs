@@ -1,5 +1,6 @@
 //! Target-specific MIR passes for the AArch64 backend.
 
+pub mod list_scheduler;
 pub mod peephole_combine;
 
 use taki_mir::passes::{MIRPass, MIRPassPipeline};
@@ -13,5 +14,6 @@ use crate::instructions::MInst;
 pub fn build_pipeline() -> MIRPassPipeline<MInst> {
     let mut pipeline = MIRPassPipeline::new();
     pipeline.add_pre_ra(Box::new(peephole_combine::PeepholeCombine));
+    pipeline.add_post_ra(Box::new(list_scheduler::ListScheduler));
     pipeline
 }

@@ -190,70 +190,57 @@ LegalizeFinal 可能改变指令数量（1→N 展开），这会使 regalloc Ou
 
 ## 6. Phase 4 — Post-RA ListScheduler Pass（核心，~4-5 天）
 
-**新文件：** `anon_armv8/src/passes/list_scheduler.rs`，以及 `anon_armv8/src/sched/{mod.rs, dag.rs, aarch53.rs, model.rs}`。
+**状态：✅ 已完成 (M8+M9，v1 保守模型)**
 
-### 6.1 工作形式
+**新文件：**
+- `anon_armv8/src/sched/mod.rs` — 模块根，类型导出
+- `anon_armv8/src/sched/aarch53.rs` — Cortex-A53 延迟/吞吐量表
+- `anon_armv8/src/sched/dag.rs` — 每 block 依赖 DAG 构建 + 关键路径
+- `anon_armv8/src/passes/list_scheduler.rs` — post-RA list scheduler pass
 
-在 `write_back_allocs`（`lib.rs:239`）之后、`LegalizeFinal` 之后运行。此时：
-- 所有 `Reg` 字段都是物理寄存器或 spill slot。
-- `output.edits`（move 序列）**尚未**物化到 VCode。
+**架构：**
 
-**决定：先物化 edits，再调度。** 新增 `MaterializeEdits: MIRPass<I>` pass，把 `output.edits` 中的 `Edit::Move` 条目物化成真实的 `MInst::gen_move` 指令（或目标特定的 spill/reload 形式）插入 VCode。这之后 `AsmWriter` 的 edit 交错逻辑会变得很简单（最终可删）。同时也让 scheduler **可以隐藏 spill/reload 的延迟**——这在 Cortex-A53 上是个实在的收益。
+1. **依赖提取**（`sched/dag.rs::inst_deps`）：
+   - 直接检查 MInst 字段提取物理寄存器 def/use（post-RA 下 `get_operands` 跳过物理寄存器，不可用）
+   - 每个 variant 映射到 `SchedClass`（Alu/Mul/Div/Load/Store/Branch/Barrier/Nop/Other）
+   - 内存操作标记 `MemKind::Load/Store`
 
-（如果不物化，scheduler 必须调度 `InstOrEdit` 流——既丑陋又错失 spill 延迟隐藏。）
+2. **DAG 构建**（`DepGraph::build`）：
+   - RAW 边权重 = producer 延迟
+   - WAW / WAR 边权重 = 0
+   - 内存依赖保守：load-after-store 有序，store-after-load/store 有序
+   - Call/Return/TailCall 是 barrier，序列化所有前后指令
 
-### 6.2 每个块的算法
+3. **关键路径**：`crit[i] = latency[i] + max(crit[successors])`
 
-对每个非 entry-prologue/epilogue 的 basic block：
+4. **List scheduling**（`list_scheduler::schedule`）：
+   - 按 critical path 降序排就绪节点
+   - 节点在 `issue[producer] + latency[producer] <= cycle` 时变为 data-ready
+   - 兜底：超过 `20 * n` cycle 未发射则按原序发出剩余节点
 
-1. **构建依赖 DAG。** 节点 = 指令索引。维护一个 last-writer map（按物理寄存器）+ last-memory-writer map（按 class）。
+5. **安全保证**：
+   - terminator 固定在 block 末尾（`find_terminator_offset`）
+   - ≤ 2 条指令的 block 跳过
+   - 发射后重建 `inst_is_branch`/`inst_is_ret`
+   - verify 支持 post-finalize 状态（跳过 `verify_strict_ssa`，因 operand 表已清空）
 
-   依赖种类：
-   - **RAW**（真依赖）：边的权重 = producer 延迟。
-   - **WAW, WAR**：寄存器分配后很少见（allocator 已经基本消除），但仍以 0 延迟边加入以防万一。
-   - **内存**：v1 保守处理。**v1：** 任何 `Load`/`Store` 与之前的 `Store`/`Load`/`Store` 保持顺序。**v2（stretch）：** 用 AMode 区分 stack 相对（`AMode::FrameSlot`、`SpOffset`）和 global（`Label`、`OutgoingArg`）；不同 slot 的 stack 访问可以自由重排。
-   - **side-effect 屏障**：`Call`/`TailCall`/`Ret`/trap 类指令与之前的所有内存操作保持顺序，并作为其后的硬屏障。
+**Cortex-A53 延迟表：**
+| Class | Latency |
+|-------|---------|
+| Alu | 1 |
+| Mul (mul/madd/msub/smull) | 3 |
+| Div (sdiv) | 11 |
+| Load (ldr/ldp) | **2** |
+| Store (str/stp) | 1 |
+| Branch | 1 |
+| Barrier (call/ret) | 1 (但序列化) |
 
-2. **关键路径优先级。** 自底向上计算 `crit[n] = latency[n] + max(crit[successors])`。`crit` 最高的就绪指令优先调度（经典 Graham's list scheduling）。
+**主要优化目标：** load-use 延迟隐藏。Cortex-A53 的 L1 load 延迟为 2 周期，紧跟的依赖 ALU 指令会停顿 1 周期。Scheduler 通过在 load 和 consumer 之间插入独立指令来隐藏这个延迟。
 
-3. **资源模型（Cortex-A53）。** 两条流水线槽，每条都有"类偏好"表。每个 `MInst` 变体映射到 `(slot, latency, throughput)`（在 `aarch53.rs`）。每个 cycle 跟踪每个资源消耗量。两条指令能双发仅当：无依赖且路由到兼容槽。
-
-4. **调度循环。**
-   ```
-   cycle = 0; ready = {roots}; issued_at[n] = None
-   while scheduled.count() < block.len():
-       for each slot in [ALU0, ALU1, LSU, MAC, BR, FP]:
-           pick highest-crit instruction in ready whose producer-results are ready
-               (issued_at[p] + latency[p] <= cycle) and whose slot == this slot
-           if found: schedule it, issued_at[n] = cycle, remove from ready, add newly-ready successors
-       cycle += 1
-   ```
-   兜底：当 `cycle - last_progress > BUDGET`（如 64）时停止，剩余指令按原序发出（安全 fallback）。
-
-5. **发射。** 把已调度指令按 `issued_at`（然后再按 slot 优先级）写回 `VCodeContainer.insts[block_range]`。调用 `recompute_cfg()`（block 边没变，但 operand ranges 要同步）。
-
-6. **校验。** `verify("post-scheduler")` 重跑 SSA + operand-order 检查 + 新增 debug 检查 `verify_deps_respected`，确保没有真依赖边被跨过。
-
-### 6.3 `MInst` 需要新增的钩子
-
-加到 `MachInst` trait 上（`anon_armv8` 在 `instructions.rs` 实现）：
-
-```rust
-trait MachInst<I: VCodeInst> {
-    // ... 已有 ...
-    fn sched_class(&self) -> SchedClass;          // ALU0, ALU1, LSU_Load, LSU_Store, MAC, FP, Branch, Barrier
-    fn is_mem_access(&self) -> bool { ... }       // 已存在
-    fn mem_addr_key(&self) -> MemAddrKey;         // 用于 v2 别名分析: StackSlot(i) | Global | Unknown
-}
-```
-
-`SchedClass` + 延迟表位于 `sched/aarch53.rs`。
-
-### 6.4 Terminator 与 prologue/epilogue
-
-- prologue/epilogue **绝不调度**（按 block 索引跳过；AsmWriter 已通过 `gen_prologue`/`gen_epilogue` 注入它们）。
-- block 末尾的 terminator `MInst`（branch/return，`MachTerminator::*` 返回的）固定在 block 末尾，绝不移动。
-- block 中部的 `Call`/`TailCall` 是屏障；它们留在原位，周围的调度被夹紧。
+**v2（stretch）尚未实现：**
+- 基于栈槽/global 的内存别名分析（当前保守：所有内存有序）
+- 精确双发射建模（ALU0/ALU1 槽位配对）
+- LoadPair/StorePair 形成（M6）
 
 ---
 

@@ -448,6 +448,14 @@ impl<I: VCodeInst> VCodeContainer<I> {
         &mut self.insts[i]
     }
 
+    /// Update the per-instruction terminator flags after reordering or
+    /// rewriting instructions. Used by post-RA passes (e.g. list scheduler).
+    pub fn set_inst_terminator(&mut self, i: usize, term: MachTerminator) {
+        self.inst_is_branch[i] =
+            matches!(term, MachTerminator::Branch | MachTerminator::TailReturn);
+        self.inst_is_ret[i] = matches!(term, MachTerminator::Return);
+    }
+
     /// Returns the instruction slice for a block, indexed in lowered-order.
     pub fn block_insts(&self, block_index: usize) -> &[I] {
         let range = self.block_range.get(block_index);
@@ -664,7 +672,11 @@ impl<I: VCodeInst> VCodeContainer<I> {
             }
             log::debug!(target: "taki_mir::verify", "stage={stage} block={block_index} insts={insts:?} succs={succs:?} params={params:?}");
         }
-        self.verify_strict_ssa(stage)?;
+        // SSA verification requires operand tables, which are cleared after
+        // finalize_for_emission. Skip it in the post-finalize state.
+        if !operands_finalized {
+            self.verify_strict_ssa(stage)?;
+        }
         log::debug!(target: "taki_mir::verify", "stage={stage} passed: blocks={blocks}, insts={}, vregs={}, operands={}", self.insts.len(), self.vreg_types.len(), self.operands.len());
         Ok(())
     }

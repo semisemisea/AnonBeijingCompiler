@@ -20,10 +20,10 @@
 
 ---
 
-## 1. 目标微架构模型 — Xilinx XCZU2EG / Cortex-A53 MPCore
+## 1. 目标微架构模型 — Xilinx XCZU15EG / Cortex-A53 MPCore
 
 权威数据源：ARM Cortex-A53 Software Optimization Guide (DUI 0901)。
-对 XCZU2EG 的 2 个隔离测评核（Cortex-A53 MPCore）：
+对 XCZU15EG 的隔离测评核（Cortex-A53 MPCore）：
 
 | 资源 | 吞吐 | 延迟 | 备注 |
 |------|------|------|------|
@@ -36,7 +36,7 @@
 | 分支 | 1 / 周期（独立单元） | 1 | 与 ALU0/ALU1 正交 |
 | 双发限制 | 总计 2 条指令 / 周期；配对指令必须**无真依赖**，且路由到兼容的槽位 | | 驱动 scheduler 的优先级排序 |
 
-XCZU2EG 的 **L1D$ 32 KB 4-way、L1I$ 32 KB 2-way、L2$ 1 MB 16-way shared** 不直接驱动**指令调度**——但 L2 命中会增加约 9 周期的额外 load 延迟；我们额外暴露一个 `aarch53_l2` 模型用于过拟合实验。
+XCZU15EG 的 **L1D$ 32 KB 4-way、L1I$ 32 KB 2-way、L2$ 1 MB 16-way shared** 不直接驱动**指令调度**——但 L2 命中会增加约 9 周期的额外 load 延迟；我们额外暴露一个 `aarch53_l2` 模型用于过拟合实验。
 
 这些数字固化在 `anon_armv8/src/sched/aarch53.rs` 中，作为 `InstrProfile { class, latency, throughput, dual_issue_slot }` 的查表。
 
@@ -239,8 +239,16 @@ LegalizeFinal 可能改变指令数量（1→N 展开），这会使 regalloc Ou
 
 **v2（stretch）尚未实现：**
 - 基于栈槽/global 的内存别名分析（当前保守：所有内存有序）
-- 精确双发射建模（ALU0/ALU1 槽位配对）
+- 精确 ALU0/ALU1 槽位配对（基础双发宽度和 LSU/MAC 资源约束已实现）
 - LoadPair/StorePair 形成（M6）
+
+**M10 correctness 加固已完成：**
+- 显式建模 NZCV producer/consumer 依赖
+- 保留全部未决 register reader 和 load，修复 WAR / store-after-load 漏边
+- barrier 与整个前缀、后缀串行；控制流不再遗漏寄存器和 NZCV use
+- load destination 只作为 def；pair pre/post-index writeback base 同时作为 use/def
+- 每周期最多双发，且 LSU、MAC/Div、FP 类资源每周期各最多一条；非流水化 Div 按延迟占用 MAC/Div 资源
+- DAG 和 issue model 新增针对性单元测试
 
 ---
 
@@ -248,7 +256,7 @@ LegalizeFinal 可能改变指令数量（1→N 展开），这会使 regalloc Ou
 
 1. **更强的 VCode verifier**（`vcode.rs:310-600`）：新增 `verify_operand_order_stable`（在 mutate 前后采集 operands，断言相等）和 `verify_sched_deps`（重放 scheduler 的依赖检查）。
 2. **基于文件的测试**在 `tests/`：对每个 `.sy` 输入，同时发射 `--emit asm` 与 `--emit asm,sched`（加一个 `-O 2` 标志打开调度 pipeline）。diff 应该**只是重排**，永不改变语义。
-3. **差分测试**在真实 XCZU2EG（若有）或 QEMU 上：跑两遍程序（`-O1` vs `-O1 -O2-sched`），断言输出相同。
+3. **差分测试**在真实 XCZU15EG（若有）或 QEMU 上：跑两遍程序（`-O1` vs `-O1 -O2-sched`），断言输出相同。
 4. **单元测试**针对 ARM Cortex-A53 Software Optimization Guide 的示例模式：load-use hiding、MAC folding、LDP pairing。每个测试断言调度的指令顺序符合预期。
 5. **benchmark 套件**：矩阵乘法、深 load chain（经典的 load 调度赢家）、多项式求值。用 scheduler 的 `issued_at` 时间戳近似 cycles 数，记录改进幅度。
 

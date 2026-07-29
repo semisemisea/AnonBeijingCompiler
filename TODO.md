@@ -191,6 +191,14 @@ LegalizeFinal 可能改变指令数量（1→N 展开），这会使 regalloc Ou
 - MIR 层的 peephole 补充了 lowering 遗漏的情况（如 IR 优化后新出现的 Mul+Add 模式）
 - `vreg_alias` 在本项目中从未使用（`add_alias` 从未被调用），所以 `rebuild_operand_tables` 使用 identity resolver
 
+**M6 LoadPair/StorePair 形成已完成：**
+- 新增 post-RA `PairCombine`，注册在 `ListScheduler` 之前
+- 只形成同 block 内相邻、同类型、同 base、低地址到高地址连续的 fixed-offset load/store
+- 使用 `SImm7Scaled::new` 验证 pair immediate 范围与对齐
+- load 拒绝相同 destination 及 destination/base 重叠；不处理 register-indexed 地址或 writeback 形成
+- 保持 VCode 指令数量不变：首条替换为 pair，次条替换为 `Nop`
+- 单元测试覆盖正向形成、地址/类型差异、逆序、寄存器 hazard 和 immediate 越界
+
 ---
 
 ## 6. Phase 4 — Post-RA ListScheduler Pass（核心，~4-5 天）
@@ -245,7 +253,6 @@ LegalizeFinal 可能改变指令数量（1→N 展开），这会使 regalloc Ou
 **v2（stretch）尚未实现：**
 - 基于栈槽/global 的内存别名分析（当前保守：所有内存有序）
 - 精确 ALU0/ALU1 槽位配对（基础双发宽度和 LSU/MAC 资源约束已实现）
-- LoadPair/StorePair 形成（M6）
 
 **M10 correctness 加固已完成：**
 - 显式建模 NZCV producer/consumer 依赖

@@ -10,8 +10,9 @@ use std::collections::HashMap;
 use taki_mir::reg_alloc::reg::PReg;
 use taki_mir::register::Reg;
 
-use crate::instructions::MInst;
-use crate::regs::RegOrZr;
+use crate::instructions::{AMode, AluOp, MInst, PairAMode};
+use crate::labels::Label;
+use crate::regs::{FP, OperandSize, RegOrZr, int_preg, stack_preg};
 use crate::sched::aarch53::{InstrProfile, SchedClass, instr_profile};
 
 /// Memory access type for dependency tracking.
@@ -21,6 +22,28 @@ pub enum MemKind {
     Store,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemRoot {
+    StackSp,
+    StackFp,
+    Global(taki_mir::prelude::HirInst),
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemAccess {
+    pub kind: MemKind,
+    pub root: MemRoot,
+    pub offset: Option<i64>,
+    pub size: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Provenance {
+    root: MemRoot,
+    offset: i64,
+}
+
 /// Dependency metadata extracted from a single instruction.
 pub struct InstDeps {
     pub defs: Vec<PReg>,
@@ -28,7 +51,7 @@ pub struct InstDeps {
     pub flags_def: bool,
     pub flags_use: bool,
     pub class: SchedClass,
-    pub mem: Option<MemKind>,
+    pub mem: Option<MemAccess>,
     pub is_barrier: bool,
 }
 
@@ -56,7 +79,8 @@ impl DepGraph {
     /// Build the dependency DAG for a slice of instructions (one block).
     pub fn build(insts: &[MInst]) -> Self {
         let n = insts.len();
-        let deps: Vec<InstDeps> = insts.iter().map(inst_deps).collect();
+        let mut deps: Vec<InstDeps> = insts.iter().map(inst_deps).collect();
+        annotate_memory_accesses(insts, &mut deps);
 
         let mut succs: Vec<Vec<(usize, u32)>> = vec![Vec::new(); n];
         let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -70,10 +94,10 @@ impl DepGraph {
         let mut last_flags_def: Option<usize> = None;
         let mut pending_flags_uses: Vec<usize> = Vec::new();
 
-        // Keep every load since the last store: a following store may alias
-        // any of them, not only the most recent load.
-        let mut pending_loads: Vec<usize> = Vec::new();
-        let mut last_store: Option<usize> = None;
+        // Compare against all memory operations since the last barrier. Once
+        // disjoint operations can skip edges, the latest store alone is not
+        // enough: an older store may still alias a new access.
+        let mut prior_memory: Vec<usize> = Vec::new();
         // A barrier (call/return) forces all subsequent instructions to depend
         // on it. Track the last barrier; everything after it must wait.
         let mut last_barrier: Option<usize> = None;
@@ -129,32 +153,22 @@ impl DepGraph {
                 }
             }
 
-            // Memory dependencies (conservative: no alias analysis).
-            match d.mem {
-                Some(MemKind::Load) => {
-                    // Load-after-store: must wait (store might write what we read).
-                    if let Some(s) = last_store {
-                        add_edge(&mut succs, &mut preds, s, i, deps[s].profile().latency);
+            if let Some(access) = d.mem {
+                for &prev in &prior_memory {
+                    let prev_access = deps[prev].mem.expect("memory history contains access");
+                    if (access.kind == MemKind::Store || prev_access.kind == MemKind::Store)
+                        && may_alias(prev_access, access)
+                    {
+                        let latency =
+                            if prev_access.kind == MemKind::Store && access.kind == MemKind::Load {
+                                deps[prev].profile().latency
+                            } else {
+                                0
+                            };
+                        add_edge(&mut succs, &mut preds, prev, i, latency);
                     }
-                    // Load-after-load is allowed (no ordering constraint on A53
-                    // for loads from different addresses, but we keep it
-                    // conservative only when a barrier is between them, which
-                    // is already handled by the barrier logic above).
-                    pending_loads.push(i);
                 }
-                Some(MemKind::Store) => {
-                    // Store-after-load: keep stores in order with loads (may alias).
-                    for &l in &pending_loads {
-                        add_edge(&mut succs, &mut preds, l, i, 0);
-                    }
-                    // Store-after-store: preserve write ordering.
-                    if let Some(s) = last_store {
-                        add_edge(&mut succs, &mut preds, s, i, 0);
-                    }
-                    last_store = Some(i);
-                    pending_loads.clear();
-                }
-                None => {}
+                prior_memory.push(i);
             }
 
             // Record defs and uses.
@@ -186,9 +200,7 @@ impl DepGraph {
                     );
                 }
                 last_barrier = Some(i);
-                // A barrier consumes all pending loads/stores.
-                pending_loads.clear();
-                last_store = None;
+                prior_memory.clear();
             }
         }
 
@@ -231,12 +243,212 @@ fn add_edge(
     preds[to].push(from);
 }
 
+fn unknown_access(kind: MemKind, size: u8) -> MemAccess {
+    MemAccess {
+        kind,
+        root: MemRoot::Unknown,
+        offset: None,
+        size,
+    }
+}
+
+fn annotate_memory_accesses(insts: &[MInst], deps: &mut [InstDeps]) {
+    let mut provenance = base_provenance();
+
+    for (inst, deps) in insts.iter().zip(deps) {
+        deps.mem = memory_access(inst, &provenance);
+
+        let propagated = propagated_provenance(inst, &provenance);
+        for def in &deps.defs {
+            provenance.remove(def);
+        }
+        if deps.is_barrier {
+            provenance = base_provenance();
+        }
+        if let Some((dst, value)) = propagated {
+            provenance.insert(dst, value);
+        }
+    }
+}
+
+fn base_provenance() -> HashMap<PReg, Provenance> {
+    HashMap::from([
+        (
+            stack_preg(),
+            Provenance {
+                root: MemRoot::StackSp,
+                offset: 0,
+            },
+        ),
+        (
+            int_preg(FP),
+            Provenance {
+                root: MemRoot::StackFp,
+                offset: 0,
+            },
+        ),
+    ])
+}
+
+fn propagated_provenance(
+    inst: &MInst,
+    provenance: &HashMap<PReg, Provenance>,
+) -> Option<(PReg, Provenance)> {
+    match inst {
+        MInst::Mov { size, dst, src } | MInst::MovPhys { size, dst, src }
+            if *size == OperandSize::Size64 =>
+        {
+            Some((preg_one(dst.reg)?, reg_provenance(*src, provenance)?))
+        }
+        MInst::AluRRImm12 {
+            op,
+            size,
+            dst,
+            src,
+            imm,
+        } if *size == OperandSize::Size64 && matches!(op, AluOp::Add | AluOp::Sub) => {
+            let mut value = reg_provenance(*src, provenance)?;
+            let immediate = i64::from(imm.value()) << if imm.shift12() { 12 } else { 0 };
+            value.offset = match op {
+                AluOp::Add => value.offset.checked_add(immediate)?,
+                AluOp::Sub => value.offset.checked_sub(immediate)?,
+                _ => unreachable!(),
+            };
+            Some((preg_one(dst.reg)?, value))
+        }
+        MInst::LoadAddr {
+            dst,
+            label: Label::GlobalValue(global),
+        } => Some((
+            preg_one(dst.reg)?,
+            Provenance {
+                root: MemRoot::Global(*global),
+                offset: 0,
+            },
+        )),
+        MInst::StackAddr { dst, addr } => {
+            let (root, offset) = pseudo_stack_address(addr)?;
+            Some((preg_one(dst.reg)?, Provenance { root, offset }))
+        }
+        _ => None,
+    }
+}
+
+fn memory_access(inst: &MInst, provenance: &HashMap<PReg, Provenance>) -> Option<MemAccess> {
+    let (kind, ty, address, pair) = match inst {
+        MInst::Load { ty, addr, .. } => (MemKind::Load, *ty, Some(addr), None),
+        MInst::Store { ty, addr, .. } => (MemKind::Store, *ty, Some(addr), None),
+        MInst::LoadPair { ty, addr, .. } => (MemKind::Load, *ty, None, Some(addr)),
+        MInst::StorePair { ty, addr, .. } => (MemKind::Store, *ty, None, Some(addr)),
+        _ => return None,
+    };
+
+    let size = ty.byte_size() * if pair.is_some() { 2 } else { 1 };
+    let location = address
+        .and_then(|addr| amode_location(addr, provenance))
+        .or_else(|| pair.and_then(|addr| pair_amode_location(addr, provenance)));
+    Some(match location {
+        Some(value) => MemAccess {
+            kind,
+            root: value.root,
+            offset: Some(value.offset),
+            size,
+        },
+        None => unknown_access(kind, size),
+    })
+}
+
+fn amode_location(addr: &AMode, provenance: &HashMap<PReg, Provenance>) -> Option<Provenance> {
+    let (mut value, displacement) = match addr {
+        AMode::Reg { base } => (reg_provenance(*base, provenance)?, 0),
+        AMode::UnsignedOffset { base, offset } => (
+            reg_provenance(*base, provenance)?,
+            i64::try_from(offset.byte_offset()).ok()?,
+        ),
+        AMode::SignedOffset { base, offset } => (
+            reg_provenance(*base, provenance)?,
+            i64::from(offset.value()),
+        ),
+        AMode::FrameSlot(offset) | AMode::SpOffset(offset) | AMode::OutgoingArg(offset) => (
+            Provenance {
+                root: MemRoot::StackSp,
+                offset: 0,
+            },
+            *offset,
+        ),
+        AMode::IncomingArg(offset) => (
+            Provenance {
+                root: MemRoot::StackFp,
+                offset: 0,
+            },
+            *offset,
+        ),
+        AMode::RegOffset { .. }
+        | AMode::ScaledRegOffset { .. }
+        | AMode::ExtendedRegOffset { .. } => return None,
+    };
+    value.offset = value.offset.checked_add(displacement)?;
+    Some(value)
+}
+
+fn pair_amode_location(
+    addr: &PairAMode,
+    provenance: &HashMap<PReg, Provenance>,
+) -> Option<Provenance> {
+    let PairAMode::SignedOffset { base, offset } = addr else {
+        return None;
+    };
+    let mut value = reg_provenance(*base, provenance)?;
+    value.offset = value.offset.checked_add(offset.byte_offset())?;
+    Some(value)
+}
+
+fn pseudo_stack_address(addr: &AMode) -> Option<(MemRoot, i64)> {
+    match addr {
+        AMode::FrameSlot(offset) | AMode::SpOffset(offset) | AMode::OutgoingArg(offset) => {
+            Some((MemRoot::StackSp, *offset))
+        }
+        AMode::IncomingArg(offset) => Some((MemRoot::StackFp, *offset)),
+        _ => None,
+    }
+}
+
+fn preg_one(reg: Reg) -> Option<PReg> {
+    reg.to_physical_reg()
+}
+
+fn reg_provenance(reg: Reg, known: &HashMap<PReg, Provenance>) -> Option<Provenance> {
+    known.get(&preg_one(reg)?).copied()
+}
+
+fn may_alias(a: MemAccess, b: MemAccess) -> bool {
+    match (a.root, b.root) {
+        (MemRoot::Global(left), MemRoot::Global(right)) if left != right => false,
+        (MemRoot::Global(_), MemRoot::StackSp | MemRoot::StackFp)
+        | (MemRoot::StackSp | MemRoot::StackFp, MemRoot::Global(_)) => false,
+        (left, right) if left == right => {
+            let (Some(a_start), Some(b_start)) = (a.offset, b.offset) else {
+                return true;
+            };
+            let Some(a_end) = a_start.checked_add(i64::from(a.size)) else {
+                return true;
+            };
+            let Some(b_end) = b_start.checked_add(i64::from(b.size)) else {
+                return true;
+            };
+            a_start < b_end && b_start < a_end
+        }
+        // SP- and FP-relative ranges may address the same frame, but their
+        // relationship is unavailable after frame legalization.
+        _ => true,
+    }
+}
+
 // ─── Instruction field extraction ──────────────────────────────────────────
 
 /// Extract dependency information from an AArch64 MInst by inspecting its
 /// fields directly. Post-RA, all Reg fields hold physical registers.
 pub fn inst_deps(inst: &MInst) -> InstDeps {
-    use crate::instructions::AluOp;
     match inst {
         MInst::Nop => InstDeps {
             defs: vec![],
@@ -448,7 +660,7 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             flags_def: false,
             flags_use: false,
             class: SchedClass::Load,
-            mem: Some(MemKind::Load),
+            mem: Some(unknown_access(MemKind::Load, 0)),
             is_barrier: false,
         },
 
@@ -458,7 +670,7 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             flags_def: false,
             flags_use: false,
             class: SchedClass::Store,
-            mem: Some(MemKind::Store),
+            mem: Some(unknown_access(MemKind::Store, 0)),
             is_barrier: false,
         },
 
@@ -470,7 +682,7 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             flags_def: false,
             flags_use: false,
             class: SchedClass::Load,
-            mem: Some(MemKind::Load),
+            mem: Some(unknown_access(MemKind::Load, 0)),
             is_barrier: false,
         },
 
@@ -482,7 +694,7 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             flags_def: false,
             flags_use: false,
             class: SchedClass::Store,
-            mem: Some(MemKind::Store),
+            mem: Some(unknown_access(MemKind::Store, 0)),
             is_barrier: false,
         },
 
@@ -603,6 +815,18 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             is_barrier: false,
         },
 
+        // LoadAddr emits an adjacent ADRP+ADD pair. Keep it atomic while
+        // exposing its destination definition and global provenance.
+        MInst::LoadAddr { dst, .. } => InstDeps {
+            defs: preg(dst.reg),
+            uses: vec![],
+            flags_def: false,
+            flags_use: false,
+            class: SchedClass::Other,
+            mem: None,
+            is_barrier: true,
+        },
+
         MInst::RetVal { pair } => InstDeps {
             defs: vec![],
             uses: preg(pair.vreg),
@@ -696,7 +920,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        instructions::{Cond, Imm12},
+        instructions::{Cond, Imm12, MemoryType},
         regs::{OperandSize, RegOrZr, int_reg},
     };
 
@@ -757,6 +981,225 @@ mod tests {
 
         assert!(has_edge(&graph, 0, 2));
         assert!(has_edge(&graph, 1, 2));
+    }
+
+    #[test]
+    fn separates_non_overlapping_stack_ranges() {
+        let insts = vec![
+            MInst::Store {
+                ty: MemoryType::I64,
+                src: int_reg(1),
+                addr: AMode::SignedOffset {
+                    base: crate::regs::stack_reg(),
+                    offset: crate::instructions::SImm9::new(0).unwrap(),
+                },
+            },
+            MInst::Load {
+                ty: MemoryType::I64,
+                dst: writable(2),
+                addr: AMode::SignedOffset {
+                    base: crate::regs::stack_reg(),
+                    offset: crate::instructions::SImm9::new(8).unwrap(),
+                },
+            },
+        ];
+        let graph = DepGraph::build(&insts);
+
+        assert!(!has_edge(&graph, 0, 1));
+    }
+
+    #[test]
+    fn preserves_overlapping_stack_ranges() {
+        let insts = vec![
+            MInst::Store {
+                ty: MemoryType::I64,
+                src: int_reg(1),
+                addr: AMode::SignedOffset {
+                    base: crate::regs::stack_reg(),
+                    offset: crate::instructions::SImm9::new(0).unwrap(),
+                },
+            },
+            MInst::Load {
+                ty: MemoryType::I32,
+                dst: writable(2),
+                addr: AMode::SignedOffset {
+                    base: crate::regs::stack_reg(),
+                    offset: crate::instructions::SImm9::new(4).unwrap(),
+                },
+            },
+        ];
+        let graph = DepGraph::build(&insts);
+
+        assert!(has_edge(&graph, 0, 1));
+    }
+
+    #[test]
+    fn a_disjoint_store_does_not_hide_an_older_alias() {
+        let stack_addr = |offset| AMode::SignedOffset {
+            base: crate::regs::stack_reg(),
+            offset: crate::instructions::SImm9::new(offset).unwrap(),
+        };
+        let insts = vec![
+            MInst::Store {
+                ty: MemoryType::I64,
+                src: int_reg(1),
+                addr: stack_addr(0),
+            },
+            MInst::Store {
+                ty: MemoryType::I64,
+                src: int_reg(2),
+                addr: stack_addr(16),
+            },
+            MInst::Load {
+                ty: MemoryType::I64,
+                dst: writable(3),
+                addr: stack_addr(0),
+            },
+        ];
+        let graph = DepGraph::build(&insts);
+
+        assert!(has_edge(&graph, 0, 2));
+        assert!(!has_edge(&graph, 1, 2));
+    }
+
+    #[test]
+    fn tracks_stack_addresses_through_moves_and_adds() {
+        let insts = vec![
+            MInst::MovPhys {
+                size: OperandSize::Size64,
+                dst: writable(4),
+                src: crate::regs::stack_reg(),
+            },
+            MInst::AluRRImm12 {
+                op: AluOp::Add,
+                size: OperandSize::Size64,
+                dst: writable(5),
+                src: int_reg(4),
+                imm: Imm12::new(16, false).unwrap(),
+            },
+            MInst::Store {
+                ty: MemoryType::I64,
+                src: int_reg(1),
+                addr: AMode::Reg { base: int_reg(5) },
+            },
+            MInst::Load {
+                ty: MemoryType::I64,
+                dst: writable(2),
+                addr: AMode::Reg {
+                    base: crate::regs::stack_reg(),
+                },
+            },
+        ];
+        let graph = DepGraph::build(&insts);
+
+        assert!(!has_edge(&graph, 2, 3));
+    }
+
+    #[test]
+    fn keeps_unknown_and_sp_vs_fp_accesses_ordered() {
+        let insts = vec![
+            MInst::Store {
+                ty: MemoryType::I64,
+                src: int_reg(1),
+                addr: AMode::Reg { base: int_reg(10) },
+            },
+            MInst::Load {
+                ty: MemoryType::I64,
+                dst: writable(2),
+                addr: AMode::Reg {
+                    base: crate::regs::stack_reg(),
+                },
+            },
+            MInst::Store {
+                ty: MemoryType::I64,
+                src: int_reg(3),
+                addr: AMode::Reg {
+                    base: crate::regs::int_reg(crate::regs::FP),
+                },
+            },
+        ];
+        let graph = DepGraph::build(&insts);
+
+        assert!(has_edge(&graph, 0, 1));
+        assert!(has_edge(&graph, 1, 2));
+    }
+
+    #[test]
+    fn pair_ranges_and_writeback_remain_safe() {
+        let insts = vec![
+            MInst::StorePair {
+                ty: MemoryType::I64,
+                src1: int_reg(1),
+                src2: int_reg(2),
+                addr: PairAMode::SignedOffset {
+                    base: crate::regs::stack_reg(),
+                    offset: crate::instructions::SImm7Scaled::new(0, 8).unwrap(),
+                },
+            },
+            MInst::Load {
+                ty: MemoryType::I64,
+                dst: writable(3),
+                addr: AMode::SignedOffset {
+                    base: crate::regs::stack_reg(),
+                    offset: crate::instructions::SImm9::new(8).unwrap(),
+                },
+            },
+            MInst::Load {
+                ty: MemoryType::I64,
+                dst: writable(4),
+                addr: AMode::SignedOffset {
+                    base: crate::regs::stack_reg(),
+                    offset: crate::instructions::SImm9::new(16).unwrap(),
+                },
+            },
+            MInst::StorePair {
+                ty: MemoryType::I64,
+                src1: int_reg(5),
+                src2: int_reg(6),
+                addr: PairAMode::PostIndex {
+                    base: crate::regs::stack_reg(),
+                    offset: crate::instructions::SImm7Scaled::new(16, 8).unwrap(),
+                },
+            },
+        ];
+        let graph = DepGraph::build(&insts);
+
+        assert!(has_edge(&graph, 0, 1));
+        assert!(!has_edge(&graph, 0, 2));
+        assert!(has_edge(&graph, 1, 3));
+        assert!(has_edge(&graph, 2, 3));
+    }
+
+    #[test]
+    fn register_redefinition_kills_address_provenance() {
+        let insts = vec![
+            MInst::MovPhys {
+                size: OperandSize::Size64,
+                dst: writable(4),
+                src: crate::regs::stack_reg(),
+            },
+            MInst::LoadImm {
+                size: OperandSize::Size64,
+                dst: writable(4),
+                value: 0,
+            },
+            MInst::Store {
+                ty: MemoryType::I64,
+                src: int_reg(1),
+                addr: AMode::Reg { base: int_reg(4) },
+            },
+            MInst::Load {
+                ty: MemoryType::I64,
+                dst: writable(2),
+                addr: AMode::SignedOffset {
+                    base: crate::regs::stack_reg(),
+                    offset: crate::instructions::SImm9::new(32).unwrap(),
+                },
+            },
+        ];
+        let graph = DepGraph::build(&insts);
+
+        assert!(has_edge(&graph, 2, 3));
     }
 
     #[test]

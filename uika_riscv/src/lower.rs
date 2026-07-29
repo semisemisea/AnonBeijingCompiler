@@ -11,7 +11,7 @@ use crate::{
         ShiftImm, ShiftImm64, StoreOP,
     },
     labels::Label,
-    regs::{ARG_REG, FARG_REG, a0, a1, a2, fa0, fp_reg, preg_name, stack_reg, zero_reg},
+    regs::{a0, a1, a2, fa0, fp_reg, preg_name, stack_reg, zero_reg},
 };
 
 use taki_mir::{
@@ -908,52 +908,29 @@ fn lower_call(
     inst: HirInst,
     call: &Call,
 ) -> LoweredOutput {
-    let mut outgoing_arg_size = 0usize;
     let mut call_arg_pairs = smallvec![];
-    let mut int_arg_idx = 0;
-    let mut float_arg_idx = 0;
-    for &arg in call.args() {
+    let types: Vec<_> = call
+        .args()
+        .iter()
+        .map(|&arg| arena.inst_data(arg).ty().clone())
+        .collect();
+    let (locations, outgoing_arg_size) = Riscv64ABI::compute_call_arg_loc(&types);
+    for (&arg, location) in call.args().iter().zip(locations) {
         let arg_reg = ctx.put_value_in_reg(arg);
-        let arg_ty = arena.inst_data(arg).ty();
-        let m_type: LoweredType = arg_ty.into();
-        match arg_ty.kind() {
-            HirTypeKind::Int32 | HirTypeKind::Pointer(_) => {
-                if int_arg_idx < 8 {
-                    call_arg_pairs.push(CallArgPair {
-                        vreg: arg_reg,
-                        preg: ARG_REG[int_arg_idx],
-                    });
-                    int_arg_idx += 1;
-                } else {
-                    let op: StoreOP = m_type.into();
-                    let addr = normalize_amode(AMode::OutgoingArg(outgoing_arg_size as i64), ctx);
-                    ctx.emit(MInst::StoreWord {
-                        rs: arg_reg,
-                        op,
-                        addr,
-                    });
-                    outgoing_arg_size += arg_ty.size();
-                }
+        match location {
+            ArgSlot::Reg { reg, .. } => call_arg_pairs.push(CallArgPair {
+                vreg: arg_reg,
+                preg: reg.into(),
+            }),
+            ArgSlot::Stack { offset, ty } => {
+                let op: StoreOP = LoweredType::from(&ty).into();
+                let addr = normalize_amode(AMode::OutgoingArg(offset), ctx);
+                ctx.emit(MInst::StoreWord {
+                    rs: arg_reg,
+                    op,
+                    addr,
+                });
             }
-            HirTypeKind::Float32 => {
-                if float_arg_idx < 8 {
-                    call_arg_pairs.push(CallArgPair {
-                        vreg: arg_reg,
-                        preg: FARG_REG[float_arg_idx],
-                    });
-                    float_arg_idx += 1;
-                } else {
-                    let op: StoreOP = m_type.into();
-                    let addr = normalize_amode(AMode::OutgoingArg(outgoing_arg_size as i64), ctx);
-                    ctx.emit(MInst::StoreWord {
-                        rs: arg_reg,
-                        op,
-                        addr,
-                    });
-                    outgoing_arg_size += arg_ty.size();
-                }
-            }
-            _ => unreachable!("unexpected call argument type: {:?}", arg_ty.kind()),
         }
     }
     let result_ty = arena.inst_data(inst).ty();
@@ -977,7 +954,7 @@ fn lower_call(
         label: Label::Function(call.callee()),
     });
     ctx.set_has_calls();
-    ctx.set_outgoing_arg_size(outgoing_arg_size);
+    ctx.set_outgoing_arg_size(outgoing_arg_size as usize);
     result.map_or(LoweredOutput::None, LoweredOutput::Value)
 }
 

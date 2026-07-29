@@ -27,6 +27,68 @@ pub enum ArgSlot {
     Stack { offset: i64, ty: HirType },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgRegBank {
+    Int,
+    Float,
+}
+
+/// Shared register-bank and stack-offset planning for scalar ABI arguments.
+/// Type classification and overflow-slot sizing remain target policies.
+pub struct ArgLayoutPlanner<'a> {
+    int_regs: &'a [Reg],
+    float_regs: &'a [Reg],
+}
+
+impl<'a> ArgLayoutPlanner<'a> {
+    pub const fn new(int_regs: &'a [Reg], float_regs: &'a [Reg]) -> Self {
+        Self {
+            int_regs,
+            float_regs,
+        }
+    }
+
+    pub fn compute(
+        &self,
+        types: &[HirType],
+        classify: impl Fn(&HirType) -> ArgRegBank,
+        stack_slot_size: impl Fn(&HirType) -> u32,
+    ) -> (Vec<ArgSlot>, u32) {
+        let mut slots = Vec::with_capacity(types.len());
+        let (mut int_index, mut float_index, mut stack_offset) = (0usize, 0usize, 0u32);
+
+        for ty in types {
+            let (regs, index) = match classify(ty) {
+                ArgRegBank::Int => (self.int_regs, &mut int_index),
+                ArgRegBank::Float => (self.float_regs, &mut float_index),
+            };
+            let reg = regs.get(*index).copied();
+            *index = index
+                .checked_add(1)
+                .expect("argument register index overflow");
+
+            if let Some(reg) = reg {
+                slots.push(ArgSlot::Reg {
+                    reg: reg
+                        .to_physical_reg()
+                        .expect("ABI argument register must be physical"),
+                    ty: ty.clone(),
+                });
+            } else {
+                slots.push(ArgSlot::Stack {
+                    offset: i64::from(stack_offset),
+                    ty: ty.clone(),
+                });
+                stack_offset = stack_offset
+                    .checked_add(stack_slot_size(ty))
+                    .expect("stack argument area overflow");
+            }
+        }
+
+        (slots, stack_offset)
+    }
+}
+
 impl StackAMode {
     fn offset_by(&self, offset: u32) -> Self {
         match self {
@@ -122,7 +184,15 @@ pub trait ABIMachineSpec {
 
     fn gen_move(src: Reg, dst: Reg, ty: LoweredType) -> Self::I;
 
-    fn compute_arg_loc(arena: ArenaContext<'_>) -> (Vec<ArgSlot>, u32);
+    fn compute_arg_loc(arena: ArenaContext<'_>) -> (Vec<ArgSlot>, u32) {
+        let types: Vec<_> = arena
+            .f()
+            .params()
+            .iter()
+            .map(|&param| arena.inst_data(param).ty().clone())
+            .collect();
+        Self::compute_call_arg_loc(&types)
+    }
 
     /// Assign locations for a call signature using the same convention as
     /// incoming function parameters. The returned size includes ABI-required
@@ -198,6 +268,58 @@ impl FrameLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reg_alloc::reg::{PReg, RegClass};
+
+    fn reg(index: usize, class: RegClass) -> Reg {
+        Reg::from_physical_reg(PReg::new(index, class))
+    }
+
+    #[test]
+    fn argument_layout_uses_independent_register_banks() {
+        let int_regs = [reg(0, RegClass::Int), reg(1, RegClass::Int)];
+        let float_regs = [reg(0, RegClass::Float)];
+        let types = vec![
+            HirType::get_i32(),
+            HirType::get_f32(),
+            HirType::get_i32(),
+            HirType::get_f32(),
+            HirType::get_i32(),
+        ];
+        let (slots, stack_size) = ArgLayoutPlanner::new(&int_regs, &float_regs).compute(
+            &types,
+            |ty| {
+                if ty.is_f32() {
+                    ArgRegBank::Float
+                } else {
+                    ArgRegBank::Int
+                }
+            },
+            |_| 8,
+        );
+
+        assert!(matches!(slots[0], ArgSlot::Reg { .. }));
+        assert!(matches!(slots[1], ArgSlot::Reg { .. }));
+        assert!(matches!(slots[2], ArgSlot::Reg { .. }));
+        assert!(matches!(slots[3], ArgSlot::Stack { offset: 0, .. }));
+        assert!(matches!(slots[4], ArgSlot::Stack { offset: 8, .. }));
+        assert_eq!(stack_size, 16);
+    }
+
+    #[test]
+    fn argument_layout_preserves_target_stack_slot_sizes() {
+        let types = vec![HirType::get_i32(), HirType::get_f32()];
+        let planner = ArgLayoutPlanner::new(&[], &[]);
+        let (_, fixed_size) = planner.compute(&types, |_| ArgRegBank::Int, |_| 8);
+        let (sized_slots, sized_size) = planner.compute(
+            &types,
+            |_| ArgRegBank::Int,
+            |ty| u32::try_from(ty.size()).unwrap(),
+        );
+
+        assert_eq!(fixed_size, 16);
+        assert!(matches!(sized_slots[1], ArgSlot::Stack { offset: 4, .. }));
+        assert_eq!(sized_size, 8);
+    }
 
     #[test]
     fn spill_slots_follow_outgoing_and_local_stack_areas() {

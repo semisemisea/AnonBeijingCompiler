@@ -140,11 +140,16 @@ LegalizeFinal 可能改变指令数量（1→N 展开），这会使 regalloc Ou
 
 ### 4b. 去重 AArch64 / RISC-V 之间重复的 ABI 代码
 
-把两后端中**结构完全相同**的逻辑抽到 `taki_mir`（或新的 `taki_mir::abi_helpers` 子模块）：
-- `compute_arg_locs` 的循环（当前每个 backend 各重复两遍：参数一遍、调用参数一遍）→ 一个泛型 `ArgLayoutPlanner { int_regs, fp_regs, stack_align }`，由 backend 提供寄存器列表。
-- prologue/epilogue 骨架（prologue = 保存 frame + clobber-save；epilogue = 反向）→ `CalleeABI::gen_prologue` 中的 `gen_prologue_epilogue_skeleton()` 辅助，调用每个 backend 在 `ABIMachineSpec` 上的钩子。
-- `call_clobbers`、`use_store_src` 等辅助 → 移到一个共享 `inst_common` 模块（镜像 cranelift 的 `machinst/inst_common.rs`）。
-- 除法魔法数：**已经**共享（`taki_mir/src/div_magic.rs`）——很好。
+**状态：✅ 已完成 (M4)**
+
+已实现：
+- `taki_mir::abi::ArgLayoutPlanner` 共享独立 int/float register bank 与 stack offset 规划循环
+- 类型分类和 overflow slot 宽度保留为目标 policy：AArch64 固定 8 字节，RISC-V 保持 scalar 实际宽度
+- `ABIMachineSpec::compute_arg_loc` 默认从函数参数类型转发到 `compute_call_arg_loc`
+- AArch64/RISC-V 普通 call lowering 直接消费同一 planner 结果，frame sizing 与实际 outgoing store offset 不再重复计算
+- 共享 planner、AAPCS64 和 RISC-V 目标行为均有单元测试
+
+未抽取 prologue/epilogue、`call_clobbers`、`use_store_src`：前者的目标指令和 frame 语义差异明显，后两者仅数行且 contract 不完全一致，继续抽象会增加接口而没有实质收益。除法魔法数已由 `taki_mir/src/div_magic.rs` 共享。
 
 ### 4c. 修复 `LowerContext` 的封装泄漏
 

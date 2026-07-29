@@ -4,7 +4,7 @@
 //! post-RA list scheduler (`passes::list_scheduler`) uses to reorder
 //! instructions within basic blocks for the in-order Cortex-A53 pipeline.
 //!
-//! ## Target: Xilinx XCZU2EG / Cortex-A53 MPCore
+//! ## Target: Xilinx XCZU15EG / Cortex-A53 MPCore
 //!
 //! The Cortex-A53 is a dual-issue, in-order core with an 8-stage pipeline.
 //! Key scheduling concerns:
@@ -25,5 +25,5 @@
 pub mod aarch53;
 pub mod dag;
 
-pub use aarch53::{SchedClass, instr_profile, InstrProfile};
+pub use aarch53::{InstrProfile, SchedClass, instr_profile};
 pub use dag::{DepGraph, InstDeps, MemKind, inst_deps};

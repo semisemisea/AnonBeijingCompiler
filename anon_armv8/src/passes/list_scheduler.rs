@@ -14,10 +14,11 @@ use std::collections::HashSet;
 use taki_mir::{
     passes::MIRPass,
     prelude::ArenaContext,
-    vcode::{MachInst, MachTerminator, VCodeContainer},
+    vcode::{MachInst, VCodeContainer},
 };
 
 use crate::instructions::MInst;
+use crate::sched::aarch53::{SchedClass, instr_profile};
 use crate::sched::dag::DepGraph;
 
 pub struct ListScheduler;
@@ -38,25 +39,19 @@ impl MIRPass<MInst> for ListScheduler {
 
             let insts: Vec<MInst> = vcode.block_insts(block_idx).to_vec();
 
-            // Never schedule the terminator — it must remain last.
-            let term_offset = find_terminator_offset(&insts);
-            let sched_range = match term_offset {
-                Some(t) if t > 1 => 0..t,
-                _ => continue,
-            };
-
-            let sched_insts = &insts[sched_range.clone()];
-            let dag = DepGraph::build(sched_insts);
+            // Control flow is represented as a full barrier in the DAG, so a
+            // terminator remains last while its register/NZCV uses stay visible.
+            let dag = DepGraph::build(&insts);
             let order = schedule(&dag);
 
-            if is_identity(&order, sched_range.len()) {
+            if is_identity(&order, insts.len()) {
                 continue;
             }
 
             // Write the scheduled instructions back.
             for (local, orig) in order.iter().enumerate() {
                 let global = range.start + local;
-                *vcode.inst_mut(global) = insts[sched_range.start + orig].clone();
+                *vcode.inst_mut(global) = insts[*orig].clone();
             }
 
             // Rebuild inst_is_branch / inst_is_ret for this block.
@@ -71,14 +66,6 @@ impl MIRPass<MInst> for ListScheduler {
 
         any_changed
     }
-}
-
-/// Find the index of the block-terminating instruction (branch/return),
-/// if any. Returns None if the block has no terminator.
-fn find_terminator_offset(insts: &[MInst]) -> Option<usize> {
-    insts.iter().rposition(|inst| {
-        !matches!(inst.is_term(), MachTerminator::None)
-    })
 }
 
 /// Run list scheduling on the dependency DAG, returning a permutation
@@ -103,9 +90,11 @@ fn schedule(dag: &DepGraph) -> Vec<usize> {
 
     let mut cycle: u32 = 0;
     let mut stall_budget: u32 = n as u32 * 20; // safety: prevent infinite loops
+    let mut mul_div_available_at: u32 = 0;
 
     while order.len() < n {
         let mut issued_this_cycle = false;
+        let mut issued_classes = Vec::with_capacity(2);
 
         // Sort ready nodes by critical path (descending) — highest priority first.
         ready.sort_by(|&a, &b| dag.crit[b].cmp(&dag.crit[a]));
@@ -115,8 +104,7 @@ fn schedule(dag: &DepGraph) -> Vec<usize> {
         for &node in &ready {
             let data_ready = dag.preds[node].iter().all(|&pred| {
                 let issued = issued_at[pred].unwrap_or(0);
-                let latency = dag
-                    .succs[pred]
+                let latency = dag.succs[pred]
                     .iter()
                     .find(|(s, _)| *s == node)
                     .map(|(_, l)| *l)
@@ -124,10 +112,24 @@ fn schedule(dag: &DepGraph) -> Vec<usize> {
                 issued + latency <= cycle
             });
 
-            if data_ready {
+            let class = dag.deps[node].class;
+            if data_ready
+                && resource_ready(class, cycle, mul_div_available_at)
+                && can_issue(class, &issued_classes)
+            {
                 issued_at[node] = Some(cycle);
                 order.push(node);
+                issued_classes.push(class);
                 issued_this_cycle = true;
+
+                if matches!(class, SchedClass::Mul | SchedClass::Div) {
+                    let occupancy = if class == SchedClass::Div {
+                        instr_profile(class).latency
+                    } else {
+                        1
+                    };
+                    mul_div_available_at = cycle + occupancy;
+                }
 
                 // Decrement successor predecessor counts; add newly-ready nodes.
                 for &(succ, _) in &dag.succs[node] {
@@ -143,8 +145,12 @@ fn schedule(dag: &DepGraph) -> Vec<usize> {
         ready = next_ready;
 
         cycle += 1;
-        stall_budget -= 1;
-        if stall_budget == 0 && !issued_this_cycle {
+        if issued_this_cycle {
+            stall_budget = n as u32 * 20;
+        } else {
+            stall_budget = stall_budget.saturating_sub(1);
+        }
+        if stall_budget == 0 {
             // Safety fallback: emit remaining nodes in original order.
             let scheduled: HashSet<usize> = order.iter().copied().collect();
             for i in 0..n {
@@ -159,7 +165,86 @@ fn schedule(dag: &DepGraph) -> Vec<usize> {
     order
 }
 
+fn resource_ready(class: SchedClass, cycle: u32, mul_div_available_at: u32) -> bool {
+    !matches!(class, SchedClass::Mul | SchedClass::Div) || cycle >= mul_div_available_at
+}
+
+fn can_issue(class: SchedClass, issued: &[SchedClass]) -> bool {
+    if issued.len() >= 2 {
+        return false;
+    }
+    if matches!(class, SchedClass::Barrier) || issued.contains(&SchedClass::Barrier) {
+        return issued.is_empty();
+    }
+
+    let uses_lsu = |class| matches!(class, SchedClass::Load | SchedClass::Store);
+    let uses_mac = |class| matches!(class, SchedClass::Mul | SchedClass::Div);
+    let uses_fp = |class| matches!(class, SchedClass::Other);
+
+    !(uses_lsu(class) && issued.iter().copied().any(uses_lsu)
+        || uses_mac(class) && issued.iter().copied().any(uses_mac)
+        || uses_fp(class) && issued.iter().copied().any(uses_fp))
+}
+
 /// Check if a permutation is the identity (0, 1, 2, ..., n-1).
 fn is_identity(order: &[usize], n: usize) -> bool {
     order.len() == n && order.iter().enumerate().all(|(i, &v)| i == v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sched::dag::InstDeps;
+
+    fn deps(class: SchedClass) -> InstDeps {
+        InstDeps {
+            defs: vec![],
+            uses: vec![],
+            flags_def: false,
+            flags_use: false,
+            class,
+            mem: None,
+            is_barrier: false,
+        }
+    }
+
+    fn independent_graph(classes: &[SchedClass]) -> DepGraph {
+        DepGraph {
+            n: classes.len(),
+            succs: vec![vec![]; classes.len()],
+            preds: vec![vec![]; classes.len()],
+            deps: classes.iter().copied().map(deps).collect(),
+            crit: vec![1; classes.len()],
+        }
+    }
+
+    #[test]
+    fn issue_model_limits_width_and_shared_units() {
+        assert!(can_issue(SchedClass::Alu, &[]));
+        assert!(can_issue(SchedClass::Alu, &[SchedClass::Alu]));
+        assert!(!can_issue(
+            SchedClass::Alu,
+            &[SchedClass::Alu, SchedClass::Alu]
+        ));
+        assert!(!can_issue(SchedClass::Store, &[SchedClass::Load]));
+        assert!(!can_issue(SchedClass::Mul, &[SchedClass::Mul]));
+        assert!(!can_issue(SchedClass::Barrier, &[SchedClass::Alu]));
+        assert!(!resource_ready(SchedClass::Mul, 10, 11));
+        assert!(!resource_ready(SchedClass::Div, 10, 11));
+        assert!(resource_ready(SchedClass::Div, 11, 11));
+    }
+
+    #[test]
+    fn schedules_every_independent_instruction_once() {
+        let graph = independent_graph(&[
+            SchedClass::Load,
+            SchedClass::Store,
+            SchedClass::Alu,
+            SchedClass::Alu,
+            SchedClass::Mul,
+        ]);
+        let mut order = schedule(&graph);
+        order.sort_unstable();
+        assert_eq!(order, vec![0, 1, 2, 3, 4]);
+    }
 }

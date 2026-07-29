@@ -679,46 +679,24 @@ fn lower_call(
     call: &Call,
 ) -> LoweredOutput {
     let mut args = Vec::new();
-    let (mut int_index, mut float_index, mut stack_offset) = (0usize, 0usize, 0i64);
-    for &arg in call.args() {
+    let types: Vec<_> = call
+        .args()
+        .iter()
+        .map(|&arg| arena.inst_data(arg).ty().clone())
+        .collect();
+    let (locations, outgoing_size) = AArch64Abi::compute_call_arg_loc(&types);
+    for (&arg, location) in call.args().iter().zip(locations) {
         let src = ctx.put_value_in_reg(arg);
-        match arena.inst_data(arg).ty().kind() {
-            TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => {
-                if let Some(&preg) = regs::INT_ARG_REGS.get(int_index) {
-                    args.push(CallArgPair { vreg: src, preg });
-                    int_index += 1;
-                } else {
-                    ctx.emit(MInst::Store {
-                        ty: memory_type(arena.inst_data(arg).ty().kind()),
-                        src,
-                        addr: AMode::OutgoingArg(stack_offset),
-                    });
-                    int_index += 1;
-                    stack_offset += 8;
-                }
-            }
-            TypeKind::Float32 => {
-                if let Some(&preg) = regs::FLOAT_ARG_REGS.get(float_index) {
-                    args.push(CallArgPair { vreg: src, preg });
-                    float_index += 1;
-                } else {
-                    ctx.emit(MInst::Store {
-                        ty: MemoryType::F32,
-                        src,
-                        addr: AMode::OutgoingArg(stack_offset),
-                    });
-                    float_index += 1;
-                    stack_offset += 8;
-                }
-            }
-            ty => {
-                ctx.lowering_panic(
-                    "AArch64 instruction selection",
-                    format!("call argument type {ty:?} is unsupported"),
-                    Some(arena.inst_data(arg).ty()),
-                    None,
-                );
-            }
+        match location {
+            ArgSlot::Reg { reg, .. } => args.push(CallArgPair {
+                vreg: src,
+                preg: reg.into(),
+            }),
+            ArgSlot::Stack { offset, ty } => ctx.emit(MInst::Store {
+                ty: memory_type(ty.kind()),
+                src,
+                addr: AMode::OutgoingArg(offset),
+            }),
         }
     }
     let result = (!arena.inst_data(inst).ty().is_unit()).then(|| ctx.result_reg(inst));
@@ -748,7 +726,7 @@ fn lower_call(
         label: Label::from_function(call.callee()),
     });
     ctx.set_has_calls();
-    ctx.set_outgoing_arg_size(stack_offset as usize);
+    ctx.set_outgoing_arg_size(outgoing_size as usize);
     result.map_or(LoweredOutput::None, LoweredOutput::Value)
 }
 

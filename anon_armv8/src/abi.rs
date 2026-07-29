@@ -1,10 +1,8 @@
 //! AAPCS64 calling convention and frame hooks for AArch64.
 
-use raana_ir::ir::arena::Arena;
 use smallvec::{SmallVec, smallvec};
 use taki_mir::{
-    abi::{ABIMachineSpec, ArgSlot, FrameLayout, StackAMode},
-    prelude::ArenaContext,
+    abi::{ABIMachineSpec, ArgLayoutPlanner, ArgRegBank, ArgSlot, FrameLayout, StackAMode},
     reg_alloc::reg::{MachineEnv, PReg, RegClass},
     register::{Reg, Writable},
     types::{F32, I32, I64, LoweredType},
@@ -116,96 +114,18 @@ impl ABIMachineSpec for AArch64Abi {
         }
     }
 
-    fn compute_arg_loc(arena: ArenaContext<'_>) -> (Vec<ArgSlot>, u32) {
-        use raana_ir::ir::TypeKind;
-
-        let mut slots = Vec::new();
-        let (mut int_index, mut float_index, mut stack_offset) = (0usize, 0usize, 0u32);
-        for &param in arena.f().params() {
-            let ty = arena.inst_data(param).ty().clone();
-            let reg = match ty.kind() {
-                TypeKind::Float32 if float_index < regs::FLOAT_ARG_REGS.len() => {
-                    let reg = regs::FLOAT_ARG_REGS[float_index];
-                    float_index += 1;
-                    Some(reg)
-                }
-                TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String
-                    if int_index < regs::INT_ARG_REGS.len() =>
-                {
-                    let reg = regs::INT_ARG_REGS[int_index];
-                    int_index += 1;
-                    Some(reg)
-                }
-                TypeKind::Float32 => {
-                    float_index += 1;
-                    None
-                }
-                TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => {
-                    int_index += 1;
-                    None
-                }
-                _ => unreachable!("non-scalar AAPCS64 parameter: {:?}", ty.kind()),
-            };
-            if let Some(reg) = reg {
-                slots.push(ArgSlot::Reg {
-                    reg: reg.to_physical_reg().unwrap(),
-                    ty,
-                });
-            } else {
-                // AAPCS64 uses one eight-byte stack slot per scalar overflow arg.
-                slots.push(ArgSlot::Stack {
-                    offset: i64::from(stack_offset),
-                    ty,
-                });
-                stack_offset += 8;
-            }
-        }
-        (slots, stack_offset)
-    }
-
     fn compute_call_arg_loc(types: &[taki_mir::prelude::HirType]) -> (Vec<ArgSlot>, u32) {
         use raana_ir::ir::TypeKind;
 
-        let mut slots = Vec::new();
-        let (mut int_index, mut float_index, mut stack_offset) = (0usize, 0usize, 0u32);
-        for ty in types {
-            let reg = match ty.kind() {
-                TypeKind::Float32 if float_index < regs::FLOAT_ARG_REGS.len() => {
-                    let reg = regs::FLOAT_ARG_REGS[float_index];
-                    float_index += 1;
-                    Some(reg)
-                }
-                TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String
-                    if int_index < regs::INT_ARG_REGS.len() =>
-                {
-                    let reg = regs::INT_ARG_REGS[int_index];
-                    int_index += 1;
-                    Some(reg)
-                }
-                TypeKind::Float32 => {
-                    float_index += 1;
-                    None
-                }
-                TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => {
-                    int_index += 1;
-                    None
-                }
+        ArgLayoutPlanner::new(&regs::INT_ARG_REGS, &regs::FLOAT_ARG_REGS).compute(
+            types,
+            |ty| match ty.kind() {
+                TypeKind::Float32 => ArgRegBank::Float,
+                TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => ArgRegBank::Int,
                 _ => unreachable!("non-scalar AAPCS64 parameter: {:?}", ty.kind()),
-            };
-            if let Some(reg) = reg {
-                slots.push(ArgSlot::Reg {
-                    reg: reg.to_physical_reg().unwrap(),
-                    ty: ty.clone(),
-                });
-            } else {
-                slots.push(ArgSlot::Stack {
-                    offset: i64::from(stack_offset),
-                    ty: ty.clone(),
-                });
-                stack_offset += 8;
-            }
-        }
-        (slots, stack_offset)
+            },
+            |_| 8,
+        )
     }
 
     fn get_machine_env() -> &'static MachineEnv {
@@ -502,4 +422,47 @@ fn append_add_constant(
         lhs: RegOrZr::Reg(base),
         rhs: RegOrZr::Reg(scratch.to_reg()),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use taki_mir::prelude::HirType;
+
+    #[test]
+    fn aapcs64_argument_layout_uses_independent_register_banks() {
+        let types = vec![HirType::get_i32(); 8]
+            .into_iter()
+            .chain(vec![HirType::get_f32(); 8])
+            .collect::<Vec<_>>();
+        let (locations, stack_size) = AArch64Abi::compute_call_arg_loc(&types);
+
+        assert_eq!(stack_size, 0);
+        assert!(matches!(
+            locations[7],
+            ArgSlot::Reg { reg, .. } if reg == regs::int_preg(7)
+        ));
+        assert!(matches!(
+            locations[15],
+            ArgSlot::Reg { reg, .. } if reg == regs::float_preg(7)
+        ));
+    }
+
+    #[test]
+    fn aapcs64_overflow_arguments_use_fixed_eight_byte_slots() {
+        let mut types = vec![HirType::get_i32(); 9];
+        types.extend(vec![HirType::get_f32(); 9]);
+        types.push(HirType::get_string());
+        let (locations, stack_size) = AArch64Abi::compute_call_arg_loc(&types);
+        let stack_offsets: Vec<_> = locations
+            .iter()
+            .filter_map(|location| match location {
+                ArgSlot::Stack { offset, .. } => Some(*offset),
+                ArgSlot::Reg { .. } => None,
+            })
+            .collect();
+
+        assert_eq!(stack_offsets, vec![0, 8, 16]);
+        assert_eq!(stack_size, 24);
+    }
 }

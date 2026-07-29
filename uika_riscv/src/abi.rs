@@ -1,8 +1,7 @@
 use smallvec::{SmallVec, smallvec};
 
-use raana_ir::ir::arena::Arena;
 use taki_mir::{
-    abi::{ABIMachineSpec, ArgSlot, FrameLayout, StackAMode},
+    abi::{ABIMachineSpec, ArgLayoutPlanner, ArgRegBank, ArgSlot, FrameLayout, StackAMode},
     reg_alloc::reg::{MachineEnv, PReg, PRegSet, RegClass},
     register::{Reg, Writable},
 };
@@ -18,57 +17,6 @@ use crate::{
 };
 
 pub struct Riscv64ABI;
-
-const RISCV_ARG_REGS: usize = 8;
-
-impl Riscv64ABI {
-    fn arg_layout(types: &[raana_ir::ir::Type]) -> (Vec<ArgSlot>, u32) {
-        use raana_ir::ir::TypeKind;
-
-        let mut args = Vec::with_capacity(types.len());
-        let mut int_arg_idx = 0;
-        let mut float_arg_idx = 0;
-        let mut stack_offset = 0usize;
-        for ty in types {
-            let reg = match ty.kind() {
-                TypeKind::Int32 | TypeKind::Pointer(_) if int_arg_idx < RISCV_ARG_REGS => {
-                    let reg = ARG_REG[int_arg_idx];
-                    int_arg_idx += 1;
-                    Some(reg)
-                }
-                TypeKind::Float32 if float_arg_idx < RISCV_ARG_REGS => {
-                    let reg = FARG_REG[float_arg_idx];
-                    float_arg_idx += 1;
-                    Some(reg)
-                }
-                TypeKind::Int32 | TypeKind::Pointer(_) => {
-                    int_arg_idx += 1;
-                    None
-                }
-                TypeKind::Float32 => {
-                    float_arg_idx += 1;
-                    None
-                }
-                kind => panic!("unsupported RISC-V scalar argument type: {kind:?}"),
-            };
-
-            if let Some(reg) = reg {
-                args.push(ArgSlot::Reg {
-                    reg: reg.to_physical_reg().unwrap(),
-                    ty: ty.clone(),
-                });
-            } else {
-                args.push(ArgSlot::Stack {
-                    offset: stack_offset as i64,
-                    ty: ty.clone(),
-                });
-                stack_offset += ty.size();
-            }
-        }
-
-        (args, stack_offset as u32)
-    }
-}
 
 impl ABIMachineSpec for Riscv64ABI {
     type I = MInst;
@@ -209,18 +157,18 @@ impl ABIMachineSpec for Riscv64ABI {
         }
     }
 
-    fn compute_arg_loc(arena: taki_mir::prelude::ArenaContext<'_>) -> (Vec<ArgSlot>, u32) {
-        let types: Vec<_> = arena
-            .f()
-            .params()
-            .iter()
-            .map(|&param| arena.inst_data(param).ty().clone())
-            .collect();
-        Self::arg_layout(&types)
-    }
-
     fn compute_call_arg_loc(types: &[raana_ir::ir::Type]) -> (Vec<ArgSlot>, u32) {
-        Self::arg_layout(types)
+        use raana_ir::ir::TypeKind;
+
+        ArgLayoutPlanner::new(&ARG_REG, &FARG_REG).compute(
+            types,
+            |ty| match ty.kind() {
+                TypeKind::Int32 | TypeKind::Pointer(_) => ArgRegBank::Int,
+                TypeKind::Float32 => ArgRegBank::Float,
+                kind => panic!("unsupported RISC-V scalar argument type: {kind:?}"),
+            },
+            |ty| u32::try_from(ty.size()).expect("stack argument size exceeds ABI range"),
+        )
     }
 
     fn get_machine_env() -> &'static MachineEnv {
@@ -494,7 +442,7 @@ mod tests {
             .into_iter()
             .chain(vec![HirType::get_f32(); 8])
             .collect::<Vec<_>>();
-        let (locations, stack_size) = Riscv64ABI::arg_layout(&types);
+        let (locations, stack_size) = Riscv64ABI::compute_call_arg_loc(&types);
 
         assert_eq!(stack_size, 0);
         assert!(matches!(
@@ -513,7 +461,7 @@ mod tests {
         types.extend(vec![HirType::get_i32(); 1]);
         types.extend(vec![HirType::get_f32(); 9]);
         types.extend(vec![HirType::get_pointer(HirType::get_i32()); 1]);
-        let (locations, stack_size) = Riscv64ABI::arg_layout(&types);
+        let (locations, stack_size) = Riscv64ABI::compute_call_arg_loc(&types);
         let stack_offsets: Vec<_> = locations
             .iter()
             .filter_map(|location| match location {

@@ -43,8 +43,16 @@ impl MIRPass<MInst> for ListScheduler {
             // terminator remains last while its register/NZCV uses stay visible.
             let dag = DepGraph::build(&insts);
             let order = schedule(&dag);
+            let original_order: Vec<_> = (0..dag.n).collect();
+            let improves_or_matches = matches!(
+                (
+                    estimate_cycles(&dag, &order),
+                    estimate_cycles(&dag, &original_order)
+                ),
+                (Some(scheduled), Some(original)) if scheduled <= original
+            );
 
-            if is_identity(&order, insts.len()) {
+            if is_identity(&order, insts.len()) || !improves_or_matches {
                 continue;
             }
 
@@ -90,7 +98,7 @@ fn schedule(dag: &DepGraph) -> Vec<usize> {
 
     let mut cycle: u32 = 0;
     let mut stall_budget: u32 = n as u32 * 20; // safety: prevent infinite loops
-    let mut mul_div_available_at: u32 = 0;
+    let mut resources = IssueResources::default();
 
     while order.len() < n {
         let mut issued_this_cycle = false;
@@ -113,23 +121,13 @@ fn schedule(dag: &DepGraph) -> Vec<usize> {
             });
 
             let class = dag.deps[node].class;
-            if data_ready
-                && resource_ready(class, cycle, mul_div_available_at)
-                && can_issue(class, &issued_classes)
-            {
+            if data_ready && resources.is_ready(class, cycle) && can_issue(class, &issued_classes) {
                 issued_at[node] = Some(cycle);
                 order.push(node);
                 issued_classes.push(class);
                 issued_this_cycle = true;
 
-                if matches!(class, SchedClass::Mul | SchedClass::Div) {
-                    let occupancy = if class == SchedClass::Div {
-                        instr_profile(class).latency
-                    } else {
-                        1
-                    };
-                    mul_div_available_at = cycle + occupancy;
-                }
+                resources.reserve(class, cycle);
 
                 // Decrement successor predecessor counts; add newly-ready nodes.
                 for &(succ, _) in &dag.succs[node] {
@@ -165,8 +163,26 @@ fn schedule(dag: &DepGraph) -> Vec<usize> {
     order
 }
 
-fn resource_ready(class: SchedClass, cycle: u32, mul_div_available_at: u32) -> bool {
-    !matches!(class, SchedClass::Mul | SchedClass::Div) || cycle >= mul_div_available_at
+#[derive(Default)]
+struct IssueResources {
+    mul_div_available_at: u32,
+}
+
+impl IssueResources {
+    fn is_ready(&self, class: SchedClass, cycle: u32) -> bool {
+        !matches!(class, SchedClass::Mul | SchedClass::Div) || cycle >= self.mul_div_available_at
+    }
+
+    fn reserve(&mut self, class: SchedClass, cycle: u32) {
+        if matches!(class, SchedClass::Mul | SchedClass::Div) {
+            let occupancy = if class == SchedClass::Div {
+                instr_profile(class).latency
+            } else {
+                1
+            };
+            self.mul_div_available_at = cycle + occupancy;
+        }
+    }
 }
 
 fn can_issue(class: SchedClass, issued: &[SchedClass]) -> bool {
@@ -184,6 +200,69 @@ fn can_issue(class: SchedClass, issued: &[SchedClass]) -> bool {
     !(uses_lsu(class) && issued.iter().copied().any(uses_lsu)
         || uses_mac(class) && issued.iter().copied().any(uses_mac)
         || uses_fp(class) && issued.iter().copied().any(uses_fp))
+}
+
+/// Estimate completion cycles for a fixed topological instruction order using
+/// the same dependency latency, issue width, and resource model as the scheduler.
+fn estimate_cycles(dag: &DepGraph, order: &[usize]) -> Option<u32> {
+    if order.len() != dag.n {
+        return None;
+    }
+
+    let mut seen = vec![false; dag.n];
+    let mut issued_at = vec![None; dag.n];
+    let mut resources = IssueResources::default();
+    let mut next = 0;
+    let mut cycle = 0;
+    let mut completion_cycle = 0;
+    let mut stall_budget = dag.n as u32 * 20;
+
+    while next < order.len() {
+        let mut issued_classes = Vec::with_capacity(2);
+        while next < order.len() {
+            let node = order[next];
+            if node >= dag.n || seen[node] {
+                return None;
+            }
+            if dag.preds[node].iter().any(|&pred| !seen[pred]) {
+                return None;
+            }
+            let data_ready = dag.preds[node].iter().all(|&pred| {
+                let latency = dag.succs[pred]
+                    .iter()
+                    .find(|(succ, _)| *succ == node)
+                    .map(|(_, latency)| *latency)
+                    .unwrap_or(0);
+                issued_at[pred].is_some_and(|issued| issued + latency.max(1) <= cycle)
+            });
+            let class = dag.deps[node].class;
+            if !data_ready
+                || !resources.is_ready(class, cycle)
+                || !can_issue(class, &issued_classes)
+            {
+                break;
+            }
+
+            seen[node] = true;
+            issued_at[node] = Some(cycle);
+            issued_classes.push(class);
+            resources.reserve(class, cycle);
+            completion_cycle = completion_cycle.max(cycle + instr_profile(class).latency.max(1));
+            next += 1;
+        }
+
+        cycle += 1;
+        if issued_classes.is_empty() {
+            stall_budget = stall_budget.saturating_sub(1);
+            if stall_budget == 0 {
+                return None;
+            }
+        } else {
+            stall_budget = dag.n as u32 * 20;
+        }
+    }
+
+    Some(completion_cycle)
 }
 
 /// Check if a permutation is the identity (0, 1, 2, ..., n-1).
@@ -229,9 +308,11 @@ mod tests {
         assert!(!can_issue(SchedClass::Store, &[SchedClass::Load]));
         assert!(!can_issue(SchedClass::Mul, &[SchedClass::Mul]));
         assert!(!can_issue(SchedClass::Barrier, &[SchedClass::Alu]));
-        assert!(!resource_ready(SchedClass::Mul, 10, 11));
-        assert!(!resource_ready(SchedClass::Div, 10, 11));
-        assert!(resource_ready(SchedClass::Div, 11, 11));
+        let mut resources = IssueResources::default();
+        resources.mul_div_available_at = 11;
+        assert!(!resources.is_ready(SchedClass::Mul, 10));
+        assert!(!resources.is_ready(SchedClass::Div, 10));
+        assert!(resources.is_ready(SchedClass::Div, 11));
     }
 
     #[test]
@@ -246,5 +327,59 @@ mod tests {
         let mut order = schedule(&graph);
         order.sort_unstable();
         assert_eq!(order, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn fixed_order_estimator_rejects_invalid_permutations() {
+        let graph = independent_graph(&[SchedClass::Alu, SchedClass::Alu]);
+
+        assert_eq!(estimate_cycles(&graph, &[0]), None);
+        assert_eq!(estimate_cycles(&graph, &[0, 0]), None);
+        assert_eq!(estimate_cycles(&graph, &[0, 2]), None);
+    }
+
+    #[test]
+    fn fixed_order_estimator_includes_final_instruction_latency() {
+        let graph = independent_graph(&[SchedClass::Div]);
+
+        assert_eq!(estimate_cycles(&graph, &[0]), Some(11));
+    }
+
+    #[test]
+    fn cortex_a53_model_benchmark_hides_load_use_stall() {
+        use taki_mir::register::Writable;
+
+        use crate::{
+            instructions::{AMode, AluOp, MemoryType},
+            regs::{OperandSize, RegOrZr, int_reg, stack_reg},
+        };
+
+        let writable = |index| Writable::from_reg(int_reg(index));
+        let independent_alu = |dst, lhs, rhs| MInst::AluRRR {
+            op: AluOp::Add,
+            size: OperandSize::Size64,
+            dst: writable(dst),
+            lhs: RegOrZr::Reg(int_reg(lhs)),
+            rhs: RegOrZr::Reg(int_reg(rhs)),
+        };
+        let insts = vec![
+            MInst::Load {
+                ty: MemoryType::I64,
+                dst: writable(1),
+                addr: AMode::Reg { base: stack_reg() },
+            },
+            independent_alu(2, 1, 3),
+            independent_alu(4, 5, 6),
+            independent_alu(7, 8, 9),
+            independent_alu(10, 11, 12),
+        ];
+        let graph = DepGraph::build(&insts);
+        let original = estimate_cycles(&graph, &[0, 1, 2, 3, 4]).unwrap();
+        let scheduled_order = schedule(&graph);
+        let scheduled = estimate_cycles(&graph, &scheduled_order).unwrap();
+
+        assert_eq!(original, 4);
+        assert_eq!(scheduled, 3);
+        assert!(scheduled < original);
     }
 }

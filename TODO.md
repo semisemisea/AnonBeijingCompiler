@@ -203,7 +203,7 @@ LegalizeFinal 可能改变指令数量（1→N 展开），这会使 regalloc Ou
 
 ## 6. Phase 4 — Post-RA ListScheduler Pass（核心，~4-5 天）
 
-**状态：✅ 已完成 (M8+M9，v1 保守模型)**
+**状态：✅ 已完成 (M8+M9+M10)**
 
 **新文件：**
 - `anon_armv8/src/sched/mod.rs` — 模块根，类型导出
@@ -216,12 +216,12 @@ LegalizeFinal 可能改变指令数量（1→N 展开），这会使 regalloc Ou
 1. **依赖提取**（`sched/dag.rs::inst_deps`）：
    - 直接检查 MInst 字段提取物理寄存器 def/use（post-RA 下 `get_operands` 跳过物理寄存器，不可用）
    - 每个 variant 映射到 `SchedClass`（Alu/Mul/Div/Load/Store/Branch/Barrier/Nop/Other）
-   - 内存操作标记 `MemKind::Load/Store`
+   - 内存操作记录 load/store、provenance、常量 offset 和访问宽度
 
 2. **DAG 构建**（`DepGraph::build`）：
    - RAW 边权重 = producer 延迟
    - WAW / WAR 边权重 = 0
-   - 内存依赖保守：load-after-store 有序，store-after-load/store 有序
+   - 内存依赖采用保守 range alias：只有可证明不相交时才解除顺序边
    - Call/Return/TailCall 是 barrier，序列化所有前后指令
 
 3. **关键路径**：`crit[i] = latency[i] + max(crit[successors])`
@@ -250,9 +250,9 @@ LegalizeFinal 可能改变指令数量（1→N 展开），这会使 regalloc Ou
 
 **主要优化目标：** load-use 延迟隐藏。Cortex-A53 的 L1 load 延迟为 2 周期，紧跟的依赖 ALU 指令会停顿 1 周期。Scheduler 通过在 load 和 consumer 之间插入独立指令来隐藏这个延迟。
 
-**v2（stretch）尚未实现：**
-- 基于栈槽/global 的内存别名分析（当前保守：所有内存有序）
+**仍可进一步调优：**
 - 精确 ALU0/ALU1 槽位配对（基础双发宽度和 LSU/MAC 资源约束已实现）
+- 在真实 XCZU15EG 上采集 runtime benchmark；当前模型结果不能替代硬件测量
 
 **M10 correctness 加固已完成：**
 - 显式建模 NZCV producer/consumer 依赖
@@ -261,6 +261,14 @@ LegalizeFinal 可能改变指令数量（1→N 展开），这会使 regalloc Ou
 - load destination 只作为 def；pair pre/post-index writeback base 同时作为 use/def
 - 每周期最多双发，且 LSU、MAC/Div、FP 类资源每周期各最多一条；非流水化 Div 按延迟占用 MAC/Div 资源
 - DAG 和 issue model 新增针对性单元测试
+
+**M10 alias model 与静态 benchmark 已完成：**
+- 按 block 原始顺序跟踪 SP/FP、global address、64-bit move 和 add/sub immediate provenance
+- 同一已知 root 仅在常量 byte range 不重叠时判定 disjoint；不同 global、global-vs-stack 也判定 disjoint
+- SP-vs-FP、动态 register offset、writeback pair、未知或溢出地址继续保守 may-alias
+- memory edge 扫描 barrier 以来的全部历史，避免中间的 disjoint store 遮蔽更早的 aliasing store
+- 新增可复用固定顺序 completion-cycle estimator，与 scheduler 共用 dependency latency、issue width 和资源占用模型
+- Cortex-A53 load-use 模型用例从原始顺序 4 cycles 降到调度后 3 cycles；这是确定性静态模型结果，不是 XCZU15EG 硬件数据
 
 ---
 

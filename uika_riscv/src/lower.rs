@@ -958,9 +958,10 @@ fn lower_call(
     result.map_or(LoweredOutput::None, LoweredOutput::Value)
 }
 
-/// Lower a tail call (self-recursion). Register arguments are forced into the
+/// Lower an ABI-compatible tail call. Register arguments are forced into the
 /// ABI argument registers via the `TailCall` operands; stack arguments are
-/// stored to the incoming-argument slots. The emitter prepends the epilogue
+/// stored to the incoming-argument slots. Tail-call elimination guarantees
+/// that caller and callee signatures match. The emitter prepends the epilogue
 /// (frame restore) to the `TailCall`, which then jumps without linking.
 fn lower_tail_call(
     ctx: &mut LowerContext<'_, MInst>,

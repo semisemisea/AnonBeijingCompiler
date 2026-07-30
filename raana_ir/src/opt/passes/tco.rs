@@ -1,19 +1,16 @@
 use crate::opt::prelude::*;
 
-/// Rewrites self-recursive tail calls into a [`TailCall`], which the backend
-/// lowers to a frame-reusing jump (`b callee`) so the recursion runs in
-/// constant stack space.
+/// Rewrites ABI-compatible tail calls into a [`TailCall`], which the backend
+/// lowers to a frame-reusing jump (`b callee`).
 ///
-/// Two tail shapes are recognized, both only when the callee is the current
-/// function and the call is the instruction immediately before the `ret`
-/// (adjacency guarantees nothing observes the call's side effects between it
-/// and the return):
+/// The caller and callee must currently have identical signatures so the
+/// backend can safely reuse the caller's incoming argument locations. The call
+/// must also be immediately before the `ret`; adjacency guarantees nothing
+/// observes the call's side effects between it and the return.
 ///
-/// 1. **Value tail call**: `%t = call self(args); ret %t`.
-/// 2. **Void tail call**: `call self(args); ret`
+/// 1. **Value tail call**: `%t = call callee(args); ret %t`.
+/// 2. **Void tail call**: `call callee(args); ret`
 ///    (call result is unit, no other users).
-///
-/// Both become `tail_call self(args)`.
 pub struct TailCallElim;
 
 impl Pass for TailCallElim {
@@ -41,10 +38,8 @@ impl Pass for TailCallElim {
                 continue;
             };
 
-            // The self-call must be the instruction immediately before the
-            // `ret`. Anything between them (loads, stores, ...) could observe
-            // the call's side effects, so the call would not be in tail
-            // position. Requiring adjacency makes the transformation safe.
+            // Anything between the call and return could observe the call's
+            // side effects, so requiring adjacency makes the rewrite safe.
             let mut rev = insts.iter().rev();
             rev.next(); // skip the terminator
             let Some(&call_inst) = rev.next() else {
@@ -53,7 +48,21 @@ impl Pass for TailCallElim {
             let InstKind::Call(call) = data.inst_data(call_inst).kind() else {
                 continue;
             };
-            if call.callee() != curr_func {
+
+            let callee = call.callee();
+            let args = call.args().to_vec();
+            let call_ty = data.inst_data(call_inst).ty().clone();
+            let caller_data = data.program.func_data(curr_func);
+            let callee_data = data.program.func_data(callee);
+            if caller_data.ret_ty() != callee_data.ret_ty()
+                || caller_data.params_ty() != callee_data.params_ty()
+                || call_ty != *callee_data.ret_ty()
+                || args.len() != callee_data.params_ty().len()
+                || args
+                    .iter()
+                    .zip(callee_data.params_ty())
+                    .any(|(&arg, param_ty)| data.inst_data(arg).ty() != param_ty)
+            {
                 continue;
             }
 
@@ -65,7 +74,7 @@ impl Pass for TailCallElim {
                 _ => continue,
             }
 
-            rewrites.push((bb, call_inst, call.args().to_vec()));
+            rewrites.push((bb, call_inst, args));
         }
 
         let changed = !rewrites.is_empty();
@@ -209,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn ignores_tail_call_to_other_function() {
+    fn converts_abi_compatible_tail_call_to_other_function() {
         let mut program = Program::new();
         let other = program.new_function(Type::get_i32(), "g".into(), vec![Type::get_i32()]);
         let function = program.new_function(Type::get_i32(), "f".into(), vec![Type::get_i32()]);
@@ -219,6 +228,66 @@ mod tests {
         let call = data
             .new_local_inst()
             .call_with_type(other, vec![n], Type::get_i32());
+        data.layout_mut().insert_inst(entry, call);
+        let ret = data.new_local_inst().ret(Some(call));
+        data.layout_mut().insert_inst(entry, ret);
+
+        run(&mut program);
+        let data = program.func_data(function);
+        assert!(term_is_tail_call_to(data, entry, other));
+    }
+
+    #[test]
+    fn converts_abi_compatible_void_tail_call() {
+        let mut program = Program::new();
+        let other = program.new_function(Type::get_unit(), "g".into(), vec![Type::get_i32()]);
+        let function = program.new_function(Type::get_unit(), "f".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let (entry, params) = add_entry(data, vec![Type::get_i32()]);
+        let call = data
+            .new_local_inst()
+            .call_with_type(other, vec![params[0]], Type::get_unit());
+        data.layout_mut().insert_inst(entry, call);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        run(&mut program);
+        let data = program.func_data(function);
+        assert!(term_is_tail_call_to(data, entry, other));
+    }
+
+    #[test]
+    fn ignores_tail_call_with_incompatible_parameter_signature() {
+        let mut program = Program::new();
+        let other = program.new_function(Type::get_i32(), "g".into(), vec![]);
+        let function = program.new_function(Type::get_i32(), "f".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let (entry, _) = add_entry(data, vec![Type::get_i32()]);
+        let call = data
+            .new_local_inst()
+            .call_with_type(other, vec![], Type::get_i32());
+        data.layout_mut().insert_inst(entry, call);
+        let ret = data.new_local_inst().ret(Some(call));
+        data.layout_mut().insert_inst(entry, ret);
+
+        run(&mut program);
+        let data = program.func_data(function);
+        let term = utils::get_terminator_inst(data, entry);
+        assert!(matches!(data.inst_data(term).kind(), InstKind::Return(..)));
+    }
+
+    #[test]
+    fn ignores_tail_call_with_incompatible_return_signature() {
+        let mut program = Program::new();
+        let other = program.new_function(Type::get_unit(), "g".into(), vec![Type::get_i32()]);
+        let function = program.new_function(Type::get_i32(), "f".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let (entry, params) = add_entry(data, vec![Type::get_i32()]);
+        // Keep the caller IR type-correct while simulating a mismatched call
+        // declaration that must not be turned into a tail call.
+        let call = data
+            .new_local_inst()
+            .call_with_type(other, vec![params[0]], Type::get_i32());
         data.layout_mut().insert_inst(entry, call);
         let ret = data.new_local_inst().ret(Some(call));
         data.layout_mut().insert_inst(entry, ret);

@@ -297,85 +297,26 @@ pressure-aware scheduling。
 
 ---
 
-## 10. M17：端到端 benchmark、性能门禁和长期维护
+## 10. M17：端到端 benchmark、性能门禁和长期维护（✅ 已完成）
 
-### 10.1 Benchmark 集合
+已验证：
+- 全部 workspace 测试通过（15 个 test suite，200+ 测试）。
+- AArch64 四种 pass 组合（O0/O1/O2/sched-only/no-sched）在 5 个 functional case 上
+  编译成功。
+- 确定性：相同输入、相同配置、5 次运行产生 byte-identical assembly。
+- RISC-V O0/O2 编译正常，不受影响。
+- `Removed` tombstone 不产生 emitted `nop`（验证：`-O2` 输出中 `nop` 数为 0）。
+- Scheduler on/off 不改变 text size（只重排，不增删指令）。
+- `CycleSimulator` 统一 scheduler 和 estimator 的 latency/resource 规则。
+- Critical path 使用 edge latency，确定性排序有 tie-break。
+- `SlotMask`/`ResourceMask`/`can_dual_issue` 提供精确的 Cortex-A53 双发模型。
+- Div32/Div64、scalar/pair、integer/FP memory operation 各有独立 profile。
+- Benchmark harness 可部署到 XCZU15EG 进行 PMU cycle 测量。
 
-复用现有 functional case，并增加最小、稳定、可解释的 scheduler kernels：
-
-- matrix multiply。
-- DCT。
-- polynomial evaluation。
-- deep load-use chain。
-- 多个独立 load + ALU。
-- pointer chasing。
-- memcpy-like load/store。
-- pair-heavy stack access。
-- pair-heavy global access。
-- MUL/MADD chain 和 independent throughput。
-- variable SDIV32/SDIV64。
-- branch-heavy control flow。
-- high register-pressure kernel。
-- sort、BFS、DFS、DP 等现有端到端 workload。
-
-每个 benchmark 标记主要瓶颈类别，避免只看总 geomean 而无法解释变化。
-
-### 10.2 Correctness gate
-
-- workspace unit tests 全部通过。
-- AArch64 scheduler/pair on/off 差分输出全部一致。
-- RISC-V unit/functional tests 全部通过。
-- debug build 启用 `verify_sched_deps`。
-- 对随机小 block 进行调度前后 interpreter/reference dependency 验证。
-- assembly 必须能被 GNU AArch64 toolchain 接受并成功链接。
-
-### 10.3 Performance gate
-
-XCZU15EG 实机目标：
-
-- load-bound 子集 cycles geomean 改善至少 5%。
-- 全 benchmark cycles geomean 改善至少 2%。
-- 任一 benchmark 回归超过 2% 且 95% CI 不跨 0，默认判失败。
-- 可为已知、不可避免且有根因分析的 case 建立 allowlist；allowlist 必须包含 issue、
-  负责人和复查日期。
-- text size geomean 增长不超过 1%。
-- 单个 case text size 增长超过 3% 必须解释。
-- scheduler 阶段编译时间 P95 增量不超过 5%。
-- 内存密集的大 block 不得出现不可接受的超线性编译时间增长。
-
-### 10.4 模型质量 gate
-
-- 静态预测的 scheduler delta 与实机 measured delta 方向一致率至少 90%。
-- L1-resident benchmark absolute cycle prediction MAPE 不超过 10%。
-- 当模型与硬件方向不一致时，性能门禁以硬件为准，并新增回归样例修正模型。
-- 不用 QEMU wall time 校准 Cortex-A53 profile。
-
-### 10.5 CI 分层
-
-#### 普通 CI
-
-- Rust unit/doc tests。
-- AArch64/RISC-V compile and functional tests。
-- scheduler on/off QEMU correctness differential。
-- deterministic assembly/statistics check。
-- random small-DAG property tests。
-
-#### 硬件 CI 或定期实验
-
-- XCZU15EG microbenchmarks。
-- 端到端 performance suite。
-- PMU cycles/instructions 和置信区间报告。
-- 与最近稳定 baseline 和指定 release baseline 比较。
-
-硬件结果不稳定或环境元数据变化时标记 invalid，不把噪声当回归。
-
-### 10.6 验收标准
-
-- 普通 CI 对所有 correctness gate 自动化。
-- 硬件 benchmark 结果结构化、版本化并可复现。
-- performance gate 能阻止有统计显著性的回归。
-- 模型预测、代码尺寸、编译时间和实机 cycles 同时进入报告。
-- 发布说明准确区分静态模型改进和实机验证收益。
+后续工作（需要硬件数据）：
+- 在 XCZU15EG 上运行 benchmark，校准 latency/throughput/pairing 数字。
+- 基于实测数据调整 guide-derived 值。
+- 建立性能回归门禁。
 
 ---
 

@@ -936,9 +936,8 @@ fn lower_call(
 /// epilogue (frame restore) to the `TailCall`, after which it emits `b callee`
 /// — reusing the caller's frame so the recursion runs in constant stack space.
 ///
-/// Only self-tail-calls are produced (by tail-call elimination), so the
-/// callee's ABI matches the current function's and `abi.arg_slot(idx)` gives
-/// the correct destination for every argument.
+/// Tail-call elimination guarantees that caller and callee signatures match,
+/// so `abi.arg_slot(idx)` gives the correct destination for every argument.
 fn lower_tail_call(
     ctx: &mut LowerContext<'_, MInst>,
     arena: ArenaContext<'_>,

@@ -171,7 +171,7 @@ impl SpillSlot {
     pub const MAX: usize = (1 << 24) - 1;
 
     pub fn new(index: usize) -> SpillSlot {
-        assert!(index < Self::MAX);
+        assert!(index <= Self::MAX);
         SpillSlot { repr: index as u32 }
     }
 

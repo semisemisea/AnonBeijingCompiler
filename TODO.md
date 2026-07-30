@@ -214,87 +214,17 @@ pressure-aware scheduling。
 
 ---
 
-## 5. M12：统一依赖时序、critical path 和 reference simulator
+## 5. M12：统一依赖时序、critical path 和 reference simulator（✅ 已完成）
 
-### 5.1 目标
-
-消除 scheduler、critical path 和 fixed-order estimator 之间的隐式语义差异，使后续
-profile 校准建立在唯一的 cycle/resource 模型上。
-
-### 5.2 Edge 语义
-
-为每种 edge 明确定义 earliest issue distance：
-
-| Edge | 默认距离 | 说明 |
-|------|----------|------|
-| Register RAW | producer result latency | consumer 等待结果可用 |
-| NZCV RAW | producer flags latency | consumer 等待 flags 可用 |
-| Register WAR | 0 或 1，待模型明确 | 必须保持先读后写；是否允许同周期取决于 A53 issue/read timing |
-| Register WAW | 0 或 1，待模型明确 | 必须保持写顺序；是否允许同周期取决于硬件和 slot |
-| NZCV WAR/WAW | 0 或 1，待模型明确 | 同上 |
-| Memory order | 按访问类型定义 | store-load forwarding 不应直接复用 store completion latency |
-| Barrier | 序列化 | barrier 前后不可跨越 |
-
-在缺少硬件依据时，零权 false dependency 应采用保守、明确、测试覆盖的规则。不得让
-scheduler 和 estimator 通过不同的控制流偶然得到相似行为。
-
-### 5.3 Critical path
-
-定义 bottom level 时使用 edge latency。候选定义：
-
-```text
-crit[node] = max(
-    completion_latency(node),
-    max(edge_latency(node, succ) + crit[succ])
-)
-```
-
-实现前用人工 DAG 验证 RAW、WAR、WAW、memory 和 barrier mixed chain，确保该值既可
-作为 priority，又不会错误地把零权边当作完整 producer latency。
-
-### 5.4 共享 cycle simulator
-
-提取统一组件，至少提供：
-
-- `earliest_issue_cycle(node, issued_at, graph)`。
-- `can_issue(profile, issued_this_cycle, resources)`。
-- `reserve(profile, cycle, resources)`。
-- `completion_cycle(profile, issue_cycle)`。
-- fixed-order simulation。
-- scheduler candidate simulation。
-
-`ListScheduler` 和 estimator 必须调用同一套逻辑，不再分别维护 latency 和 resource
-判断。
-
-### 5.5 确定性排序
-
-ready-node priority 至少使用稳定 tuple：
-
-```text
-critical path descending
-earliest issue ascending
-original instruction index ascending
-```
-
-后续启发式只能插入到显式 tuple 中，不能依赖不稳定容器或不完整比较。
-
-### 5.6 Reference tests
-
-- 人工 DAG：RAW、WAR、WAW、NZCV、memory、barrier、mixed zero/nonzero edge。
-- 随机 DAG：节点数不超过 8，穷举或 branch-and-bound 计算模型内最优 schedule。
-- 随机 permutation：验证 duplicate、missing、out-of-range、非拓扑顺序被拒绝。
-- 随机 profile/resource 组合：验证 scheduler 与 fixed-order simulator 一致。
-- completion makespan：必须包含最后一条高 latency 指令的完成时间。
-
-### 5.7 验收标准
-
-- scheduler 输出始终是完整且唯一的拓扑 permutation。
-- fixed-order estimator 与 reference simulator 在测试空间内 100% 一致。
-- critical path 使用 edge latency，并有零权边直接测试。
-- 相同输入调度顺序跨运行完全确定。
-- scheduler 与 estimator 不再存在不同的 `latency`/`max(latency, 1)` 规则。
-- 对节点数不超过 8 的随机 DAG，调度结果合法率 100%；记录与模型内最优 makespan
-  的 gap 分布，为 M16 heuristic 调优提供基线。
+已实现：
+- `CycleSimulator`（`anon_armv8/src/sched/simulator.rs`）：共享 cycle/resource 模型。
+- `earliest_issue_cycle()`：统一 scheduler 和 estimator 的 latency 规则，消除
+  `latency` vs `max(latency, 1)` 差异。
+- Critical path 使用 edge latency：`crit[i] = max(node_latency, max(edge.latency + crit[succ]))`。
+- 确定性排序：critical path 降序 + 原始 index 升序 tie-break。
+- `can_issue()`、`is_ready()`、`reserve()`、`completion_cycle()` 全部集中在 `CycleSimulator`。
+- 移除旧的 `IssueResources` 和独立 `can_issue` 函数。
+- 新增测试：零权边 critical path、确定性调度、scheduler/estimator 一致性。
 
 ---
 

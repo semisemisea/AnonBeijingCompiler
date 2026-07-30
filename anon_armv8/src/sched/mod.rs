@@ -24,6 +24,7 @@
 
 pub mod aarch53;
 pub mod dag;
+pub mod simulator;
 
 pub use aarch53::{InstrProfile, SchedClass, instr_profile};
 pub use dag::{DepGraph, InstDeps, MemKind, inst_deps};

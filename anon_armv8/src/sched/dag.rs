@@ -376,12 +376,18 @@ impl DepGraph {
             }
         }
 
-        // Compute critical path (longest weighted path from each node to a leaf).
+        // Compute critical path using edge latency: the longest path from each
+        // node to a leaf, where each edge contributes its earliest-issue
+        // distance. This is the bottom-level heuristic for list scheduling.
         let mut crit = vec![0u32; n];
         for i in (0..n).rev() {
             let node_latency = deps[i].profile().latency;
-            let max_succ = succs[i].iter().map(|edge| crit[edge.node]).max().unwrap_or(0);
-            crit[i] = node_latency + max_succ;
+            let max_succ = succs[i]
+                .iter()
+                .map(|edge| edge.latency + crit[edge.node])
+                .max()
+                .unwrap_or(0);
+            crit[i] = node_latency.max(max_succ);
         }
 
         DepGraph {

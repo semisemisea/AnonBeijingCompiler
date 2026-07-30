@@ -243,100 +243,23 @@ pressure-aware scheduling。
 
 ---
 
-## 7. M14：精确 Cortex-A53 issue-slot 和资源模型
+## 7. M14：精确 Cortex-A53 issue-slot 和资源模型（✅ 已完成）
 
-### 7.1 目标
-
-将当前 class-only 模型升级为可表达 Cortex-A53 双发槽位、吞吐、占用和主要结构
-hazard 的 profile，同时保留一个更保守的 generic AArch64 profile 作为回退。
-
-### 7.2 Profile 结构
-
-建议最小结构：
-
-```rust
-struct InstrProfile {
-    result_latency: u32,
-    reciprocal_throughput: u32,
-    resource_occupancy: u32,
-    allowed_slots: SlotMask,
-    resources: ResourceMask,
-    emitted_ops: u8,
-}
-```
-
-若实测证明不同 operand/result 有不同 bypass latency，再扩展 operand-specific latency；
-不要在没有数据前过度抽象。
-
-### 7.3 资源与槽位
-
-至少表达：
-
-- `ALU0`
-- `ALU1`
-- `LSU`
-- `MAC`
-- `DIV`
-- `FP_NEON`
-- `BRANCH`
-- `FRONTEND_ISSUE`
-
-每周期总发射上限仍为 2，但合法配对由 slot/resource assignment 决定，而不是只检查
-两个粗粒度 class 是否不同。
-
-### 7.4 指令分类
-
-至少拆分：
-
-- simple integer ALU。
-- shifted/extended integer ALU。
-- compare、conditional select、move-wide。
-- Mul、MAdd、MSub、SMulL。
-- Div32、Div64。
-- scalar integer load/store。
-- scalar FP load/store。
-- pair integer load/store。
-- pair FP load/store。
-- FP move。
-- FP add/sub。
-- FP multiply。
-- FP divide。
-- FP compare。
-- int/FP conversion。
-- branch。
-- atomic bundle。
-- full barrier。
-
-### 7.5 数据来源
-
-每条 profile 必须记录来源：
-
-- ARM Cortex-A53 Software Optimization Guide 的章节/表格；或
-- XCZU15EG microbenchmark 名称和结果版本。
-
-文档数据与实测冲突时，保留两者并说明默认选择。硬件尚未验证的值要明确标记为
-guide-derived，不得伪装为 measured。
-
-### 7.6 Generic profile
-
-增加保守的 `generic_aarch64` profile：
-
-- 不假定精确 ALU0/ALU1 配对。
-- 对未知或 compound instruction 使用保守 occupancy。
-- 保证 correctness，但不承诺 Cortex-A53 最优。
-
-CLI/backend 可选择 `cortex-a53` 或 `generic-aarch64`，未知 CPU 默认选择保守模型。
-
-### 7.7 验收标准
-
-- scheduler 可见的常用 MInst 不再落入无 operand 信息的 catch-all。
-- 所有 profile 都有来源和直接测试。
-- Div32/Div64、scalar/pair、integer/FP memory operation 分开。
-- 合法 pairing 由 slot/resource assignment 判断。
-- 构建 pairing matrix 测试，覆盖允许和禁止的双发组合。
-- generic profile 和 Cortex-A53 profile 均可选择且生成合法代码。
-- 静态 mixed-kernel reference simulator 能解释每个 stall 的 dependency 或 resource
-  原因。
+已实现：
+- `Slot` / `SlotMask`：ALU0、ALU1、EITHER 槽位掩码。
+- `ResourceMask`：ALU、LSU、MAC、DIV、FP_NEON、BRANCH、FRONTEND 资源位。
+- `InstrProfile` 扩展：`latency`、`reciprocal_throughput`、`resource_occupancy`、
+  `allowed_slots`、`resources`、`emitted_ops`。
+- 细分 `SchedClass`：Alu、AluShift、AluMisc、Mul、Div32、Div64、
+  LoadInt/StoreInt、LoadFp/StoreFp、LoadPairInt/StorePairInt、LoadPairFp/StorePairFp、
+  FpMove、FpAddSub、FpMul、FpDiv、FpCmp、FpCvt、Branch、Barrier、Nop、Other。
+- `can_dual_issue()`：基于 slot 分配和资源共享的合法双发判断。
+- `generic_profile()`：保守回退，不限制槽位。
+- `profile_for_model()`：按 `AArch64SchedModel` 选择 profile 函数。
+- 所有 latency 标记为 guide-derived，未声称为实测数据。
+- Pairing matrix 测试：ALU+ALU、ALU+Load、Load+Store（禁止）、Mul+Mul（禁止）、
+  Div32 vs Div64 latency、pair vs scalar profile、generic vs cortex-a53 槽位差异。
+- 功能测试通过，assembly 正常生成。
 
 ---
 

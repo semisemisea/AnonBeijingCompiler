@@ -740,12 +740,15 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             is_barrier: false,
         },
 
-        MInst::SDiv { dst, lhs, rhs, .. } => InstDeps {
+        MInst::SDiv { size, dst, lhs, rhs } => InstDeps {
             defs: preg(dst.reg),
             uses: [preg(*lhs), preg(*rhs)].into_iter().flatten().collect(),
             flags_def: false,
             flags_use: false,
-            class: SchedClass::Div,
+            class: match size {
+                OperandSize::Size32 => SchedClass::Div32,
+                OperandSize::Size64 => SchedClass::Div64,
+            },
             mem: None,
             is_barrier: false,
         },
@@ -840,46 +843,68 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             }
         }
 
-        MInst::Load { dst, addr, .. } => InstDeps {
+        MInst::Load { ty, dst, addr } => InstDeps {
             defs: preg(dst.reg),
             uses: amode_regs(addr),
             flags_def: false,
             flags_use: false,
-            class: SchedClass::Load,
+            class: if ty.is_float() {
+                SchedClass::LoadFp
+            } else {
+                SchedClass::LoadInt
+            },
             mem: Some(unknown_access(MemKind::Load, 0)),
             is_barrier: false,
         },
 
-        MInst::Store { src, addr, .. } => InstDeps {
+        MInst::Store { ty, src, addr } => InstDeps {
             defs: vec![],
             uses: [preg(*src), amode_regs(addr)].concat(),
             flags_def: false,
             flags_use: false,
-            class: SchedClass::Store,
+            class: if ty.is_float() {
+                SchedClass::StoreFp
+            } else {
+                SchedClass::StoreInt
+            },
             mem: Some(unknown_access(MemKind::Store, 0)),
             is_barrier: false,
         },
 
         MInst::LoadPair {
-            dst1, dst2, addr, ..
+            ty,
+            dst1,
+            dst2,
+            addr,
         } => InstDeps {
             defs: [preg(dst1.reg), preg(dst2.reg), pair_amode_defs(addr)].concat(),
             uses: pair_amode_regs(addr),
             flags_def: false,
             flags_use: false,
-            class: SchedClass::Load,
+            class: if ty.is_float() {
+                SchedClass::LoadPairFp
+            } else {
+                SchedClass::LoadPairInt
+            },
             mem: Some(unknown_access(MemKind::Load, 0)),
             is_barrier: false,
         },
 
         MInst::StorePair {
-            src1, src2, addr, ..
+            ty,
+            src1,
+            src2,
+            addr,
         } => InstDeps {
             defs: pair_amode_defs(addr),
             uses: [preg(*src1), preg(*src2), pair_amode_regs(addr)].concat(),
             flags_def: false,
             flags_use: false,
-            class: SchedClass::Store,
+            class: if ty.is_float() {
+                SchedClass::StorePairFp
+            } else {
+                SchedClass::StorePairInt
+            },
             mem: Some(unknown_access(MemKind::Store, 0)),
             is_barrier: false,
         },

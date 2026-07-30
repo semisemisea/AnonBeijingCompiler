@@ -253,10 +253,27 @@ fn estimate_cycles(dag: &DepGraph, order: &[usize]) -> Option<CycleEstimateStats
         }
         for class in &issued_classes {
             match class {
-                SchedClass::Load | SchedClass::Store => result.resources.lsu += 1,
-                SchedClass::Alu => result.resources.alu += 1,
-                SchedClass::Mul | SchedClass::Div => result.resources.mac_div += 1,
-                SchedClass::Other => result.resources.fp_other += 1,
+                SchedClass::LoadInt
+                | SchedClass::StoreInt
+                | SchedClass::LoadFp
+                | SchedClass::StoreFp
+                | SchedClass::LoadPairInt
+                | SchedClass::StorePairInt
+                | SchedClass::LoadPairFp
+                | SchedClass::StorePairFp => result.resources.lsu += 1,
+                SchedClass::Alu | SchedClass::AluShift | SchedClass::AluMisc => {
+                    result.resources.alu += 1
+                }
+                SchedClass::Mul | SchedClass::Div32 | SchedClass::Div64 => {
+                    result.resources.mac_div += 1
+                }
+                SchedClass::FpMove
+                | SchedClass::FpAddSub
+                | SchedClass::FpMul
+                | SchedClass::FpDiv
+                | SchedClass::FpCmp
+                | SchedClass::FpCvt
+                | SchedClass::Other => result.resources.fp_other += 1,
                 SchedClass::Branch | SchedClass::Barrier => result.resources.branch += 1,
                 SchedClass::Nop => {}
             }
@@ -338,21 +355,21 @@ mod tests {
             SchedClass::Alu,
             &[SchedClass::Alu, SchedClass::Alu]
         ));
-        assert!(!CycleSimulator::can_issue(SchedClass::Store, &[SchedClass::Load]));
+        assert!(!CycleSimulator::can_issue(SchedClass::StoreInt, &[SchedClass::LoadInt]));
         assert!(!CycleSimulator::can_issue(SchedClass::Mul, &[SchedClass::Mul]));
         assert!(!CycleSimulator::can_issue(SchedClass::Barrier, &[SchedClass::Alu]));
         let mut sim = CycleSimulator::new();
-        sim.reserve(SchedClass::Div, 0);
+        sim.reserve(SchedClass::Div32, 0);
         assert!(!sim.is_ready(SchedClass::Mul, 10));
-        assert!(!sim.is_ready(SchedClass::Div, 10));
-        assert!(sim.is_ready(SchedClass::Div, 11));
+        assert!(!sim.is_ready(SchedClass::Div32, 10));
+        assert!(sim.is_ready(SchedClass::Div32, 11));
     }
 
     #[test]
     fn schedules_every_independent_instruction_once() {
         let graph = independent_graph(&[
-            SchedClass::Load,
-            SchedClass::Store,
+            SchedClass::LoadInt,
+            SchedClass::StoreInt,
             SchedClass::Alu,
             SchedClass::Alu,
             SchedClass::Mul,
@@ -374,11 +391,25 @@ mod tests {
 
     #[test]
     fn fixed_order_estimator_includes_final_instruction_latency() {
-        let graph = independent_graph(&[SchedClass::Div]);
+        let graph = independent_graph(&[SchedClass::Div32]);
 
         assert_eq!(
             estimate_cycles(&graph, &[0]).map(|e| e.completion_cycles),
             Some(11)
+        );
+    }
+
+    #[test]
+    fn div64_has_higher_latency_than_div32() {
+        let g32 = independent_graph(&[SchedClass::Div32]);
+        let g64 = independent_graph(&[SchedClass::Div64]);
+        assert_eq!(
+            estimate_cycles(&g32, &[0]).map(|e| e.completion_cycles),
+            Some(11)
+        );
+        assert_eq!(
+            estimate_cycles(&g64, &[0]).map(|e| e.completion_cycles),
+            Some(19)
         );
     }
 

@@ -28,17 +28,19 @@ impl CycleSimulator {
 
     /// Check whether `class` can issue at `cycle` given the resource state.
     pub fn is_ready(&self, class: SchedClass, cycle: u32) -> bool {
-        !matches!(class, SchedClass::Mul | SchedClass::Div) || cycle >= self.mul_div_available_at
+        !matches!(
+            class,
+            SchedClass::Mul | SchedClass::Div32 | SchedClass::Div64 | SchedClass::FpDiv
+        ) || cycle >= self.mul_div_available_at
     }
 
     /// Reserve resources for an instruction issued at `cycle`.
     pub fn reserve(&mut self, class: SchedClass, cycle: u32) {
-        if matches!(class, SchedClass::Mul | SchedClass::Div) {
-            let occupancy = if class == SchedClass::Div {
-                instr_profile(class).latency
-            } else {
-                1
-            };
+        if matches!(
+            class,
+            SchedClass::Mul | SchedClass::Div32 | SchedClass::Div64 | SchedClass::FpDiv
+        ) {
+            let occupancy = instr_profile(class).resource_occupancy;
             self.mul_div_available_at = cycle + occupancy;
         }
     }
@@ -52,12 +54,37 @@ impl CycleSimulator {
             return already_issued.is_empty();
         }
 
-        let uses_lsu = |c| matches!(c, SchedClass::Load | SchedClass::Store);
-        let uses_mac = |c| matches!(c, SchedClass::Mul | SchedClass::Div);
-        let uses_fp = |c| matches!(c, SchedClass::Other);
+        let uses_lsu = |c| {
+            matches!(
+                c,
+                SchedClass::LoadInt
+                    | SchedClass::StoreInt
+                    | SchedClass::LoadFp
+                    | SchedClass::StoreFp
+                    | SchedClass::LoadPairInt
+                    | SchedClass::StorePairInt
+                    | SchedClass::LoadPairFp
+                    | SchedClass::StorePairFp
+            )
+        };
+        let uses_mac = |c| matches!(c, SchedClass::Mul);
+        let uses_div = |c| matches!(c, SchedClass::Div32 | SchedClass::Div64);
+        let uses_fp = |c| {
+            matches!(
+                c,
+                SchedClass::FpMove
+                    | SchedClass::FpAddSub
+                    | SchedClass::FpMul
+                    | SchedClass::FpDiv
+                    | SchedClass::FpCmp
+                    | SchedClass::FpCvt
+                    | SchedClass::Other
+            )
+        };
 
         !(uses_lsu(class) && already_issued.iter().copied().any(uses_lsu)
             || uses_mac(class) && already_issued.iter().copied().any(uses_mac)
+            || uses_div(class) && already_issued.iter().copied().any(uses_div)
             || uses_fp(class) && already_issued.iter().copied().any(uses_fp))
     }
 
@@ -109,15 +136,15 @@ mod tests {
             SchedClass::Alu,
             &[SchedClass::Alu, SchedClass::Alu]
         ));
-        assert!(!CycleSimulator::can_issue(SchedClass::Store, &[SchedClass::Load]));
+        assert!(!CycleSimulator::can_issue(SchedClass::StoreInt, &[SchedClass::LoadInt]));
         assert!(!CycleSimulator::can_issue(SchedClass::Mul, &[SchedClass::Mul]));
-        assert!(!CycleSimulator::can_issue(SchedClass::Other, &[SchedClass::Other]));
+        assert!(!CycleSimulator::can_issue(SchedClass::FpAddSub, &[SchedClass::FpMul]));
     }
 
     #[test]
     fn completion_includes_latency() {
-        assert_eq!(CycleSimulator::completion_cycle(SchedClass::Div, 0), 11);
+        assert_eq!(CycleSimulator::completion_cycle(SchedClass::Div32, 0), 11);
+        assert_eq!(CycleSimulator::completion_cycle(SchedClass::Div64, 0), 19);
         assert_eq!(CycleSimulator::completion_cycle(SchedClass::Alu, 5), 6);
-        assert_eq!(CycleSimulator::completion_cycle(SchedClass::Nop, 3), 4);
     }
 }

@@ -57,7 +57,7 @@ pub struct PairCombineStats {
     pub changed: bool,
     pub load_pairs_formed: u64,
     pub store_pairs_formed: u64,
-    pub tombstone_nops_created: u64,
+    pub tombstone_removed_created: u64,
 }
 
 impl PairCombineStats {
@@ -66,7 +66,7 @@ impl PairCombineStats {
         self.changed |= other.changed;
         self.load_pairs_formed += other.load_pairs_formed;
         self.store_pairs_formed += other.store_pairs_formed;
-        self.tombstone_nops_created += other.tombstone_nops_created;
+        self.tombstone_removed_created += other.tombstone_removed_created;
     }
 }
 

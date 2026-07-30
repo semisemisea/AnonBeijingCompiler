@@ -371,6 +371,9 @@ pub enum SelectValue {
 #[derive(Clone, Debug)]
 pub enum MInst {
     Nop,
+    /// Tombstone left by a MIR pass that consumed the original instruction.
+    /// Emits nothing; the emitter must skip it.
+    Removed,
     AluRRR {
         op: AluOp,
         size: OperandSize,
@@ -704,7 +707,7 @@ impl MachInst for MInst {
 
     fn get_operands(&mut self, collector: &mut impl OperandVisitor) {
         match self {
-            Self::Nop | Self::BCond { .. } | Self::Jump { .. } | Self::Ret => {}
+            Self::Nop | Self::Removed | Self::BCond { .. } | Self::Jump { .. } | Self::Ret => {}
             Self::AluRRR { dst, lhs, rhs, .. } => {
                 use_reg_or_zr(collector, lhs);
                 use_reg_or_zr(collector, rhs);
@@ -981,6 +984,7 @@ impl MachInstEmit for MInst {
     fn emit(&self, ctx: &mut dyn EmitContext) -> core::fmt::Result {
         match self {
             Self::Nop => write!(ctx, "nop"),
+            Self::Removed => Ok(()),
             Self::AluRRR {
                 op,
                 size,

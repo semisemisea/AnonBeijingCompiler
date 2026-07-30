@@ -636,7 +636,7 @@ fn may_alias(a: MemAccess, b: MemAccess) -> bool {
 /// fields directly. Post-RA, all Reg fields hold physical registers.
 pub fn inst_deps(inst: &MInst) -> InstDeps {
     match inst {
-        MInst::Nop => InstDeps {
+        MInst::Nop | MInst::Removed => InstDeps {
             defs: vec![],
             uses: vec![],
             flags_def: false,

@@ -148,7 +148,7 @@ fn combine_mac_in_block(
         };
 
         if let Some(fused_inst) = fused {
-            *vcode.inst_mut(i) = MInst::Nop;
+            *vcode.inst_mut(i) = MInst::Removed;
             *vcode.inst_mut(i + 1) = fused_inst;
             fused_count += 1;
             // Skip past the fused pair.

@@ -33,9 +33,9 @@ impl MIRPass<MInst> for PairCombine {
                         MInst::StorePair { .. } => stats.pair.store_pairs_formed += 1,
                         _ => unreachable!(),
                     }
-                    stats.pair.tombstone_nops_created += 1;
+                    stats.pair.tombstone_removed_created += 1;
                     *vcode.inst_mut(i) = pair;
-                    *vcode.inst_mut(i + 1) = MInst::Nop;
+                    *vcode.inst_mut(i + 1) = MInst::Removed;
                     changed = true;
                     i += 2;
                 } else {

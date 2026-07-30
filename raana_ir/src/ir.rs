@@ -6,6 +6,7 @@ pub mod inst_kind;
 pub(crate) mod instruction;
 pub mod layout;
 pub(crate) mod program;
+pub(crate) mod remap;
 pub(crate) mod types;
 
 pub mod builder_trait {

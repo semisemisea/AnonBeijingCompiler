@@ -45,48 +45,6 @@ impl EdgeTable {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Node {
-    pub func: Function,
-    pub inst: Inst,
-}
-
-impl Node {
-    pub fn new(func: Function, inst: Inst) -> Self {
-        Self { func, inst }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CallSite {
-    pub call: Inst,
-    pub caller: Function,
-    pub callee: Function,
-    /// The instruction right next to the call instruction.
-    pub continuation: Inst,
-}
-
-#[derive(Debug, Default)]
-pub struct CallSiteTable {
-    calls: Vec<Inst>,
-    callers: Vec<Function>,
-    callees: Vec<Function>,
-    continuations: Vec<Inst>,
-}
-
-impl CallSiteTable {
-    fn push(&mut self, call: Inst, caller: Function, callee: Function, continuation: Inst) {
-        self.calls.push(call);
-        self.callers.push(caller);
-        self.callees.push(callee);
-        self.continuations.push(continuation);
-    }
-
-    fn len(&self) -> usize {
-        self.calls.len()
-    }
-}
-
 pub struct ICFG {
     /// Entry function for a program. Usually `main` function.
     entry_func: Function,
@@ -547,7 +505,13 @@ mod tests {
             data.layout_mut().insert_inst(entry, ret);
             (
                 ret,
-                *data.layout().entry_bb().unwrap().insts().get_first().unwrap(),
+                *data
+                    .layout()
+                    .entry_bb()
+                    .unwrap()
+                    .insts()
+                    .get_first()
+                    .unwrap(),
             )
         };
 
@@ -568,7 +532,9 @@ mod tests {
             let data = program.func_data_mut(main);
             let entry = data.add_entry_block();
             let val = data.new_local_inst().integer(42);
-            let call = data.new_local_inst().call_with_type(f, vec![val], Type::get_i32());
+            let call = data
+                .new_local_inst()
+                .call_with_type(f, vec![val], Type::get_i32());
             let ret = data.new_local_inst().ret(Some(call));
             data.layout_mut().insert_inst(entry, call);
             data.layout_mut().insert_inst(entry, ret);
@@ -583,7 +549,9 @@ mod tests {
         assert_eq!(cs.callee, g);
 
         // Call edge: (f, tail_call) -> (g, g_entry)
-        let f_out = icfg.outgoing_edges_of(Node::new(f, tail_call)).collect::<Vec<_>>();
+        let f_out = icfg
+            .outgoing_edges_of(Node::new(f, tail_call))
+            .collect::<Vec<_>>();
         let call_edge = f_out
             .iter()
             .find(|e| e.edge_type == EdgeType::Call)
@@ -591,7 +559,9 @@ mod tests {
         assert_eq!(call_edge.dst, Node::new(g, g_entry));
 
         // Return edge (relay input): (g, g_ret) -> (f, tail_call)
-        let g_out = icfg.outgoing_edges_of(Node::new(g, g_ret)).collect::<Vec<_>>();
+        let g_out = icfg
+            .outgoing_edges_of(Node::new(g, g_ret))
+            .collect::<Vec<_>>();
         let return_edge = g_out
             .iter()
             .find(|e| e.edge_type == EdgeType::Return)

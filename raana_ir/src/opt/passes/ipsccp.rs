@@ -2,7 +2,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::opt::{
-    analysis_passes::icfg::{Edge, EdgeType, Node},
+    analysis_passes::icfg::{Edge, EdgeType},
     prelude::*,
     utils::visit_and_replace,
 };
@@ -123,16 +123,6 @@ impl Pass for IPSCCP {
         };
         edge_worklist.push_back(start_edge);
         edge_visited.insert(start_edge);
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        struct Block {
-            func: Function,
-            block: BasicBlock,
-        }
-        impl Block {
-            fn new(func: Function, block: BasicBlock) -> Block {
-                Block { func, block }
-            }
-        }
         let mut block_visited = FxHashSet::default();
 
         // Stage 1: Worklist algorithm.
@@ -299,8 +289,7 @@ impl Pass for IPSCCP {
                         let callee = tail_call.callee();
                         let callee_data = program.func_data(callee);
                         if !callee_data.layout().is_decl() {
-                            for (&arg, &param) in
-                                tail_call.args().iter().zip(callee_data.params())
+                            for (&arg, &param) in tail_call.args().iter().zip(callee_data.params())
                             {
                                 let arg_status = lattice_map.get(Node::new(func, arg));
                                 merge_and_extend(
@@ -317,9 +306,7 @@ impl Pass for IPSCCP {
                         // propagate it further along this node's outgoing Return
                         // edges, which connect to the caller's call site.
                         let node_status = lattice_map.get(node);
-                        for Edge { dst, edge_type, .. } in
-                            icfg.outgoing_edges_of(node)
-                        {
+                        for Edge { dst, edge_type, .. } in icfg.outgoing_edges_of(node) {
                             if edge_type != EdgeType::Return {
                                 continue;
                             }
@@ -364,11 +351,7 @@ impl Pass for IPSCCP {
                                     Some(cs) => Node::new(dst.func, cs.call),
                                     None => dst,
                                 };
-                                if merge_and_extend(
-                                    target,
-                                    ret_val_status,
-                                    &mut lattice_map,
-                                ) {
+                                if merge_and_extend(target, ret_val_status, &mut lattice_map) {
                                     // The relay node's lattice was set externally
                                     // (by us, not by its own evaluation), so it will
                                     // not be revisited through `used_by`. Re-schedule
@@ -568,8 +551,8 @@ mod tests {
     use super::*;
     use crate::{
         ir::{
-            builder::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
             BinaryOp,
+            builder::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
         },
         llvm::LlvmWriter,
     };
@@ -661,10 +644,8 @@ mod tests {
         // would be Constant(0) and `replace_inst_with` would have mutated its
         // data to Integer(0).
         let data = program.func_data(fun);
-        assert!(matches!(
-            data.inst_data(dep_param).kind(),
-            InstKind::BlockArgRef(..)
-        ),
+        assert!(
+            matches!(data.inst_data(dep_param).kind(), InstKind::BlockArgRef(..)),
             "dep parameter was constant-propagated — tail-call arg propagation is broken"
         );
     }

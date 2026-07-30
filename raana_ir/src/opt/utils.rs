@@ -1,5 +1,9 @@
 use std::collections::{HashMap, hash_map::Entry};
 
+pub(crate) mod body_clone;
+pub mod call;
+pub mod global_handle;
+
 use crate::{
     ir::{
         BasicBlock, FunctionData, Inst, InstKind, Type, TypeKind,

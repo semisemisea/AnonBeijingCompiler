@@ -31,4 +31,7 @@ pub mod prelude {
     pub use super::utils::IDAllocator;
     // utils
     pub use super::utils;
+
+    pub use utils::call::*;
+    pub use utils::global_handle::*;
 }

@@ -87,13 +87,13 @@ impl Arena for ArenaContextMut<'_> {
 pub trait Pass: Send + Sync {
     /// Runs this pass over every function once and reports whether it changed IR.
     fn run(&self, program: &mut Program) -> bool {
-        let funcs = program.global_arena().func_arena().funcs();
+        let func_layout = program.function_layout().to_vec();
         let mut arena_context = ArenaContextMut {
             program,
             curr_func: None,
         };
         let mut changed = false;
-        for func in funcs {
+        for func in func_layout {
             arena_context.curr_func = Some(func);
             changed |= self.run_on(&mut arena_context);
         }
@@ -162,6 +162,9 @@ impl PassesManager {
             let ssa = Box::new(ssa::SSATransform);
             p.register_initial(ssa);
 
+            let inline = Box::new(inline::Inline);
+            p.register_initial(inline);
+
             let tco_initial = Box::new(tco::TailCallElim);
             p.register_initial(tco_initial);
 
@@ -193,6 +196,7 @@ impl PassesManager {
 
             let dpe = dce::DeadPhiElimination;
             p.register(Box::new(dpe));
+
             let dce = dce::DeadCodeElimination;
             p.register(Box::new(dce));
 

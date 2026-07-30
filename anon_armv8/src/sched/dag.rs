@@ -740,7 +740,12 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             is_barrier: false,
         },
 
-        MInst::SDiv { size, dst, lhs, rhs } => InstDeps {
+        MInst::SDiv {
+            size,
+            dst,
+            lhs,
+            rhs,
+        } => InstDeps {
             defs: preg(dst.reg),
             uses: [preg(*lhs), preg(*rhs)].into_iter().flatten().collect(),
             flags_def: false,

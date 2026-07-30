@@ -94,11 +94,7 @@ impl CycleSimulator {
     /// This is the single rule used by both the scheduler and the estimator.
     /// An edge with latency `L` from predecessor `P` to node `N` means `N`
     /// cannot issue before `issued[P] + L`.
-    pub fn earliest_issue_cycle(
-        dag: &DepGraph,
-        node: usize,
-        issued_at: &[Option<u32>],
-    ) -> u32 {
+    pub fn earliest_issue_cycle(dag: &DepGraph, node: usize, issued_at: &[Option<u32>]) -> u32 {
         let mut earliest = 0u32;
         for &pred in &dag.preds[node] {
             let pred_issued = issued_at[pred].unwrap_or(0);
@@ -125,20 +121,38 @@ mod tests {
     #[test]
     fn barrier_must_issue_alone() {
         assert!(CycleSimulator::can_issue(SchedClass::Barrier, &[]));
-        assert!(!CycleSimulator::can_issue(SchedClass::Barrier, &[SchedClass::Alu]));
-        assert!(!CycleSimulator::can_issue(SchedClass::Alu, &[SchedClass::Barrier]));
+        assert!(!CycleSimulator::can_issue(
+            SchedClass::Barrier,
+            &[SchedClass::Alu]
+        ));
+        assert!(!CycleSimulator::can_issue(
+            SchedClass::Alu,
+            &[SchedClass::Barrier]
+        ));
     }
 
     #[test]
     fn dual_issue_respects_resource_limits() {
-        assert!(CycleSimulator::can_issue(SchedClass::Alu, &[SchedClass::Alu]));
+        assert!(CycleSimulator::can_issue(
+            SchedClass::Alu,
+            &[SchedClass::Alu]
+        ));
         assert!(!CycleSimulator::can_issue(
             SchedClass::Alu,
             &[SchedClass::Alu, SchedClass::Alu]
         ));
-        assert!(!CycleSimulator::can_issue(SchedClass::StoreInt, &[SchedClass::LoadInt]));
-        assert!(!CycleSimulator::can_issue(SchedClass::Mul, &[SchedClass::Mul]));
-        assert!(!CycleSimulator::can_issue(SchedClass::FpAddSub, &[SchedClass::FpMul]));
+        assert!(!CycleSimulator::can_issue(
+            SchedClass::StoreInt,
+            &[SchedClass::LoadInt]
+        ));
+        assert!(!CycleSimulator::can_issue(
+            SchedClass::Mul,
+            &[SchedClass::Mul]
+        ));
+        assert!(!CycleSimulator::can_issue(
+            SchedClass::FpAddSub,
+            &[SchedClass::FpMul]
+        ));
     }
 
     #[test]

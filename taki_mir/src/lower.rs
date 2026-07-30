@@ -215,9 +215,7 @@ pub trait LowerBackend {
     /// `finalize_for_emission`, immediately before assembly emission. The
     /// default returns an empty pipeline; backends override this to register
     /// peephole, scheduling, and other machine-code passes.
-    fn mir_pipeline(
-        _config: &Self::CodegenConfig,
-    ) -> crate::passes::MIRPassPipeline<Self::MInst> {
+    fn mir_pipeline(_config: &Self::CodegenConfig) -> crate::passes::MIRPassPipeline<Self::MInst> {
         crate::passes::MIRPassPipeline::new()
     }
 }

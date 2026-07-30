@@ -175,7 +175,9 @@ pub fn generic_profile(class: SchedClass) -> InstrProfile {
 }
 
 /// Select the profile function for a given scheduler model.
-pub fn profile_for_model(model: crate::config::AArch64SchedModel) -> fn(SchedClass) -> InstrProfile {
+pub fn profile_for_model(
+    model: crate::config::AArch64SchedModel,
+) -> fn(SchedClass) -> InstrProfile {
     match model {
         crate::config::AArch64SchedModel::CortexA53 => instr_profile,
     }
@@ -189,8 +191,7 @@ pub fn can_dual_issue(first: SchedClass, second: SchedClass) -> bool {
     // Check slot compatibility: at least one valid slot assignment must exist.
     let slots_work = (p1.allowed_slots.can_issue_to(Slot::Alu0)
         && p2.allowed_slots.can_issue_to(Slot::Alu1))
-        || (p1.allowed_slots.can_issue_to(Slot::Alu1)
-            && p2.allowed_slots.can_issue_to(Slot::Alu0));
+        || (p1.allowed_slots.can_issue_to(Slot::Alu1) && p2.allowed_slots.can_issue_to(Slot::Alu0));
     if !slots_work {
         return false;
     }

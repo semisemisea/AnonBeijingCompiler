@@ -245,6 +245,10 @@ impl MemoryType {
             Self::I64 | Self::F64 => 8,
         }
     }
+
+    pub const fn is_float(self) -> bool {
+        matches!(self, Self::F32 | Self::F64)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

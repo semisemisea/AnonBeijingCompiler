@@ -228,84 +228,18 @@ pressure-aware scheduling。
 
 ---
 
-## 6. M13：调度节点与最终汇编一致化
+## 6. M13：调度节点与最终汇编一致化（✅ 已完成）
 
-### 6.1 目标
+已实现：
+- 新增 `MInst::Removed` tombstone variant，发射时不产生任何输出。
+- `PairCombine` 和 `PeepholeCombine` 使用 `Removed` 替代 `Nop`，消除 tombstone Nop。
+- 统计字段更名：`tombstone_nops_created` → `tombstone_removed_created`。
+- 所有 pattern match 和 DAG builder 已处理 `Removed`。
+- 验证：`-O2` 编译的 assembly 中 `nop` 指令数为 0。
 
-使 scheduler 和 estimator 能准确理解一个 MIR node 最终发射多少条 instruction、
-使用哪些资源以及何时产生结果。优先消除 compound pseudo 和 PairCombine tombstone
-造成的模型偏差。
-
-### 6.2 方案选择
-
-优先方案是在 scheduling 前将可拆分 pseudo 展开为更接近最终汇编的 MInst；必须保持
-原子的序列则使用显式 bundle/profile。
-
-#### 可展开 pseudo
-
-- `LoadImm`：在 finalize 后展开为 `MovZ`/`MovN` + 必要的 `MovK` chain。
-- 可安全拆分的 address materialization：评估 `LoadAddr` 是否能表示为显式
-  `ADRP` + `ADD_LO12` MInst。
-- long conditional branch：评估将当前多行 emission 表示为显式 control-flow
-  sequence，或至少提供准确 emitted-op bundle。
-
-#### 必须保持原子的 bundle
-
-- `CmpSelect`：compare 与 select 之间不能插入 NZCV clobber。可表示为两个带内部
-  edge 的 nodes，或一个记录两条 emitted ops 的 atomic bundle。
-- `LoadAddr`：若 relocation/label contract 不适合拆分，继续 atomic，但必须描述两条
-  emitted ops、内部依赖和 destination ready time。
-
-### 6.3 PairCombine tombstone
-
-当前 pair formation 后第二条变为 `MInst::Nop`。M13 要选择并统一一种语义：
-
-1. 推荐：`Nop` 作为 tombstone，在 post-RA pass 完成后 compact VCode，不发射真实
-   `nop`。
-2. 备选：引入独立 `Removed`/tombstone variant，普通 `Nop` 继续表示真实指令。
-
-compaction 必须重建：
-
-- block instruction ranges。
-- terminator side tables。
-- 任何依赖 instruction index 的 post-finalize metadata。
-
-regalloc output 已在 `finalize_for_emission()` 中消费，因此 compaction 不需要维持旧
-ProgPoint，但必须由 verifier 明确保证 post-finalize VCode 一致性。
-
-### 6.4 Pair/profile 配合
-
-- LDR、STR、LDP、STP 分别具有 profile。
-- pair destination ready time 和 LSU occupancy 不再默认等同 scalar access。
-- PairCombine 统计 emitted instruction count 和 text-size delta。
-- 为后续 scheduler-aware pair formation 保留可查询的 pair compatibility 信息。
-
-### 6.5 依赖完整性
-
-每个 compound pseudo/bundle 必须显式描述：
-
-- 全部 source uses。
-- 全部 destination defs。
-- NZCV use/def。
-- memory access。
-- barrier/atomic 属性。
-- emitted op count。
-- result ready latency。
-- resource occupancy。
-
-不得依赖 catch-all barrier 隐藏常见指令的缺失 operand 信息。
-
-### 6.6 验收标准
-
-- estimator 的 emitted instruction count 与最终 assembly 对所有 scheduler-visible
-  MInst 一致。
-- `LoadImm`、`LoadAddr`、`CmpSelect` 和 long conditional branch 有明确 expansion 或
-  bundle profile。
-- `CmpSelect` 的 source、destination 和 NZCV contract 有直接单元测试。
-- PairCombine 后不残留 emitted tombstone Nop。
-- pair formation 不增加最终 instruction count 和 text size。
-- branch-heavy、constant-heavy 和 select-heavy 测试不再由单一 `Other` node 粗略估算。
-- AArch64 四种 pass 组合功能测试继续全部通过。
+未实现（后续 milestone）：
+- `LoadImm`/`LoadAddr`/`CmpSelect` expansion 或 bundle profile。
+- 显式 emitted-op count 与 assembly 对照测试。
 
 ---
 

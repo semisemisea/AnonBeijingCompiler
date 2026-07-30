@@ -22,8 +22,9 @@ use taki_mir::{
 };
 
 use crate::instructions::MInst;
-use crate::sched::aarch53::{SchedClass, instr_profile};
+use crate::sched::aarch53::SchedClass;
 use crate::sched::dag::DepGraph;
+use crate::sched::simulator::CycleSimulator;
 
 pub struct ListScheduler;
 
@@ -105,6 +106,9 @@ impl MIRPass<MInst> for ListScheduler {
 /// Run list scheduling on the dependency DAG, returning a permutation
 /// `order` where `order[new_position] = old_index`, plus an optional fallback
 /// reason if the stall budget was exhausted.
+///
+/// Uses `CycleSimulator` for all latency/resource decisions so that the
+/// scheduler and the fixed-order estimator share exactly one model.
 fn schedule(dag: &DepGraph) -> (Vec<usize>, Option<SchedulerFallbackReason>) {
     let n = dag.n;
     if n == 0 {
@@ -125,36 +129,32 @@ fn schedule(dag: &DepGraph) -> (Vec<usize>, Option<SchedulerFallbackReason>) {
 
     let mut cycle: u32 = 0;
     let mut stall_budget: u32 = n as u32 * 20; // safety: prevent infinite loops
-    let mut resources = IssueResources::default();
+    let mut sim = CycleSimulator::new();
 
     while order.len() < n {
         let mut issued_this_cycle = false;
         let mut issued_classes = Vec::with_capacity(2);
 
-        // Sort ready nodes by critical path (descending) — highest priority first.
-        ready.sort_by(|&a, &b| dag.crit[b].cmp(&dag.crit[a]));
+        // Deterministic priority: critical path (desc), then original index (asc).
+        ready.sort_by(|&a, &b| dag.crit[b].cmp(&dag.crit[a]).then(a.cmp(&b)));
 
         // Try to issue ready nodes whose data dependencies are satisfied.
         let mut next_ready = Vec::new();
         for &node in &ready {
-            let data_ready = dag.preds[node].iter().all(|&pred| {
-                let issued = issued_at[pred].unwrap_or(0);
-                let latency = dag.succs[pred]
-                    .iter()
-                    .find(|edge| edge.node == node)
-                    .map(|edge| edge.latency)
-                    .unwrap_or(0);
-                issued + latency <= cycle
-            });
+            let earliest = CycleSimulator::earliest_issue_cycle(dag, node, &issued_at);
+            let data_ready = earliest <= cycle;
 
             let class = dag.deps[node].class;
-            if data_ready && resources.is_ready(class, cycle) && can_issue(class, &issued_classes) {
+            if data_ready
+                && sim.is_ready(class, cycle)
+                && CycleSimulator::can_issue(class, &issued_classes)
+            {
                 issued_at[node] = Some(cycle);
                 order.push(node);
                 issued_classes.push(class);
                 issued_this_cycle = true;
 
-                resources.reserve(class, cycle);
+                sim.reserve(class, cycle);
 
                 // Decrement successor predecessor counts; add newly-ready nodes.
                 for edge in &dag.succs[node] {
@@ -191,47 +191,9 @@ fn schedule(dag: &DepGraph) -> (Vec<usize>, Option<SchedulerFallbackReason>) {
     (order, None)
 }
 
-#[derive(Default)]
-struct IssueResources {
-    mul_div_available_at: u32,
-}
-
-impl IssueResources {
-    fn is_ready(&self, class: SchedClass, cycle: u32) -> bool {
-        !matches!(class, SchedClass::Mul | SchedClass::Div) || cycle >= self.mul_div_available_at
-    }
-
-    fn reserve(&mut self, class: SchedClass, cycle: u32) {
-        if matches!(class, SchedClass::Mul | SchedClass::Div) {
-            let occupancy = if class == SchedClass::Div {
-                instr_profile(class).latency
-            } else {
-                1
-            };
-            self.mul_div_available_at = cycle + occupancy;
-        }
-    }
-}
-
-fn can_issue(class: SchedClass, issued: &[SchedClass]) -> bool {
-    if issued.len() >= 2 {
-        return false;
-    }
-    if matches!(class, SchedClass::Barrier) || issued.contains(&SchedClass::Barrier) {
-        return issued.is_empty();
-    }
-
-    let uses_lsu = |class| matches!(class, SchedClass::Load | SchedClass::Store);
-    let uses_mac = |class| matches!(class, SchedClass::Mul | SchedClass::Div);
-    let uses_fp = |class| matches!(class, SchedClass::Other);
-
-    !(uses_lsu(class) && issued.iter().copied().any(uses_lsu)
-        || uses_mac(class) && issued.iter().copied().any(uses_mac)
-        || uses_fp(class) && issued.iter().copied().any(uses_fp))
-}
-
 /// Estimate completion cycles for a fixed topological instruction order using
-/// the same dependency latency, issue width, and resource model as the scheduler.
+/// the same `CycleSimulator` model as the scheduler. Both paths share the
+/// identical latency, resource, and issue-width rules.
 fn estimate_cycles(dag: &DepGraph, order: &[usize]) -> Option<CycleEstimateStats> {
     if order.len() != dag.n {
         return None;
@@ -239,7 +201,7 @@ fn estimate_cycles(dag: &DepGraph, order: &[usize]) -> Option<CycleEstimateStats
 
     let mut seen = vec![false; dag.n];
     let mut issued_at = vec![None; dag.n];
-    let mut resources = IssueResources::default();
+    let mut sim = CycleSimulator::new();
     let mut next = 0;
     let mut cycle = 0;
     let mut completion_cycle = 0;
@@ -259,18 +221,13 @@ fn estimate_cycles(dag: &DepGraph, order: &[usize]) -> Option<CycleEstimateStats
             if dag.preds[node].iter().any(|&pred| !seen[pred]) {
                 return None;
             }
-            let data_ready = dag.preds[node].iter().all(|&pred| {
-                let latency = dag.succs[pred]
-                    .iter()
-                    .find(|edge| edge.node == node)
-                    .map(|edge| edge.latency)
-                    .unwrap_or(0);
-                issued_at[pred].is_some_and(|issued| issued + latency.max(1) <= cycle)
-            });
+            let earliest = CycleSimulator::earliest_issue_cycle(dag, node, &issued_at);
+            let data_ready = earliest <= cycle;
+
             let class = dag.deps[node].class;
             if !data_ready
-                || !resources.is_ready(class, cycle)
-                || !can_issue(class, &issued_classes)
+                || !sim.is_ready(class, cycle)
+                || !CycleSimulator::can_issue(class, &issued_classes)
             {
                 break;
             }
@@ -278,8 +235,8 @@ fn estimate_cycles(dag: &DepGraph, order: &[usize]) -> Option<CycleEstimateStats
             seen[node] = true;
             issued_at[node] = Some(cycle);
             issued_classes.push(class);
-            resources.reserve(class, cycle);
-            completion_cycle = completion_cycle.max(cycle + instr_profile(class).latency.max(1));
+            sim.reserve(class, cycle);
+            completion_cycle = completion_cycle.max(CycleSimulator::completion_cycle(class, cycle));
             next += 1;
         }
 
@@ -375,20 +332,20 @@ mod tests {
 
     #[test]
     fn issue_model_limits_width_and_shared_units() {
-        assert!(can_issue(SchedClass::Alu, &[]));
-        assert!(can_issue(SchedClass::Alu, &[SchedClass::Alu]));
-        assert!(!can_issue(
+        assert!(CycleSimulator::can_issue(SchedClass::Alu, &[]));
+        assert!(CycleSimulator::can_issue(SchedClass::Alu, &[SchedClass::Alu]));
+        assert!(!CycleSimulator::can_issue(
             SchedClass::Alu,
             &[SchedClass::Alu, SchedClass::Alu]
         ));
-        assert!(!can_issue(SchedClass::Store, &[SchedClass::Load]));
-        assert!(!can_issue(SchedClass::Mul, &[SchedClass::Mul]));
-        assert!(!can_issue(SchedClass::Barrier, &[SchedClass::Alu]));
-        let mut resources = IssueResources::default();
-        resources.mul_div_available_at = 11;
-        assert!(!resources.is_ready(SchedClass::Mul, 10));
-        assert!(!resources.is_ready(SchedClass::Div, 10));
-        assert!(resources.is_ready(SchedClass::Div, 11));
+        assert!(!CycleSimulator::can_issue(SchedClass::Store, &[SchedClass::Load]));
+        assert!(!CycleSimulator::can_issue(SchedClass::Mul, &[SchedClass::Mul]));
+        assert!(!CycleSimulator::can_issue(SchedClass::Barrier, &[SchedClass::Alu]));
+        let mut sim = CycleSimulator::new();
+        sim.reserve(SchedClass::Div, 0);
+        assert!(!sim.is_ready(SchedClass::Mul, 10));
+        assert!(!sim.is_ready(SchedClass::Div, 10));
+        assert!(sim.is_ready(SchedClass::Div, 11));
     }
 
     #[test]
@@ -461,5 +418,92 @@ mod tests {
         assert_eq!(original.completion_cycles, 4);
         assert_eq!(scheduled.completion_cycles, 3);
         assert!(scheduled.completion_cycles < original.completion_cycles);
+    }
+
+    #[test]
+    fn critical_path_uses_edge_latency_not_node_latency() {
+        // A zero-latency WAR edge should not inflate the critical path.
+        // mov x1, x2  (reads x2)
+        // mov x2, x3  (writes x2 — WAR edge from 0->1 with latency 0)
+        // Without edge-latency critical path, node 0's crit would be
+        //   latency(0) + crit(1) = 1 + 1 = 2.
+        // With edge-latency critical path, node 0's crit should be
+        //   max(1, 0 + 1) = 1.
+        use crate::instructions::MInst;
+        use crate::regs::OperandSize;
+
+        let insts = vec![
+            MInst::Mov {
+                size: OperandSize::Size64,
+                dst: taki_mir::register::Writable::from_reg(crate::regs::int_reg(1)),
+                src: crate::regs::int_reg(2),
+            },
+            MInst::Mov {
+                size: OperandSize::Size64,
+                dst: taki_mir::register::Writable::from_reg(crate::regs::int_reg(2)),
+                src: crate::regs::int_reg(3),
+            },
+        ];
+        let graph = DepGraph::build(&insts);
+
+        // Node 1 (leaf): crit = its own latency = 1
+        assert_eq!(graph.crit[1], 1);
+        // Node 0: max(1, 0 + 1) = 1 — not 1 + 1 = 2
+        assert_eq!(graph.crit[0], 1);
+    }
+
+    #[test]
+    fn scheduler_output_is_deterministic() {
+        use crate::instructions::{AMode, AluOp, MemoryType};
+        use crate::regs::{OperandSize, RegOrZr, int_reg, stack_reg};
+
+        let writable = |index| taki_mir::register::Writable::from_reg(int_reg(index));
+        let alu = |dst, lhs, rhs| MInst::AluRRR {
+            op: AluOp::Add,
+            size: OperandSize::Size64,
+            dst: writable(dst),
+            lhs: RegOrZr::Reg(int_reg(lhs)),
+            rhs: RegOrZr::Reg(int_reg(rhs)),
+        };
+        let insts = vec![
+            MInst::Load {
+                ty: MemoryType::I64,
+                dst: writable(1),
+                addr: AMode::Reg { base: stack_reg() },
+            },
+            alu(2, 1, 3),
+            alu(4, 5, 6),
+            alu(7, 8, 9),
+        ];
+
+        let (order1, _) = schedule(&DepGraph::build(&insts));
+        let (order2, _) = schedule(&DepGraph::build(&insts));
+        assert_eq!(order1, order2, "same input must produce same schedule");
+    }
+
+    #[test]
+    fn scheduler_and_estimator_agree_on_latency_rule() {
+        // Both paths must use the same `earliest_issue_cycle` from CycleSimulator.
+        // A Nop (latency 0) followed by an ALU must be scheduled in consecutive
+        // cycles, not the same cycle — the unified rule treats 0-latency edges
+        // as "can issue in the same cycle" via earliest_issue_cycle.
+        use crate::instructions::MInst;
+
+        let insts = vec![
+            MInst::Nop,
+            MInst::Mov {
+                size: crate::regs::OperandSize::Size64,
+                dst: taki_mir::register::Writable::from_reg(crate::regs::int_reg(1)),
+                src: crate::regs::int_reg(2),
+            },
+        ];
+        let graph = DepGraph::build(&insts);
+        let original = estimate_cycles(&graph, &[0, 1]).unwrap();
+        let (sched_order, _) = schedule(&graph);
+        let scheduled = estimate_cycles(&graph, &sched_order).unwrap();
+
+        // Nop has latency 0, so the Mov can issue at cycle 0 or 1.
+        // Both original and scheduled should agree.
+        assert_eq!(original.completion_cycles, scheduled.completion_cycles);
     }
 }

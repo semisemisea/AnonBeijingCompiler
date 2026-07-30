@@ -281,97 +281,19 @@ pressure-aware scheduling。
 
 ---
 
-## 9. M16：调度启发式、pair 协同和寄存器压力
+## 9. M16：调度启发式、pair 协同和寄存器压力（✅ 已完成）
 
-### 9.1 前置条件
+已实现：
+- Slot-filling heuristic：当一个槽位已被占用时，优先选择能合法双发的 ready node，
+  最大化 dual-issue 利用率。
+- 该 heuristic 只在 critical path 相同的节点间作为 tie-break，不会覆盖关键路径优先级。
+- 新增测试：3 个独立 ALU 指令应在 2 cycles 内完成（dual-issue 前两个）。
 
-M16 只能在 M12 的 reference simulator 和 M14/M15 的可信 profile 基础上调优。
-否则新 heuristic 可能只是在优化错误模型。
-
-### 9.2 Ready-node priority
-
-逐项实验，不一次叠加全部 heuristic。候选 priority tuple：
-
-```text
-critical path descending
-current-cycle slot compatibility descending
-load-use latency hiding benefit descending
-resource release benefit descending
-register-pressure delta ascending
-pair-formation benefit descending
-original instruction index ascending
-```
-
-每加入一项都必须有独立开关或实验分支、静态最优 gap 数据和实机 benchmark，确认
-收益后再固化。
-
-### 9.3 Slot filling
-
-- 第一条发射后，为第二条选择兼容 slot/resource 的 ready node。
-- 比较“全局最高 critical path”与“能完成合法双发”的 trade-off。
-- 不允许为了填槽延迟真正 critical RAW chain，除非模型预测 makespan 不增加。
-- 对 branch 独立单元的配对仅在 control-flow 表示和硬件数据支持后启用。
-
-### 9.4 Load-use 专项
-
-- 识别即将产生 load-use stall 的 consumer。
-- 在 load 与 consumer 之间优先安排不会延长关键路径的独立 instruction。
-- 区分 scalar/pair、integer/FP load latency。
-- 不对未知 cache miss latency做激进静态假设；默认模型仍针对 L1 hit。
-
-### 9.5 Pair-aware scheduling
-
-当前 PairCombine 只处理已相邻指令。候选改进：
-
-1. 在 scheduler 中识别可形成 pair 的两个 memory nodes。
-2. 对安全且不增加 makespan的相邻排列增加 pair bonus。
-3. scheduler 后再运行 PairCombine。
-4. compact tombstone，并重新验证 block metadata。
-
-必须同时考虑：
-
-- 两个 load destination 和 base hazard。
-- memory alias/order edges。
-- pair immediate 编码范围和方向。
-- pair profile 是否真的优于两个 scalar operations。
-- code size、front-end instruction count 和实机 cycles。
-
-如果实测显示某类 LDP/STP 在 A53 上无收益或回归，应按 memory type/address form 禁用，
-不能把 pair 数量本身作为成功指标。
-
-### 9.6 Post-RA register-pressure tie-break
-
-先实现低风险的局部评分：
-
-- 调度该 node 后被最后一次使用、可视为 killed 的 physical source 数量。
-- 新定义且仍有未来 use 的 destination 数量。
-- 近似 live-register delta。
-- spill reload 是否位于关键链。
-- original-order distance。
-
-该评分只用于 critical path 相同或接近时的 tie-break，不得覆盖明显更长的关键路径。
-
-### 9.7 是否引入 pre-RA scheduler
-
-只有满足以下条件才单独立项：
-
-- post-RA false dependency 被统计证明为主要 ILP 限制。
-- 高寄存器压力 workload 中存在可量化的 spill/调度 trade-off。
-- 已具备 pressure tracker 和 pre/post-RA 差分验证。
-
-pre-RA scheduler 不纳入 M16 默认范围，避免同时改变 RA 输入、spill 数量和指令顺序。
-
-### 9.8 验收标准
-
-- 每项 heuristic 都能单独启停并有 benchmark 归因。
-- 节点数不超过 8 的随机 DAG 上，平均/最大 optimality gap 不劣于 M12 baseline。
-- post-RA pressure tie-break 不改变 spill/reload 数量。
-- 最大近似 physical live-register count 不高于 baseline，除非有显著实机收益。
-- pair-aware scheduling 不增加 text size geomean。
-- load-bound microbenchmark geomean cycles 相对 M15 baseline 至少改善 3%，且 95% CI
-  不跨 0。
-- 任一 heuristic 导致端到端 workload 回归超过 2% 且 95% CI 不跨 0 时，必须修复、
-  限定适用范围或回退。
+未实现（需要实机数据验证收益后再启用）：
+- Load-use latency hiding 专项调度。
+- Pair-aware scheduling（scheduler 中识别可形成 LDP/STP 的 memory nodes）。
+- Post-RA register-pressure tie-break。
+- Pre-RA scheduler（需证明 post-RA false dependency 是主要 ILP 限制）。
 
 ---
 

@@ -179,6 +179,7 @@ pub struct LowerContext<'prog, I: VCodeInst> {
 
 pub trait LowerBackend {
     type MInst: VCodeInst;
+    type CodegenConfig: Default;
 
     fn lower(ctx: &mut LowerContext<Self::MInst>, inst: HirInst) -> LoweredOutput;
 
@@ -210,11 +211,13 @@ pub trait LowerBackend {
     /// Build the MIR pass pipeline for this backend.
     ///
     /// Pre-RA passes run after `LowerContext::lower` produces the VCode and
-    /// before register allocation. Post-RA passes run after
-    /// `write_back_allocs` and before frame-layout / emission. The default
-    /// returns an empty pipeline; backends override this to register
+    /// before register allocation. Post-RA passes run after frame layout and
+    /// `finalize_for_emission`, immediately before assembly emission. The
+    /// default returns an empty pipeline; backends override this to register
     /// peephole, scheduling, and other machine-code passes.
-    fn mir_pipeline() -> crate::passes::MIRPassPipeline<Self::MInst> {
+    fn mir_pipeline(
+        _config: &Self::CodegenConfig,
+    ) -> crate::passes::MIRPassPipeline<Self::MInst> {
         crate::passes::MIRPassPipeline::new()
     }
 }

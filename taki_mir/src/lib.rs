@@ -7,6 +7,7 @@ use crate::{
     emit::AsmWriter,
     lower::{LowerBackend, LowerContext},
     reg_alloc::function::Function,
+    stats::{CodegenStats, FunctionCodegenStats},
     vcode::MachInstEmit,
 };
 
@@ -19,6 +20,7 @@ pub mod lower;
 pub mod passes;
 pub mod reg_alloc;
 pub mod register;
+pub mod stats;
 pub mod types;
 pub mod vcode;
 
@@ -135,11 +137,27 @@ fn lower_global_init(program: &HirProgram, init: HirInst) -> Vec<GlobalData> {
     }
 }
 
+pub struct CompileOutput {
+    pub assembly: String,
+    pub stats: CodegenStats,
+}
+
 pub fn compile<B: LowerBackend>(p: &HirProgram) -> String
 where
     B::MInst: MachInstEmit,
 {
+    compile_with_config::<B>(p, &B::CodegenConfig::default()).assembly
+}
+
+pub fn compile_with_config<B: LowerBackend>(
+    p: &HirProgram,
+    config: &B::CodegenConfig,
+) -> CompileOutput
+where
+    B::MInst: MachInstEmit,
+{
     let mut buf = String::new();
+    let mut function_stats = Vec::new();
 
     let mut globals = vec![];
     for (gi, &inst) in p.global_inst_layout().iter().enumerate() {
@@ -190,13 +208,18 @@ where
 
     writeln!(buf, "{}", B::text_section_directive()).unwrap();
 
-    let pipeline = B::mir_pipeline();
+    let pipeline = B::mir_pipeline(config);
 
     for &func in p.function_layout() {
         let func_data = p.func_data(func);
         if func_data.layout().entry_bb().is_none() {
             continue;
         }
+
+        let mut stats = FunctionCodegenStats {
+            function: func_data.name().to_string(),
+            ..FunctionCodegenStats::default()
+        };
 
         let arena = ArenaContext {
             program: p,
@@ -211,7 +234,7 @@ where
             panic!("function={} {error}", func_data.name());
         });
 
-        if pipeline.run_pre_ra(&mut vcode, arena) {
+        if pipeline.run_pre_ra(&mut vcode, arena, &mut stats) {
             vcode.rebuild_operand_tables();
             vcode.verify("post-pre-RA-passes").unwrap_or_else(|error| {
                 log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
@@ -286,7 +309,7 @@ where
         // the emitter iterates the VCode directly.
         vcode.finalize_for_emission(&output);
 
-        if pipeline.run_post_ra(&mut vcode, arena) {
+        if pipeline.run_post_ra(&mut vcode, arena, &mut stats) {
             vcode.verify("post-post-RA-passes").unwrap_or_else(|error| {
                 log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
                 panic!("function={} {error}", func_data.name());
@@ -298,6 +321,7 @@ where
         w.write_function(&vcode);
         let asm = &buf[asm_start..];
         log::debug!(target: "taki_mir::emit", "function={} final assembly: bytes={}, lines={}\n{}", func_data.name(), asm.len(), asm.lines().count(), asm);
+        function_stats.push(stats);
     }
 
     if let Some(runtime) = B::runtime_assembly(p) {
@@ -311,6 +335,9 @@ where
         }
     }
 
-    buf
+    CompileOutput {
+        assembly: buf,
+        stats: CodegenStats::aggregate(function_stats),
+    }
 }
 pub mod libcall;

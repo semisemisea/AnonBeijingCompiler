@@ -1,6 +1,9 @@
 //! Post-RA formation of adjacent AArch64 load/store pairs.
 
-use taki_mir::{passes::MIRPass, prelude::ArenaContext, register::Reg, vcode::VCodeContainer};
+use taki_mir::{
+    passes::MIRPass, prelude::ArenaContext, register::Reg, stats::FunctionCodegenStats,
+    vcode::VCodeContainer,
+};
 
 use crate::instructions::{AMode, MInst, PairAMode, SImm7Scaled};
 
@@ -11,7 +14,13 @@ impl MIRPass<MInst> for PairCombine {
         "PairCombine"
     }
 
-    fn run(&self, vcode: &mut VCodeContainer<MInst>, _arena: ArenaContext) -> bool {
+    fn run(
+        &self,
+        vcode: &mut VCodeContainer<MInst>,
+        _arena: ArenaContext,
+        stats: &mut FunctionCodegenStats,
+    ) -> bool {
+        stats.pair.ran = true;
         let mut changed = false;
 
         for block_idx in 0..vcode.num_blocks() {
@@ -19,6 +28,12 @@ impl MIRPass<MInst> for PairCombine {
             let mut i = range.start;
             while i + 1 < range.end {
                 if let Some(pair) = form_pair(vcode.inst(i), vcode.inst(i + 1)) {
+                    match pair {
+                        MInst::LoadPair { .. } => stats.pair.load_pairs_formed += 1,
+                        MInst::StorePair { .. } => stats.pair.store_pairs_formed += 1,
+                        _ => unreachable!(),
+                    }
+                    stats.pair.tombstone_nops_created += 1;
                     *vcode.inst_mut(i) = pair;
                     *vcode.inst_mut(i + 1) = MInst::Nop;
                     changed = true;
@@ -29,6 +44,7 @@ impl MIRPass<MInst> for PairCombine {
             }
         }
 
+        stats.pair.changed = changed;
         changed
     }
 }

@@ -17,7 +17,7 @@
 //!
 //! Backends assemble their pipeline via `LowerBackend::mir_pipeline`.
 
-use crate::{prelude::ArenaContext, vcode::VCodeContainer};
+use crate::{prelude::ArenaContext, stats::FunctionCodegenStats, vcode::VCodeContainer};
 
 /// A MIR-level transformation pass.
 ///
@@ -44,7 +44,12 @@ pub trait MIRPass<I: crate::vcode::VCodeInst>: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Run on a single function's VCode. Returns `true` if the VCode changed.
-    fn run(&self, vcode: &mut VCodeContainer<I>, arena: ArenaContext) -> bool;
+    fn run(
+        &self,
+        vcode: &mut VCodeContainer<I>,
+        arena: ArenaContext,
+        stats: &mut FunctionCodegenStats,
+    ) -> bool;
 }
 
 /// An ordered collection of MIR passes split by the phase at which they run.
@@ -82,13 +87,23 @@ impl<I: crate::vcode::VCodeInst> MIRPassPipeline<I> {
     /// Run every pre-RA pass in order, returning `true` if any pass changed
     /// the VCode. Verifies the operand/CFG invariants before and after the
     /// phase when running in debug builds.
-    pub fn run_pre_ra(&self, vcode: &mut VCodeContainer<I>, arena: ArenaContext) -> bool {
-        self.run_phase("pre-RA", &self.pre_ra, vcode, arena)
+    pub fn run_pre_ra(
+        &self,
+        vcode: &mut VCodeContainer<I>,
+        arena: ArenaContext,
+        stats: &mut FunctionCodegenStats,
+    ) -> bool {
+        self.run_phase("pre-RA", &self.pre_ra, vcode, arena, stats)
     }
 
     /// Run every post-RA pass in order. See `run_pre_ra`.
-    pub fn run_post_ra(&self, vcode: &mut VCodeContainer<I>, arena: ArenaContext) -> bool {
-        self.run_phase("post-RA", &self.post_ra, vcode, arena)
+    pub fn run_post_ra(
+        &self,
+        vcode: &mut VCodeContainer<I>,
+        arena: ArenaContext,
+        stats: &mut FunctionCodegenStats,
+    ) -> bool {
+        self.run_phase("post-RA", &self.post_ra, vcode, arena, stats)
     }
 
     fn run_phase(
@@ -97,6 +112,7 @@ impl<I: crate::vcode::VCodeInst> MIRPassPipeline<I> {
         passes: &[Box<dyn MIRPass<I>>],
         vcode: &mut VCodeContainer<I>,
         arena: ArenaContext,
+        stats: &mut FunctionCodegenStats,
     ) -> bool {
         if passes.is_empty() {
             return false;
@@ -118,7 +134,7 @@ impl<I: crate::vcode::VCodeInst> MIRPassPipeline<I> {
 
         let mut any_changed = false;
         for pass in passes {
-            let changed = pass.run(vcode, arena);
+            let changed = pass.run(vcode, arena, stats);
             log::trace!(
                 target: "taki_mir::passes",
                 "function={} phase={} pass={} changed={}",

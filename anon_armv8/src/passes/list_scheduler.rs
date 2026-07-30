@@ -136,7 +136,21 @@ fn schedule(dag: &DepGraph) -> (Vec<usize>, Option<SchedulerFallbackReason>) {
         let mut issued_classes = Vec::with_capacity(2);
 
         // Deterministic priority: critical path (desc), then original index (asc).
-        ready.sort_by(|&a, &b| dag.crit[b].cmp(&dag.crit[a]).then(a.cmp(&b)));
+        // When a slot is already occupied, prefer nodes that can fill the
+        // remaining slot (dual-issue bonus).
+        ready.sort_by(|&a, &b| {
+            dag.crit[b].cmp(&dag.crit[a]).then_with(|| {
+                // If one instruction is already issued, prefer a compatible
+                // second instruction to maximize dual-issue.
+                if !issued_classes.is_empty() {
+                    let a_compat = CycleSimulator::can_issue(dag.deps[a].class, &issued_classes);
+                    let b_compat = CycleSimulator::can_issue(dag.deps[b].class, &issued_classes);
+                    b_compat.cmp(&a_compat)
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            }).then(a.cmp(&b))
+        });
 
         // Try to issue ready nodes whose data dependencies are satisfied.
         let mut next_ready = Vec::new();
@@ -536,5 +550,30 @@ mod tests {
         // Nop has latency 0, so the Mov can issue at cycle 0 or 1.
         // Both original and scheduled should agree.
         assert_eq!(original.completion_cycles, scheduled.completion_cycles);
+    }
+
+    #[test]
+    fn slot_filling_maximizes_dual_issue() {
+        // Three independent ALU ops: the scheduler should pack two into cycle 0
+        // and one into cycle 1, rather than spreading them one per cycle.
+        use crate::instructions::{AluOp, MInst};
+        use crate::regs::{OperandSize, RegOrZr, int_reg};
+
+        let writable = |index| taki_mir::register::Writable::from_reg(int_reg(index));
+        let alu = |dst, lhs, rhs| MInst::AluRRR {
+            op: AluOp::Add,
+            size: OperandSize::Size64,
+            dst: writable(dst),
+            lhs: RegOrZr::Reg(int_reg(lhs)),
+            rhs: RegOrZr::Reg(int_reg(rhs)),
+        };
+        let insts = vec![alu(1, 2, 3), alu(4, 5, 6), alu(7, 8, 9)];
+        let graph = DepGraph::build(&insts);
+        let (order, _) = schedule(&graph);
+        let estimate = estimate_cycles(&graph, &order).unwrap();
+
+        // 3 independent ALU ops should complete in 2 cycles (dual-issue first two).
+        assert_eq!(estimate.completion_cycles, 2);
+        assert!(estimate.dual_issue_cycles >= 1);
     }
 }

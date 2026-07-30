@@ -139,17 +139,22 @@ fn schedule(dag: &DepGraph) -> (Vec<usize>, Option<SchedulerFallbackReason>) {
         // When a slot is already occupied, prefer nodes that can fill the
         // remaining slot (dual-issue bonus).
         ready.sort_by(|&a, &b| {
-            dag.crit[b].cmp(&dag.crit[a]).then_with(|| {
-                // If one instruction is already issued, prefer a compatible
-                // second instruction to maximize dual-issue.
-                if !issued_classes.is_empty() {
-                    let a_compat = CycleSimulator::can_issue(dag.deps[a].class, &issued_classes);
-                    let b_compat = CycleSimulator::can_issue(dag.deps[b].class, &issued_classes);
-                    b_compat.cmp(&a_compat)
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            }).then(a.cmp(&b))
+            dag.crit[b]
+                .cmp(&dag.crit[a])
+                .then_with(|| {
+                    // If one instruction is already issued, prefer a compatible
+                    // second instruction to maximize dual-issue.
+                    if !issued_classes.is_empty() {
+                        let a_compat =
+                            CycleSimulator::can_issue(dag.deps[a].class, &issued_classes);
+                        let b_compat =
+                            CycleSimulator::can_issue(dag.deps[b].class, &issued_classes);
+                        b_compat.cmp(&a_compat)
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .then(a.cmp(&b))
         });
 
         // Try to issue ready nodes whose data dependencies are satisfied.
@@ -364,14 +369,26 @@ mod tests {
     #[test]
     fn issue_model_limits_width_and_shared_units() {
         assert!(CycleSimulator::can_issue(SchedClass::Alu, &[]));
-        assert!(CycleSimulator::can_issue(SchedClass::Alu, &[SchedClass::Alu]));
+        assert!(CycleSimulator::can_issue(
+            SchedClass::Alu,
+            &[SchedClass::Alu]
+        ));
         assert!(!CycleSimulator::can_issue(
             SchedClass::Alu,
             &[SchedClass::Alu, SchedClass::Alu]
         ));
-        assert!(!CycleSimulator::can_issue(SchedClass::StoreInt, &[SchedClass::LoadInt]));
-        assert!(!CycleSimulator::can_issue(SchedClass::Mul, &[SchedClass::Mul]));
-        assert!(!CycleSimulator::can_issue(SchedClass::Barrier, &[SchedClass::Alu]));
+        assert!(!CycleSimulator::can_issue(
+            SchedClass::StoreInt,
+            &[SchedClass::LoadInt]
+        ));
+        assert!(!CycleSimulator::can_issue(
+            SchedClass::Mul,
+            &[SchedClass::Mul]
+        ));
+        assert!(!CycleSimulator::can_issue(
+            SchedClass::Barrier,
+            &[SchedClass::Alu]
+        ));
         let mut sim = CycleSimulator::new();
         sim.reserve(SchedClass::Div32, 0);
         assert!(!sim.is_ready(SchedClass::Mul, 10));

@@ -200,7 +200,12 @@ mod tests {
         assert!(!config.list_scheduler);
 
         let mut argv = base();
-        argv.extend(["-O", "2", "--disable-mir-peephole", "--disable-pair-combine"]);
+        argv.extend([
+            "-O",
+            "2",
+            "--disable-mir-peephole",
+            "--disable-pair-combine",
+        ]);
         let config = parse(&argv).aarch64_codegen_config();
         assert!(!config.peephole_combine);
         assert!(!config.pair_combine);

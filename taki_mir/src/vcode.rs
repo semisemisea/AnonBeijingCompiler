@@ -160,10 +160,7 @@ impl<I: VCodeInst> VCodeContainer<I> {
     pub fn finalize_for_emission(&mut self, output: &Output) {
         use crate::types::{F32, I64};
 
-        let frame = self
-            .abi
-            .frame_layout()
-            .clone();
+        let frame = self.abi.frame_layout().clone();
         let spill_unit_bytes = self.abi.spill_unit_bytes();
         let num_blocks = self.block_range.len();
 
@@ -189,9 +186,9 @@ impl<I: VCodeInst> VCodeContainer<I> {
                                 let ty = match class {
                                     RegClass::Float => F32,
                                     RegClass::Int => I64,
-                                    RegClass::Vector => unreachable!(
-                                        "vector register moves are unsupported"
-                                    ),
+                                    RegClass::Vector => {
+                                        unreachable!("vector register moves are unsupported")
+                                    }
                                 };
                                 let mv = I::ABISpec::gen_move(
                                     Reg::from_physical_reg(from_reg),
@@ -241,12 +238,10 @@ impl<I: VCodeInst> VCodeContainer<I> {
                                 let to_slot = to.as_stack().unwrap();
                                 let from_offset =
                                     frame.spill_slot_offset(from_slot, spill_unit_bytes);
-                                let to_offset =
-                                    frame.spill_slot_offset(to_slot, spill_unit_bytes);
-                                for inst in I::ABISpec::gen_stack_to_stack_move(
-                                    from_offset,
-                                    to_offset,
-                                ) {
+                                let to_offset = frame.spill_slot_offset(to_slot, spill_unit_bytes);
+                                for inst in
+                                    I::ABISpec::gen_stack_to_stack_move(from_offset, to_offset)
+                                {
                                     for inst in I::ABISpec::legalize_inst(&frame, inst) {
                                         new_insts.push(inst);
                                     }

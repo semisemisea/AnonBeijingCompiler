@@ -3,7 +3,7 @@ use std::num::NonZeroU32;
 use crate::ir::{
     arena::{Arena, LocalArena},
     basic_block::BasicBlock,
-    builder::{BasicBlockBuilders, LocalBuilder},
+    builder::{BasicBlockBuilder, BasicBlockBuilders, LocalBuilder},
     instruction::Inst,
     layout::Layout,
     types::Type,
@@ -86,6 +86,22 @@ impl FunctionData {
             .to_vec();
         self.params = params;
         entry
+    }
+
+    pub(crate) fn split_block_after(
+        &mut self,
+        anchor: Inst,
+        tail_name: String,
+        tail_params: Vec<Type>,
+    ) -> BasicBlock {
+        let head = self
+            .layout()
+            .parent_bb(anchor)
+            .expect("anchor instruction must be in the layout");
+        let tail = self.new_basic_block().basic_block(tail_name, tail_params);
+        self.layout_mut().insert_bb_after(head, tail);
+        self.layout_mut().move_suffix_after(anchor, tail);
+        tail
     }
 
     pub fn name(&self) -> &str {

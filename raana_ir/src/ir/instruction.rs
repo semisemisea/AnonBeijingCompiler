@@ -4,7 +4,11 @@ use std::{
 };
 
 use crate::ir::{
-    inst_kind::{BasicBlockUsage, InstKind, InstUsage},
+    inst_kind::{
+        Aggregate, BasicBlockUsage, Binary, Branch, Call, Cast, GetElemPtr, GlobalAlloc, InstKind,
+        InstUsage, Jump, Load, MemZero, Return, Select, Store, TailCall,
+    },
+    remap::EntityMapper,
     types::Type,
 };
 
@@ -79,6 +83,140 @@ impl InstData {
 
     pub fn name(&self) -> Option<&String> {
         self.name.as_ref()
+    }
+
+    pub(crate) fn remap_refs<M: EntityMapper>(&self, mapper: &mut M) -> Result<Self, M::Error> {
+        let mapped_kind = match self.kind() {
+            InstKind::Undef
+            | InstKind::ZeroInit
+            | InstKind::Integer(..)
+            | InstKind::Float(..)
+            | InstKind::Alloc
+            | InstKind::BlockArgRef(..) => self.kind().clone(),
+            InstKind::Binary(binary) => {
+                Binary::new_data(
+                    mapper.map_inst(binary.lhs())?,
+                    mapper.map_inst(binary.rhs())?,
+                    binary.op(),
+                    self.ty().clone(),
+                )
+                .kind
+            }
+            InstKind::Select(select) => {
+                Select::new_data(
+                    mapper.map_inst(select.cond())?,
+                    mapper.map_inst(select.if_true())?,
+                    mapper.map_inst(select.if_false())?,
+                    self.ty().clone(),
+                )
+                .kind
+            }
+            InstKind::Jump(jump) => {
+                Jump::new_data(
+                    mapper.map_block(jump.target())?,
+                    jump.args()
+                        .iter()
+                        .map(|&arg| mapper.map_inst(arg))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+                .kind
+            }
+            InstKind::Branch(branch) => {
+                Branch::new_data(
+                    mapper.map_inst(branch.cond())?,
+                    mapper.map_block(branch.t_target())?,
+                    branch
+                        .t_args()
+                        .iter()
+                        .map(|&arg| mapper.map_inst(arg))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    mapper.map_block(branch.f_target())?,
+                    branch
+                        .f_args()
+                        .iter()
+                        .map(|&arg| mapper.map_inst(arg))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+                .kind
+            }
+            InstKind::Cast(cast) => {
+                Cast::new_data(mapper.map_inst(cast.src())?, self.ty().clone()).kind
+            }
+            InstKind::Return(ret) => {
+                Return::new_data(
+                    ret.value()
+                        .map(|value| mapper.map_inst(value))
+                        .transpose()?,
+                )
+                .kind
+            }
+            InstKind::GetElemPtr(gep) => {
+                GetElemPtr::new_data(
+                    mapper.map_inst(gep.base())?,
+                    gep.offsets()
+                        .iter()
+                        .map(|&offset| mapper.map_inst(offset))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    self.ty().clone(),
+                )
+                .kind
+            }
+            InstKind::GlobalAlloc(alloc) => {
+                GlobalAlloc::new_data(mapper.map_inst(alloc.init())?, self.ty().clone()).kind
+            }
+            InstKind::Store(store) => {
+                Store::new_data(
+                    mapper.map_inst(store.src())?,
+                    mapper.map_inst(store.dest())?,
+                )
+                .kind
+            }
+            InstKind::MemZero(mem_zero) => {
+                MemZero::new_data(mapper.map_inst(mem_zero.dest())?, mem_zero.byte_len()).kind
+            }
+            InstKind::Load(load) => {
+                Load::new_data(mapper.map_inst(load.src())?, self.ty().clone()).kind
+            }
+            InstKind::Call(call) => {
+                Call::new_data(
+                    mapper.map_function(call.callee())?,
+                    call.args()
+                        .iter()
+                        .map(|&arg| mapper.map_inst(arg))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    self.ty().clone(),
+                )
+                .kind
+            }
+            InstKind::TailCall(call) => {
+                TailCall::new_data(
+                    mapper.map_function(call.callee())?,
+                    call.args()
+                        .iter()
+                        .map(|&arg| mapper.map_inst(arg))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+                .kind
+            }
+            InstKind::Aggregate(aggregate) => {
+                Aggregate::new_data(
+                    self.ty().clone(),
+                    aggregate
+                        .value()
+                        .iter()
+                        .map(|&value| mapper.map_inst(value))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+                .kind
+            }
+        };
+
+        Ok(Self {
+            ty: self.ty.clone(),
+            name: self.name.clone(),
+            kind: mapped_kind,
+            used_by: HashSet::new(),
+        })
     }
 }
 

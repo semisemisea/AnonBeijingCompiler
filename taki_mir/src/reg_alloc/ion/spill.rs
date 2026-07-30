@@ -34,11 +34,9 @@ impl<'a, F: Function> Env<'a, F> {
         // Sort by spill weight descending so that higher-priority bundles
         // (hotter uses, longer ranges) get the first pick of available
         // registers in the second-chance pass.
-        self.ctx
-            .spilled_bundles
-            .sort_unstable_by_key(|&bundle| {
-                core::cmp::Reverse(self.ctx.bundles[bundle].cached_spill_weight())
-            });
+        self.ctx.spilled_bundles.sort_unstable_by_key(|&bundle| {
+            core::cmp::Reverse(self.ctx.bundles[bundle].cached_spill_weight())
+        });
 
         for i in 0..self.ctx.spilled_bundles.len() {
             let bundle = self.ctx.spilled_bundles[i]; // don't borrow self

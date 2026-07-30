@@ -18,13 +18,13 @@ type ValStack = Vec<Vec<Inst>>;
 
 impl Pass for SSATransform {
     fn run(&self, program: &mut crate::ir::Program) -> bool {
-        let funcs = program.global_arena().func_arena().funcs();
+        let func_layout = program.function_layout().to_vec();
         let mut arena_context = ArenaContextMut {
             program,
             curr_func: None,
         };
         let mut changed = false;
-        for func in funcs {
+        for func in func_layout {
             arena_context.curr_func = Some(func);
             changed |= self.run_on(&mut arena_context);
         }

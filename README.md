@@ -80,8 +80,23 @@ soyo_compiler -S --target aarch64 -o testcase.s testcase.sy [-O 1]
 `--emit asm` select outputs. Multiple comma-separated `--emit` values treat
 `-o` as an output directory and name files from the input stem.
 
-`-O 1` enables the intended optimization path. The compiler accepts one input
-file and requires `-o`.
+### Optimization levels
+
+| Level | IR passes | MIR peephole | Pair combine | Scheduler |
+|-------|-----------|-------------|-------------|-----------|
+| `-O0` | off       | off         | off         | off       |
+| `-O1` | on        | on          | on          | off       |
+| `-O2` | on        | on          | on          | on        |
+
+Explicit flags override the level defaults:
+
+```bash
+soyo_compiler -O2 --disable-sched -S --target aarch64 -o out.s test.sy
+```
+
+Available AArch64 MIR pass controls: `--enable/--disable-mir-peephole`,
+`--enable/--disable-pair-combine`, `--enable/--disable-sched`,
+`--sched-model cortex-a53`.
 
 Unsupported backend HIR is reported as a concise code-generation error with
 function, block where available, instruction, type, phase, and legality

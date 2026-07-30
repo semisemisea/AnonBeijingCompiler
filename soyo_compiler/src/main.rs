@@ -37,6 +37,8 @@ fn main() {
 }
 
 fn run(args: cli::Arg) -> Result<(), String> {
+    args.validate()?;
+    let aarch64_config = args.aarch64_codegen_config();
     let source_code = std::fs::read_to_string(&args.input_path).unwrap();
 
     let ast = sysy::CompUnitsParser::new().parse(&source_code).unwrap();
@@ -73,7 +75,7 @@ fn run(args: cli::Arg) -> Result<(), String> {
         None
     };
     let asm = if needs_asm {
-        Some(dump_asm(&program, args.target))
+        Some(dump_asm(&program, args.target, &aarch64_config))
     } else {
         None
     };
@@ -113,10 +115,16 @@ fn dump_llvm(program: &raana_ir::ir::Program) -> String {
     raana_ir::llvm::write_llvm_ir(program)
 }
 
-fn dump_asm(program: &raana_ir::ir::Program, target: cli::Target) -> String {
+fn dump_asm(
+    program: &raana_ir::ir::Program,
+    target: cli::Target,
+    aarch64_config: &anon_armv8::AArch64CodegenConfig,
+) -> String {
     match target {
         cli::Target::Riscv64 => taki_mir::compile::<Riscv64Backend>(program),
-        cli::Target::Aarch64 => taki_mir::compile::<AArch64Backend>(program),
+        cli::Target::Aarch64 => {
+            taki_mir::compile_with_config::<AArch64Backend>(program, aarch64_config).assembly
+        }
     }
 }
 

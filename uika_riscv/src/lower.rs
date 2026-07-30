@@ -1021,6 +1021,7 @@ pub struct Riscv64Backend;
 
 impl LowerBackend for Riscv64Backend {
     type MInst = MInst;
+    type CodegenConfig = ();
     fn lower(ctx: &mut LowerContext<Self::MInst>, inst: HirInst) -> LoweredOutput {
         let arena = ctx.arena;
         match arena.inst_data(inst).kind() {

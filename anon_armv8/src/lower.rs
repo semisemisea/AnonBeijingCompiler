@@ -799,6 +799,7 @@ fn lower_return(
 
 impl LowerBackend for AArch64Backend {
     type MInst = MInst;
+    type CodegenConfig = crate::config::AArch64CodegenConfig;
 
     fn lower(ctx: &mut LowerContext<Self::MInst>, inst: HirInst) -> LoweredOutput {
         let arena = ctx.arena;
@@ -937,8 +938,10 @@ impl LowerBackend for AArch64Backend {
         runtime::assembly(program)
     }
 
-    fn mir_pipeline() -> taki_mir::passes::MIRPassPipeline<Self::MInst> {
-        crate::passes::build_pipeline()
+    fn mir_pipeline(
+        config: &Self::CodegenConfig,
+    ) -> taki_mir::passes::MIRPassPipeline<Self::MInst> {
+        crate::passes::build_pipeline(config)
     }
 }
 

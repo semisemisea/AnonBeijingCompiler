@@ -14,6 +14,10 @@ use std::collections::HashSet;
 use taki_mir::{
     passes::MIRPass,
     prelude::ArenaContext,
+    stats::{
+        CycleEstimateStats, FunctionCodegenStats, ResourceUseStats, SchedulerFallback,
+        SchedulerFallbackReason,
+    },
     vcode::{MachInst, VCodeContainer},
 };
 
@@ -28,31 +32,53 @@ impl MIRPass<MInst> for ListScheduler {
         "ListScheduler"
     }
 
-    fn run(&self, vcode: &mut VCodeContainer<MInst>, _arena: ArenaContext) -> bool {
+    fn run(
+        &self,
+        vcode: &mut VCodeContainer<MInst>,
+        _arena: ArenaContext,
+        stats: &mut FunctionCodegenStats,
+    ) -> bool {
+        stats.scheduler.ran = true;
         let mut any_changed = false;
 
         for block_idx in 0..vcode.num_blocks() {
+            stats.scheduler.blocks_total += 1;
             let range = vcode.block_inst_range(block_idx);
             if range.len() <= 2 {
+                stats.scheduler.blocks_skipped_short += 1;
                 continue;
             }
+            stats.scheduler.blocks_checked += 1;
 
             let insts: Vec<MInst> = vcode.block_insts(block_idx).to_vec();
 
             // Control flow is represented as a full barrier in the DAG, so a
             // terminator remains last while its register/NZCV uses stay visible.
             let dag = DepGraph::build(&insts);
-            let order = schedule(&dag);
+            dag.stats.record_to_taki_stats(&mut stats.scheduler.dag);
+            let (order, fallback) = schedule(&dag);
+            if let Some(reason) = fallback {
+                stats.scheduler.fallbacks.push(SchedulerFallback {
+                    block: block_idx,
+                    reason,
+                });
+            }
             let original_order: Vec<_> = (0..dag.n).collect();
+            let original_estimate = estimate_cycles(&dag, &original_order);
+            let scheduled_estimate = estimate_cycles(&dag, &order);
+            accumulate_estimate(&mut stats.scheduler.original, original_estimate.as_ref());
+            accumulate_estimate(&mut stats.scheduler.scheduled, scheduled_estimate.as_ref());
             let improves_or_matches = matches!(
-                (
-                    estimate_cycles(&dag, &order),
-                    estimate_cycles(&dag, &original_order)
-                ),
-                (Some(scheduled), Some(original)) if scheduled <= original
+                (scheduled_estimate, original_estimate),
+                (Some(scheduled), Some(original)) if scheduled.completion_cycles <= original.completion_cycles
             );
 
-            if is_identity(&order, insts.len()) || !improves_or_matches {
+            if is_identity(&order, insts.len()) {
+                stats.scheduler.identity_schedules += 1;
+                continue;
+            }
+            if !improves_or_matches {
+                stats.scheduler.estimator_rejections += 1;
                 continue;
             }
 
@@ -77,11 +103,12 @@ impl MIRPass<MInst> for ListScheduler {
 }
 
 /// Run list scheduling on the dependency DAG, returning a permutation
-/// `order` where `order[new_position] = old_index`.
-fn schedule(dag: &DepGraph) -> Vec<usize> {
+/// `order` where `order[new_position] = old_index`, plus an optional fallback
+/// reason if the stall budget was exhausted.
+fn schedule(dag: &DepGraph) -> (Vec<usize>, Option<SchedulerFallbackReason>) {
     let n = dag.n;
     if n == 0 {
-        return vec![];
+        return (vec![], None);
     }
 
     // remaining_preds[i] = number of unscheduled predecessors
@@ -114,8 +141,8 @@ fn schedule(dag: &DepGraph) -> Vec<usize> {
                 let issued = issued_at[pred].unwrap_or(0);
                 let latency = dag.succs[pred]
                     .iter()
-                    .find(|(s, _)| *s == node)
-                    .map(|(_, l)| *l)
+                    .find(|edge| edge.node == node)
+                    .map(|edge| edge.latency)
                     .unwrap_or(0);
                 issued + latency <= cycle
             });
@@ -130,7 +157,8 @@ fn schedule(dag: &DepGraph) -> Vec<usize> {
                 resources.reserve(class, cycle);
 
                 // Decrement successor predecessor counts; add newly-ready nodes.
-                for &(succ, _) in &dag.succs[node] {
+                for edge in &dag.succs[node] {
+                    let succ = edge.node;
                     remaining_preds[succ] -= 1;
                     if remaining_preds[succ] == 0 {
                         next_ready.push(succ);
@@ -156,11 +184,11 @@ fn schedule(dag: &DepGraph) -> Vec<usize> {
                     order.push(i);
                 }
             }
-            break;
+            return (order, Some(SchedulerFallbackReason::StallBudgetExhausted));
         }
     }
 
-    order
+    (order, None)
 }
 
 #[derive(Default)]
@@ -204,7 +232,7 @@ fn can_issue(class: SchedClass, issued: &[SchedClass]) -> bool {
 
 /// Estimate completion cycles for a fixed topological instruction order using
 /// the same dependency latency, issue width, and resource model as the scheduler.
-fn estimate_cycles(dag: &DepGraph, order: &[usize]) -> Option<u32> {
+fn estimate_cycles(dag: &DepGraph, order: &[usize]) -> Option<CycleEstimateStats> {
     if order.len() != dag.n {
         return None;
     }
@@ -216,6 +244,10 @@ fn estimate_cycles(dag: &DepGraph, order: &[usize]) -> Option<u32> {
     let mut cycle = 0;
     let mut completion_cycle = 0;
     let mut stall_budget = dag.n as u32 * 20;
+    let mut result = CycleEstimateStats {
+        samples: 1,
+        ..CycleEstimateStats::default()
+    };
 
     while next < order.len() {
         let mut issued_classes = Vec::with_capacity(2);
@@ -230,8 +262,8 @@ fn estimate_cycles(dag: &DepGraph, order: &[usize]) -> Option<u32> {
             let data_ready = dag.preds[node].iter().all(|&pred| {
                 let latency = dag.succs[pred]
                     .iter()
-                    .find(|(succ, _)| *succ == node)
-                    .map(|(_, latency)| *latency)
+                    .find(|edge| edge.node == node)
+                    .map(|edge| edge.latency)
                     .unwrap_or(0);
                 issued_at[pred].is_some_and(|issued| issued + latency.max(1) <= cycle)
             });
@@ -251,6 +283,28 @@ fn estimate_cycles(dag: &DepGraph, order: &[usize]) -> Option<u32> {
             next += 1;
         }
 
+        match issued_classes.len() {
+            0 => {
+                result.idle_cycles += 1;
+            }
+            1 => {
+                result.single_issue_cycles += 1;
+            }
+            _ => {
+                result.dual_issue_cycles += 1;
+            }
+        }
+        for class in &issued_classes {
+            match class {
+                SchedClass::Load | SchedClass::Store => result.resources.lsu += 1,
+                SchedClass::Alu => result.resources.alu += 1,
+                SchedClass::Mul | SchedClass::Div => result.resources.mac_div += 1,
+                SchedClass::Other => result.resources.fp_other += 1,
+                SchedClass::Branch | SchedClass::Barrier => result.resources.branch += 1,
+                SchedClass::Nop => {}
+            }
+        }
+
         cycle += 1;
         if issued_classes.is_empty() {
             stall_budget = stall_budget.saturating_sub(1);
@@ -262,7 +316,28 @@ fn estimate_cycles(dag: &DepGraph, order: &[usize]) -> Option<u32> {
         }
     }
 
-    Some(completion_cycle)
+    result.completion_cycles = u64::from(completion_cycle);
+    result.stall_cycles = result.idle_cycles;
+    Some(result)
+}
+
+fn accumulate_estimate(target: &mut CycleEstimateStats, estimate: Option<&CycleEstimateStats>) {
+    let Some(estimate) = estimate else { return };
+    target.samples += estimate.samples;
+    target.completion_cycles += estimate.completion_cycles;
+    target.stall_cycles += estimate.stall_cycles;
+    target.single_issue_cycles += estimate.single_issue_cycles;
+    target.dual_issue_cycles += estimate.dual_issue_cycles;
+    target.idle_cycles += estimate.idle_cycles;
+    accumulate_resources(&mut target.resources, &estimate.resources);
+}
+
+fn accumulate_resources(target: &mut ResourceUseStats, source: &ResourceUseStats) {
+    target.lsu += source.lsu;
+    target.alu += source.alu;
+    target.mac_div += source.mac_div;
+    target.fp_other += source.fp_other;
+    target.branch += source.branch;
 }
 
 /// Check if a permutation is the identity (0, 1, 2, ..., n-1).
@@ -294,6 +369,7 @@ mod tests {
             preds: vec![vec![]; classes.len()],
             deps: classes.iter().copied().map(deps).collect(),
             crit: vec![1; classes.len()],
+            stats: Default::default(),
         }
     }
 
@@ -324,7 +400,8 @@ mod tests {
             SchedClass::Alu,
             SchedClass::Mul,
         ]);
-        let mut order = schedule(&graph);
+        let (mut order, fallback) = schedule(&graph);
+        assert_eq!(fallback, None);
         order.sort_unstable();
         assert_eq!(order, vec![0, 1, 2, 3, 4]);
     }
@@ -342,7 +419,10 @@ mod tests {
     fn fixed_order_estimator_includes_final_instruction_latency() {
         let graph = independent_graph(&[SchedClass::Div]);
 
-        assert_eq!(estimate_cycles(&graph, &[0]), Some(11));
+        assert_eq!(
+            estimate_cycles(&graph, &[0]).map(|e| e.completion_cycles),
+            Some(11)
+        );
     }
 
     #[test]
@@ -375,11 +455,11 @@ mod tests {
         ];
         let graph = DepGraph::build(&insts);
         let original = estimate_cycles(&graph, &[0, 1, 2, 3, 4]).unwrap();
-        let scheduled_order = schedule(&graph);
+        let (scheduled_order, _) = schedule(&graph);
         let scheduled = estimate_cycles(&graph, &scheduled_order).unwrap();
 
-        assert_eq!(original, 4);
-        assert_eq!(scheduled, 3);
-        assert!(scheduled < original);
+        assert_eq!(original.completion_cycles, 4);
+        assert_eq!(scheduled.completion_cycles, 3);
+        assert!(scheduled.completion_cycles < original.completion_cycles);
     }
 }

@@ -9,13 +9,14 @@ use std::collections::HashMap;
 use taki_mir::{
     passes::MIRPass,
     prelude::ArenaContext,
-    reg_alloc::reg::{OperandKind, OperandVisitor},
+    reg_alloc::reg::{OperandKind, OperandVisitor as _},
     register::Reg,
+    stats::FunctionCodegenStats,
     vcode::{MachInst, VCodeContainer},
 };
 
 use crate::instructions::{AluOp, MInst};
-use crate::regs::{OperandSize, RegOrZr};
+use crate::regs::RegOrZr;
 
 pub struct PeepholeCombine;
 
@@ -24,14 +25,23 @@ impl MIRPass<MInst> for PeepholeCombine {
         "PeepholeCombine"
     }
 
-    fn run(&self, vcode: &mut VCodeContainer<MInst>, _arena: ArenaContext) -> bool {
+    fn run(
+        &self,
+        vcode: &mut VCodeContainer<MInst>,
+        _arena: ArenaContext,
+        stats: &mut FunctionCodegenStats,
+    ) -> bool {
+        stats.peephole.ran = true;
         let use_counts = build_vreg_use_counts(vcode);
 
         let mut changed = false;
         for block_idx in 0..vcode.num_blocks() {
             let range = vcode.block_inst_range(block_idx);
-            changed |= combine_mac_in_block(vcode, range, &use_counts);
+            let fused = combine_mac_in_block(vcode, range, &use_counts);
+            stats.peephole.mac_pairs_formed += fused;
+            changed |= fused > 0;
         }
+        stats.peephole.changed = changed;
         changed
     }
 }
@@ -57,12 +67,12 @@ fn combine_mac_in_block(
     vcode: &mut VCodeContainer<MInst>,
     range: core::ops::Range<usize>,
     use_counts: &HashMap<Reg, u32>,
-) -> bool {
-    let mut changed = false;
+) -> u64 {
+    let mut fused_count = 0;
     let mut i = range.start;
     while i + 1 < range.end {
         // Check if instruction `i` is a standalone Mul whose result is single-use.
-        let (mul_dst, mul_lhs, mul_rhs, size) = match vcode.inst(i) {
+        let (mul_dst, mul_lhs, mul_rhs, _size) = match vcode.inst(i) {
             MInst::AluRRR {
                 op: AluOp::Mul,
                 dst,
@@ -140,14 +150,14 @@ fn combine_mac_in_block(
         if let Some(fused_inst) = fused {
             *vcode.inst_mut(i) = MInst::Nop;
             *vcode.inst_mut(i + 1) = fused_inst;
-            changed = true;
+            fused_count += 1;
             // Skip past the fused pair.
             i += 2;
         } else {
             i += 1;
         }
     }
-    changed
+    fused_count
 }
 
 /// Extract the `Reg` from a `RegOrZr`, if it is not the zero register.

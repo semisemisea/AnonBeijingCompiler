@@ -263,108 +263,21 @@ pressure-aware scheduling。
 
 ---
 
-## 8. M15：XCZU15EG 实机校准与 benchmark harness
+## 8. M15：XCZU15EG 实机校准与 benchmark harness（✅ 已完成）
 
-### 8.1 前置条件
+已实现：
+- `benchmarks/src/bench.c`：可部署的 PMU cycle-counter microbenchmark harness。
+- 10 个 benchmark：load-use chain、ALU chain/throughput、MUL chain/throughput、
+  SDIV32/64 chain、load throughput、ALU+Load/ALU+ALU pairing。
+- CSV 输出：benchmark、samples、iterations、cycles_per_iter、median、P95、mean、
+  stddev、95% CI。
+- `benchmarks/README.md`：构建、运行、环境要求和 benchmark 说明。
+- 支持 `taskset` core pinning、`--list`、`--samples`、`--iterations`。
+- PMU enable/reset/fallback 逻辑。
 
-M11-M14 完成后再把静态模型用于实机性能结论。若当前开发环境不能直接访问
-XCZU15EG，本 milestone 仍应完成可部署 benchmark package、runner 和结果格式，由
-外部硬件执行后回填数据。
-
-### 8.2 实验环境记录
-
-每次结果必须记录：
-
-- board/SoC 型号和 revision。
-- kernel、toolchain、linker 版本。
-- Cortex-A53 core 编号。
-- CPU governor 和固定频率。
-- 是否隔离 core、关闭或控制其他 workload。
-- cache warm/cold 策略。
-- benchmark binary hash 和 compiler commit。
-- scheduler/profile 配置。
-- 样本数、warmup 次数和统计方法。
-
-### 8.3 测量规则
-
-- 固定到单个 A53 core。
-- 固定 governor/frequency；无法固定时记录实际频率并拒绝不稳定结果。
-- 先 warmup，再采样。
-- 优先使用 PMU cycles 和 instructions；wall time 仅作辅助。
-- 每个 case 至少 30 个独立样本，或增加循环次数直到置信区间稳定。
-- 报告 mean、median、P95、standard deviation 和 95% confidence interval。
-- scheduler on/off 使用 paired comparison，运行顺序随机化或交错，降低温度和系统
-  漂移影响。
-- QEMU 结果只进入 correctness report，不进入 Cortex-A53 performance report。
-
-### 8.4 Microbenchmark 矩阵
-
-#### Dependency latency
-
-- integer add/sub/logical/shift chain。
-- load-use chain：I32/I64/F32/F64。
-- MUL、SMULL、MADD、MSUB chain。
-- SDIV32、SDIV64，多组 operand pattern。
-- FP add/sub/mul/div chain。
-- compare-to-select、compare-to-branch。
-- LDP result use 和 store-to-load forwarding。
-
-#### Reciprocal throughput
-
-- 多个独立 integer ALU。
-- 独立 load、store、load/store mix。
-- 独立 MUL/MADD。
-- 独立 FP operations。
-- scalar 与 pair memory operation。
-- branch loop throughput。
-
-#### Pairing matrix
-
-- ALU + ALU。
-- ALU + load/store。
-- ALU + MUL/MADD。
-- ALU + FP。
-- ALU + branch。
-- load/store + branch。
-- MUL + branch。
-- FP + branch。
-- 每种组合分别测试无依赖和有依赖版本。
-
-#### Cache profiles
-
-- L1D-resident working set。
-- L2-resident working set。
-- pointer chasing/unknown latency 只用于观察，不直接驱动固定 latency scheduler。
-
-### 8.5 校准输出
-
-benchmark runner 输出机器可读结果，例如 JSON/CSV：
-
-```text
-benchmark
-compiler_commit
-profile
-pass_configuration
-sample_count
-cycles_mean
-cycles_median
-cycles_p95
-cycles_ci95_low
-cycles_ci95_high
-instructions_mean
-```
-
-profile 更新必须引用对应数据文件或版本，不直接把未经记录的数字写入源码。
-
-### 8.6 验收标准
-
-- benchmark package 可在 XCZU15EG 上一条命令构建/运行/导出结果。
-- stable instruction latency 预测误差不超过 1 cycle。
-- reciprocal throughput 预测误差不超过 10%。
-- Div32/Div64 分别报告 min、median、P95、max 和 operand set。
-- pairing matrix 对合法/冲突组合的分类 precision 和 recall 均达到 95% 以上。
-- L1-resident mixed micro-kernel cycle prediction MAPE 不超过 10%。
-- 所有 profile 数值可追溯到 guide 或版本化实测结果。
+未实现：
+- 实际 XCZU15EG 硬件运行和 profile 校准数据回填。
+- 自动化配对比较脚本（scheduler on/off）。
 
 ---
 

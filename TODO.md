@@ -19,6 +19,11 @@
   物化/纯 FP + dead load），`-O1` 起默认开启，`--enable/disable-mir-dce`
   开关，`DceStats` 统计。huffman-01 上 `-O1` 指令数 964 → 935（-3%），
   `mov w13, wzr` 等死代码全部消除。
+- ABI 参数绑定基础设施（M19）：`taki_mir` 新增 `ArgPair { vreg, preg }`、
+  `ABIMachineSpec::gen_args()`、`CalleeABI::reg_args`/`take_args()`；
+  AArch64 与 RISC-V 各新增零字节 `MInst::Args` 伪指令（`reg_fixed_def`
+  固定寄存器定义、空 emission、非 terminator、不在 DCE 白名单、verify
+  校验固定寄存器类匹配）。尚未接入 lowering，行为不变。
 
 目标硬件是 Xilinx XCZU15EG 上的 Cortex-A53 MPCore。
 
@@ -151,57 +156,10 @@ Args pseudo: fixed_def(parameter vreg, ABI preg)
   栈的风险。
 - Cranelift 本身也没有该通道，说明 pseudo 方案是成熟长期架构而非 workaround。
 
-### M19：引入通用 Args Pseudo 表示
+### M19：引入通用 Args Pseudo 表示 ✅（commit 9ea625b）
 
-目标：在 `taki_mir` ABI 层建立与 Cranelift 一致的参数绑定抽象，暂不改变最终
-lowering 行为，便于单独验证基础设施。
-
-数据结构（`taki_mir/src/abi.rs`）：
-
-```rust
-pub struct ArgPair {
-    pub vreg: Writable<Reg>,
-    pub preg: Reg,
-}
-```
-
-与现有类型保持对称：`ArgPair`（callee entry: preg -> vreg，fixed def）、
-`CallArgPair`（caller call: vreg -> preg，fixed use）、`CallRetPair`（caller
-return: preg -> vreg，fixed def）、`RetPair`（callee return: vreg -> preg，
-fixed use）。
-
-ABI 接口（`ABIMachineSpec`）：
-
-```rust
-fn gen_args(args: Vec<ArgPair>) -> Self::I;
-```
-
-`CalleeABI` 新增 `reg_args: Vec<ArgPair>` 与：
-
-```rust
-pub fn take_args(&mut self) -> Option<M::I> {
-    if self.reg_args.is_empty() {
-        None
-    } else {
-        Some(M::gen_args(core::mem::take(&mut self.reg_args)))
-    }
-}
-```
-
-目标后端指令：AArch64 / RISC-V 各增加 `MInst::Args { args: Vec<ArgPair> }`。
-
-- operand semantics：对每个 `ArgPair` 调用 `reg_fixed_def(vreg, preg)`。
-- emission：`Ok(())`（不输出机器码）。
-- `is_move()` / `is_term()` / `verify()` 增加对应臂。
-- 不进 DCE 白名单（不可删）；peephole/pair 等 match 增加默认安全臂。
-
-测试：
-
-- `Args` 每个 operand 必须是 `Def + FixedReg`；fixed preg 与 vreg class 一致。
-- `Args` emission 为空、不是 terminator、不被 DCE 删除。
-- 无参数函数不生成 `Args`。
-
-提交边界：`[Feat(MIR)]: Add fixed-register Args pseudo instruction`
+已完成：`ArgPair`、`gen_args`、`take_args`、双后端 `MInst::Args` 及配套测试。
+详见提交记录，不再重复维护。
 
 ### M20：将寄存器参数改为 Fixed Def
 

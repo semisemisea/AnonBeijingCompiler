@@ -443,6 +443,22 @@ impl<I: VCodeInst> VCodeContainer<I> {
         &mut self.insts[i]
     }
 
+    /// Mutable access to the whole flattened instruction stream. Used by MIR
+    /// passes that rewrite many instructions in place (e.g. dead code
+    /// elimination). Passes that change any instruction's operand structure
+    /// must let the pipeline trigger `rebuild_operand_tables` afterwards.
+    pub fn insts_mut(&mut self) -> &mut [I] {
+        &mut self.insts
+    }
+
+    /// All branch block arguments of the function. These are virtual-register
+    /// uses that live in the CFG side tables and never appear in any
+    /// instruction's operand list; MIR passes computing liveness or use
+    /// counts must treat them as uses.
+    pub fn branch_block_args(&self) -> &[VReg] {
+        &self.branch_block_args
+    }
+
     /// Update the per-instruction terminator flags after reordering or
     /// rewriting instructions. Used by post-RA passes (e.g. list scheduler).
     pub fn set_inst_terminator(&mut self, i: usize, term: MachTerminator) {

@@ -10,6 +10,7 @@ pub enum AArch64SchedModel {
 /// Configuration controlling target-specific MIR passes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AArch64CodegenConfig {
+    pub dce: bool,
     pub peephole_combine: bool,
     pub pair_combine: bool,
     pub list_scheduler: bool,
@@ -19,6 +20,7 @@ pub struct AArch64CodegenConfig {
 impl Default for AArch64CodegenConfig {
     fn default() -> Self {
         Self {
+            dce: true,
             peephole_combine: true,
             pair_combine: true,
             list_scheduler: true,

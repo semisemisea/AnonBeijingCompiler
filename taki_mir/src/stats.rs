@@ -23,6 +23,7 @@ impl CodegenStats {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FunctionCodegenStats {
     pub function: String,
+    pub dce: DceStats,
     pub peephole: PeepholeStats,
     pub pair: PairCombineStats,
     pub scheduler: SchedulerStats,
@@ -30,9 +31,25 @@ pub struct FunctionCodegenStats {
 
 impl FunctionCodegenStats {
     fn accumulate(&mut self, other: &Self) {
+        self.dce.accumulate(&other.dce);
         self.peephole.accumulate(&other.peephole);
         self.pair.accumulate(&other.pair);
         self.scheduler.accumulate(&other.scheduler);
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DceStats {
+    pub ran: bool,
+    pub changed: bool,
+    pub instructions_removed: u64,
+}
+
+impl DceStats {
+    fn accumulate(&mut self, other: &Self) {
+        self.ran |= other.ran;
+        self.changed |= other.changed;
+        self.instructions_removed += other.instructions_removed;
     }
 }
 

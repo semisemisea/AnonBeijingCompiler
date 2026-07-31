@@ -10,6 +10,9 @@ use frontend::utils::ToRaanaIR;
 mod cli;
 mod frontend;
 
+#[cfg(test)]
+mod abi_matrix;
+
 lalrpop_util::lalrpop_mod!(sysy);
 
 /// compiler --emit asm -o testcase.s testcase.sy [-O1]

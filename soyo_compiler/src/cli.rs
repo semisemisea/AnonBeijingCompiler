@@ -43,6 +43,10 @@ pub(crate) struct Arg {
         default_value_t = Target::Riscv64
     )]
     pub(crate) target: Target,
+    #[arg(long, conflicts_with = "disable_mir_dce")]
+    pub(crate) enable_mir_dce: bool,
+    #[arg(long, conflicts_with = "enable_mir_dce")]
+    pub(crate) disable_mir_dce: bool,
     #[arg(long, conflicts_with = "disable_mir_peephole")]
     pub(crate) enable_mir_peephole: bool,
     #[arg(long, conflicts_with = "enable_mir_peephole")]
@@ -64,24 +68,33 @@ impl Arg {
         use anon_armv8::AArch64CodegenConfig;
         let mut config = match self.opt_level {
             0 => AArch64CodegenConfig {
+                dce: false,
                 peephole_combine: false,
                 pair_combine: false,
                 list_scheduler: false,
                 sched_model: self.sched_model.into(),
             },
             1 => AArch64CodegenConfig {
+                dce: true,
                 peephole_combine: true,
                 pair_combine: true,
                 list_scheduler: false,
                 sched_model: self.sched_model.into(),
             },
             _ => AArch64CodegenConfig {
+                dce: true,
                 peephole_combine: true,
                 pair_combine: true,
                 list_scheduler: true,
                 sched_model: self.sched_model.into(),
             },
         };
+        if self.enable_mir_dce {
+            config.dce = true;
+        }
+        if self.disable_mir_dce {
+            config.dce = false;
+        }
         if self.enable_mir_peephole {
             config.peephole_combine = true;
         }
@@ -105,7 +118,9 @@ impl Arg {
 
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.target == Target::Riscv64 {
-            let aarch64_only = self.enable_mir_peephole
+            let aarch64_only = self.enable_mir_dce
+                || self.disable_mir_dce
+                || self.enable_mir_peephole
                 || self.disable_mir_peephole
                 || self.enable_pair_combine
                 || self.disable_pair_combine
@@ -158,6 +173,7 @@ mod tests {
         let mut argv = base();
         argv.extend(["-O", "0"]);
         let config = parse(&argv).aarch64_codegen_config();
+        assert!(!config.dce);
         assert!(!config.peephole_combine);
         assert!(!config.pair_combine);
         assert!(!config.list_scheduler);
@@ -168,6 +184,7 @@ mod tests {
         let mut argv = base();
         argv.extend(["-O", "1"]);
         let config = parse(&argv).aarch64_codegen_config();
+        assert!(config.dce);
         assert!(config.peephole_combine);
         assert!(config.pair_combine);
         assert!(!config.list_scheduler);
@@ -178,6 +195,7 @@ mod tests {
         let mut argv = base();
         argv.extend(["-O", "2"]);
         let config = parse(&argv).aarch64_codegen_config();
+        assert!(config.dce);
         assert!(config.peephole_combine);
         assert!(config.pair_combine);
         assert!(config.list_scheduler);
@@ -188,6 +206,7 @@ mod tests {
         let mut argv = base();
         argv.extend(["-O", "0", "--enable-sched"]);
         let config = parse(&argv).aarch64_codegen_config();
+        assert!(!config.dce);
         assert!(!config.peephole_combine);
         assert!(!config.pair_combine);
         assert!(config.list_scheduler);
@@ -195,6 +214,7 @@ mod tests {
         let mut argv = base();
         argv.extend(["-O", "2", "--disable-sched"]);
         let config = parse(&argv).aarch64_codegen_config();
+        assert!(config.dce);
         assert!(config.peephole_combine);
         assert!(config.pair_combine);
         assert!(!config.list_scheduler);
@@ -210,12 +230,32 @@ mod tests {
         assert!(!config.peephole_combine);
         assert!(!config.pair_combine);
         assert!(config.list_scheduler);
+
+        let mut argv = base();
+        argv.extend(["-O", "0", "--enable-mir-dce"]);
+        let config = parse(&argv).aarch64_codegen_config();
+        assert!(config.dce);
+        assert!(!config.peephole_combine);
+        assert!(!config.pair_combine);
+        assert!(!config.list_scheduler);
+
+        let mut argv = base();
+        argv.extend(["-O", "2", "--disable-mir-dce"]);
+        let config = parse(&argv).aarch64_codegen_config();
+        assert!(!config.dce);
+        assert!(config.peephole_combine);
+        assert!(config.pair_combine);
+        assert!(config.list_scheduler);
     }
 
     #[test]
     fn conflicting_flags_are_rejected() {
         let mut argv = base();
         argv.extend(["--enable-sched", "--disable-sched"]);
+        assert!(Arg::try_parse_from(&argv).is_err());
+
+        let mut argv = base();
+        argv.extend(["--enable-mir-dce", "--disable-mir-dce"]);
         assert!(Arg::try_parse_from(&argv).is_err());
     }
 

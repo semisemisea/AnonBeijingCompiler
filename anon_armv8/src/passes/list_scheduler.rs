@@ -160,10 +160,26 @@ fn schedule(dag: &DepGraph) -> (Vec<usize>, Option<SchedulerFallbackReason>) {
         // Try to issue ready nodes whose data dependencies are satisfied.
         let mut next_ready = Vec::new();
         for &node in &ready {
+            let class = dag.deps[node].class;
+            if class == SchedClass::Nop {
+                // Zero-width pseudo (Args / RetVal): consumes no issue slot, no
+                // resource, and no cycle. It completes immediately, so its
+                // successors may issue in the same cycle.
+                let earliest = CycleSimulator::earliest_issue_cycle(dag, node, &issued_at);
+                issued_at[node] = Some(earliest);
+                order.push(node);
+                for edge in &dag.succs[node] {
+                    let succ = edge.node;
+                    remaining_preds[succ] -= 1;
+                    if remaining_preds[succ] == 0 {
+                        next_ready.push(succ);
+                    }
+                }
+                continue;
+            }
             let earliest = CycleSimulator::earliest_issue_cycle(dag, node, &issued_at);
             let data_ready = earliest <= cycle;
 
-            let class = dag.deps[node].class;
             if data_ready
                 && sim.is_ready(class, cycle)
                 && CycleSimulator::can_issue(class, &issued_classes)
@@ -240,10 +256,19 @@ fn estimate_cycles(dag: &DepGraph, order: &[usize]) -> Option<CycleEstimateStats
             if dag.preds[node].iter().any(|&pred| !seen[pred]) {
                 return None;
             }
+            let class = dag.deps[node].class;
+            if class == SchedClass::Nop {
+                // Zero-width pseudo: no issue slot, no resource, no cycle.
+                // Complete it immediately and continue in the same cycle.
+                let earliest = CycleSimulator::earliest_issue_cycle(dag, node, &issued_at);
+                issued_at[node] = Some(earliest);
+                seen[node] = true;
+                next += 1;
+                continue;
+            }
             let earliest = CycleSimulator::earliest_issue_cycle(dag, node, &issued_at);
             let data_ready = earliest <= cycle;
 
-            let class = dag.deps[node].class;
             if !data_ready
                 || !sim.is_ready(class, cycle)
                 || !CycleSimulator::can_issue(class, &issued_classes)
@@ -428,6 +453,36 @@ mod tests {
             estimate_cycles(&graph, &[0]).map(|e| e.completion_cycles),
             Some(11)
         );
+    }
+
+    #[test]
+    fn nop_class_pseudo_consumes_no_cycle_in_the_estimator() {
+        // [Args (Nop), add] must cost exactly the same as [add] alone.
+        let with_pseudo = independent_graph(&[SchedClass::Nop, SchedClass::Alu]);
+        let plain = independent_graph(&[SchedClass::Alu]);
+
+        let with_estimate = estimate_cycles(&with_pseudo, &[0, 1]).unwrap();
+        let plain_estimate = estimate_cycles(&plain, &[0]).unwrap();
+
+        assert_eq!(
+            with_estimate.completion_cycles,
+            plain_estimate.completion_cycles
+        );
+        assert_eq!(with_estimate.single_issue_cycles, 1);
+        assert_eq!(with_estimate.idle_cycles, 0);
+        assert_eq!(with_estimate.samples, 1);
+    }
+
+    #[test]
+    fn nop_class_pseudo_stays_free_when_scheduled_with_a_dual() {
+        let graph = independent_graph(&[SchedClass::Nop, SchedClass::Alu, SchedClass::Alu]);
+        let estimate = estimate_cycles(&graph, &[0, 1, 2]).unwrap();
+
+        // Two real ALUs dual-issue in one cycle; the Nop rides along free.
+        assert_eq!(estimate.completion_cycles, 1);
+        assert_eq!(estimate.dual_issue_cycles, 1);
+        assert_eq!(estimate.single_issue_cycles, 0);
+        assert_eq!(estimate.idle_cycles, 0);
     }
 
     #[test]

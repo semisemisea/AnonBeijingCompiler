@@ -2,7 +2,9 @@
 
 use smallvec::{SmallVec, smallvec};
 use taki_mir::{
-    abi::{ABIMachineSpec, ArgLayoutPlanner, ArgRegBank, ArgSlot, FrameLayout, StackAMode},
+    abi::{
+        ABIMachineSpec, ArgLayoutPlanner, ArgPair, ArgRegBank, ArgSlot, FrameLayout, StackAMode,
+    },
     reg_alloc::reg::{MachineEnv, PReg, RegClass},
     register::{Reg, Writable},
     types::{F32, I32, I64, LoweredType},
@@ -97,6 +99,10 @@ impl ABIMachineSpec for AArch64Abi {
             dst,
             addr: mem.into(),
         }
+    }
+
+    fn gen_args(args: Vec<ArgPair>) -> MInst {
+        MInst::Args { args }
     }
 
     fn gen_move(src: Reg, dst: Reg, ty: LoweredType) -> MInst {

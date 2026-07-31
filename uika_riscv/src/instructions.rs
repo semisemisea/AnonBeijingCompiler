@@ -1,7 +1,7 @@
 use smallvec::SmallVec;
 
 use taki_mir::{
-    abi::{CallArgPair, CallRetPair, RetPair, StackAMode},
+    abi::{ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
     reg_alloc::reg::{OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
     types::{F32, I32, I64, LoweredType},
@@ -92,6 +92,11 @@ impl MachInst for MInst {
             }
             MInst::RetVal { pair } => {
                 collector.reg_fixed_use(&mut pair.vreg, pair.preg);
+            }
+            MInst::Args { args } => {
+                for arg_pair in args {
+                    collector.reg_fixed_def(&mut arg_pair.vreg, arg_pair.preg);
+                }
             }
             MInst::Jump { .. } => {}
             MInst::JumpReg { rs } => {
@@ -259,6 +264,7 @@ impl MachInstEmit for MInst {
             }
             MInst::Ret => write!(ctx, "ret"),
             MInst::RetVal { .. } => Ok(()),
+            MInst::Args { .. } => Ok(()),
             MInst::Jump { label } => {
                 write!(ctx, "la t6, ")?;
                 label.emit(ctx)?;
@@ -414,6 +420,12 @@ pub enum MInst {
     Ret,
     RetVal {
         pair: RetPair,
+    },
+    /// Bind incoming register parameters to their fixed ABI physical
+    /// registers. Emits no machine code; register allocation resolves the
+    /// fixed defs. Must be the first instruction of the entry block.
+    Args {
+        args: Vec<ArgPair>,
     },
     Jump {
         label: Label,
@@ -754,12 +766,119 @@ impl AMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShiftImm, ShiftImm64, call_clobbers};
+    use super::{MInst, ShiftImm, ShiftImm64, call_clobbers};
     use crate::{
         abi::DEFAULT_CLOBBERS,
-        regs::{a0, f_reg, fa0, pf_reg, px_reg, x_reg},
+        regs::{a0, a1, f_reg, fa0, pf_reg, px_reg, x_reg},
     };
-    use taki_mir::{abi::CallRetPair, register::Writable};
+    use taki_mir::{
+        abi::{ArgPair, CallRetPair},
+        reg_alloc::reg::{OperandConstraint, OperandKind, RegClass, VReg},
+        register::{Reg, Writable},
+        vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
+    };
+
+    #[derive(Default)]
+    struct TestEmitContext(String);
+
+    impl core::fmt::Write for TestEmitContext {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            self.0.push_str(text);
+            Ok(())
+        }
+    }
+
+    impl EmitContext for TestEmitContext {
+        fn write_reg(&mut self, _reg: &Reg) -> core::fmt::Result {
+            unreachable!("Args pseudo has no register operands to emit")
+        }
+
+        fn write_label_ref(
+            &mut self,
+            _idx: taki_mir::block_order::MirBlockIndex,
+        ) -> core::fmt::Result {
+            unreachable!("Args pseudo has no labels")
+        }
+
+        fn write_function_label(
+            &mut self,
+            _func: taki_mir::prelude::HirFunction,
+        ) -> core::fmt::Result {
+            unreachable!("Args pseudo has no labels")
+        }
+
+        fn write_global_label(&mut self, _gv: taki_mir::prelude::HirInst) -> core::fmt::Result {
+            unreachable!("Args pseudo has no labels")
+        }
+
+        fn write_external_symbol(&mut self, symbol: &str) -> core::fmt::Result {
+            self.0.push_str(symbol);
+            Ok(())
+        }
+    }
+
+    fn virtual_reg(index: usize, class: RegClass) -> Reg {
+        Reg::from_virtual_reg(VReg::new(192 + index, class))
+    }
+
+    fn int_args() -> MInst {
+        MInst::Args {
+            args: vec![
+                ArgPair {
+                    vreg: Writable::from_reg(virtual_reg(0, RegClass::Int)),
+                    preg: a0(),
+                },
+                ArgPair {
+                    vreg: Writable::from_reg(virtual_reg(1, RegClass::Int)),
+                    preg: a1(),
+                },
+            ],
+        }
+    }
+
+    struct TestOperandVisitor(Vec<(VReg, OperandConstraint, OperandKind)>);
+
+    impl taki_mir::reg_alloc::reg::OperandVisitor for TestOperandVisitor {
+        fn add_operand(
+            &mut self,
+            reg: &mut Reg,
+            constraint: OperandConstraint,
+            kind: OperandKind,
+            _pos: taki_mir::reg_alloc::reg::OperandPos,
+        ) {
+            self.0
+                .push((reg.to_virtual_reg().unwrap(), constraint, kind));
+        }
+    }
+
+    #[test]
+    fn args_pseudo_emits_no_machine_code() {
+        let mut ctx = TestEmitContext::default();
+        int_args().emit(&mut ctx).unwrap();
+        assert_eq!(ctx.0, "");
+    }
+
+    #[test]
+    fn args_pseudo_is_not_a_terminator() {
+        assert_eq!(int_args().is_term(), MachTerminator::None);
+    }
+
+    #[test]
+    fn args_pseudo_binds_each_parameter_with_a_fixed_def() {
+        let mut args = int_args();
+        let mut visitor = TestOperandVisitor(Vec::new());
+        args.get_operands(&mut visitor);
+        assert_eq!(visitor.0.len(), 2);
+        for (index, (vreg, constraint, kind)) in visitor.0.iter().enumerate() {
+            assert_eq!(*kind, OperandKind::Def);
+            let OperandConstraint::FixedReg(preg) = constraint else {
+                panic!("Args operands must use FixedReg constraints");
+            };
+            let expected = [a0(), a1()][index];
+            assert_eq!(*preg, expected.to_physical_reg().unwrap());
+            assert_eq!(vreg.class(), RegClass::Int);
+        }
+    }
 
     #[test]
     fn shift_immediates_enforce_operand_width() {

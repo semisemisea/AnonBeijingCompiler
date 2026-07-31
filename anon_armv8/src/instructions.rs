@@ -1,7 +1,7 @@
 //! Typed AArch64 instruction forms and encoding-valid operands.
 
 use taki_mir::{
-    abi::{CallArgPair, CallRetPair, RetPair, StackAMode},
+    abi::{ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
     reg_alloc::reg::{OperandVisitor, OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
     types::{F32, I32, I64, LoweredType},
@@ -629,6 +629,12 @@ pub enum MInst {
     RetVal {
         pair: RetPair,
     },
+    /// Bind incoming register parameters to their fixed ABI physical
+    /// registers. Emits no machine code; register allocation resolves the
+    /// fixed defs. Must be the first instruction of the entry block.
+    Args {
+        args: Vec<ArgPair>,
+    },
     Ret,
 }
 
@@ -686,6 +692,14 @@ impl MInst {
                 if pair_access_size(addr) != ty.byte_size() =>
             {
                 Err("pair address offset scaling does not match memory width")
+            }
+            Self::Args { args } => {
+                for pair in args {
+                    if pair.preg.class() != pair.vreg.to_reg().class() {
+                        return Err("Args fixed def register class mismatch");
+                    }
+                }
+                Ok(())
             }
             _ => Ok(()),
         }
@@ -883,6 +897,11 @@ impl MachInst for MInst {
                 collector.reg_clobbers(call_clobbers(*clobbers, ret.as_ref()));
             }
             Self::RetVal { pair } => collector.reg_fixed_use(&mut pair.vreg, pair.preg),
+            Self::Args { args } => {
+                for pair in args {
+                    collector.reg_fixed_def(&mut pair.vreg, pair.preg);
+                }
+            }
             Self::TailCall { args, clobbers, .. } => {
                 for pair in args {
                     collector.reg_fixed_use(&mut pair.vreg, pair.preg);
@@ -1368,6 +1387,7 @@ impl MachInstEmit for MInst {
                 emit_pair_amode(ctx, addr)
             }
             Self::RetVal { .. } => Ok(()),
+            Self::Args { .. } => Ok(()),
             Self::Call { label, .. } => {
                 write!(ctx, "bl ")?;
                 label.emit(ctx)
@@ -1872,10 +1892,12 @@ mod tests {
     use core::fmt::Write;
 
     use taki_mir::{
+        abi::ArgPair,
         block_order::MirBlockIndex,
         prelude::{HirFunction, HirInst},
-        register::Writable,
-        vcode::{EmitContext, MachInstEmit},
+        reg_alloc::reg::{OperandConstraint, OperandKind, RegClass, VReg},
+        register::{Reg, Writable},
+        vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
     };
 
     use super::{Cond, Imm12, MInst, SelectCmp, SelectValue, call_clobbers};
@@ -2062,5 +2084,81 @@ mod tests {
         assert!(Imm12::maybe_from_u64(0xfff001).is_none());
         assert!(Imm12::maybe_from_u64(0x1000_0000).is_none());
         assert!(Imm12::maybe_from_u64(u64::MAX).is_none());
+    }
+
+    fn virtual_reg(index: usize, class: RegClass) -> Reg {
+        Reg::from_virtual_reg(VReg::new(192 + index, class))
+    }
+
+    fn int_args() -> MInst {
+        MInst::Args {
+            args: vec![
+                ArgPair {
+                    vreg: Writable::from_reg(virtual_reg(0, RegClass::Int)),
+                    preg: int_reg(0),
+                },
+                ArgPair {
+                    vreg: Writable::from_reg(virtual_reg(1, RegClass::Int)),
+                    preg: int_reg(1),
+                },
+            ],
+        }
+    }
+
+    struct TestOperandVisitor(Vec<(VReg, OperandConstraint, OperandKind)>);
+
+    impl taki_mir::reg_alloc::reg::OperandVisitor for TestOperandVisitor {
+        fn add_operand(
+            &mut self,
+            reg: &mut Reg,
+            constraint: OperandConstraint,
+            kind: OperandKind,
+            _pos: taki_mir::reg_alloc::reg::OperandPos,
+        ) {
+            self.0
+                .push((reg.to_virtual_reg().unwrap(), constraint, kind));
+        }
+    }
+
+    #[test]
+    fn args_pseudo_emits_no_machine_code() {
+        assert_eq!(emit(int_args()), "");
+    }
+
+    #[test]
+    fn args_pseudo_is_not_a_terminator() {
+        assert_eq!(int_args().is_term(), MachTerminator::None);
+    }
+
+    #[test]
+    fn args_pseudo_binds_each_parameter_with_a_fixed_def() {
+        let mut args = int_args();
+        let mut visitor = TestOperandVisitor(Vec::new());
+        args.get_operands(&mut visitor);
+        assert_eq!(visitor.0.len(), 2);
+        for (index, (vreg, constraint, kind)) in visitor.0.iter().enumerate() {
+            assert_eq!(*kind, OperandKind::Def);
+            let OperandConstraint::FixedReg(preg) = constraint else {
+                panic!("Args operands must use FixedReg constraints");
+            };
+            assert_eq!(*preg, int_reg(index as u8).to_physical_reg().unwrap());
+            assert_eq!(vreg.class(), RegClass::Int);
+        }
+    }
+
+    #[test]
+    fn args_verify_accepts_matching_register_classes() {
+        assert!(int_args().verify().is_ok());
+    }
+
+    #[test]
+    fn args_verify_rejects_mismatched_register_classes() {
+        let args = MInst::Args {
+            args: vec![ArgPair {
+                vreg: Writable::from_reg(virtual_reg(0, RegClass::Float)),
+                preg: int_reg(0),
+            }],
+        };
+        assert!(args.verify().is_err());
     }
 }

@@ -377,4 +377,19 @@ mod tests {
         assert!(matches!(insts[0], MInst::Nop));
         assert!(matches!(insts[1], MInst::Removed));
     }
+
+    #[test]
+    fn never_removes_args_pseudo() {
+        use taki_mir::abi::ArgPair;
+        let args = MInst::Args {
+            args: vec![ArgPair {
+                vreg: Writable::from_reg(vreg(0)),
+                preg: int_reg(0),
+            }],
+        };
+        let mut insts = vec![args, MInst::Ret];
+        let removed = eliminate_dead_insts(&mut insts, &[]);
+        assert_eq!(removed, 0);
+        assert!(matches!(insts[0], MInst::Args { .. }));
+    }
 }

@@ -142,6 +142,11 @@ pub trait ABIMachineSpec {
     /// final outgoing-argument area is known.
     fn gen_get_stack_addr(mem: StackAMode, dst: Writable<Reg>) -> Self::I;
 
+    /// Build the function-entry pseudo-instruction that binds each register
+    /// parameter virtual register to its fixed ABI physical register. It must
+    /// emit no machine code; register allocation resolves the fixed defs.
+    fn gen_args(args: Vec<ArgPair>) -> Self::I;
+
     fn gen_store_stack(src: Reg, mem: StackAMode, ty: LoweredType) -> Self::I;
 
     fn gen_spill_store(src: Reg, spill_off: i64, ty: LoweredType) -> SmallVec<[Self::I; 4]> {
@@ -374,6 +379,16 @@ pub struct CallRetPair {
     pub preg: Reg,
 }
 
+/// An incoming register function parameter bound directly to its ABI physical
+/// register. The `Args` pseudo-instruction defines `vreg` from `preg` without
+/// emitting any machine code, replacing the old unconditional home-slot
+/// store/load round trip for register arguments.
+#[derive(Debug, Clone)]
+pub struct ArgPair {
+    pub vreg: Writable<Reg>,
+    pub preg: Reg,
+}
+
 /// The function abstraction at ABI level.
 /// Most of the data is not initialized correctly at constructor.
 /// It will gradually build during the lowering process.
@@ -403,6 +418,11 @@ pub struct CalleeABI<M: ABIMachineSpec> {
     /// Spill slot offsets for register arguments (indexed by param index)
     reg_arg_spillslots: Vec<i64>,
 
+    /// Register arguments awaiting `take_args`, which packages them into the
+    /// entry `Args` pseudo. Populated by `gen_copy_arg_to_reg`; consumed by
+    /// `gen_arg_setup` in lowering.
+    reg_args: Vec<ArgPair>,
+
     _mach: PhantomData<M>,
 }
 
@@ -421,6 +441,7 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
             alloc_to_ss: FxHashMap::default(),
             frame_layout: None,
             reg_arg_spillslots: vec![-1; num_args],
+            reg_args: Vec::new(),
             _mach: PhantomData,
         }
     }
@@ -611,6 +632,16 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
     /// where the callee will read it.
     pub fn arg_slot(&self, idx: usize) -> ArgSlot {
         self.args[idx].clone()
+    }
+
+    /// Drain the collected register-argument bindings and package them into the
+    /// entry `Args` pseudo. Returns `None` when no register argument was bound.
+    pub fn take_args(&mut self) -> Option<M::I> {
+        if self.reg_args.is_empty() {
+            None
+        } else {
+            Some(M::gen_args(core::mem::take(&mut self.reg_args)))
+        }
     }
 
     pub fn gen_prologue(&self) -> SmallVec<[M::I; 16]> {

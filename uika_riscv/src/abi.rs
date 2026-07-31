@@ -1,7 +1,9 @@
 use smallvec::{SmallVec, smallvec};
 
 use taki_mir::{
-    abi::{ABIMachineSpec, ArgLayoutPlanner, ArgRegBank, ArgSlot, FrameLayout, StackAMode},
+    abi::{
+        ABIMachineSpec, ArgLayoutPlanner, ArgPair, ArgRegBank, ArgSlot, FrameLayout, StackAMode,
+    },
     reg_alloc::reg::{MachineEnv, PReg, PRegSet, RegClass},
     register::{Reg, Writable},
 };
@@ -68,6 +70,10 @@ impl ABIMachineSpec for Riscv64ABI {
             rd: dst,
             addr: mem.into(),
         }
+    }
+
+    fn gen_args(args: Vec<ArgPair>) -> Self::I {
+        MInst::Args { args }
     }
 
     fn gen_store_stack(

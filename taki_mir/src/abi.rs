@@ -415,9 +415,6 @@ pub struct CalleeABI<M: ABIMachineSpec> {
 
     frame_layout: Option<FrameLayout>,
 
-    /// Spill slot offsets for register arguments (indexed by param index)
-    reg_arg_spillslots: Vec<i64>,
-
     /// Register arguments awaiting `take_args`, which packages them into the
     /// entry `Args` pseudo. Populated by `gen_copy_arg_to_reg`; consumed by
     /// `gen_arg_setup` in lowering.
@@ -429,7 +426,6 @@ pub struct CalleeABI<M: ABIMachineSpec> {
 impl<M: ABIMachineSpec> CalleeABI<M> {
     pub fn new(arena: ArenaContext<'_>) -> CalleeABI<M> {
         let (args, sized_stack_arg_size) = M::compute_arg_loc(arena);
-        let num_args = args.len();
         CalleeABI {
             args,
             total_stackslots_size: 0,
@@ -440,7 +436,6 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
             stackslots_keys: SecondaryMap::new(),
             alloc_to_ss: FxHashMap::default(),
             frame_layout: None,
-            reg_arg_spillslots: vec![-1; num_args],
             reg_args: Vec::new(),
             _mach: PhantomData,
         }
@@ -553,62 +548,20 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
         Ok(())
     }
 
-    /// Pre-allocate spill slots for all register arguments without
-    /// emitting any instructions.
-    pub fn prealloc_reg_arg_spills(&mut self) {
-        let mut reg_indices: Vec<(usize, HirType)> = Vec::new();
-        for (idx, slot) in self.args.iter().enumerate() {
-            if let ArgSlot::Reg { ty, .. } = slot {
-                reg_indices.push((idx, ty.clone()));
-            }
-        }
-        for (idx, ty) in reg_indices {
-            if self.reg_arg_spillslots[idx] < 0 {
-                self.reg_arg_spillslots[idx] = self.allocate_stackslot(ty) as i64;
-            }
-        }
-    }
-
-    pub fn gen_store_reg_args_to_stack(&mut self) -> SmallVec<[M::I; 4]> {
-        let mut insts = smallvec![];
-        let mut reg_slots: Vec<(usize, PReg, HirType)> = Vec::new();
-        for (idx, slot) in self.args.iter().enumerate() {
-            if let ArgSlot::Reg { reg: preg, ty } = slot {
-                reg_slots.push((idx, *preg, ty.clone()));
-            }
-        }
-        for (idx, preg, ty) in reg_slots {
-            if self.reg_arg_spillslots[idx] < 0 {
-                self.reg_arg_spillslots[idx] = self.allocate_stackslot(ty.clone()) as i64;
-            }
-            for inst in M::gen_spill_store(preg.into(), self.reg_arg_spillslots[idx], ty.into()) {
-                insts.push(inst);
-            }
-        }
-        insts
-    }
-
+    /// Bind the `idx`-th function parameter to `into_reg`.
+    ///
+    /// Register arguments are recorded as [`ArgPair`]s to be packaged into the
+    /// entry `Args` pseudo by [`CalleeABI::take_args`]; no instructions are
+    /// emitted. Stack arguments are materialized with an incoming-argument
+    /// load. Only called for parameters whose value is actually needed.
     pub fn gen_copy_arg_to_reg(&mut self, idx: usize, into_reg: Reg) -> SmallVec<[M::I; 4]> {
         let mut insts = smallvec![];
         match self.args[idx].clone() {
-            ArgSlot::Reg { reg: preg, ty } => {
-                if self.reg_arg_spillslots[idx] < 0 {
-                    self.reg_arg_spillslots[idx] = self.allocate_stackslot(ty.clone()) as i64;
-                    for inst in M::gen_spill_store(
-                        preg.into(),
-                        self.reg_arg_spillslots[idx],
-                        ty.clone().into(),
-                    ) {
-                        insts.push(inst);
-                    }
-                }
-                for inst in M::gen_spill_load(
-                    self.reg_arg_spillslots[idx],
-                    Writable::from_reg(into_reg),
-                    ty.clone().into(),
-                ) {
-                    insts.push(inst);
-                }
+            ArgSlot::Reg { reg: preg, .. } => {
+                self.reg_args.push(ArgPair {
+                    vreg: Writable::from_reg(into_reg),
+                    preg: preg.into(),
+                });
             }
             ArgSlot::Stack { offset, ty } => {
                 for inst in

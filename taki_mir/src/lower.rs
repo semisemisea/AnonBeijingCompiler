@@ -445,11 +445,10 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             .enumerate()
             .collect();
 
-        // Pre-allocate spill slots so gen_copy_arg_to_reg emits only loads.
-        self.vcode.vcode.abi.prealloc_reg_arg_spills();
-
-        // Phase 1: Emit loads for all parameters (in .rev() order so that
-        // register loads come last in VCode, first after reverse_and_finalize).
+        // Phase 1: Emit incoming loads for stack arguments. Register arguments
+        // are collected as `ArgPair`s and bound by the entry `Args` pseudo
+        // below. (Iterating in `.rev()` keeps the per-instruction groups in
+        // the same final forward order as the original two-phase scheme.)
         for (i, param) in params.into_iter().rev() {
             // A function parameter may have no ordinary HIR users yet still
             // feed the entry block parameters via the prologue edge (tracked
@@ -468,11 +467,12 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             self.finish_ir_inst();
         }
 
-        // Phase 2: Emit register-arg stores at the END of the VCode block.
-        // After reverse_and_finalize they become the FIRST instructions,
-        // saving arg registers before any loads can clobber them.
-        for inst in self.vcode.vcode.abi.gen_store_reg_args_to_stack() {
-            self.emit(inst);
+        // Phase 2: Package the collected register-argument bindings into the
+        // entry `Args` pseudo. Emitted last so that after the reverse ordering
+        // it becomes the first instruction of the entry block, before any stack
+        // argument loads or ordinary entry instructions.
+        if let Some(args) = self.vcode.vcode.abi.take_args() {
+            self.emit(args);
         }
         self.finish_ir_inst();
     }

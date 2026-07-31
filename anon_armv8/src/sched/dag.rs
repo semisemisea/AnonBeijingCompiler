@@ -1048,7 +1048,21 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             uses: preg(pair.vreg),
             flags_def: false,
             flags_use: false,
-            class: SchedClass::Alu,
+            class: SchedClass::Nop,
+            mem: None,
+            is_barrier: false,
+        },
+
+        // The entry Args pseudo defines every register parameter and emits no
+        // machine code. It consumes zero cycles and zero resources; its defs
+        // still enforce the register RAW/WAW/WAR ordering that keeps argument
+        // values alive until their first real use.
+        MInst::Args { args } => InstDeps {
+            defs: args.iter().flat_map(|pair| preg(pair.vreg.reg)).collect(),
+            uses: vec![],
+            flags_def: false,
+            flags_use: false,
+            class: SchedClass::Nop,
             mem: None,
             is_barrier: false,
         },
@@ -1132,7 +1146,7 @@ fn pair_amode_defs(addr: &crate::instructions::PairAMode) -> Vec<PReg> {
 
 #[cfg(test)]
 mod tests {
-    use taki_mir::register::Writable;
+    use taki_mir::{abi::ArgPair, register::Writable};
 
     use super::*;
     use crate::{
@@ -1142,6 +1156,72 @@ mod tests {
 
     fn writable(index: u8) -> Writable<Reg> {
         Writable::from_reg(int_reg(index))
+    }
+
+    fn args_deps() -> InstDeps {
+        inst_deps(&MInst::Args {
+            args: vec![
+                ArgPair {
+                    vreg: writable(0),
+                    preg: int_reg(0),
+                },
+                ArgPair {
+                    vreg: writable(1),
+                    preg: int_reg(1),
+                },
+            ],
+        })
+    }
+
+    #[test]
+    fn args_pseudo_is_a_free_nop_with_register_defs() {
+        let deps = args_deps();
+        assert_eq!(deps.class, SchedClass::Nop);
+        assert!(
+            deps.defs
+                .iter()
+                .all(|p| matches!(*p, p if p.hw_enc() == 0 || p.hw_enc() == 1))
+        );
+        assert!(deps.uses.is_empty());
+        assert!(!deps.flags_def && !deps.flags_use);
+        assert!(deps.mem.is_none());
+        assert!(!deps.is_barrier);
+    }
+
+    #[test]
+    fn args_defs_keep_argument_readers_after_the_pseudo() {
+        let insts = vec![
+            MInst::Args {
+                args: vec![ArgPair {
+                    vreg: writable(0),
+                    preg: int_reg(0),
+                }],
+            },
+            MInst::AluRRR {
+                op: crate::instructions::AluOp::Add,
+                size: OperandSize::Size64,
+                dst: writable(2),
+                lhs: RegOrZr::Reg(int_reg(0)),
+                rhs: RegOrZr::Reg(int_reg(3)),
+            },
+        ];
+        let graph = DepGraph::build(&insts);
+        assert!(has_edge(&graph, 0, 1));
+        assert!(!has_edge(&graph, 1, 0));
+    }
+
+    #[test]
+    fn retval_is_a_free_nop_that_reads_the_return_value() {
+        let deps = inst_deps(&MInst::RetVal {
+            pair: taki_mir::abi::RetPair {
+                vreg: int_reg(0),
+                preg: int_reg(0),
+            },
+        });
+        assert_eq!(deps.class, SchedClass::Nop);
+        assert_eq!(deps.uses, vec![int_preg(0)]);
+        assert!(deps.defs.is_empty());
+        assert!(!deps.is_barrier);
     }
 
     fn has_edge(graph: &DepGraph, from: usize, to: usize) -> bool {

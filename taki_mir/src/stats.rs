@@ -27,6 +27,8 @@ pub struct FunctionCodegenStats {
     pub peephole: PeepholeStats,
     pub pair: PairCombineStats,
     pub scheduler: SchedulerStats,
+    pub abi: AbiArgStats,
+    pub regalloc: RegallocStats,
 }
 
 impl FunctionCodegenStats {
@@ -35,6 +37,49 @@ impl FunctionCodegenStats {
         self.peephole.accumulate(&other.peephole);
         self.pair.accumulate(&other.pair);
         self.scheduler.accumulate(&other.scheduler);
+        self.abi.accumulate(&other.abi);
+        self.regalloc.accumulate(&other.regalloc);
+    }
+}
+
+/// Incoming-argument binding statistics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AbiArgStats {
+    /// Register parameters bound through the entry `Args` pseudo.
+    pub register_args_bound: u64,
+    /// Register parameters that were never needed and skipped entirely.
+    pub unused_register_args_skipped: u64,
+    /// Stack parameters materialized with an incoming-argument load.
+    pub incoming_stack_args_loaded: u64,
+}
+
+impl AbiArgStats {
+    fn accumulate(&mut self, other: &Self) {
+        self.register_args_bound += other.register_args_bound;
+        self.unused_register_args_skipped += other.unused_register_args_skipped;
+        self.incoming_stack_args_loaded += other.incoming_stack_args_loaded;
+    }
+}
+
+/// Register-allocation outcome statistics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegallocStats {
+    /// Number of allocator spill slots (`spill_size` units) used.
+    pub spill_slots: u64,
+    /// Allocator edits moving a value between two registers.
+    pub reg_to_reg_edits: u64,
+    /// Allocator edits spilling a value to the stack.
+    pub reg_to_stack_edits: u64,
+    /// Allocator edits reloading a value from the stack.
+    pub stack_to_reg_edits: u64,
+}
+
+impl RegallocStats {
+    fn accumulate(&mut self, other: &Self) {
+        self.spill_slots += other.spill_slots;
+        self.reg_to_reg_edits += other.reg_to_reg_edits;
+        self.reg_to_stack_edits += other.reg_to_stack_edits;
+        self.stack_to_reg_edits += other.stack_to_reg_edits;
     }
 }
 

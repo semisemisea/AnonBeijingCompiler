@@ -211,4 +211,77 @@ mod tests {
             "dead parameter must not create memory traffic:\n{use_first}"
         );
     }
+
+    #[test]
+    fn leaf_register_arguments_are_bound_without_spills_or_moves() {
+        use anon_armv8::AArch64CodegenConfig;
+        use taki_mir::stats::FunctionCodegenStats;
+
+        let case = MATRIX.iter().find(|c| c.name == "leaf_add").unwrap();
+        let ast = crate::sysy::CompUnitsParser::new()
+            .parse(case.source)
+            .expect("valid SysY");
+        let mut ctx = AstGenContext::new();
+        ast.convert(&mut ctx);
+        let mut program = ctx.program;
+        let pass_manager = raana_ir::opt::pass::PassesManager::default_ref();
+        pass_manager.run_passes(&mut program);
+        let config = AArch64CodegenConfig {
+            dce: true,
+            peephole_combine: true,
+            pair_combine: true,
+            list_scheduler: true,
+            sched_model: anon_armv8::AArch64SchedModel::CortexA53,
+        };
+        let output = taki_mir::compile_with_config::<AArch64Backend>(&program, &config);
+
+        let add: &FunctionCodegenStats = output
+            .stats
+            .functions
+            .iter()
+            .find(|stats| stats.function == "add")
+            .expect("stats must include the `add` function");
+        assert_eq!(add.abi.register_args_bound, 2);
+        assert_eq!(add.abi.unused_register_args_skipped, 0);
+        assert_eq!(add.abi.incoming_stack_args_loaded, 0);
+        assert_eq!(add.regalloc.spill_slots, 0);
+        assert_eq!(add.regalloc.reg_to_reg_edits, 0);
+        assert_eq!(add.regalloc.reg_to_stack_edits, 0);
+        assert_eq!(add.regalloc.stack_to_reg_edits, 0);
+    }
+
+    #[test]
+    fn dead_register_parameter_is_counted_as_skipped() {
+        use anon_armv8::AArch64CodegenConfig;
+        use taki_mir::stats::FunctionCodegenStats;
+
+        let case = MATRIX.iter().find(|c| c.name == "unused_params").unwrap();
+        let ast = crate::sysy::CompUnitsParser::new()
+            .parse(case.source)
+            .expect("valid SysY");
+        let mut ctx = AstGenContext::new();
+        ast.convert(&mut ctx);
+        let mut program = ctx.program;
+        let pass_manager = raana_ir::opt::pass::PassesManager::default_ref();
+        pass_manager.run_passes(&mut program);
+        let config = AArch64CodegenConfig {
+            dce: true,
+            peephole_combine: true,
+            pair_combine: true,
+            list_scheduler: true,
+            sched_model: anon_armv8::AArch64SchedModel::CortexA53,
+        };
+        let output = taki_mir::compile_with_config::<AArch64Backend>(&program, &config);
+
+        let use_first: &FunctionCodegenStats = output
+            .stats
+            .functions
+            .iter()
+            .find(|stats| stats.function == "use_first")
+            .expect("stats must include the `use_first` function");
+        assert_eq!(use_first.abi.register_args_bound, 1);
+        assert_eq!(use_first.abi.unused_register_args_skipped, 1);
+        assert_eq!(use_first.abi.incoming_stack_args_loaded, 0);
+        assert_eq!(use_first.regalloc.spill_slots, 0);
+    }
 }

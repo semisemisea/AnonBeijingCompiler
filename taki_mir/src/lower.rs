@@ -454,6 +454,9 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             // feed the entry block parameters via the prologue edge (tracked
             // by `value_lowered_use`); keep such parameters live.
             if !self.is_value_needed(param) {
+                if matches!(self.arg_slot(i), ArgSlot::Reg { .. }) {
+                    self.vcode.vcode.abi.note_unused_register_arg();
+                }
                 continue;
             }
             for inst in self

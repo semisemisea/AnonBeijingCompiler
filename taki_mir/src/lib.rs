@@ -260,6 +260,13 @@ where
                     (false, false) => (counts.0, counts.1, counts.2, counts.3 + 1),
                 }
             });
+        stats.abi = vcode.abi.arg_stats();
+        stats.regalloc = crate::stats::RegallocStats {
+            spill_slots: output.num_spillslots as u64,
+            reg_to_reg_edits,
+            reg_to_stack_edits,
+            stack_to_reg_edits,
+        };
         log::debug!(target: "taki_mir::reg_alloc", "function={} allocation complete: locations={}, spill-slots={}, edits={}, allocation-time-us={}", func_data.name(), output.allocs.len(), output.num_spillslots, output.edits.len(), allocation_start.elapsed().as_micros());
         log::debug!(target: "taki_mir::reg_alloc", "function={} edit-kinds: reg-reg={}, reg-stack={}, stack-reg={}, stack-stack={}", func_data.name(), reg_to_reg_edits, reg_to_stack_edits, stack_to_reg_edits, stack_to_stack_edits);
         for (inst, allocs) in

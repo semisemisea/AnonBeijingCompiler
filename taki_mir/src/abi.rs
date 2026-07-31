@@ -420,6 +420,11 @@ pub struct CalleeABI<M: ABIMachineSpec> {
     /// `gen_arg_setup` in lowering.
     reg_args: Vec<ArgPair>,
 
+    /// Counters for incoming-argument statistics.
+    bound_register_args: u64,
+    unused_register_args_skipped: u64,
+    incoming_stack_args_loaded: u64,
+
     _mach: PhantomData<M>,
 }
 
@@ -437,6 +442,9 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
             alloc_to_ss: FxHashMap::default(),
             frame_layout: None,
             reg_args: Vec::new(),
+            bound_register_args: 0,
+            unused_register_args_skipped: 0,
+            incoming_stack_args_loaded: 0,
             _mach: PhantomData,
         }
     }
@@ -558,12 +566,14 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
         let mut insts = smallvec![];
         match self.args[idx].clone() {
             ArgSlot::Reg { reg: preg, .. } => {
+                self.bound_register_args += 1;
                 self.reg_args.push(ArgPair {
                     vreg: Writable::from_reg(into_reg),
                     preg: preg.into(),
                 });
             }
             ArgSlot::Stack { offset, ty } => {
+                self.incoming_stack_args_loaded += 1;
                 for inst in
                     M::gen_incoming_arg_load(offset, Writable::from_reg(into_reg), ty.into())
                 {
@@ -572,6 +582,21 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
             }
         }
         insts
+    }
+
+    /// Record a register parameter that was skipped because its value is
+    /// never needed.
+    pub fn note_unused_register_arg(&mut self) {
+        self.unused_register_args_skipped += 1;
+    }
+
+    /// Incoming-argument binding statistics accumulated during lowering.
+    pub fn arg_stats(&self) -> crate::stats::AbiArgStats {
+        crate::stats::AbiArgStats {
+            register_args_bound: self.bound_register_args,
+            unused_register_args_skipped: self.unused_register_args_skipped,
+            incoming_stack_args_loaded: self.incoming_stack_args_loaded,
+        }
     }
 
     pub fn frame_layout(&self) -> &FrameLayout {

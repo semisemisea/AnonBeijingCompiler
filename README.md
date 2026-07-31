@@ -82,11 +82,11 @@ soyo_compiler -S --target aarch64 -o testcase.s testcase.sy [-O 1]
 
 ### Optimization levels
 
-| Level | IR passes | MIR peephole | Pair combine | Scheduler |
-|-------|-----------|-------------|-------------|-----------|
-| `-O0` | off       | off         | off         | off       |
-| `-O1` | on        | on          | on          | off       |
-| `-O2` | on        | on          | on          | on        |
+| Level | IR passes | MIR DCE | MIR peephole | Pair combine | Scheduler |
+|-------|-----------|---------|--------------|--------------|-----------|
+| `-O0` | off       | off     | off          | off          | off       |
+| `-O1` | on        | on      | on           | on           | off       |
+| `-O2` | on        | on      | on           | on           | on        |
 
 Explicit flags override the level defaults:
 
@@ -94,7 +94,8 @@ Explicit flags override the level defaults:
 soyo_compiler -O2 --disable-sched -S --target aarch64 -o out.s test.sy
 ```
 
-Available AArch64 MIR pass controls: `--enable/--disable-mir-peephole`,
+Available AArch64 MIR pass controls: `--enable/--disable-mir-dce`,
+`--enable/--disable-mir-peephole`,
 `--enable/--disable-pair-combine`, `--enable/--disable-sched`,
 `--sched-model cortex-a53`.
 

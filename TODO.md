@@ -1,6 +1,6 @@
 # Cortex-A53 后端优化计划
 
-本文档只记录尚未完成的工作。M1-M18 已完成，历史设计与实现细节以 Git 提交记录
+本文档只记录尚未完成的工作。M1-M24 已完成，历史设计与实现细节以 Git 提交记录
 和代码测试为准，不在这里重复维护。
 
 已完成的能力概要：
@@ -19,6 +19,12 @@
   物化/纯 FP + dead load），`-O1` 起默认开启，`--enable/disable-mir-dce`
   开关，`DceStats` 统计。huffman-01 上 `-O1` 指令数 964 → 935（-3%），
   `mov w13, wzr` 等死代码全部消除。
+- 入口参数 fixed-register live-in（M19-M24）：`Args` 伪指令以 `reg_fixed_def`
+  直接绑定寄存器参数，消除 ABI home-slot store/load 往返；post-RA 调度将
+  `Args`/`RetVal` 建模为零周期 Nop；RA 并行拷贝与真实 spill 门禁；AArch64 +
+  RISC-V × `-O0/1/2` ABI 矩阵与 5 次确定性；`AbiArgStats`/`RegallocStats`
+  统计。纯叶函数 `add` 收敛为 `add w0, w0, w1; ret`（无 frame、无 str/ldr），
+  huffman 入口 str/ldr 全部消失。
 - ABI 参数绑定基础设施（M19）：`taki_mir` 新增 `ArgPair { vreg, preg }`、
   `ABIMachineSpec::gen_args()`、`CalleeABI::reg_args`/`take_args()`；
   AArch64 与 RISC-V 各新增零字节 `MInst::Args` 伪指令（`reg_fixed_def`
@@ -108,10 +114,11 @@ AAPCS64 入参寄存器 w0/w1
 
 ---
 
-## 2. 主计划：入口参数 fixed-register live-in（Args 伪指令）
+## 2. 主计划：入口参数 fixed-register live-in（Args 伪指令）✅ 已完成
 
 对应"参数不落栈"的结构性修复。这不是性能 peephole，而是 ABI 参数表示方式的
-架构改造，参考 Cranelift 的 `Args` 伪指令实现。M19-M24 依次推进。
+架构改造，参考 Cranelift 的 `Args` 伪指令实现。M19-M24 已全部完成并提交，
+以下为设计背景与参考实现，供后续维护参考，不再重复维护里程碑细节。
 
 ### 2.1 参考实现：Cranelift 的 `Args` 伪指令
 
@@ -178,125 +185,38 @@ ops + 非 barrier`；`RetVal` 由 `Alu` 校正为 `Nop`；`schedule()` 与
 `estimate_cycles()` 将 Nop 类指令视为零周期（不占 issue slot、不消耗 cycle、
 不污染 dual-issue/single-issue 统计）。详见提交记录，不再重复维护。
 
-### M22：验证 Parallel Copy 与真实 Spill
+### M22：验证 Parallel Copy 与真实 Spill ✅（commit 92ddd8a）
 
-整个改造最关键的正确性门禁。
+已完成：Ion `TestFunction` 增加 clobber 支持；新增 5 项 RA 门禁——同寄存器
+fixed-def 无 move、重分配只出 reg-reg move 不 spill、Int/Float 参数交换环由
+parallel-move 破环、跨全寄存器 clobber 的真实 spill（`num_spillslots` 而非
+home slot）、普通 use 后进入 fixed call argument。测试过程中将测试 env 的
+专用 scratch 调整为保留寄存器（与 AArch64/RISC-V 一致），避免与 parallel-move
+端点冲突。详见提交记录，不再重复维护。
 
-同寄存器分配：
+### M23：ABI 与跨后端回归验证 ✅（commit 2e058c9）
 
-```text
-incoming x0；Args fixed-def v0=x0；v0 后续仍分配 x0
-预期：无 mov、无参数 stack slot、无参数 spill
-```
+已完成：`soyo_compiler/src/abi_matrix.rs` 新增 14 个 ABI 矩阵用例（0/1/8/9 参数、
+i32/f32/混合、未使用参数、跨普通 call、tail call、递归、本地 alloc、参数重赋值），
+AArch64 + RISC-V × `-O0/1/2` 全编译成功且 5 次 byte-identical；叶函数 `add`
+收敛为 `add w0, w0, w1; ret`（无 frame、无 str/ldr/sw/lw）；未使用参数不产生
+参数内存往返。QEMU differential 由 `tests/test.py` 在容器内执行（本地无交叉
+工具链）。详见提交记录，不再重复维护。
 
-普通重分配：
+### M24：Frame 与性能门禁 ✅（commit 892c778）
 
-```text
-incoming x0；v0 后续需要 x9
-预期：allocator edit 生成 mov x9, x0，而不是 str/ldr 栈中转
-```
-
-参数交换环：
-
-```text
-arg0: x0 -> 后续要求 x1；arg1: x1 -> 后续要求 x0
-预期：Ion 按 parallel semantics 破环，例如 tmp=x0; x0=x1; x1=tmp
-scratch 选择顺序：专用 scratch -> 该 program point 空闲寄存器 -> 临时 spill slot
-```
-
-需覆盖 Int 与 Float 两个 register class。
-
-高寄存器压力（参数跨 call 存活 + 大量 live value + call 破坏 caller-saved）：
-
-```text
-预期：值可搬到 callee-saved register；或生成真实 spill（位于 spill_size 区域，
-不重新引入 ABI home slot）；prologue 正确保存新增 callee-saved register
-```
-
-多个 fixed constraints（同参数后续又遇到 fixed use，如 call 参数需要 x1）：
-
-```text
-验证 Ion 的 split / fixed requirement / inserted moves / redundant move
-elimination 闭环
-```
-
-提交边界：`[Test(Regalloc)]: Cover incoming fixed defs and parallel argument moves`
-
-### M23：ABI 与跨后端回归验证
-
-AArch64 测试矩阵：
-
-- 0 参数 / 1 个 `i32` / 1 个 `i64`/pointer / 1 个 `f32`。
-- 8 个整数参数 / 8 个浮点参数 / 9 个整数参数（第 9 个从栈加载）。
-- int/float 混合、未使用参数、参数跨普通 call 存活、跨 tail call。
-- 递归调用、叶函数、有本地 `alloc` 的函数、真实 RA spill 的函数。
-- 参数被源程序重新赋值。
-
-RISC-V 测试矩阵（`a0-a7` fixed-def、超量 stack args、float regs、tail call、
-混合、交换环）。
-
-优化级别：该改造是 ABI correctness / codegen architecture，不由优化 flag 控制，
-`-O0/-O1/-O2` 均不再为寄存器参数生成 home slot。注意区分：
-
-```text
--O0 前端源语言参数的 alloc/store/load：允许（IR mem2reg 未运行）
-ABI register home slot：不允许
-```
-
-Differential correctness：QEMU AArch64、RISC-V emulator、现有 functional cases、
-tail-call cases、参数数量边界、随机小函数参数传递。
-
-确定性：同一输入重复编译 5 次，汇编 byte-identical。
-
-提交边界：`[Test]: Add cross-target incoming argument ABI gates`
-
-### M24：Frame 与性能门禁
-
-静态门禁：纯叶算术函数（无本地栈对象、无调用、无 RA spill）如
-`int add(int a, int b) { return a + b; }`：
-
-```text
-目标收敛到接近：add w0, w0, w1; ret
-至少满足：stackslots_size == 0；无参数 str/ldr；不因参数创建 frame；
-无多余 register move 时不产生 edit
-```
-
-是否完全消除 frame pointer 取决于当前 prologue policy，但上述下限必须达成。
-
-统计字段（`taki_mir/src/stats.rs`）：
-
-```rust
-pub struct AbiArgStats {
-    pub register_args_bound: u64,
-    pub unused_register_args_skipped: u64,
-    pub incoming_stack_args_loaded: u64,
-}
-
-pub struct RegallocStats {
-    pub spill_slots: u64,
-    pub reg_to_reg_edits: u64,
-    pub reg_to_stack_edits: u64,
-    pub stack_to_reg_edits: u64,
-}
-```
-
-不建议做"home slots eliminated"运行时计数：新架构中 home slot 根本不应存在，
-应以 invariant/test 保证而非优化命中统计。
-
-XCZU15EG 基准（M15 harness）：增加参数入口 microbenchmark——单/双/八参数叶
-函数、参数跨 call、高压力真实 spill。预期收益：消除 store-forward latency、
-减少 load/store 指令、减少 LSU 占用、缩小 frame、部分叶函数完全消除 frame
-setup、为 list scheduler 提供更干净的基本块。
-
-huffman 预期变化：`_and` / `_xor` / `_or` / `rotrN` / `rotlN` 入口的
-`str w0, [sp, #0]; str w1, [sp, #16]; ldr ...; ldr ...` 全部消失。这比当前
-调度器在 store/load 间插入独立指令更有效，因为直接消除了停顿源。
-
-提交边界：`[Perf]: Add incoming argument frame and performance gates`
+已完成：`taki_mir/src/stats.rs` 新增 `AbiArgStats`（register_args_bound /
+unused_register_args_skipped / incoming_stack_args_loaded）与 `RegallocStats`
+（spill_slots / reg_to_reg / reg_to_stack / stack_to_reg edits），在
+`compile_with_config` 中填充；`CalleeABI` 记录参数绑定计数。验证：
+`add` 叶函数 `register_args_bound=2`、零 spill、零 move；`use_first` 死参数
+`unused_register_args_skipped=1`；huffman `_and`/`_xor`/`rotrN` 入口的
+`str/ldr` 全部消失。XCZU15EG 实机 microbenchmark 仍阻塞于硬件不可用。
+详见提交记录，不再重复维护。
 
 ### 2.3 关键不变量
 
-实施期间必须持续满足：
+以下不变量已在 M19-M24 中实现并由测试门禁持续校验：
 
 1. `Args` 必须是 entry block 第一条 pre-RA 指令。
 2. 每个活跃的 register argument 恰好有一个 fixed def。
@@ -313,7 +233,7 @@ huffman 预期变化：`_and` / `_xor` / `_or` / `rotrN` / `rotlN` 入口的
 
 ### 2.4 预计文件范围
 
-核心修改：
+核心修改（全部完成）：
 
 - `taki_mir/src/abi.rs`
 - `taki_mir/src/lower.rs`
@@ -340,16 +260,19 @@ huffman 预期变化：`_and` / `_xor` / `_or` / `rotrN` / `rotlN` 入口的
 
 ### 2.5 验收标准
 
-- `cargo test --workspace` 全通过。
-- AArch64 与 RISC-V differential correctness 全通过。
-- 所有优化级别均不生成 ABI 参数 home-slot 往返。
-- huffman 中寄存器参数入口的 `str/ldr` 全部消失。
-- 纯叶算术函数 `stackslots_size == 0`。
-- 参数交换环正确。
-- 参数跨 call 和高压力 spill 正确。
-- stack arguments 和 tail calls 无回归。
-- post-RA estimator 不为 `Args`/`RetVal` 计算虚假 cycle。
-- 汇编输出保持确定性。
+完成情况（本地静态验证）：
+
+- ✅ `cargo test --workspace` 全通过。
+- ⏳ AArch64 与 RISC-V differential correctness：QEMU 在容器内由
+  `tests/test.py` 执行，本地无交叉工具链，待硬件/Docker 环境运行。
+- ✅ 所有优化级别均不生成 ABI 参数 home-slot 往返。
+- ✅ huffman 中寄存器参数入口的 `str/ldr` 全部消失。
+- ✅ 纯叶算术函数 `add w0, w0, w1; ret`（无 frame、`stackslots_size == 0`）。
+- ✅ 参数交换环正确（Int/Float）。
+- ✅ 参数跨 call 和高压力 spill 正确。
+- ✅ stack arguments 和 tail calls 无回归（ABI 矩阵编译门禁）。
+- ✅ post-RA estimator 不为 `Args`/`RetVal` 计算虚假 cycle。
+- ✅ 汇编输出保持确定性（5 次 byte-identical）。
 
 ---
 
@@ -375,8 +298,8 @@ DCE 是兜底；更优解是 lowering 时就不为未使用的 block param 和�
 ### P2：跨块 / 全局调度
 
 块内调度对被 call 切碎的热点无能为力。候选方向：循环不变 load 外提
-（`adrp+add+ldr gv_*` 全局量地址重算）、跨块 hoist。属大改动，需先完成
-M19-M24 并重新评估收益空间。
+（`adrp+add+ldr gv_*` 全局量地址重算）、跨块 hoist。属大改动，M19-M24 已完成，
+待重新评估收益空间。
 
 ### P2：调度验证器闭环
 
@@ -404,7 +327,8 @@ M19-M24 并重新评估收益空间。
 - 基于实测调整 guide-derived profile 值。
 - 建立性能回归门禁。
 - 回答：WAR/WAW/NZCV false dependency 是否允许 A53 同周期双发。
-- 用 M24 的参数入口 microbenchmark 量化 `Args` 改造的实际收益。
+- 用 M24 的参数入口 microbenchmark 量化 `Args` 改造的实际收益（M19-M24
+  已完成，入口 str/ldr 已消除，实机数字待测）。
 
 ---
 

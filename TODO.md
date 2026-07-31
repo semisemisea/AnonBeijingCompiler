@@ -161,84 +161,22 @@ Args pseudo: fixed_def(parameter vreg, ABI preg)
 已完成：`ArgPair`、`gen_args`、`take_args`、双后端 `MInst::Args` 及配套测试。
 详见提交记录，不再重复维护。
 
-### M20：将寄存器参数改为 Fixed Def
+### M20：将寄存器参数改为 Fixed Def ✅（commit c46dbe1）
 
-目标：正式消除寄存器参数的 home-slot store/load。
+已完成：`gen_copy_arg_to_reg` 对寄存器参数只收集 `ArgPair`（栈参数保留
+incoming load）；`gen_arg_setup` 末尾 `take_args()` 使 `Args` 成为 entry 首条；
+删除 `reg_arg_spillslots` / `prealloc_reg_arg_spills` /
+`gen_store_reg_args_to_stack`。经验证：`add` 叶函数 frame 从 80B 降到 48B，
+ABI home-slot 往返全部消失（AArch64 + RISC-V）。剩余 `str/ldr` 来自前端
+`alloc/store/load` 参数模式（`FUNC_ARG_OPT_ENABLE=false`），属 M24 范畴。
+详见提交记录，不再重复维护。
 
-重写 `CalleeABI::gen_copy_arg_to_reg`（建议改名 `bind_arg_to_reg`，避免同时
-"记录 pseudo"与"返回实际指令"两种语义）：
+### M21：Post-RA Pseudo 语义与调度集成 ✅（commit d152203）
 
-```rust
-ArgSlot::Reg { reg, .. } => {
-    self.reg_args.push(ArgPair {
-        vreg: Writable::from_reg(into_reg),
-        preg: reg.into(),
-    });
-}
-ArgSlot::Stack { offset, ty } => {
-    // 保留现有 incoming-stack load
-}
-```
-
-重写 `LowerContext::gen_arg_setup`（`taki_mir/src/lower.rs:433-478`），替换
-两阶段 store/load + 逆序翻转：
-
-```text
-遍历实际使用的 entry 参数
-  register arg -> 收集 ArgPair
-  stack arg    -> 生成 incoming load
-finish 当前 lowering group
-take_args() -> Args pseudo 位于函数体最前
-```
-
-关键顺序：`Args pseudo -> stack argument loads -> 普通 entry 指令`。VCode 当前
-逆序构建，需对 `finish_ir_inst()` 规则写显式测试，不能仅靠源码顺序推断。
-
-删除旧 home-slot 状态（确认新路径稳定后）：
-
-- `CalleeABI::reg_arg_spillslots`、`prealloc_reg_arg_spills()`、
-  `gen_store_reg_args_to_stack()`。
-- `gen_spill_store()`/`gen_spill_load()` 本身可能仍有其他用途，不能因名称
-  相同直接删除 ABI machine hook。
-
-未使用参数：只有 `is_value_needed(param)` 的寄存器参数才进入 `Args`，同时修复
-未使用参数仍分配 home slot / 生成 `str` / 强迫叶函数建栈帧的问题。
-
-栈参数：超过 ABI 寄存器数量的参数继续走 `gen_incoming_arg_load`，不改变
-AAPCS64 stack argument offset、caller outgoing 布局、tail-call stack 处理、
-frame pointer 相对寻址。
-
-提交边界：`[Refactor(MIR)]: Bind incoming register arguments with fixed defs`
-
-### M21：Post-RA Pseudo 语义与调度集成
-
-与 Cranelift 不同，本项目有 post-RA list scheduler，必须显式定义 `Args` 的
-调度语义，不能只空 emission。
-
-`Args` 在 `anon_armv8/src/sched/dag.rs` 中的语义：
-
-```text
-defs: 所有参数分配后的 physical registers
-uses: none
-latency: 0
-resources: none
-emitted ops: 0
-barrier: false
-```
-
-- 不能当普通 `Alu`：静态 estimator 会凭空增加 cycle。
-- 不建议当 full barrier：会不必要地限制 entry block 调度。
-- 建议 `class: SchedClass::Nop`，但必须保留 `defs`，确保后续对参数物理寄存器
-  的 use/def/WAR/WAW 关系正确。
-
-顺带校正 `RetVal`：当前不输出机器码却被分类为 `SchedClass::Alu`
-（`dag.rs:1046-1053`），会让 estimator 计算不存在的 ALU 操作。改为
-`uses: return vreg, class: Nop, emitted ops: 0`。
-
-不采用"RA 后把 `Args` 转 `Removed`"作为第一版：后续调度仍需要知道 entry
-physical registers 的初始定义边界；保留 zero-cost pseudo 更利于调试与 verifier。
-
-提交边界：`[Fix(AArch64)]: Model zero-width ABI pseudos in post-RA scheduling`
+已完成：`Args` 建模为 `defs + SchedClass::Nop + 0 latency/resource/emitted
+ops + 非 barrier`；`RetVal` 由 `Alu` 校正为 `Nop`；`schedule()` 与
+`estimate_cycles()` 将 Nop 类指令视为零周期（不占 issue slot、不消耗 cycle、
+不污染 dual-issue/single-issue 统计）。详见提交记录，不再重复维护。
 
 ### M22：验证 Parallel Copy 与真实 Spill
 

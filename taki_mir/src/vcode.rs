@@ -1085,7 +1085,7 @@ impl<I: VCodeInst> VCodeBuilder<I> {
 mod tests {
     use super::*;
     use crate::{
-        abi::{ABIMachineSpec, ArgSlot, CalleeABI, FrameLayout, StackAMode},
+        abi::{ABIMachineSpec, ArgPair, ArgSlot, CalleeABI, FrameLayout, StackAMode},
         prelude::{ArenaContext, HirBasicBlock, HirFunctionData, HirInst, HirType},
         reg_alloc::reg::{MachineEnv, OperandVisitorImpl, PReg},
         register::{Reg, VRegAllocator, Writable},
@@ -1189,6 +1189,10 @@ mod tests {
             TestInst::LoadImm { rd: dst }
         }
 
+        fn gen_args(_args: Vec<ArgPair>) -> Self::I {
+            TestInst::Nop
+        }
+
         fn gen_store_stack(_src: Reg, _mem: StackAMode, _ty: LoweredType) -> Self::I {
             TestInst::Nop
         }
@@ -1289,6 +1293,19 @@ mod tests {
             .expect("Ion allocation should succeed");
 
         assert!(vcode.verify_alloc_output(&output).is_ok());
+    }
+
+    #[test]
+    fn take_args_returns_none_when_no_register_arguments_bound() {
+        let mut program = Program::new();
+        let func = program.new_function(HirType::get_unit(), "args".to_owned(), vec![]);
+        add_block(program.func_data_mut(func), "entry");
+        let arena = ArenaContext {
+            program: &program,
+            curr_func: Some(func),
+        };
+        let mut abi = CalleeABI::<TestABI>::new(arena);
+        assert!(abi.take_args().is_none());
     }
 
     #[test]

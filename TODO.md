@@ -15,6 +15,10 @@
 - XCZU15EG PMU benchmark harness（M15，待实机运行）。
 - Slot-filling dual-issue heuristic（M16）。
 - 端到端验证门禁、确定性检查（M17）。
+- pre-RA DCE（M18）：worklist use-count fixpoint，白名单制（纯 ALU/Mov/常量
+  物化/纯 FP + dead load），`-O1` 起默认开启，`--enable/disable-mir-dce`
+  开关，`DceStats` 统计。huffman-01 上 `-O1` 指令数 964 → 935（-3%），
+  `mov w13, wzr` 等死代码全部消除。
 
 目标硬件是 Xilinx XCZU15EG 上的 Cortex-A53 MPCore。
 
@@ -28,6 +32,7 @@
 
 ```text
 lowering
+  -> pre-RA DeadCodeElim      (-O1 起)
   -> pre-RA PeepholeCombine   (-O1 起)
   -> register allocation
   -> write_back_allocs
@@ -42,8 +47,9 @@ lowering
 
 - `anon_armv8/src/passes/mod.rs`：按 `AArch64CodegenConfig` 注册 pass。
 - `taki_mir/src/passes.rs`：`MIRPass` trait、pre-RA/post-RA 两阶段 pipeline。
+- `anon_armv8/src/passes/dce.rs`：worklist use-count fixpoint DCE，白名单制。
 - `anon_armv8/src/passes/peephole_combine.rs`：vreg use 计数 + MAC 融合，
-  使用 `Removed` tombstone（pre-RA DCE 的直接参照实现）。
+  使用 `Removed` tombstone。
 - `anon_armv8/src/instructions.rs`：`MInst` 枚举（约 60 个 variant）。
 - `taki_mir/src/stats.rs`：函数级 / 编译单元级结构化统计。
 - `soyo_compiler/src/cli.rs`：`-O` 映射与 `--enable/disable-*` 开关。
@@ -59,135 +65,7 @@ lowering
 
 ---
 
-## 2. M18：Pre-RA 死代码消除（DCE）
-
-### 2.1 动机
-
-对 huffman-01 调度前后汇编的对比分析（60/896 行变动，纯重排、指令数不变）
-表明：当前后端的热点块被 call 和分支切碎，块内调度收益有限（估计 <2%）。
-同时输出中存在明显死代码，删除它们能直接减少指令数，收益确定且大于重排：
-
-1. `movz w3, #0x1` 紧跟 `movz w3, #0x20`：两个不同 vreg 的常量，前者零使用，
-   RA 后巧合分配到同一物理寄存器。
-2. `mov w13, wzr` / `mov w7, wzr`：从未被使用的 vreg（大概率来自 block param
-   或分支参数物化）。
-3. 链式死亡：消费者被删后，其生产者随之变死。
-
-### 2.2 已决策事项
-
-| 决策点 | 结论 |
-|--------|------|
-| 是否删除结果未使用的 load | 是。`Ldr`/`LdrPair` 等结果全死时可删（AArch64 load 架构上无副作用，SysY 语义安全，且死 load 仍占 LSU 和发射槽） |
-| 默认优化级别 | `-O1` 起开启（纯收益、无调度风险，与 peephole/pair 同级）；`-O0` 关闭 |
-| 阶段 | 只做 pre-RA。观察到的死代码均为 vreg 零使用，pre-RA 可全部捕获；RA 本身不引入死代码，post-RA DCE 预期收益极低 |
-
-### 2.3 实现内容
-
-#### 2.3.1 新增 pass：`anon_armv8/src/passes/dce.rs`（约 200 行）
-
-算法：worklist 驱动的 use-count fixpoint DCE。pre-RA VCode 保持 SSA，
-每个 vreg 只定义一次，因此 use-count = 0 即死。
-
-1. 全函数统计每个 vreg 作为 `Use` 操作数出现的次数，参照
-   `PeepholeCombine::build_vreg_use_counts`（`get_operands` 遍历 +
-   `OperandKind::Use` 过滤）。该 helper 可抽为共享函数或直接复制。
-2. 扫描全部指令：指令属于可删白名单、至少有一个 def、且所有 def 的 vreg
-   use-count 均为 0 → 标记为 `MInst::Removed`；同时把该指令所有 use 操作数
-   的计数递减，计数因此归零的 vreg 的 def 指令加入 worklist。
-3. 处理 worklist 直至为空（处理链式死亡）。
-
-多 def 指令（如 `LdrPair`）：必须所有 def 都死才可删；任一 def 存活则整条保留。
-
-#### 2.3.2 可删白名单（纯指令 + dead load）
-
-- 整数 ALU：`AluRRR`、`AluRRRR`、`AluRRImm12`、`AluRRImmLogic`、
-  `AluRRImmShift`、`AluRRRShift`、`AluRRRExtend`。
-- 乘除：`SDiv`（AArch64 除零不 trap，返回零，删除安全）、`SMulL`、`MAdd`、
-  `MSub`。
-- 数据移动与常量物化：`Mov`、`MovPhys`、`LoadImm`、`MovZ`、`MovN`、`MovK`、
-  `MovFromZero`。
-- 地址计算：`LoadAddr`（ADRP+ADD，纯）、`StackAddr`。
-- 选择：`CSet`、`CmpSelect`（cmp+csel 是原子单位，flags 内部消化，dst 死则
-  整条可删）。
-- 纯 FP：`FMov`、`FMovFromZero`、`FAlu`、`Scvtf` 等不改变全局状态的 FP 操作。
-- dead load：`Ldr`、`LdrPair` 等所有 load variant，结果全死时可删。
-
-#### 2.3.3 永不删除
-
-- terminator：`BCond`、`Cbz`、`Cbnz`、`Tbz`、`Tbnz`、`CondBr`、`Jump`、`Ret`
-  （pass 不变式要求 terminator 保持在 block 末尾）。
-- `Call` / tail call（副作用、返回值约定）。
-- 所有 store：`Str`、`StrPair` 等（内存副作用）。
-- flags 定义者：`CmpRR`、`CmpImm`、`FCmp`（隐式定义 NZCV，无 vreg def，但
-  被后续 BCond/CSet 消费，绝不能删）。实现规则：**没有任何 def 的指令一律
-  跳过**，天然覆盖此类。
-- `Nop`：保留真实指令语义（M13 决策，`Removed` 才是 tombstone）。
-- `MInst::Removed`：跳过。
-- 任何无法确认纯性的 variant：保守保留，宁漏勿错。
-
-#### 2.3.4 pass 不变式
-
-- 遵守 `MIRPass` contract（`taki_mir/src/passes.rs`）：不改变剩余指令的
-  operand 遍历顺序；`Removed` tombstone 已有 pre-RA 先例（PeepholeCombine），
-  RA 与 verifier 均可处理。
-- 不触碰 CFG side tables，无需 `recompute_cfg`。
-- `run` 返回是否有指令被标记为 `Removed`。
-
-#### 2.3.5 基础设施接线
-
-- `anon_armv8/src/config.rs`：`AArch64CodegenConfig` 增加 `dce: bool`。
-- `anon_armv8/src/passes/mod.rs`：`build_pipeline` 中 DCE 注册在
-  PeepholeCombine **之前**（先清死代码，peephole 看到更干净的指令流；
-  peephole 融合要求 single-use，不会新产生死代码，无需第二轮 DCE）。
-- `soyo_compiler/src/cli.rs`：
-  - 新增 `--enable-mir-dce` / `--disable-mir-dce`；
-  - `aarch64_codegen_config()` 映射：`-O0` 关，`-O1`/`-O2` 开；
-  - 显式 flag 覆盖 `-O` 的既有优先级规则同样适用于 DCE；
-  - RISC-V target 拒绝该 flag（与现有 MIR flag 行为一致）；
-  - 更新现有 CLI 配置解析测试，补充 DCE 组合。
-- `taki_mir/src/stats.rs`：新增 `DceStats { ran, changed,
-  instructions_removed }`，挂入 `FunctionCodegenStats`，并纳入编译单元级
-  聚合。
-
-#### 2.3.6 测试
-
-单元测试（`dce.rs` 内或配套测试文件）：
-
-- 死 `MovZ`/`Mov` 被标记为 `Removed`。
-- 活依赖链（def 有真实使用）完整保留。
-- `Call`、store、`CmpRR`/`CmpImm`、terminator 一律保留。
-- `LdrPair` 双 def：一个存活则整条保留；两个全死则删除。
-- dead `Ldr` 被删除。
-- 链式死亡：a 只被死指令 b 使用，b 删后 a 也被删（fixpoint）。
-- 无 def 指令（Cmp 类）不触发 panic、不删除。
-- pass 关闭时（`dce: false`）VCode 完全不变。
-
-端到端验证：
-
-- 重编 `results/perf/huffman-01.sy`：确认三类死代码消失、text 指令数下降，
-  并与 scheduler on/off 组合交叉验证（DCE 与调度正交）。
-- `cargo test --workspace` 全绿（15 个 test suite）。
-- 5 个 functional case 在 O0/O1/O2 下编译并做正确性回归。
-- RISC-V O0/O2 编译不受影响。
-- 确定性：相同输入相同配置多次编译 byte-identical。
-
-#### 2.3.7 文档与提交
-
-- `TODO.md`：M18 完成后删除本节细节。
-- `README` 优化级别表增加 DCE 列（O0 关 / O1 开 / O2 开）。
-- 独立提交，信息遵循 `[Feat(AArch64)]: ...` 风格；提交前
-  `cargo fmt --all -- --check` 与 `cargo test --workspace` 通过。
-
-### 2.4 验收标准
-
-- huffman-01 中 `movz w3,#0x1`（后接 `movz w3,#0x20`）、`mov w13,wzr`、
-  `mov w7,wzr` 等死代码不再出现。
-- `-O1` 输出的 text 指令数严格小于等于 `-O0`，且无任何功能回归。
-- 全部既有测试通过，RISC-V 不受影响。
-
----
-
-## 3. 后续候选工作
+## 2. 后续候选工作
 
 按预期收益排序，均需在前一项验证后再启动。
 
@@ -252,7 +130,7 @@ RA 引入的 spill/reload 与 callee-saved save/restore 无法被 pre-RA 调度�
 
 ---
 
-## 4. 总体执行原则
+## 3. 总体执行原则
 
 1. 每个 milestone 独立提交；`TODO.md` 在 milestone 完成后删除对应已完成
    细节，只保留后续工作。
@@ -263,7 +141,7 @@ RA 引入的 spill/reload 与 callee-saved save/restore 无法被 pre-RA 调度�
 
 ---
 
-## 5. 风险与缓解
+## 4. 风险与缓解
 
 | 风险 | 严重度 | 缓解措施 |
 |------|--------|---------|

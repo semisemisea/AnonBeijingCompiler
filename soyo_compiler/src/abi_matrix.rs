@@ -1,0 +1,214 @@
+//! Cross-target ABI regression matrix for incoming function parameters.
+//!
+//! Covers the AAPCS64 / RISC-V argument conventions exercised end to end:
+//! zero/one/eight/nine arguments, integer/float mixes, unused parameters,
+//! parameters flowing across ordinary calls and tail calls, recursion, local
+//! allocations, and parameter reassignment. Every case must compile for both
+//! targets at every optimization level and must be byte-for-byte deterministic
+//! across repeated compilations.
+//!
+//! Differential correctness against expected runtime output is validated by
+//! `tests/test.py` under QEMU (requires a cross toolchain); this module is the
+//! portable compilation + determinism gate that runs in any environment.
+
+use crate::cli::Target;
+use crate::frontend::utils::{AstGenContext, ToRaanaIR};
+use anon_armv8::AArch64Backend;
+use uika_riscv::lower::Riscv64Backend;
+
+struct MatrixCase {
+    name: &'static str,
+    source: &'static str,
+}
+
+const MATRIX: &[MatrixCase] = &[
+    MatrixCase {
+        name: "leaf_add",
+        source: "int add(int a, int b) { return a + b; }\nint main() { return add(3, 4); }\n",
+    },
+    MatrixCase {
+        name: "no_args",
+        source: "int forty_two() { return 42; }\nint main() { return forty_two(); }\n",
+    },
+    MatrixCase {
+        name: "one_i32",
+        source: "int twice(int a) { return a + a; }\nint main() { return twice(7); }\n",
+    },
+    MatrixCase {
+        name: "one_f32",
+        source: "float identity(float x) { return x; }\nint main() { return 0; }\n",
+    },
+    MatrixCase {
+        name: "eight_int_args",
+        source: "int sum8(int a, int b, int c, int d, int e, int f, int g, int h) { return a + b + c + d + e + f + g + h; }\nint main() { return sum8(1, 2, 3, 4, 5, 6, 7, 8); }\n",
+    },
+    MatrixCase {
+        name: "eight_float_args",
+        source: "float pick(float a, float b, float c, float d, float e, float f, float g, float h) { return a; }\nint main() { return 0; }\n",
+    },
+    MatrixCase {
+        name: "nine_int_args",
+        source: "int last(int a, int b, int c, int d, int e, int f, int g, int h, int i) { return i; }\nint main() { return last(1, 2, 3, 4, 5, 6, 7, 8, 9); }\n",
+    },
+    MatrixCase {
+        name: "mixed_int_float",
+        source: "float mix(int a, float b) { return b; }\nint main() { return 0; }\n",
+    },
+    MatrixCase {
+        name: "unused_params",
+        source: "int use_first(int a, int b) { return a; }\nint main() { return use_first(3, 4); }\n",
+    },
+    MatrixCase {
+        name: "params_across_call",
+        source: "int helper(int x) { return x + 1; }\nint caller(int a, int b) { return helper(a) + b; }\nint main() { return caller(3, 4); }\n",
+    },
+    MatrixCase {
+        name: "tail_recursion",
+        source: "int fact(int n, int acc) { if (n == 0) { return acc; } return fact(n - 1, acc * n); }\nint main() { return fact(5, 1); }\n",
+    },
+    MatrixCase {
+        name: "local_alloc",
+        source: "int use_array() { int arr[4]; arr[0] = 3; return arr[0]; }\nint main() { return use_array(); }\n",
+    },
+    MatrixCase {
+        name: "param_reassigned",
+        source: "int reassign(int a) { a = a + 1; return a; }\nint main() { return reassign(3); }\n",
+    },
+    MatrixCase {
+        name: "non_tail_recursion",
+        source: "int fib(int n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); }\nint main() { return fib(10); }\n",
+    },
+];
+
+fn compile_sy(source: &str, target: Target, opt_level: u8) -> String {
+    let ast = crate::sysy::CompUnitsParser::new()
+        .parse(source)
+        .expect("SysY test case must parse");
+    let mut ctx = AstGenContext::new();
+    ast.convert(&mut ctx);
+    let mut program = ctx.program;
+    if opt_level > 0 {
+        let pass_manager = raana_ir::opt::pass::PassesManager::default_ref();
+        pass_manager.run_passes(&mut program);
+    }
+    let aarch64_config = match opt_level {
+        0 => anon_armv8::AArch64CodegenConfig {
+            dce: false,
+            peephole_combine: false,
+            pair_combine: false,
+            list_scheduler: false,
+            sched_model: anon_armv8::AArch64SchedModel::CortexA53,
+        },
+        1 => anon_armv8::AArch64CodegenConfig {
+            dce: true,
+            peephole_combine: true,
+            pair_combine: true,
+            list_scheduler: false,
+            sched_model: anon_armv8::AArch64SchedModel::CortexA53,
+        },
+        _ => anon_armv8::AArch64CodegenConfig {
+            dce: true,
+            peephole_combine: true,
+            pair_combine: true,
+            list_scheduler: true,
+            sched_model: anon_armv8::AArch64SchedModel::CortexA53,
+        },
+    };
+    match target {
+        Target::Riscv64 => taki_mir::compile::<Riscv64Backend>(&program),
+        Target::Aarch64 => {
+            taki_mir::compile_with_config::<AArch64Backend>(&program, &aarch64_config).assembly
+        }
+    }
+}
+
+fn function_section(asm: &str, name: &str) -> String {
+    let start = asm
+        .lines()
+        .position(|line| line.trim() == format!("{name}:"))
+        .unwrap_or_else(|| panic!("missing function section `{name}` in assembly:\n{asm}"));
+    let mut end = asm.lines().count();
+    for (index, line) in asm.lines().enumerate().skip(start + 1) {
+        let trimmed = line.trim();
+        if (trimmed.ends_with(':') && !trimmed.starts_with('.'))
+            || (trimmed.ends_with(':') && trimmed.starts_with("Lfunc"))
+        {
+            end = index;
+            break;
+        }
+    }
+    asm.lines()
+        .skip(start)
+        .take(end - start)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compile_deterministically(case: &MatrixCase, target: Target, opt_level: u8) -> String {
+        let first = compile_sy(case.source, target, opt_level);
+        for _ in 0..4 {
+            let again = compile_sy(case.source, target, opt_level);
+            assert_eq!(
+                first, again,
+                "compilation of `{}` ({target:?}, -O{opt_level}) is not deterministic",
+                case.name
+            );
+        }
+        first
+    }
+
+    #[test]
+    fn abi_matrix_compiles_for_both_targets_at_all_optimization_levels() {
+        for case in MATRIX {
+            for target in [Target::Aarch64, Target::Riscv64] {
+                for opt_level in [0u8, 1, 2] {
+                    let asm = compile_deterministically(case, target, opt_level);
+                    assert!(!asm.trim().is_empty(), "empty assembly for {}", case.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn leaf_register_function_has_no_frame_and_no_argument_memory_round_trip() {
+        let case = MATRIX.iter().find(|c| c.name == "leaf_add").unwrap();
+        for opt_level in [1u8, 2] {
+            for target in [Target::Aarch64, Target::Riscv64] {
+                let asm = compile_deterministically(case, target, opt_level);
+                let add = function_section(&asm, "add");
+                for banned in [
+                    "str ", "ldr ", "sw ", "lw ", "stp", "ldp", "sub sp", "addi sp",
+                ] {
+                    assert!(
+                        !add.contains(banned),
+                        "`add` must have no frame or argument memory round trip \
+                         (target {target:?}, -O{opt_level}); found `{banned}` in:\n{add}"
+                    );
+                }
+                if target == Target::Aarch64 {
+                    assert!(
+                        add.contains("add w0, w0, w1"),
+                        "expected `add w0, w0, w1; ret` for the leaf (target {target:?}, -O{opt_level}):\n{add}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unused_register_parameter_produces_no_argument_slots() {
+        let case = MATRIX.iter().find(|c| c.name == "unused_params").unwrap();
+        let asm = compile_deterministically(case, Target::Aarch64, 2);
+        let use_first = function_section(&asm, "use_first");
+        // The second parameter is dead; it must not be materialized onto the
+        // stack or read back.
+        assert!(
+            !use_first.contains("str w1") && !use_first.contains("ldr w"),
+            "dead parameter must not create memory traffic:\n{use_first}"
+        );
+    }
+}

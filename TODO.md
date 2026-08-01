@@ -46,11 +46,21 @@
   多 veneer 小 reach 收敛、>1MB BRANCH19 用例与标签移位渲染；全 corpus
   QEMU 差分通过。
 - 基准与验证基建（M30）：`scripts/perf_compare.sh` 一键产出每 milestone
-  的 `.s` 指令数对比表（current/orig/sched/clang + gem5 sim_insts 列，
-  统计方法统一为 awk 指令计数，静态数字仅作模型级回归）；M31-M38 起点
-  基线记录在 `results/perf_compare/`。
+   的 `.s` 指令数对比表（current/orig/sched/clang + gem5 sim_insts 列，
+   统计方法统一为 awk 指令计数，静态数字仅作模型级回归）；M31-M38 起点
+   基线记录在 `results/perf_compare/`。
+- if-conversion 推广 + land/lor 折叠（M31）：`finish_candidate` 的
+   `reaches(merge, head)` 守卫放宽为 `head` 支配 `merge`（循环累加器
+   `if (bit_a==1 && bit_b==1) result += power` 由分支 + phi 拷贝转为
+   `select`）；三角 arm 从单条指令推广为单用链（`and`+`eq` 等），新增
+   第三候选形状：`br c1, rhs, merge(0)` / `br c1, merge(c1), rhs` 折叠为
+   `band/bor(c1, c2)` 并删 rhs 块（要求 0/1 比较值）。huffman-01
+   706 → 686：`_and/_or/_xor` 循环体无分支（`cset`+`band/bor`+`csel`），
+   与 clang 结构一致；与 clang 的差距（`ccmp`、`subs` 融合）留给 M32/M33。
+   单测覆盖累加器、land/lor 折叠、链式 arm；abi_matrix 的 R4 用例改用
+   call-arm 形状；全 corpus QEMU 差分通过。
 
-备注：M27/M30 已完成并独立提交；M28（RISC-V slot 化）待做。
+备注：M27/M30/M31 已完成并独立提交；M28（RISC-V slot 化）待做。
 
 目标硬件是 Xilinx XCZU15EG 上的 Cortex-A53 MPCore。
 
@@ -96,23 +106,22 @@ DCE。相关 pass 见 `raana_ir/src/opt/passes/`。
 
 ### 1.2 现状与差距总览（huffman-01 对照 clang -O2）
 
-M26 基线：huffman-01 静态指令数 687（M25/M26 累计 -21%）。对照
-`results/perf/huffman-01_clang.s`（clang -O2）与 `huffman-01.s`（本项目），
-差距集中在 IR 层分支结构、后端标志融合、循环不变量与外提：
+M31 基线：huffman-01 静态指令数 686（awk 方法，M30 基线 706）。对照
+`results/perf/huffman-01_clang.s`（clang -O2），差距集中在后端标志
+融合、循环不变量与外提：
 
 | 函数 | clang | 本项目 | 差距根因 |
 |---|---|---|---|
-| `_and/_xor/_or` 循环体（32 次迭代） | ~10 条/迭代：`ccmp`+`csel` 无分支 | ~19 条/迭代：`&&`/`\|\|` 分支+cset+二次分支；if 菱形分支+phi 拷贝；回边 5 条 `mov`；`sub;cmp;b.ne` 未融合 | if-conversion 保守；无 ccmp；无 subs/tst 融合；RA 拷贝未消除 |
+| `_and/_xor/_or` 循环体（32 次迭代） | ~10 条/迭代：`ccmp`+`csel` 无分支 | ~20 条/迭代：无分支（`cset`+`band/bor`+`cset`+`cmp`+`csel`），但比较/标志未融合；回边仍有 mov | 无 ccmp；无 subs/tst 融合；RA 拷贝未消除 |
 | `rotrN/rotlN` | 二分比较树（最坏 ~3 次 cmp） | 8 次线性 cmp 链（内联后重复复制） | 无 if 链→switch/决策树 |
 | `read_bits`（热点，2000×10⁵/5 调用） | 全局一次载入寄存器、出口统一写回；switch 表提取；无函数调用 | 循环内重复 `adrp+ldr` 全局；循环体 store 回写；热循环保留 `bl rotlN`（栈帧+8-cmp 链）；尾部内联 rotrN 8-cmp 链 | 缺 GSP/LICM；内联仅"单调用点"；无链→switch |
 | `output_data` | `gv_out_num` 一次加载；尾调用 `b putch` | 重复加载 3 次；`bl putch`+栈帧 | 缺 load-CSE/GSP；TCO 未覆盖 if 链末尾调用 |
 | `decode_fixed_huffman` | 等价结构 | 死空块跳转 `then_13: b while_entry_5` | simplify_cfg 缺口 |
 
-根因分层：
+根因分层（M31 已修 IR 层 land/lor 与循环累加器，余下）：
 
-- **IR 层（raana_ir）**：if_conversion 只支持 3 种保守形状，`reaches(merge,
-  head)` 阻止循环累加器转换；land/lor 三角不折叠；无 LICM/GSP/load-CSE；
-  内联仅"单调用点"；无 if 链→switch。
+- **IR 层（raana_ir）**：无 LICM/GSP/load-CSE；内联仅"单调用点"；
+  无 if 链→switch。
 - **后端层（anon_armv8）**：无 `ccmp` 指令；`CmpSelect` 只支持直线
   cmp+csel/cset 配对；无 `subs`/`tst` 融合；`Mov` 按 64 位宽度发射。
 - **RA 层（taki_mir ion 移植）**：回边 blockparam 拷贝未被 bundle 合并/
@@ -182,22 +191,14 @@ M26 基线：huffman-01 静态指令数 687（M25/M26 累计 -21%）。对照
   M31-M38 起点基线在 `results/perf_compare/`；`cargo test --workspace`
   全绿。已完成独立提交。
 
-#### M31：if-conversion 推广 + land/lor 折叠（IR，最大单点收益）
+#### M31：if-conversion 推广 + land/lor 折叠（已完成）
 
-- 文件：`raana_ir/src/opt/passes/if_conversion.rs`。
-- 设计：
-  1. **放宽 `reaches(merge, head)`（line 215）**：当 head 支配 merge、且所有
-     被上提指令的操作数经 `available_at`（line 325）在 head 可用时允许转换
-     ——覆盖循环累加器 `if (bit_a==1 && bit_b==1) result += power;`。
-     `safe_arm_binary`（line 301）已排除 div/rem/副作用，仅 `reaches` 过保守。
-     转换后 head 内为 `select(cond, result+power, result)`，merge 的 phi 由
-     `apply()`（line 418-460）事务化删除。
-  2. **新增第三候选形状：land/lor 三角** `br %c1, rhs, merge(0,..); rhs:
-     %c2=…; jump merge(%c2,…)`，`%c1/%c2` 为 0/1 比较值 → 折叠为
-     `band/bor(c1, c2)` 单指令，删 rhs 块（LLVM 语义；cranelift 无此 pass）。
-  3. 之后由 `boolean_simplify` 归约 `select(cond,1,0)` → 比较本身。
-- 验收：`_and/_xor/_or` 内循环无分支、无 phi 拷贝（先于 M32 每迭代减 ~8 条）；
-  单测覆盖循环累加器与 `&&`/`||`；全 corpus 功能回归。
+- `reaches(merge, head)` 放宽为 `head` 支配 `merge`（循环累加器转
+  `select`）；三角 arm 推广为单用链；新增 land/lor 折叠为
+  `band/bor(c1, c2)`（要求 0/1 比较值），删 rhs 块。
+- 结果：huffman-01 706 → 686；`_and/_or/_xor` 循环体无分支；
+  单测覆盖累加器、land/lor、链式 arm；abi_matrix R4 用例改用 call-arm
+  形状；全 corpus QEMU 差分通过。已完成独立提交（93f43a8）。
 
 #### M32：CondResult + ccmp 后端机制
 

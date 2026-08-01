@@ -1,5 +1,6 @@
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use crate::ir::{
     BasicBlockBuilders, LocalBuilder,
@@ -226,12 +227,17 @@ pub trait Arena {
     }
 
     #[inline]
-    fn alloc_local_inst(&mut self, data: InstData) -> Inst {
-        let id = self.local_mut().inst_arena.alloc(data.clone());
-        for used in data.inst_usage() {
+    fn alloc_local_inst(&mut self, mut data: InstData) -> Inst {
+        let inst_usage = data.inst_usage().collect::<SmallVec<[Inst; 4]>>();
+        let bb_usage = data.bb_usage().collect::<SmallVec<[BasicBlock; 2]>>();
+        debug_assert!(data.used_by().is_empty());
+        data.used_by_mut().clear();
+
+        let id = self.local_mut().inst_arena.alloc(data);
+        for used in inst_usage {
             self.inst_data_mut(used).used_by_mut().insert(id);
         }
-        for bb in data.bb_usage() {
+        for bb in bb_usage {
             self.bb_data_mut(bb).used_by_mut().insert(id);
         }
         id
@@ -269,9 +275,13 @@ pub trait Arena {
     }
 
     #[inline]
-    fn alloc_global_inst(&mut self, data: InstData) -> Inst {
-        let id = self.global_mut().inst_arena.alloc(data.clone());
-        for used in data.inst_usage() {
+    fn alloc_global_inst(&mut self, mut data: InstData) -> Inst {
+        let inst_usage = data.inst_usage().collect::<SmallVec<[Inst; 4]>>();
+        debug_assert!(data.used_by().is_empty());
+        data.used_by_mut().clear();
+
+        let id = self.global_mut().inst_arena.alloc(data);
+        for used in inst_usage {
             self.inst_data_mut(used).used_by_mut().insert(id);
         }
         id

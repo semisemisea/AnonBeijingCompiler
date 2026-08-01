@@ -154,7 +154,7 @@ impl BlockLoweringOrder {
                             succ: orig,
                             succ_idx: succ_idx as u32,
                         };
-                        assert!(
+                        debug_assert!(
                             !lowered_order.contains(&edge),
                             "each source successor index must produce a distinct edge block"
                         );

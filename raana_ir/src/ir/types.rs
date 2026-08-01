@@ -1,4 +1,6 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, rc::Rc};
+
+use rustc_hash::FxHashMap;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum TypeKind {
@@ -59,7 +61,7 @@ pub const POINTER_SIZE: usize = std::mem::size_of::<*const ()>();
 
 impl Type {
     thread_local! {
-        static POOL: RefCell<HashMap<TypeKind, Type>> = RefCell::new(HashMap::new());
+        static POOL: RefCell<FxHashMap<TypeKind, Type>> = RefCell::new(FxHashMap::default());
     }
 
     pub fn kind(&self) -> &TypeKind {

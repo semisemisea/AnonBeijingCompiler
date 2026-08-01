@@ -31,6 +31,7 @@ impl LICM {
         data: &mut ArenaContextMut<'_>,
         cfg: &CFG,
         dom_tree: &DominanceTree,
+        parameter_blocks: &FxHashMap<Inst, BasicBlock>,
     ) -> LoopResult {
         fn insts(looop: &Loop, data: &ArenaContextMut<'_>) -> impl Iterator<Item = Inst> {
             looop
@@ -80,12 +81,11 @@ impl LICM {
                     states.get(&operand) == Some(&Lattice::Invariant)
                 }
                 Some(block) => dom_tree.dominates(block, looop.header()),
-                None if matches!(data.inst_data(operand).kind(), InstKind::BlockArgRef(..)) => cfg
-                    .blocks()
-                    .iter()
-                    .copied()
-                    .find(|&block| data.bb_data(block).params().contains(&operand))
-                    .is_some_and(|block| dom_tree.dominates(block, looop.header())),
+                None if matches!(data.inst_data(operand).kind(), InstKind::BlockArgRef(..)) => {
+                    parameter_blocks
+                        .get(&operand)
+                        .is_some_and(|&block| dom_tree.dominates(block, looop.header()))
+                }
                 None => false,
             }
         };
@@ -214,13 +214,30 @@ impl Pass for LICM {
         }
         let mut changed = false;
         loop {
-            let (cfg, dom_tree, loop_analysis) = loop_analysis::LoopAnalysis::new(data);
+            let Some(cfg) = CFG::new(data) else {
+                return changed;
+            };
+            if cfg.is_acyclic() {
+                return changed;
+            }
+            let parameter_blocks = cfg
+                .blocks()
+                .iter()
+                .flat_map(|&block| {
+                    data.bb_data(block)
+                        .params()
+                        .iter()
+                        .copied()
+                        .map(move |parameter| (parameter, block))
+                })
+                .collect::<FxHashMap<_, _>>();
+            let (cfg, dom_tree, loop_analysis) = loop_analysis::LoopAnalysis::from_cfg(cfg);
             let mut rebuild = false;
 
             // Loops are ordered from small to big. This lets an instruction
             // hoisted from an inner loop be considered by its outer loop.
             for looop in loop_analysis.loops() {
-                match Self::solve(looop, data, &cfg, &dom_tree) {
+                match Self::solve(looop, data, &cfg, &dom_tree, &parameter_blocks) {
                     LoopResult::Unchanged => {}
                     LoopResult::Changed => changed = true,
                     LoopResult::CfgChanged => {
@@ -252,6 +269,22 @@ mod tests {
             curr_func: Some(function),
         };
         LICM.run_on(&mut context)
+    }
+
+    #[test]
+    fn skips_an_acyclic_function() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "acyclic".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        data.layout_mut().push_bb_back(exit);
+        let jump = data.new_local_inst().jump(exit, vec![]);
+        data.layout_mut().insert_inst(entry, jump);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(!run(&mut program, function));
     }
 
     #[test]

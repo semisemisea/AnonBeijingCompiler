@@ -1,7 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    num::NonZeroU32,
-};
+use std::num::NonZeroU32;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ir::instruction::Inst;
 
@@ -9,7 +8,7 @@ use crate::ir::instruction::Inst;
 pub struct BasicBlockData {
     name: String,
     params: Vec<Inst>,
-    used_by: HashSet<Inst>,
+    used_by: FxHashSet<Inst>,
 }
 
 impl BasicBlockData {
@@ -17,7 +16,7 @@ impl BasicBlockData {
         BasicBlockData {
             name,
             params,
-            used_by: HashSet::new(),
+            used_by: FxHashSet::default(),
         }
     }
 
@@ -25,11 +24,11 @@ impl BasicBlockData {
         &self.params
     }
 
-    pub fn used_by(&self) -> &HashSet<Inst> {
+    pub fn used_by(&self) -> &FxHashSet<Inst> {
         &self.used_by
     }
 
-    pub fn used_by_mut(&mut self) -> &mut HashSet<Inst> {
+    pub fn used_by_mut(&mut self) -> &mut FxHashSet<Inst> {
         &mut self.used_by
     }
 
@@ -51,14 +50,14 @@ pub struct BasicBlock(NonZeroU32);
 
 #[derive(Debug, Clone)]
 pub struct BasicBlockArena {
-    data: HashMap<BasicBlock, BasicBlockData>,
+    data: FxHashMap<BasicBlock, BasicBlockData>,
     next_id: u32,
 }
 
 impl BasicBlockArena {
     pub fn new() -> BasicBlockArena {
         BasicBlockArena {
-            data: HashMap::new(),
+            data: FxHashMap::default(),
             next_id: 1,
         }
     }

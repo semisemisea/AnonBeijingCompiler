@@ -1,7 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    num::NonZeroU32,
-};
+use std::num::NonZeroU32;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ir::{
     inst_kind::{
@@ -17,7 +16,7 @@ pub struct InstData {
     ty: Type,
     name: Option<String>,
     kind: InstKind,
-    pub(crate) used_by: HashSet<Inst>,
+    pub(crate) used_by: FxHashSet<Inst>,
 }
 
 impl Clone for InstData {
@@ -27,7 +26,7 @@ impl Clone for InstData {
             ty: self.ty.clone(),
             name: self.name.clone(),
             kind: self.kind.clone(),
-            used_by: HashSet::new(),
+            used_by: FxHashSet::default(),
         }
     }
 }
@@ -39,7 +38,7 @@ impl InstData {
             ty,
             name: None,
             kind,
-            used_by: HashSet::new(),
+            used_by: FxHashSet::default(),
         }
     }
 
@@ -47,11 +46,11 @@ impl InstData {
         self.name = Some(name);
     }
 
-    pub fn used_by(&self) -> &HashSet<Inst> {
+    pub fn used_by(&self) -> &FxHashSet<Inst> {
         &self.used_by
     }
 
-    pub(in crate::ir) fn used_by_mut(&mut self) -> &mut HashSet<Inst> {
+    pub(in crate::ir) fn used_by_mut(&mut self) -> &mut FxHashSet<Inst> {
         &mut self.used_by
     }
 
@@ -215,7 +214,7 @@ impl InstData {
             ty: self.ty.clone(),
             name: self.name.clone(),
             kind: mapped_kind,
-            used_by: HashSet::new(),
+            used_by: FxHashSet::default(),
         })
     }
 }
@@ -241,20 +240,20 @@ const GLOBAL_ID_START_FROM: u32 = 0x40000000;
 
 #[derive(Debug, Clone)]
 pub struct LocalInstArena {
-    data: HashMap<Inst, InstData>,
+    data: FxHashMap<Inst, InstData>,
     next_id: u32,
 }
 
 #[derive(Debug, Clone)]
 pub struct GlobalInstArena {
-    data: HashMap<Inst, InstData>,
+    data: FxHashMap<Inst, InstData>,
     next_id: u32,
 }
 
 impl LocalInstArena {
     pub fn new() -> LocalInstArena {
         LocalInstArena {
-            data: HashMap::new(),
+            data: FxHashMap::default(),
             next_id: LOCAL_ID_START_FROM,
         }
     }
@@ -285,12 +284,16 @@ impl LocalInstArena {
     pub fn datas(&self) -> std::collections::hash_map::Iter<'_, Inst, InstData> {
         self.data.iter()
     }
+
+    pub fn data(&self) -> &FxHashMap<Inst, InstData> {
+        &self.data
+    }
 }
 
 impl GlobalInstArena {
     pub fn new() -> GlobalInstArena {
         GlobalInstArena {
-            data: HashMap::new(),
+            data: FxHashMap::default(),
             next_id: GLOBAL_ID_START_FROM,
         }
     }

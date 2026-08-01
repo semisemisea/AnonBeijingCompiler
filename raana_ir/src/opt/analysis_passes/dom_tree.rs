@@ -178,6 +178,7 @@ pub mod v2 {
                 dfs_in,
                 dfs_out,
             };
+            #[cfg(debug_assertions)]
             tree.verify(cfg);
             tree
         }
@@ -226,27 +227,28 @@ pub mod v2 {
             dominator != block && self.dominates(dominator, block)
         }
 
+        #[cfg(debug_assertions)]
         fn verify(&self, cfg: &CFG) {
-            assert_eq!(self.entry, cfg.entry());
-            assert_eq!(self.immediate_dominators.len(), cfg.block_count());
-            assert_eq!(self.children.len(), cfg.block_count());
-            assert_eq!(self.depths.len(), cfg.block_count());
-            assert_eq!(self.dfs_in.len(), cfg.block_count());
-            assert_eq!(self.dfs_out.len(), cfg.block_count());
-            assert_eq!(self.immediate_dominator(self.entry), None);
-            assert_eq!(self.depth_of(self.entry), 0);
+            debug_assert_eq!(self.entry, cfg.entry());
+            debug_assert_eq!(self.immediate_dominators.len(), cfg.block_count());
+            debug_assert_eq!(self.children.len(), cfg.block_count());
+            debug_assert_eq!(self.depths.len(), cfg.block_count());
+            debug_assert_eq!(self.dfs_in.len(), cfg.block_count());
+            debug_assert_eq!(self.dfs_out.len(), cfg.block_count());
+            debug_assert_eq!(self.immediate_dominator(self.entry), None);
+            debug_assert_eq!(self.depth_of(self.entry), 0);
 
             for &block in cfg.blocks() {
-                assert!(self.dominates(block, block));
+                debug_assert!(self.dominates(block, block));
                 if block == self.entry {
                     continue;
                 }
                 let idom = self
                     .immediate_dominator(block)
                     .expect("every reachable non-entry block must have an idom");
-                assert!(self.strictly_dominates(idom, block));
-                assert_eq!(self.depth_of(block), self.depth_of(idom) + 1);
-                assert!(self.children_of(idom).contains(&block));
+                debug_assert!(self.strictly_dominates(idom, block));
+                debug_assert_eq!(self.depth_of(block), self.depth_of(idom) + 1);
+                debug_assert!(self.children_of(idom).contains(&block));
 
                 let mut ancestor = block;
                 for _ in 0..cfg.block_count() {
@@ -257,7 +259,7 @@ pub mod v2 {
                         .immediate_dominator(ancestor)
                         .expect("only the entry may lack an idom");
                 }
-                assert_eq!(
+                debug_assert_eq!(
                     ancestor, self.entry,
                     "immediate-dominator chain must reach the entry"
                 );

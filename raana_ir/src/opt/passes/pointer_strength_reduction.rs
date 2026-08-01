@@ -1,3 +1,5 @@
+use rustc_hash::FxHashMap;
+
 use crate::opt::{
     analysis_passes::{
         dom_tree::v2::DominanceTree,
@@ -46,6 +48,7 @@ impl PointerStrengthReduction {
         loops: &LoopAnalysis,
         ivs: &BasicInductionVariableAnalysis,
         looop: &Loop,
+        parameter_blocks: &FxHashMap<Inst, BasicBlock>,
     ) -> Option<Candidate> {
         let &[latch] = looop.latches() else {
             return None;
@@ -96,10 +99,24 @@ impl PointerStrengthReduction {
                     };
                     if gep.offsets().len() < 2
                         || gep.offsets().last().copied() != Some(iv.parameter())
-                        || !Self::available_at_header(data, dom_tree, looop, gep.base())
+                        || !Self::available_at_header(
+                            data,
+                            dom_tree,
+                            looop,
+                            parameter_blocks,
+                            gep.base(),
+                        )
                         || !gep.offsets()[..gep.offsets().len() - 1]
                             .iter()
-                            .all(|&offset| Self::available_at_header(data, dom_tree, looop, offset))
+                            .all(|&offset| {
+                                Self::available_at_header(
+                                    data,
+                                    dom_tree,
+                                    looop,
+                                    parameter_blocks,
+                                    offset,
+                                )
+                            })
                         || !Self::has_only_loop_memory_users(data, looop, inst)
                     {
                         continue;
@@ -184,6 +201,7 @@ impl PointerStrengthReduction {
         data: &ArenaContextMut<'_>,
         dom_tree: &DominanceTree,
         looop: &Loop,
+        parameter_blocks: &FxHashMap<Inst, BasicBlock>,
         value: Inst,
     ) -> bool {
         if value.is_global() || data.inst_data(value).kind().is_const() {
@@ -191,17 +209,13 @@ impl PointerStrengthReduction {
         }
         match data.layout().parent_bb(value) {
             Some(block) => !looop.contains(block) && dom_tree.dominates(block, looop.header()),
-            None if matches!(data.inst_data(value).kind(), InstKind::BlockArgRef(..)) => data
-                .layout()
-                .basicblocks()
-                .iter()
-                .map(|layout| layout.bb())
-                .find(|&block| data.bb_data(block).params().contains(&value))
-                .is_some_and(|block| {
+            None if matches!(data.inst_data(value).kind(), InstKind::BlockArgRef(..)) => {
+                parameter_blocks.get(&value).is_some_and(|&block| {
                     !looop.contains(block)
                         && dom_tree.contains(block)
                         && dom_tree.dominates(block, looop.header())
-                }),
+                })
+            }
             None => false,
         }
     }
@@ -289,13 +303,36 @@ impl Pass for PointerStrengthReduction {
         }
         let mut changed = false;
         loop {
-            let (cfg, dom_tree, loops) = LoopAnalysis::new(data);
+            let Some(cfg) = CFG::new(data) else {
+                return changed;
+            };
+            if cfg.is_acyclic() {
+                return changed;
+            }
+            let parameter_blocks = cfg
+                .blocks()
+                .iter()
+                .flat_map(|&block| {
+                    data.bb_data(block)
+                        .params()
+                        .iter()
+                        .copied()
+                        .map(move |parameter| (parameter, block))
+                })
+                .collect::<FxHashMap<_, _>>();
+            let (cfg, dom_tree, loops) = LoopAnalysis::from_cfg(cfg);
             let ivs = BasicInductionVariableAnalysis::new(data, &cfg, &loops);
             let mut transformed = false;
             for looop in loops.loops() {
-                let Some(candidate) =
-                    Self::find_candidate(data, &cfg, &dom_tree, &loops, &ivs, looop)
-                else {
+                let Some(candidate) = Self::find_candidate(
+                    data,
+                    &cfg,
+                    &dom_tree,
+                    &loops,
+                    &ivs,
+                    looop,
+                    &parameter_blocks,
+                ) else {
                     continue;
                 };
                 match Self::apply_candidate(data, &cfg, looop, candidate) {
@@ -410,6 +447,22 @@ mod tests {
             curr_func: Some(function),
         };
         PointerStrengthReduction.run_on(&mut context)
+    }
+
+    #[test]
+    fn skips_an_acyclic_function() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "acyclic".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        data.layout_mut().push_bb_back(exit);
+        let jump = data.new_local_inst().jump(exit, vec![]);
+        data.layout_mut().insert_inst(entry, jump);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(!run(&mut program, function));
     }
 
     fn integer_constant(data: &FunctionData, inst: Inst) -> Option<i32> {

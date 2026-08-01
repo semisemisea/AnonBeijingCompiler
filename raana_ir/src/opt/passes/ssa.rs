@@ -85,7 +85,7 @@ impl Pass for SSATransform {
         // variable(vid) is insert as basic block(bbid) at index(usize)
         let mut insert_table = vec![vec![]; bb_id.cnt()];
 
-        let mut worked = vec![HashSet::new(); bb_id.cnt()];
+        let mut worked = vec![HashSet::default(); bb_id.cnt()];
 
         for (vid, frontiers) in val_usage.iter().enumerate().flat_map(|(vid, def_bbs)| {
             def_bbs
@@ -333,7 +333,7 @@ pub fn dominance_analysis(
     prece: &CFGGraph,
     idom_map: &IDomMap,
 ) -> Frontier {
-    let mut dominance_frontier = Frontier::new();
+    let mut dominance_frontier = Frontier::default();
 
     // algorithm I looked up from wikipedia.
     for bb in 0..id_alloca.cnt() {

@@ -1,4 +1,6 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
+
+use rustc_hash::FxHashSet as HashSet;
 
 use itertools::Itertools;
 
@@ -122,8 +124,8 @@ impl Pass for SparseConditionConstantPropagation {
         let mut bb_allocator: IDAllocator<BasicBlock, BId> = IDAllocator::new(1);
         bb_allocator.check_or_alloc_id_same(entry_bb.bb());
 
-        let mut edge_visited = EdgeSet::new();
-        let mut vertex_visited = HashSet::new();
+        let mut edge_visited = EdgeSet::default();
+        let mut vertex_visited = HashSet::default();
 
         let mut flow_worklist = FlowWorklist::new();
         let mut ssa_worklist = SSAWorklist::new();

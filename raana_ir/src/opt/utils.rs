@@ -1,4 +1,6 @@
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::hash_map::Entry;
+
+use rustc_hash::FxHashMap as HashMap;
 
 pub(crate) mod body_clone;
 pub mod call;
@@ -21,7 +23,7 @@ use itertools::Itertools;
 use log::debug;
 
 pub mod type_alias {
-    use std::collections::{HashMap, HashSet};
+    use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
     use crate::{
         ir::{BasicBlock, Inst},
@@ -71,8 +73,8 @@ where
 {
     pub fn new(increase_by: I) -> IDAllocator<PK, I, NK> {
         Self {
-            id_pos: HashMap::new(),
-            id_neg: HashMap::new(),
+            id_pos: HashMap::default(),
+            id_neg: HashMap::default(),
             cnt: I::zero(),
             increase_by,
         }

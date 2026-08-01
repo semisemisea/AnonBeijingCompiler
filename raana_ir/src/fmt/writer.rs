@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::fmt::Write;
 
@@ -115,8 +115,8 @@ impl Writer<'_> {
                 program,
                 curr_func: None,
             },
-            symbol: HashMap::new(),
-            bb_name: HashMap::new(),
+            symbol: HashMap::default(),
+            bb_name: HashMap::default(),
             counter: 0,
         }
     }

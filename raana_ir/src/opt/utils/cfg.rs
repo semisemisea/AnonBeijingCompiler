@@ -24,6 +24,7 @@ pub struct CFG {
     reverse_postorder: Vec<BasicBlock>,
     successors: FxHashMap<BasicBlock, BlockNeighbors>,
     predecessors: FxHashMap<BasicBlock, BlockNeighbors>,
+    acyclic: bool,
 }
 
 impl CFG {
@@ -53,7 +54,7 @@ impl CFG {
                 .copied()
                 .unwrap_or_else(|| panic!("reachable basic block {block:?} is empty"));
 
-            assert!(
+            debug_assert!(
                 instructions
                     .iter()
                     .take(instructions.len().saturating_sub(1))
@@ -85,44 +86,48 @@ impl CFG {
             successors
         }
 
-        fn visit(
-            data: &FunctionData,
-            block: BasicBlock,
-            layout_blocks: &FxHashSet<BasicBlock>,
-            visited: &mut FxHashSet<BasicBlock>,
-            successors: &mut FxHashMap<BasicBlock, BlockNeighbors>,
-            postorder: &mut Vec<BasicBlock>,
-        ) {
-            if !visited.insert(block) {
-                return;
-            }
-
-            let block_successors = block_successors(data, block, layout_blocks);
-            for &successor in &block_successors {
-                visit(
-                    data,
-                    successor,
-                    layout_blocks,
-                    visited,
-                    successors,
-                    postorder,
-                );
-            }
-            successors.insert(block, block_successors);
-            postorder.push(block);
+        #[derive(Clone, Copy)]
+        enum Visit {
+            Enter(BasicBlock),
+            Exit(BasicBlock),
         }
 
+        let mut active = FxHashSet::default();
         let mut visited = FxHashSet::default();
         let mut successors = FxHashMap::default();
         let mut postorder = Vec::new();
-        visit(
-            data,
-            entry,
-            &layout_blocks,
-            &mut visited,
-            &mut successors,
-            &mut postorder,
-        );
+        let mut acyclic = true;
+        let mut stack = vec![Visit::Enter(entry)];
+        while let Some(visit) = stack.pop() {
+            match visit {
+                Visit::Enter(block) => {
+                    if visited.contains(&block) {
+                        continue;
+                    }
+                    if !active.insert(block) {
+                        acyclic = false;
+                        continue;
+                    }
+
+                    let block_successors = block_successors(data, block, &layout_blocks);
+                    stack.push(Visit::Exit(block));
+                    for &successor in block_successors.iter().rev() {
+                        if active.contains(&successor) {
+                            acyclic = false;
+                        } else if !visited.contains(&successor) {
+                            stack.push(Visit::Enter(successor));
+                        }
+                    }
+                    successors.insert(block, block_successors);
+                }
+                Visit::Exit(block) => {
+                    active.remove(&block);
+                    if visited.insert(block) {
+                        postorder.push(block);
+                    }
+                }
+            }
+        }
 
         let mut reverse_postorder = postorder.clone();
         reverse_postorder.reverse();
@@ -147,7 +152,9 @@ impl CFG {
             reverse_postorder,
             successors,
             predecessors,
+            acyclic,
         };
+        #[cfg(debug_assertions)]
         graph.verify();
         Some(graph)
     }
@@ -195,6 +202,10 @@ impl CFG {
         self.successors.values().map(BlockNeighbors::len).sum()
     }
 
+    pub fn is_acyclic(&self) -> bool {
+        self.acyclic
+    }
+
     pub fn edges(&self) -> impl Iterator<Item = CFGEdge> + '_ {
         self.reverse_postorder.iter().flat_map(|&src| {
             self.successors_of(src)
@@ -204,31 +215,32 @@ impl CFG {
         })
     }
 
+    #[cfg(debug_assertions)]
     fn verify(&self) {
-        assert_eq!(self.reverse_postorder.first(), Some(&self.entry));
-        assert_eq!(self.postorder.len(), self.reverse_postorder.len());
-        assert_eq!(self.successors.len(), self.reverse_postorder.len());
-        assert_eq!(self.predecessors.len(), self.reverse_postorder.len());
+        debug_assert_eq!(self.reverse_postorder.first(), Some(&self.entry));
+        debug_assert_eq!(self.postorder.len(), self.reverse_postorder.len());
+        debug_assert_eq!(self.successors.len(), self.reverse_postorder.len());
+        debug_assert_eq!(self.predecessors.len(), self.reverse_postorder.len());
 
         let blocks = self
             .reverse_postorder
             .iter()
             .copied()
             .collect::<FxHashSet<_>>();
-        assert_eq!(blocks.len(), self.reverse_postorder.len());
-        assert_eq!(
+        debug_assert_eq!(blocks.len(), self.reverse_postorder.len());
+        debug_assert_eq!(
             self.postorder.iter().copied().collect::<FxHashSet<_>>(),
             blocks
         );
 
         for edge in self.edges() {
-            assert!(blocks.contains(&edge.src));
-            assert!(blocks.contains(&edge.dst));
-            assert!(self.predecessors_of(edge.dst).contains(&edge.src));
+            debug_assert!(blocks.contains(&edge.src));
+            debug_assert!(blocks.contains(&edge.dst));
+            debug_assert!(self.predecessors_of(edge.dst).contains(&edge.src));
         }
         for (&dst, sources) in &self.predecessors {
             for &src in sources {
-                assert!(self.successors_of(src).contains(&dst));
+                debug_assert!(self.successors_of(src).contains(&dst));
             }
         }
     }
@@ -287,6 +299,7 @@ mod tests {
         assert_eq!(cfg.entry(), entry);
         assert_eq!(cfg.block_count(), 4);
         assert_eq!(cfg.edge_count(), 4);
+        assert!(cfg.is_acyclic());
         assert_eq!(cfg.reverse_postorder().first(), Some(&entry));
         assert_eq!(cfg.postorder().last(), Some(&entry));
         assert!(!cfg.is_reachable(unreachable));
@@ -333,6 +346,7 @@ mod tests {
         data.layout_mut().insert_inst(exit, ret);
 
         let cfg = CFG::new(data).unwrap();
+        assert!(!cfg.is_acyclic());
         assert_eq!(cfg.successors_of(body), &[header]);
         assert_eq!(
             cfg.predecessors_of(header)
@@ -359,5 +373,32 @@ mod tests {
         data.layout_mut().insert_inst(entry, value);
 
         let _ = CFG::new(data);
+    }
+
+    #[test]
+    fn builds_a_deep_acyclic_cfg_without_recursion() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "deep_cfg".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let mut blocks = vec![entry];
+        for index in 0..20_000 {
+            let block = data
+                .new_basic_block()
+                .basic_block(format!("block_{index}"), vec![]);
+            data.layout_mut().push_bb_back(block);
+            blocks.push(block);
+        }
+        for pair in blocks.windows(2) {
+            let jump = data.new_local_inst().jump(pair[1], vec![]);
+            data.layout_mut().insert_inst(pair[0], jump);
+        }
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(*blocks.last().unwrap(), ret);
+
+        let cfg = CFG::new(data).unwrap();
+        assert!(cfg.is_acyclic());
+        assert_eq!(cfg.block_count(), blocks.len());
+        assert_eq!(cfg.reverse_postorder(), blocks);
     }
 }

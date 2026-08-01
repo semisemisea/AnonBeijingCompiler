@@ -64,6 +64,20 @@ impl LabelKind {
         positive: (1 << 20) * 2,
         negative: (1 << 20) * 2,
     };
+
+    /// Whether an offset of `to - from` bytes is reachable.
+    pub fn in_range(self, from: usize, to: usize) -> bool {
+        let distance = to as i64 - from as i64;
+        -(self.negative as i64) <= distance && distance <= self.positive as i64
+    }
+}
+
+/// Number of 4-byte instructions a slot occupies.
+fn slot_len(slot: &Slot) -> usize {
+    match slot {
+        Slot::Text(_) | Slot::Branch(_) => 1,
+        Slot::Veneer(veneer) => veneer.lines.len().max(1),
+    }
 }
 
 /// One emitted instruction slot.
@@ -73,8 +87,43 @@ pub enum Slot {
     Text(String),
     /// An optimizable branch: mnemonic + operands before the target label.
     Branch(BranchRef),
-    /// A long-branch veneer inserted during `resolve` (one text line each).
-    Veneer(Vec<String>),
+    /// A long-branch veneer inserted by `resolve` when a branch falls out of
+    /// range: a labeled sequence of instruction lines jumping to the target.
+    Veneer(VeneerRec),
+}
+
+/// A labeled veneer sequence.
+#[derive(Clone, Debug)]
+pub struct VeneerRec {
+    /// Unique name of the veneer label.
+    pub name: String,
+    /// Unique name of the label bound right after the veneer's lines; the
+    /// inverted conditional branch targets it so the false path skips the
+    /// veneer entirely.
+    pub end_name: String,
+    /// One instruction per line, each rendered `    `-indented.
+    pub lines: Vec<String>,
+}
+
+/// A branch target: an intra-function block or a veneer label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabelRef {
+    Block(MirBlockIndex),
+    /// Start label of a veneer (target of an unconditional long branch).
+    Veneer(u32),
+    /// Label after a veneer's lines (target of an inverted conditional long
+    /// branch: the false path skips the veneer and continues after it).
+    VeneerEnd(u32),
+}
+
+impl LabelRef {
+    /// The block target, when this reference names a block.
+    pub fn block(self) -> Option<MirBlockIndex> {
+        match self {
+            LabelRef::Block(block) => Some(block),
+            LabelRef::Veneer(_) | LabelRef::VeneerEnd(_) => None,
+        }
+    }
 }
 
 /// Structured form of an optimizable branch.
@@ -85,8 +134,8 @@ pub struct BranchRef {
     /// Inverted-encoding text, e.g. `"b.ne "` for `"b.eq "`. `None` for
     /// unconditional branches.
     pub inv_prefix: Option<String>,
-    /// Intra-function target block.
-    pub target: MirBlockIndex,
+    /// Target label.
+    pub target: LabelRef,
     /// Branch reach.
     pub kind: LabelKind,
 }
@@ -125,12 +174,19 @@ pub struct EmitBuffer<'a, B: LowerBackend> {
     enable_branch_opt: bool,
     /// Emission-time branch optimization counters.
     stats: BranchOptStats,
+    /// Symbol names of veneers inserted by `resolve`, by veneer id.
+    veneer_names: Vec<String>,
+    /// Symbol names of the labels bound right after each veneer's lines.
+    veneer_end_names: Vec<String>,
+    /// Prefix used for synthesized veneer symbols (`.L{func}_veneer_{id}`).
+    func_name: String,
     _phantom: PhantomData<B>,
 }
 
 impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
     pub fn new(
         program: &'a HirProgram,
+        func_name: String,
         block_labels: Vec<String>,
         enable_branch_opt: bool,
     ) -> Self {
@@ -147,6 +203,9 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
             labels_at_tail_off: 0,
             enable_branch_opt,
             stats: BranchOptStats::default(),
+            veneer_names: Vec::new(),
+            veneer_end_names: Vec::new(),
+            func_name,
             _phantom: PhantomData,
         }
     }
@@ -190,9 +249,15 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
     }
 
     /// Symbol name of a label after alias resolution.
-    fn label_name(&self, label: MirBlockIndex) -> &str {
-        let label = self.resolved(label);
-        &self.block_labels[label.index()]
+    fn label_name(&self, label: LabelRef) -> &str {
+        match label {
+            LabelRef::Block(block) => {
+                let block = self.resolved(block);
+                &self.block_labels[block.index()]
+            }
+            LabelRef::Veneer(id) => &self.veneer_names[id as usize],
+            LabelRef::VeneerEnd(id) => &self.veneer_end_names[id as usize],
+        }
     }
 
     /// Lazily clear `labels_at_tail` if the tail has moved past the offset the
@@ -235,9 +300,12 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
             let Slot::Branch(branch) = &self.slots[b.start] else {
                 unreachable!("latest_branches entry must reference a branch slot");
             };
+            let LabelRef::Block(target) = branch.target else {
+                unreachable!("optimizable branches only target blocks");
+            };
             let is_uncond = branch.inv_prefix.is_none();
 
-            if self.resolve_label_offset(branch.target) == cur_off {
+            if self.resolve_label_offset(target) == cur_off {
                 self.stats.changed = true;
                 self.stats.fallthrough_removed += 1;
                 self.truncate_last_branch();
@@ -249,10 +317,10 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
                 // Redirect labels bound at this branch's start to its target,
                 // unless that would create an alias cycle (target resolving
                 // back to this branch's start).
-                if self.resolve_label_offset(branch.target) != start {
+                if self.resolve_label_offset(target) != start {
                     let redirected = b.labels_at_this_branch.len();
                     for &label in &b.labels_at_this_branch {
-                        self.label_aliases[label.index()] = Some(branch.target);
+                        self.label_aliases[label.index()] = Some(target);
                     }
                     self.latest_branches.last_mut().unwrap().labels_at_this_branch.clear();
                     if redirected > 0 {
@@ -285,7 +353,7 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
 
                     if prev_is_cond
                         && prev_adjacent
-                        && self.resolve_label_offset(prev_branch.target) == cur_off
+                        && self.resolve_label_offset(prev_branch.target.block().unwrap()) == cur_off
                     {
                         let target = branch.target;
                         self.stats.changed = true;
@@ -342,8 +410,127 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
     }
 
     /// Range check every branch against its `LabelKind` and insert veneers
-    /// where needed. Implemented in M27; currently a no-op.
-    pub fn resolve(&mut self) {}
+    /// where needed.
+    ///
+    /// Every slot is a fixed 4-byte instruction, so byte offsets are exact.
+    /// Out-of-range branches are rewritten to jump to a veneer spliced
+    /// immediately after the branch (block terminators have no fallthrough
+    /// into the veneer); the veneer reaches the original target. Offsets are
+    /// then recomputed and the pass repeats until stable; insertion only
+    /// grows offsets, so the relaxation is monotone and converges in a
+    /// couple of rounds.
+    pub fn resolve(&mut self) {
+        const MAX_ROUNDS: usize = 8;
+        let mut veneer_id = 0u32;
+        for _ in 0..MAX_ROUNDS {
+            // Byte offset of each slot boundary (including trailing end).
+            let mut byte_offsets = Vec::with_capacity(self.slots.len() + 1);
+            let mut bytes = 0usize;
+            byte_offsets.push(0);
+            for slot in &self.slots {
+                bytes += slot_len(slot) * 4;
+                byte_offsets.push(bytes);
+            }
+
+            // Collect every out-of-range branch against this round's snapshot
+            // first: inserting a veneer shifts subsequent slots, which would
+            // otherwise corrupt the offset table mid-round.
+            let mut to_veneer: Vec<usize> = Vec::new();
+            for (i, slot) in self.slots.iter().enumerate() {
+                let Slot::Branch(branch) = slot else {
+                    continue;
+                };
+                let LabelRef::Block(target) = branch.target else {
+                    continue;
+                };
+                let target_off = byte_offsets[self.label_offsets[target.index()]];
+                if !branch.kind.in_range(byte_offsets[i], target_off) {
+                    to_veneer.push(i);
+                }
+            }
+            if to_veneer.is_empty() {
+                break;
+            }
+            // Insert from the end so earlier insertions never invalidate the
+            // slot index of a later insertion.
+            for &i in to_veneer.iter().rev() {
+                self.insert_veneer(i, veneer_id);
+                veneer_id += 1;
+            }
+        }
+
+        // Invariant: every emitted branch is inside its `LabelKind` reach.
+        let mut byte_offsets = Vec::with_capacity(self.slots.len() + 1);
+        let mut bytes = 0usize;
+        byte_offsets.push(0);
+        for slot in &self.slots {
+            bytes += slot_len(slot) * 4;
+            byte_offsets.push(bytes);
+        }
+        for (i, slot) in self.slots.iter().enumerate() {
+            if let Slot::Branch(branch) = slot {
+                let LabelRef::Block(target) = branch.target else {
+                    continue;
+                };
+                let target_off = byte_offsets[self.label_offsets[target.index()]];
+                assert!(
+                    branch.kind.in_range(byte_offsets[i], target_off),
+                    "branch {i} ({}{}) out of {branch:?} range after veneer relaxation",
+                    branch.prefix,
+                    self.label_name(branch.target)
+                );
+            }
+        }
+    }
+
+    /// Rewrite the branch at slot `i` to target a fresh veneer spliced right
+    /// after it, which reaches the original target. Conditional branches are
+    /// inverted so the false path skips the veneer (targeting the veneer's
+    /// end label); unconditional branches target the veneer's start label.
+    /// Also shifts every label bound after the insertion point by one slot.
+    fn insert_veneer(&mut self, i: usize, veneer_id: u32) {
+        let Slot::Branch(branch) = &self.slots[i] else {
+            unreachable!("veneer insertion requires a branch slot");
+        };
+        let LabelRef::Block(target) = branch.target else {
+            unreachable!("veneer insertion requires a block target");
+        };
+        let name = format!(".L_{}_veneer_{}", self.func_name, veneer_id);
+        let end_name = format!("{name}_end");
+        let target_name = self.label_name(LabelRef::Block(target));
+        let (new_prefix, new_inv, new_target) = if branch.inv_prefix.is_some() {
+            // `b.<cond> T` out of range -> `b.<!cond> V_end; V: b T; V_end:`.
+            let inv = branch.inv_prefix.as_ref().unwrap().clone();
+            (inv, None, LabelRef::VeneerEnd(veneer_id))
+        } else {
+            // `b T` out of range -> `b V; V: b T`.
+            ("b ".to_owned(), None, LabelRef::Veneer(veneer_id))
+        };
+        let lines = B::veneer_lines(branch.kind, target_name);
+        self.veneer_names.push(name.clone());
+        self.veneer_end_names.push(end_name.clone());
+        self.slots[i] = Slot::Branch(BranchRef {
+            prefix: new_prefix,
+            inv_prefix: new_inv,
+            target: new_target,
+            kind: branch.kind,
+        });
+        self.slots.insert(
+            i + 1,
+            Slot::Veneer(VeneerRec {
+                name,
+                end_name,
+                lines,
+            }),
+        );
+        // Labels bound after the branch shift right by the inserted slot.
+        for offset in self.label_offsets.iter_mut() {
+            if *offset != usize::MAX && *offset > i {
+                *offset += 1;
+            }
+        }
+        self.stats.veneers_inserted += 1;
+    }
 
     /// Render the buffer: block labels, then one `    `-indented line per
     /// slot, with branch targets resolved through the alias chain.
@@ -385,12 +572,16 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
                     out.push_str(self.label_name(branch.target));
                     out.push('\n');
                 }
-                Slot::Veneer(lines) => {
-                    for line in lines {
+                Slot::Veneer(veneer) => {
+                    out.push_str(&veneer.name);
+                    out.push_str(":\n");
+                    for line in &veneer.lines {
                         out.push_str("    ");
                         out.push_str(line);
                         out.push('\n');
                     }
+                    out.push_str(&veneer.end_name);
+                    out.push_str(":\n");
                 }
             }
         }
@@ -420,7 +611,7 @@ impl<B: LowerBackend> EmitContext for EmitBuffer<'_, B> {
     }
 
     fn write_label_ref(&mut self, idx: MirBlockIndex) -> core::fmt::Result {
-        let label = self.label_name(idx).to_owned();
+        let label = self.label_name(LabelRef::Block(idx)).to_owned();
         write!(self, "{label}")
     }
 
@@ -473,7 +664,7 @@ impl<B: LowerBackend> EmitContext for EmitBuffer<'_, B> {
         self.slots.push(Slot::Branch(BranchRef {
             prefix: prefix.to_owned(),
             inv_prefix: inv_prefix.map(str::to_owned),
-            target,
+            target: LabelRef::Block(target),
             kind,
         }));
         Ok(())
@@ -716,6 +907,10 @@ mod tests {
         fn emit_long_jump(_ctx: &mut LowerContext<Self::MInst>, _target: MirBlockIndex) {
             unreachable!()
         }
+
+        fn veneer_lines(_kind: LabelKind, target: &str) -> Vec<String> {
+            vec![format!("b {target}")]
+        }
     }
 
     fn empty_program() -> HirProgram {
@@ -738,7 +933,7 @@ mod tests {
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        EmitBuffer::new(program, labels, branch_opt)
+        EmitBuffer::new(program, "f".to_owned(), labels, branch_opt)
     }
 
     fn put_inst(buffer: &mut EmitBuffer<'_, TestBackend>, text: &str) {
@@ -976,6 +1171,156 @@ mod tests {
         assert_eq!(
             out,
             ".L_f_a:\n    b .L_f_d\n.L_f_b:\n.L_f_c:\n    nop\n.L_f_d:\n    ret\n"
+        );
+    }
+
+    #[test]
+    fn resolve_inserts_veneer_for_forward_out_of_range_branch() {
+        let program = empty_program();
+        let mut buffer = buffer(&program, vec![".L_f_a", ".L_f_b"]);
+        buffer.bind_label(MirBlockIndex::new(0));
+        buffer
+            .put_branch(
+                "b.eq ",
+                Some("b.ne "),
+                MirBlockIndex::new(1),
+                LabelKind::BRANCH14,
+            )
+            .unwrap();
+        for _ in 0..9000 {
+            put_inst(&mut buffer, "nop");
+        }
+        buffer.bind_label(MirBlockIndex::new(1));
+        put_inst(&mut buffer, "ret");
+        buffer.resolve();
+        let stats = buffer.branch_stats();
+        assert_eq!(stats.veneers_inserted, 1);
+        let out = buffer.finish();
+        assert!(
+            out.contains("    b.ne .L_f_veneer_0_end\n"),
+            "out-of-range branch must be inverted to skip the veneer:\n{out}"
+        );
+        assert!(
+            out.contains(".L_f_veneer_0:\n    b .L_f_b\n.L_f_veneer_0_end:\n"),
+            "veneer must reach the original target, with its end label bound after it:\n{out}"
+        );
+        assert!(
+            out.contains("    nop\n.L_f_b:\n    ret\n"),
+            "labels bound after the veneer must render at their shifted position:\n{out}"
+        );
+    }
+
+    #[test]
+    fn resolve_inserts_veneer_for_backward_out_of_range_branch() {
+        let program = empty_program();
+        let mut buffer = buffer(&program, vec![".L_f_a", ".L_f_b"]);
+        buffer.bind_label(MirBlockIndex::new(0));
+        put_inst(&mut buffer, "ret");
+        for _ in 0..9000 {
+            put_inst(&mut buffer, "nop");
+        }
+        buffer.bind_label(MirBlockIndex::new(1));
+        buffer
+            .put_branch(
+                "b.eq ",
+                Some("b.ne "),
+                MirBlockIndex::new(0),
+                LabelKind::BRANCH14,
+            )
+            .unwrap();
+        buffer.resolve();
+        let stats = buffer.branch_stats();
+        assert_eq!(stats.veneers_inserted, 1);
+        let out = buffer.finish();
+        assert!(
+            out.contains(".L_f_veneer_0:\n    b .L_f_a\n.L_f_veneer_0_end:\n"),
+            "backward branch needs a veneer reaching its target:\n{out}"
+        );
+    }
+
+    #[test]
+    fn resolve_relaxes_multiple_out_of_range_branches_in_few_rounds() {
+        // Three branches over a tiny reach: every relaxation round must keep
+        // previously inserted veneers intact and converge within 3 rounds.
+        let program = empty_program();
+        let mut buffer = buffer(&program, vec![".L_f_a", ".L_f_b", ".L_f_c", ".L_f_d"]);
+        let tiny = LabelKind {
+            positive: 4,
+            negative: 4,
+        };
+        buffer.bind_label(MirBlockIndex::new(0));
+        buffer
+            .put_branch(
+                "b.eq ",
+                Some("b.ne "),
+                MirBlockIndex::new(1),
+                tiny,
+            )
+            .unwrap();
+        buffer
+            .put_uncond_branch("b ", MirBlockIndex::new(2), tiny)
+            .unwrap();
+        buffer
+            .put_branch(
+                "b.ne ",
+                Some("b.eq "),
+                MirBlockIndex::new(3),
+                tiny,
+            )
+            .unwrap();
+        buffer.bind_label(MirBlockIndex::new(1));
+        put_inst(&mut buffer, "nop");
+        buffer.bind_label(MirBlockIndex::new(2));
+        put_inst(&mut buffer, "nop");
+        buffer.bind_label(MirBlockIndex::new(3));
+        put_inst(&mut buffer, "ret");
+        buffer.resolve();
+        let stats = buffer.branch_stats();
+        assert_eq!(stats.veneers_inserted, 3);
+        let out = buffer.finish();
+        for id in 0..3 {
+            assert!(
+                out.contains(&format!(".L_f_veneer_{id}:")),
+                "veneer {id} must be present:\n{out}"
+            );
+        }
+        assert!(
+            out.contains("    b.eq .L_f_veneer_0_end\n"),
+            "the third branch (b.ne D) must invert and skip its veneer:\n{out}"
+        );
+    }
+
+    #[test]
+    fn resolve_handles_branch19_out_of_range_over_one_megabyte() {
+        // A genuine >1MB forward jump: BRANCH19 reach is ±1MB, so the veneer
+        // must be spliced and the final label must render past all nops.
+        let program = empty_program();
+        let mut buffer = buffer(&program, vec![".L_f_a", ".L_f_b"]);
+        buffer.bind_label(MirBlockIndex::new(0));
+        buffer
+            .put_branch(
+                "b.eq ",
+                Some("b.ne "),
+                MirBlockIndex::new(1),
+                LabelKind::BRANCH19,
+            )
+            .unwrap();
+        for _ in 0..270_000 {
+            put_inst(&mut buffer, "nop");
+        }
+        buffer.bind_label(MirBlockIndex::new(1));
+        put_inst(&mut buffer, "ret");
+        buffer.resolve();
+        let stats = buffer.branch_stats();
+        assert_eq!(stats.veneers_inserted, 1);
+        let out = buffer.finish();
+        assert!(
+            out.contains("    b.ne .L_f_veneer_0_end\n"),
+            "branch beyond ±1MB must target the veneer end:\n{out}"
+        );
+        assert!(
+            out.contains("    nop\n.L_f_b:\n    ret\n"),
+            "the shifted target label must render right before ret:\n{out}"
         );
     }
 }

@@ -947,6 +947,23 @@ impl LowerBackend for AArch64Backend {
     fn branch_opt_enabled(config: &Self::CodegenConfig) -> bool {
         config.branch_opt
     }
+
+    fn veneer_lines(kind: taki_mir::emit_buffer::LabelKind, target: &str) -> Vec<String> {
+        use taki_mir::emit_buffer::LabelKind;
+        match kind {
+            // A conditional branch fell out of ±1MB: the (inverted) branch
+            // reaches the adjacent veneer; the veneer's `b` covers ±128MB.
+            LabelKind::BRANCH14 | LabelKind::BRANCH19 => vec![format!("b {target}")],
+            // `b` itself fell out of ±128MB: materialize the address through
+            // the linker scratch register x16 (practically unreachable).
+            LabelKind::BRANCH26 => vec![
+                format!("adrp x16, {target}"),
+                format!("add x16, x16, :lo12:{target}"),
+                "br x16".to_owned(),
+            ],
+            other => unreachable!("AArch64 does not emit {other:?} branches"),
+        }
+    }
 }
 
 /// Select a branch-local, pure condition tree.  Claims are made through the

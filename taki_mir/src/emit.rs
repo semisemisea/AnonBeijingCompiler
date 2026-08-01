@@ -57,7 +57,8 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
             .iter()
             .map(|lb| B::format_block_label(lb, self.func_data))
             .collect();
-        let mut buffer = EmitBuffer::<B>::new(self.program, block_labels, self.branch_opt);
+        let mut buffer =
+            EmitBuffer::<B>::new(self.program, name.to_owned(), block_labels, self.branch_opt);
 
         for inst in &vcode.abi.gen_prologue() {
             emit_legalized::<B::MInst, B>(&frame, inst, &mut buffer);

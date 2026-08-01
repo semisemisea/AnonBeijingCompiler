@@ -225,6 +225,14 @@ pub trait LowerBackend {
     fn branch_opt_enabled(_config: &Self::CodegenConfig) -> bool {
         false
     }
+
+    /// Instruction lines of a veneer that reaches `target` for a branch of
+    /// `kind` that fell out of range. Each line is one fixed-width
+    /// instruction slot, spliced immediately after the branch (a block
+    /// terminator, so no fallthrough can enter the veneer).
+    fn veneer_lines(_kind: crate::emit_buffer::LabelKind, _target: &str) -> Vec<String> {
+        unreachable!("backends with branch slots must provide veneer lines")
+    }
 }
 
 /// impl block for all backend specified operation

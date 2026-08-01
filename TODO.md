@@ -37,10 +37,16 @@
   `compile_with_config`；修复 finish 渲染非单调 label offset 的缺陷（回归
   单测）。huffman-01 指令数 804 → 687（累计 -21%）：fallthrough=99、
   inverted=17、threaded=13、dead=1；R1-R4 专项单测 + abi_matrix 门禁通过。
+- veneer 范围松弛（M27）：`LabelKind` 增加 `in_range(from,to)`（BRANCH14/
+  19/26 与 RISC-V B/JAL 常量），每分支 slot 携带 reach；`resolve()` 对
+  超范围分支快照收集后从后向前插入 veneer（条件分支倒相后指向 veneer
+  end 标签使 false 路径跳过 veneer、无条件分支指向 veneer 起始标签），
+  同步移位其后的 `label_offsets`，逐轮重算偏移至稳定；后端提供
+  `veneer_lines`（AArch64：`b`；`adrp+add+br x16` 兜底）。单测覆盖前后向、
+  多 veneer 小 reach 收敛、>1MB BRANCH19 用例与标签移位渲染；全 corpus
+  QEMU 差分通过。
 
-备注：M27（veneer/resolve 松弛）在 M26 提交后已开始实现，工作区存在未提交
-改动（`taki_mir/src/emit_buffer.rs`、`taki_mir/src/emit.rs`、
-`anon_armv8/src/lower.rs`、`taki_mir/src/lower.rs`），尚未完成验证与提交。
+备注：M27 已完成并独立提交；M28（RISC-V slot 化）待做。
 
 目标硬件是 Xilinx XCZU15EG 上的 Cortex-A53 MPCore。
 
@@ -78,7 +84,7 @@ DCE。相关 pass 见 `raana_ir/src/opt/passes/`。
 - `anon_armv8/src/passes/peephole_combine.rs`：vreg use 计数 + MAC 融合。
 - `anon_armv8/src/instructions.rs`：`MInst` 枚举（约 60 个 variant）。
 - `anon_armv8/src/lower.rs`：ISel（`lower_select`/`select_branch_condition`）。
-- `taki_mir/src/emit_buffer.rs`：EmitBuffer（M25 建，M26 分支规则，M27 WIP）。
+- `taki_mir/src/emit_buffer.rs`：EmitBuffer（M25 建，M26 分支规则，M27 veneer）。
 - `taki_mir/src/emit.rs`：`AsmWriter::write_function` 逐块文本发射。
 - `taki_mir/src/block_order.rs`：domtree RPO 块序（`lowered_order`）。
 - `taki_mir/src/stats.rs`：函数级 / 编译单元级结构化统计。
@@ -311,58 +317,32 @@ M26 基线：huffman-01 静态指令数 687（M25/M26 累计 -21%）。对照
 
 ---
 
-## 3. 主计划 B：分支发射重构（M27-M29，对照 Cranelift MachBuffer）
+## 3. 主计划 B：分支发射重构（M28-M29，对照 Cranelift MachBuffer）
 
-### 3.1 遗留局限（M26 之后）
+### 3.1 遗留局限（M27 之后）
 
-1. 无偏移/范围概念：分支假定目标都在对应 `LabelKind` 范围内，超范围会
-   汇编失败（当前 corpus 未触发，但无保证）——M27 加 veneer 兜底；
-2. RISC-V `CondBr` 仍是 5 条 `la t6, X; jr t6` trampoline + `1f` hack
+1. RISC-V `CondBr` 仍是 5 条 `la t6, X; jr t6` trampoline + `1f` hack
    ——M28 改为 slot；
-3. 冷块沉底未做（只在 `BlockLoweringOrder` 预留 `is_cold()` 接口）。
+2. 冷块沉底未做（只在 `BlockLoweringOrder` 预留 `is_cold()` 接口）。
 
 ### 3.2 参考实现：Cranelift 的 MachBuffer
 
 核心在 `../wasmtime/cranelift/codegen/src/machinst/buffer.rs`，模块注释
-（1-107 行）本身就是设计文档。要点（M25/M26 已移植部分略）：
+（1-107 行）本身就是设计文档。M25/M26/M27 已移植：EmitBuffer 文本 slot、
+latest-branches 四规则（R1-R4）、`LabelKind` reach 与 veneer 松弛循环。
+VCode 驱动（`vcode.rs:736-1132`）的冷块沉底与 island 前瞻未移植——我们
+发射文本 .s 且指令定长 4B，偏移精确可算，M27 的单调松弛循环已覆盖
+island 前瞻的功能。
 
-- **latest-branches 窥视栈 + 四规则**（`optimize_branches`，`:999-1271`）：
-  R1 fallthrough 消除（`:1057`）、R2 标签别名/穿线（`:1137`，防环 `:1170`）、
-  R3 双无条件下冗余删除（`:1207`）、R4 条件+无条件翻转（`:1222`，
-  `add_cond_branch(..., inverted)` `:856-890`）——M26 已完成，RISC-V 未适配。
-- **范围与 veneer**：`LabelUse` trait（AArch64 `inst/mod.rs:2937-2956`）：
-  Branch14（tbz，±1MB）、Branch19（b.cond/cbz，±1MB）、Branch26（b/bl，
-  ±128MB）；`deadline`/`island`/`emit_veneer` 机制（`buffer.rs:142-210,
-  1310-1329, 1544-1567`）——M27 主体。
-- **VCode 驱动**（`vcode.rs:736-1132`）：冷块沉底（`final_order` +
-  `cold_blocks`）→ `bind_label`（触发 `optimize_branches`）→ `island_needed`
-  前瞻 → `finish()` 解析 fixup。
+### 3.3 里程碑
 
-我们发射文本 .s 且指令定长 4B，因此比 Cranelift 简单：无需字节 fixup/patch
-与 deadline/island 前瞻，偏移**精确可算**，用单调松弛循环即可。
+#### M27：范围检查 + veneer 松弛（已完成）
 
-### 3.3 veneer 与范围松弛设计（M27 主体，已定决策）
-
-- 第一阶段：所有分支按 `Branch19/26` 直接发射，不做 trampoline；
-- 第二阶段（resolve）：slot 定长（4B）→ 精确计算每标签偏移；找出超范围
-  的条件分支；
-- 第三阶段：超范围分支改发两指令形式（条件+无条件），veneer 插在**分支
-  自身之后**——分支是块终结符，之后必然是块边界，无 fallthrough 进入；
-  若该分支已被优化成单条件且另一目标为 fallthrough，则先强制两指令形式
-  再插 veneer；
-- 第四阶段：重算偏移，重复直至稳定（单调收敛，通常 1-2 轮）。此循环替代
-  Cranelift 的 deadline/island 前瞻，定长指令下完全等价且更简单。
-
-### 3.4 里程碑
-
-#### M27：范围检查 + veneer 松弛（进行中，工作区未提交）
-
-- 工作区已有：`Slot::Veneer(VeneerRec)`、`LabelRef::{Block,Veneer}`、
-  `LabelKind::in_range`、`slot_len`、veneer 符号命名（`.L{func}_veneer_{id}`）。
-- 待完成：`resolve` 松弛循环（四阶段）、Branch14/19/26 范围驱动、装配器
-  集成（`taki_mir/src/emit.rs`、`anon_armv8/src/lower.rs`）。
-- 验收：合成 >1MB 代码块用例验证 veneer 正确且松弛收敛（≤3 轮）；QEMU
-  差分通过；全 benchmark 编译成功无汇编器超范围报错；完成后独立提交。
+- `LabelKind::in_range` + BRANCH14/19/26 常量；`resolve()` 快照收集超范围
+  分支、倒序插入 veneer（条件倒相指 end 标签、无条件指起始标签）、同步
+  `label_offsets` 移位、逐轮松弛至稳定；后端 `veneer_lines`。单测覆盖
+  前后向、多 veneer 收敛、>1MB BRANCH19、标签移位渲染；全 corpus QEMU
+  差分通过；已独立提交（33ac708）。
 
 #### M28：RISC-V 适配
 
@@ -454,9 +434,9 @@ fallthrough 收益。SysY 前端暂无冷热信息，本期仅在 `BlockLowering
 | `ccmp` 链破坏 NZCV 使用顺序（与现有 `CmpSelect` 邻接配对机制整合） | 中 | 条件仅限单用纯比较；emit 单测；on/off 差分 |
 | RA 拷贝消除与并行拷贝求解器交互导致确定性回归 | 中 | 5 次 byte-identical 门禁；redundant_moves 语义保留 |
 | 内联膨胀（多调用点 + 递归深度）增加编译时间与代码体积 | 中 | 代价估计 + 阈值 + 深度限界；corpus 编译时间监控 |
-| 别名链成环 / 截断后标签簿记错误（M27） | 高 | 完整移植 Cranelift 不变量；专项单测；on/off 差分 |
-| 多指令 MInst slot 化破坏"每 slot 4B"假设（M27） | 中 | slot 粒度 = 单条指令；verify 断言发射 slot 数 == 指令数 |
-| veneer 插入改变偏移导致松弛不收敛（M27） | 中 | 单调性（只增不减）+ 最大迭代上限（≤3 轮）+ 每轮全量范围断言 |
+| 别名链成环 / 截断后标签簿记错误 | 高 | 完整移植 Cranelift 不变量；专项单测；on/off 差分 |
+| 多指令 MInst slot 化破坏"每 slot 4B"假设 | 中 | slot 粒度 = 单条指令；verify 断言发射 slot 数 == 指令数 |
+| veneer 插入改变偏移导致松弛不收敛 | 中 | 单调性（只增不减）+ 快照收集/倒序插入 + 每轮全量范围断言 |
 | 分支优化与 post-RA ListScheduler 交互 | 低 | 调度在 vcode 层（块内），EmitBuffer 只在块边界截断，块内顺序不变 |
 | 汇编器对超范围分支报错 | 低 | `resolve` 保证发射前所有分支在范围内；veneer 全覆盖 |
 | RISC-V B-type ±4KB 范围触发大量 veneer | 低 | veneer 仅在超范围时触发，`la+jr` 4 条/veneer |

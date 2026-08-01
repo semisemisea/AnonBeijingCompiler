@@ -325,8 +325,13 @@ where
         }
 
         let asm_start = buf.len();
-        let mut w = AsmWriter::<B>::new(&mut buf, func_data, p);
-        w.write_function(&vcode);
+        let mut w = AsmWriter::<B>::new(
+            &mut buf,
+            func_data,
+            p,
+            B::branch_opt_enabled(config),
+        );
+        w.write_function(&vcode, &mut stats);
         let asm = &buf[asm_start..];
         log::debug!(target: "taki_mir::emit", "function={} final assembly: bytes={}, lines={}\n{}", func_data.name(), asm.len(), asm.lines().count(), asm);
         function_stats.push(stats);

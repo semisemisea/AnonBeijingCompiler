@@ -21,7 +21,13 @@ use crate::block_order::MirBlockIndex;
 use crate::lower::LowerBackend;
 use crate::prelude::*;
 use crate::register::Reg;
+use crate::stats::BranchOptStats;
 use crate::vcode::EmitContext;
+
+/// Bound on a single branch's `labels_at_this_branch` list; beyond it,
+/// simplification is skipped so that long `goto next; next:` chains cannot
+/// produce quadratic alias coalescing (Cranelift #3468).
+const LABEL_LIST_THRESHOLD: usize = 100;
 
 /// Signed branch reach in bytes, matching the ISA encoding of each form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,11 +121,19 @@ pub struct EmitBuffer<'a, B: LowerBackend> {
     labels_at_tail: Vec<MirBlockIndex>,
     /// Slot offset the `labels_at_tail` list is valid for.
     labels_at_tail_off: usize,
+    /// Whether branch simplification rules are enabled (`-O1` and up).
+    enable_branch_opt: bool,
+    /// Emission-time branch optimization counters.
+    stats: BranchOptStats,
     _phantom: PhantomData<B>,
 }
 
 impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
-    pub fn new(program: &'a HirProgram, block_labels: Vec<String>) -> Self {
+    pub fn new(
+        program: &'a HirProgram,
+        block_labels: Vec<String>,
+        enable_branch_opt: bool,
+    ) -> Self {
         let count = block_labels.len();
         EmitBuffer {
             slots: Vec::new(),
@@ -131,7 +145,17 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
             latest_branches: Vec::new(),
             labels_at_tail: Vec::new(),
             labels_at_tail_off: 0,
+            enable_branch_opt,
+            stats: BranchOptStats::default(),
             _phantom: PhantomData,
+        }
+    }
+
+    /// Branch optimization counters accumulated during emission.
+    pub fn branch_stats(&self) -> BranchOptStats {
+        BranchOptStats {
+            ran: self.enable_branch_opt,
+            ..self.stats.clone()
         }
     }
 
@@ -182,10 +206,139 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
     }
 
     /// Branch simplification rules (fallthrough elimination, label threading,
-    /// dead-jump removal, condition inversion). Wired up in M26; the hook is
-    /// called from `bind_label` and by the emitter at function end.
-    fn optimize_branches(&mut self) {
+    /// dead-jump removal, condition inversion), ported from Cranelift's
+    /// `MachBuffer::optimize_branches`. Only operates on tail-adjacent
+    /// branches, so truncation never disturbs the block instruction order.
+    ///
+    /// Called from `bind_label` and once more at function end by the emitter.
+    pub fn optimize_branches(&mut self) {
+        if !self.enable_branch_opt {
+            self.lazily_clear_labels_at_tail();
+            return;
+        }
+        // R1: branch whose target resolves to the current tail is a no-op;
+        // truncate it. R2: a tail unconditional branch's start labels are
+        // aliased to its target. R3: an unreachable uncond after another
+        // uncond is removed. R4: a cond branch followed by an uncond whose
+        // cond target is the tail is inverted to skip the uncond.
+        while let Some(b) = self.latest_branches.last() {
+            let cur_off = self.slots.len();
+            if b.start + 1 < cur_off {
+                // Code was emitted after this branch; it is no longer at the
+                // tail and cannot be edited.
+                break;
+            }
+            if b.labels_at_this_branch.len() > LABEL_LIST_THRESHOLD {
+                break;
+            }
+
+            let Slot::Branch(branch) = &self.slots[b.start] else {
+                unreachable!("latest_branches entry must reference a branch slot");
+            };
+            let is_uncond = branch.inv_prefix.is_none();
+
+            if self.resolve_label_offset(branch.target) == cur_off {
+                self.stats.changed = true;
+                self.stats.fallthrough_removed += 1;
+                self.truncate_last_branch();
+                continue;
+            }
+
+            if is_uncond {
+                let start = b.start;
+                // Redirect labels bound at this branch's start to its target,
+                // unless that would create an alias cycle (target resolving
+                // back to this branch's start).
+                if self.resolve_label_offset(branch.target) != start {
+                    let redirected = b.labels_at_this_branch.len();
+                    for &label in &b.labels_at_this_branch {
+                        self.label_aliases[label.index()] = Some(branch.target);
+                    }
+                    self.latest_branches.last_mut().unwrap().labels_at_this_branch.clear();
+                    if redirected > 0 {
+                        self.stats.changed = true;
+                        self.stats.labels_threaded += redirected as u64;
+                        continue;
+                    }
+                } else {
+                    break;
+                }
+
+                if self.latest_branches.len() > 1 {
+                    let prev_start = self.latest_branches[self.latest_branches.len() - 2].start;
+                    let Slot::Branch(prev_branch) = &self.slots[prev_start] else {
+                        unreachable!("latest_branches entry must reference a branch slot");
+                    };
+                    let prev_is_uncond = prev_branch.inv_prefix.is_none();
+                    let prev_is_cond = !prev_is_uncond;
+                    let prev_adjacent = prev_start + 1 == start;
+
+                    if prev_is_uncond
+                        && prev_adjacent
+                        && self.latest_branches.last().unwrap().labels_at_this_branch.is_empty()
+                    {
+                        self.stats.changed = true;
+                        self.stats.dead_jumps_removed += 1;
+                        self.truncate_last_branch();
+                        continue;
+                    }
+
+                    if prev_is_cond
+                        && prev_adjacent
+                        && self.resolve_label_offset(prev_branch.target) == cur_off
+                    {
+                        let target = branch.target;
+                        self.stats.changed = true;
+                        self.stats.branches_inverted += 1;
+                        self.truncate_last_branch();
+                        // Swap prefix and inverted prefix, retarget the cond
+                        // branch to the removed uncond's target.
+                        let Slot::Branch(prev_slot) = &mut self.slots[prev_start] else {
+                            unreachable!("latest_branches entry must reference a branch slot");
+                        };
+                        let inverted = prev_slot.inv_prefix.take().unwrap();
+                        let original = std::mem::replace(&mut prev_slot.prefix, inverted);
+                        prev_slot.inv_prefix = Some(original);
+                        prev_slot.target = target;
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+        self.purge_latest_branches();
+    }
+
+    /// Remove the last branch and everything after its start. Labels bound at
+    /// the (former) tail move back to the branch's start offset; labels bound
+    /// at the branch's start become the new tail labels.
+    fn truncate_last_branch(&mut self) {
         self.lazily_clear_labels_at_tail();
+        let b = self.latest_branches.pop().unwrap();
+        debug_assert_eq!(b.start + 1, self.slots.len());
+        self.slots.truncate(b.start);
+
+        let cur_off = self.slots.len();
+        self.labels_at_tail_off = cur_off;
+        for &label in &self.labels_at_tail {
+            self.label_offsets[label.index()] = cur_off;
+        }
+        self.labels_at_tail.extend(b.labels_at_this_branch);
+    }
+
+    /// Drop all branch records once the tail has moved past the last one.
+    fn purge_latest_branches(&mut self) {
+        let cur_off = self.slots.len();
+        if let Some(b) = self.latest_branches.last() {
+            if b.start + 1 < cur_off {
+                self.latest_branches.clear();
+            }
+        }
+    }
+
+    /// Resolve a label to its slot offset, or `usize::MAX` when not yet bound.
+    fn resolve_label_offset(&self, label: MirBlockIndex) -> usize {
+        self.label_offsets[self.resolved(label).index()]
     }
 
     /// Range check every branch against its `LabelKind` and insert veneers
@@ -194,11 +347,32 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
 
     /// Render the buffer: block labels, then one `    `-indented line per
     /// slot, with branch targets resolved through the alias chain.
+    ///
+    /// Label definitions render at their recorded slot offset. Offsets are
+    /// not necessarily monotonic in block order (branch truncation moves
+    /// labels backward), so label events are sorted by (offset, block index)
+    /// before interleaving with the slot stream.
     pub fn finish(self) -> String {
+        let mut label_events: Vec<(usize, usize)> = self
+            .label_offsets
+            .iter()
+            .enumerate()
+            .filter(|&(_, offset)| *offset != usize::MAX)
+            .map(|(index, &offset)| (offset, index))
+            .collect();
+        label_events.sort_unstable();
+
         let mut out = String::new();
-        let mut next_block = 0;
+        let mut label_cursor = 0;
+        let mut emit_labels = |out: &mut String, at: usize, label_cursor: &mut usize| {
+            while *label_cursor < label_events.len() && label_events[*label_cursor].0 == at {
+                out.push_str(&self.block_labels[label_events[*label_cursor].1]);
+                out.push_str(":\n");
+                *label_cursor += 1;
+            }
+        };
         for (index, slot) in self.slots.iter().enumerate() {
-            self.emit_labels_at(&mut out, index, &mut next_block);
+            emit_labels(&mut out, index, &mut label_cursor);
             match slot {
                 Slot::Text(text) => {
                     out.push_str("    ");
@@ -220,16 +394,8 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
                 }
             }
         }
-        self.emit_labels_at(&mut out, self.slots.len(), &mut next_block);
+        emit_labels(&mut out, self.slots.len(), &mut label_cursor);
         out
-    }
-
-    fn emit_labels_at(&self, out: &mut String, at: usize, next_block: &mut usize) {
-        while *next_block < self.label_offsets.len() && self.label_offsets[*next_block] == at {
-            out.push_str(&self.block_labels[*next_block]);
-            out.push_str(":\n");
-            *next_block += 1;
-        }
     }
 }
 
@@ -560,11 +726,19 @@ mod tests {
         program: &'a HirProgram,
         block_labels: Vec<&str>,
     ) -> EmitBuffer<'a, TestBackend> {
+        buffer_with_opt(program, block_labels, true)
+    }
+
+    fn buffer_with_opt<'a>(
+        program: &'a HirProgram,
+        block_labels: Vec<&str>,
+        branch_opt: bool,
+    ) -> EmitBuffer<'a, TestBackend> {
         let labels = block_labels
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        EmitBuffer::new(program, labels)
+        EmitBuffer::new(program, labels, branch_opt)
     }
 
     fn put_inst(buffer: &mut EmitBuffer<'_, TestBackend>, text: &str) {
@@ -589,7 +763,7 @@ mod tests {
     #[test]
     fn renders_branch_slots_with_resolved_targets() {
         let program = empty_program();
-        let mut buffer = buffer(&program, vec![".L_f_a", ".L_f_b"]);
+        let mut buffer = buffer_with_opt(&program, vec![".L_f_a", ".L_f_b"], false);
         buffer.bind_label(MirBlockIndex::new(0));
         buffer
             .put_branch(
@@ -627,7 +801,7 @@ mod tests {
     #[test]
     fn take_inst_text_consumes_pending_without_creating_a_slot() {
         let program = empty_program();
-        let mut buffer = buffer(&program, vec![".L_f_entry"]);
+        let mut buffer = buffer_with_opt(&program, vec![".L_f_entry"], false);
         buffer.bind_label(MirBlockIndex::new(0));
         core::fmt::write(&mut buffer, format_args!("cbz w0, ")).unwrap();
         let prefix = buffer.take_inst_text();
@@ -642,5 +816,166 @@ mod tests {
             )
             .unwrap();
         assert_eq!(buffer.finish(), ".L_f_entry:\n    cbz w0, .L_f_entry\n");
+    }
+
+    // ---- Branch optimization rules (M26) ----
+
+    #[test]
+    fn r1_removes_branch_pair_whose_target_is_the_fallthrough() {
+        let program = empty_program();
+        let mut buffer = buffer(&program, vec![".L_f_a", ".L_f_b"]);
+        buffer.bind_label(MirBlockIndex::new(0));
+        buffer
+            .put_branch(
+                "b.eq ",
+                Some("b.ne "),
+                MirBlockIndex::new(1),
+                LabelKind::BRANCH19,
+            )
+            .unwrap();
+        buffer
+            .put_uncond_branch("b ", MirBlockIndex::new(1), LabelKind::BRANCH26)
+            .unwrap();
+        buffer.bind_label(MirBlockIndex::new(1));
+        put_inst(&mut buffer, "ret");
+        let stats = buffer.branch_stats();
+        assert_eq!(stats.fallthrough_removed, 2);
+        assert_eq!(
+            buffer.finish(),
+            ".L_f_a:\n.L_f_b:\n    ret\n",
+            "both branches to the fallthrough block are no-ops and must vanish"
+        );
+    }
+
+    #[test]
+    fn r4_inverts_condition_to_skip_trailing_jump() {
+        let program = empty_program();
+        let mut buffer = buffer(&program, vec![".L_f_a", ".L_f_b", ".L_f_c"]);
+        buffer.bind_label(MirBlockIndex::new(0));
+        buffer
+            .put_branch(
+                "b.eq ",
+                Some("b.ne "),
+                MirBlockIndex::new(1),
+                LabelKind::BRANCH19,
+            )
+            .unwrap();
+        buffer
+            .put_uncond_branch("b ", MirBlockIndex::new(2), LabelKind::BRANCH26)
+            .unwrap();
+        buffer.bind_label(MirBlockIndex::new(1));
+        let stats = buffer.branch_stats();
+        assert_eq!(stats.branches_inverted, 1);
+        assert_eq!(
+            buffer.finish(),
+            ".L_f_a:\n    b.ne .L_f_c\n.L_f_b:\n",
+            "b.eq B; b C with B as the fallthrough collapses to one inverted branch"
+        );
+    }
+
+    #[test]
+    fn r4_inverts_back_when_the_inverted_branch_precedes_another_jump() {
+        let program = empty_program();
+        let mut buffer = buffer(&program, vec![".L_f_a", ".L_f_b", ".L_f_c"]);
+        buffer.bind_label(MirBlockIndex::new(0));
+        buffer
+            .put_branch(
+                "b.eq ",
+                Some("b.ne "),
+                MirBlockIndex::new(1),
+                LabelKind::BRANCH19,
+            )
+            .unwrap();
+        buffer
+            .put_uncond_branch("b ", MirBlockIndex::new(2), LabelKind::BRANCH26)
+            .unwrap();
+        buffer.bind_label(MirBlockIndex::new(1)); // R4: b.ne C
+        buffer
+            .put_uncond_branch("b ", MirBlockIndex::new(0), LabelKind::BRANCH26)
+            .unwrap();
+        buffer.bind_label(MirBlockIndex::new(2)); // R2 threads B->A; R4 inverts back
+        let stats = buffer.branch_stats();
+        assert_eq!(stats.branches_inverted, 2);
+        assert_eq!(stats.labels_threaded, 1);
+        assert_eq!(
+            buffer.finish(),
+            ".L_f_a:\n    b.eq .L_f_a\n.L_f_b:\n.L_f_c:\n",
+            "double inversion restores the original condition"
+        );
+    }
+
+    #[test]
+    fn r2_threads_labels_and_r3_removes_unreachable_jump() {
+        let program = empty_program();
+        let mut buffer = buffer(&program, vec![".L_f_d", ".L_f_a", ".L_f_b", ".L_f_c"]);
+        buffer.bind_label(MirBlockIndex::new(0));
+        put_inst(&mut buffer, "nop");
+        buffer.bind_label(MirBlockIndex::new(1));
+        buffer
+            .put_uncond_branch("b ", MirBlockIndex::new(0), LabelKind::BRANCH26)
+            .unwrap();
+        buffer.bind_label(MirBlockIndex::new(2));
+        buffer
+            .put_uncond_branch("b ", MirBlockIndex::new(0), LabelKind::BRANCH26)
+            .unwrap();
+        buffer.bind_label(MirBlockIndex::new(3));
+        let stats = buffer.branch_stats();
+        assert_eq!(stats.labels_threaded, 2);
+        assert_eq!(stats.dead_jumps_removed, 1);
+        assert_eq!(
+            buffer.finish(),
+            ".L_f_d:\n    nop\n.L_f_a:\n    b .L_f_d\n.L_f_b:\n.L_f_c:\n",
+            "B's jump is unreachable (B threads to D) and must be removed"
+        );
+    }
+
+    #[test]
+    fn r2_cycle_guard_keeps_self_loop() {
+        let program = empty_program();
+        let mut buffer = buffer(&program, vec![".L_f_a", ".L_f_b"]);
+        buffer.bind_label(MirBlockIndex::new(0));
+        buffer
+            .put_uncond_branch("b ", MirBlockIndex::new(0), LabelKind::BRANCH26)
+            .unwrap();
+        buffer.bind_label(MirBlockIndex::new(1));
+        put_inst(&mut buffer, "ret");
+        assert_eq!(
+            buffer.finish(),
+            ".L_f_a:\n    b .L_f_a\n.L_f_b:\n    ret\n",
+            "aliasing A to itself would create a cycle, so the loop must survive"
+        );
+    }
+
+    #[test]
+    fn finish_renders_labels_with_non_monotonic_offsets() {
+        // Branch truncation can move labels backward out of block order; every
+        // definition must still render, interleaved by its (possibly reused)
+        // slot offset. Regression for the empty-chain cascade in 68_brainfk.
+        let program = empty_program();
+        let mut buffer = buffer(&program, vec![".L_f_a", ".L_f_b", ".L_f_c", ".L_f_d"]);
+        buffer.bind_label(MirBlockIndex::new(0));
+        buffer
+            .put_uncond_branch("b ", MirBlockIndex::new(3), LabelKind::BRANCH26)
+            .unwrap();
+        buffer.bind_label(MirBlockIndex::new(1));
+        buffer
+            .put_uncond_branch("b ", MirBlockIndex::new(3), LabelKind::BRANCH26)
+            .unwrap();
+        // Truncations below move labels 1 and 0 backward past label 3's slot.
+        buffer.bind_label(MirBlockIndex::new(2));
+        put_inst(&mut buffer, "nop");
+        buffer.bind_label(MirBlockIndex::new(3));
+        put_inst(&mut buffer, "ret");
+        let out = buffer.finish();
+        for name in [".L_f_a", ".L_f_b", ".L_f_c", ".L_f_d"] {
+            assert!(
+                out.contains(&format!("{name}:")),
+                "label {name} must be defined:\n{out}"
+            );
+        }
+        assert_eq!(
+            out,
+            ".L_f_a:\n    b .L_f_d\n.L_f_b:\n.L_f_c:\n    nop\n.L_f_d:\n    ret\n"
+        );
     }
 }

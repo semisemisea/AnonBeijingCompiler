@@ -14,6 +14,7 @@
 use crate::cli::Target;
 use crate::frontend::utils::{AstGenContext, ToRaanaIR};
 use anon_armv8::AArch64Backend;
+use taki_mir::stats::FunctionCodegenStats;
 use uika_riscv::lower::Riscv64Backend;
 
 struct MatrixCase {
@@ -98,6 +99,7 @@ fn compile_sy(source: &str, target: Target, opt_level: u8) -> String {
             pair_combine: false,
             list_scheduler: false,
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
+            branch_opt: false,
         },
         1 => anon_armv8::AArch64CodegenConfig {
             dce: true,
@@ -105,6 +107,7 @@ fn compile_sy(source: &str, target: Target, opt_level: u8) -> String {
             pair_combine: true,
             list_scheduler: false,
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
+            branch_opt: true,
         },
         _ => anon_armv8::AArch64CodegenConfig {
             dce: true,
@@ -112,6 +115,7 @@ fn compile_sy(source: &str, target: Target, opt_level: u8) -> String {
             pair_combine: true,
             list_scheduler: true,
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
+            branch_opt: true,
         },
     };
     match target {
@@ -232,6 +236,7 @@ mod tests {
             pair_combine: true,
             list_scheduler: true,
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
+            branch_opt: true,
         };
         let output = taki_mir::compile_with_config::<AArch64Backend>(&program, &config);
 
@@ -270,6 +275,7 @@ mod tests {
             pair_combine: true,
             list_scheduler: true,
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
+            branch_opt: true,
         };
         let output = taki_mir::compile_with_config::<AArch64Backend>(&program, &config);
 
@@ -283,5 +289,89 @@ mod tests {
         assert_eq!(use_first.abi.unused_register_args_skipped, 1);
         assert_eq!(use_first.abi.incoming_stack_args_loaded, 0);
         assert_eq!(use_first.regalloc.spill_slots, 0);
+    }
+
+    fn compile_with_branch_opt(source: &str, branch_opt: bool) -> taki_mir::CompileOutput {
+        use anon_armv8::AArch64CodegenConfig;
+
+        let ast = crate::sysy::CompUnitsParser::new()
+            .parse(source)
+            .expect("valid SysY");
+        let mut ctx = AstGenContext::new();
+        ast.convert(&mut ctx);
+        let mut program = ctx.program;
+        let pass_manager = raana_ir::opt::pass::PassesManager::default_ref();
+        pass_manager.run_passes(&mut program);
+        let config = AArch64CodegenConfig {
+            dce: true,
+            peephole_combine: true,
+            pair_combine: true,
+            list_scheduler: true,
+            sched_model: anon_armv8::AArch64SchedModel::CortexA53,
+            branch_opt,
+        };
+        taki_mir::compile_with_config::<AArch64Backend>(&program, &config)
+    }
+
+    fn function_stats<'a>(
+        output: &'a taki_mir::CompileOutput,
+        name: &str,
+    ) -> &'a FunctionCodegenStats {
+        output
+            .stats
+            .functions
+            .iter()
+            .find(|stats| stats.function == name)
+            .unwrap_or_else(|| panic!("stats must include the `{name}` function"))
+    }
+
+    #[test]
+    fn branch_optimization_removes_fallthrough_and_inverts_jumps() {
+        let source = "int f(int x) { if (x > 3) { return 1; } return 0; }\n\
+                      int g(int a, int b) {\n\
+                          int bit_a = a % 2;\n\
+                          int bit_b = b % 2;\n\
+                          int r = 0;\n\
+                          if (bit_a == 1 || bit_b == 1) { r = a + b; }\n\
+                          return r;\n\
+                      }\n\
+                      int main() { return f(1) + g(2, 3); }\n";
+        let output = compile_with_branch_opt(source, true);
+        let f = function_stats(&output, "f");
+        assert!(f.branch_opt.ran);
+        assert!(
+            f.branch_opt.fallthrough_removed + f.branch_opt.dead_jumps_removed >= 1,
+            "`f` must eliminate its jump to the fallthrough merge block"
+        );
+        let g = function_stats(&output, "g");
+        assert!(
+            g.branch_opt.branches_inverted >= 1,
+            "`g` must invert its condition to skip the trailing jump"
+        );
+        assert!(
+            g.branch_opt.labels_threaded >= 1,
+            "`g` must thread empty edge-block labels"
+        );
+
+        let f_section = function_section(&output.assembly, "f");
+        assert!(
+            !f_section.lines().any(|line| line.trim() == "1:"),
+            "no local trampoline labels may remain:\n{f_section}"
+        );
+    }
+
+    #[test]
+    fn branch_optimization_off_keeps_two_instruction_form() {
+        let source = "int g(int x) { if (x > 3) { return x; } return 0; }\nint main() { return g(2); }\n";
+        let off = compile_with_branch_opt(source, false);
+        let on = compile_with_branch_opt(source, true);
+        assert!(!function_stats(&off, "g").branch_opt.ran);
+        let count = |asm: &str| asm.lines().filter(|l| l.starts_with("    ")).count();
+        let off_g = function_section(&off.assembly, "g");
+        let on_g = function_section(&on.assembly, "g");
+        assert!(
+            count(&off_g) > count(&on_g),
+            "the -O0-style two-instruction form must be strictly larger:\n{off_g}\n{on_g}"
+        );
     }
 }

@@ -30,7 +30,14 @@
   删除 `1f` 局部标号 hack），多指令 MInst（`LoadImm`/`LoadAddr`/`CmpSelect`）
   拆为逐指令 slot；RISC-V 文本输出逐字节不变。huffman-01 指令数 870 → 804
   （-8%），`-O0/1/2` × 双 target 全部确定性通过，全 corpus 编译+汇编通过。
-  优化规则（M26）与 veneer（M27）尚未开启。
+- 分支优化四规则（M26）：`optimize_branches` 移植 Cranelift R1（fallthrough
+  消除）/R2（标签穿线，防环）/R3（双 uncond 死跳删除）/R4（条件倒相合并），
+  `LABEL_LIST_THRESHOLD` 防二次方；`-O` 门控（`-O0` 保留两指令形式作差分
+  基线，`AArch64CodegenConfig::branch_opt`）；`BranchOptStats` 统计接入
+  `compile_with_config`；修复 finish 渲染非单调 label offset 的缺陷（回归
+  单测）。huffman-01 指令数 804 → 687（累计 -21%）：fallthrough=99、
+  inverted=17、threaded=13、dead=1；R1-R4 专项单测 + abi_matrix 门禁通过。
+  veneer（M27）与 RISC-V slot 化（M28）尚未完成。
 
 目标硬件是 Xilinx XCZU15EG 上的 Cortex-A53 MPCore。
 
@@ -84,27 +91,27 @@ lowering
 
 ## 2. 主计划：Fallthrough 长期最优重构（EmitBuffer，参考 Cranelift MachBuffer）
 
-### 2.1 问题量化（M25 基线）
+### 2.1 问题量化（M26 基线）
 
-M25 已把 AArch64 分支发射改为 EmitBuffer 结构化 Branch slot 的 2 指令形式
-（`b.<cond> T; b F`），huffman-01 指令数 870 → 804（-8%）。剩余可优化点：
+M25/M26 已把 AArch64 分支发射改为 EmitBuffer 结构化 Branch slot，并开启
+R1-R4 优化：huffman-01 指令数 870 → 687（-21%）。剩余工作集中在超范围
+分支（veneer）与 RISC-V：
 
-| 模式 | 数量 | M25 后代价 | M26 重构后代价 | 可省 |
+| 模式 | 数量 | 当前状态 | 目标 | 可省 |
 |---|---|---|---|---|
-| 2 指令分支组（`b.cond T; b F`） | 66 | 2 条/组 | 1~2 条/组（目标为 fallthrough 时 1 条） | ~66 |
-| 真死跳转 `b next_block`（紧邻后续块） | 35 | 1 条 | 0 条（fallthrough 消除） | 35 |
-| **合计** | | | | **~100 条（-12%）** |
+| 分支已收敛为单条（R1/R4） | 82 处优化 | - | - | 已完成 |
+| 超范围条件分支（>±1MB） | 0（当前 corpus） | 直接发射，无范围检查 | veneer 兜底 | 正确性保障 |
+| RISC-V `CondBr`（5 条 `la+jr`） | 每处 | trampoline 文本 | `beqz/bnez` + veneer | 每处 ~3 条 |
 
-热循环收益更大：`_and`/`_or` 每 32 迭代 × 每次 `read_bits` × 数千符号，
-循环内每次省 1-2 条分支指令。
+热循环收益已兑现：`_and`/`_or` 循环内每次少 1-2 条分支指令。
 
-**M25 之后仍未解决的局限**（M26/M27 的主攻对象）：
+**M26 之后仍未解决的局限**（M27/M28 的主攻对象）：
 
-1. 无法"分支倒相"（`b.eq` ↔ `b.ne`）、无法"标签别名/穿线"
-   （`L: b M` 时把指向 L 的引用改为 M）、无法删除"跳转到紧邻块"的死跳转；
+1. 无偏移/范围概念：分支假定目标都在对应 `LabelKind` 范围内，超范围会
+   汇编失败（当前 corpus 未触发，但无保证）；
 2. RISC-V `CondBr` 仍是 5 条 `la t6, X; jr t6` trampoline（M28 改为 slot）；
-3. 没有偏移/范围概念：`-O0` 基线的 2 指令形式假定目标都在 ±1MB 内；
-4. AArch64 侧 `1f` hack 已删除；RISC-V 侧仍在（M28 清理）。
+3. RISC-V 侧 `1f` hack 仍在（M28 清理）；
+4. 冷块沉底未做（只在 `BlockLoweringOrder` 预留 `is_cold()` 接口）。
 
 ### 2.2 参考实现：Cranelift 的 MachBuffer
 
@@ -245,14 +252,14 @@ impl EmitBuffer {
 
 | 文件 | 改动 |
 |---|---|
-| `taki_mir/src/emit_buffer.rs`（M25 已建） | EmitBuffer 核心；M26 填 optimize_branches 四规则；M27 填 resolve 松弛 |
-| `taki_mir/src/vcode.rs` | `EmitContext` 新增 `end_inst/put_branch/put_uncond_branch`（M25 已完成）；`MachInst` trait 增加 veneer 生成接口（M27）；verify 断言 slot 粒度（M27） |
-| `taki_mir/src/emit.rs` | `write_function` 已改走 buffer（M25 完成）；M26 函数尾调 `optimize_branches`；M27 传 `-O` 开关给 resolve |
-| `anon_armv8/src/instructions.rs` | 分支 MInst 已改 Branch slot、`1f` hack 已删（M25 完成）；M27 `Cbz/Tbz` veneer 前缀接入 |
+| `taki_mir/src/emit_buffer.rs`（M25 已建） | EmitBuffer 核心；R1-R4 已完成（M26）；M27 填 `resolve` 松弛 |
+| `taki_mir/src/vcode.rs` | `end_inst/put_branch/put_uncond_branch`（M25 已完成）；`MachInst` trait 增加 veneer 生成接口（M27）；verify 断言 slot 粒度（M27） |
+| `taki_mir/src/emit.rs` | `write_function` 已改走 buffer（M25）；`optimize_branches` 函数尾调用（M26）；M27 传 veneer 接口 |
+| `anon_armv8/src/instructions.rs` | 分支 MInst 已改 Branch slot、`1f` hack 已删（M25）；M27 无改动 |
 | `anon_armv8/src/labels.rs` | `Label::block()` 访问器（M25 完成） |
 | `anon_armv8/src/lower.rs` | 可选：`CmpImm(0)+CondBr{Ne}` 兜底（`:860-870`）在 slot 层识别为 `cbz` |
 | `uika_riscv/src/instructions.rs` | `CondBr` 改为 slot（`beqz/bnez` 倒相）；veneer 用 `la t6,X; jr t6`（B-type ±4KB / JAL ±1MB） |
-| `taki_mir/src/stats.rs` | `BranchOptStats`：`fallthrough_removed / branches_inverted / labels_threaded / dead_jumps_removed / veneers_inserted`（沿用 DCE 统计模式） |
+| `taki_mir/src/stats.rs` | `BranchOptStats` 已接入（M26）；`veneers_inserted` 由 M27 填充 |
 
 #### 2.4.6 顺带收益（同构改造附带解决）
 
@@ -280,27 +287,21 @@ impl EmitBuffer {
 10. AArch64 与 RISC-V 共用 EmitBuffer，行为一致；RISC-V 不受 AArch64
     配置开关影响。
 
-### 2.6 里程碑（M26-M29）
+### 2.6 里程碑（M27-M29）
 
 每个 milestone 独立提交；完成后在 TODO.md 删除对应细节，只保留一行历史
 （同 M19-M24 惯例）。已定决策：EmitBuffer 放 `taki_mir` 通用层；范围策略
 采用"±1MB 内直跳、超范围才 veneer"；冷块沉底本期不做，仅在
-`BlockLoweringOrder` 预留 `is_cold()` 接口；M25 已完成并独立提交（可回退）。
-
-#### M26：optimize_branches 四规则
-
-- 移植 R1-R4 + `LABEL_LIST_THRESHOLD` + 别名防环；`bind_label` 内与函数尾
-  调用。
-- `BranchOptStats` 统计接入 `compile_with_config`。
-- 验收：huffman-01 指令数 804 → ~750±10；专项单测覆盖 R1（fallthrough
-  消除）、R2（穿线链 + 防环 + 空 edge block 吞噬）、R3（双 uncond）、R4
-  （翻转后再翻转恢复）；`-O0` 与 `-O1` 差分正确。
+`BlockLoweringOrder` 预留 `is_cold()` 接口；M25/M26 已完成并独立提交。
 
 #### M27：范围检查 + veneer 松弛
 
-- `LabelKind`（Branch14/19/26）范围表；`resolve` 松弛循环；veneer 插入规则
-  （分支后、fallthrough 先强制两指令形式）。
-- `Cbz/Cbnz/Tbz/Tbnz` 接入 slot。
+- `resolve` 松弛循环：slot 定长（4B）→ 精确计算每标签偏移 → 找出超范围
+  分支 → veneer 插在分支自身之后（块终结符，无 fallthrough）；若该分支
+  已被优化成单条件且另一目标为 fallthrough，先强制两指令形式再插 veneer；
+  重算偏移重复直至稳定（单调收敛，≤3 轮）。
+- `Cbz/Cbnz/Tbz/Tbnz` 已接入 slot（M25），veneer 前缀由 Branch14/19 类型
+  驱动。
 - 验收：合成 >1MB 代码块用例验证 veneer 正确且松弛收敛（≤3 轮）；QEMU
   差分（`tests/test.py`）通过；全 benchmark 编译成功无汇编器超范围报错。
 
@@ -350,10 +351,10 @@ impl EmitBuffer {
 
 - `cargo test --workspace` 全通过；AArch64 + RISC-V × `-O0/1/2` 编译成功且
   5 次 byte-identical。
-- huffman-01 静态指令数 870 → ~750±10（-12%~-16%），热循环（`_and`/`_or`
-  每轮）少 2-3 条分支。
-- `.s` 输出中不再出现 `1f` 局部标号 trampoline；所有分支为直接
-  `b.cond`/`b`（超范围场景为 veneer 形式）。
+- huffman-01 静态指令数 870 → 687（-21%，M26 已达成；M27/M28 目标为
+  RISC-V 侧同等收敛），热循环（`_and`/`_or` 每轮）少 1-2 条分支。
+- AArch64 `.s` 输出不再出现 `1f` 局部标号 trampoline；所有分支为直接
+  `b.cond`/`b`（超范围场景为 veneer 形式）；RISC-V `1f` 在 M28 清理。
 - QEMU differential 全通过（`tests/test.py`）。
 - 所有 benchmark 无汇编器"branch out of range"错误。
 - `BranchOptStats` 有统计值；`-O0` 与 `-O1` on/off 差分无行为差异。

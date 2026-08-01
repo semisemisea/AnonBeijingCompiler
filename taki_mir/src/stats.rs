@@ -29,6 +29,7 @@ pub struct FunctionCodegenStats {
     pub scheduler: SchedulerStats,
     pub abi: AbiArgStats,
     pub regalloc: RegallocStats,
+    pub branch_opt: BranchOptStats,
 }
 
 impl FunctionCodegenStats {
@@ -39,6 +40,36 @@ impl FunctionCodegenStats {
         self.scheduler.accumulate(&other.scheduler);
         self.abi.accumulate(&other.abi);
         self.regalloc.accumulate(&other.regalloc);
+        self.branch_opt.accumulate(&other.branch_opt);
+    }
+}
+
+/// Emission-time branch optimization statistics (EmitBuffer rules).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BranchOptStats {
+    pub ran: bool,
+    pub changed: bool,
+    /// Branches removed because their target was the fallthrough (R1).
+    pub fallthrough_removed: u64,
+    /// Conditional branches inverted to eliminate a following jump (R4).
+    pub branches_inverted: u64,
+    /// Labels redirected through a tail unconditional branch (R2).
+    pub labels_threaded: u64,
+    /// Unreachable unconditional branches removed after another uncond (R3).
+    pub dead_jumps_removed: u64,
+    /// Long-branch veneers inserted by range relaxation (M27).
+    pub veneers_inserted: u64,
+}
+
+impl BranchOptStats {
+    fn accumulate(&mut self, other: &Self) {
+        self.ran |= other.ran;
+        self.changed |= other.changed;
+        self.fallthrough_removed += other.fallthrough_removed;
+        self.branches_inverted += other.branches_inverted;
+        self.labels_threaded += other.labels_threaded;
+        self.dead_jumps_removed += other.dead_jumps_removed;
+        self.veneers_inserted += other.veneers_inserted;
     }
 }
 

@@ -24,6 +24,14 @@ impl Label {
         Self::Block(block)
     }
 
+    /// The lowered block index, when this label names an intra-function block.
+    pub fn block(&self) -> Option<MirBlockIndex> {
+        match self {
+            Self::Block(block) => Some(*block),
+            _ => None,
+        }
+    }
+
     pub fn emit(&self, ctx: &mut dyn EmitContext) -> core::fmt::Result {
         match self {
             Self::Block(block) => ctx.write_label_ref(*block),

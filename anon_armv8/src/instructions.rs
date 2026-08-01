@@ -2,6 +2,7 @@
 
 use taki_mir::{
     abi::{ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
+    emit_buffer::LabelKind,
     reg_alloc::reg::{OperandVisitor, OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
     types::{F32, I32, I64, LoweredType},
@@ -1197,7 +1198,8 @@ impl MachInstEmit for MInst {
                 emit_reg(ctx, dst.to_reg(), OperandSize::Size64)?;
                 write!(ctx, ", ")?;
                 label.emit(ctx)?;
-                write!(ctx, "\n    add ")?;
+                ctx.end_inst()?;
+                write!(ctx, "add ")?;
                 emit_reg(ctx, dst.to_reg(), OperandSize::Size64)?;
                 write!(ctx, ", ")?;
                 emit_reg(ctx, dst.to_reg(), OperandSize::Size64)?;
@@ -1208,8 +1210,17 @@ impl MachInstEmit for MInst {
                 unreachable!("stack addresses must be legalized before emission")
             }
             Self::BCond { cond, label } => {
-                write!(ctx, "b.{} ", cond_name(*cond))?;
-                label.emit(ctx)
+                let target = label
+                    .block()
+                    .expect("BCond target must be an intra-function block");
+                let cond_text = cond_name(*cond);
+                let inverted_text = cond_name(invert_cond(*cond));
+                ctx.put_branch(
+                    &format!("b.{cond_text} "),
+                    Some(&format!("b.{inverted_text} ")),
+                    target,
+                    LabelKind::BRANCH19,
+                )
             }
             Self::Cbz {
                 size,
@@ -1223,22 +1234,25 @@ impl MachInstEmit for MInst {
                 true_label,
                 false_label,
             } => {
-                write!(
-                    ctx,
-                    "{} ",
-                    if matches!(self, Self::Cbz { .. }) {
-                        "cbnz"
-                    } else {
-                        "cbz"
-                    }
+                let (mnemonic, inverted_mnemonic) = match self {
+                    Self::Cbz { .. } => ("cbz", "cbnz"),
+                    _ => ("cbnz", "cbz"),
+                };
+                let true_target = true_label
+                    .block()
+                    .expect("Cbz/Cbnz target must be an intra-function block");
+                let false_target = false_label
+                    .block()
+                    .expect("Cbz/Cbnz target must be an intra-function block");
+                let prefix = branch_prefix(ctx, mnemonic, *reg, *size)?;
+                let inv_prefix = branch_prefix(ctx, inverted_mnemonic, *reg, *size)?;
+                ctx.put_branch(
+                    &prefix,
+                    Some(&inv_prefix),
+                    true_target,
+                    LabelKind::BRANCH19,
                 )?;
-                emit_reg(ctx, *reg, *size)?;
-                // Conditional branches have shorter reach than `b`; skip the
-                // first long jump locally, then use long jumps for both arms.
-                write!(ctx, ", 1f\n    b ")?;
-                true_label.emit(ctx)?;
-                write!(ctx, "\n1:\n    b ")?;
-                false_label.emit(ctx)
+                ctx.put_uncond_branch("b ", false_target, LabelKind::BRANCH26)
             }
             Self::Tbz {
                 size,
@@ -1254,34 +1268,52 @@ impl MachInstEmit for MInst {
                 true_label,
                 false_label,
             } => {
-                write!(
-                    ctx,
-                    "{} ",
-                    if matches!(self, Self::Tbz { .. }) {
-                        "tbnz"
-                    } else {
-                        "tbz"
-                    }
+                let (mnemonic, inverted_mnemonic) = match self {
+                    Self::Tbz { .. } => ("tbz", "tbnz"),
+                    _ => ("tbnz", "tbz"),
+                };
+                let true_target = true_label
+                    .block()
+                    .expect("Tbz/Tbnz target must be an intra-function block");
+                let false_target = false_label
+                    .block()
+                    .expect("Tbz/Tbnz target must be an intra-function block");
+                let prefix = branch_prefix_bit(ctx, mnemonic, *reg, *size, *bit)?;
+                let inv_prefix = branch_prefix_bit(ctx, inverted_mnemonic, *reg, *size, *bit)?;
+                ctx.put_branch(
+                    &prefix,
+                    Some(&inv_prefix),
+                    true_target,
+                    LabelKind::BRANCH14,
                 )?;
-                emit_reg(ctx, *reg, *size)?;
-                write!(ctx, ", #{bit}, 1f\n    b ")?;
-                true_label.emit(ctx)?;
-                write!(ctx, "\n1:\n    b ")?;
-                false_label.emit(ctx)
+                ctx.put_uncond_branch("b ", false_target, LabelKind::BRANCH26)
             }
             Self::CondBr {
                 cond,
                 true_label,
                 false_label,
             } => {
-                write!(ctx, "b.{} 1f\n    b ", cond_name(invert_cond(*cond)))?;
-                true_label.emit(ctx)?;
-                write!(ctx, "\n1:\n    b ")?;
-                false_label.emit(ctx)
+                let true_target = true_label
+                    .block()
+                    .expect("CondBr target must be an intra-function block");
+                let false_target = false_label
+                    .block()
+                    .expect("CondBr target must be an intra-function block");
+                let cond_text = cond_name(*cond);
+                let inverted_text = cond_name(invert_cond(*cond));
+                ctx.put_branch(
+                    &format!("b.{cond_text} "),
+                    Some(&format!("b.{inverted_text} ")),
+                    true_target,
+                    LabelKind::BRANCH19,
+                )?;
+                ctx.put_uncond_branch("b ", false_target, LabelKind::BRANCH26)
             }
             Self::Jump { label } => {
-                write!(ctx, "b ")?;
-                label.emit(ctx)
+                let target = label
+                    .block()
+                    .expect("Jump target must be an intra-function block");
+                ctx.put_uncond_branch("b ", target, LabelKind::BRANCH26)
             }
             Self::CSet { cond, dst } => {
                 write!(ctx, "cset ")?;
@@ -1290,7 +1322,7 @@ impl MachInstEmit for MInst {
             }
             Self::CmpSelect { cmp, cond, value } => {
                 emit_select_cmp(ctx, cmp)?;
-                write!(ctx, "\n    ")?;
+                ctx.end_inst()?;
                 match value {
                     SelectValue::Int {
                         size,
@@ -1401,6 +1433,36 @@ impl MachInstEmit for MInst {
     }
 }
 
+/// Compose the text before a branch target for a register-testing branch
+/// (cbz/cbnz): mnemonic, register, and the trailing separator. The text is
+/// accumulated through `ctx` so register rendering stays in one place.
+fn branch_prefix(
+    ctx: &mut dyn EmitContext,
+    mnemonic: &str,
+    reg: Reg,
+    size: OperandSize,
+) -> Result<String, core::fmt::Error> {
+    write!(ctx, "{mnemonic} ")?;
+    emit_reg(ctx, reg, size)?;
+    write!(ctx, ", ")?;
+    Ok(ctx.take_inst_text())
+}
+
+/// Like [`branch_prefix`] for test-bit branches (tbz/tbnz), which also carry
+/// the bit index.
+fn branch_prefix_bit(
+    ctx: &mut dyn EmitContext,
+    mnemonic: &str,
+    reg: Reg,
+    size: OperandSize,
+    bit: u8,
+) -> Result<String, core::fmt::Error> {
+    write!(ctx, "{mnemonic} ")?;
+    emit_reg(ctx, reg, size)?;
+    write!(ctx, ", #{bit}, ")?;
+    Ok(ctx.take_inst_text())
+}
+
 fn emit_select_cmp(ctx: &mut dyn EmitContext, cmp: &SelectCmp) -> core::fmt::Result {
     match cmp {
         SelectCmp::IntRR { size, lhs, rhs } => {
@@ -1433,7 +1495,7 @@ fn emit_load_imm(
         .enumerate()
     {
         if index != 0 {
-            write!(ctx, "\n    ")?;
+            ctx.end_inst()?;
         }
         match step {
             crate::constants::ConstantStep::Zero => {
@@ -1932,6 +1994,13 @@ mod tests {
 
         fn write_global_label(&mut self, _global: HirInst) -> core::fmt::Result {
             unreachable!("select pseudo has no labels")
+        }
+
+        /// Mirror the emission contract of `EmitBuffer::end_inst`: one flush
+        /// = one instruction line.
+        fn end_inst(&mut self) -> core::fmt::Result {
+            self.0.push_str("\n    ");
+            Ok(())
         }
     }
 

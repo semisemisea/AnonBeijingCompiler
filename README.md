@@ -103,6 +103,26 @@ Unsupported backend HIR is reported as a concise code-generation error with
 function, block where available, instruction, type, phase, and legality
 context. Internal compiler invariants remain fail-fast errors.
 
+### gem5 performance testing
+
+The container builds an ARM gem5 (syscall-emulation) model of the Xilinx
+XCZU15EG Cortex-A53 subsystem: quad-core in-order A53, 32 KiB 2-way L1I /
+32 KiB 4-way L1D, shared 1 MiB 16-way L2, ARMv8-A 64-bit with NEON and
+single/double-precision FP. Run compiler-produced ELFs under it to collect
+cycle counts and cache miss rates:
+
+```bash
+make gem5 perf/conv2d-1.sy        # build gem5 once, then run the case under gem5
+make gem5-run path/to/program.elf   # run any AArch64 ELF under the A53 model
+```
+
+`make gem5-build` clones gem5 v25.1.0.1 into `.gem5/` and builds it (one-time,
+30-60 min). gem5 SE simulates on the order of 100k instructions/s, so use the
+small-input test cases rather than the MB-sized ones; each result lands in
+`results/<case>/gem5-stats/stats.txt` with a compact summary printed by the
+harness. `GEM5_ARGS` passes extra options (e.g. `--cpu-clock=1.5GHz`,
+`--num-cpus=4`, `--maxinsts=100000000`).
+
 ## Build from source
 
 To be announced

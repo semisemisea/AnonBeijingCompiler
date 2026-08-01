@@ -57,6 +57,45 @@ pub trait EmitContext: core::fmt::Write {
     fn write_function_label(&mut self, func: crate::prelude::HirFunction) -> core::fmt::Result;
     fn write_global_label(&mut self, gv: crate::prelude::HirInst) -> core::fmt::Result;
     fn write_external_symbol(&mut self, symbol: &str) -> core::fmt::Result;
+
+    /// End the current instruction: flush the accumulated instruction text as
+    /// one slot. No-op when nothing was written since the last flush.
+    fn end_inst(&mut self) -> core::fmt::Result {
+        Ok(())
+    }
+
+    /// Take the text accumulated since the last flush (the current
+    /// instruction's text) for structured use, e.g. composing a branch
+    /// prefix that includes a rendered register.
+    fn take_inst_text(&mut self) -> String {
+        String::new()
+    }
+
+    /// Emit an optimizable conditional branch whose target remains symbolic.
+    /// `prefix` is the text before the target label; `inv_prefix` is the
+    /// inverted-encoding equivalent used when branch optimization flips the
+    /// condition.
+    fn put_branch(
+        &mut self,
+        prefix: &str,
+        inv_prefix: Option<&str>,
+        target: MirBlockIndex,
+        kind: crate::emit_buffer::LabelKind,
+    ) -> core::fmt::Result {
+        let _ = (prefix, inv_prefix, target, kind);
+        Ok(())
+    }
+
+    /// Emit an optimizable unconditional branch.
+    fn put_uncond_branch(
+        &mut self,
+        prefix: &str,
+        target: MirBlockIndex,
+        kind: crate::emit_buffer::LabelKind,
+    ) -> core::fmt::Result {
+        let _ = (prefix, target, kind);
+        Ok(())
+    }
 }
 
 pub trait MachInstEmit {

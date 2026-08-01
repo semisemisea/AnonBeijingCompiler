@@ -7,6 +7,15 @@ ARGS ?=
 TESTS ?=
 DOCKER ?= docker
 
+# gem5 performance testing
+GEM5_BUILD ?= .gem5
+GEM5_BIN ?= $(GEM5_BUILD)/build/ARM/gem5.opt
+GEM5_TAG ?= v25.1.0.1
+GEM5_DIR_IN ?= /work/gem5
+GEM5_BIN_IN ?= $(GEM5_DIR_IN)/build/ARM/gem5.opt
+GEM5_CONFIG ?= $(CURDIR)/gem5/a53_se.py
+GEM5_ARGS ?=
+
 ifeq ($(firstword $(MAKECMDGOALS)),test)
 TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
 $(eval $(TEST_ARGS):;@:)
@@ -57,6 +66,17 @@ MCA_FILE_PATH := $(abspath $(MCA_FILE))
 $(eval $(MCA_FILE):;@:)
 endif
 
+ifeq ($(firstword $(MAKECMDGOALS)),gem5)
+TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+$(eval $(TEST_ARGS):;@:)
+endif
+
+ifeq ($(firstword $(MAKECMDGOALS)),gem5-run)
+GEM5_RUN_ELF := $(word 2,$(MAKECMDGOALS))
+GEM5_RUN_ELF_PATH := $(abspath $(GEM5_RUN_ELF))
+$(eval $(GEM5_RUN_ELF):;@:)
+endif
+
 HOST_ARCH := $(shell uname -m)
 ifeq ($(HOST_ARCH),x86_64)
 MUSL_TARGET := x86_64-unknown-linux-musl
@@ -76,7 +96,7 @@ endif
 HOST_TARGET_DIR := $(CURDIR)/target/host-musl
 COMPILER := /work/target/$(MUSL_TARGET)/release/compiler
 
-.PHONY: help test test-baseline test-llvm test-riscv run-elf run-elf-riscv debug-elf debug-elf-riscv mca test-image test-compiler build-lib build-lib-riscv clean-results
+.PHONY: help test test-baseline test-llvm test-riscv run-elf run-elf-riscv debug-elf debug-elf-riscv mca test-image test-compiler build-lib build-lib-riscv clean-results gem5 gem5-run gem5-build
 
 help:
 	@printf '%s\n' 'make test [functional/case.sy]      Build the AArch64 compiler and run the AArch64 harness.'
@@ -87,6 +107,10 @@ help:
 	@printf '%s\n' 'make run-elf path/to/program.elf  Execute an AArch64 ELF in the test container.'
 	@printf '%s\n' 'make debug-elf path/to/program.elf Start the AArch64 QEMU/GDB workflow.'
 	@printf '%s\n' 'make mca path/to/target.s        Analyse AArch64 assembly with llvm-mca.'
+	@printf '%s\n' 'make gem5 perf/01_mm1.sy         Build gem5 once, then run the compiler test suite under'
+	@printf '%s\n' '                                  the XCZU15EG Cortex-A53 gem5 model and print stats.'
+	@printf '%s\n' 'make gem5-run path/to/program.elf Run an AArch64 ELF under the gem5 A53 model.'
+	@printf '%s\n' 'make gem5-build                   Clone and build gem5 into .gem5 (first run only).'
 
 test: test-compiler build-lib test-image
 	mkdir -p "$(RESULTS)"
@@ -214,6 +238,74 @@ mca: test-image
 		-v "$(MCA_FILE_PATH):/work/target.s:ro" \
 		--entrypoint llvm-mca \
 		"$(IMAGE)" -march=aarch64 -mcpu=cortex-a53 -timeline /work/target.s
+
+# Run the compiler test suite under the gem5 Cortex-A53 model (XCZU15EG).
+# gem5 SE simulates a few hundred K instructions/second, so pass small-input
+# cases (e.g. `make gem5 perf/conv2d-1`) rather than the MB-sized ones.
+gem5: test-compiler build-lib test-image gem5-build
+	mkdir -p "$(RESULTS)"
+	@cleanup() { $(DOCKER) rm -f "$(CONTAINER)" >/dev/null 2>&1 || true; }; \
+	trap cleanup EXIT INT TERM; \
+	cleanup; \
+	$(DOCKER) run -t --name "$(CONTAINER)" --network none \
+		-e SOYO_COMPILER="$(COMPILER)" \
+		-e SOYO_GEM5="$(GEM5_BIN_IN)" \
+		-e SOYO_GEM5_CONFIG="/work/gem5-config/a53_se.py" \
+		-e SOYO_GEM5_EXTRA="$(GEM5_ARGS)" \
+		-v "$(HOST_TARGET_DIR):/work/target:ro" \
+		-v "$(CURDIR)/tests:/work/tests:ro" \
+		-v "$(CURDIR)/sysylib:/work/sysylib:ro" \
+		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
+		-v "$(CURDIR)/$(GEM5_BUILD):$(GEM5_DIR_IN):ro" \
+		-v "$(CURDIR)/gem5:/work/gem5-config:ro" \
+		"$(IMAGE)" --runner gem5 $(ARGS) $(TESTS) $(TEST_ARGS)
+
+# Run a single pre-built AArch64 ELF under the gem5 Cortex-A53 model.
+# Optional: GEM5_INPUT=path/to/input (fed as stdin), GEM5_ARGS="--cpu-clock=1.5GHz --maxinsts=100000000".
+gem5-run: test-image gem5-build
+	@if [ -z "$(GEM5_RUN_ELF)" ]; then \
+		printf 'usage: make gem5-run path/to/program.elf [GEM5_INPUT=path] [GEM5_ARGS="..."]\n' >&2; \
+		exit 2; \
+	fi; \
+	if [ ! -f "$(GEM5_RUN_ELF_PATH)" ]; then \
+		printf 'ELF not found: %s\n' "$(GEM5_RUN_ELF)" >&2; \
+		exit 2; \
+	fi
+	mkdir -p "$(RESULTS)/gem5"
+	$(DOCKER) run --rm -t --network none \
+		-v "$(CURDIR)/$(GEM5_BUILD):$(GEM5_DIR_IN):ro" \
+		-v "$(CURDIR)/gem5:/work/gem5-config:ro" \
+		-v "$(GEM5_RUN_ELF_PATH):/work/program.elf:ro" \
+		$(if $(GEM5_INPUT),-v "$(abspath $(GEM5_INPUT)):/work/program.in:ro",) \
+		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
+		--entrypoint /bin/sh \
+		"$(IMAGE)" -c 'cd $(GEM5_DIR_IN) && ./build/ARM/gem5.opt \
+			--outdir=/work/results/gem5 \
+			/work/gem5-config/a53_se.py \
+			/work/program.elf \
+			$(if $(GEM5_INPUT),--input=/work/program.in,) \
+			--output=/work/results/gem5/program.stdout \
+			$(GEM5_ARGS)'
+
+# Build gem5 (clone + scons) into .gem5/. The gem5 binary embeds the absolute
+# build path, so the volume is always mounted at $(GEM5_DIR_IN) (/work/gem5).
+gem5-build: test-image
+	@mkdir -p "$(GEM5_BUILD)"
+	$(DOCKER) run --rm -t -u "$$(id -u):$$(id -g)" \
+		--entrypoint /bin/sh \
+		-v "$(CURDIR)/$(GEM5_BUILD):$(GEM5_DIR_IN)" \
+		-w "$(GEM5_DIR_IN)" \
+		"$(IMAGE)" -c \
+			'if [ -x "$(GEM5_BIN_IN)" ]; then \
+				printf "gem5 already built: %s\n" "$(GEM5_BIN_IN)"; \
+				exit 0; \
+			fi; \
+			if [ ! -d src ]; then \
+				printf "cloning gem5 $(GEM5_TAG)...\n"; \
+				git clone --depth 1 --branch $(GEM5_TAG) https://github.com/gem5/gem5.git .; \
+			fi; \
+			printf "building gem5 (this takes a while)...\n"; \
+			scons -j4 --ignore-style --linker=lld CC=clang CXX=clang++ build/ARM/gem5.opt'
 
 # Build the test image if the tag is missing or the Dockerfile has changed.
 # The stamp records a checksum rather than a timestamp: cloning the repository

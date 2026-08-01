@@ -15,21 +15,22 @@
 - XCZU15EG PMU benchmark harness（M15，待实机运行）。
 - Slot-filling dual-issue heuristic（M16）。
 - 端到端验证门禁、确定性检查（M17）。
-- pre-RA DCE（M18）：worklist use-count fixpoint，白名单制（纯 ALU/Mov/常量
-  物化/纯 FP + dead load），`-O1` 起默认开启，`--enable/disable-mir-dce`
-  开关，`DceStats` 统计。huffman-01 上 `-O1` 指令数 964 → 935（-3%），
-  `mov w13, wzr` 等死代码全部消除。
+- pre-RA DCE（M18）：worklist use-count fixpoint，白名单制，`-O1` 起默认开启，
+  `--enable/disable-mir-dce` 开关，`DceStats` 统计。huffman-01 上 `-O1`
+  指令数 964 → 935（-3%）。
 - 入口参数 fixed-register live-in（M19-M24）：`Args` 伪指令以 `reg_fixed_def`
   直接绑定寄存器参数，消除 ABI home-slot store/load 往返；post-RA 调度将
   `Args`/`RetVal` 建模为零周期 Nop；RA 并行拷贝与真实 spill 门禁；AArch64 +
   RISC-V × `-O0/1/2` ABI 矩阵与 5 次确定性；`AbiArgStats`/`RegallocStats`
-  统计。纯叶函数 `add` 收敛为 `add w0, w0, w1; ret`（无 frame、无 str/ldr），
-  huffman 入口 str/ldr 全部消失。
-- ABI 参数绑定基础设施（M19）：`taki_mir` 新增 `ArgPair { vreg, preg }`、
-  `ABIMachineSpec::gen_args()`、`CalleeABI::reg_args`/`take_args()`；
-  AArch64 与 RISC-V 各新增零字节 `MInst::Args` 伪指令（`reg_fixed_def`
-  固定寄存器定义、空 emission、非 terminator、不在 DCE 白名单、verify
-  校验固定寄存器类匹配）。尚未接入 lowering，行为不变。
+  统计。纯叶函数 `add` 收敛为 `add w0, w0, w1; ret`（无 frame、无 str/ldr）。
+- EmitBuffer 文本缓冲（M25）：`taki_mir` 通用层新增 `emit_buffer.rs`（Slot/
+  BranchRef/LabelKind/BranchRec/别名链/labels_at_tail/latest_branches），
+  发射流程改走 buffer（prologue/epilogue 同样经 buffer）；AArch64
+  `CondBr/Cbz/Cbnz/Tbz/Tbnz/BCond/Jump` 改为结构化 Branch slot（2 指令形式，
+  删除 `1f` 局部标号 hack），多指令 MInst（`LoadImm`/`LoadAddr`/`CmpSelect`）
+  拆为逐指令 slot；RISC-V 文本输出逐字节不变。huffman-01 指令数 870 → 804
+  （-8%），`-O0/1/2` × 双 target 全部确定性通过，全 corpus 编译+汇编通过。
+  优化规则（M26）与 veneer（M27）尚未开启。
 
 目标硬件是 Xilinx XCZU15EG 上的 Cortex-A53 MPCore。
 
@@ -51,7 +52,7 @@ lowering
   -> finalize_for_emission
   -> post-RA PairCombine      (-O1 起)
   -> post-RA ListScheduler    (-O2 起)
-  -> assembly emission
+  -> assembly emission        (EmitBuffer 文本缓冲，M25 起)
 ```
 
 关键代码：
@@ -59,49 +60,16 @@ lowering
 - `anon_armv8/src/passes/mod.rs`：按 `AArch64CodegenConfig` 注册 pass。
 - `taki_mir/src/passes.rs`：`MIRPass` trait、pre-RA/post-RA 两阶段 pipeline。
 - `anon_armv8/src/passes/dce.rs`：worklist use-count fixpoint DCE，白名单制。
-- `anon_armv8/src/passes/peephole_combine.rs`：vreg use 计数 + MAC 融合，
-  使用 `Removed` tombstone。
+- `anon_armv8/src/passes/peephole_combine.rs`：vreg use 计数 + MAC 融合。
 - `anon_armv8/src/instructions.rs`：`MInst` 枚举（约 60 个 variant）。
+- `taki_mir/src/emit.rs`：`AsmWriter::write_function` 逐块文本发射。
+- `taki_mir/src/block_order.rs`：domtree RPO 块序（`lowered_order`）。
 - `taki_mir/src/stats.rs`：函数级 / 编译单元级结构化统计。
 - `soyo_compiler/src/cli.rs`：`-O` 映射与 `--enable/disable-*` 开关。
 
-### 1.2 已知问题：入口参数无条件落栈
+### 1.2 已知问题：分支发射无条件使用 3 指令 trampoline
 
-当前函数入口为每个寄存器参数无条件生成 home-slot 中转（如 `_and` 入口）：
-
-```asm
-str w0, [sp, #0]
-str w1, [sp, #16]
-ldr w12, [sp, #0]
-ldr w5, [sp, #16]
-```
-
-这不是 RA 压力导致的 spill，而是 `CalleeABI` 的参数初始化方案：
-
-```text
-AAPCS64 入参寄存器 w0/w1
-  -> 无条件保存到普通栈槽（计入 stackslots_size，非 spill_size）
-  -> 从栈槽加载到参数虚拟寄存器
-  -> RA 将参数虚拟寄存器分配为 w12/w5
-```
-
-根因排序：
-
-1. `taki_mir/src/abi.rs` 的 `prealloc_reg_arg_spills()` /
-   `gen_store_reg_args_to_stack()` / `gen_copy_arg_to_reg()` 无条件为寄存器
-   参数分配 home slot 并生成 store/load（`taki_mir/src/abi.rs:535-601`）。
-2. 入口参数没有 fixed-register live-in 表示，只能通过栈中转 materialize
-   （`taki_mir/src/lower.rs:433-478` 的 `gen_arg_setup`）。
-3. 现有 MIR pass（DCE / PeepholeCombine / PairCombine / ListScheduler）无法
-   消除该模式：store 不可删、load 结果被使用、`Store+Load` 不是 `is_move()`。
-4. 每个 `i32` 参数 home slot 独立按 16 字节对齐（`taki_mir/src/abi.rs:428-439`），
-   既浪费栈空间，也因地址差为 16 而非 4 导致 PairCombine 无法形成 `stp`。
-5. 未使用的寄存器参数也可能被保存（`gen_store_reg_args_to_stack` 遍历所有
-   寄存器参数，不检查 `is_value_needed`）。
-
-前端为源语言参数创建的 `alloc/store/load`（`soyo_compiler/src/frontend/ast.rs:144-155`）
-在 `-O1/-O2` 下已被 SSA/mem2reg 消除（`raana_ir/src/opt/passes/ssa.rs`），不是上述
-入口 `str/ldr` 的主要来源。
+问题背景与量化见 §2.1，本计划（M25-M29）的主攻对象。
 
 ### 1.3 当前结论边界
 
@@ -114,165 +82,281 @@ AAPCS64 入参寄存器 w0/w1
 
 ---
 
-## 2. 主计划：入口参数 fixed-register live-in（Args 伪指令）✅ 已完成
+## 2. 主计划：Fallthrough 长期最优重构（EmitBuffer，参考 Cranelift MachBuffer）
 
-对应"参数不落栈"的结构性修复。这不是性能 peephole，而是 ABI 参数表示方式的
-架构改造，参考 Cranelift 的 `Args` 伪指令实现。M19-M24 已全部完成并提交，
-以下为设计背景与参考实现，供后续维护参考，不再重复维护里程碑细节。
+### 2.1 问题量化（M25 基线）
 
-### 2.1 参考实现：Cranelift 的 `Args` 伪指令
+M25 已把 AArch64 分支发射改为 EmitBuffer 结构化 Branch slot 的 2 指令形式
+（`b.<cond> T; b F`），huffman-01 指令数 870 → 804（-8%）。剩余可优化点：
 
-Cranelift 并未为 regalloc2 增加"无定义入口 live-in"特殊通道，而是在函数体第一条
-放置零字节 `Args` 伪指令，并为每个寄存器参数记录 `reg_fixed_def(vreg, ABI preg)`：
+| 模式 | 数量 | M25 后代价 | M26 重构后代价 | 可省 |
+|---|---|---|---|---|
+| 2 指令分支组（`b.cond T; b F`） | 66 | 2 条/组 | 1~2 条/组（目标为 fallthrough 时 1 条） | ~66 |
+| 真死跳转 `b next_block`（紧邻后续块） | 35 | 1 条 | 0 条（fallthrough 消除） | 35 |
+| **合计** | | | | **~100 条（-12%）** |
 
-- `ArgPair { vreg, preg }`：`wasmtime/cranelift/codegen/src/machinst/abi.rs:120-129`
-- 寄存器参数只写入 `reg_args`，不生成 store/load：`abi.rs:1562-1584`
-- 函数第一条插入 `Args`：`machinst/lower.rs:525-565`
-- `Args` 使用 `reg_fixed_def`：`isa/aarch64/inst/mod.rs:794-798`
-- `Args` 不输出机器码：`isa/aarch64/inst/emit.rs:2931-2934`
-- 栈参数仍正常 load：`machinst/abi.rs:1585-1605`
+热循环收益更大：`_and`/`_or` 每 32 迭代 × 每次 `read_bits` × 数千符号，
+循环内每次省 1-2 条分支指令。
 
-```text
-当前：
-ABI preg -> 参数 home slot -> parameter vreg -> RA
+**M25 之后仍未解决的局限**（M26/M27 的主攻对象）：
 
-目标：
-Args pseudo: fixed_def(parameter vreg, ABI preg)
-  -> RA 自动处理后续分配、复制、交换环和真实 spill
+1. 无法"分支倒相"（`b.eq` ↔ `b.ne`）、无法"标签别名/穿线"
+   （`L: b M` 时把指向 L 的引用改为 M）、无法删除"跳转到紧邻块"的死跳转；
+2. RISC-V `CondBr` 仍是 5 条 `la t6, X; jr t6` trampoline（M28 改为 slot）；
+3. 没有偏移/范围概念：`-O0` 基线的 2 指令形式假定目标都在 ±1MB 内；
+4. AArch64 侧 `1f` hack 已删除；RISC-V 侧仍在（M28 清理）。
+
+### 2.2 参考实现：Cranelift 的 MachBuffer
+
+核心在 `../wasmtime/cranelift/codegen/src/machinst/buffer.rs`，模块注释
+（1-107 行）本身就是设计文档。要点：
+
+**2.2.1 单遍发射 + fixup（不关心布局）**
+`MachInst::emit` 把指令字节写进 `MachBuffer`，分支目标用符号化 `MachLabel`，
+`use_label_at_offset()` 记录 fixup（`buffer.rs:791-807`）；每个块首
+`bind_label()`（`:726-747`）。发射方不需要知道块序与目标距离。
+
+**2.2.2 latest-branches 窥视栈（`optimize_branches`，`:999-1271`）**
+`bind_label` 内部调用（`:745`），函数末尾再调一次（`vcode.rs:1132`）。
+只操作"尾部连续分支"（latest_branches 栈），可安全截断。四条规则：
+
+- **R1 fallthrough 消除**（`:1057`）：分支目标解析 == 当前尾部偏移 →
+  `truncate_last_branch()` 整条删除（分支到自身 fallthrough 是 no-op）。
+- **R2 标签别名/穿线**（`:1137`）：尾部是无条件分支且其起始处绑定了标签 →
+  把那些标签全部 alias 到分支目标（防环检查 `:1170`），等效删除空块；
+  配合 R3 可吞噬 RA 未插入 move 的空 edge block。
+- **R3 双无条件下冗余删除**（`:1207`）：`b; b` 相邻且第二个起始无标签 →
+  删第二个（不可达）。
+- **R4 条件+无条件翻转**（`:1222`）：`cond_br L2; b L3` 且 `L2` 解析为当前
+  尾 → 截断 `b L3`，把条件分支字节替换为**预编码的倒相字节**，目标改为
+  L3。发射方在 `add_cond_branch(..., inverted)`（`:856-890`）中提供条件分支
+  的两种编码（AArch64 `inst/emit.rs:3081-3102`）。
+- 阈值保护 `LABEL_LIST_THRESHOLD`（`:1041`）防止长串 `goto next` 标签合并
+  导致的二次方行为。
+
+**2.2.3 范围与 veneer**
+`LabelUse` trait（AArch64 `inst/mod.rs:2937-2956`）：Branch14（tbz，±1MB）、
+Branch19（b.cond/cbz，±1MB）、Branch26（b/bl，±128MB）、Adr21、PCRel32；
+每个类型声明正负范围、patch 掩码、veneer 支持与大小（`:2958-3048`）。
+`deadline`/`island`/`emit_veneer` 机制（`buffer.rs:142-210, 1310-1329,
+1544-1567`）在安全点（块间或 jump-around 之后，`:850-857`）插入长跳 veneer。
+
+**2.2.4 VCode 驱动**（`vcode.rs:736-1132`）
+冷块沉底（`final_order` + `cold_blocks`，`:759-770`）→ 每块 `bind_label`
+（触发 `optimize_branches`，`:872`）→ 每条指令后 `island_needed` 前瞻检查
+（`:851-857`）→ 尾部 `optimize_branches`（`:1132`）→ `finish()` 解析 fixup。
+
+### 2.3 关键洞察：我们的约束使问题比 Cranelift 更简单
+
+我们发射**文本 .s**（由系统汇编器解析符号），且 **AArch64/RISC-V 每条指令
+固定 4 字节**。由此：
+
+| Cranelift 机制 | 我们是否需要 | 原因 |
+|---|---|---|
+| 字节级 fixup/patch | 否 | 标签保持符号化 `.L_xxx`，由汇编器解析 |
+| deadline/island 前瞻 | 否（可选） | 指令定长 → 偏移**精确可算**，用单调松弛循环即可 |
+| latest-branches + 截断 + 倒相 + 别名 | **是** | 这是算法内核，与发射介质无关 |
+| 倒相字节预编码 | 是（文本级等价） | `b.eq` ↔ `b.ne` 只是模板替换 |
+| veneer | 是（简化版） | 文本级：插入一条 `b target` 模板 |
+
+结论：目标架构是**文本级 MachBuffer**——每个 slot = 一条 4 字节指令的
+文本模板，Cranelift 的算法内核原样移植，但无需字节编码器、无需 deadline
+机器。
+
+### 2.4 目标架构：EmitBuffer（taki_mir 通用层，RISC-V 同步受益）
+
+#### 2.4.1 数据模型（新文件 `taki_mir/src/emit_buffer.rs`）
+
+```rust
+/// 一个 slot = 一条定长指令的文本模板（发射时逐 slot 输出一行）
+pub enum Slot {
+    Text(String),                        // 普通指令
+    Branch(BranchRef),                   // 分支指令：只含 (前缀, 条件, 目标标签)
+    Veneer { target: LabelId },          // 目标后端生成的 veneer 模板组
+}
+
+pub struct BranchRef {
+    pub prefix: String,                  // 如 "b.eq " / "cbz w0, " / "tbz w0, #3, "
+    pub inv_prefix: String,              // 倒相模板（条件分支必填）
+    pub target: LabelId,
+    pub kind: LabelKind,                 // Branch14/19/26（范围）
+    pub is_cond: bool,
+}
+
+pub struct EmitBuffer {
+    slots: Vec<Slot>,                    // 尾部可截断
+    labels: Vec<LabelState>,             // Unbound | Bound(idx) | Alias(target)
+    latest_branches: Vec<BranchRec>,     // 尾部连续分支栈（含 start/end slot、labels_at_this_branch）
+    labels_at_tail: Vec<LabelId>,
+    veneers: Vec<VeneerRec>,             // 松弛阶段使用
+}
 ```
 
-### 2.2 为什么采用该方案
+关键点：分支 slot 只存 `(prefix, 条件, 目标)` 三元组——**倒相 = 换
+`inv_prefix`，改目标 = 改 `target`，删分支 = 截断 slot**，都是 O(1) 文本级
+操作，不需要字节 patch。
 
-项目已具备全部依赖机制，无需立即修改 allocator 核心：
+#### 2.4.2 API（对齐 MachBuffer，由 `EmitContext` 暴露给 `MInst::emit`）
 
-- `OperandConstraint::FixedReg`：`taki_mir/src/reg_alloc/reg.rs:527`
-- `reg_fixed_def()` / `reg_fixed_def_at_start()`：`reg.rs:813-820, 835-841`
-- 调用返回值已用 fixed-def：`anon_armv8/src/instructions.rs:880-882`
-- `RetVal` 已验证"只约束寄存器、不输出机器码"的 pseudo 模式：
-  `instructions.rs:885, 1370`
-- Ion parallel-move 环解析：`taki_mir/src/reg_alloc/moves.rs:41-136`
-- Ion 用专用 scratch / 空闲寄存器 / 临时 spill slot 破环：
-  `taki_mir/src/reg_alloc/ion/moves.rs:759-864`
+```rust
+impl EmitContext for EmitBuffer {
+    fn put_inst(&mut self, text: String);                      // 普通 slot
+    fn put_branch(&mut self, prefix, inv_prefix, label, kind); // add_cond_branch 等价
+    fn put_uncond_branch(&mut self, prefix, label, kind);      // add_uncond_branch 等价
+}
+impl EmitBuffer {
+    pub fn bind_label(&mut self, id: LabelId);            // 内部调用 optimize_branches
+    pub fn optimize_branches(&mut self);                  // 四条规则移植
+    pub fn resolve(&mut self);                            // 范围检查 + veneer 松弛
+    pub fn finish(self) -> String;                        // 渲染文本（含别名解析）
+}
+```
 
-暂不采用 allocator 原生 entry live-in（`Function::entry_liveins`）的原因：
+#### 2.4.3 optimize_branches 四条规则移植（对照 buffer.rs 行号）
 
-- `compute_liveness` 明确拒绝 entry virtual live-in：`ion/liveranges.rs:355-362`
-- VCode verifier 明确拒绝 entry block parameter：`vcode.rs:767`
-- 无定义 live-in range 很难正确绑定 fixed requirement，`Use.slot` 假设约束
-  来源于真实指令 operand；spill/split 后缺少写入初始值的路径，有读未初始化
-  栈的风险。
-- Cranelift 本身也没有该通道，说明 pseudo 方案是成熟长期架构而非 workaround。
+- R1（`:1057`）：`resolve(target) == tail` → 弹出 BranchRec、截断 slot、
+  合并 `labels_at_tail` 与 `labels_at_this_branch` 回退（移植
+  `truncate_last_branch` `:892-996` 的标签簿记）；
+- R2（`:1137`）：无条件分支且 `labels_at_this_branch` 非空且
+  `resolve(target) != start` → 全部 `label_aliases[l] = target`（防环检查
+  保留，`:1170`）；
+- R3（`:1207`）：无条件分支接无条件分支 → 截断后者；
+- R4（`:1222`）：`cond(L2) + uncond(L3)` 且 `resolve(L2) == tail` →
+  截断 uncond、条件分支换 `inv_prefix`、`target = L3`；
+- `LABEL_LIST_THRESHOLD` 防二次方保护（`:1041`）保留。
+- 调用时机与 Cranelift 相同：`bind_label` 内 + 函数末尾。
 
-### M19：引入通用 Args Pseudo 表示 ✅（commit 9ea625b）
+#### 2.4.4 veneer 与范围松弛（比 Cranelift 更简单）
 
-已完成：`ArgPair`、`gen_args`、`take_args`、双后端 `MInst::Args` 及配套测试。
-详见提交记录，不再重复维护。
+- `LabelKind`（AArch64）与 `inst/mod.rs:2937` 对齐：
+  `Branch14`(±1MB, tbz)、`Branch19`(±1MB, b.cond/cbz)、`Branch26`(±128MB,
+  b/bl)；
+- **第一阶段**：所有分支按 `Branch19/26` 直接发射，不做 trampoline；
+- **第二阶段（resolve）**：slot 定长（4B）→ 精确计算每标签偏移；找出
+  超范围的条件分支；
+- **第三阶段**：超范围分支改发两指令形式（条件+无条件），veneer 插在
+  **分支自身之后**——分支是块终结符，之后必然是块边界，无 fallthrough
+  进入；若该分支已被优化成单条件且另一目标为 fallthrough，则先强制两指令
+  形式再插 veneer；
+- **第四阶段**：重算偏移，重复直至稳定（单调收敛，通常 1-2 轮）。此循环
+  替代 Cranelift 的 deadline/island 前瞻，定长指令下完全等价且更简单。
 
-### M20：将寄存器参数改为 Fixed Def ✅（commit c46dbe1）
+#### 2.4.5 发射集成改造点
 
-已完成：`gen_copy_arg_to_reg` 对寄存器参数只收集 `ArgPair`（栈参数保留
-incoming load）；`gen_arg_setup` 末尾 `take_args()` 使 `Args` 成为 entry 首条；
-删除 `reg_arg_spillslots` / `prealloc_reg_arg_spills` /
-`gen_store_reg_args_to_stack`。经验证：`add` 叶函数 frame 从 80B 降到 48B，
-ABI home-slot 往返全部消失（AArch64 + RISC-V）。剩余 `str/ldr` 来自前端
-`alloc/store/load` 参数模式（`FUNC_ARG_OPT_ENABLE=false`），属 M24 范畴。
-详见提交记录，不再重复维护。
+| 文件 | 改动 |
+|---|---|
+| `taki_mir/src/emit_buffer.rs`（M25 已建） | EmitBuffer 核心；M26 填 optimize_branches 四规则；M27 填 resolve 松弛 |
+| `taki_mir/src/vcode.rs` | `EmitContext` 新增 `end_inst/put_branch/put_uncond_branch`（M25 已完成）；`MachInst` trait 增加 veneer 生成接口（M27）；verify 断言 slot 粒度（M27） |
+| `taki_mir/src/emit.rs` | `write_function` 已改走 buffer（M25 完成）；M26 函数尾调 `optimize_branches`；M27 传 `-O` 开关给 resolve |
+| `anon_armv8/src/instructions.rs` | 分支 MInst 已改 Branch slot、`1f` hack 已删（M25 完成）；M27 `Cbz/Tbz` veneer 前缀接入 |
+| `anon_armv8/src/labels.rs` | `Label::block()` 访问器（M25 完成） |
+| `anon_armv8/src/lower.rs` | 可选：`CmpImm(0)+CondBr{Ne}` 兜底（`:860-870`）在 slot 层识别为 `cbz` |
+| `uika_riscv/src/instructions.rs` | `CondBr` 改为 slot（`beqz/bnez` 倒相）；veneer 用 `la t6,X; jr t6`（B-type ±4KB / JAL ±1MB） |
+| `taki_mir/src/stats.rs` | `BranchOptStats`：`fallthrough_removed / branches_inverted / labels_threaded / dead_jumps_removed / veneers_inserted`（沿用 DCE 统计模式） |
 
-### M21：Post-RA Pseudo 语义与调度集成 ✅（commit d152203）
+#### 2.4.6 顺带收益（同构改造附带解决）
 
-已完成：`Args` 建模为 `defs + SchedClass::Nop + 0 latency/resource/emitted
-ops + 非 barrier`；`RetVal` 由 `Alu` 校正为 `Nop`；`schedule()` 与
-`estimate_cycles()` 将 Nop 类指令视为零周期（不占 issue slot、不消耗 cycle、
-不污染 dual-issue/single-issue 统计）。详见提交记录，不再重复维护。
+- 35 条真死跳转（`b next_block`）→ R1 消除；
+- 空 edge block（RA 未插入 move）→ R2 别名自动吞噬，无需 MIR 层空块删除
+  pass；
+- RISC-V 的 5 指令 `CondBr` 降为 1-2 条（`beqz/bnez` + 必要时 veneer）；
+- 后续可基于 slot 层做更多分支窥视（cbz 融合、反向条件选择等）。
 
-### M22：验证 Parallel Copy 与真实 Spill ✅（commit 92ddd8a）
+### 2.5 关键不变量
 
-已完成：Ion `TestFunction` 增加 clobber 支持；新增 5 项 RA 门禁——同寄存器
-fixed-def 无 move、重分配只出 reg-reg move 不 spill、Int/Float 参数交换环由
-parallel-move 破环、跨全寄存器 clobber 的真实 spill（`num_spillslots` 而非
-home slot）、普通 use 后进入 fixed call argument。测试过程中将测试 env 的
-专用 scratch 调整为保留寄存器（与 AArch64/RISC-V 一致），避免与 parallel-move
-端点冲突。详见提交记录，不再重复维护。
+1. 每个 slot 恰好对应一条 4 字节指令（`MInst::emit` 发射多个 slot 时，
+   verify 断言 slot 数 == 指令数）。
+2. `latest_branches` 尾部连续、按偏移升序、无重叠（同 buffer.rs:110-122）。
+3. `labels_at_tail` 精确且完备；`labels_at_this_branch` 完整记录绑定在
+   分支起始处的标签。
+4. 标签别名不得成环（`resolve` 跟随链时防环检查）。
+5. 截断只发生在缓冲尾部；块内指令顺序不变（ListScheduler 不受影响）。
+6. veneer 只插在无 fallthrough 的位置（分支之后）；被 R1 消除的分支不得
+   残留 veneer 需求。
+7. 发射前所有分支目标均在对应 `LabelKind` 范围内。
+8. 输出确定性：同输入、同 flag 组合，5 次 byte-identical。
+9. 优化规则只在 `-O1/-O2` 开启；`-O0` 走等价两指令形式，作为 on/off
+   差分回归基线。
+10. AArch64 与 RISC-V 共用 EmitBuffer，行为一致；RISC-V 不受 AArch64
+    配置开关影响。
 
-### M23：ABI 与跨后端回归验证 ✅（commit 2e058c9）
+### 2.6 里程碑（M26-M29）
 
-已完成：`soyo_compiler/src/abi_matrix.rs` 新增 14 个 ABI 矩阵用例（0/1/8/9 参数、
-i32/f32/混合、未使用参数、跨普通 call、tail call、递归、本地 alloc、参数重赋值），
-AArch64 + RISC-V × `-O0/1/2` 全编译成功且 5 次 byte-identical；叶函数 `add`
-收敛为 `add w0, w0, w1; ret`（无 frame、无 str/ldr/sw/lw）；未使用参数不产生
-参数内存往返。QEMU differential 由 `tests/test.py` 在容器内执行（本地无交叉
-工具链）。详见提交记录，不再重复维护。
+每个 milestone 独立提交；完成后在 TODO.md 删除对应细节，只保留一行历史
+（同 M19-M24 惯例）。已定决策：EmitBuffer 放 `taki_mir` 通用层；范围策略
+采用"±1MB 内直跳、超范围才 veneer"；冷块沉底本期不做，仅在
+`BlockLoweringOrder` 预留 `is_cold()` 接口；M25 已完成并独立提交（可回退）。
 
-### M24：Frame 与性能门禁 ✅（commit 892c778）
+#### M26：optimize_branches 四规则
 
-已完成：`taki_mir/src/stats.rs` 新增 `AbiArgStats`（register_args_bound /
-unused_register_args_skipped / incoming_stack_args_loaded）与 `RegallocStats`
-（spill_slots / reg_to_reg / reg_to_stack / stack_to_reg edits），在
-`compile_with_config` 中填充；`CalleeABI` 记录参数绑定计数。验证：
-`add` 叶函数 `register_args_bound=2`、零 spill、零 move；`use_first` 死参数
-`unused_register_args_skipped=1`；huffman `_and`/`_xor`/`rotrN` 入口的
-`str/ldr` 全部消失。XCZU15EG 实机 microbenchmark 仍阻塞于硬件不可用。
-详见提交记录，不再重复维护。
+- 移植 R1-R4 + `LABEL_LIST_THRESHOLD` + 别名防环；`bind_label` 内与函数尾
+  调用。
+- `BranchOptStats` 统计接入 `compile_with_config`。
+- 验收：huffman-01 指令数 804 → ~750±10；专项单测覆盖 R1（fallthrough
+  消除）、R2（穿线链 + 防环 + 空 edge block 吞噬）、R3（双 uncond）、R4
+  （翻转后再翻转恢复）；`-O0` 与 `-O1` 差分正确。
 
-### 2.3 关键不变量
+#### M27：范围检查 + veneer 松弛
 
-以下不变量已在 M19-M24 中实现并由测试门禁持续校验：
+- `LabelKind`（Branch14/19/26）范围表；`resolve` 松弛循环；veneer 插入规则
+  （分支后、fallthrough 先强制两指令形式）。
+- `Cbz/Cbnz/Tbz/Tbnz` 接入 slot。
+- 验收：合成 >1MB 代码块用例验证 veneer 正确且松弛收敛（≤3 轮）；QEMU
+  差分（`tests/test.py`）通过；全 benchmark 编译成功无汇编器超范围报错。
 
-1. `Args` 必须是 entry block 第一条 pre-RA 指令。
-2. 每个活跃的 register argument 恰好有一个 fixed def。
-3. 未使用 register argument 不产生 `ArgPair`。
-4. stack argument 仍由真实 load 定义。
-5. `Args` 不输出机器码。
-6. `Args` 在 scheduler 模型中消耗 0 cycle、0 resource。
-7. fixed-def operand 的 register class 必须匹配 ABI preg。
-8. allocator 把参数分配到 ABI preg 时不得生成 move。
-9. 参数复制环必须由 parallel-move resolver 处理，禁止顺序裸 `mov`。
-10. 只有 Ion 真正 spill 时才分配 `spill_size`。
-11. ABI register arguments 不得增加 `stackslots_size`。
-12. caller、callee、tail-call 必须继续使用同一个 `ArgSlot` 布局。
+#### M28：RISC-V 适配
 
-### 2.4 预计文件范围
+- `CondBr` → `beqz/bnez` 倒相 slot；`LabelKind`：B-type ±4KB / JAL ±1MB；
+  veneer 用 `la t6,X; jr t6`。
+- `abi_matrix` AArch64 + RISC-V × `-O0/1/2` 全回归。
+- 验收：RISC-V 全部用例 5 次 byte-identical；小用例 asm 检查（h-1-01 等）
+  `CondBr` 收敛为 1 条 `beqz/bnez`；QEMU 差分通过。
 
-核心修改（全部完成）：
+#### M29：测试、门禁与收尾
 
-- `taki_mir/src/abi.rs`
-- `taki_mir/src/lower.rs`
-- `anon_armv8/src/instructions.rs`
-- `anon_armv8/src/abi.rs`
-- `anon_armv8/src/sched/dag.rs`
-- `uika_riscv/src/instructions.rs`
-- `uika_riscv/src/abi.rs`
+- 移植 Cranelift buffer 行为测试思路：fallthrough 消除、条件翻转、穿线链、
+  别名防环、超范围 veneer、截断后标签簿记。
+- 确定性门禁、on/off 差分、QEMU 语义差分纳入 `tests/`。
+- 性能差分表：全 `benchmarks/` 用例的 `.s` 指令数 vs clang（记录静态模型
+  改进，按 §1.3 原则不声称实机收益）。
+- TODO.md 收尾；文档记录设计决策与遗留项（冷块沉底、CmpImm+CondBr→cbz
+  融合）。
+
+### 2.7 预计文件范围
+
+核心修改：
+
+- `taki_mir/src/emit_buffer.rs`（M25 已建）
+- `taki_mir/src/emit.rs`（M25 已改）
+- `taki_mir/src/vcode.rs`（M25 已改）
+- `taki_mir/src/stats.rs`
+- `anon_armv8/src/instructions.rs`（M25 已改）
+- `anon_armv8/src/labels.rs`（M25 已改）
 
 机械适配：
 
-- `anon_armv8/src/passes/dce.rs`、`peephole_combine.rs`、`pair_combine.rs`
-- 其他对 `MInst` 做 exhaustive match 的位置
-- RISC-V 对应 match
+- 其他对 `MInst` 做 exhaustive match / `EmitContext` 实现的位置
+- `anon_armv8/src/passes/*`（DCE / PeepholeCombine / PairCombine 对 emit
+  无依赖，仅确认不改）
+- `uika_riscv/src/instructions.rs`、`uika_riscv/src/abi.rs`
 
 测试与统计：
 
-- `taki_mir/src/reg_alloc/moves.rs`
-- `taki_mir/src/reg_alloc/ion/mod.rs`（或专用测试模块）
-- `taki_mir/src/vcode.rs`
-- `taki_mir/src/stats.rs`
-- AArch64 / RISC-V ABI 测试
-- `tests/` functional cases、`benchmarks/`
+- `taki_mir/src/emit_buffer.rs` 内嵌单测（或专用测试模块）
+- `tests/` functional cases、`benchmarks/` 性能差分
+- `abi_matrix` 双 target 回归
 
-### 2.5 验收标准
+### 2.8 验收标准
 
-完成情况（本地静态验证）：
-
-- ✅ `cargo test --workspace` 全通过。
-- ⏳ AArch64 与 RISC-V differential correctness：QEMU 在容器内由
-  `tests/test.py` 执行，本地无交叉工具链，待硬件/Docker 环境运行。
-- ✅ 所有优化级别均不生成 ABI 参数 home-slot 往返。
-- ✅ huffman 中寄存器参数入口的 `str/ldr` 全部消失。
-- ✅ 纯叶算术函数 `add w0, w0, w1; ret`（无 frame、`stackslots_size == 0`）。
-- ✅ 参数交换环正确（Int/Float）。
-- ✅ 参数跨 call 和高压力 spill 正确。
-- ✅ stack arguments 和 tail calls 无回归（ABI 矩阵编译门禁）。
-- ✅ post-RA estimator 不为 `Args`/`RetVal` 计算虚假 cycle。
-- ✅ 汇编输出保持确定性（5 次 byte-identical）。
+- `cargo test --workspace` 全通过；AArch64 + RISC-V × `-O0/1/2` 编译成功且
+  5 次 byte-identical。
+- huffman-01 静态指令数 870 → ~750±10（-12%~-16%），热循环（`_and`/`_or`
+  每轮）少 2-3 条分支。
+- `.s` 输出中不再出现 `1f` 局部标号 trampoline；所有分支为直接
+  `b.cond`/`b`（超范围场景为 veneer 形式）。
+- QEMU differential 全通过（`tests/test.py`）。
+- 所有 benchmark 无汇编器"branch out of range"错误。
+- `BranchOptStats` 有统计值；`-O0` 与 `-O1` on/off 差分无行为差异。
 
 ---
 
@@ -286,10 +370,15 @@ DCE 是兜底；更优解是 lowering 时就不为未使用的 block param 和�
 常量与 `mov wzr`。DCE 落地后统计 `instructions_removed` 的构成，若某类来源
 占主导，直接在 `taki_mir/src/lower.rs` 或 `anon_armv8/src/lower.rs` 消除源头。
 
-### P1：双重分支化简
+### P1：短路 `&&`/`||` 的 flags 融合（ccmp / merge-phi 分支折叠）
 
-`cmp; b.eq 1f; b target; 1: b other` 可化简为单条条件分支，每个分支点省
-1 条指令和 1 个前端槽。需处理 long-jump 形式的跳转范围约束。
+`_and`/`_or`/`_xor` 热循环体内 `cset → cmp → b` 的 bool 物化链（每 bit
+迭代 ~20 条 vs clang 的 `ccmp`+`csel` 13 条）。根因：IR 里 `&&` 是
+`zext i1→i32` + `icmp ne ...,0` + 汇聚 phi（`phi [0],[zext]`），
+`select_branch_condition`（`anon_armv8/src/lower.rs:951`）只处理单一比较的
+直线形式。候选方向：扩展 lowering 识别 merge-phi 形式在 predecessor 上按
+flags 直接分支；或新增 `ccmp` 融合。与 M25-M29 的 EmitBuffer 无依赖，
+可并行设计。
 
 ### P2：phi 拷贝 coalescing
 
@@ -298,8 +387,7 @@ DCE 是兜底；更优解是 lowering 时就不为未使用的 block param 和�
 ### P2：跨块 / 全局调度
 
 块内调度对被 call 切碎的热点无能为力。候选方向：循环不变 load 外提
-（`adrp+add+ldr gv_*` 全局量地址重算）、跨块 hoist。属大改动，M19-M24 已完成，
-待重新评估收益空间。
+（`adrp+add+ldr gv_*` 全局量地址重算）、跨块 hoist。属大改动。
 
 ### P2：调度验证器闭环
 
@@ -321,14 +409,21 @@ DCE 是兜底；更优解是 lowering 时就不为未使用的 block param 和�
 - post-RA register-pressure tie-break。
 - pre-RA scheduler（需先证明 post-RA false dependency 是主要 ILP 限制）。
 
+### P2：冷块沉底与布局
+
+Cranelift `BlockLoweringOrder` 的 `cold_blocks` 机制（`blockorder.rs:87-90,
+260-265`）把冷块沉到函数末尾；配合 M25-M29 的 EmitBuffer，冷块天然获得
+fallthrough 收益。SysY 前端暂无冷热信息，本期仅在 `BlockLoweringOrder`
+预留 `is_cold()` 接口。
+
 ### P3：XCZU15EG 实机校准（依赖硬件访问）
 
 - 运行 `benchmarks/src/bench.c`，校准 latency / throughput / pairing 数据。
 - 基于实测调整 guide-derived profile 值。
 - 建立性能回归门禁。
 - 回答：WAR/WAW/NZCV false dependency 是否允许 A53 同周期双发。
-- 用 M24 的参数入口 microbenchmark 量化 `Args` 改造的实际收益（M19-M24
-  已完成，入口 str/ldr 已消除，实机数字待测）。
+- 用 M19-M24 的参数入口 microbenchmark 与 M25-M29 的 huffman 差分量化
+  实际收益（实机数字待测）。
 
 ---
 
@@ -340,8 +435,9 @@ DCE 是兜底；更优解是 lowering 时就不为未使用的 block param 和�
 3. 所有 AArch64 改动必须同时验证 RISC-V 不受影响。
 4. 新 pass 默认走"白名单 + 保守保留"策略，宁漏勿错。
 5. 未获得实机数据前，只能声称"静态模型改进"。
-6. ABI/codegen 架构改动（M19-M24）不由优化 flag 控制，任何优化级别都必须
-   保持正确。
+6. ABI/codegen 架构改动（M19-M24、M25-M29）不由优化 flag 控制，任何优化
+   级别都必须保持正确；分支优化规则本身由 `-O` 控制。
+7. 发射层改造以行为等价为第一优先级，优化规则在等价基线上逐步开启。
 
 ---
 
@@ -349,17 +445,14 @@ DCE 是兜底；更优解是 lowering 时就不为未使用的 block param 和�
 
 | 风险 | 严重度 | 缓解措施 |
 |------|--------|---------|
+| 别名链成环 / 截断后标签簿记错误 | 高 | 完整移植 Cranelift 不变量（`labels_at_tail` 精确完备、`truncate_last_branch` 簿记）；专项单测；on/off 差分 |
+| 多指令 MInst（movz+movk、adrp+add、cmp+csel）slot 化破坏"每 slot 4B"假设 | 中 | slot 粒度 = 单条指令，`emit` 顺序写多个 slot；verify 断言发射 slot 数 == 指令数 |
+| veneer 插入改变偏移导致松弛不收敛 | 中 | 单调性（只增不减）+ 最大迭代上限（≤3 轮）+ 每轮全量范围断言 |
+| 分支优化与 post-RA ListScheduler 交互 | 低 | 调度在 vcode 层（块内），EmitBuffer 只在块边界截断，块内顺序不变 |
+| 汇编器对超范围分支报错 | 低 | `resolve` 保证发射前所有分支在范围内；veneer 全覆盖 |
+| RISC-V B-type ±4KB 范围触发大量 veneer | 低 | veneer 仅在超范围时触发，`la+jr` 4 条/veneer |
 | DCE 误删有隐式副作用的指令（flags、内存、call） | 高 | 白名单制；无 def 指令一律跳过；全量功能回归；on/off 差分 |
-| dead load 删除改变 trap 行为 | 低 | SysY 语义下 load 地址必合法；如未来支持 volatile 需加例外 |
-| DCE 破坏 SSA / operand 不变式 | 中 | `Removed` tombstone 沿用 M13 先例；pipeline 既有 verify 钩子 |
 | 缺失 register/NZCV/memory 依赖导致调度误编译 | 高 | 保守 catch-all barrier、on/off 差分、`verify_sched_deps`（待做） |
-| `Args` fixed-def 与后续分配冲突导致参数值丢失 | 高 | M22 专项覆盖同寄存器/重分配/交换环/跨 call/高压力 spill；parallel-move resolver 验证 |
-| entry 参数 spill/split 后初值未写回，读到未初始化栈 | 高 | 只绑定 fixed-def 到真实 operand 的 range/bundle；不引入 allocator 原生 live-in；M22 spill 专项 |
-| `Args`/`RetVal` 被 estimator 计为真实 ALU，污染模型 | 中 | `SchedClass::Nop` + 显式 emitted ops 0；M21 校正 |
-| VCode 逆序构建下 `Args` 未排到函数体最前 | 中 | 对 `finish_ir_inst` 规则写显式顺序测试；post-lowering verify |
-| 改造破坏 RISC-V 或 tail-call | 中 | M23 双 target + tail-call 矩阵；`ArgSlot` 布局不变 |
-| `i32` 参数按 64 位拷贝（edit 用 I64）高 32 位未定义 | 低 | AAPCS 下消费端用 Size32 指令，低 32 位语义安全；M22 覆盖 w/x 混合 |
-| slot/resource 模型错误导致硬件回归 | 高 | 模型内防退化仅作辅助，实机 gate 为准 |
-| AArch64 配置改动破坏 RISC-V | 中 | 双 target 测试、RISC-V 拒绝 MIR flag |
+| 发射层改造破坏 RISC-V 或 tail-call | 中 | M28 双 target + tail-call 矩阵回归；`ArgSlot` 布局不变 |
 | QEMU wall time 被误用为 A53 性能数据 | 中 | QEMU 仅进入 correctness gate |
 | 实机环境频率/温度噪声掩盖结果 | 中 | core pinning、paired samples、95% CI、环境元数据 |

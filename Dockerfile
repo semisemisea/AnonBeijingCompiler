@@ -1,4 +1,4 @@
-FROM ubuntu:24.04
+FROM ghcr.io/gem5/ubuntu-24.04_all-dependencies
 
 ENV DEBIAN_FRONTEND=noninteractive
 

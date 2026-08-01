@@ -132,6 +132,114 @@ def combined_output(stdout, returncode):
     return stdout + f"{returncode}\n".encode()
 
 
+GEM5_BIN = Path(os.environ.get("SOYO_GEM5", "/work/gem5/build/ARM/gem5.opt"))
+GEM5_CONFIG = Path(
+    os.environ.get("SOYO_GEM5_CONFIG", "/work/gem5-config/a53_se.py")
+)
+
+
+def read_stats_table(path):
+    if not path.exists():
+        return None
+    stats = {}
+    for line in path.read_text().splitlines():
+        key, sep, rest = line.partition(" ")
+        if sep and rest.strip():
+            stats[key] = rest.split()[0]
+    return stats
+
+
+def fmt_count(value):
+    try:
+        v = int(float(value))
+    except ValueError:
+        return value
+    if v >= 1e9:
+        return f"{v / 1e9:.2f}G"
+    if v >= 1e6:
+        return f"{v / 1e6:.2f}M"
+    if v >= 1e3:
+        return f"{v / 1e3:.2f}K"
+    return str(v)
+
+
+def miss_rate(stats, path):
+    hits = stats.get(path + ".overallHits::total")
+    misses = stats.get(path + ".overallMisses::total")
+    if hits is None or misses is None:
+        return None
+    total = int(hits) + int(misses)
+    if total == 0:
+        return 0.0
+    return 100.0 * int(misses) / total
+
+
+# With a single CPU the stat group is system.cpu.* rather than system.cpu0.*,
+# so try both prefixes.
+CPU_STAT_BASES = ("system.cpu0.", "system.cpu.")
+
+
+def summarize_gem5(elf, stats_dir):
+    stats = read_stats_table(stats_dir / "stats.txt")
+    if stats is None:
+        return "gem5: no stats.txt produced"
+    lines = []
+
+    cpi = next(
+        (stats[k] for k in (base + "cpi" for base in CPU_STAT_BASES) if k in stats),
+        None,
+    )
+    parts = []
+    if stats.get("simSeconds"):
+        parts.append(f"sim {stats['simSeconds']}s")
+    if stats.get("simInsts"):
+        parts.append(f"{fmt_count(stats['simInsts'])} inst")
+    if cpi:
+        parts.append(f"CPI {cpi}")
+    if stats.get("hostSeconds"):
+        parts.append(f"(host {stats['hostSeconds']}s)")
+    lines.append("gem5: " + " ".join(parts))
+
+    rates = []
+    for label, cache in (("L1I", "icache"), ("L1D", "dcache"), ("L2", None)):
+        if cache is None:
+            path = "system.l2"
+        else:
+            path = next(
+                (base + cache for base in CPU_STAT_BASES if base + cache + ".overallHits::total" in stats),
+                None,
+            )
+        rate = miss_rate(stats, path) if path else None
+        if rate is not None:
+            rates.append(f"{label} {rate:.2f}% miss")
+    if rates:
+        lines.append("gem5: " + " | ".join(rates))
+    lines.append(f"gem5: stats in {stats_dir.relative_to(RESULTS_ROOT)}")
+    return "\n".join(lines)
+
+
+def run_under_gem5(elf, stdin_file, out_dir, timeout):
+    stats_dir = out_dir / (elf.stem + ".gem5-stats")
+    stats_dir.mkdir(parents=True, exist_ok=True)
+    program_stdout = out_dir / (elf.stem + ".gem5.stdout")
+    program_exit = stats_dir / "exitcode"
+    cmd = [
+        str(GEM5_BIN),
+        f"--outdir={stats_dir}",
+        str(GEM5_CONFIG),
+        str(elf),
+        f"--output={program_stdout}",
+        f"--exitcode={program_exit}",
+    ]
+    if stdin_file is not None:
+        cmd.append(f"--input={stdin_file.name}")
+    cmd.extend(os.environ.get("SOYO_GEM5_EXTRA", "").split())
+    proc = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout
+    )
+    return proc, summarize_gem5(elf, stats_dir)
+
+
 def write_process_output(proc, stdout_path, stderr_path, returncode_path):
     stdout_path.write_bytes(proc.stdout or b"")
     stderr_path.write_bytes(proc.stderr or b"")
@@ -151,6 +259,14 @@ def remaining_timeout(start):
     return remaining
 
 
+def step_timeout(runner, start):
+    """gem5 simulations legitimately run for far longer than the qemu limit,
+    so disable the per-test timeout when running under gem5."""
+    if runner == "gem5":
+        return None
+    return remaining_timeout(start)
+
+
 def copy_testcase_files(src, out_dir):
     src_rel = rel_test(src)
     dst_base = (out_dir / src_rel).with_suffix("")
@@ -160,13 +276,13 @@ def copy_testcase_files(src, out_dir):
             shutil.copy2(path, dst_base.with_suffix(path.suffix))
 
 
-def run_test(src, out_dir, opt_level, compiler, backend, target, baseline):
+def run_test(src, out_dir, opt_level, compiler, backend, target, baseline, runner):
     start = time.perf_counter()
     src_rel = rel_test(src)
     arch_config = TARGET_CONFIG[target]
     sysylib = ROOT / "sysylib" / arch_config["sysylib"]
     if str(src_rel) in SKIP_TESTS:
-        return None, "SKIP", "skipped (missing input)"
+        return None, "SKIP", "skipped (missing input)", ""
     base = src.with_suffix("")
     copy_testcase_files(src, out_dir)
 
@@ -226,7 +342,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline):
             compile_args,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=remaining_timeout(start),
+            timeout=step_timeout(runner, start),
         )
     except subprocess.TimeoutExpired as err:
         write_timeout_output(err, compile_stdout, compile_stderr, compile_returncode)
@@ -234,6 +350,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline):
             None,
             " TLE",
             f"compile timeout after {TEST_TIMEOUT}s",
+            "",
         )
     write_process_output(
         compile_proc, compile_stdout, compile_stderr, compile_returncode
@@ -248,6 +365,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline):
             None,
             " CE ",
             f"exit {compile_proc.returncode}\n{output or '(no output)'}",
+            "",
         )
 
     if not baseline:
@@ -261,17 +379,18 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline):
                 ir_args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=remaining_timeout(start),
+                timeout=step_timeout(runner, start),
             )
         except subprocess.TimeoutExpired as err:
             write_timeout_output(err, compile_stdout, compile_stderr, compile_returncode)
-            return None, " TLE", f"ir timeout after {TEST_TIMEOUT}s"
+            return None, " TLE", f"ir timeout after {TEST_TIMEOUT}s", ""
         if ir_proc.returncode:
             output = (ir_proc.stdout + ir_proc.stderr).decode("utf-8", "replace").strip()
             return (
                 None,
                 " CE ",
                 f"ir exit {ir_proc.returncode}\n{output or '(no output)'}",
+                "",
             )
 
     # LLVM backend: lower .ll to .o via llc before linking
@@ -289,7 +408,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline):
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=remaining_timeout(start),
+                timeout=step_timeout(runner, start),
             )
         except subprocess.TimeoutExpired as err:
             write_timeout_output(
@@ -299,6 +418,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline):
                 None,
                 " TLE",
                 f"llc timeout after {TEST_TIMEOUT}s",
+                "",
             )
         if llc_proc.returncode:
             output = (
@@ -311,6 +431,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline):
                 None,
                 " CE ",
                 f"llc exit {llc_proc.returncode}\n{output or '(no output)'}",
+                "",
             )
         link_input = str(obj)
     else:
@@ -333,7 +454,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline):
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=remaining_timeout(start),
+            timeout=step_timeout(runner, start),
         )
     except subprocess.TimeoutExpired as err:
         write_timeout_output(err, runtime_stdout, runtime_stderr, runtime_returncode)
@@ -350,20 +471,27 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline):
             None,
             " RE ",
             f"link exit {link_proc.returncode}\n{link_proc.stderr.decode('utf-8', 'replace').strip() or '(no output)'}",
+            "",
         )
 
     stdin = base.with_suffix(".in")
     stdin_file = stdin.open("rb") if stdin.exists() else None
     runtime_start = time.perf_counter()
+    gem5_summary = ""
     try:
         try:
-            run_proc = subprocess.run(
-                [arch_config["qemu"], str(elf)],
-                stdin=stdin_file,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=remaining_timeout(start),
-            )
+            if runner == "gem5":
+                run_proc, gem5_summary = run_under_gem5(
+                    elf, stdin_file, out_dir, step_timeout(runner, start)
+                )
+            else:
+                run_proc = subprocess.run(
+                    [arch_config["qemu"], str(elf)],
+                    stdin=stdin_file,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=step_timeout(runner, start),
+                )
         except subprocess.TimeoutExpired as err:
             write_timeout_output(
                 err, runtime_stdout, runtime_stderr, runtime_returncode
@@ -372,16 +500,24 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline):
                 time.perf_counter() - runtime_start,
                 " TLE",
                 f"runtime timeout after {TEST_TIMEOUT}s",
+                gem5_summary,
             )
     finally:
         if stdin_file is not None:
             stdin_file.close()
 
     write_process_output(run_proc, runtime_stdout, runtime_stderr, runtime_returncode)
-    actual = combined_output(run_proc.stdout, run_proc.returncode)
+    if runner == "gem5":
+        gem5_stdout = out_dir / (elf.stem + ".gem5.stdout")
+        stdout_data = gem5_stdout.read_bytes() if gem5_stdout.exists() else b""
+        gem5_exit = out_dir / (elf.stem + ".gem5-stats") / "exitcode"
+        exit_code = int(gem5_exit.read_text().strip()) if gem5_exit.exists() else -1
+        actual = combined_output(stdout_data, exit_code)
+    else:
+        actual = combined_output(run_proc.stdout, run_proc.returncode)
     status, msg = compare_output(actual, base.with_suffix(".out"), run_proc.stderr)
     if status == "PASS":
-        return time.perf_counter() - runtime_start, status, msg
+        return time.perf_counter() - runtime_start, status, msg, gem5_summary
 
     if run_proc.returncode != 0 and run_proc.stderr.strip():
         output = (run_proc.stdout + run_proc.stderr).decode("utf-8", "replace").strip()
@@ -389,9 +525,10 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline):
             time.perf_counter() - runtime_start,
             " RE ",
             f"exit {run_proc.returncode}\n{output or '(no output)'}",
+            gem5_summary,
         )
 
-    return time.perf_counter() - runtime_start, status, msg
+    return time.perf_counter() - runtime_start, status, msg, gem5_summary
 
 
 def parse_args(argv):
@@ -433,6 +570,12 @@ def parse_args(argv):
         help="compile test cases with the container clang",
     )
     parser.add_argument(
+        "--runner",
+        choices=["qemu", "gem5"],
+        default="qemu",
+        help="runtime used to execute ELFs (default: qemu)",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="show test case output details",
@@ -452,13 +595,15 @@ def parse_args(argv):
     return args
 
 
-def check_mounts(compiler, target, baseline):
+def check_mounts(compiler, target, baseline, runner):
     arch_config = TARGET_CONFIG[target]
     sysylib = ROOT / "sysylib" / arch_config["sysylib"]
     missing = []
     paths = (TESTS_ROOT, RESULTS_ROOT, sysylib)
     if not baseline:
         paths += (compiler,)
+    if runner == "gem5":
+        paths += (GEM5_BIN, GEM5_CONFIG)
     for path in paths:
         if not path.exists():
             missing.append(str(path))
@@ -472,7 +617,7 @@ def check_mounts(compiler, target, baseline):
 
 def run_tests(args):
     compiler = args.compiler.resolve()
-    if not check_mounts(compiler, args.target, args.baseline):
+    if not check_mounts(compiler, args.target, args.baseline, args.runner):
         return 1
 
     try:
@@ -541,13 +686,14 @@ def run_tests(args):
                 args.backend,
                 args.target,
                 args.baseline,
+                args.runner,
             ): src
             for src in files
         }
         set_status(0, rel_test(files[0]))
         for done, future in enumerate(as_completed(futures), 1):
             src = futures[future]
-            elapsed, status, msg = future.result()
+            elapsed, status, msg, gem5_summary = future.result()
             path = rel_test(src)
             if elapsed is not None:
                 timings.append((elapsed, path))
@@ -562,6 +708,9 @@ def run_tests(args):
                 f"{paint(str(path), 'dim')}",
                 running is not None,
             )
+            if gem5_summary:
+                for line in gem5_summary.splitlines():
+                    log(f"  {line}", running is not None)
             if status != "PASS" and args.verbose:
                 for line in msg.splitlines():
                     log(f"  {line}", running is not None)

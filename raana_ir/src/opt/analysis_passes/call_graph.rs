@@ -40,7 +40,7 @@ impl CallEdgeTable {
 impl CallGraph {
     /// Return all the callees of a function
     /// a.k.a all the functions that would be called inside the given function
-    pub fn callees_of(&self, func: Function) -> impl Iterator<Item = Function> + '_ {
+    pub fn callees_in(&self, func: Function) -> impl Iterator<Item = Function> + '_ {
         self.call_site_indices
             .get(&func)
             .into_iter()
@@ -50,7 +50,7 @@ impl CallGraph {
 
     /// Return all the callsites of a function
     /// a.k.a all the instruction of `InstKind::Call` inside the given function
-    pub fn callsites_of(&self, func: Function) -> impl Iterator<Item = Node> + '_ {
+    pub fn callsites_in(&self, func: Function) -> impl Iterator<Item = Node> + '_ {
         self.call_site_indices
             .get(&func)
             .into_iter()
@@ -60,7 +60,7 @@ impl CallGraph {
 
     /// Return all the callsites that call the given function.
     /// a.k.a all the call instruction which callee is given function.
-    pub fn be_called_at(&self, func: Function) -> impl Iterator<Item = Node> + '_ {
+    pub fn incoming_callsites_of(&self, func: Function) -> impl Iterator<Item = Node> + '_ {
         self.callee_indices
             .get(&func)
             .into_iter()
@@ -82,6 +82,10 @@ impl CallGraph {
             .map(|(&func, indices)| (func, indices.len()))
     }
 
+    pub fn callees(&self) -> impl Iterator<Item = Function> {
+        self.callee_indices.keys().copied()
+    }
+
     pub fn in_degrees_of_all(&self) -> impl Iterator<Item = (Function, usize)> {
         self.callee_indices
             .iter()
@@ -92,7 +96,7 @@ impl CallGraph {
         let mut queue = VecDeque::from([from]);
         let mut visited = HashSet::from([from]);
         while let Some(function) = queue.pop_front() {
-            for callee in self.callees_of(function) {
+            for callee in self.callees_in(function) {
                 if callee == target {
                     return true;
                 }

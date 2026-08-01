@@ -1,431 +1,707 @@
-//! Loop-invariant code motion (LICM).
-//!
-//! Hoists pure invariant instructions (arithmetic, logical, comparisons,
-//! casts) out of natural loops into the preheader. Deliberately conservative
-//! (`宁漏勿错`): only single-preheader loops whose header dominates the back
-//! edge are considered, and only instructions with provably invariant
-//! operands move. Block parameters are treated as invariant only when every
-//! incoming edge passes the same instruction.
-//!
-//! After GSP the loop-carried global loads are already SSA values, so the
-//! remaining hoist candidates are pure expressions over loop-invariant
-//! operands (clang's `elaborate_licm_hoist` equivalent).
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::opt::{
+    analysis_passes::{dom_tree::v2::DominanceTree, loop_analysis::Loop},
+    prelude::*,
+    utils::{
+        cfg::CFG,
+        preheader::{EnsurePreheader, ensure_preheader},
+    },
+};
 
-use crate::ir::inst_kind;
-use crate::opt::prelude::*;
+/// Loop invariant code motion
+pub struct LICM;
 
-pub struct Licm;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lattice {
+    Variant,
+    Invariant,
+}
 
-impl Pass for Licm {
-    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
-        if data.layout().entry_bb().is_none() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopResult {
+    Unchanged,
+    Changed,
+    CfgChanged,
+}
+
+impl LICM {
+    fn solve(
+        looop: &Loop,
+        data: &mut ArenaContextMut<'_>,
+        cfg: &CFG,
+        dom_tree: &DominanceTree,
+    ) -> LoopResult {
+        fn insts(looop: &Loop, data: &ArenaContextMut<'_>) -> impl Iterator<Item = Inst> {
+            looop
+                .body()
+                .iter()
+                .flat_map(|&bb| data.layout().basicblock(bb).insts())
+                .copied()
+        }
+
+        fn can_be_invariant(kind: &InstKind) -> bool {
+            matches!(
+                kind,
+                InstKind::Integer(..)
+                    | InstKind::Float(..)
+                    | InstKind::Binary(..)
+                    | InstKind::Cast(..)
+                    | InstKind::GetElemPtr(..)
+                    | InstKind::Select(..)
+            )
+        }
+
+        fn is_integer_zero(data: &ArenaContextMut<'_>, inst: Inst) -> bool {
+            matches!(data.inst_data(inst).kind(), InstKind::Integer(value) if value.value() == 0)
+        }
+
+        let loop_params = looop
+            .body()
+            .iter()
+            .flat_map(|&block| data.bb_data(block).params().iter().copied())
+            .collect::<FxHashSet<_>>();
+        let loop_insts = insts(looop, data).collect::<Vec<_>>();
+        let mut map = loop_insts
+            .iter()
+            .copied()
+            .map(|inst| (inst, Lattice::Variant))
+            .collect::<FxHashMap<_, _>>();
+
+        let operand_is_invariant = |operand: Inst, states: &FxHashMap<Inst, Lattice>| {
+            if operand.is_global() || data.inst_data(operand).kind().is_const() {
+                return true;
+            }
+            if loop_params.contains(&operand) {
+                return false;
+            }
+            match data.layout().parent_bb(operand) {
+                Some(block) if looop.contains(block) => {
+                    states.get(&operand) == Some(&Lattice::Invariant)
+                }
+                Some(block) => dom_tree.dominates(block, looop.header()),
+                None if matches!(data.inst_data(operand).kind(), InstKind::BlockArgRef(..)) => cfg
+                    .blocks()
+                    .iter()
+                    .copied()
+                    .find(|&block| data.bb_data(block).params().contains(&operand))
+                    .is_some_and(|block| dom_tree.dominates(block, looop.header())),
+                None => false,
+            }
+        };
+
+        let mut invariant_order = vec![];
+        let mut worklist = VecDeque::from_iter(loop_insts.iter().copied());
+        while let Some(inst) = worklist.pop_front() {
+            let inst_data = data.inst_data(inst);
+            let status = if can_be_invariant(inst_data.kind())
+                && inst_data
+                    .inst_usage()
+                    .all(|operand| operand_is_invariant(operand, &map))
+            {
+                Lattice::Invariant
+            } else {
+                Lattice::Variant
+            };
+            let orig = map
+                .insert(inst, status)
+                .expect("loop instruction was initialized");
+            if orig != status {
+                invariant_order.push(inst);
+                worklist.extend(data.inst_data(inst).used_by().iter().filter_map(|&user| {
+                    data.layout()
+                        .parent_bb(user)
+                        .filter(|&block| looop.contains(block))
+                        .map(|_| user)
+                }));
+            }
+        }
+
+        let partial_geps = loop_insts
+            .into_iter()
+            .filter_map(|inst| {
+                if map.get(&inst) == Some(&Lattice::Invariant) {
+                    return None;
+                }
+                let InstKind::GetElemPtr(gep) = data.inst_data(inst).kind() else {
+                    return None;
+                };
+                if !operand_is_invariant(gep.base(), &map) {
+                    return None;
+                }
+                let prefix_len = gep
+                    .offsets()
+                    .iter()
+                    .take_while(|&&offset| operand_is_invariant(offset, &map))
+                    .count();
+                if prefix_len == 0 || prefix_len == gep.offsets().len() {
+                    return None;
+                }
+                if prefix_len == 1 && is_integer_zero(data, gep.offsets()[0]) {
+                    return None;
+                }
+                Some((
+                    inst,
+                    gep.base(),
+                    gep.offsets()[..prefix_len].to_vec(),
+                    gep.offsets()[prefix_len..].to_vec(),
+                    data.inst_data(inst).ty().clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        let has_invariant_insts = invariant_order
+            .iter()
+            .any(|&inst| !data.inst_data(inst).kind().is_const());
+        if !has_invariant_insts && partial_geps.is_empty() {
+            return LoopResult::Unchanged;
+        }
+
+        let Some(preheader) = ensure_preheader(data, cfg, looop) else {
+            return LoopResult::Unchanged;
+        };
+        let preheader = match preheader {
+            EnsurePreheader::Existing(preheader) => preheader,
+            EnsurePreheader::Created(..) => return LoopResult::CfgChanged,
+        };
+
+        let mut changed = false;
+        for inst in invariant_order {
+            let inst_data = data.inst_data(inst);
+            if inst_data.kind().is_const() {
+                continue;
+            }
+            changed = true;
+            let bb = data
+                .layout()
+                .parent_bb(inst)
+                .expect("invariant inst must be in the layout, constants is excluded");
+            data.layout_mut().remove_inst(bb, inst);
+            data.layout_mut().insert_before_terminator(preheader, inst);
+        }
+
+        for (inst, base, prefix_offsets, remaining_offsets, original_ty) in partial_geps {
+            let prefix = data.new_local_value().get_elem_ptr(base, prefix_offsets);
+            data.layout_mut()
+                .insert_before_terminator(preheader, prefix);
+
+            let zero = data.new_local_value().integer(0);
+            let mut suffix_offsets = Vec::with_capacity(remaining_offsets.len() + 1);
+            suffix_offsets.push(zero);
+            suffix_offsets.extend(remaining_offsets);
+            data.replace_inst_with(inst)
+                .get_elem_ptr(prefix, suffix_offsets);
+            assert_eq!(
+                data.inst_data(inst).ty(),
+                &original_ty,
+                "splitting GEP must preserve its result type"
+            );
+            changed = true;
+        }
+
+        if changed {
+            LoopResult::Changed
+        } else {
+            LoopResult::Unchanged
+        }
+    }
+}
+
+impl Pass for LICM {
+    fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
+        if data.layout().is_decl() {
             return false;
         }
         let mut changed = false;
-        let mut bb_id = utils::IDAllocator::new(1);
-        let (graph, prece) = cfg::build_cfg_both(data, &mut bb_id);
-        let rpo_path = cfg::rpo_path(&graph);
-        let idom_map = dom_tree::idom(&prece, &rpo_path);
-        let dominators = dom_tree::build_dominance_tree(&idom_map, rpo_path.len());
+        loop {
+            let (cfg, dom_tree, loop_analysis) = loop_analysis::LoopAnalysis::new(data);
+            let mut rebuild = false;
 
-        // Natural loop discovery: back edges (M -> H with H dominating M).
-        // `prece[h]` lists H's predecessors, so the edge M->H is a back
-        // edge exactly when H dominates M.
-        let mut back_edges: Vec<(usize, usize)> = Vec::new();
-        for h in 0..bb_id.cnt() {
-            if let Some(preds) = prece.get(&h) {
-                for &m in preds {
-                    if m != h && dominates(h, m, &dominators) {
-                        back_edges.push((m, h));
+            // Loops are ordered from small to big. This lets an instruction
+            // hoisted from an inner loop be considered by its outer loop.
+            for looop in loop_analysis.loops() {
+                match Self::solve(looop, data, &cfg, &dom_tree) {
+                    LoopResult::Unchanged => {}
+                    LoopResult::Changed => changed = true,
+                    LoopResult::CfgChanged => {
+                        changed = true;
+                        rebuild = true;
+                        break;
                     }
                 }
             }
-        }
 
-        for (m, h) in back_edges {
-            let loop_blocks = loop_body(&graph, &prece, m, h, &dominators);
-            let Some(preheader) = preheader(data, &bb_id, &graph, &prece, h, &loop_blocks) else {
-                continue;
-            };
-            if hoist_loop(data, &bb_id, &graph, &prece, h, &loop_blocks, preheader, &dominators) {
-                changed = true;
-            }
-        }
-        changed
-    }
-}
-
-/// Whether `h` dominates `m`, by walking `m`'s idom chain (idom stored as
-/// the parent in the dominator tree).
-fn dominates(h: usize, m: usize, tree: &DomTree) -> bool {
-    let mut runner = m;
-    loop {
-        if runner == h {
-            return true;
-        }
-        // tree[i] lists children; the parent must be recovered by search.
-        let parent = tree
-            .iter()
-            .enumerate()
-            .find(|(_, children)| children.contains(&runner))
-            .map(|(parent, _)| parent);
-        match parent {
-            Some(p) if p != runner => runner = p,
-            _ => return runner == h,
-        }
-    }
-}
-
-/// The natural loop of back edge (M -> H): every block dominated by H that
-/// can reach M.
-fn loop_body(
-    graph: &CFGGraph,
-    prece: &CFGGraph,
-    m: usize,
-    h: usize,
-    tree: &DomTree,
-) -> HashSet<usize> {
-    let mut body = HashSet::new();
-    body.insert(h);
-    body.insert(m);
-    // Backward worklist from M: blocks that can reach M, restricted to
-    // blocks dominated by H.
-    let mut work_queue = VecDeque::from([m]);
-    while let Some(bb) = work_queue.pop_front() {
-        if let Some(preds) = prece.get(&bb) {
-            for &pred in preds {
-                if dominates(h, pred, tree) && body.insert(pred) {
-                    work_queue.push_back(pred);
-                }
+            if !rebuild {
+                return changed;
             }
         }
     }
-    let _ = graph;
-    body
-}
-
-/// A unique non-loop predecessor of the header.
-fn preheader(
-    data: &ArenaContextMut<'_>,
-    bb_id: &utils::IDAllocator<BasicBlock, usize>,
-    graph: &CFGGraph,
-    prece: &CFGGraph,
-    h: usize,
-    loop_blocks: &HashSet<usize>,
-) -> Option<BasicBlock> {
-    let _ = (graph, bb_id);
-    let non_loop_preds: Vec<usize> = prece
-        .get(&h)
-        .into_iter()
-        .flatten()
-        .copied()
-        .filter(|p| !loop_blocks.contains(p))
-        .collect();
-    if non_loop_preds.len() != 1 {
-        return None;
-    }
-    Some(bb_id.search_id(non_loop_preds[0]))
-}
-
-/// Hoist invariant pure instructions from the loop into the preheader.
-fn hoist_loop(
-    data: &mut ArenaContextMut<'_>,
-    bb_id: &utils::IDAllocator<BasicBlock, usize>,
-    graph: &CFGGraph,
-    prece: &CFGGraph,
-    h: usize,
-    loop_blocks: &HashSet<usize>,
-    preheader: BasicBlock,
-    tree: &DomTree,
-) -> bool {
-    let _ = (bb_id, graph, prece, tree);
-    let h_bb = bb_id.search_id(h);
-    // Define outside the loop: the function entry always dominates the loop,
-    // so any definition not inside a loop block is available.
-    // `invariant` maps an instruction (or block parameter) to the value that
-    // must be substituted for it when hoisted: parameters resolve to their
-    // invariant incoming argument, everything else to itself.
-    let mut invariant: HashMap<Inst, Inst> = HashMap::new();
-    let mut moved: Vec<(Inst, BasicBlock)> = Vec::new();
-
-    // Collect all loop instructions in block order, with the block's params
-    // treated specially (a param is invariant only when every incoming edge
-    // passes the same invariant instruction).
-    let mut insts_in_loop: Vec<(BasicBlock, Inst)> = Vec::new();
-    for layout in data.layout().basicblocks() {
-        let Some(bid) = bb_id.get_id_safe(&layout.bb()) else {
-            continue;
-        };
-        if !loop_blocks.contains(&bid) {
-            continue;
-        }
-        for &inst in layout.insts() {
-            insts_in_loop.push((layout.bb(), inst));
-        }
-    }
-
-    loop {
-        let mut progressed = false;
-        for (bb, inst) in &insts_in_loop {
-            if invariant.contains_key(inst) {
-                continue;
-            }
-            if !pure_kind(data, *inst) {
-                continue;
-            }
-            if operands_invariant(data, *inst, bb, h_bb, loop_blocks, &mut invariant, bb_id) {
-                invariant.insert(*inst, *inst);
-                moved.push((*inst, *bb));
-                progressed = true;
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
-
-    if moved.is_empty() {
-        return false;
-    }
-
-    let preheader_terminator = data.layout().basicblock(preheader).terminator();
-    for (inst, bb) in moved {
-        // Rewrite parameters to their invariant incoming values so the
-        // hoisted instruction no longer references values defined only on
-        // the loop's edges.
-        let replacement = rewrite_operands(data, inst, &invariant);
-        utils::visit_and_replace(data, inst, replacement);
-        data.layout_mut().remove_inst(bb, inst);
-        data.layout_mut().insert_inst_before(preheader_terminator, replacement);
-    }
-    true
-}
-
-/// Rewrite an instruction's operands through the invariant map (parameters
-/// become their incoming argument) and return the rewritten instruction.
-fn rewrite_operands(
-    data: &mut ArenaContextMut<'_>,
-    inst: Inst,
-    invariant: &HashMap<Inst, Inst>,
-) -> Inst {
-    let ty = data.inst_data(inst).ty().clone();
-    match data.inst_data(inst).kind() {
-        InstKind::Binary(binary) => {
-            let op = binary.op();
-            let lhs = *invariant.get(&binary.lhs()).unwrap_or(&binary.lhs());
-            let rhs = *invariant.get(&binary.rhs()).unwrap_or(&binary.rhs());
-            builder(data).insert_inst(inst_kind::Binary::new_data(lhs, rhs, op, ty))
-        }
-        InstKind::Cast(cast) => {
-            let src = *invariant.get(&cast.src()).unwrap_or(&cast.src());
-            builder(data).insert_inst(inst_kind::Cast::new_data(src, ty))
-        }
-        _ => inst,
-    }
-}
-
-/// A local-instruction builder whose arena can also address global
-/// instructions (needed only for the rewritten insts).
-fn builder<'a>(data: &'a mut ArenaContextMut<'_>) -> crate::ir::builder::LocalBuilder<'a> {
-    crate::ir::builder::LocalBuilder { arena: data }
-}
-
-fn pure_kind(data: &ArenaContextMut<'_>, inst: Inst) -> bool {
-    match data.inst_data(inst).kind() {
-        InstKind::Binary(..) | InstKind::Cast(..) => true,
-        _ => false,
-    }
-}
-
-fn operands_invariant(
-    data: &ArenaContextMut<'_>,
-    inst: Inst,
-    bb: &BasicBlock,
-    h_bb: BasicBlock,
-    loop_blocks: &HashSet<usize>,
-    invariant: &mut HashMap<Inst, Inst>,
-    bb_id: &utils::IDAllocator<BasicBlock, usize>,
-) -> bool {
-    let operands: Vec<Inst> = match data.inst_data(inst).kind() {
-        InstKind::Binary(binary) => vec![binary.lhs(), binary.rhs()],
-        InstKind::Cast(cast) => vec![cast.src()],
-        _ => return false,
-    };
-    for operand in operands {
-        if data.inst_data(operand).kind().is_const() {
-            continue;
-        }
-        if invariant.contains_key(&operand) {
-            continue;
-        }
-        // A block parameter: invariant only when every incoming edge passes
-        // the same instruction and that instruction is invariant or defined
-        // outside the loop. The substitution is recorded so hoisted
-        // instructions reference the incoming value instead of the param.
-        if let InstKind::BlockArgRef(..) = data.inst_data(operand).kind() {
-            let Some(param_block) = block_of_param(data, operand) else {
-                return false;
-            };
-            let _ = (bb, h_bb);
-            if param_block == *bb {
-                let mut common: Option<Inst> = None;
-                let mut all_same = true;
-                for &pred_inst in data.bb_data(param_block).used_by() {
-                    let args = match data.inst_data(pred_inst).kind() {
-                        InstKind::Jump(jump) => jump.args().to_vec(),
-                        InstKind::Branch(branch) => {
-                            let mut a = branch.t_args().to_vec();
-                            a.extend(branch.f_args().to_vec());
-                            a
-                        }
-                        _ => return false,
-                    };
-                    // The param's index within its block.
-                    let idx = data.bb_data(param_block).params().iter().position(|&p| p == operand);
-                    let Some(idx) = idx else { return false };
-                    let Some(&arg) = args.get(idx) else { return false };
-                    match common {
-                        None => common = Some(arg),
-                        Some(c) if c == arg => {}
-                        _ => all_same = false,
-                    }
-                }
-                let Some(arg) = common else { return false };
-                if all_same
-                    && (invariant.contains_key(&arg)
-                        || data.inst_data(arg).kind().is_const()
-                        || defined_outside_loop(data, arg, loop_blocks, bb_id))
-                {
-                    invariant.insert(operand, arg);
-                    continue;
-                }
-                return false;
-            }
-        }
-        if defined_outside_loop(data, operand, loop_blocks, bb_id) {
-            continue;
-        }
-        return false;
-    }
-    true
-}
-
-fn defined_outside_loop(
-    data: &ArenaContextMut<'_>,
-    inst: Inst,
-    loop_blocks: &HashSet<usize>,
-    bb_id: &utils::IDAllocator<BasicBlock, usize>,
-) -> bool {
-    if inst.is_global() {
-        return true;
-    }
-    for layout in data.layout().basicblocks() {
-        let Some(bid) = bb_id.get_id_safe(&layout.bb()) else {
-            continue;
-        };
-        if loop_blocks.contains(&bid) {
-            continue;
-        }
-        if layout.insts().iter().any(|i| *i == inst) {
-            return true;
-        }
-    }
-    false
-}
-
-fn block_of_param(data: &ArenaContextMut<'_>, param: Inst) -> Option<BasicBlock> {
-    data.layout()
-        .basicblocks()
-        .iter()
-        .find(|layout| data.bb_data(layout.bb()).params().contains(&param))
-        .map(|layout| layout.bb())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::{
+        Program, Type,
+        builder_trait::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
+    };
 
-    /// entry: jump header(32); header(n): br (n != 0) body/exit; body:
-    /// v = 2 * 3; n' = n - 1; jump header(n') — the multiply of constants is
-    /// invariant and must move to the preheader.
+    fn run(program: &mut Program, function: Function) -> bool {
+        let mut context = ArenaContextMut {
+            program,
+            curr_func: Some(function),
+        };
+        LICM.run_on(&mut context)
+    }
+
     #[test]
-    fn hoists_constant_multiply_out_of_loop() {
+    fn hoists_transitive_pure_invariants_in_dependency_order() {
         let mut program = Program::new();
-        let func = program.new_function(Type::get_i32(), "licm".to_owned(), vec![]);
-        let (entry, header, body, exit) = {
-            let data = program.func_data_mut(func);
-            let entry = data
-                .new_basic_block()
-                .basic_block("entry".to_owned(), vec![]);
-            let header = data
-                .new_basic_block()
-                .basic_block("header".to_owned(), vec![Type::get_i32()]);
-            let body = data
-                .new_basic_block()
-                .basic_block("body".to_owned(), vec![]);
-            let exit = data
-                .new_basic_block()
-                .basic_block("exit".to_owned(), vec![]);
-            data.layout_mut().push_bb_back(entry);
-            data.layout_mut().push_bb_back(header);
-            data.layout_mut().push_bb_back(body);
-            data.layout_mut().push_bb_back(exit);
+        let function = program.new_function(Type::get_unit(), "licm".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let external = data.params()[0];
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
 
-            let init = data.new_local_inst().integer(32);
-            let jump = data.new_local_inst().jump(header, vec![init]);
-            data.layout_mut().insert_inst(entry, jump);
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
 
-            let param = data.bb_data(header).params()[0];
-            let branch = data.new_local_inst().branch(param, body, vec![], exit, vec![]);
-            data.layout_mut().insert_inst(header, branch);
+        let induction = data.bb_data(header).params()[0];
+        let one = data.new_local_inst().integer(1);
+        let invariant_one = data.new_local_inst().binary(BinaryOp::Add, external, one);
+        let invariant_two = data
+            .new_local_inst()
+            .binary(BinaryOp::Mul, invariant_one, one);
+        let variant = data.new_local_inst().binary(BinaryOp::Add, induction, one);
+        let slot = data.new_local_inst().alloc(Type::get_i32());
+        let store = data.new_local_inst().store(invariant_two, slot);
+        for inst in [invariant_one, invariant_two, variant, slot, store] {
+            data.layout_mut().insert_inst(header, inst);
+        }
+        let condition = data.new_local_inst().integer(1);
+        let branch = data
+            .new_local_inst()
+            .branch(condition, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, branch);
 
-            let two = data.new_local_inst().integer(2);
-            let three = data.new_local_inst().integer(3);
-            let mul = data.new_local_inst().binary(BinaryOp::Mul, two, three);
-            let one = data.new_local_inst().integer(1);
-            let dec = data.new_local_inst().binary(BinaryOp::Sub, param, one);
-            let back = data.new_local_inst().jump(header, vec![dec]);
-            data.layout_mut().insert_inst(body, mul);
-            data.layout_mut().insert_inst(body, back);
+        let backedge = data.new_local_inst().jump(header, vec![variant]);
+        data.layout_mut().insert_inst(body, backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
 
-            let ret = data.new_local_inst().ret(None);
-            data.layout_mut().insert_inst(exit, ret);
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(data.layout().parent_bb(invariant_one), Some(entry));
+        assert_eq!(data.layout().parent_bb(invariant_two), Some(entry));
+        assert_eq!(data.layout().parent_bb(variant), Some(header));
+        assert_eq!(data.layout().parent_bb(slot), Some(header));
+        assert_eq!(data.layout().parent_bb(store), Some(header));
+        assert_eq!(data.layout().parent_bb(branch), Some(header));
+        assert_eq!(data.layout().parent_bb(backedge), Some(body));
 
-            (entry, header, body, exit)
-        };
-        let mut data = ArenaContextMut {
-            program: &mut program,
-            curr_func: Some(func),
-        };
-        assert!(Licm.run_on(&mut data));
-        // The multiply moved into the preheader (entry), before the jump.
-        let entry_insts: Vec<Inst> = data
+        let preheader_insts = data
             .layout()
             .basicblock(entry)
             .insts()
             .iter()
             .copied()
-            .collect();
-        assert!(
-            entry_insts
-                .iter()
-                .any(|&i| matches!(data.inst_data(i).kind(), InstKind::Binary(b) if b.op() == BinaryOp::Mul)),
-            "multiply must be hoisted to the preheader"
-        );
-        let body_insts: Vec<Inst> = data
-            .layout()
-            .basicblock(body)
-            .insts()
+            .collect::<Vec<_>>();
+        let first = preheader_insts
             .iter()
-            .copied()
-            .collect();
-        assert!(
-            !body_insts
-                .iter()
-                .any(|&i| matches!(data.inst_data(i).kind(), InstKind::Binary(b) if b.op() == BinaryOp::Mul)),
-            "multiply must leave the loop body"
+            .position(|&inst| inst == invariant_one)
+            .unwrap();
+        let second = preheader_insts
+            .iter()
+            .position(|&inst| inst == invariant_two)
+            .unwrap();
+        let terminator = preheader_insts
+            .iter()
+            .position(|&inst| inst == entry_jump)
+            .unwrap();
+        assert!(first < second && second < terminator);
+    }
+
+    #[test]
+    fn hoists_pure_binary_ops_but_not_memory_side_effects() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "licm_effects".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let header = data.new_basic_block().basic_block("header".into(), vec![]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let slot = data.new_local_inst().alloc(Type::get_i32());
+        data.layout_mut().insert_inst(entry, slot);
+        let entry_jump = data.new_local_inst().jump(header, vec![]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let one = data.new_local_inst().integer(1);
+        let zero = data.new_local_inst().integer(0);
+        let div = data.new_local_inst().binary(BinaryOp::Div, one, zero);
+        let rem = data.new_local_inst().binary(BinaryOp::Rem, one, zero);
+        let load = data.new_local_inst().load(slot);
+        let store = data.new_local_inst().store(one, slot);
+        for inst in [div, rem, load, store] {
+            data.layout_mut().insert_inst(header, inst);
+        }
+        let condition = data.new_local_inst().integer(1);
+        let branch = data
+            .new_local_inst()
+            .branch(condition, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, branch);
+        let backedge = data.new_local_inst().jump(header, vec![]);
+        data.layout_mut().insert_inst(body, backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(data.layout().parent_bb(div), Some(entry));
+        assert_eq!(data.layout().parent_bb(rem), Some(entry));
+        for inst in [load, store] {
+            assert_eq!(data.layout().parent_bb(inst), Some(header));
+        }
+    }
+
+    #[test]
+    fn creates_a_preheader_before_hoisting() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "licm_no_preheader".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let side = data.new_basic_block().basic_block("side".into(), vec![]);
+        let header = data.new_basic_block().basic_block("header".into(), vec![]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [side, header, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let condition = data.new_local_inst().integer(1);
+        let entry_branch = data
+            .new_local_inst()
+            .branch(condition, header, vec![], side, vec![]);
+        data.layout_mut().insert_inst(entry, entry_branch);
+        let side_ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(side, side_ret);
+
+        let one = data.new_local_inst().integer(1);
+        let invariant = data.new_local_inst().binary(BinaryOp::Add, one, one);
+        data.layout_mut().insert_inst(header, invariant);
+        let header_branch = data
+            .new_local_inst()
+            .branch(condition, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, header_branch);
+        let backedge = data.new_local_inst().jump(header, vec![]);
+        data.layout_mut().insert_inst(body, backedge);
+        let exit_ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, exit_ret);
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        let (cfg, _dom_tree, loops) = loop_analysis::LoopAnalysis::new(data);
+        let looop = loops
+            .loops()
+            .iter()
+            .find(|looop| looop.header() == header)
+            .unwrap();
+        let preheader = looop.get_preheader(&cfg).unwrap();
+        assert_ne!(preheader, entry);
+        assert_eq!(data.layout().parent_bb(invariant), Some(preheader));
+        let insts = data.layout().basicblock(preheader).insts();
+        let invariant_position = insts.iter().position(|&inst| inst == invariant).unwrap();
+        let terminator_position = insts.len() - 1;
+        assert!(invariant_position < terminator_position);
+        assert!(!run(&mut program, function));
+    }
+
+    #[test]
+    fn does_not_create_a_preheader_without_hoist_candidates() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "licm_no_candidate".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let side = data.new_basic_block().basic_block("side".into(), vec![]);
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [side, header, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let condition = data.new_local_inst().integer(1);
+        let zero = data.new_local_inst().integer(0);
+        let entry_branch =
+            data.new_local_inst()
+                .branch(condition, header, vec![zero], side, vec![]);
+        data.layout_mut().insert_inst(entry, entry_branch);
+        let side_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(side, side_jump);
+
+        let induction = data.bb_data(header).params()[0];
+        let one = data.new_local_inst().integer(1);
+        let next = data.new_local_inst().binary(BinaryOp::Add, induction, one);
+        data.layout_mut().insert_inst(header, next);
+        let header_branch = data
+            .new_local_inst()
+            .branch(condition, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, header_branch);
+        let backedge = data.new_local_inst().jump(header, vec![next]);
+        data.layout_mut().insert_inst(body, backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        let block_count = data.layout().basicblocks().len();
+        assert!(!run(&mut program, function));
+        assert_eq!(
+            program.func_data(function).layout().basicblocks().len(),
+            block_count
         );
+    }
+
+    #[test]
+    fn does_not_rewrite_an_entry_header_loop() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "licm_entry_loop".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let one = data.new_local_inst().integer(1);
+        let invariant = data.new_local_inst().binary(BinaryOp::Add, one, one);
+        data.layout_mut().insert_inst(entry, invariant);
+        let condition = data.new_local_inst().integer(1);
+        let branch = data
+            .new_local_inst()
+            .branch(condition, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(entry, branch);
+        let backedge = data.new_local_inst().jump(entry, vec![]);
+        data.layout_mut().insert_inst(body, backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(!run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(data.layout().entry_bb().unwrap().bb(), entry);
+        assert_eq!(data.layout().parent_bb(invariant), Some(entry));
+    }
+
+    #[test]
+    fn rebuilds_analyses_after_each_created_preheader() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "licm_rebuild".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let side_a = data.new_basic_block().basic_block("side_a".into(), vec![]);
+        let header_a = data
+            .new_basic_block()
+            .basic_block("header_a".into(), vec![]);
+        let latch_a = data.new_basic_block().basic_block("latch_a".into(), vec![]);
+        let after_a = data.new_basic_block().basic_block("after_a".into(), vec![]);
+        let side_b = data.new_basic_block().basic_block("side_b".into(), vec![]);
+        let header_b = data
+            .new_basic_block()
+            .basic_block("header_b".into(), vec![]);
+        let latch_b = data.new_basic_block().basic_block("latch_b".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [
+            side_a, header_a, latch_a, after_a, side_b, header_b, latch_b, exit,
+        ] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let condition = data.new_local_inst().integer(1);
+        let entry_branch =
+            data.new_local_inst()
+                .branch(condition, header_a, vec![], side_a, vec![]);
+        data.layout_mut().insert_inst(entry, entry_branch);
+        let side_a_jump = data.new_local_inst().jump(header_a, vec![]);
+        data.layout_mut().insert_inst(side_a, side_a_jump);
+
+        let one = data.new_local_inst().integer(1);
+        let invariant_a = data.new_local_inst().binary(BinaryOp::Add, one, one);
+        data.layout_mut().insert_inst(header_a, invariant_a);
+        let branch_a = data
+            .new_local_inst()
+            .branch(condition, latch_a, vec![], after_a, vec![]);
+        data.layout_mut().insert_inst(header_a, branch_a);
+        let backedge_a = data.new_local_inst().jump(header_a, vec![]);
+        data.layout_mut().insert_inst(latch_a, backedge_a);
+
+        let after_a_branch =
+            data.new_local_inst()
+                .branch(condition, header_b, vec![], side_b, vec![]);
+        data.layout_mut().insert_inst(after_a, after_a_branch);
+        let side_b_jump = data.new_local_inst().jump(header_b, vec![]);
+        data.layout_mut().insert_inst(side_b, side_b_jump);
+
+        let invariant_b = data.new_local_inst().binary(BinaryOp::Mul, one, one);
+        data.layout_mut().insert_inst(header_b, invariant_b);
+        let branch_b = data
+            .new_local_inst()
+            .branch(condition, latch_b, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header_b, branch_b);
+        let backedge_b = data.new_local_inst().jump(header_b, vec![]);
+        data.layout_mut().insert_inst(latch_b, backedge_b);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        let (cfg, _dom_tree, loops) = loop_analysis::LoopAnalysis::new(data);
+        for (header, invariant) in [(header_a, invariant_a), (header_b, invariant_b)] {
+            let looop = loops
+                .loops()
+                .iter()
+                .find(|looop| looop.header() == header)
+                .unwrap();
+            let preheader = looop.get_preheader(&cfg).unwrap();
+            assert_eq!(data.layout().parent_bb(invariant), Some(preheader));
+        }
+        assert!(!run(&mut program, function));
+    }
+
+    #[test]
+    fn hoists_fully_invariant_gep() {
+        let array_ty = Type::get_array(Type::get_array(Type::get_i32(), 8), 8);
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "licm_gep".into(),
+            vec![Type::get_pointer(array_ty), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let row = data.params()[1];
+        let header = data.new_basic_block().basic_block("header".into(), vec![]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let entry_jump = data.new_local_inst().jump(header, vec![]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let zero = data.new_local_inst().integer(0);
+        let gep = data.new_local_inst().get_elem_ptr(base, vec![zero, row]);
+        data.layout_mut().insert_inst(header, gep);
+        let condition = data.new_local_inst().integer(1);
+        let branch = data
+            .new_local_inst()
+            .branch(condition, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, branch);
+        let backedge = data.new_local_inst().jump(header, vec![]);
+        data.layout_mut().insert_inst(body, backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(data.layout().parent_bb(gep), Some(entry));
+        let entry_insts = data.layout().basicblock(entry).insts();
+        let gep_position = entry_insts.iter().position(|&inst| inst == gep).unwrap();
+        let terminator_position = entry_insts
+            .iter()
+            .position(|&inst| inst == entry_jump)
+            .unwrap();
+        assert!(gep_position < terminator_position);
+    }
+
+    #[test]
+    fn hoists_invariant_gep_prefix_and_preserves_original_value() {
+        let array_ty = Type::get_array(Type::get_array(Type::get_i32(), 8), 8);
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "licm_partial_gep".into(),
+            vec![Type::get_pointer(array_ty), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let row = data.params()[1];
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let column = data.bb_data(header).params()[0];
+        let gep = data
+            .new_local_inst()
+            .get_elem_ptr(base, vec![zero, row, column]);
+        let original_ty = data.inst_data(gep).ty().clone();
+        let load = data.new_local_inst().load(gep);
+        for inst in [gep, load] {
+            data.layout_mut().insert_inst(header, inst);
+        }
+        let one = data.new_local_inst().integer(1);
+        let next = data.new_local_inst().binary(BinaryOp::Add, column, one);
+        data.layout_mut().insert_inst(header, next);
+        let condition = data.new_local_inst().integer(1);
+        let branch = data
+            .new_local_inst()
+            .branch(condition, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, branch);
+        let backedge = data.new_local_inst().jump(header, vec![next]);
+        data.layout_mut().insert_inst(body, backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(data.layout().parent_bb(gep), Some(header));
+        assert_eq!(data.inst_data(gep).ty(), &original_ty);
+        assert_eq!(
+            data.inst_data(load).inst_usage().collect::<Vec<_>>(),
+            vec![gep]
+        );
+
+        let InstKind::GetElemPtr(suffix) = data.inst_data(gep).kind() else {
+            panic!("original value must remain a GEP");
+        };
+        assert_eq!(suffix.offsets().len(), 2);
+        assert!(matches!(
+            data.inst_data(suffix.offsets()[0]).kind(),
+            InstKind::Integer(value) if value.value() == 0
+        ));
+        assert_eq!(suffix.offsets()[1], column);
+
+        let prefix = suffix.base();
+        assert_eq!(data.layout().parent_bb(prefix), Some(entry));
+        let InstKind::GetElemPtr(prefix_gep) = data.inst_data(prefix).kind() else {
+            panic!("partial motion must create a prefix GEP");
+        };
+        assert_eq!(prefix_gep.base(), base);
+        assert_eq!(prefix_gep.offsets(), &[zero, row]);
+        assert!(data.inst_data(prefix).used_by().contains(&gep));
+        assert!(!data.inst_data(base).used_by().contains(&gep));
+
+        assert!(!run(&mut program, function));
     }
 }

@@ -36,7 +36,7 @@ use crate::opt::prelude::*;
 pub struct RotateLoops;
 
 impl Pass for RotateLoops {
-    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
+    fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         if data.layout().entry_bb().is_none() {
             return false;
         }
@@ -189,7 +189,9 @@ mod tests {
             data.layout_mut().insert_inst(entry, jump);
 
             let param = data.bb_data(header).params()[0];
-            let branch = data.new_local_inst().branch(param, body, vec![], exit, vec![]);
+            let branch = data
+                .new_local_inst()
+                .branch(param, body, vec![], exit, vec![]);
             data.layout_mut().insert_inst(header, branch);
 
             let one = data.new_local_inst().integer(1);

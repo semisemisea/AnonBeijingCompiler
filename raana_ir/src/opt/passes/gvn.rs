@@ -251,7 +251,7 @@ impl ScopedLoadLeaders {
 }
 
 impl Pass for GlobalInstNumbering {
-    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
+    fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         if data.layout().entry_bb().is_none() {
             return false;
         }

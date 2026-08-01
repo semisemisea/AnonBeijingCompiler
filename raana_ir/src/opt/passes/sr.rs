@@ -3,7 +3,7 @@ use crate::opt::prelude::*;
 pub struct StrengthReduction;
 
 impl Pass for StrengthReduction {
-    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
+    fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         let mut changed = self.specialize_remainder_comparisons(data);
         loop {
             let mut iteration_changed = false;

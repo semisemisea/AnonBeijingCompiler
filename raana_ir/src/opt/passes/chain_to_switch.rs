@@ -57,7 +57,7 @@ struct Link {
 }
 
 impl Pass for ChainToSwitch {
-    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
+    fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         if data.layout().entry_bb().is_none() {
             return false;
         }
@@ -257,7 +257,16 @@ impl ChainToSwitch {
         let key = links[mid].k;
         let (left_target, left_args) = if lo < mid {
             (
-                Self::build_tree(data, x, links, default, default_args.clone(), lo, mid, into_block),
+                Self::build_tree(
+                    data,
+                    x,
+                    links,
+                    default,
+                    default_args.clone(),
+                    lo,
+                    mid,
+                    into_block,
+                ),
                 vec![],
             )
         } else {
@@ -303,9 +312,9 @@ impl ChainToSwitch {
         };
         let lt = data.new_local_inst().binary(BinaryOp::Lt, x, key_inst);
         data.layout_mut().insert_inst(split, lt);
-        let split_br = data
-            .new_local_inst()
-            .branch(lt, left_target, left_args, right_target, right_args);
+        let split_br =
+            data.new_local_inst()
+                .branch(lt, left_target, left_args, right_target, right_args);
         data.layout_mut().insert_inst(split, split_br);
 
         let check_br = data.new_local_inst().branch(
@@ -339,7 +348,9 @@ mod tests {
             let entry = data
                 .new_basic_block()
                 .basic_block("entry".to_owned(), vec![Type::get_i32()]);
-            let exit = data.new_basic_block().basic_block("exit".to_owned(), vec![]);
+            let exit = data
+                .new_basic_block()
+                .basic_block("exit".to_owned(), vec![]);
             data.layout_mut().push_bb_back(entry);
             data.layout_mut().push_bb_back(exit);
             (entry, exit)
@@ -355,7 +366,9 @@ mod tests {
                     if k == 1 {
                         entry
                     } else {
-                        let bb = data.new_basic_block().basic_block(format!("case_{k}"), vec![]);
+                        let bb = data
+                            .new_basic_block()
+                            .basic_block(format!("case_{k}"), vec![]);
                         data.layout_mut().push_bb_back(bb);
                         bb
                     }
@@ -373,7 +386,9 @@ mod tests {
                 let value = data.new_local_inst().integer((k * 2) as i32);
                 data.layout_mut().insert_inst(handler, value);
                 let next = if k < len { chain_blocks[k] } else { exit };
-                let br = data.new_local_inst().branch(test, handler, vec![], next, vec![]);
+                let br = data
+                    .new_local_inst()
+                    .branch(test, handler, vec![], next, vec![]);
                 data.layout_mut().insert_inst(case, br);
                 cases.push(case);
             }

@@ -2,7 +2,11 @@ use std::collections::{HashMap, hash_map::Entry};
 
 pub(crate) mod body_clone;
 pub mod call;
+pub mod cfg;
 pub mod global_handle;
+pub mod logical_edge;
+pub mod pointer_strength_reduction_cost;
+pub mod preheader;
 
 use crate::{
     ir::{

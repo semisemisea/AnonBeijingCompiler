@@ -882,7 +882,7 @@ impl<'a> LlvmWriter<'a> {
         }
         writeln!(
             self.buffer,
-            "getelementptr inbounds {}, ptr {}, {}",
+            "getelementptr {}, ptr {}, {}",
             src_elem_ty, base, indices
         )
     }
@@ -946,7 +946,7 @@ impl<'a> LlvmWriter<'a> {
                             .collect();
                         writeln!(
                             self.buffer,
-                            "  {} = getelementptr inbounds {}, ptr {}, {}",
+                            "  {} = getelementptr {}, ptr {}, {}",
                             gep_name,
                             base_ty,
                             dest_name,
@@ -975,7 +975,7 @@ impl<'a> LlvmWriter<'a> {
                     .collect();
                 writeln!(
                     self.buffer,
-                    "  {} = getelementptr inbounds {}, ptr {}, {}",
+                    "  {} = getelementptr {}, ptr {}, {}",
                     gep_name,
                     base_ty,
                     dest_name,
@@ -1078,5 +1078,31 @@ mod tests {
             "{llvm}"
         );
         assert!(llvm.contains("i8 0, i64 16, i1 false)"), "{llvm}");
+    }
+
+    #[test]
+    fn does_not_claim_unproven_gep_inbounds() {
+        let array_ty = Type::get_array(Type::get_i32(), 4);
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_pointer(Type::get_i32()),
+            "address".into(),
+            vec![Type::get_pointer(array_ty), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let index = data.params()[1];
+        let zero = data.new_local_inst().integer(0);
+        let gep = data.new_local_inst().get_elem_ptr(base, vec![zero, index]);
+        data.layout_mut().insert_inst(entry, gep);
+        let ret = data.new_local_inst().ret(Some(gep));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let mut writer = LlvmWriter::new(&program);
+        writer.write().unwrap();
+        let llvm = writer.finish();
+        assert!(llvm.contains("getelementptr [4 x i32]"), "{llvm}");
+        assert!(!llvm.contains("getelementptr inbounds"), "{llvm}");
     }
 }

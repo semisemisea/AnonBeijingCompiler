@@ -115,7 +115,7 @@ type FlowWorklist = VecDeque<(BId, BId)>;
 type SSAWorklist = VecDeque<Inst>;
 
 impl Pass for SparseConditionConstantPropagation {
-    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
+    fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         let Some(entry_bb) = data.layout().entry_bb() else {
             return false;
         };
@@ -241,7 +241,7 @@ impl Pass for SparseConditionConstantPropagation {
             changed = true;
         }
 
-        let ubb = super::dce::UnreachableBasicBlock;
+        let mut ubb = super::dce::UnreachableBasicBlock;
         changed |= ubb.run_on(data);
 
         let mut useless_phi_list = Vec::new();

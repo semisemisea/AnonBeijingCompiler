@@ -80,7 +80,7 @@ type EdgeSet = FxHashSet<Edge>;
 type NodeSet = FxHashSet<Node>;
 
 impl Pass for IPSCCP {
-    fn run(&self, program: &mut Program) -> bool {
+    fn run(&mut self, program: &mut Program) -> bool {
         // Stage 0: Variables initialization.
         let mut edge_visited = EdgeSet::default();
         let mut node_visited = NodeSet::default();

@@ -11,7 +11,7 @@ pub struct JumpOnlyElimination;
 /// Function (call to function)
 /// Branches and Return
 impl Pass for DeadCodeElimination {
-    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
+    fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         self.run_on_func(data)
     }
 }
@@ -203,7 +203,7 @@ mod tests {
 }
 
 impl Pass for DeadPhiElimination {
-    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
+    fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         let mut bb_allocator: IDAllocator<BasicBlock, BId> = IDAllocator::new(1);
         let mut unused_params_indices = Vec::with_capacity(data.layout().basicblocks().len());
 
@@ -285,8 +285,46 @@ impl Pass for DeadPhiElimination {
     }
 }
 
+#[cfg(test)]
+mod dead_phi_tests {
+    use super::{DeadPhiElimination, Pass};
+    use crate::ir::{InstKind, Program, Type, arena::Arena, builder_trait::*};
+
+    #[test]
+    fn removes_dead_param_from_both_same_target_branch_arms() {
+        let mut program = Program::new();
+        let function =
+            program.new_function(Type::get_unit(), "dead_phi".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let merge = data
+            .new_basic_block()
+            .basic_block("merge".into(), vec![Type::get_i32()]);
+        data.layout_mut().push_bb_back(merge);
+
+        let cond = data.params()[0];
+        let zero = data.new_local_inst().integer(0);
+        let one = data.new_local_inst().integer(1);
+        let branch = data
+            .new_local_inst()
+            .branch(cond, merge, vec![zero], merge, vec![one]);
+        data.layout_mut().insert_inst(entry, branch);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(merge, ret);
+
+        assert!(DeadPhiElimination.run(&mut program));
+        let data = program.func_data(function);
+        assert!(data.bb_data(merge).params().is_empty());
+        let InstKind::Branch(branch_data) = data.inst_data(branch).kind() else {
+            panic!("entry terminator must remain a branch");
+        };
+        assert!(branch_data.t_args().is_empty());
+        assert!(branch_data.f_args().is_empty());
+    }
+}
+
 impl Pass for UnreachableBasicBlock {
-    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
+    fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         if data.layout().entry_bb().is_none() {
             return false;
         }

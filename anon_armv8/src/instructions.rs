@@ -373,6 +373,22 @@ pub enum SelectValue {
     Bool { dst: WritableReg },
 }
 
+/// A chained conditional-compare step between a [`CmpSelect`]'s first
+/// comparison and its select, or between a comparison and a conditional
+/// branch. Semantics: if `cond` holds (based on the preceding NZCV), compare
+/// `lhs` with `rhs`/`imm` and set NZCV from the result; otherwise set NZCV to
+/// `nzcv`. With the right nzcv value this folds `band`/`bor` of two
+/// comparisons into a single flag chain (clang's `ccmp` pattern).
+#[derive(Clone, Debug)]
+pub struct CCmpStep {
+    pub size: OperandSize,
+    pub lhs: Reg,
+    pub rhs: RegOrZr,
+    pub imm: Option<Imm12>,
+    pub nzcv: u8,
+    pub cond: Cond,
+}
+
 #[derive(Clone, Debug)]
 pub enum MInst {
     Nop,
@@ -560,11 +576,24 @@ pub enum MInst {
     },
     /// Emits an adjacent comparison and `csel`, `fcsel`, or `cset` pair.
     /// This is atomic at the machine-instruction level because NZCV is not an
-    /// allocatable value and must not be separated from its consumer.
+    /// allocatable value and must not be separated from its consumer. The
+    /// optional `ccmp` chain step folds a `band`/`bor` of two comparisons.
     CmpSelect {
         cmp: SelectCmp,
+        ccmp: Option<Box<CCmpStep>>,
         cond: Cond,
         value: SelectValue,
+    },
+    /// A standalone conditional compare: `ccmp lhs, rhs, #nzcv, cond`.
+    /// Emitted between a comparison and a `CondBr` when the branch condition
+    /// is a `band`/`bor` of two comparisons.
+    CCmp {
+        size: OperandSize,
+        lhs: Reg,
+        rhs: RegOrZr,
+        imm: Option<Imm12>,
+        nzcv: u8,
+        cond: Cond,
     },
     FMov {
         dst: WritableReg,
@@ -689,6 +718,7 @@ impl MInst {
             Self::Tbz { size, bit, .. } | Self::Tbnz { size, bit, .. } if *bit >= size.bits() => {
                 Err("test-bit index exceeds AArch64 encoding range")
             }
+            Self::CCmp { nzcv, .. } if *nzcv > 0xF => Err("ccmp NZCV immediate exceeds 4 bits"),
             Self::LoadPair { ty, addr, .. } | Self::StorePair { ty, addr, .. }
                 if pair_access_size(addr) != ty.byte_size() =>
             {
@@ -822,7 +852,7 @@ impl MachInst for MInst {
             | Self::LoadAddr { dst, .. }
             | Self::StackAddr { dst, .. }
             | Self::CSet { dst, .. } => collector.reg_def(dst),
-            Self::CmpSelect { cmp, value, .. } => {
+            Self::CmpSelect { cmp, ccmp, value, .. } => {
                 match cmp {
                     SelectCmp::IntRR { lhs, rhs, .. } => {
                         collector.reg_use(lhs);
@@ -833,6 +863,10 @@ impl MachInst for MInst {
                         collector.reg_use(lhs);
                         collector.reg_use(rhs);
                     }
+                }
+                if let Some(ccmp) = ccmp {
+                    collector.reg_use(&mut ccmp.lhs);
+                    use_reg_or_zr(collector, &mut ccmp.rhs);
                 }
                 match value {
                     SelectValue::Int {
@@ -852,6 +886,13 @@ impl MachInst for MInst {
                     }
                     SelectValue::Bool { dst } => collector.reg_def(dst),
                 }
+            }
+            Self::CCmp {
+                lhs, rhs, imm, ..
+            } => {
+                collector.reg_use(lhs);
+                use_reg_or_zr(collector, rhs);
+                let _ = imm;
             }
             Self::MovK { dst, src, .. } => {
                 collector.reg_use(src);
@@ -1320,9 +1361,21 @@ impl MachInstEmit for MInst {
                 emit_reg(ctx, dst.to_reg(), OperandSize::Size32)?;
                 write!(ctx, ", {}", cond_name(*cond))
             }
-            Self::CmpSelect { cmp, cond, value } => {
+            Self::CCmp {
+                size,
+                lhs,
+                rhs,
+                imm,
+                nzcv,
+                cond,
+            } => emit_ccmp(ctx, *size, *lhs, rhs, *imm, *nzcv, *cond),
+            Self::CmpSelect { cmp, ccmp, cond, value } => {
                 emit_select_cmp(ctx, cmp)?;
                 ctx.end_inst()?;
+                if let Some(ccmp) = ccmp {
+                    emit_ccmp(ctx, ccmp.size, ccmp.lhs, &ccmp.rhs, ccmp.imm, ccmp.nzcv, ccmp.cond)?;
+                    ctx.end_inst()?;
+                }
                 match value {
                     SelectValue::Int {
                         size,
@@ -1482,6 +1535,31 @@ fn emit_select_cmp(ctx: &mut dyn EmitContext, cmp: &SelectCmp) -> core::fmt::Res
         }
         SelectCmp::Float { lhs, rhs } => emit_float_rr(ctx, "fcmp", *lhs, rhs),
     }
+}
+
+fn emit_ccmp(
+    ctx: &mut dyn EmitContext,
+    size: OperandSize,
+    lhs: Reg,
+    rhs: &RegOrZr,
+    imm: Option<Imm12>,
+    nzcv: u8,
+    cond: Cond,
+) -> core::fmt::Result {
+    write!(ctx, "ccmp ")?;
+    emit_reg(ctx, lhs, size)?;
+    match (rhs, imm) {
+        (RegOrZr::Reg(rhs), _) => {
+            write!(ctx, ", ")?;
+            emit_reg(ctx, *rhs, size)?;
+        }
+        (RegOrZr::Zr, Some(imm)) => write!(ctx, ", #{}", imm.value())?,
+        (RegOrZr::Zr, None) => {
+            write!(ctx, ", ")?;
+            emit_gpr(ctx, &Gpr::Zr, size)?;
+        }
+    }
+    write!(ctx, ", #{nzcv}, {}", cond_name(cond))
 }
 
 fn emit_load_imm(
@@ -1962,7 +2040,7 @@ mod tests {
         vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
     };
 
-    use super::{Cond, Imm12, MInst, SelectCmp, SelectValue, call_clobbers};
+    use super::{CCmpStep, Cond, Imm12, MInst, SelectCmp, SelectValue, call_clobbers};
     use crate::regs::{OperandSize, float_reg, int_reg};
 
     #[derive(Default)]
@@ -2018,6 +2096,7 @@ mod tests {
                 lhs: int_reg(1),
                 imm: Imm12::new(0, false).unwrap(),
             },
+            ccmp: None,
             cond: Cond::Ne,
             value: SelectValue::Int {
                 size: OperandSize::Size32,
@@ -2062,6 +2141,7 @@ mod tests {
                 lhs: int_reg(1),
                 imm: Imm12::new(0, false).unwrap(),
             },
+            ccmp: None,
             cond: Cond::Ne,
             value: SelectValue::Int {
                 size: OperandSize::Size64,
@@ -2086,6 +2166,7 @@ mod tests {
                 if_true: float_reg(1),
                 if_false: float_reg(2),
             },
+            ccmp: None,
         });
         assert_eq!(text, "fcmp s4, s5\n    fcsel s0, s1, s2, mi");
     }
@@ -2098,12 +2179,70 @@ mod tests {
                 lhs: int_reg(1),
                 rhs: crate::regs::RegOrZr::Reg(int_reg(2)),
             },
+            ccmp: None,
             cond: Cond::Eq,
             value: SelectValue::Bool {
                 dst: Writable::from_reg(int_reg(0)),
             },
         });
         assert_eq!(text, "cmp w1, w2\n    cset w0, eq");
+    }
+
+    #[test]
+    fn emits_and_ccmp_chain_as_cmp_ccmp_csel() {
+        let text = emit(MInst::CmpSelect {
+            cmp: SelectCmp::IntImm {
+                size: OperandSize::Size32,
+                lhs: int_reg(1),
+                imm: Imm12::new(1, false).unwrap(),
+            },
+            ccmp: Some(Box::new(CCmpStep {
+                size: OperandSize::Size32,
+                lhs: int_reg(2),
+                rhs: crate::regs::RegOrZr::Zr,
+                imm: Some(Imm12::new(1, false).unwrap()),
+                nzcv: 0,
+                cond: Cond::Eq,
+            })),
+            cond: Cond::Eq,
+            value: SelectValue::Int {
+                size: OperandSize::Size32,
+                dst: Writable::from_reg(int_reg(0)),
+                if_true: int_reg(3),
+                if_false: int_reg(4),
+            },
+        });
+        assert_eq!(
+            text,
+            "cmp w1, #1\n    ccmp w2, #1, #0, eq\n    csel w0, w3, w4, eq"
+        );
+    }
+
+    #[test]
+    fn emits_or_ccmp_chain_with_true_fallback_nzcv() {
+        let text = emit(MInst::CmpSelect {
+            cmp: SelectCmp::IntRR {
+                size: OperandSize::Size32,
+                lhs: int_reg(1),
+                rhs: crate::regs::RegOrZr::Reg(int_reg(2)),
+            },
+            ccmp: Some(Box::new(CCmpStep {
+                size: OperandSize::Size32,
+                lhs: int_reg(3),
+                rhs: crate::regs::RegOrZr::Zr,
+                imm: Some(Imm12::new(1, false).unwrap()),
+                nzcv: 4,
+                cond: Cond::Ne,
+            })),
+            cond: Cond::Eq,
+            value: SelectValue::Bool {
+                dst: Writable::from_reg(int_reg(0)),
+            },
+        });
+        assert_eq!(
+            text,
+            "cmp w1, w2\n    ccmp w3, #1, #4, ne\n    cset w0, eq"
+        );
     }
 
     #[test]

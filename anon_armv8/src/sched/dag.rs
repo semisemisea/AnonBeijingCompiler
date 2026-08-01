@@ -826,6 +826,22 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             is_barrier: false,
         },
 
+        // `ccmp` consumes NZCV as its condition and redefines it, so it sits
+        // between the preceding comparison and the consuming branch/select.
+        MInst::CCmp { lhs, rhs, .. } => {
+            let mut uses = preg(*lhs);
+            uses.extend(collect_reg_or_zr_vec(rhs));
+            InstDeps {
+                defs: vec![],
+                uses,
+                flags_def: true,
+                flags_use: true,
+                class: SchedClass::Alu,
+                mem: None,
+                is_barrier: false,
+            }
+        }
+
         MInst::Mov { dst, src, .. } | MInst::MovPhys { dst, src, .. } => InstDeps {
             defs: preg(dst.reg),
             uses: preg(*src),

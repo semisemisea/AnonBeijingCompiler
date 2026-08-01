@@ -17,7 +17,7 @@ type InsertTable = Vec<Vec<(VId, Index)>>;
 type ValStack = Vec<Vec<Inst>>;
 
 impl Pass for SSATransform {
-    fn run(&self, program: &mut crate::ir::Program) -> bool {
+    fn run(&mut self, program: &mut crate::ir::Program) -> bool {
         let func_layout = program.function_layout().to_vec();
         let mut arena_context = ArenaContextMut {
             program,
@@ -28,18 +28,18 @@ impl Pass for SSATransform {
             arena_context.curr_func = Some(func);
             changed |= self.run_on(&mut arena_context);
         }
-        let dce = super::dce::DeadCodeElimination;
+        let mut dce = super::dce::DeadCodeElimination;
         changed |= dce.run(program);
         changed
     }
 
-    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
+    fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         // function declaration. skip.
         if data.layout().entry_bb().is_none() {
             return false;
         }
 
-        let ubb = super::dce::UnreachableBasicBlock;
+        let mut ubb = super::dce::UnreachableBasicBlock;
         let mut changed = ubb.run_on(data);
 
         debug!("----------------------------------");

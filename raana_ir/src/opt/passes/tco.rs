@@ -14,7 +14,7 @@ use crate::opt::prelude::*;
 pub struct TailCallElim;
 
 impl Pass for TailCallElim {
-    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
+    fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         let curr_func = data.curr_func.unwrap();
         if data.layout().entry_bb().is_none() {
             return false;

@@ -16,7 +16,7 @@ const CALL_SIZE_LIMIT: usize = 40;
 const TOTAL_SIZE_LIMIT: usize = 100;
 
 impl Pass for Inline {
-    fn run(&self, program: &mut Program) -> bool {
+    fn run(&mut self, program: &mut Program) -> bool {
         let mut changed = false;
         while Self::once(program) {
             changed = true;
@@ -121,7 +121,7 @@ impl Inline {
                 continue;
             }
             let callee_data = program.func_data(callee);
-            let callsites: Vec<_> = call_graph.be_called_at(callee).collect();
+            let callsites: Vec<_> = call_graph.incoming_callsites_of(callee).collect();
             if callsites.is_empty() {
                 continue;
             }
@@ -133,10 +133,9 @@ impl Inline {
             if size > CALL_SIZE_LIMIT || size.saturating_mul(callsites.len()) > TOTAL_SIZE_LIMIT {
                 continue;
             }
-            let Some(&callsite) = callsites
-                .iter()
-                .find(|callsite| callsite.func != callee && !call_graph.reaches(callee, callsite.func))
-            else {
+            let Some(&callsite) = callsites.iter().find(|callsite| {
+                callsite.func != callee && !call_graph.reaches(callee, callsite.func)
+            }) else {
                 continue;
             };
             let caller_data = program.func_data(callsite.func);

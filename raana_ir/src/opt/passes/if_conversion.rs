@@ -27,7 +27,7 @@ struct Candidate {
 }
 
 impl Pass for IfConversion {
-    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
+    fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         // Re-scan after every rewrite. Apart from keeping the analysis simple,
         // this permits an exposed outer candidate to be converted as well.
         let mut changed = false;

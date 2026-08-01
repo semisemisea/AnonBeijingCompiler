@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::opt::prelude::*;
+use crate::opt::utils::logical_edge::{
+    LogicalEdge as Edge, LogicalEdgeArm as EdgeArm, LogicalEdgeRewriter,
+};
 
 // GVN-PRE implementation status and roadmap:
 //
@@ -64,25 +67,6 @@ enum ValueKey {
     Integer(Type, i32),
     Expr(Expr),
     Identity(Type, Inst),
-}
-
-#[derive(Clone, Copy)]
-enum EdgeArm {
-    Jump,
-    True,
-    False,
-}
-
-#[derive(Clone, Copy)]
-struct Edge {
-    from: BasicBlock,
-    terminator: Inst,
-    arm: EdgeArm,
-}
-
-enum Rewrite {
-    Jump(BasicBlock, Vec<Inst>),
-    Branch(Inst, BasicBlock, Vec<Inst>, BasicBlock, Vec<Inst>),
 }
 
 struct ValueNumbers {
@@ -181,17 +165,6 @@ impl ValueNumbers {
     }
 }
 
-impl Edge {
-    fn args(self, data: &ArenaContextMut<'_>) -> Vec<Inst> {
-        match (self.arm, data.inst_data(self.terminator).kind()) {
-            (EdgeArm::Jump, InstKind::Jump(jump)) => jump.args().to_vec(),
-            (EdgeArm::True, InstKind::Branch(branch)) => branch.t_args().to_vec(),
-            (EdgeArm::False, InstKind::Branch(branch)) => branch.f_args().to_vec(),
-            _ => unreachable!(),
-        }
-    }
-}
-
 impl GVNPRE {
     fn reachable_edges(
         &self,
@@ -212,24 +185,22 @@ impl GVNPRE {
             let terminator = data.layout().basicblock(bb).terminator();
             match data.inst_data(terminator).kind() {
                 InstKind::Jump(jump) => {
-                    incoming.entry(jump.target()).or_default().push(Edge {
-                        from: bb,
+                    incoming.entry(jump.target()).or_default().push(Edge::new(
+                        bb,
                         terminator,
-                        arm: EdgeArm::Jump,
-                    });
+                        EdgeArm::Jump,
+                    ));
                     work.push(jump.target());
                 }
                 InstKind::Branch(branch) => {
-                    incoming.entry(branch.t_target()).or_default().push(Edge {
-                        from: bb,
-                        terminator,
-                        arm: EdgeArm::True,
-                    });
-                    incoming.entry(branch.f_target()).or_default().push(Edge {
-                        from: bb,
-                        terminator,
-                        arm: EdgeArm::False,
-                    });
+                    incoming
+                        .entry(branch.t_target())
+                        .or_default()
+                        .push(Edge::new(bb, terminator, EdgeArm::True));
+                    incoming
+                        .entry(branch.f_target())
+                        .or_default()
+                        .push(Edge::new(bb, terminator, EdgeArm::False));
                     work.push(branch.f_target());
                     work.push(branch.t_target());
                 }
@@ -394,57 +365,6 @@ impl GVNPRE {
                 .all(|(&arg, &param)| data.inst_data(arg).ty() == data.inst_data(param).ty())
     }
 
-    fn rewrite_for(data: &ArenaContextMut<'_>, terminator: Inst) -> Rewrite {
-        match data.inst_data(terminator).kind() {
-            InstKind::Jump(jump) => Rewrite::Jump(jump.target(), jump.args().to_vec()),
-            InstKind::Branch(branch) => Rewrite::Branch(
-                branch.cond(),
-                branch.t_target(),
-                branch.t_args().to_vec(),
-                branch.f_target(),
-                branch.f_args().to_vec(),
-            ),
-            _ => unreachable!(),
-        }
-    }
-
-    fn append_edge_value(rewrite: &mut Rewrite, arm: EdgeArm, value: Inst) {
-        match (arm, rewrite) {
-            (EdgeArm::Jump, Rewrite::Jump(_, args)) => args.push(value),
-            (EdgeArm::True, Rewrite::Branch(_, _, args, _, _)) => args.push(value),
-            (EdgeArm::False, Rewrite::Branch(_, _, _, _, args)) => args.push(value),
-            _ => unreachable!(),
-        }
-    }
-
-    fn retarget_edge_to_split(rewrite: &mut Rewrite, arm: EdgeArm, split: BasicBlock) {
-        match (arm, rewrite) {
-            (EdgeArm::True, Rewrite::Branch(_, target, args, _, _)) => {
-                *target = split;
-                args.clear();
-            }
-            (EdgeArm::False, Rewrite::Branch(_, _, _, target, args)) => {
-                *target = split;
-                args.clear();
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    fn apply_rewrites(data: &mut ArenaContextMut<'_>, rewrites: HashMap<Inst, Rewrite>) {
-        for (terminator, rewrite) in rewrites {
-            match rewrite {
-                Rewrite::Jump(target, args) => {
-                    data.replace_inst_with(terminator).jump(target, args);
-                }
-                Rewrite::Branch(cond, t_target, t_args, f_target, f_args) => {
-                    data.replace_inst_with(terminator)
-                        .branch(cond, t_target, t_args, f_target, f_args);
-                }
-            }
-        }
-    }
-
     fn apply(
         &self,
         data: &mut ArenaContextMut<'_>,
@@ -453,17 +373,14 @@ impl GVNPRE {
         edges: &[Edge],
         leaders: &[Inst],
     ) {
-        let mut rewrites = HashMap::new();
+        let mut rewrites = LogicalEdgeRewriter::new();
         for (&edge, &leader) in edges.iter().zip(leaders) {
-            let rewrite = rewrites
-                .entry(edge.terminator)
-                .or_insert_with(|| Self::rewrite_for(data, edge.terminator));
-            Self::append_edge_value(rewrite, edge.arm, leader);
+            rewrites.append_arg(data, edge, leader);
         }
 
         let ty = data.inst_data(recomputation).ty().clone();
         let param = data.new_basic_block().add_param(bb, ty);
-        Self::apply_rewrites(data, rewrites);
+        rewrites.apply(data);
         utils::visit_and_replace(data, recomputation, param);
         data.remove_layout_inst(bb, recomputation);
     }
@@ -481,11 +398,9 @@ impl GVNPRE {
         rhs: Inst,
     ) {
         let missing = edges[missing_index];
-        let mut rewrites = HashMap::new();
+        let mut rewrites = LogicalEdgeRewriter::new();
         for &edge in edges {
-            rewrites
-                .entry(edge.terminator)
-                .or_insert_with(|| Self::rewrite_for(data, edge.terminator));
+            rewrites.seed(data, edge.terminator);
         }
 
         let inserted = data.new_local_inst().binary(op, lhs, rhs);
@@ -494,24 +409,16 @@ impl GVNPRE {
                 .insert_inst_before(missing.terminator, inserted);
             missing
         } else {
-            let old_args = missing.args(data);
+            let old_args = missing.args(data).to_vec();
             let split = data
                 .new_basic_block()
                 .basic_block("gvn_pre_split".into(), vec![]);
             data.layout_mut().push_bb_back(split);
             data.layout_mut().insert_inst(split, inserted);
-            Self::retarget_edge_to_split(
-                rewrites.get_mut(&missing.terminator).unwrap(),
-                missing.arm,
-                split,
-            );
+            rewrites.retarget(data, missing, split, vec![]);
             let split_jump = data.new_local_inst().jump(bb, old_args);
             data.layout_mut().insert_inst(split, split_jump);
-            Edge {
-                from: split,
-                terminator: split_jump,
-                arm: EdgeArm::Jump,
-            }
+            Edge::new(split, split_jump, EdgeArm::Jump)
         };
 
         let ty = data.inst_data(recomputation).ty().clone();
@@ -521,22 +428,20 @@ impl GVNPRE {
                 continue;
             }
             let value = leaders[index].unwrap_or(inserted);
-            Self::append_edge_value(rewrites.get_mut(&edge.terminator).unwrap(), edge.arm, value);
+            rewrites.append_arg(data, edge, value);
         }
         if effective_missing.terminator != missing.terminator {
-            let mut split_rewrite = Self::rewrite_for(data, effective_missing.terminator);
-            Self::append_edge_value(&mut split_rewrite, EdgeArm::Jump, inserted);
-            rewrites.insert(effective_missing.terminator, split_rewrite);
+            rewrites.append_arg(data, effective_missing, inserted);
         }
 
-        Self::apply_rewrites(data, rewrites);
+        rewrites.apply(data);
         utils::visit_and_replace(data, recomputation, param);
         data.remove_layout_inst(bb, recomputation);
     }
 }
 
 impl Pass for GVNPRE {
-    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
+    fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         let (blocks, incoming) = self.reachable_edges(data);
         if blocks.is_empty() {
             return false;
@@ -773,7 +678,7 @@ mod tests {
         data.layout_mut().insert_inst(merge, recomputation);
         data.layout_mut().insert_inst(merge, ret);
 
-        let pass = GVNPRE;
+        let mut pass = GVNPRE;
         assert!(pass.run(&mut program));
         assert!(!pass.run(&mut program));
         let data = program.func_data(function);
@@ -842,7 +747,7 @@ mod tests {
         let exit_ret = data.new_local_inst().ret(Some(zero));
         data.layout_mut().insert_inst(exit, exit_ret);
 
-        let pass = GVNPRE;
+        let mut pass = GVNPRE;
         assert!(pass.run(&mut program));
         assert!(!pass.run(&mut program));
         let data = program.func_data(function);
@@ -907,7 +812,7 @@ mod tests {
         data.layout_mut().insert_inst(merge, recomputation);
         data.layout_mut().insert_inst(merge, ret);
 
-        let pass = GVNPRE;
+        let mut pass = GVNPRE;
         assert!(pass.run(&mut program));
         assert!(!pass.run(&mut program));
         let data = program.func_data(function);

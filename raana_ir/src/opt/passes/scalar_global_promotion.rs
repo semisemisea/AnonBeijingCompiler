@@ -25,7 +25,7 @@ use crate::opt::prelude::*;
 pub struct ScalarGlobalPromotion;
 
 impl Pass for ScalarGlobalPromotion {
-    fn run(&self, program: &mut Program) -> bool {
+    fn run(&mut self, program: &mut Program) -> bool {
         let may_touch = call_analysis(program);
         let eligible = eligible_globals(program);
         let mut changed = false;
@@ -73,7 +73,11 @@ fn eligible_globals(program: &Program) -> HashSet<Inst> {
             }
         }
     }
-    eligible.into_iter().filter(|(_, ok)| *ok).map(|(g, _)| g).collect()
+    eligible
+        .into_iter()
+        .filter(|(_, ok)| *ok)
+        .map(|(g, _)| g)
+        .collect()
 }
 
 /// Function -> set of globals it may load or store, transitively through
@@ -142,7 +146,12 @@ fn promote_function(
         return false;
     }
     let mut changed = false;
-    let globals: Vec<Inst> = data.global().inst_arena().datas().map(|(i, _)| *i).collect();
+    let globals: Vec<Inst> = data
+        .global()
+        .inst_arena()
+        .datas()
+        .map(|(i, _)| *i)
+        .collect();
     for global in globals {
         if !eligible.contains(&global) {
             continue;
@@ -177,7 +186,10 @@ fn promotable_in(
     for layout in data.layout().basicblocks() {
         for &inst in layout.insts() {
             if let InstKind::Call(call) = data.inst_data(inst).kind() {
-                if may_touch.get(&call.callee()).is_some_and(|g| g.contains(&global)) {
+                if may_touch
+                    .get(&call.callee())
+                    .is_some_and(|g| g.contains(&global))
+                {
                     return false;
                 }
             }
@@ -240,8 +252,14 @@ fn promote(data: &mut ArenaContextMut<'_>, global: Inst) -> bool {
     // whose arena can address global instructions (FunctionData's Arena
     // cannot).
     let entry_load = builder(data).insert_inst(inst_kind::Load::new_data(global, pointee.clone()));
-    let entry_first = *data.layout().basicblock(entry_bb).insts().get_first().unwrap();
-    data.layout_mut().insert_inst_before(entry_first, entry_load);
+    let entry_first = *data
+        .layout()
+        .basicblock(entry_bb)
+        .insts()
+        .get_first()
+        .unwrap();
+    data.layout_mut()
+        .insert_inst_before(entry_first, entry_load);
 
     // Thread the value through the CFG in dominator-tree pre-order.
     let dom_tree = dom_tree::build_dominance_tree(&idom_map, rpo_path.len());
@@ -335,7 +353,13 @@ fn thread(
         pushes += 1;
     }
 
-    let insts: Vec<Inst> = data.layout().basicblock(bb).insts().iter().copied().collect();
+    let insts: Vec<Inst> = data
+        .layout()
+        .basicblock(bb)
+        .insts()
+        .iter()
+        .copied()
+        .collect();
     for inst in insts {
         if inst == entry_load {
             continue;
@@ -413,4 +437,3 @@ fn thread(
         stack.pop();
     }
 }
-

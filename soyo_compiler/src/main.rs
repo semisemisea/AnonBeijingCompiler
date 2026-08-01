@@ -51,9 +51,9 @@ fn run(args: cli::Arg) -> Result<(), String> {
     let mut program = ctx.program;
 
     if args.opt_level > 0 {
-        let pass_manager = match args.target {
-            cli::Target::Aarch64 => raana_ir::opt::pass::PassesManager::aarch64_ref(),
-            cli::Target::Riscv64 => raana_ir::opt::pass::PassesManager::default_ref(),
+        let mut pass_manager = match args.target {
+            cli::Target::Aarch64 => raana_ir::opt::pass::PassesManager::aarch64(),
+            cli::Target::Riscv64 => raana_ir::opt::pass::PassesManager::default(),
         };
         pass_manager.run_passes(&mut program);
     }

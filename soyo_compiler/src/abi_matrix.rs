@@ -89,7 +89,10 @@ fn compile_sy(source: &str, target: Target, opt_level: u8) -> String {
     ast.convert(&mut ctx);
     let mut program = ctx.program;
     if opt_level > 0 {
-        let pass_manager = raana_ir::opt::pass::PassesManager::aarch64_ref();
+        let mut pass_manager = match target {
+            Target::Aarch64 => raana_ir::opt::pass::PassesManager::aarch64(),
+            Target::Riscv64 => raana_ir::opt::pass::PassesManager::default(),
+        };
         pass_manager.run_passes(&mut program);
     }
     let aarch64_config = match opt_level {
@@ -231,7 +234,7 @@ mod tests {
         let mut ctx = AstGenContext::new();
         ast.convert(&mut ctx);
         let mut program = ctx.program;
-        let pass_manager = raana_ir::opt::pass::PassesManager::aarch64_ref();
+        let mut pass_manager = raana_ir::opt::pass::PassesManager::aarch64();
         pass_manager.run_passes(&mut program);
         let config = AArch64CodegenConfig {
             dce: true,
@@ -271,7 +274,7 @@ mod tests {
         let mut ctx = AstGenContext::new();
         ast.convert(&mut ctx);
         let mut program = ctx.program;
-        let pass_manager = raana_ir::opt::pass::PassesManager::aarch64_ref();
+        let mut pass_manager = raana_ir::opt::pass::PassesManager::aarch64();
         pass_manager.run_passes(&mut program);
         let config = AArch64CodegenConfig {
             dce: true,
@@ -305,7 +308,7 @@ mod tests {
         let mut ctx = AstGenContext::new();
         ast.convert(&mut ctx);
         let mut program = ctx.program;
-        let pass_manager = raana_ir::opt::pass::PassesManager::aarch64_ref();
+        let mut pass_manager = raana_ir::opt::pass::PassesManager::aarch64();
         pass_manager.run_passes(&mut program);
         let config = AArch64CodegenConfig {
             dce: true,
@@ -376,7 +379,8 @@ mod tests {
 
     #[test]
     fn branch_optimization_off_keeps_two_instruction_form() {
-        let source = "int g(int x) { if (x > 3) { return x; } return 0; }\nint main() { return g(2); }\n";
+        let source =
+            "int g(int x) { if (x > 3) { return x; } return 0; }\nint main() { return g(2); }\n";
         let off = compile_with_branch_opt(source, false);
         let on = compile_with_branch_opt(source, true);
         assert!(!function_stats(&off, "g").branch_opt.ran);
@@ -388,5 +392,4 @@ mod tests {
             "the -O0-style two-instruction form must be strictly larger:\n{off_g}\n{on_g}"
         );
     }
-
 }

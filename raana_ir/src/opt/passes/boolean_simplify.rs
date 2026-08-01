@@ -7,7 +7,7 @@ use crate::opt::prelude::*;
 pub struct BooleanSimplification;
 
 impl Pass for BooleanSimplification {
-    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
+    fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         let mut changed = false;
         loop {
             let insts = data

@@ -89,6 +89,30 @@ impl Layout {
         index
     }
 
+    /// Insert a fresh block immediately before an existing layout block.
+    ///
+    /// Inserting before the current entry changes `entry_bb()`. Callers that
+    /// cannot migrate function parameters must reject that case beforehand.
+    pub(crate) fn insert_bb_before(
+        &mut self,
+        before: BasicBlock,
+        bb: BasicBlock,
+    ) -> index_list::ListIndex {
+        assert!(
+            !self.back.contains_key(&bb),
+            "block is already in the layout"
+        );
+        let before_index = *self
+            .back
+            .get(&before)
+            .expect("anchor block must be in the layout");
+        let index = self
+            .bbs
+            .insert_before(before_index, BasicBlockLayout::new(bb));
+        self.back.insert(bb, index);
+        index
+    }
+
     pub fn entry_bb(&self) -> Option<&BasicBlockLayout> {
         self.bbs.get(self.bbs.first_index())
     }
@@ -102,6 +126,19 @@ impl Layout {
         self.parent.insert(inst, bb);
         let idx = self.basicblock_mut(bb).insts.insert_last(inst);
         self.basicblock_mut(bb).back.insert(inst, idx);
+    }
+
+    pub fn insert_before_terminator(&mut self, bb: BasicBlock, inst: Inst) {
+        assert!(self.back.contains_key(&bb), "block must be in the layout");
+        assert!(
+            !self.parent.contains_key(&inst),
+            "instruction is already in the layout"
+        );
+        self.parent.insert(inst, bb);
+        let bb_layout_mut = self.basicblock_mut(bb);
+        let last = bb_layout_mut.insts.last_index();
+        let idx = bb_layout_mut.insts.insert_before(last, inst);
+        bb_layout_mut.back.insert(inst, idx);
     }
 
     pub fn insert_inst_before(&mut self, before: Inst, inst: Inst) {
@@ -306,5 +343,57 @@ mod tests {
             .binary(crate::ir::BinaryOp::Sub, mul, one);
         data.layout_mut().insert_inst_before(ret, before_ret);
         assert_eq!(data.layout().parent_bb(before_ret), Some(tail));
+    }
+
+    #[test]
+    fn inserts_a_block_before_an_anchor_without_changing_entry() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "blocks".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let header = data.new_basic_block().basic_block("header".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        data.layout_mut().push_bb_back(header);
+        data.layout_mut().push_bb_back(exit);
+
+        let preheader = data
+            .new_basic_block()
+            .basic_block("preheader".into(), vec![Type::get_i32()]);
+        let parameter = data.bb_data(preheader).params()[0];
+        data.layout_mut().insert_bb_before(header, preheader);
+
+        assert_eq!(
+            data.layout()
+                .basicblocks()
+                .iter()
+                .map(|layout| layout.bb())
+                .collect::<Vec<_>>(),
+            vec![entry, preheader, header, exit]
+        );
+        assert_eq!(data.layout().entry_bb().unwrap().bb(), entry);
+        assert!(data.layout().basicblock(preheader).insts().is_empty());
+        assert_eq!(data.layout().parent_bb(parameter), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "block is already in the layout")]
+    fn rejects_inserting_a_layout_block_twice() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "duplicate".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        data.layout_mut().insert_bb_before(entry, entry);
+    }
+
+    #[test]
+    #[should_panic(expected = "anchor block must be in the layout")]
+    fn rejects_a_missing_block_anchor() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "missing".into(), vec![]);
+        let data = program.func_data_mut(function);
+        data.add_entry_block();
+        let missing = data.new_basic_block().basic_block("missing".into(), vec![]);
+        let block = data.new_basic_block().basic_block("block".into(), vec![]);
+        data.layout_mut().insert_bb_before(missing, block);
     }
 }

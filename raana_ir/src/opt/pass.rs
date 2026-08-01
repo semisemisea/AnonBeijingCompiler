@@ -1,5 +1,3 @@
-use std::sync::OnceLock;
-
 use crate::{
     ir::{Function, FunctionData, Program, arena::Arena},
     opt::passes::*,
@@ -86,7 +84,7 @@ impl Arena for ArenaContextMut<'_> {
 
 pub trait Pass: Send + Sync {
     /// Runs this pass over every function once and reports whether it changed IR.
-    fn run(&self, program: &mut Program) -> bool {
+    fn run(&mut self, program: &mut Program) -> bool {
         let func_layout = program.function_layout().to_vec();
         let mut arena_context = ArenaContextMut {
             program,
@@ -104,7 +102,7 @@ pub trait Pass: Send + Sync {
     /// Normally you should not !only! implement this function
     /// But you can implement both function at same time.
     /// Runs this pass on one function and reports whether it changed IR.
-    fn run_on(&self, _data: &mut ArenaContextMut<'_>) -> bool {
+    fn run_on(&mut self, _data: &mut ArenaContextMut<'_>) -> bool {
         false
     }
 }
@@ -134,16 +132,16 @@ impl PassesManager {
         self.fixed_point_start += 1;
     }
 
-    pub fn run_passes(&self, program: &mut Program) {
+    pub fn run_passes(&mut self, program: &mut Program) {
         const MAX_PIPELINE_ITERATIONS: usize = 100;
 
-        for pass in &self.passes[..self.fixed_point_start] {
+        for pass in &mut self.passes[..self.fixed_point_start] {
             pass.run(program);
         }
 
         for iteration in 0..MAX_PIPELINE_ITERATIONS {
             let changed = self.passes[self.fixed_point_start..]
-                .iter()
+                .iter_mut()
                 .fold(false, |changed, pass| pass.run(program) || changed);
             if !changed {
                 return;
@@ -156,22 +154,21 @@ impl PassesManager {
         }
     }
 
-    pub fn default_ref() -> &'static PassesManager {
-        DEFAULT_PASSES_LIST.get_or_init(|| Self::build_pass_list(false))
-    }
-
     /// The AArch64 pipeline: the common pipeline plus `chain_to_switch`,
     /// which shapes equality chains for the AArch64 `chain_fusion` backend
     /// pass. RISC-V keeps the common pipeline (its branches materialize
     /// conditions into registers, so the tree would not amortize).
-    pub fn aarch64_ref() -> &'static PassesManager {
-        AARCH64_PASSES_LIST.get_or_init(|| Self::build_pass_list(true))
+    pub fn aarch64() -> PassesManager {
+        Self::build_pass_list(true)
     }
 
     fn build_pass_list(with_chain_to_switch: bool) -> PassesManager {
         let mut p = PassesManager::new();
         let ssa = Box::new(ssa::SSATransform);
         p.register_initial(ssa);
+
+        let specialize = Box::new(specialize::Specialize::default());
+        p.register_initial(specialize);
 
         let inline = Box::new(inline::Inline);
         p.register_initial(inline);
@@ -205,11 +202,14 @@ impl PassesManager {
         }
 
         // Hoist loop-invariant pure expressions to the preheader.
-        let licm = Box::new(licm::Licm);
+        let licm = Box::new(licm::LICM);
         p.register(licm);
 
         let gvn = Box::new(gvn::GlobalInstNumbering);
         p.register(gvn);
+
+        let pointer_sr = Box::new(pointer_strength_reduction::PointerStrengthReduction);
+        p.register(pointer_sr);
 
         let sr = Box::new(sr::StrengthReduction);
         p.register(sr);
@@ -238,8 +238,11 @@ impl PassesManager {
     }
 }
 
-static DEFAULT_PASSES_LIST: OnceLock<PassesManager> = OnceLock::new();
-static AARCH64_PASSES_LIST: OnceLock<PassesManager> = OnceLock::new();
+impl Default for PassesManager {
+    fn default() -> Self {
+        Self::build_pass_list(false)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -253,7 +256,7 @@ mod tests {
     struct Pass(AtomicUsize);
 
     impl super::Pass for Pass {
-        fn run_on(&self, _data: &mut ArenaContextMut<'_>) -> bool {
+        fn run_on(&mut self, _data: &mut ArenaContextMut<'_>) -> bool {
             self.0.fetch_add(1, Ordering::Relaxed) == 0
         }
     }
@@ -261,7 +264,7 @@ mod tests {
     struct FirstPass(Arc<AtomicUsize>);
 
     impl super::Pass for FirstPass {
-        fn run_on(&self, _data: &mut ArenaContextMut<'_>) -> bool {
+        fn run_on(&mut self, _data: &mut ArenaContextMut<'_>) -> bool {
             self.0
                 .compare_exchange(1, 2, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
@@ -271,7 +274,7 @@ mod tests {
     struct SecondPass(Arc<AtomicUsize>);
 
     impl super::Pass for SecondPass {
-        fn run_on(&self, _data: &mut ArenaContextMut<'_>) -> bool {
+        fn run_on(&mut self, _data: &mut ArenaContextMut<'_>) -> bool {
             self.0
                 .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
@@ -282,10 +285,10 @@ mod tests {
     fn run_reports_per_function_changes() {
         let mut program = Program::new();
         program.new_function(crate::ir::Type::get_unit(), "test".into(), vec![]);
-        let pass = Pass(AtomicUsize::new(0));
+        let mut pass = Pass(AtomicUsize::new(0));
 
-        assert!(super::Pass::run(&pass, &mut program));
-        assert!(!super::Pass::run(&pass, &mut program));
+        assert!(super::Pass::run(&mut pass, &mut program));
+        assert!(!super::Pass::run(&mut pass, &mut program));
         assert_eq!(pass.0.load(Ordering::Relaxed), 2);
     }
 

@@ -3,7 +3,7 @@ use crate::opt::prelude::*;
 pub struct SimplifyCFG;
 
 impl Pass for SimplifyCFG {
-    fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
+    fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         if data.layout().entry_bb().is_none() {
             return false;
         }
@@ -110,11 +110,11 @@ impl SimplifyCFG {
             },
             Branch {
                 to_modify: Inst,
-                is_true_branch: bool,
-                new: BasicBlock,
                 cond: Inst,
-                another_target: BasicBlock,
-                another_args: Vec<Inst>,
+                t_target: BasicBlock,
+                t_args: Vec<Inst>,
+                f_target: BasicBlock,
+                f_args: Vec<Inst>,
             },
         }
 
@@ -130,6 +130,11 @@ impl SimplifyCFG {
             if !(jump.args().is_empty() && data.bb_data(bb_layout.bb()).params().is_empty()) {
                 continue;
             }
+            // Removing a self-jumping block would leave its predecessors
+            // targeting a block that is no longer in the function layout.
+            if jump.target() == bb_layout.bb() {
+                continue;
+            }
             for &used in data.bb_data(bb_layout.bb()).used_by() {
                 match data.inst_data(used).kind() {
                     InstKind::Jump(..) => {
@@ -139,19 +144,21 @@ impl SimplifyCFG {
                         });
                     }
                     InstKind::Branch(branch) => {
-                        let is_true_branch = branch.t_target() == bb_layout.bb();
-                        let (another_target, another_args) = if is_true_branch {
-                            (branch.f_target(), branch.f_args().to_vec())
-                        } else {
-                            (branch.t_target(), branch.t_args().to_vec())
-                        };
                         edits.push(Edit::Branch {
                             to_modify: used,
-                            is_true_branch,
-                            new: jump.target(),
                             cond: branch.cond(),
-                            another_target,
-                            another_args,
+                            t_target: if branch.t_target() == bb_layout.bb() {
+                                jump.target()
+                            } else {
+                                branch.t_target()
+                            },
+                            t_args: branch.t_args().to_vec(),
+                            f_target: if branch.f_target() == bb_layout.bb() {
+                                jump.target()
+                            } else {
+                                branch.f_target()
+                            },
+                            f_args: branch.f_args().to_vec(),
                         });
                     }
                     _ => unreachable!(),
@@ -167,34 +174,93 @@ impl SimplifyCFG {
             }
             Edit::Branch {
                 to_modify,
-                is_true_branch,
-                new,
                 cond,
-                another_target,
-                another_args,
+                t_target,
+                t_args,
+                f_target,
+                f_args,
             } => {
-                if is_true_branch {
-                    data.replace_inst_with(to_modify).branch(
-                        cond,
-                        new,
-                        vec![],
-                        another_target,
-                        another_args,
-                    );
-                } else {
-                    data.replace_inst_with(to_modify).branch(
-                        cond,
-                        another_target,
-                        another_args,
-                        new,
-                        vec![],
-                    );
-                }
+                data.replace_inst_with(to_modify)
+                    .branch(cond, t_target, t_args, f_target, f_args);
             }
         });
         trivial_block.into_iter().for_each(|bb| {
-            data.curr_func_data_mut().layout_mut().remove_basicblock(bb);
+            data.curr_func_data_mut().remove_layout_basicblock(bb);
         });
         changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ir::{Program, Type, builder_trait::*},
+        opt::utils::cfg::CFG,
+    };
+
+    #[test]
+    fn keeps_trivial_self_loop_in_layout() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "self_loop".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let loop_block = data.new_basic_block().basic_block("loop".into(), vec![]);
+        data.layout_mut().push_bb_back(loop_block);
+
+        let enter = data.new_local_inst().jump(loop_block, vec![]);
+        data.layout_mut().insert_inst(entry, enter);
+        let backedge = data.new_local_inst().jump(loop_block, vec![]);
+        data.layout_mut().insert_inst(loop_block, backedge);
+
+        let mut context = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(function),
+        };
+        assert!(!SimplifyCFG::remove_trivial_jump_block(&mut context));
+        assert!(CFG::new(context.curr_func_data()).is_some());
+        assert_eq!(
+            context
+                .curr_func_data()
+                .layout()
+                .basicblock(loop_block)
+                .terminator(),
+            backedge
+        );
+    }
+
+    #[test]
+    fn redirects_both_same_target_branch_arms() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "same_target".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let trivial = data.new_basic_block().basic_block("trivial".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        data.layout_mut().push_bb_back(trivial);
+        data.layout_mut().push_bb_back(exit);
+
+        let cond = data.new_local_inst().integer(1);
+        let branch = data
+            .new_local_inst()
+            .branch(cond, trivial, vec![], trivial, vec![]);
+        data.layout_mut().insert_inst(entry, branch);
+        let bypass = data.new_local_inst().jump(exit, vec![]);
+        data.layout_mut().insert_inst(trivial, bypass);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        let mut context = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(function),
+        };
+        assert!(SimplifyCFG::remove_trivial_jump_block(&mut context));
+        let InstKind::Branch(branch_data) = context.inst_data(branch).kind() else {
+            panic!("entry terminator must remain a branch");
+        };
+        assert_eq!(branch_data.t_target(), exit);
+        assert_eq!(branch_data.f_target(), exit);
+        assert!(!context.bb_data(exit).used_by().contains(&bypass));
+        assert!(CFG::new(context.curr_func_data()).is_some());
     }
 }

@@ -842,6 +842,28 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         true
     }
 
+    /// Atomically mark two producers consumed by the same intermediate, which
+    /// is itself consumed by `root`. Used when a `band`/`bor` of two single-use
+    /// comparisons is folded into a flag chain (ccmp) while lowering `root`.
+    pub fn sink_pure_single_use_pair(
+        &mut self,
+        producer_a: HirInst,
+        producer_b: HirInst,
+        intermediate: HirInst,
+        root: HirInst,
+    ) -> bool {
+        if !self.can_sink_pure_single_use_producer(producer_a, intermediate, root)
+            || !self.can_sink_pure_single_use_producer(producer_b, intermediate, root)
+            || !self.can_sink_pure_single_use_producer(intermediate, root, root)
+        {
+            return false;
+        }
+        self.inst_sunk.insert(producer_a);
+        self.inst_sunk.insert(producer_b);
+        self.inst_sunk.insert(intermediate);
+        true
+    }
+
     fn can_sink_pure_single_use_producer(
         &self,
         producer: HirInst,

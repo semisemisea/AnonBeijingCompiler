@@ -59,8 +59,23 @@
    与 clang 结构一致；与 clang 的差距（`ccmp`、`subs` 融合）留给 M32/M33。
    单测覆盖累加器、land/lor 折叠、链式 arm；abi_matrix 的 R4 用例改用
    call-arm 形状；全 corpus QEMU 差分通过。
+- CondResult + ccmp 后端机制（M32）：`taki_mir::lower` 新增
+   `sink_pure_single_use_pair` 原子下沉两个单用纯比较；`anon_armv8` 新增
+   `MInst::CCmp { size, lhs, rhs|imm, nzcv, cond }` 与
+   `CmpSelect::ccmp`（链式 `cmp; ccmp…; csel/cset`），`lower_select`/
+   `select_branch_condition` 对 `band/bor(b1,b2)`（单用纯比较）生成
+   `cmp; ccmp; csel/b.cc`，And=`#0,eq`、Or=`#4,ne`（对照 clang `_and`/
+   `_or`），branch 路径用 `cond_result_invert` 的 De Morgan 反转。
+   踩坑两处：(a) `ccmp` 立即数是 5 位（0..=31）而非 12 位，超范围需
+   `movz`+寄存器回退（`ccmp_operands`）；(b) `nzcv_making_cond_false(Le)`
+   原为 `#8`（N=1,V=0 → `N!=V` → LE 真）应落 `#0`（Z=0、N=V），否则
+   `while (ch >= 48 && ch <= 57)` 的 and 链在 ccmp 未执行时误入数字循环
+   体导致 SIGSEGV（BFS/DFS/DSU 回归）。新增 `ccmp_nzcv_fallbacks_*`
+   单测逐一验证 14 条件 × true/false 回退值；huffman-01 686 → 640
+   （`_and/_xor/_or` 内循环 `cmp; ccmp; csel`，8 条/迭代与 clang 持平）；
+   全 corpus QEMU 差分、40/40 h_functional、109/109 functional 通过。
 
-备注：M27/M30/M31 已完成并独立提交；M28（RISC-V slot 化）待做。
+备注：M27/M30/M31/M32 已完成并独立提交；M28（RISC-V slot 化）待做。
 
 目标硬件是 Xilinx XCZU15EG 上的 Cortex-A53 MPCore。
 
@@ -106,26 +121,19 @@ DCE。相关 pass 见 `raana_ir/src/opt/passes/`。
 
 ### 1.2 现状与差距总览（huffman-01 对照 clang -O2）
 
-M31 基线：huffman-01 静态指令数 686（awk 方法，M30 基线 706）。对照
-`results/perf/huffman-01_clang.s`（clang -O2），差距集中在后端标志
-融合、循环不变量与外提：
+M32 基线：huffman-01 静态指令数 640（awk 方法，M31 基线 686）。对照
+`results/perf/huffman-01_clang.s`（clang -O2），差距集中在循环不变量
+外提与 RA 拷贝消除：
 
 | 函数 | clang | 本项目 | 差距根因 |
 |---|---|---|---|
-| `_and/_xor/_or` 循环体（32 次迭代） | ~10 条/迭代：`ccmp`+`csel` 无分支 | ~20 条/迭代：无分支（`cset`+`band/bor`+`cset`+`cmp`+`csel`），但比较/标志未融合；回边仍有 mov | 无 ccmp；无 subs/tst 融合；RA 拷贝未消除 |
-| `rotrN/rotlN` | 二分比较树（最坏 ~3 次 cmp） | 8 次线性 cmp 链（内联后重复复制） | 无 if 链→switch/决策树 |
-| `read_bits`（热点，2000×10⁵/5 调用） | 全局一次载入寄存器、出口统一写回；switch 表提取；无函数调用 | 循环内重复 `adrp+ldr` 全局；循环体 store 回写；热循环保留 `bl rotlN`（栈帧+8-cmp 链）；尾部内联 rotrN 8-cmp 链 | 缺 GSP/LICM；内联仅"单调用点"；无链→switch |
-| `output_data` | `gv_out_num` 一次加载；尾调用 `b putch` | 重复加载 3 次；`bl putch`+栈帧 | 缺 load-CSE/GSP；TCO 未覆盖 if 链末尾调用 |
-| `decode_fixed_huffman` | 等价结构 | 死空块跳转 `then_13: b while_entry_5` | simplify_cfg 缺口 |
+| `_and/_xor/_or` 循环体（32 次迭代） | ~10 条/迭代：`ccmp`+`csel` 无分支 | 8 条/迭代：`cmp`+`ccmp`+`csel` 无分支（M32 后与 clang 持平） | 回边仍有 mov（M35）；循环计数 `subs` 融合（M33） |
+| `rotrN/rotlN` | 二分比较树（最坏 ~3 次 cmp） | 8 次线性 cmp 链（内联后重复复制） | 无 if 链→switch/决策树（M37） |
+| `read_bits`（热点，2000×10⁵/5 调用） | 全局一次载入寄存器、出口统一写回；switch 表提取；无函数调用 | 循环内重复 `adrp+ldr` 全局；循环体 store 回写；热循环保留 `bl rotlN`（栈帧+8-cmp 链） | 缺 GSP/LICM（M34）；内联仅"单调用点"（M36） |
+| `output_data` | `gv_out_num` 一次加载；尾调用 `b putch` | 重复加载 3 次；`bl putch`+栈帧 | 缺 load-CSE/GSP（M34）；TCO 未覆盖 if 链末尾调用（M38） |
+| `decode_fixed_huffman` | 等价结构 | 死空块跳转 `then_13: b while_entry_5` | simplify_cfg 缺口（M38） |
 
-根因分层（M31 已修 IR 层 land/lor 与循环累加器，余下）：
-
-- **IR 层（raana_ir）**：无 LICM/GSP/load-CSE；内联仅"单调用点"；
-  无 if 链→switch。
-- **后端层（anon_armv8）**：无 `ccmp` 指令；`CmpSelect` 只支持直线
-  cmp+csel/cset 配对；无 `subs`/`tst` 融合；`Mov` 按 64 位宽度发射。
-- **RA 层（taki_mir ion 移植）**：回边 blockparam 拷贝未被 bundle 合并/
-  冗余移动消除命中。
+根因分层（M32 已修后端 `ccmp`，余下）：
 
 ### 1.3 当前结论边界
 
@@ -200,23 +208,16 @@ M31 基线：huffman-01 静态指令数 686（awk 方法，M30 基线 706）。�
   单测覆盖累加器、land/lor、链式 arm；abi_matrix R4 用例改用 call-arm
   形状；全 corpus QEMU 差分通过。已完成独立提交（93f43a8）。
 
-#### M32：CondResult + ccmp 后端机制
+#### M32：CondResult + ccmp 后端机制（已完成）
 
-- 文件：`anon_armv8/src/lower.rs`（`lower_select`/`select_comparison`/
-  `select_branch_condition`）、`anon_armv8/src/instructions.rs`、
-  `anon_armv8/src/regs.rs`。
-- 设计：
-  1. 新增 `MInst::CCmp { size, lhs, rhs|imm, nzcv, cond }`；`CmpSelect` 扩展
-     为链式（`cmp; ccmp…; csel/cset`，或新 `SelectCC`）；
-  2. 移植 `CondResult` 抽象：`lower_select` 匹配 `cond = Band(b1,b2)/
-     Bor(b1,b2)`（b 为单用纯比较，复用 `select_comparison` 的
-     `sink_pure_single_use_chain` 机制）→ `cmp; ccmp; csel/cset`；
-     `select_branch_condition` 同条件 → `cmp; ccmp; b.cc`；
-  3. nzcv：And=`#0,eq`、Or=`#4,ne`（对照 clang `_and`/`_or`）；8/16 位、
-     imm 操作数、反转路径补齐（移植 `cond_result_invert` 的 De Morgan）。
-- 验收：`_and/_xor/_or` 内循环 ~10 条/迭代（与 clang 持平）；emit 单测
-  （仿 `instructions.rs` `emits_adjacent_*` 系列）；`read_bits` 内联副本
-  同样受益。
+- `MInst::CCmp` + `CmpSelect::ccmp` 链式生成；`lower_select`/
+  `select_branch_condition` 对单用纯比较的 `band/bor` 生成
+  `cmp; ccmp; csel/b.cc`（And=`#0,eq`、Or=`#4,ne`）。
+- 踩坑：ccmp 立即数仅 5 位（超范围 `movz`+寄存器回退）；`Le` 的
+  `nzcv_making_cond_false` 应为 `#0`（BFS/DFS/DSU SIGSEGV 根因）。
+- 结果：huffman-01 686 → 640；`_and/_xor/_or` 内循环 8 条/迭代与 clang
+  持平；`ccmp_nzcv_fallbacks` 单测覆盖 14 条件；全 corpus QEMU 差分、
+  40/40 h_functional、109/109 functional 通过。已独立提交。
 
 #### M33：标志融合 peephole
 

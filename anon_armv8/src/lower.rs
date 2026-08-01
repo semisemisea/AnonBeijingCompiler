@@ -18,13 +18,14 @@ use taki_mir::{
 use crate::{
     abi::AArch64Abi,
     instructions::{
-        AMode, AluOp, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift, MInst, MemoryType,
-        SelectCmp, SelectValue, ShiftOp,
+        AMode, AluOp, CCmpStep, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift, MInst,
+        MemoryType, SelectCmp, SelectValue, ShiftOp,
     },
     labels::Label,
     regs::{self, OperandSize, RegOrZr},
     runtime::{self, EmbeddedSymbol},
 };
+use taki_mir::register::Reg;
 
 pub struct AArch64Backend;
 
@@ -479,47 +480,77 @@ fn lower_select(
         );
     }
 
-    let condition = select_comparison(ctx, arena, inst, select);
-    let (cmp, cond) = if let Some((binary, invert)) = condition {
-        let lhs_ty = arena.inst_data(binary.lhs()).ty().kind();
-        if matches!(lhs_ty, TypeKind::Float32) {
-            let cond = if invert {
-                invert_float_comparison_cond(binary.op())
-            } else {
-                float_comparison_cond(binary.op())
-            };
-            (
-                SelectCmp::Float {
-                    lhs: ctx.put_value_in_reg(binary.lhs()),
-                    rhs: ctx.put_value_in_reg(binary.rhs()),
-                },
-                cond,
-            )
+    // Fold `select(band(b1, b2), t, f)` / `select(bor(b1, b2), t, f)` with
+    // single-use pure comparisons into `cmp; ccmp; csel/cset`.
+    let chain = select_ccmp_chain(ctx, arena, inst, select);
+    let (cmp, ccmp, cond) = if let Some((first, second, is_and)) = chain {
+        let InstKind::Binary(first_binary) = arena.inst_data(first).kind() else {
+            unreachable!("ccmp chain operand is a binary comparison");
+        };
+        let InstKind::Binary(second_binary) = arena.inst_data(second).kind() else {
+            unreachable!("ccmp chain operand is a binary comparison");
+        };
+        let (cmp, cond1) = comparison_cmp(ctx, arena, &first_binary);
+        let (second_size, second_lhs, second_rhs, second_imm) =
+            ccmp_operands(ctx, arena, &second_binary);
+        let cond2 = comparison_cond(second_binary.op());
+        // `ccmp second, #nzcv, cond1` executes when `cond1` holds. For `and`
+        // the fallback NZCV must make the final condition false (b1 false =>
+        // whole and false); for `or` it must make it true (b1 true => whole
+        // or true). clang: and -> `#0, eq`, or -> `#4, ne`.
+        let (ccmp_cond, nzcv) = if is_and {
+            (cond1, nzcv_making_cond_false(cond2))
         } else {
-            let size = operand_size(lhs_ty);
-            let lhs = ctx.put_value_in_reg(binary.lhs());
-            let cmp =
-                if let Some(imm) = integer_constant(arena, binary.rhs()).and_then(positive_imm12) {
+            (invert_cond(cond1), nzcv_making_cond_true(cond2))
+        };
+        let ccmp = CCmpStep {
+            size: second_size,
+            lhs: second_lhs,
+            rhs: second_rhs,
+            imm: second_imm,
+            nzcv,
+            cond: ccmp_cond,
+        };
+        (cmp, Some(Box::new(ccmp)), cond2)
+    } else {
+        // Fall back to a single comparison or a compare-against-zero.
+        let condition = select_comparison(ctx, arena, inst, select);
+        let (cmp, cond) = if let Some((binary, invert)) = condition {
+            let lhs_ty = arena.inst_data(binary.lhs()).ty().kind();
+            if matches!(lhs_ty, TypeKind::Float32) {
+                let cond = if invert {
+                    invert_float_comparison_cond(binary.op())
+                } else {
+                    float_comparison_cond(binary.op())
+                };
+                (
+                    SelectCmp::Float {
+                        lhs: ctx.put_value_in_reg(binary.lhs()),
+                        rhs: ctx.put_value_in_reg(binary.rhs()),
+                    },
+                    cond,
+                )
+            } else {
+                let (size, lhs, rhs, imm) = comparison_operands(ctx, arena, &binary);
+                let cmp = if let Some(imm) = imm {
                     SelectCmp::IntImm { size, lhs, imm }
                 } else {
-                    SelectCmp::IntRR {
-                        size,
-                        lhs,
-                        rhs: RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs())),
-                    }
+                    SelectCmp::IntRR { size, lhs, rhs }
                 };
-            let cond = comparison_cond(binary.op());
-            (cmp, if invert { invert_cond(cond) } else { cond })
-        }
-    } else {
-        (
-            SelectCmp::IntImm {
-                size: OperandSize::Size32,
-                lhs: ctx.put_value_in_reg(select.cond()),
-                imm: Imm12::new(0, false).unwrap(),
-            },
-            Cond::Ne,
-        )
+                let cond = comparison_cond(binary.op());
+                (cmp, if invert { invert_cond(cond) } else { cond })
+            }
+        } else {
+            (
+                SelectCmp::IntImm {
+                    size: OperandSize::Size32,
+                    lhs: ctx.put_value_in_reg(select.cond()),
+                    imm: Imm12::new(0, false).unwrap(),
+                },
+                Cond::Ne,
+            )
+        };
+        (cmp, None, cond)
     };
 
     let result = ctx.result_reg(inst);
@@ -556,8 +587,176 @@ fn lower_select(
         (cond, value)
     };
 
-    ctx.emit(MInst::CmpSelect { cmp, cond, value });
+    ctx.emit(MInst::CmpSelect { cmp, ccmp, cond, value });
     LoweredOutput::Value(result)
+}
+
+/// Match `cond = band(b1, b2)` / `cond = bor(b1, b2)` where both `b1` and
+/// `b2` are single-use, pure, integer comparisons. Returns `(b1, b2, is_and)`
+/// as HIR instructions.
+fn select_ccmp_chain(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    select: &Select,
+) -> Option<(HirInst, HirInst, bool)> {
+    let cond = select.cond();
+    let chain = ccmp_chain_operands(ctx, arena, cond, inst)?;
+    if !ctx.sink_pure_single_use_pair(chain.0, chain.1, cond, inst) {
+        return None;
+    }
+    Some(chain)
+}
+
+/// Same detection for a branch condition.
+fn branch_ccmp_chain(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    branch: HirInst,
+    cond: HirInst,
+) -> Option<(HirInst, HirInst, bool)> {
+    let chain = ccmp_chain_operands(ctx, arena, cond, branch)?;
+    if !ctx.sink_pure_single_use_pair(chain.0, chain.1, cond, branch) {
+        return None;
+    }
+    Some(chain)
+}
+
+/// Recognize `band(b1, b2)` / `bor(b1, b2)` of two single-use, pure, integer
+/// comparisons without claiming anything yet. Returns the two operand HIR
+/// instructions and whether the combine is `and`.
+fn ccmp_chain_operands(
+    ctx: &LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    cond: HirInst,
+    root: HirInst,
+) -> Option<(HirInst, HirInst, bool)> {
+    let InstKind::Binary(outer) = arena.inst_data(cond).kind() else {
+        return None;
+    };
+    let (is_and, first, second) = match outer.op() {
+        BinaryOp::And => (true, outer.lhs(), outer.rhs()),
+        BinaryOp::Or => (false, outer.lhs(), outer.rhs()),
+        _ => return None,
+    };
+    if !has_only_user(ctx, cond, root) {
+        return None;
+    }
+    let InstKind::Binary(first_binary) = arena.inst_data(first).kind() else {
+        return None;
+    };
+    let InstKind::Binary(second_binary) = arena.inst_data(second).kind() else {
+        return None;
+    };
+    if !is_comparison(first_binary.op()) || !is_comparison(second_binary.op()) {
+        return None;
+    }
+    if !has_only_user(ctx, first, cond) || !has_only_user(ctx, second, cond) {
+        return None;
+    }
+    let first_ty = arena.inst_data(first_binary.lhs()).ty().kind();
+    let second_ty = arena.inst_data(second_binary.lhs()).ty().kind();
+    if matches!(first_ty, TypeKind::Float32) || matches!(second_ty, TypeKind::Float32) {
+        return None;
+    }
+    Some((first, second, is_and))
+}
+
+/// Return the comparison operands as a `(size, lhs, rhs, imm)` tuple, with
+/// `imm = Some` when the RHS is a legal positive 12-bit immediate.
+#[allow(clippy::type_complexity)]
+fn comparison_operands(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    binary: &Binary,
+) -> (OperandSize, Reg, RegOrZr, Option<Imm12>) {
+    let size = operand_size(arena.inst_data(binary.lhs()).ty().kind());
+    let lhs = ctx.put_value_in_reg(binary.lhs());
+    let imm = integer_constant(arena, binary.rhs()).and_then(positive_imm12);
+    let rhs = if imm.is_some() {
+        RegOrZr::Zr
+    } else {
+        RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs()))
+    };
+    (size, lhs, rhs, imm)
+}
+
+/// Comparison operands for a `ccmp`: the immediate operand is 5-bit
+/// (0..=31), so constants outside that range fall back to a register.
+#[allow(clippy::type_complexity)]
+fn ccmp_operands(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    binary: &Binary,
+) -> (OperandSize, Reg, RegOrZr, Option<Imm12>) {
+    let size = operand_size(arena.inst_data(binary.lhs()).ty().kind());
+    let lhs = ctx.put_value_in_reg(binary.lhs());
+    let imm = integer_constant(arena, binary.rhs())
+        .filter(|value| (0..=31).contains(value))
+        .and_then(|value| Imm12::new(value as u16, false));
+    let rhs = if imm.is_some() {
+        RegOrZr::Zr
+    } else {
+        RegOrZr::Reg(ctx.put_value_in_reg(binary.rhs()))
+    };
+    (size, lhs, rhs, imm)
+}
+
+/// Build the flag-producing comparison for `binary` alone.
+fn comparison_cmp(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    binary: &Binary,
+) -> (SelectCmp, Cond) {
+    let (size, lhs, rhs, imm) = comparison_operands(ctx, arena, binary);
+    let cmp = if let Some(imm) = imm {
+        SelectCmp::IntImm { size, lhs, imm }
+    } else {
+        SelectCmp::IntRR { size, lhs, rhs }
+    };
+    (cmp, comparison_cond(binary.op()))
+}
+
+/// A 4-bit NZCV value that makes `cond` evaluate to false (the fallback
+/// written by `ccmp` when its condition does not hold, for `band`).
+fn nzcv_making_cond_false(cond: Cond) -> u8 {
+    match cond {
+        Cond::Eq => 0,   // Z=0
+        Cond::Ne => 4,   // Z=1
+        Cond::Hs => 0,   // C=0
+        Cond::Lo => 2,   // C=1
+        Cond::Mi => 0,   // N=0
+        Cond::Pl => 8,   // N=1
+        Cond::Vs => 0,   // V=0
+        Cond::Vc => 1,   // V=1
+        Cond::Hi => 4,   // Z=1
+        Cond::Ls => 2,   // C=1,Z=0
+        Cond::Ge => 8,   // N=1,V=0
+        Cond::Lt => 0,   // N=0,V=0
+        Cond::Gt => 4,   // Z=1
+        Cond::Le => 0,   // Z=0,N=0,V=0
+    }
+}
+
+/// A 4-bit NZCV value that makes `cond` evaluate to true (the fallback
+/// written by `ccmp` when its condition does not hold, for `bor`).
+fn nzcv_making_cond_true(cond: Cond) -> u8 {
+    match cond {
+        Cond::Eq => 4,   // Z=1
+        Cond::Ne => 0,   // Z=0
+        Cond::Hs => 2,   // C=1
+        Cond::Lo => 0,   // C=0
+        Cond::Mi => 8,   // N=1
+        Cond::Pl => 0,   // N=0
+        Cond::Vs => 1,   // V=1
+        Cond::Vc => 0,   // V=0
+        Cond::Hi => 2,   // C=1,Z=0
+        Cond::Ls => 4,   // Z=1
+        Cond::Ge => 0,   // N=0,V=0
+        Cond::Lt => 8,   // N=1,V=0
+        Cond::Gt => 0,   // Z=0,N=0,V=0
+        Cond::Le => 4,   // Z=1
+    }
 }
 
 fn select_comparison(
@@ -977,6 +1176,49 @@ fn select_branch_condition(
     false_target: MirBlockIndex,
 ) -> bool {
     let arena = ctx.arena;
+    // Fold `br band(b1, b2)` / `br bor(b1, b2)` into `cmp; ccmp; b.cc`.
+    if let Some((first, second, is_and)) = branch_ccmp_chain(ctx, arena, branch, cond) {
+        let InstKind::Binary(first_binary) = arena.inst_data(first).kind() else {
+            unreachable!("ccmp chain operand is a binary comparison");
+        };
+        let InstKind::Binary(second_binary) = arena.inst_data(second).kind() else {
+            unreachable!("ccmp chain operand is a binary comparison");
+        };
+        let (size, lhs, rhs, imm) = comparison_operands(ctx, arena, &first_binary);
+        if let Some(imm) = imm {
+            ctx.emit(MInst::CmpImm { size, lhs, imm });
+        } else {
+            ctx.emit(MInst::CmpRR { size, lhs, rhs });
+        }
+        let cond1 = comparison_cond(first_binary.op());
+        let (second_size, second_lhs, second_rhs, second_imm) =
+            ccmp_operands(ctx, arena, &second_binary);
+        let cond2 = comparison_cond(second_binary.op());
+        let (ccmp_cond, nzcv) = if is_and {
+            (cond1, nzcv_making_cond_false(cond2))
+        } else {
+            (invert_cond(cond1), nzcv_making_cond_true(cond2))
+        };
+        ctx.emit(MInst::CCmp {
+            size: second_size,
+            lhs: second_lhs,
+            rhs: second_rhs,
+            imm: second_imm,
+            nzcv,
+            cond: ccmp_cond,
+        });
+        let (true_label, false_label) = (
+            Label::from_block(true_target),
+            Label::from_block(false_target),
+        );
+        ctx.emit(MInst::CondBr {
+            cond: cond2,
+            true_label,
+            false_label,
+        });
+        return true;
+    }
+
     let InstKind::Binary(outer) = arena.inst_data(cond).kind() else {
         return false;
     };
@@ -1822,7 +2064,8 @@ fn float_comparison_cond(op: BinaryOp) -> Cond {
 
 #[cfg(test)]
 mod tests {
-    use super::signed_power_of_two;
+    use super::{nzcv_making_cond_false, nzcv_making_cond_true, signed_power_of_two};
+    use crate::instructions::Cond;
     use crate::instructions::MInst;
     use raana_ir::ir::{BinaryOp, Program, Type};
     use taki_mir::{
@@ -2039,6 +2282,66 @@ mod tests {
                 assert_eq!(quotient, expected_quotient, "{dividend} / {divisor}");
                 assert_eq!(remainder, expected_remainder, "{dividend} % {divisor}");
             }
+        }
+    }
+
+    /// The NZCV fallback values written by `ccmp` must flip the named
+    /// condition against the result of the actual comparison.  A wrong
+    /// fallback silently changes the combined `band`/`bor` semantics (the
+    /// `Le => 8` bug made `LE` evaluate true when the ccmp did not run).
+    #[test]
+    fn ccmp_nzcv_fallbacks_flip_each_condition() {
+        for cond in [
+            Cond::Eq,
+            Cond::Ne,
+            Cond::Hs,
+            Cond::Lo,
+            Cond::Mi,
+            Cond::Pl,
+            Cond::Vs,
+            Cond::Vc,
+            Cond::Hi,
+            Cond::Ls,
+            Cond::Ge,
+            Cond::Lt,
+            Cond::Gt,
+            Cond::Le,
+        ] {
+            let false_flags = nzcv_making_cond_false(cond);
+            let true_flags = nzcv_making_cond_true(cond);
+            assert!(
+                !evaluates(cond, false_flags),
+                "nzcv_making_cond_false({cond:?}) = #{false_flags:x} must make it false"
+            );
+            assert!(
+                evaluates(cond, true_flags),
+                "nzcv_making_cond_true({cond:?}) = #{true_flags:x} must make it true"
+            );
+        }
+    }
+
+    /// Evaluate a condition against a bare NZCV value, using the same
+    /// definition AArch64 uses (`LE` is `Z || (N != V)`, `GT` is
+    /// `Z == 0 && N == V`, ...).
+    fn evaluates(cond: Cond, nzcv: u8) -> bool {
+        let n = nzcv >> 3 & 1 == 1;
+        let z = nzcv >> 2 & 1 == 1;
+        let v = nzcv & 1 == 1;
+        match cond {
+            Cond::Eq => z,
+            Cond::Ne => !z,
+            Cond::Hs => nzcv >> 1 & 1 == 1,
+            Cond::Lo => nzcv >> 1 & 1 == 0,
+            Cond::Mi => n,
+            Cond::Pl => !n,
+            Cond::Vs => v,
+            Cond::Vc => !v,
+            Cond::Hi => nzcv >> 1 & 1 == 1 && !z,
+            Cond::Ls => nzcv >> 1 & 1 == 0 || z,
+            Cond::Ge => n == v,
+            Cond::Lt => n != v,
+            Cond::Gt => !z && n == v,
+            Cond::Le => z || n != v,
         }
     }
 }

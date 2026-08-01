@@ -45,8 +45,12 @@
   `veneer_lines`（AArch64：`b`；`adrp+add+br x16` 兜底）。单测覆盖前后向、
   多 veneer 小 reach 收敛、>1MB BRANCH19 用例与标签移位渲染；全 corpus
   QEMU 差分通过。
+- 基准与验证基建（M30）：`scripts/perf_compare.sh` 一键产出每 milestone
+  的 `.s` 指令数对比表（current/orig/sched/clang + gem5 sim_insts 列，
+  统计方法统一为 awk 指令计数，静态数字仅作模型级回归）；M31-M38 起点
+  基线记录在 `results/perf_compare/`。
 
-备注：M27 已完成并独立提交；M28（RISC-V slot 化）待做。
+备注：M27/M30 已完成并独立提交；M28（RISC-V slot 化）待做。
 
 目标硬件是 Xilinx XCZU15EG 上的 Cortex-A53 MPCore。
 
@@ -171,14 +175,12 @@ M26 基线：huffman-01 静态指令数 687（M25/M26 累计 -21%）。对照
 
 ### 2.4 里程碑
 
-#### M30：基准与验证基建
+#### M30：基准与验证基建（已完成）
 
-- 已有：`make gem5-run` + `gem5/a53_se.py`（A53 模型统计 sim_insts）、
-  `results/perf/` 全套产物。
-- 新增：`scripts/perf_compare.sh`——对每个 milestone 自动产出 `.s` 指令数与
-  gem5 `sim_insts` 对比表（`_orig`/`_sched`/`_clang` 对照）；raana 新 pass
-  单测模板（仿 `if_conversion.rs` 测试结构）；记录 M31-M38 起点基线。
-- 验收：一条命令产出全表；`cargo test --workspace` 全绿。
+- `scripts/perf_compare.sh` 一键产出 `.s` 指令数对比表（current/orig/
+  sched/clang + gem5 sim_insts 列，gem5 统计复用 harness 产物）；
+  M31-M38 起点基线在 `results/perf_compare/`；`cargo test --workspace`
+  全绿。已完成独立提交。
 
 #### M31：if-conversion 推广 + land/lor 折叠（IR，最大单点收益）
 

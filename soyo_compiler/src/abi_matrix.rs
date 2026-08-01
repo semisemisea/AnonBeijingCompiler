@@ -328,14 +328,14 @@ mod tests {
     #[test]
     fn branch_optimization_removes_fallthrough_and_inverts_jumps() {
         let source = "int f(int x) { if (x > 3) { return 1; } return 0; }\n\
-                      int g(int a, int b) {\n\
-                          int bit_a = a % 2;\n\
-                          int bit_b = b % 2;\n\
+                      int h(int c) { return c; }\n\
+                      int ga, gb;\n\
+                      int g() {\n\
                           int r = 0;\n\
-                          if (bit_a == 1 || bit_b == 1) { r = a + b; }\n\
+                          if (ga > 3 || gb < 2) { r = h(ga); }\n\
                           return r;\n\
                       }\n\
-                      int main() { return f(1) + g(2, 3); }\n";
+                      int main() { ga = 2; gb = 3; return f(1) + g(); }\n";
         let output = compile_with_branch_opt(source, true);
         let f = function_stats(&output, "f");
         assert!(f.branch_opt.ran);
@@ -374,4 +374,5 @@ mod tests {
             "the -O0-style two-instruction form must be strictly larger:\n{off_g}\n{on_g}"
         );
     }
+
 }

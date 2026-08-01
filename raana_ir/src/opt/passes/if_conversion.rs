@@ -1,16 +1,19 @@
 use crate::opt::prelude::*;
 
-/// Conservatively converts small, value-producing branches into `select`s.
+/// Converts small, value-producing branches into `select`s, and folds
+/// `&&`/`||` branch triangles into single `and`/`or` instructions.
 ///
-/// This deliberately handles only three canonical shapes: a branch whose two
-/// edges have the same target, an empty diamond, and a triangle containing at
-/// most one speculatable integer binary instruction.
+/// Handles four canonical shapes: a branch whose two edges have the same
+/// target, an empty diamond, a triangle containing a chain of speculatable
+/// integer instructions, and a land/lor triangle (`br c1, rhs, merge(0)`
+/// with `rhs: c2 = ...; jump merge(c2)` folding to `band(c1, c2)`).
 pub struct IfConversion;
 
 #[derive(Clone, Copy)]
 enum MergedValue {
     Common(Inst),
     Select { if_true: Inst, if_false: Inst },
+    BoolBinary { op: BinaryOp, lhs: Inst, rhs: Inst },
 }
 
 struct Candidate {
@@ -20,7 +23,7 @@ struct Candidate {
     cond: Inst,
     values: Vec<MergedValue>,
     remove_blocks: Vec<BasicBlock>,
-    move_inst: Option<(BasicBlock, Inst)>,
+    move_insts: Vec<(BasicBlock, Inst)>,
 }
 
 impl Pass for IfConversion {
@@ -77,7 +80,7 @@ impl IfConversion {
                 branch.t_args(),
                 branch.f_args(),
                 vec![],
-                None,
+                vec![],
             );
         }
 
@@ -116,22 +119,30 @@ impl IfConversion {
                     &ta,
                     &fa,
                     vec![t, f],
-                    None,
+                    vec![],
                 );
             }
         }
 
         // Triangle: one edge reaches the merge directly, the other through a
-        // unique arm with zero or one safe integer binary operation.
-        let (arm, merge, direct_args, direct_is_true) = if let Some((_, m, _)) = self.arm(data, f) {
-            if m == t {
-                (f, t, branch.t_args(), true)
+        // unique arm with a chain of safe integer operations. Prefer the
+        // true-edge-arm shape; when the merge itself is jump-terminated (a
+        // loop latch), `arm(f)` would still match and must not shadow the arm.
+        let (arm, merge, direct_args, direct_is_true) = if let Some((_, m, _)) = self.arm(data, t) {
+            if m == f {
+                (t, f, branch.f_args(), false)
+            } else if let Some((_, m2, _)) = self.arm(data, f) {
+                if m2 == t {
+                    (f, t, branch.t_args(), true)
+                } else {
+                    return None;
+                }
             } else {
                 return None;
             }
-        } else if let Some((_, m, _)) = self.arm(data, t) {
-            if m == f {
-                (t, f, branch.f_args(), false)
+        } else if let Some((_, m2, _)) = self.arm(data, f) {
+            if m2 == t {
+                (f, t, branch.t_args(), true)
             } else {
                 return None;
             }
@@ -156,6 +167,11 @@ impl IfConversion {
             return None;
         }
 
+        // The arm may hold a chain of pure integer instructions ending in the
+        // merge value (e.g. `c2 = eq(and(x, m), 1)` for a land/lor fold). Every
+        // instruction must be single-use, feed the next link or the jump, and
+        // have operands available at `head` (either dominating values or
+        // earlier chain results that are hoisted together).
         let insts = data
             .layout()
             .basicblock(arm)
@@ -163,17 +179,36 @@ impl IfConversion {
             .iter()
             .copied()
             .collect::<Vec<_>>();
-        let move_inst = match insts.as_slice() {
-            [_jump] => None,
-            [binary, _jump] if self.safe_arm_binary(data, *binary, arm_jump, head) => {
-                Some((arm, *binary))
+        // The arm may hold a chain of pure integer instructions ending in the
+        // merge value (e.g. `c2 = eq(and(x, m), 1)` for a land/lor fold).
+        // Every link must be single-use, feeding the next link (or the jump
+        // for the last link), with operands available at `head` or from an
+        // earlier link that is hoisted along with it.
+        let mut move_insts = Vec::new();
+        if insts.len() > 1 {
+            let chain_len = insts.len() - 1;
+            for (idx, &inst) in insts[..chain_len].iter().enumerate() {
+                if !self.safe_arm_binary(data, inst, head, &move_insts.iter().map(|&(_, i)| i).collect::<Vec<_>>()) {
+                    return None;
+                }
+                let users = data.inst_data(inst).used_by();
+                if users.len() != 1 {
+                    return None;
+                }
+                let feeds_next = idx + 1 < chain_len && users.contains(&insts[idx + 1]);
+                let feeds_jump = idx + 1 == chain_len && users.contains(&arm_jump);
+                if !feeds_next && !feeds_jump {
+                    return None;
+                }
+                move_insts.push((arm, inst));
             }
-            _ => return None,
-        };
-        let local = move_inst.map(|(_, inst)| inst);
+        }
         if arm_args
             .iter()
-            .any(|&value| Some(value) != local && !self.available_at(data, value, head))
+            .any(|&value| {
+                !move_insts.iter().any(|&(_, inst)| inst == value)
+                    && !self.available_at(data, value, head)
+            })
             || direct_args
                 .iter()
                 .any(|&value| !self.available_at(data, value, head))
@@ -195,7 +230,7 @@ impl IfConversion {
             true_args,
             false_args,
             vec![arm],
-            move_inst,
+            move_insts,
         )
     }
 
@@ -210,9 +245,15 @@ impl IfConversion {
         true_args: &[Inst],
         false_args: &[Inst],
         remove_blocks: Vec<BasicBlock>,
-        move_inst: Option<(BasicBlock, Inst)>,
+        move_insts: Vec<(BasicBlock, Inst)>,
     ) -> Option<Candidate> {
-        if merge == head || self.reaches(data, merge, head) {
+        // The hoisted instructions are speculated into `head`, so `head` must
+        // dominate `merge` (its operands are already checked to be available
+        // at `head`, and `safe_arm_binary` excludes div/rem). The previous
+        // `reaches(merge, head)` rejection blocked every loop-carried
+        // accumulator (`if (bit_a==1 && bit_b==1) result += power`), which is
+        // exactly the profitable case; dominance is the right precondition.
+        if merge == head || !self.dominates(data, head, merge) {
             return None;
         }
         let params = data.bb_data(merge).params();
@@ -230,13 +271,15 @@ impl IfConversion {
             }
             values.push(if if_true == if_false {
                 MergedValue::Common(if_true)
+            } else if let Some((op, lhs, rhs)) = self.fold_land_lor(data, cond, if_true, if_false) {
+                MergedValue::BoolBinary { op, lhs, rhs }
             } else {
                 MergedValue::Select { if_true, if_false }
             });
         }
         if !values
             .iter()
-            .any(|value| matches!(value, MergedValue::Select { .. }))
+            .any(|value| matches!(value, MergedValue::Select { .. } | MergedValue::BoolBinary { .. }))
         {
             return None;
         }
@@ -247,27 +290,49 @@ impl IfConversion {
             cond,
             values,
             remove_blocks,
-            move_inst,
+            move_insts,
         })
     }
 
-    fn reaches(&self, data: &ArenaContextMut<'_>, from: BasicBlock, target: BasicBlock) -> bool {
-        let mut seen = HashSet::new();
-        let mut work = VecDeque::from([from]);
-        while let Some(block) = work.pop_front() {
-            if !seen.insert(block) {
-                continue;
-            }
-            if block == target {
-                return true;
-            }
-            let Some(terminator) = data.layout().basicblock(block).insts().get_last().copied()
-            else {
-                continue;
-            };
-            work.extend(data.inst_data(terminator).bb_usage());
+    /// Fold `select(c1, c2, 0)` to `band(c1, c2)` and `select(c1, c1, c2)` to
+    /// `bor(c1, c2)` when both operands are 0/1 comparison results. This is
+    /// LLVM's `&&`/`||` lowering; Cranelift has no such pass.
+    fn fold_land_lor(
+        &self,
+        data: &ArenaContextMut<'_>,
+        cond: Inst,
+        if_true: Inst,
+        if_false: Inst,
+    ) -> Option<(BinaryOp, Inst, Inst)> {
+        // `c1 ? c2 : 0` with c1, c2 in {0,1} == `c1 && c2`.
+        if self.zero_one(data, cond)
+            && self.zero_one(data, if_true)
+            && self.is_zero_const(data, if_false)
+        {
+            return Some((BinaryOp::And, cond, if_true));
         }
-        false
+        // `c1 ? c1 : c2` with c1, c2 in {0,1} == `c1 || c2`.
+        if self.zero_one(data, cond)
+            && if_true == cond
+            && self.zero_one(data, if_false)
+        {
+            return Some((BinaryOp::Or, cond, if_false));
+        }
+        None
+    }
+
+    /// Whether a value is guaranteed to be 0 or 1: an integer comparison
+    /// result, or the constants 0/1 themselves.
+    fn zero_one(&self, data: &ArenaContextMut<'_>, value: Inst) -> bool {
+        match data.inst_data(value).kind() {
+            InstKind::Binary(binary) => binary.op().is_compare(),
+            InstKind::Integer(integer) => matches!(integer.value(), 0 | 1),
+            _ => false,
+        }
+    }
+
+    fn is_zero_const(&self, data: &ArenaContextMut<'_>, value: Inst) -> bool {
+        matches!(data.inst_data(value).kind(), InstKind::Integer(i) if i.value() == 0)
     }
 
     fn empty_arm(
@@ -298,28 +363,26 @@ impl IfConversion {
         Some((jump_inst, jump.target(), jump.args().to_vec()))
     }
 
+    /// Whether an arm instruction is speculatable: a pure i32 integer binary
+    /// (no div/rem, no side effects) whose operands are either available at
+    /// `head` or produced by an earlier chain link hoisted along with it.
     fn safe_arm_binary(
         &self,
         data: &ArenaContextMut<'_>,
         inst: Inst,
-        jump: Inst,
         head: BasicBlock,
+        chain: &[Inst],
     ) -> bool {
         let InstKind::Binary(binary) = data.inst_data(inst).kind() else {
             return false;
         };
+        let operand_ok = |value: Inst| chain.contains(&value) || self.available_at(data, value, head);
         data.inst_data(inst).ty().is_i32()
             && data.inst_data(binary.lhs()).ty().is_i32()
             && data.inst_data(binary.rhs()).ty().is_i32()
             && !matches!(binary.op(), BinaryOp::Div | BinaryOp::Rem)
-            && self.available_at(data, binary.lhs(), head)
-            && self.available_at(data, binary.rhs(), head)
-            && data
-                .inst_data(inst)
-                .used_by()
-                .iter()
-                .all(|&user| user == jump)
-            && data.inst_data(inst).used_by().contains(&jump)
+            && operand_ok(binary.lhs())
+            && operand_ok(binary.rhs())
     }
 
     fn available_at(&self, data: &ArenaContextMut<'_>, value: Inst, head: BasicBlock) -> bool {
@@ -421,10 +484,10 @@ impl IfConversion {
         // Remove the old terminator first so newly inserted values naturally
         // precede the replacement jump in layout order.
         data.remove_layout_inst(candidate.head, candidate.terminator);
-        if let Some((arm, inst)) = candidate.move_inst {
+        for (arm, inst) in &candidate.move_insts {
             // Moving preserves the instruction identity and all use-def links.
-            data.layout_mut().remove_inst(arm, inst);
-            data.layout_mut().insert_inst(candidate.head, inst);
+            data.layout_mut().remove_inst(*arm, *inst);
+            data.layout_mut().insert_inst(candidate.head, *inst);
         }
 
         let mut replacements = Vec::with_capacity(params.len());
@@ -437,6 +500,11 @@ impl IfConversion {
                         .select(candidate.cond, if_true, if_false);
                     data.layout_mut().insert_inst(candidate.head, select);
                     select
+                }
+                MergedValue::BoolBinary { op, lhs, rhs } => {
+                    let binary = data.new_local_inst().binary(op, lhs, rhs);
+                    data.layout_mut().insert_inst(candidate.head, binary);
+                    binary
                 }
             };
             replacements.push(replacement);
@@ -688,7 +756,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_same_target_loop() {
+    fn converts_same_target_loop_preserving_the_loop() {
+        // A branch whose merge reaches the head used to be rejected wholesale;
+        // M31 relaxes this to a dominance check, so the loop survives but the
+        // branch becomes a select (correct: head dominates merge, and the
+        // select's operands are all available at head).
         let mut program = Program::new();
         let function = program.new_function(Type::get_unit(), "loop".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
@@ -715,11 +787,175 @@ mod tests {
 
         run(&mut program);
         let data = program.func_data(function);
-        assert_eq!(blocks(data).len(), 2);
-        assert_eq!(select_count(data), 0);
+        assert_eq!(blocks(data).len(), 2, "loop must survive");
+        assert_eq!(select_count(data), 1);
         assert!(matches!(
-            data.inst_data(branch).kind(),
-            InstKind::Branch(..)
+            data.inst_data(backedge).kind(),
+            InstKind::Jump(j) if j.target() == head
+        ));
+    }
+
+    #[test]
+    fn folds_land_triangle_into_band() {
+        // `if (bit_a == 1 && bit_b == 1) result += power` (land shape):
+        //   head: c1 = eq ...; br c1, rhs, merge(0, ...)
+        //   rhs:  c2 = eq ...; jump merge(c2, ...)
+        // folds to band(c1, c2) in head, rhs deleted.
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_i32(), "land".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let __pty = data.params_ty().to_vec();
+        let head = data.new_basic_block().basic_block("head".into(), __pty);
+        let __params = data.bb_data(head).params().to_vec();
+
+        data.set_params(__params);
+        let rhs = data.new_basic_block().basic_block("rhs".into(), vec![]);
+        let merge = data
+            .new_basic_block()
+            .basic_block("merge".into(), vec![Type::get_i32(), Type::get_i32()]);
+        for bb in [head, rhs, merge] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let a = data.params()[0];
+        let one_a = data.new_local_inst().integer(1);
+        let c1 = data.new_local_inst().binary(BinaryOp::Eq, a, one_a);
+        data.layout_mut().insert_inst(head, c1);
+        let seven = data.new_local_inst().integer(7);
+        let pass = data.new_local_inst().binary(BinaryOp::Add, a, seven);
+        data.layout_mut().insert_inst(head, pass);
+        let zero = data.new_local_inst().integer(0);
+        let two_a = data.new_local_inst().integer(2);
+        let c2 = data.new_local_inst().binary(BinaryOp::Eq, a, two_a);
+        data.layout_mut().insert_inst(rhs, c2);
+        let branch = data.new_local_inst().branch(c1, rhs, vec![], merge, vec![zero, pass]);
+        data.layout_mut().insert_inst(head, branch);
+        let rhs_jump = data.new_local_inst().jump(merge, vec![c2, pass]);
+        data.layout_mut().insert_inst(rhs, rhs_jump);
+        let param = data.bb_data(merge).params()[0];
+        let ret = data.new_local_inst().ret(Some(param));
+        data.layout_mut().insert_inst(merge, ret);
+
+        run(&mut program);
+        let data = program.func_data(function);
+        assert_eq!(blocks(data).len(), 2, "rhs block must be removed");
+        assert_eq!(select_count(data), 0);
+        let band_count = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|layout| layout.insts())
+            .filter(|&&inst| {
+                matches!(data.inst_data(inst).kind(), InstKind::Binary(b) if b.op() == BinaryOp::And)
+                    && data.inst_data(inst).used_by().len() == 1
+            })
+            .count();
+        assert_eq!(band_count, 1, "one band must replace the land branch");
+        assert!(data.layout().parent_bb(c2).is_some_and(|bb| bb == head));
+    }
+
+    #[test]
+    fn folds_lor_triangle_into_bor() {
+        // `if (bit_a == 1 || bit_b == 1) ...` (lor shape):
+        //   head: c1 = eq ...; br c1, merge(c1, ...), rhs
+        //   rhs:  c2 = eq ...; jump merge(c2, ...)
+        // folds to bor(c1, c2) in head, rhs deleted.
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_i32(), "lor".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let __pty = data.params_ty().to_vec();
+        let head = data.new_basic_block().basic_block("head".into(), __pty);
+        let __params = data.bb_data(head).params().to_vec();
+
+        data.set_params(__params);
+        let rhs = data.new_basic_block().basic_block("rhs".into(), vec![]);
+        let merge = data
+            .new_basic_block()
+            .basic_block("merge".into(), vec![Type::get_i32(), Type::get_i32()]);
+        for bb in [head, rhs, merge] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let a = data.params()[0];
+        let one_a = data.new_local_inst().integer(1);
+        let c1 = data.new_local_inst().binary(BinaryOp::Eq, a, one_a);
+        data.layout_mut().insert_inst(head, c1);
+        let seven = data.new_local_inst().integer(7);
+        let pass = data.new_local_inst().binary(BinaryOp::Add, a, seven);
+        data.layout_mut().insert_inst(head, pass);
+        let branch = data.new_local_inst().branch(c1, merge, vec![c1, pass], rhs, vec![]);
+        data.layout_mut().insert_inst(head, branch);
+        let two_a = data.new_local_inst().integer(2);
+        let c2 = data.new_local_inst().binary(BinaryOp::Eq, a, two_a);
+        data.layout_mut().insert_inst(rhs, c2);
+        let rhs_jump = data.new_local_inst().jump(merge, vec![c2, pass]);
+        data.layout_mut().insert_inst(rhs, rhs_jump);
+        let param = data.bb_data(merge).params()[0];
+        let ret = data.new_local_inst().ret(Some(param));
+        data.layout_mut().insert_inst(merge, ret);
+
+        run(&mut program);
+        let data = program.func_data(function);
+        assert_eq!(blocks(data).len(), 2, "rhs block must be removed");
+        assert_eq!(select_count(data), 0);
+        let bor_count = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|layout| layout.insts())
+            .filter(|&&inst| {
+                matches!(data.inst_data(inst).kind(), InstKind::Binary(b) if b.op() == BinaryOp::Or)
+                    && data.inst_data(inst).used_by().len() == 1
+            })
+            .count();
+        assert_eq!(bor_count, 1, "one bor must replace the lor branch");
+    }
+
+    #[test]
+    fn converts_loop_accumulator_with_speculation() {
+        // The M31 headline: `while (len) { if (bit_a == 1 && bit_b == 1)
+        // result += power; ... }` — the inner triangle's merge is reachable
+        // from its head through the loop back-edge, which the old
+        // `reaches(merge, head)` guard rejected. head dominates merge, so the
+        // accumulator now converts to a select.
+        let mut program = Program::new();
+        let function =
+            program.new_function(Type::get_i32(), "acc".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let __pty = data.params_ty().to_vec();
+        let head = data.new_basic_block().basic_block("head".into(), __pty);
+        let __params = data.bb_data(head).params().to_vec();
+
+        data.set_params(__params);
+        let arm = data.new_basic_block().basic_block("arm".into(), vec![]);
+        let merge = data
+            .new_basic_block()
+            .basic_block("merge".into(), vec![Type::get_i32()]);
+        for bb in [head, arm, merge] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let a = data.params()[0];
+        let one_a = data.new_local_inst().integer(1);
+        let cond = data.new_local_inst().binary(BinaryOp::Eq, a, one_a);
+        data.layout_mut().insert_inst(head, cond);
+        let branch = data.new_local_inst().branch(cond, arm, vec![], merge, vec![a]);
+        data.layout_mut().insert_inst(head, branch);
+        // arm: result' = result + power (operands dominate head).
+        let one_b = data.new_local_inst().integer(1);
+        let inc = data.new_local_inst().binary(BinaryOp::Add, a, one_b);
+        data.layout_mut().insert_inst(arm, inc);
+        let arm_jump = data.new_local_inst().jump(merge, vec![inc]);
+        data.layout_mut().insert_inst(arm, arm_jump);
+        let param = data.bb_data(merge).params()[0];
+        let back = data.new_local_inst().jump(head, vec![param]);
+        data.layout_mut().insert_inst(merge, back);
+
+        run(&mut program);
+        let data = program.func_data(function);
+        assert_eq!(blocks(data).len(), 2, "arm must be removed, loop survives");
+        assert_eq!(select_count(data), 1);
+        assert!(data.layout().parent_bb(inc).is_some_and(|bb| bb == head));
+        assert!(matches!(
+            data.inst_data(back).kind(),
+            InstKind::Jump(j) if j.target() == head
         ));
     }
 }

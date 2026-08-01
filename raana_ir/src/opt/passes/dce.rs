@@ -51,7 +51,7 @@ fn is_critical(value: Inst, data: &FunctionData) -> bool {
 impl DeadCodeElimination {
     pub(crate) fn run_on_func(&self, data: &mut ArenaContextMut<'_>) -> bool {
         let mut worklist = VecDeque::new();
-        let mut live_inst = HashSet::new();
+        let mut live_inst = HashSet::default();
 
         macro_rules! mark_live {
             ($inst: expr) => {

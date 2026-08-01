@@ -440,7 +440,7 @@ impl IfConversion {
         // A block is dominated by `dominator` exactly when it is unreachable
         // from entry after removing `dominator`. Searching forward avoids
         // treating predecessor cycles as proof of dominance.
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut work = VecDeque::from([entry]);
         while let Some(current) = work.pop_front() {
             if !seen.insert(current) {

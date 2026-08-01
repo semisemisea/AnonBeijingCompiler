@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet};
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::fmt::Write;
 
@@ -157,10 +157,10 @@ impl<'a> LlvmWriter<'a> {
                 program,
                 curr_func: None,
             },
-            local_names: HashMap::new(),
-            global_names: HashMap::new(),
-            bb_labels: HashMap::new(),
-            phi_incoming: HashMap::new(),
+            local_names: HashMap::default(),
+            global_names: HashMap::default(),
+            bb_labels: HashMap::default(),
+            phi_incoming: HashMap::default(),
             name_counter: 0,
             bb_counter: 0,
             used_memset: false,
@@ -324,7 +324,7 @@ impl<'a> LlvmWriter<'a> {
         // Collect all Alloc insts from all blocks (must be hoisted to entry).
         // Preserve block order; each inst appears at most once.
         let alloca_insts: Vec<Inst> = {
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = FxHashSet::default();
             all_bbs_and_insts
                 .iter()
                 .flat_map(|(_, _, insts)| insts.iter().copied())
@@ -339,7 +339,7 @@ impl<'a> LlvmWriter<'a> {
         // monotonic when allocas are hoisted to the entry block.
         self.local_names.clear();
         self.name_counter = 0;
-        let alloca_set: std::collections::HashSet<Inst> = alloca_insts.iter().copied().collect();
+        let alloca_set: FxHashSet<Inst> = alloca_insts.iter().copied().collect();
         // Pass 0: function parameters (appear before allocas in the signature)
         for &p in &params {
             self.local_names
@@ -488,7 +488,7 @@ impl<'a> LlvmWriter<'a> {
             }
         }
 
-        let alloca_set: std::collections::HashSet<Inst> = alloca_insts.iter().copied().collect();
+        let alloca_set: FxHashSet<Inst> = alloca_insts.iter().copied().collect();
         let func = self.arena.curr_func.unwrap();
         let insts: Vec<Inst> = self
             .arena

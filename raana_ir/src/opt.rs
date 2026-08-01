@@ -15,7 +15,8 @@ pub mod prelude {
     pub use crate::ir::{Function, FunctionData};
 
     // Common Data Structure.
-    pub use std::collections::{HashMap, HashSet, VecDeque};
+    pub use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+    pub use std::collections::VecDeque;
 
     pub use log::{debug, error, info, trace, warn};
 

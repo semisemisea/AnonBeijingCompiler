@@ -46,9 +46,11 @@ pub struct LoopAnalysis {
 
     /// `direct_parent[i] == j`, means `loops[i]`'s direct parent is `loops[j]`
     /// if `i == j`, means `loops[i]` is one of the root in the loop forest.
+    #[cfg(debug_assertions)]
     direct_parent: Vec<usize>,
 
     /// Each loop owns a unique header, so we use it to find the index of `loops`.
+    #[cfg(debug_assertions)]
     loop_index: FxHashMap<BasicBlock, usize>,
 
     /// `block_to_inner_loop[&bb] == i`, means the smallest loop contains the `bb` is `loops[i]`
@@ -68,6 +70,10 @@ impl LoopAnalysis {
 
     pub fn new(data: &FunctionData) -> (CFG, DominanceTree, LoopAnalysis) {
         let cfg = utils::cfg::CFG::new(data).unwrap();
+        Self::from_cfg(cfg)
+    }
+
+    pub fn from_cfg(cfg: CFG) -> (CFG, DominanceTree, LoopAnalysis) {
         let dom_tree = dom_tree::v2::DominanceTree::from_cfg(&cfg);
         let mut back_edges: FxHashMap<BasicBlock, SmallVec<[BasicBlock; 2]>> = FxHashMap::default();
         for edge in cfg.edges() {
@@ -75,16 +81,17 @@ impl LoopAnalysis {
                 back_edges.entry(edge.dst).or_default().push(edge.src);
             }
         }
+        #[cfg(debug_assertions)]
         assert_reducible(&cfg, &dom_tree);
 
         let mut loops = vec![];
         for (header, latches) in back_edges {
             for &latch in &latches {
-                assert!(
+                debug_assert!(
                     cfg.successors_of(latch).contains(&header),
                     "loop latch must have an edge to its header"
                 );
-                assert!(
+                debug_assert!(
                     dom_tree.dominates(header, latch),
                     "loop header must dominate every latch"
                 );
@@ -100,7 +107,7 @@ impl LoopAnalysis {
                 for &pred in cfg.predecessors_of(block) {
                     // prevent re-explore and over-explore (beyond header block)
                     if body.insert(pred) {
-                        assert!(
+                        debug_assert!(
                             dom_tree.dominates(header, pred),
                             "natural loop contains a block not dominated by its header"
                         );
@@ -108,9 +115,9 @@ impl LoopAnalysis {
                     }
                 }
             }
-            assert!(body.contains(&header));
-            assert!(latches.iter().all(|latch| body.contains(latch)));
-            assert!(
+            debug_assert!(body.contains(&header));
+            debug_assert!(latches.iter().all(|latch| body.contains(latch)));
+            debug_assert!(
                 body.iter().all(|&block| dom_tree.dominates(header, block)),
                 "loop header must dominate every block in its natural loop"
             );
@@ -123,11 +130,14 @@ impl LoopAnalysis {
 
         // sort the loops from small to big.
         loops.sort_unstable_by_key(|l| l.body.len());
+        #[cfg(debug_assertions)]
         assert_laminar(&loops);
 
-        let mut direct_parent = Vec::with_capacity(loops.len());
         let mut block_to_inner_loop = FxHashMap::default();
         block_to_inner_loop.reserve(cfg.block_count());
+        #[cfg(debug_assertions)]
+        let mut direct_parent = Vec::with_capacity(loops.len());
+        #[cfg(debug_assertions)]
         for i in 0..loops.len() {
             direct_parent.push(i);
         }
@@ -135,17 +145,20 @@ impl LoopAnalysis {
             l1.body.iter().for_each(|&bb| {
                 block_to_inner_loop.entry(bb).or_insert(i);
             });
+            #[cfg(debug_assertions)]
             if let Some((j, _)) = loops
                 .iter()
                 .enumerate()
                 .skip(i + 1)
-                .find(|&(_j, l2)| l1.body.iter().all(|block| l2.body.contains(block)))
+                .find(|&(_j, l2)| l2.contains(l1.header))
             {
                 direct_parent[i] = j;
             }
         }
+        #[cfg(debug_assertions)]
         let loop_index = FxHashMap::from_iter(loops.iter().enumerate().map(|(i, l)| (l.header, i)));
-        assert_eq!(
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
             loop_index.len(),
             loops.len(),
             "each natural loop must have a unique header"
@@ -153,27 +166,31 @@ impl LoopAnalysis {
 
         let analysis = LoopAnalysis {
             loops,
+            #[cfg(debug_assertions)]
             direct_parent,
+            #[cfg(debug_assertions)]
             loop_index,
             block_to_inner_loop,
         };
+        #[cfg(debug_assertions)]
         analysis.verify(&cfg, &dom_tree);
         (cfg, dom_tree, analysis)
     }
 
+    #[cfg(debug_assertions)]
     fn verify(&self, cfg: &utils::cfg::CFG, dom_tree: &dom_tree::v2::DominanceTree) {
-        assert_eq!(self.direct_parent.len(), self.loops.len());
-        assert_eq!(self.loop_index.len(), self.loops.len());
+        debug_assert_eq!(self.direct_parent.len(), self.loops.len());
+        debug_assert_eq!(self.loop_index.len(), self.loops.len());
 
         for (index, looop) in self.loops.iter().enumerate() {
-            assert_eq!(self.loop_index.get(&looop.header), Some(&index));
-            assert!(looop.body.contains(&looop.header));
-            assert!(!looop.latches.is_empty());
+            debug_assert_eq!(self.loop_index.get(&looop.header), Some(&index));
+            debug_assert!(looop.body.contains(&looop.header));
+            debug_assert!(!looop.latches.is_empty());
             for &latch in &looop.latches {
-                assert!(looop.body.contains(&latch));
-                assert!(cfg.successors_of(latch).contains(&looop.header));
+                debug_assert!(looop.body.contains(&latch));
+                debug_assert!(cfg.successors_of(latch).contains(&looop.header));
             }
-            assert!(
+            debug_assert!(
                 looop
                     .body
                     .iter()
@@ -182,7 +199,7 @@ impl LoopAnalysis {
 
             let parent = self.direct_parent[index];
             if parent == index {
-                assert!(
+                debug_assert!(
                     self.loops
                         .iter()
                         .enumerate()
@@ -194,16 +211,16 @@ impl LoopAnalysis {
                     "a root loop must not be contained in another loop"
                 );
             } else {
-                assert!(parent < self.loops.len());
+                debug_assert!(parent < self.loops.len());
                 let parent_loop = &self.loops[parent];
-                assert!(looop.body.len() < parent_loop.body.len());
-                assert!(
+                debug_assert!(looop.body.len() < parent_loop.body.len());
+                debug_assert!(
                     looop
                         .body
                         .iter()
                         .all(|block| parent_loop.body.contains(block))
                 );
-                assert!(
+                debug_assert!(
                     self.loops
                         .iter()
                         .enumerate()
@@ -222,9 +239,9 @@ impl LoopAnalysis {
         }
 
         for (&block, &index) in &self.block_to_inner_loop {
-            assert!(index < self.loops.len());
-            assert!(self.loops[index].contains(block));
-            assert!(
+            debug_assert!(index < self.loops.len());
+            debug_assert!(self.loops[index].contains(block));
+            debug_assert!(
                 self.loops.iter().enumerate().all(|(other, candidate)| {
                     !candidate.contains(block)
                         || self.loops[index].body.len() <= candidate.body.len()
@@ -236,6 +253,7 @@ impl LoopAnalysis {
     }
 }
 
+#[cfg(debug_assertions)]
 fn assert_laminar(loops: &[Loop]) {
     for (index, lhs) in loops.iter().enumerate() {
         for rhs in loops.iter().skip(index + 1) {
@@ -245,11 +263,11 @@ fn assert_laminar(loops: &[Loop]) {
             }
             let lhs_in_rhs = lhs.body.iter().all(|block| rhs.body.contains(block));
             let rhs_in_lhs = rhs.body.iter().all(|block| lhs.body.contains(block));
-            assert!(
+            debug_assert!(
                 lhs_in_rhs || rhs_in_lhs,
                 "natural loops in a reducible CFG must be nested or disjoint"
             );
-            assert_ne!(
+            debug_assert_ne!(
                 lhs.body, rhs.body,
                 "distinct natural loops must not have identical block sets"
             );
@@ -257,9 +275,10 @@ fn assert_laminar(loops: &[Loop]) {
     }
 }
 
+#[cfg(debug_assertions)]
 fn assert_reducible(cfg: &utils::cfg::CFG, dom_tree: &dom_tree::v2::DominanceTree) {
-    assert_eq!(cfg.entry(), dom_tree.entry());
-    assert!(cfg.blocks().iter().all(|&block| dom_tree.contains(block)));
+    debug_assert_eq!(cfg.entry(), dom_tree.entry());
+    debug_assert!(cfg.blocks().iter().all(|&block| dom_tree.contains(block)));
 
     let mut indegrees = FxHashMap::default();
     for &block in cfg.blocks() {
@@ -292,7 +311,7 @@ fn assert_reducible(cfg: &utils::cfg::CFG, dom_tree: &dom_tree::v2::DominanceTre
             }
         }
     }
-    assert_eq!(
+    debug_assert_eq!(
         visited,
         cfg.block_count(),
         "irreducible CFG is not supported by natural loop analysis"

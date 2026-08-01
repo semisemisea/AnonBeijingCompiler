@@ -52,7 +52,7 @@ impl BooleanSimplification {
         let Some((value, expected)) = self.boolean_comparison(data, &binary) else {
             return false;
         };
-        if !self.is_canonical_bool(data, value, &mut HashSet::new()) {
+        if !self.is_canonical_bool(data, value, &mut HashSet::default()) {
             return false;
         }
 
@@ -129,7 +129,7 @@ impl BooleanSimplification {
         }
 
         if !data.inst_data(inst).ty().is_i32()
-            || !self.is_canonical_bool(data, select.cond(), &mut HashSet::new())
+            || !self.is_canonical_bool(data, select.cond(), &mut HashSet::default())
         {
             return false;
         }

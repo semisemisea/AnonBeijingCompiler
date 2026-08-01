@@ -190,19 +190,11 @@ impl FunctionData {
     }
 
     pub fn has_inst_data(&self, inst: Inst) -> bool {
-        !inst.is_global()
-            && self
-                .local_arena()
-                .inst_arena()
-                .datas()
-                .any(|(&key, _)| key == inst)
+        !inst.is_global() && self.local_arena().inst_arena().data().contains_key(&inst)
     }
 
     fn has_layout_bb(&self, bb: BasicBlock) -> bool {
-        self.layout()
-            .basicblocks()
-            .iter()
-            .any(|layout| layout.bb() == bb)
+        self.layout().contains_bb(bb)
     }
 }
 

@@ -94,7 +94,7 @@ impl CallGraph {
 
     pub fn reaches(&self, from: Function, target: Function) -> bool {
         let mut queue = VecDeque::from([from]);
-        let mut visited = HashSet::from([from]);
+        let mut visited = HashSet::from_iter([from]);
         while let Some(function) = queue.pop_front() {
             for callee in self.callees_in(function) {
                 if callee == target {

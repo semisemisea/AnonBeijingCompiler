@@ -208,8 +208,8 @@ impl ICFG {
             src: Node,
             dst: Node,
             edges: &mut EdgeTable,
-            forward: &mut HashMap<Node, SmallVec<[usize; 2]>, rustc_hash::FxBuildHasher>,
-            backward: &mut HashMap<Node, SmallVec<[usize; 2]>, rustc_hash::FxBuildHasher>,
+            forward: &mut HashMap<Node, SmallVec<[usize; 2]>>,
+            backward: &mut HashMap<Node, SmallVec<[usize; 2]>>,
         ) -> usize {
             let edge_len = edges.len();
             edges.push(ty, src.inst, dst.inst);

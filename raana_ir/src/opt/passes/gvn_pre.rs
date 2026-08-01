@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::opt::prelude::*;
 use crate::opt::utils::logical_edge::{
@@ -79,8 +79,8 @@ impl ValueNumbers {
     fn new() -> Self {
         Self {
             next: 0,
-            values: HashMap::new(),
-            keys: HashMap::new(),
+            values: HashMap::default(),
+            keys: HashMap::default(),
         }
     }
 
@@ -171,11 +171,11 @@ impl GVNPRE {
         data: &ArenaContextMut<'_>,
     ) -> (Vec<BasicBlock>, HashMap<BasicBlock, Vec<Edge>>) {
         let Some(entry) = data.layout().entry_bb().map(|layout| layout.bb()) else {
-            return (Vec::new(), HashMap::new());
+            return (Vec::new(), HashMap::default());
         };
         let mut order = Vec::new();
-        let mut incoming: HashMap<BasicBlock, Vec<Edge>> = HashMap::new();
-        let mut seen = HashSet::new();
+        let mut incoming: HashMap<BasicBlock, Vec<Edge>> = HashMap::default();
+        let mut seen = HashSet::default();
         let mut work = vec![entry];
         while let Some(bb) = work.pop() {
             if !seen.insert(bb) {
@@ -205,7 +205,7 @@ impl GVNPRE {
                     work.push(branch.t_target());
                 }
                 InstKind::Return(..) => {}
-                _ => return (Vec::new(), HashMap::new()),
+                _ => return (Vec::new(), HashMap::default()),
             }
         }
         (order, incoming)
@@ -218,7 +218,7 @@ impl GVNPRE {
         incoming: &HashMap<BasicBlock, Vec<Edge>>,
         numbers: &mut ValueNumbers,
     ) -> HashMap<BasicBlock, Available> {
-        let mut output: HashMap<BasicBlock, Available> = HashMap::new();
+        let mut output: HashMap<BasicBlock, Available> = HashMap::default();
         let mut changed = true;
         while changed {
             changed = false;
@@ -277,7 +277,7 @@ impl GVNPRE {
         incoming: &HashMap<BasicBlock, Vec<Edge>>,
     ) -> HashMap<BasicBlock, HashSet<BasicBlock>> {
         let all = blocks.iter().copied().collect::<HashSet<_>>();
-        let mut dominators = HashMap::new();
+        let mut dominators = HashMap::default();
         let Some(&entry) = blocks.first() else {
             return dominators;
         };
@@ -285,7 +285,7 @@ impl GVNPRE {
             dominators.insert(
                 bb,
                 if bb == entry {
-                    HashSet::from([entry])
+                    HashSet::from_iter([entry])
                 } else {
                     all.clone()
                 },

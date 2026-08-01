@@ -1,18 +1,17 @@
-use std::collections::HashMap;
-
 use index_list::{Index, IndexList};
+use rustc_hash::FxHashMap;
 
 use crate::ir::{basic_block::BasicBlock, instruction::Inst};
 pub struct Layout {
     bbs: IndexList<BasicBlockLayout>,
-    back: HashMap<BasicBlock, Index>,
-    parent: HashMap<Inst, BasicBlock>,
+    back: FxHashMap<BasicBlock, Index>,
+    parent: FxHashMap<Inst, BasicBlock>,
 }
 
 pub struct BasicBlockLayout {
     pub bb: BasicBlock,
     insts: IndexList<Inst>,
-    back: HashMap<Inst, Index>,
+    back: FxHashMap<Inst, Index>,
 }
 
 impl BasicBlockLayout {
@@ -20,7 +19,7 @@ impl BasicBlockLayout {
         BasicBlockLayout {
             bb,
             insts: IndexList::new(),
-            back: HashMap::new(),
+            back: FxHashMap::default(),
         }
     }
 
@@ -42,13 +41,17 @@ impl Layout {
     pub fn new() -> Layout {
         Layout {
             bbs: IndexList::new(),
-            back: HashMap::new(),
-            parent: HashMap::new(),
+            back: FxHashMap::default(),
+            parent: FxHashMap::default(),
         }
     }
 
     pub fn basicblocks(&self) -> &IndexList<BasicBlockLayout> {
         &self.bbs
+    }
+
+    pub fn contains_bb(&self, bb: BasicBlock) -> bool {
+        self.back.contains_key(&bb)
     }
 
     pub fn basicblock(&self, bb: BasicBlock) -> &BasicBlockLayout {

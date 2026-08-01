@@ -38,8 +38,6 @@ impl<T> VecExt<T> for Vec<T> {
 }
 
 pub mod prelude {
-    use std::collections::HashSet;
-
     pub use raana_ir::ir::Program as HirProgram;
     pub use raana_ir::ir::Type as HirType;
     pub use raana_ir::ir::arena::Arena;
@@ -54,15 +52,13 @@ pub mod prelude {
     };
     pub use raana_ir::ir::{Function as HirFunction, FunctionData as HirFunctionData};
 
-    use rustc_hash::FxBuildHasher;
+    pub use rustc_hash::FxHashSet;
 
     #[derive(Clone, Copy)]
     pub struct ArenaContext<'a> {
         pub program: &'a HirProgram,
         pub curr_func: Option<HirFunction>,
     }
-
-    pub type FxHashSet<K> = HashSet<K, FxBuildHasher>;
 
     impl ArenaContext<'_> {
         /// Get current function data

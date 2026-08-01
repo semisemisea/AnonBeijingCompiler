@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet as HashSet;
 
 use log::debug;
 
@@ -9,7 +9,7 @@ use crate::{
 
 pub fn rpo_path(g: &CFGGraph) -> GPath {
     let mut path = Vec::new();
-    let mut visited = Set::new();
+    let mut visited = Set::default();
     fn dfs(node: usize, g: &CFGGraph, ans: &mut GPath, visited: &mut Set) {
         visited.insert(node);
         for &succ in g[&node].iter() {
@@ -76,11 +76,11 @@ pub fn build_cfg_both(
         }
     }
     // <a,b> in set E when a can directly jump to b
-    let mut graph = CFGGraph::new();
+    let mut graph = CFGGraph::default();
     // reverse graph
-    let mut prece = CFGGraph::new();
+    let mut prece = CFGGraph::default();
     prece.entry(0).or_default();
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     dfs(
         data.layout().entry_bb().unwrap().bb(),
         data,

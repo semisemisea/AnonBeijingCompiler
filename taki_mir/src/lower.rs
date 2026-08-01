@@ -218,6 +218,13 @@ pub trait LowerBackend {
     fn mir_pipeline(_config: &Self::CodegenConfig) -> crate::passes::MIRPassPipeline<Self::MInst> {
         crate::passes::MIRPassPipeline::new()
     }
+
+    /// Whether emission-time branch optimization (EmitBuffer simplification
+    /// rules) is enabled for this config. `-O0` keeps the two-instruction
+    /// branch form as an on/off differential baseline.
+    fn branch_opt_enabled(_config: &Self::CodegenConfig) -> bool {
+        false
+    }
 }
 
 /// impl block for all backend specified operation

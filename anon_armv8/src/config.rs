@@ -15,6 +15,8 @@ pub struct AArch64CodegenConfig {
     pub pair_combine: bool,
     pub list_scheduler: bool,
     pub sched_model: AArch64SchedModel,
+    /// Emission-time branch optimization (EmitBuffer rules).
+    pub branch_opt: bool,
 }
 
 impl Default for AArch64CodegenConfig {
@@ -25,6 +27,7 @@ impl Default for AArch64CodegenConfig {
             pair_combine: true,
             list_scheduler: true,
             sched_model: AArch64SchedModel::CortexA53,
+            branch_opt: true,
         }
     }
 }

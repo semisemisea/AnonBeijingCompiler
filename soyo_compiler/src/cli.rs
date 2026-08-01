@@ -73,6 +73,7 @@ impl Arg {
                 pair_combine: false,
                 list_scheduler: false,
                 sched_model: self.sched_model.into(),
+                branch_opt: false,
             },
             1 => AArch64CodegenConfig {
                 dce: true,
@@ -80,6 +81,7 @@ impl Arg {
                 pair_combine: true,
                 list_scheduler: false,
                 sched_model: self.sched_model.into(),
+                branch_opt: true,
             },
             _ => AArch64CodegenConfig {
                 dce: true,
@@ -87,6 +89,7 @@ impl Arg {
                 pair_combine: true,
                 list_scheduler: true,
                 sched_model: self.sched_model.into(),
+                branch_opt: true,
             },
         };
         if self.enable_mir_dce {

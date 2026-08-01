@@ -943,6 +943,10 @@ impl LowerBackend for AArch64Backend {
     ) -> taki_mir::passes::MIRPassPipeline<Self::MInst> {
         crate::passes::build_pipeline(config)
     }
+
+    fn branch_opt_enabled(config: &Self::CodegenConfig) -> bool {
+        config.branch_opt
+    }
 }
 
 /// Select a branch-local, pure condition tree.  Claims are made through the

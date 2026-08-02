@@ -266,17 +266,16 @@ impl Pass for IPSCCP {
                         }
                     }
                     InstKind::Cast(cast) => {
-                        if data.inst_data(inst).ty().is_i32() {
-                            if let InstKind::Float(float) = data.inst_data(cast.src()).kind() {
-                                merge_and_extend(
-                                    node,
-                                    Lattice::Constant(float.value() as i32),
-                                    &mut lattice_map,
-                                );
+                        let status = if data.inst_data(inst).ty().is_i32() {
+                            match data.inst_data(cast.src()).kind() {
+                                InstKind::Float(float) => fold_f32_to_i32(float.value())
+                                    .map_or(Lattice::Bottom, Lattice::Constant),
+                                _ => Lattice::Bottom,
                             }
-                            merge_and_extend(node, Lattice::Bottom, &mut lattice_map);
-                        }
-                        merge_and_extend(node, Lattice::Bottom, &mut lattice_map);
+                        } else {
+                            Lattice::Bottom
+                        };
+                        merge_and_extend(node, status, &mut lattice_map);
                     }
                     InstKind::Store(..) | InstKind::MemZero(..) => {}
                     InstKind::TailCall(tail_call) => {
@@ -503,6 +502,19 @@ impl Pass for IPSCCP {
                     .filter(|&bb| {
                         bb != data.layout().entry_bb().unwrap().bb()
                             && data.bb_data(bb).used_by().is_empty()
+                            // A block may have become unreachable while its
+                            // non-terminator instructions still feed values
+                            // into reachable blocks (e.g. LICM-hoisted GEPs
+                            // used by a surviving loop body). Removing it then
+                            // destroys live values and leaves dangling
+                            // operands. Only remove blocks whose every
+                            // instruction is itself unused.
+                            && data
+                                .layout()
+                                .basicblock(bb)
+                                .insts()
+                                .iter()
+                                .all(|&inst| data.inst_data(inst).used_by().is_empty())
                     })
                     .map(|bb| Block::new(func, bb))
                     .collect::<Vec<_>>(),
@@ -546,6 +558,13 @@ fn mathematic_operation(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
     }
 }
 
+pub(super) fn fold_f32_to_i32(value: f32) -> Option<i32> {
+    // The target conversions truncate toward zero for representable values.
+    // Keep non-finite and out-of-range values as runtime casts because Rust's
+    // saturating `as` conversion does not match the target instructions there.
+    (value.is_finite() && value >= i32::MIN as f32 && value < i32::MAX as f32).then(|| value as i32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +575,56 @@ mod tests {
         },
         llvm::LlvmWriter,
     };
+
+    fn build_float_cast(value: f32) -> (Program, Function, Inst, Inst) {
+        let mut program = Program::new();
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let data = program.func_data_mut(main);
+        let entry = data.add_entry_block();
+        let source = data.new_local_inst().float(value);
+        let cast = data.new_local_inst().cast(source, Type::get_i32());
+        let ret = data.new_local_inst().ret(Some(cast));
+        data.layout_mut().insert_inst(entry, cast);
+        data.layout_mut().insert_inst(entry, ret);
+        (program, main, cast, ret)
+    }
+
+    fn assert_float_cast_folds(value: f32, expected: i32) {
+        let (mut program, main, cast, ret) = build_float_cast(value);
+
+        assert!(IPSCCP.run(&mut program));
+
+        let data = program.func_data(main);
+        assert!(matches!(
+            data.inst_data(cast).kind(),
+            InstKind::Integer(integer) if integer.value() == expected
+        ));
+        assert_eq!(data.layout().parent_bb(cast), None);
+        let InstKind::Return(ret) = data.inst_data(ret).kind() else {
+            panic!("expected return instruction")
+        };
+        assert_eq!(ret.value(), Some(cast));
+    }
+
+    #[test]
+    fn folds_in_range_float_literals_to_i32() {
+        assert_float_cast_folds(3.75, 3);
+        assert_float_cast_folds(-2.75, -2);
+        assert_float_cast_folds(i32::MIN as f32, i32::MIN);
+    }
+
+    #[test]
+    fn keeps_non_finite_and_out_of_range_float_casts() {
+        for value in [i32::MAX as f32, 1.0e10, f32::INFINITY, f32::NAN] {
+            let (mut program, main, cast, _) = build_float_cast(value);
+
+            assert!(!IPSCCP.run(&mut program));
+            assert!(matches!(
+                program.func_data(main).inst_data(cast).kind(),
+                InstKind::Cast(..)
+            ));
+        }
+    }
 
     /// Build a self-recursive tail-call function and verify that IPSCCP does
     /// not mis-propagate a parameter that varies across recursive tail calls.

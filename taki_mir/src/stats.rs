@@ -134,6 +134,7 @@ pub struct PeepholeStats {
     pub ran: bool,
     pub changed: bool,
     pub mac_pairs_formed: u64,
+    pub flag_fusions_formed: u64,
 }
 
 impl PeepholeStats {
@@ -141,6 +142,7 @@ impl PeepholeStats {
         self.ran |= other.ran;
         self.changed |= other.changed;
         self.mac_pairs_formed += other.mac_pairs_formed;
+        self.flag_fusions_formed += other.flag_fusions_formed;
     }
 }
 

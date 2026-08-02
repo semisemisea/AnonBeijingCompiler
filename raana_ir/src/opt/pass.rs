@@ -174,6 +174,11 @@ impl PassesManager {
             let simplify_cfg = Box::new(simplify_cfg::SimplifyCFG);
             p.register(simplify_cfg);
 
+            // Rotate test-at-top countdown loops to test-at-bottom so the
+            // backend can fuse the decrement with the loop test.
+            let rotate_loops = Box::new(rotate_loops::RotateLoops);
+            p.register(rotate_loops);
+
             let gvn = Box::new(gvn::GlobalInstNumbering);
             p.register(gvn);
 

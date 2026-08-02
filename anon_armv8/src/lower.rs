@@ -1734,6 +1734,9 @@ fn fold_mul_add_sub(
         BinaryOp::Add if !is_mul(arena, lhs) && is_mul(arena, rhs) => (rhs, lhs),
         BinaryOp::Add if is_mul(arena, lhs) && !is_mul(arena, rhs) => (lhs, rhs),
         BinaryOp::Sub if !is_mul(arena, lhs) && is_mul(arena, rhs) => (rhs, lhs),
+        // Both operands are multiplications: fold the LHS into the
+        // accumulate, materializing the RHS multiplication as the addend.
+        BinaryOp::Add if is_mul(arena, lhs) && is_mul(arena, rhs) => (lhs, rhs),
         _ => return None,
     };
     let InstKind::Binary(mul) = arena.inst_data(mul_inst).kind() else {
@@ -2551,5 +2554,88 @@ mod tests {
         // Two users: the GEP must be materialized, so no extended-register
         // *addressing* form (an ALU `add ..., sxtw #2` may still appear).
         assert!(!assembly.contains("sxtw #2]"), "{assembly}");
+    }
+
+    #[test]
+    fn mul_mul_add_folds_into_madd() {
+        use raana_ir::ir::builder_trait::*;
+
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "mul_mul_add".into(),
+            vec![
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_i32(),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let [a, b, c, d] = [
+            data.params()[0],
+            data.params()[1],
+            data.params()[2],
+            data.params()[3],
+        ];
+        let mul1 = data.new_local_inst().binary(BinaryOp::Mul, a, b);
+        let mul2 = data.new_local_inst().binary(BinaryOp::Mul, c, d);
+        let add = data.new_local_inst().binary(BinaryOp::Add, mul1, mul2);
+        data.layout_mut().insert_inst(entry, mul1);
+        data.layout_mut().insert_inst(entry, mul2);
+        data.layout_mut().insert_inst(entry, add);
+        let ret = data.new_local_inst().ret(Some(add));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+        // mul(mul, mul) + add folds: one madd (lhs fused) + one standalone mul
+        // (the addend), no separate add.
+        assert_eq!(assembly.matches("madd").count(), 1, "{assembly}");
+        assert_eq!(assembly.matches("\n    mul ").count(), 1, "{assembly}");
+        assert!(!assembly.contains("\n    add w"), "{assembly}");
+    }
+
+    #[test]
+    fn multi_use_mul_blocks_madd_fold() {
+        use raana_ir::ir::builder_trait::*;
+
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "mul_mul_add_multi".into(),
+            vec![
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_pointer(Type::get_i32()),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let [a, b, c, d] = [
+            data.params()[0],
+            data.params()[1],
+            data.params()[2],
+            data.params()[3],
+        ];
+        let ptr = data.params()[4];
+        let mul1 = data.new_local_inst().binary(BinaryOp::Mul, a, b);
+        let mul2 = data.new_local_inst().binary(BinaryOp::Mul, c, d);
+        let add = data.new_local_inst().binary(BinaryOp::Add, mul1, mul2);
+        // mul1 has a second user (the store): the fold must fall back.
+        let store = data.new_local_inst().store(mul1, ptr);
+        data.layout_mut().insert_inst(entry, mul1);
+        data.layout_mut().insert_inst(entry, mul2);
+        data.layout_mut().insert_inst(entry, add);
+        data.layout_mut().insert_inst(entry, store);
+        let ret = data.new_local_inst().ret(Some(add));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+        assert_eq!(assembly.matches("madd").count(), 0, "{assembly}");
+        assert_eq!(assembly.matches("\n    mul ").count(), 2, "{assembly}");
+        assert!(assembly.contains("\n    add w"), "{assembly}");
     }
 }

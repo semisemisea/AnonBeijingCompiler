@@ -1,0 +1,21 @@
+int first[32][16];
+int second[32][16];
+int third[32][16];
+
+int main() {
+    int i = 0;
+    while (i < 8) {
+        first[i][0] = i;
+        second[i][0] = i * 2;
+        third[i][0] = i * 3;
+        i = i + 1;
+    }
+
+    int sum = 0;
+    i = 0;
+    while (i < 8) {
+        sum = sum + first[i][0] + second[i][0] + third[i][0];
+        i = i + 1;
+    }
+    return sum - 168;
+}

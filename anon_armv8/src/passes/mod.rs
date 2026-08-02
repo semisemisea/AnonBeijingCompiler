@@ -1,5 +1,6 @@
 //! Target-specific MIR passes for the AArch64 backend.
 
+pub mod chain_fusion;
 pub mod dce;
 pub mod list_scheduler;
 pub mod pair_combine;
@@ -21,6 +22,9 @@ pub fn build_pipeline(config: &AArch64CodegenConfig) -> MIRPassPipeline<MInst> {
     }
     if config.peephole_combine {
         pipeline.add_pre_ra(Box::new(peephole_combine::PeepholeCombine));
+    }
+    if config.chain_fusion {
+        pipeline.add_pre_ra(Box::new(chain_fusion::ChainFusion));
     }
     if config.pair_combine {
         pipeline.add_post_ra(Box::new(pair_combine::PairCombine));

@@ -17,6 +17,9 @@ pub struct AArch64CodegenConfig {
     pub sched_model: AArch64SchedModel,
     /// Emission-time branch optimization (EmitBuffer rules).
     pub branch_opt: bool,
+    /// Pre-RA chain fusion: fold the second compare of a `chain_to_switch`
+    /// (check, split) node pair into the check block's compare.
+    pub chain_fusion: bool,
 }
 
 impl Default for AArch64CodegenConfig {
@@ -28,6 +31,7 @@ impl Default for AArch64CodegenConfig {
             list_scheduler: true,
             sched_model: AArch64SchedModel::CortexA53,
             branch_opt: true,
+            chain_fusion: true,
         }
     }
 }

@@ -25,6 +25,7 @@ pub struct FunctionCodegenStats {
     pub function: String,
     pub dce: DceStats,
     pub peephole: PeepholeStats,
+    pub chain_fusion: ChainFusionStats,
     pub pair: PairCombineStats,
     pub scheduler: SchedulerStats,
     pub abi: AbiArgStats,
@@ -36,6 +37,7 @@ impl FunctionCodegenStats {
     fn accumulate(&mut self, other: &Self) {
         self.dce.accumulate(&other.dce);
         self.peephole.accumulate(&other.peephole);
+        self.chain_fusion.accumulate(&other.chain_fusion);
         self.pair.accumulate(&other.pair);
         self.scheduler.accumulate(&other.scheduler);
         self.abi.accumulate(&other.abi);
@@ -135,6 +137,21 @@ pub struct PeepholeStats {
     pub changed: bool,
     pub mac_pairs_formed: u64,
     pub flag_fusions_formed: u64,
+}
+
+/// Chain fusion (AArch64 `chain_fusion`): compares removed from the second
+/// block of a (check, split) decision-tree node pair.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChainFusionStats {
+    pub fusions: u64,
+    pub changed: bool,
+}
+
+impl ChainFusionStats {
+    fn accumulate(&mut self, other: &Self) {
+        self.fusions += other.fusions;
+        self.changed |= other.changed;
+    }
 }
 
 impl PeepholeStats {

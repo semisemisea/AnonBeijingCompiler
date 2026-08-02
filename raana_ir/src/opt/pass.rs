@@ -157,71 +157,89 @@ impl PassesManager {
     }
 
     pub fn default_ref() -> &'static PassesManager {
-        DEFAULT_PASSES_LIST.get_or_init(|| {
-            let mut p = PassesManager::new();
-            let ssa = Box::new(ssa::SSATransform);
-            p.register_initial(ssa);
+        DEFAULT_PASSES_LIST.get_or_init(|| Self::build_pass_list(false))
+    }
 
-            let inline = Box::new(inline::Inline);
-            p.register_initial(inline);
+    /// The AArch64 pipeline: the common pipeline plus `chain_to_switch`,
+    /// which shapes equality chains for the AArch64 `chain_fusion` backend
+    /// pass. RISC-V keeps the common pipeline (its branches materialize
+    /// conditions into registers, so the tree would not amortize).
+    pub fn aarch64_ref() -> &'static PassesManager {
+        AARCH64_PASSES_LIST.get_or_init(|| Self::build_pass_list(true))
+    }
 
-            let tco_initial = Box::new(tco::TailCallElim);
-            p.register_initial(tco_initial);
+    fn build_pass_list(with_chain_to_switch: bool) -> PassesManager {
+        let mut p = PassesManager::new();
+        let ssa = Box::new(ssa::SSATransform);
+        p.register_initial(ssa);
 
-            // Promote unobservable scalar globals to SSA values so the
-            // backend keeps them in registers (load once, write back once).
-            // One-shot (not a fixpoint rewrite): it must run after inlining
-            // so the callee-touch analysis sees the final call graph.
-            let gsp = Box::new(scalar_global_promotion::ScalarGlobalPromotion);
-            p.register_initial(gsp);
+        let inline = Box::new(inline::Inline);
+        p.register_initial(inline);
 
-            let ipsccp = Box::new(ipsccp::IPSCCP);
-            p.register(ipsccp);
+        let tco_initial = Box::new(tco::TailCallElim);
+        p.register_initial(tco_initial);
 
-            let simplify_cfg = Box::new(simplify_cfg::SimplifyCFG);
-            p.register(simplify_cfg);
+        // Promote unobservable scalar globals to SSA values so the
+        // backend keeps them in registers (load once, write back once).
+        // One-shot (not a fixpoint rewrite): it must run after inlining
+        // so the callee-touch analysis sees the final call graph.
+        let gsp = Box::new(scalar_global_promotion::ScalarGlobalPromotion);
+        p.register_initial(gsp);
 
-            // Rotate test-at-top countdown loops to test-at-bottom so the
-            // backend can fuse the decrement with the loop test.
-            let rotate_loops = Box::new(rotate_loops::RotateLoops);
-            p.register(rotate_loops);
+        let ipsccp = Box::new(ipsccp::IPSCCP);
+        p.register(ipsccp);
 
-            // Hoist loop-invariant pure expressions to the preheader.
-            let licm = Box::new(licm::Licm);
-            p.register(licm);
+        let simplify_cfg = Box::new(simplify_cfg::SimplifyCFG);
+        p.register(simplify_cfg);
 
-            let gvn = Box::new(gvn::GlobalInstNumbering);
-            p.register(gvn);
+        // Rotate test-at-top countdown loops to test-at-bottom so the
+        // backend can fuse the decrement with the loop test.
+        let rotate_loops = Box::new(rotate_loops::RotateLoops);
+        p.register(rotate_loops);
 
-            let sr = Box::new(sr::StrengthReduction);
-            p.register(sr);
+        // Balanced decision tree for equality chains; the AArch64 backend
+        // fuses each (eq, lt) node pair into a single compare.
+        if with_chain_to_switch {
+            let chain_to_switch = Box::new(chain_to_switch::ChainToSwitch);
+            p.register(chain_to_switch);
+        }
 
-            let if_conversion = Box::new(if_conversion::IfConversion);
-            p.register(if_conversion);
+        // Hoist loop-invariant pure expressions to the preheader.
+        let licm = Box::new(licm::Licm);
+        p.register(licm);
 
-            // A second TCO pass catches tail calls exposed by the
-            // simplification passes above.
-            let tco = Box::new(tco::TailCallElim);
-            p.register(tco);
+        let gvn = Box::new(gvn::GlobalInstNumbering);
+        p.register(gvn);
 
-            let boolean_simplification = Box::new(boolean_simplify::BooleanSimplification);
-            p.register(boolean_simplification);
+        let sr = Box::new(sr::StrengthReduction);
+        p.register(sr);
 
-            let gvn_pre = Box::new(gvn_pre::GVNPRE);
-            p.register(gvn_pre);
+        let if_conversion = Box::new(if_conversion::IfConversion);
+        p.register(if_conversion);
 
-            let dpe = dce::DeadPhiElimination;
-            p.register(Box::new(dpe));
+        // A second TCO pass catches tail calls exposed by the
+        // simplification passes above.
+        let tco = Box::new(tco::TailCallElim);
+        p.register(tco);
 
-            let dce = dce::DeadCodeElimination;
-            p.register(Box::new(dce));
+        let boolean_simplification = Box::new(boolean_simplify::BooleanSimplification);
+        p.register(boolean_simplification);
 
-            p
-        })
+        let gvn_pre = Box::new(gvn_pre::GVNPRE);
+        p.register(gvn_pre);
+
+        let dpe = dce::DeadPhiElimination;
+        p.register(Box::new(dpe));
+
+        let dce = dce::DeadCodeElimination;
+        p.register(Box::new(dce));
+
+        p
     }
 }
 
 static DEFAULT_PASSES_LIST: OnceLock<PassesManager> = OnceLock::new();
+static AARCH64_PASSES_LIST: OnceLock<PassesManager> = OnceLock::new();
 
 #[cfg(test)]
 mod tests {

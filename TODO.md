@@ -69,13 +69,28 @@
    踩坑两处：(a) `ccmp` 立即数是 5 位（0..=31）而非 12 位，超范围需
    `movz`+寄存器回退（`ccmp_operands`）；(b) `nzcv_making_cond_false(Le)`
    原为 `#8`（N=1,V=0 → `N!=V` → LE 真）应落 `#0`（Z=0、N=V），否则
-   `while (ch >= 48 && ch <= 57)` 的 and 链在 ccmp 未执行时误入数字循环
+    `while (ch >= 48 && ch <= 57)` 的 and 链在 ccmp 未执行时误入数字循环
    体导致 SIGSEGV（BFS/DFS/DSU 回归）。新增 `ccmp_nzcv_fallbacks_*`
    单测逐一验证 14 条件 × true/false 回退值；huffman-01 686 → 640
    （`_and/_xor/_or` 内循环 `cmp; ccmp; csel`，8 条/迭代与 clang 持平）；
    全 corpus QEMU 差分、40/40 h_functional、109/109 functional 通过。
+- 标志融合 + 循环旋转（M33）：IR 层新增 `rotate_loops`（循环旋转：
+   头测试下沉到 latch，`header: br v, body, exit` 改为
+   `latch: br v', header(v'), exit`；仅当所有非回边 pred 传入经证明
+   非零常量时删除头测试，否则宁漏勿错）。后端 peephole 新增
+   `SubsRRImm12`/`AndsRRImmLogic`/`TstRRImmLogic` 变体与三条融合规则：
+   (a) `sub r,#imm; cmp r,#0; b.cc` → `subs`（仅 Eq/Ne/Mi/Pl，subs 不保
+   C/V）；(b) `and r,r,#imm; cmp r,#0` → `ands`（结果存活）或 `tst`
+   （结果死；排除 Hs/Lo/Hi/Ls）；(c) 回边 latch 的 `sub r,r,#imm; b T`
+   + `T: cmp r,#0; b.cc` → `subs`（验证 T 的块参数即 sub 结果，flags
+   跨块边由调度器 NZCV-WAW/RAW 边保证顺序）。huffman-01
+   `_and/_xor/_or` 循环体 `lsl; subs wX,wX,#1; b.eq/ne` 与 clang
+   `adds; b.lo` 同构；单测覆盖 IR 旋转（常量入口/零入口拒绝）与三条
+   融合（含 tst vs ands、条件排除）。已知遗留：h_functional
+   35_math.sy 在 -O2 下为旧有 FP 分歧（负参数 Newton 迭代混沌发散，
+   M30-M33 行为一致，-O0 通过，非本里程碑引入）。
 
-备注：M27/M30/M31/M32 已完成并独立提交；M28（RISC-V slot 化）待做。
+备注：M27/M30/M31/M32/M33 已完成并独立提交；M28（RISC-V slot 化）待做。
 
 目标硬件是 Xilinx XCZU15EG 上的 Cortex-A53 MPCore。
 
@@ -121,19 +136,19 @@ DCE。相关 pass 见 `raana_ir/src/opt/passes/`。
 
 ### 1.2 现状与差距总览（huffman-01 对照 clang -O2）
 
-M32 基线：huffman-01 静态指令数 640（awk 方法，M31 基线 686）。对照
+M33 基线：huffman-01 静态指令数 648（awk 方法，M32 基线 640）。对照
 `results/perf/huffman-01_clang.s`（clang -O2），差距集中在循环不变量
 外提与 RA 拷贝消除：
 
 | 函数 | clang | 本项目 | 差距根因 |
 |---|---|---|---|
-| `_and/_xor/_or` 循环体（32 次迭代） | ~10 条/迭代：`ccmp`+`csel` 无分支 | 8 条/迭代：`cmp`+`ccmp`+`csel` 无分支（M32 后与 clang 持平） | 回边仍有 mov（M35）；循环计数 `subs` 融合（M33） |
+| `_and/_xor/_or` 循环体（32 次迭代） | ~10 条/迭代：`ccmp`+`csel` 无分支，回边 `adds;b.lo` | 8 条/迭代：`cmp`+`ccmp`+`csel` + 回边 `subs;b.eq`（M33 后与 clang 同构） | 回边 blockparam 拷贝（M35） |
 | `rotrN/rotlN` | 二分比较树（最坏 ~3 次 cmp） | 8 次线性 cmp 链（内联后重复复制） | 无 if 链→switch/决策树（M37） |
 | `read_bits`（热点，2000×10⁵/5 调用） | 全局一次载入寄存器、出口统一写回；switch 表提取；无函数调用 | 循环内重复 `adrp+ldr` 全局；循环体 store 回写；热循环保留 `bl rotlN`（栈帧+8-cmp 链） | 缺 GSP/LICM（M34）；内联仅"单调用点"（M36） |
 | `output_data` | `gv_out_num` 一次加载；尾调用 `b putch` | 重复加载 3 次；`bl putch`+栈帧 | 缺 load-CSE/GSP（M34）；TCO 未覆盖 if 链末尾调用（M38） |
 | `decode_fixed_huffman` | 等价结构 | 死空块跳转 `then_13: b while_entry_5` | simplify_cfg 缺口（M38） |
 
-根因分层（M32 已修后端 `ccmp`，余下）：
+根因分层（M32 已修后端 `ccmp`，M33 已修循环计数 `subs` 融合，余下）：
 
 ### 1.3 当前结论边界
 
@@ -219,16 +234,16 @@ M32 基线：huffman-01 静态指令数 640（awk 方法，M31 基线 686）。�
   持平；`ccmp_nzcv_fallbacks` 单测覆盖 14 条件；全 corpus QEMU 差分、
   40/40 h_functional、109/109 functional 通过。已独立提交。
 
-#### M33：标志融合 peephole
+#### M33：标志融合 + 循环旋转（已完成）
 
-- 文件：`anon_armv8/src/passes/peephole_combine.rs`（现仅 MAdd/MSub 融合）、
-  `instructions.rs`（`AluOp` 增 `Subs/Adds` flag 变体）。
-- 设计（触发条件：结果单用、cmp 紧跟，仿 `combine_mac_in_block` 的 use
-  计数）：
-  - `sub r,#imm; cmp r,#0; b.cc` → `subs r,r,#imm; b.cc`；
-  - `and r,r,#imm; cmp r,#0; b.eq/ne` → `tst r,#imm; b.*`；
-  - 循环计数 `subs w8,w8,#1; b.ne`（消除 `_and` 等循环中的单独 cmp）。
-- 验收：全部 `sub X,#1; cmp X,#0; b.ne` 消失；on/off 差分无行为差异。
+- IR 层新增 `rotate_loops`（raana_ir）：`while (v) { body; v = f(v); }`
+  中非回边入口传非零常量时，头测试下沉到 latch（`br v', header(v'), exit`），
+  头块退化为直通；入口值不可证非零则拒绝旋转。
+- 后端新增 `SubsRRImm12`/`AndsRRImmLogic`/`TstRRImmLogic` 与三条融合规则
+  （块内 sub/and + `cmp r,#0` + CondBr；回边 latch + 测试块的跨块 subs）。
+- 结果：`_and/_xor/_or` 回边 `subs wX,wX,#1; b.eq/ne`（clang 同构）；
+  单测覆盖旋转与融合；RISC-V × functional/h_functional 无回归；
+  35_math.sy -O2 FP 分歧为 M30 起旧有（-O0 通过）。已独立提交。
 
 #### M34：GSP + LICM + load-CSE（IR 层）
 

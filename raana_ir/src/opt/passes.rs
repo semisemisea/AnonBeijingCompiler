@@ -6,6 +6,7 @@ pub mod gvn_pre;
 pub mod if_conversion;
 pub mod inline;
 pub mod ipsccp;
+pub mod rotate_loops;
 pub mod simplify_cfg;
 pub mod specialize;
 pub mod sr;

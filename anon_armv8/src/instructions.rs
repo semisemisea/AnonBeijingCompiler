@@ -487,6 +487,29 @@ pub enum MInst {
         lhs: Reg,
         imm: Imm12,
     },
+    /// `subs dst, src, #imm`: subtract and set flags. Produced by fusing a
+    /// `sub` with a following `cmp dst, #0` (count-down loop tests).
+    SubsRRImm12 {
+        size: OperandSize,
+        dst: WritableReg,
+        src: Reg,
+        imm: Imm12,
+    },
+    /// `ands dst, src, #imm`: bitwise-and and set flags. Produced by fusing
+    /// a live `and` with a following `cmp dst, #0`.
+    AndsRRImmLogic {
+        size: OperandSize,
+        dst: WritableReg,
+        src: RegOrZr,
+        imm: ImmLogic,
+    },
+    /// `tst src, #imm`: set flags from `src & imm` without writing a result.
+    /// Produced when the fused `and` result is dead.
+    TstRRImmLogic {
+        size: OperandSize,
+        src: RegOrZr,
+        imm: ImmLogic,
+    },
     Mov {
         size: OperandSize,
         dst: WritableReg,
@@ -840,6 +863,15 @@ impl MachInst for MInst {
             | Self::Cbnz { reg: lhs, .. }
             | Self::Tbz { reg: lhs, .. }
             | Self::Tbnz { reg: lhs, .. } => collector.reg_use(lhs),
+            Self::SubsRRImm12 { dst, src, .. } => {
+                use_sp_aware_reg(collector, src);
+                def_sp_aware_reg(collector, dst);
+            }
+            Self::AndsRRImmLogic { dst, src, .. } => {
+                use_reg_or_zr(collector, src);
+                collector.reg_def(dst);
+            }
+            Self::TstRRImmLogic { src, .. } => use_reg_or_zr(collector, src),
             Self::MovPhys { dst, src, .. } => {
                 use_sp_aware_reg(collector, src);
                 def_sp_aware_reg(collector, dst);
@@ -1188,6 +1220,34 @@ impl MachInstEmit for MInst {
                     write!(ctx, ", lsl #12")?;
                 }
                 Ok(())
+            }
+            Self::SubsRRImm12 {
+                size,
+                dst,
+                src,
+                imm,
+            } => {
+                write!(ctx, "subs ")?;
+                emit_reg(ctx, dst.to_reg(), *size)?;
+                write!(ctx, ", ")?;
+                emit_reg(ctx, *src, *size)?;
+                write!(ctx, ", #{}", imm.value())?;
+                if imm.shift12() {
+                    write!(ctx, ", lsl #12")?;
+                }
+                Ok(())
+            }
+            Self::AndsRRImmLogic { size, dst, src, imm } => {
+                write!(ctx, "ands ")?;
+                emit_reg(ctx, dst.to_reg(), *size)?;
+                write!(ctx, ", ")?;
+                emit_reg_or_zr(ctx, src, *size)?;
+                write!(ctx, ", #0x{:x}", imm.value())
+            }
+            Self::TstRRImmLogic { size, src, imm } => {
+                write!(ctx, "tst ")?;
+                emit_reg_or_zr(ctx, src, *size)?;
+                write!(ctx, ", #0x{:x}", imm.value())
             }
             Self::Mov { size, dst, src } => {
                 write!(ctx, "mov ")?;
@@ -2040,7 +2100,7 @@ mod tests {
         vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
     };
 
-    use super::{CCmpStep, Cond, Imm12, MInst, SelectCmp, SelectValue, call_clobbers};
+    use super::{CCmpStep, Cond, Imm12, ImmLogic, MInst, SelectCmp, SelectValue, call_clobbers};
     use crate::regs::{OperandSize, float_reg, int_reg};
 
     #[derive(Default)]
@@ -2243,6 +2303,32 @@ mod tests {
             text,
             "cmp w1, w2\n    ccmp w3, #1, #4, ne\n    cset w0, eq"
         );
+    }
+
+    #[test]
+    fn emits_fused_flag_forms() {
+        let subs = emit(MInst::SubsRRImm12 {
+            size: OperandSize::Size32,
+            dst: Writable::from_reg(int_reg(1)),
+            src: int_reg(1),
+            imm: Imm12::new(1, false).unwrap(),
+        });
+        assert_eq!(subs, "subs w1, w1, #1");
+
+        let ands = emit(MInst::AndsRRImmLogic {
+            size: OperandSize::Size32,
+            dst: Writable::from_reg(int_reg(1)),
+            src: crate::regs::RegOrZr::Reg(int_reg(2)),
+            imm: ImmLogic::new(0x8000_0001, OperandSize::Size32).unwrap(),
+        });
+        assert_eq!(ands, "ands w1, w2, #0x80000001");
+
+        let tst = emit(MInst::TstRRImmLogic {
+            size: OperandSize::Size32,
+            src: crate::regs::RegOrZr::Reg(int_reg(2)),
+            imm: ImmLogic::new(0x8000_0001, OperandSize::Size32).unwrap(),
+        });
+        assert_eq!(tst, "tst w2, #0x80000001");
     }
 
     #[test]

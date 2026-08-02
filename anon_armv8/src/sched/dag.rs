@@ -826,6 +826,38 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             is_barrier: false,
         },
 
+        // Flag-producing fused forms: `subs`/`ands`/`tst` define NZCV like a
+        // compare but also produce (or omit) a register result.
+        MInst::SubsRRImm12 { dst, src, .. } => InstDeps {
+            defs: preg(dst.reg),
+            uses: preg(*src),
+            flags_def: true,
+            flags_use: false,
+            class: SchedClass::Alu,
+            mem: None,
+            is_barrier: false,
+        },
+
+        MInst::AndsRRImmLogic { dst, src, .. } => InstDeps {
+            defs: preg(dst.reg),
+            uses: collect_reg_or_zr_vec(src),
+            flags_def: true,
+            flags_use: false,
+            class: SchedClass::Alu,
+            mem: None,
+            is_barrier: false,
+        },
+
+        MInst::TstRRImmLogic { src, .. } => InstDeps {
+            defs: vec![],
+            uses: collect_reg_or_zr_vec(src),
+            flags_def: true,
+            flags_use: false,
+            class: SchedClass::Alu,
+            mem: None,
+            is_barrier: false,
+        },
+
         // `ccmp` consumes NZCV as its condition and redefines it, so it sits
         // between the preceding comparison and the consuming branch/select.
         MInst::CCmp { lhs, rhs, .. } => {

@@ -29,7 +29,7 @@ for arg in "$@"; do
         *) args+=("$arg") ;;
     esac
 done
-set -- "${args[@]}"
+set -- "${args[@]+"${args[@]}"}"
 
 # Millestone label (git short sha + branch) recorded for traceability.
 MILESTONE="${SOYO_MILESTONE:-$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)}"

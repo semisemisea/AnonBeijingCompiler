@@ -226,6 +226,7 @@ where
         let abi = CalleeABI::new(arena);
         let lower = LowerContext::new(p, func, abi, lower_order);
         let mut vcode = lower.lower::<B>();
+        #[cfg(debug_assertions)]
         vcode.verify("post-lowering").unwrap_or_else(|error| {
             log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
             panic!("function={} {error}", func_data.name());
@@ -233,6 +234,7 @@ where
 
         if pipeline.run_pre_ra(&mut vcode, arena, &mut stats) {
             vcode.rebuild_operand_tables();
+            #[cfg(debug_assertions)]
             vcode.verify("post-pre-RA-passes").unwrap_or_else(|error| {
                 log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
                 panic!("function={} {error}", func_data.name());
@@ -243,6 +245,7 @@ where
         let allocation_start = Instant::now();
         let output =
             crate::reg_alloc::ion::run(&vcode, machine_env).expect("register allocation failed");
+        #[cfg(debug_assertions)]
         vcode.verify_alloc_output(&output).unwrap_or_else(|error| {
             log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
             panic!("function={} {error}", func_data.name());
@@ -275,6 +278,7 @@ where
             log::trace!(target: "taki_mir::reg_alloc", "function={} edit at {point:?}: {edit:?}", func_data.name());
         }
         vcode.write_back_allocs(&output);
+        #[cfg(debug_assertions)]
         vcode
             .verify("post-allocation-writeback")
             .unwrap_or_else(|error| {
@@ -314,6 +318,7 @@ where
         vcode.finalize_for_emission(&output);
 
         if pipeline.run_post_ra(&mut vcode, arena, &mut stats) {
+            #[cfg(debug_assertions)]
             vcode.verify("post-post-RA-passes").unwrap_or_else(|error| {
                 log::error!(target: "taki_mir::verify", "function={} {error}", func_data.name());
                 panic!("function={} {error}", func_data.name());

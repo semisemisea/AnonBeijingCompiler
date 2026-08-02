@@ -4,13 +4,14 @@ use crate::opt::{
     analysis_passes::{
         dom_tree::v2::DominanceTree,
         induction_variable::{
-            BasicInductionVariable, BasicInductionVariableAnalysis, InductionStep,
+            BasicInductionVariableAnalysis, InductionDirection, normalize_strict_unit_exit,
         },
         loop_analysis::{Loop, LoopAnalysis},
     },
     prelude::*,
     utils::{
         cfg::CFG,
+        gep::gep_index_stride,
         logical_edge::{LogicalEdge, LogicalEdgeRewriter, incoming_edges, outgoing_edges},
         pointer_strength_reduction_cost::estimate_aarch64_pointer_strength_reduction,
         preheader::{EnsurePreheader, ensure_preheader},
@@ -19,17 +20,13 @@ use crate::opt::{
 
 pub struct PointerStrengthReduction;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Direction {
-    Forward,
-}
-
 struct Candidate {
     gep: Inst,
-    iv_position: usize,
+    header_iv_position: usize,
+    gep_iv_position: usize,
     latch: BasicBlock,
     backedge: LogicalEdge,
-    direction: Direction,
+    pointer_step: i32,
     base: Inst,
     offsets: Vec<Inst>,
     pointer_ty: Type,
@@ -69,10 +66,10 @@ impl PointerStrengthReduction {
         }
 
         for iv in ivs.for_loop(looop) {
-            let Some(direction) = Self::safe_unit_direction(data, looop, iv) else {
+            let Some(direction) = normalize_strict_unit_exit(data, looop, iv) else {
                 continue;
             };
-            let Some(iv_position) = data
+            let Some(header_iv_position) = data
                 .bb_data(looop.header())
                 .params()
                 .iter()
@@ -80,7 +77,8 @@ impl PointerStrengthReduction {
             else {
                 continue;
             };
-            if backedge.args(data).get(iv_position).copied() != iv.update_values().first().copied()
+            if backedge.args(data).get(header_iv_position).copied()
+                != iv.update_values().first().copied()
                 || iv.update_values().len() != 1
             {
                 continue;
@@ -97,8 +95,20 @@ impl PointerStrengthReduction {
                     let InstKind::GetElemPtr(gep) = data.inst_data(inst).kind() else {
                         continue;
                     };
+                    let mut iv_positions =
+                        gep.offsets()
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(position, &offset)| {
+                                (offset == iv.parameter()).then_some(position)
+                            });
+                    let Some(gep_iv_position) = iv_positions.next() else {
+                        continue;
+                    };
+                    if iv_positions.next().is_some() {
+                        continue;
+                    }
                     if gep.offsets().len() < 2
-                        || gep.offsets().last().copied() != Some(iv.parameter())
                         || !Self::available_at_header(
                             data,
                             dom_tree,
@@ -106,9 +116,12 @@ impl PointerStrengthReduction {
                             parameter_blocks,
                             gep.base(),
                         )
-                        || !gep.offsets()[..gep.offsets().len() - 1]
+                        || !gep
+                            .offsets()
                             .iter()
-                            .all(|&offset| {
+                            .enumerate()
+                            .filter(|(position, _)| *position != gep_iv_position)
+                            .all(|(_, &offset)| {
                                 Self::available_at_header(
                                     data,
                                     dom_tree,
@@ -121,9 +134,34 @@ impl PointerStrengthReduction {
                     {
                         continue;
                     }
-                    let Some(cost) =
-                        estimate_aarch64_pointer_strength_reduction(data, cfg, looop, gep)
-                    else {
+                    let Some(stride) = gep_index_stride(data, inst, gep_iv_position) else {
+                        continue;
+                    };
+                    let signed_pointer_step = match direction {
+                        InductionDirection::Forward => stride.result_element_stride,
+                        InductionDirection::Backward => {
+                            let Some(step) = stride.result_element_stride.checked_neg() else {
+                                continue;
+                            };
+                            step
+                        }
+                    };
+                    let signed_byte_delta = match direction {
+                        InductionDirection::Forward => stride.byte_stride,
+                        InductionDirection::Backward => {
+                            let Some(delta) = stride.byte_stride.checked_neg() else {
+                                continue;
+                            };
+                            delta
+                        }
+                    };
+                    let Some(cost) = estimate_aarch64_pointer_strength_reduction(
+                        data,
+                        cfg,
+                        looop,
+                        gep,
+                        signed_byte_delta,
+                    ) else {
                         continue;
                     };
                     if !cost.is_profitable() {
@@ -131,10 +169,11 @@ impl PointerStrengthReduction {
                     }
                     return Some(Candidate {
                         gep: inst,
-                        iv_position,
+                        header_iv_position,
+                        gep_iv_position,
                         latch,
                         backedge,
-                        direction,
+                        pointer_step: signed_pointer_step,
                         base: gep.base(),
                         offsets: gep.offsets().to_vec(),
                         pointer_ty: data.inst_data(inst).ty().clone(),
@@ -143,58 +182,6 @@ impl PointerStrengthReduction {
             }
         }
         None
-    }
-
-    fn safe_unit_direction(
-        data: &ArenaContextMut<'_>,
-        looop: &Loop,
-        iv: &BasicInductionVariable,
-    ) -> Option<Direction> {
-        let step = match iv.step() {
-            InductionStep::Add(step) if Self::integer_constant(data, step) == Some(1) => {
-                Direction::Forward
-            }
-            _ => return None,
-        };
-
-        let terminator = data.layout().basicblock(looop.header()).terminator();
-        let InstKind::Branch(branch) = data.inst_data(terminator).kind() else {
-            return None;
-        };
-        let true_inside = looop.contains(branch.t_target());
-        let false_inside = looop.contains(branch.f_target());
-        if true_inside == false_inside {
-            return None;
-        }
-        let InstKind::Binary(compare) = data.inst_data(branch.cond()).kind() else {
-            return None;
-        };
-        if !data.inst_data(compare.lhs()).ty().is_i32()
-            || !data.inst_data(compare.rhs()).ty().is_i32()
-        {
-            return None;
-        }
-
-        let mut op = compare.op();
-        if !true_inside {
-            op = op.complement_integer_compare()?;
-        }
-        if compare.rhs() == iv.parameter() {
-            op = op.swap_compare_args()?;
-        } else if compare.lhs() != iv.parameter() {
-            return None;
-        }
-        match (step, op) {
-            (Direction::Forward, BinaryOp::Lt) => Some(Direction::Forward),
-            _ => None,
-        }
-    }
-
-    fn integer_constant(data: &ArenaContextMut<'_>, inst: Inst) -> Option<i32> {
-        match data.inst_data(inst).kind() {
-            InstKind::Integer(integer) => Some(integer.value()),
-            _ => None,
-        }
     }
 
     fn available_at_header(
@@ -261,13 +248,13 @@ impl PointerStrengthReduction {
 
         let mut rewrites = LogicalEdgeRewriter::new();
         for edge in entry_edges {
-            let initial_iv = edge.args(data)[candidate.iv_position];
+            let initial_iv = edge.args(data)[candidate.header_iv_position];
             let mut initial_offsets = candidate.offsets.clone();
-            *initial_offsets.last_mut().unwrap() = initial_iv;
+            initial_offsets[candidate.gep_iv_position] = initial_iv;
             let initial_pointer = data
                 .new_local_value()
                 .get_elem_ptr(candidate.base, initial_offsets);
-            assert_eq!(data.inst_data(initial_pointer).ty(), &candidate.pointer_ty);
+            debug_assert_eq!(data.inst_data(initial_pointer).ty(), &candidate.pointer_ty);
             data.layout_mut()
                 .insert_before_terminator(preheader, initial_pointer);
             rewrites.append_arg(data, edge, initial_pointer);
@@ -276,13 +263,11 @@ impl PointerStrengthReduction {
         let pointer = data
             .new_basic_block()
             .add_param(looop.header(), candidate.pointer_ty.clone());
-        let pointer_step = data.new_local_value().integer(match candidate.direction {
-            Direction::Forward => 1,
-        });
+        let pointer_step = data.new_local_value().integer(candidate.pointer_step);
         let next_pointer = data
             .new_local_value()
             .get_elem_ptr(pointer, vec![pointer_step]);
-        assert_eq!(data.inst_data(next_pointer).ty(), &candidate.pointer_ty);
+        debug_assert_eq!(data.inst_data(next_pointer).ty(), &candidate.pointer_ty);
         data.layout_mut()
             .insert_before_terminator(candidate.latch, next_pointer);
         rewrites.append_arg(data, candidate.backedge, next_pointer);
@@ -291,7 +276,7 @@ impl PointerStrengthReduction {
         let zero = data.new_local_value().integer(0);
         data.replace_inst_with(candidate.gep)
             .get_elem_ptr(pointer, vec![zero]);
-        assert_eq!(data.inst_data(candidate.gep).ty(), &candidate.pointer_ty);
+        debug_assert_eq!(data.inst_data(candidate.gep).ty(), &candidate.pointer_ty);
         ApplyResult::Changed
     }
 }
@@ -369,7 +354,12 @@ mod tests {
         backedge: Inst,
     }
 
-    fn build_loop(compare_op: BinaryOp, iv_last: bool) -> (Program, LoopFixture) {
+    fn build_loop_with_update(
+        update_op: BinaryOp,
+        step_value: i32,
+        compare_op: BinaryOp,
+        iv_last: bool,
+    ) -> (Program, LoopFixture) {
         let array_ty = Type::get_array(Type::get_i32(), 32);
         let mut program = Program::new();
         let function = program.new_function(
@@ -407,8 +397,8 @@ mod tests {
         };
         let gep = data.new_local_inst().get_elem_ptr(base, offsets);
         let load = data.new_local_inst().load(gep);
-        let one = data.new_local_inst().integer(1);
-        let next_iv = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        let step = data.new_local_inst().integer(step_value);
+        let next_iv = data.new_local_inst().binary(update_op, iv, step);
         for inst in [gep, load, next_iv] {
             data.layout_mut().insert_inst(header, inst);
         }
@@ -439,6 +429,10 @@ mod tests {
                 backedge,
             },
         )
+    }
+
+    fn build_loop(compare_op: BinaryOp, iv_last: bool) -> (Program, LoopFixture) {
+        build_loop_with_update(BinaryOp::Add, 1, compare_op, iv_last)
     }
 
     fn run(program: &mut Program, function: Function) -> bool {
@@ -542,6 +536,37 @@ mod tests {
     }
 
     #[test]
+    fn carries_a_pointer_for_a_backward_unit_step_loop() {
+        let (mut program, fixture) = build_loop_with_update(BinaryOp::Sub, 1, BinaryOp::Gt, true);
+        assert!(run(&mut program, fixture.function));
+
+        let data = program.func_data(fixture.function);
+        let pointer = data.bb_data(fixture.header).params()[1];
+        let InstKind::Jump(backedge) = data.inst_data(fixture.backedge).kind() else {
+            panic!("backedge must remain a jump");
+        };
+        let next_pointer = backedge.args()[1];
+        let InstKind::GetElemPtr(next) = data.inst_data(next_pointer).kind() else {
+            panic!("latch must compute the next pointer");
+        };
+        assert_eq!(next.base(), pointer);
+        assert_eq!(integer_constant(data, next.offsets()[0]), Some(-1));
+        assert!(!run(&mut program, fixture.function));
+    }
+
+    #[test]
+    fn rejects_a_non_unit_step_without_a_no_wrap_proof() {
+        let (mut program, fixture) = build_loop_with_update(BinaryOp::Add, 2, BinaryOp::Lt, true);
+        assert!(!run(&mut program, fixture.function));
+        let data = program.func_data(fixture.function);
+        assert_eq!(data.bb_data(fixture.header).params().len(), 1);
+        let InstKind::GetElemPtr(gep) = data.inst_data(fixture.gep).kind() else {
+            unreachable!()
+        };
+        assert_eq!(gep.offsets().last().copied(), Some(fixture.iv));
+    }
+
+    #[test]
     fn rejects_a_non_strict_bound_that_can_wrap() {
         let (mut program, fixture) = build_loop(BinaryOp::Le, true);
         let param_count = program
@@ -611,8 +636,159 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_induction_index_before_the_final_gep_index() {
+    fn carries_a_pointer_for_an_induction_index_before_the_final_gep_index() {
         let (mut program, fixture) = build_loop(BinaryOp::Lt, false);
+        assert!(run(&mut program, fixture.function));
+        let data = program.func_data(fixture.function);
+        let pointer = data.bb_data(fixture.header).params()[1];
+        let InstKind::Jump(backedge) = data.inst_data(fixture.backedge).kind() else {
+            panic!("backedge must remain a jump");
+        };
+        let InstKind::GetElemPtr(next) = data.inst_data(backedge.args()[1]).kind() else {
+            panic!("latch must compute the next pointer");
+        };
+        assert_eq!(next.base(), pointer);
+        assert_eq!(integer_constant(data, next.offsets()[0]), Some(32));
+        let InstKind::Jump(entry_jump) = data.inst_data(fixture.entry_jump).kind() else {
+            panic!("entry terminator must remain a jump");
+        };
+        let InstKind::GetElemPtr(initial) = data.inst_data(entry_jump.args()[1]).kind() else {
+            panic!("entry must compute the initial pointer");
+        };
+        assert_eq!(initial.offsets()[0], entry_jump.args()[0]);
+        assert!(!run(&mut program, fixture.function));
+    }
+
+    #[test]
+    fn queries_the_stride_of_a_global_array_base() {
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        let array_ty = Type::get_array(Type::get_i32(), 32);
+        let initializer = program.new_value().zero_init(array_ty);
+        let base = program.new_value().global_alloc(initializer);
+        {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(fixture.function),
+            };
+            let zero = data.new_local_value().integer(0);
+            data.replace_inst_with(fixture.gep)
+                .get_elem_ptr(base, vec![zero, fixture.iv]);
+        }
+
+        let data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(fixture.function),
+        };
+        assert_eq!(
+            gep_index_stride(&data, fixture.gep, 1),
+            Some(crate::opt::utils::gep::GepIndexStride {
+                byte_stride: 4,
+                result_element_stride: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn carries_a_backward_pointer_through_an_invariant_suffix() {
+        let row_ty = Type::get_array(Type::get_i32(), 32);
+        let matrix_ty = Type::get_array(row_ty, 4);
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "pointer_sr_middle".into(),
+            vec![
+                Type::get_pointer(matrix_ty),
+                Type::get_i32(),
+                Type::get_i32(),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let bound = data.params()[1];
+        let suffix = data.params()[2];
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, latch, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let initial = data.new_local_inst().integer(3);
+        let entry_jump = data.new_local_inst().jump(header, vec![initial]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let iv = data.bb_data(header).params()[0];
+        let zero = data.new_local_inst().integer(0);
+        let gep = data
+            .new_local_inst()
+            .get_elem_ptr(base, vec![zero, iv, suffix]);
+        let load = data.new_local_inst().load(gep);
+        let one = data.new_local_inst().integer(1);
+        let next_iv = data.new_local_inst().binary(BinaryOp::Sub, iv, one);
+        let compare = data.new_local_inst().binary(BinaryOp::Gt, iv, bound);
+        for inst in [gep, load, next_iv, compare] {
+            data.layout_mut().insert_inst(header, inst);
+        }
+        let branch = data
+            .new_local_inst()
+            .branch(compare, latch, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, branch);
+        let backedge = data.new_local_inst().jump(header, vec![next_iv]);
+        data.layout_mut().insert_inst(latch, backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        let pointer = data.bb_data(header).params()[1];
+        let InstKind::Jump(backedge) = data.inst_data(backedge).kind() else {
+            panic!("backedge must remain a jump");
+        };
+        let InstKind::GetElemPtr(next) = data.inst_data(backedge.args()[1]).kind() else {
+            panic!("latch must compute the next pointer");
+        };
+        assert_eq!(next.base(), pointer);
+        assert_eq!(integer_constant(data, next.offsets()[0]), Some(-32));
+        let InstKind::Jump(entry_jump) = data.inst_data(entry_jump).kind() else {
+            panic!("entry terminator must remain a jump");
+        };
+        let InstKind::GetElemPtr(initial_pointer) = data.inst_data(entry_jump.args()[1]).kind()
+        else {
+            panic!("entry must compute the initial pointer");
+        };
+        assert_eq!(initial_pointer.offsets(), [zero, initial, suffix]);
+        assert!(!run(&mut program, function));
+    }
+
+    #[test]
+    fn rejects_a_gep_that_uses_the_same_induction_variable_twice() {
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, false);
+        let data = program.func_data_mut(fixture.function);
+        let base = data.params()[0];
+        data.replace_inst_with(fixture.gep)
+            .get_elem_ptr(base, vec![fixture.iv, fixture.iv]);
+
+        assert!(!run(&mut program, fixture.function));
+        assert_eq!(
+            program
+                .func_data(fixture.function)
+                .bb_data(fixture.header)
+                .params()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn rejects_a_loop_variant_suffix_after_the_induction_index() {
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, false);
+        let data = program.func_data_mut(fixture.function);
+        let base = data.params()[0];
+        data.replace_inst_with(fixture.gep)
+            .get_elem_ptr(base, vec![fixture.iv, fixture.next_iv]);
+
         assert!(!run(&mut program, fixture.function));
         assert_eq!(
             program

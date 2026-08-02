@@ -48,6 +48,12 @@ impl BasicInductionVariable {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InductionDirection {
+    Forward,
+    Backward,
+}
+
 pub struct BasicInductionVariableAnalysis {
     by_header: FxHashMap<BasicBlock, Vec<BasicInductionVariable>>,
 }
@@ -94,6 +100,62 @@ impl BasicInductionVariableAnalysis {
         self.for_loop(looop)
             .iter()
             .find(|variable| variable.parameter == parameter)
+    }
+}
+
+/// Normalize a unit-step header exit to `iv < bound` or `iv > bound` while the
+/// selected branch arm remains inside the loop.
+pub fn normalize_strict_unit_exit(
+    data: &ArenaContextMut<'_>,
+    looop: &Loop,
+    iv: &BasicInductionVariable,
+) -> Option<InductionDirection> {
+    let direction = match iv.step() {
+        InductionStep::Add(step) => match integer_constant(data, step)? {
+            1 => InductionDirection::Forward,
+            -1 => InductionDirection::Backward,
+            _ => return None,
+        },
+        InductionStep::Sub(step) => match integer_constant(data, step)? {
+            1 => InductionDirection::Backward,
+            -1 => InductionDirection::Forward,
+            _ => return None,
+        },
+    };
+
+    let terminator = data.layout().basicblock(looop.header()).terminator();
+    let InstKind::Branch(branch) = data.inst_data(terminator).kind() else {
+        return None;
+    };
+    let true_inside = looop.contains(branch.t_target());
+    let false_inside = looop.contains(branch.f_target());
+    if true_inside == false_inside {
+        return None;
+    }
+
+    let InstKind::Binary(compare) = data.inst_data(branch.cond()).kind() else {
+        return None;
+    };
+    if !data.inst_data(compare.lhs()).ty().is_i32() || !data.inst_data(compare.rhs()).ty().is_i32()
+    {
+        return None;
+    }
+
+    let mut op = compare.op();
+    if !true_inside {
+        op = op.complement_integer_compare()?;
+    }
+    if compare.lhs() == iv.parameter() {
+    } else if compare.rhs() == iv.parameter() {
+        op = op.swap_compare_args()?;
+    } else {
+        return None;
+    }
+
+    match (direction, op) {
+        (InductionDirection::Forward, BinaryOp::Lt)
+        | (InductionDirection::Backward, BinaryOp::Gt) => Some(direction),
+        _ => None,
     }
 }
 
@@ -211,6 +273,13 @@ fn is_literal_zero(data: &FunctionData, value: Inst) -> bool {
         && matches!(data.inst_data(value).kind(), InstKind::Integer(integer) if integer.value() == 0)
 }
 
+fn integer_constant(data: &ArenaContextMut<'_>, value: Inst) -> Option<i32> {
+    match data.inst_data(value).kind() {
+        InstKind::Integer(integer) => Some(integer.value()),
+        _ => None,
+    }
+}
+
 fn same_step(data: &FunctionData, lhs: InductionStep, rhs: InductionStep) -> bool {
     match (lhs, rhs) {
         (InductionStep::Add(lhs), InductionStep::Add(rhs))
@@ -257,6 +326,164 @@ mod tests {
         assert_eq!(variables.len(), 1);
         assert_eq!(variables[0].parameter(), parameter);
         variables[0].clone()
+    }
+
+    fn normalized_direction(
+        update_op: BinaryOp,
+        step_value: i32,
+        compare_op: BinaryOp,
+        iv_on_left: bool,
+        continue_on_true: bool,
+    ) -> Option<InductionDirection> {
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "normalized_exit".into(),
+            vec![Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let bound = data.params()[0];
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, latch, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let iv = data.bb_data(header).params()[0];
+        let step = data.new_local_inst().integer(step_value);
+        let update = data.new_local_inst().binary(update_op, iv, step);
+        data.layout_mut().insert_inst(header, update);
+        let (lhs, rhs) = if iv_on_left { (iv, bound) } else { (bound, iv) };
+        let compare = data.new_local_inst().binary(compare_op, lhs, rhs);
+        data.layout_mut().insert_inst(header, compare);
+        let (true_target, false_target) = if continue_on_true {
+            (latch, exit)
+        } else {
+            (exit, latch)
+        };
+        let branch =
+            data.new_local_inst()
+                .branch(compare, true_target, vec![], false_target, vec![]);
+        data.layout_mut().insert_inst(header, branch);
+        let backedge = data.new_local_inst().jump(header, vec![update]);
+        data.layout_mut().insert_inst(latch, backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        let data = program.func_data(function);
+        let (cfg, _dom_tree, loops) = LoopAnalysis::new(data);
+        let looop = only_loop(&loops);
+        let analysis = BasicInductionVariableAnalysis::new(data, &cfg, &loops);
+        let iv = analysis.find(looop, iv)?;
+        let context = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(function),
+        };
+        normalize_strict_unit_exit(&context, looop, iv)
+    }
+
+    #[test]
+    fn normalizes_forward_and_backward_strict_unit_exits() {
+        assert_eq!(
+            normalized_direction(BinaryOp::Add, 1, BinaryOp::Lt, true, true),
+            Some(InductionDirection::Forward)
+        );
+        assert_eq!(
+            normalized_direction(BinaryOp::Sub, -1, BinaryOp::Ge, true, false),
+            Some(InductionDirection::Forward)
+        );
+        assert_eq!(
+            normalized_direction(BinaryOp::Sub, 1, BinaryOp::Gt, true, true),
+            Some(InductionDirection::Backward)
+        );
+        assert_eq!(
+            normalized_direction(BinaryOp::Add, -1, BinaryOp::Le, true, false),
+            Some(InductionDirection::Backward)
+        );
+    }
+
+    #[test]
+    fn rejects_non_strict_mismatched_and_non_unit_exits() {
+        assert_eq!(
+            normalized_direction(BinaryOp::Add, 1, BinaryOp::Le, true, true),
+            None
+        );
+        assert_eq!(
+            normalized_direction(BinaryOp::Add, 1, BinaryOp::Gt, true, true),
+            None
+        );
+        assert_eq!(
+            normalized_direction(BinaryOp::Add, 2, BinaryOp::Lt, true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn normalizes_an_exit_with_a_global_unit_step() {
+        let mut program = Program::new();
+        let step = program.new_value().integer(1);
+        let function = program.new_function(
+            Type::get_unit(),
+            "global_step_exit".into(),
+            vec![Type::get_i32()],
+        );
+        let (header, iv) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = data.add_entry_block();
+            let bound = data.params()[0];
+            let header = data
+                .new_basic_block()
+                .basic_block("header".into(), vec![Type::get_i32()]);
+            let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+            let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+            for block in [header, latch, exit] {
+                data.layout_mut().push_bb_back(block);
+            }
+
+            let zero = data.new_local_value().integer(0);
+            let entry_jump = data.new_local_value().jump(header, vec![zero]);
+            data.layout_mut().insert_inst(entry, entry_jump);
+            let iv = data.bb_data(header).params()[0];
+            let update = data.new_local_value().binary(BinaryOp::Add, iv, step);
+            let compare = data.new_local_value().binary(BinaryOp::Lt, iv, bound);
+            for inst in [update, compare] {
+                data.layout_mut().insert_inst(header, inst);
+            }
+            let branch = data
+                .new_local_value()
+                .branch(compare, latch, vec![], exit, vec![]);
+            data.layout_mut().insert_inst(header, branch);
+            let backedge = data.new_local_value().jump(header, vec![update]);
+            data.layout_mut().insert_inst(latch, backedge);
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(exit, ret);
+            (header, iv)
+        };
+
+        let data = program.func_data(function);
+        let (cfg, _dom_tree, loops) = LoopAnalysis::new(data);
+        let looop = only_loop(&loops);
+        assert_eq!(looop.header(), header);
+        let analysis = BasicInductionVariableAnalysis::new(data, &cfg, &loops);
+        let iv = analysis.find(looop, iv).unwrap();
+        let context = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(function),
+        };
+        assert_eq!(
+            normalize_strict_unit_exit(&context, looop, iv),
+            Some(InductionDirection::Forward)
+        );
     }
 
     #[test]

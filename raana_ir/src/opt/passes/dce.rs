@@ -262,11 +262,15 @@ impl Pass for DeadPhiElimination {
                         let ft = branch.f_target();
                         let mut ta = branch.t_args().to_vec();
                         let mut fa = branch.f_args().to_vec();
+                        // The same block may be both the true and the false
+                        // target of a branch; trim each side independently so
+                        // the rebuilt branch keeps args aligned with params.
                         if bb == branch.t_target() {
                             for &index in unused_params_index.iter() {
                                 ta.swap_remove(index);
                             }
-                        } else {
+                        }
+                        if bb == branch.f_target() {
                             for &index in unused_params_index.iter() {
                                 fa.swap_remove(index);
                             }

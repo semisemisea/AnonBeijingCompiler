@@ -441,7 +441,7 @@ impl Pass for IPSCCP {
             };
             if matches!(
                 arena.inst_data(node.inst).kind(),
-                InstKind::Call(..) | InstKind::BlockArgRef(..)
+                InstKind::Call(..) | InstKind::BlockArgRef(..) | InstKind::TailCall(..)
             ) {
                 let has_uses = !arena.inst_data(node.inst).used_by().is_empty();
                 if !has_uses {

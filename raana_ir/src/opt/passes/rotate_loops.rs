@@ -120,6 +120,21 @@ impl RotateLoops {
         }
         let back_edge = back_edge.unwrap();
 
+        // After rotation the body's `br v', header(args), exit` skips the
+        // header on the false edge, so any reference to a header parameter
+        // inside `exit` would see the *previous* iteration's value instead of
+        // the freshly computed one. The tested counter is the exception: its
+        // value on exit is zero either way. Refuse to rotate when `exit`
+        // mentions any other header parameter.
+        let tested_param = params[tested_index];
+        for &inst in data.layout().basicblock(exit).insts().iter() {
+            for used in data.inst_data(inst).inst_usage() {
+                if params.contains(&used) && used != tested_param {
+                    return false;
+                }
+            }
+        }
+
         // Move the header's test to the latch: br v', header(args), exit.
         let back_args = match data.inst_data(back_edge).kind() {
             InstKind::Jump(jump) => jump.args().to_vec(),

@@ -111,6 +111,67 @@ pub fn analyze_gep(
     })
 }
 
+/// Fold a constant-only GEP into a `(base, constant_offset)` pair consumed by a
+/// load/store, when the GEP's sole user is `consumer` and the offset satisfies
+/// `offset_ok`.
+///
+/// On success the GEP is sunk via `sink_pure_single_use_producer`, so it is no
+/// longer materialized on its own: the consumer's addressing mode can name the
+/// base register and the folded constant offset directly. `offset_ok` runs
+/// before sinking, so a caller that cannot encode the offset in its addressing
+/// mode can safely fall back to `put_value_in_reg(gep)` without tripping the
+/// sunk-instruction assertion.
+pub fn fold_gep_constant_offset<I: VCodeInst>(
+    ctx: &mut LowerContext<'_, I>,
+    arena: ArenaContext<'_>,
+    gep_inst: HirInst,
+    consumer: HirInst,
+    offset_ok: impl FnOnce(i64) -> bool,
+) -> Option<(Reg, i64)> {
+    let gep = match arena.inst_data(gep_inst).kind() {
+        InstKind::GetElemPtr(gep) => gep,
+        _ => return None,
+    };
+    let analysis = analyze_gep(arena, gep_inst, gep).ok()?;
+    if !analysis.dynamic_terms.is_empty() || !offset_ok(analysis.constant_offset) {
+        return None;
+    }
+    if !ctx.sink_pure_single_use_producer(gep_inst, consumer) {
+        return None;
+    }
+    let base = ctx.put_value_in_reg(analysis.base);
+    Some((base, analysis.constant_offset))
+}
+
+/// Sink a single-use GEP and return its full address decomposition.
+///
+/// Unlike `fold_gep_constant_offset`, the `foldable` predicate sees the whole
+/// `GepAddress` (dynamic terms included), so the caller decides how to exploit
+/// the decomposition (e.g. AArch64 extended-register addressing for one
+/// dynamic term). On success the GEP is sunk and must not be materialized;
+/// every failure path runs before sinking, so the caller can safely fall back
+/// to `put_value_in_reg(gep)`.
+pub fn sink_gep_into_address<I: VCodeInst>(
+    ctx: &mut LowerContext<'_, I>,
+    arena: ArenaContext<'_>,
+    gep_inst: HirInst,
+    consumer: HirInst,
+    foldable: impl FnOnce(&GepAddress) -> bool,
+) -> Option<GepAddress> {
+    let gep = match arena.inst_data(gep_inst).kind() {
+        InstKind::GetElemPtr(gep) => gep,
+        _ => return None,
+    };
+    let analysis = analyze_gep(arena, gep_inst, gep).ok()?;
+    if !foldable(&analysis) {
+        return None;
+    }
+    if !ctx.sink_pure_single_use_producer(gep_inst, consumer) {
+        return None;
+    }
+    Some(analysis)
+}
+
 /// A lowering context for a single function
 pub struct LowerContext<'prog, I: VCodeInst> {
     /// Arena to get everything you need about HirFunction

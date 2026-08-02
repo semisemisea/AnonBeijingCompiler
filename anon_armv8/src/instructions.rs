@@ -1861,6 +1861,10 @@ fn emit_amode(ctx: &mut dyn EmitContext, addr: &AMode) -> core::fmt::Result {
             extend,
             shift,
         } => {
+            debug_assert!(
+                *shift <= 3,
+                "AArch64 load/store extend scale is 0..=3, got {shift}"
+            );
             write!(ctx, "[")?;
             emit_reg(ctx, *base, OperandSize::Size64)?;
             write!(ctx, ", ")?;

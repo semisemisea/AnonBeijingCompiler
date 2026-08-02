@@ -248,6 +248,11 @@ fn promote(data: &mut ArenaContextMut<'_>, global: Inst) -> bool {
     let mut stack: Vec<Inst> = vec![entry_load];
     let mut remove_list: Vec<(Inst, BasicBlock)> = Vec::new();
     let mut write_backs: Vec<(Inst, BasicBlock)> = Vec::new();
+    // (load, replacement) pairs deferred until after the DFS has extended
+    // every jump/branch args list to match the freshly inserted block
+    // parameters. Running `visit_and_replace` inline trips on terminators
+    // whose args have not yet been lengthened.
+    let mut load_replacements: Vec<(Inst, Inst)> = Vec::new();
     thread(
         0,
         &dom_tree,
@@ -259,9 +264,14 @@ fn promote(data: &mut ArenaContextMut<'_>, global: Inst) -> bool {
         &mut stack,
         &mut remove_list,
         &mut write_backs,
+        &mut load_replacements,
     );
 
     let mut changed = false;
+    for (load, rep) in load_replacements {
+        utils::visit_and_replace(data, load, rep);
+        changed = true;
+    }
     for (inst, bb) in remove_list {
         data.remove_layout_inst(bb, inst);
         changed = true;
@@ -316,6 +326,7 @@ fn thread(
     stack: &mut Vec<Inst>,
     remove_list: &mut Vec<(Inst, BasicBlock)>,
     write_backs: &mut Vec<(Inst, BasicBlock)>,
+    load_replacements: &mut Vec<(Inst, Inst)>,
 ) {
     let bb = bb_id.search_id(node);
     let mut pushes = 0;
@@ -332,7 +343,10 @@ fn thread(
         match data.inst_data(inst).kind() {
             InstKind::Load(load) if load.src() == global => {
                 let rep = stack.last().copied().unwrap_or(stack[0]);
-                utils::visit_and_replace(data, inst, rep);
+                // Defer the visit_and_replace: jumping into it now would
+                // rebuild terminators whose args have not yet been extended
+                // to match the freshly inserted block parameters.
+                load_replacements.push((inst, rep));
                 remove_list.push((inst, bb));
             }
             InstKind::Store(store) if store.dest() == global => {
@@ -390,6 +404,7 @@ fn thread(
                 stack,
                 remove_list,
                 write_backs,
+                load_replacements,
             );
         }
     }

@@ -481,6 +481,67 @@ fn lower_eq_zero(
     LoweredOutput::Value(rd.to_reg())
 }
 
+/// Fold `x * value` into a shift plus an optional add/sub when the
+/// multiplier decomposes as 2^n, 2^n+1, or 2^n-1. Returns `None` otherwise;
+/// the caller falls back to `mul`. Only positive multipliers are folded; a
+/// negative one would need a `neg` that rarely beats `li` + `mul`.
+///
+/// x * 2^n     ->  slli(x, n)
+/// x * (2^n+1) ->  slli(x, n) + addw
+/// x * (2^n-1) ->  slli(x, n) - subw
+fn fold_mul_constant_riscv(
+    ctx: &mut LowerContext<'_, MInst>,
+    rd: Writable<Reg>,
+    x: Reg,
+    value: i32,
+) -> Option<()> {
+    let pow2_shift = |v: u32| -> Option<ShiftImm> {
+        ShiftImm::new(u8::try_from(v.trailing_zeros()).ok()?)
+    };
+    if value > 1 && (value as u32).is_power_of_two() {
+        ctx.emit(MInst::AluRRImmShift {
+            op: AluRRImmShiftOP::SlliW,
+            rd,
+            rs: x,
+            shamt: pow2_shift(value as u32)?,
+        });
+        return Some(());
+    }
+    if value > 2 && ((value - 1) as u32).is_power_of_two() {
+        let shifted = ctx.alloc_tmp(HirType::get_i32());
+        ctx.emit(MInst::AluRRImmShift {
+            op: AluRRImmShiftOP::SlliW,
+            rd: Writable::from_reg(shifted),
+            rs: x,
+            shamt: pow2_shift((value - 1) as u32)?,
+        });
+        ctx.emit(MInst::AluRRR {
+            op: AluRRROP::AddW,
+            rd,
+            rs1: shifted,
+            rs2: x,
+        });
+        return Some(());
+    }
+    if value > 3 && ((value + 1) as u32).is_power_of_two() {
+        let shifted = ctx.alloc_tmp(HirType::get_i32());
+        ctx.emit(MInst::AluRRImmShift {
+            op: AluRRImmShiftOP::SlliW,
+            rd: Writable::from_reg(shifted),
+            rs: x,
+            shamt: pow2_shift((value + 1) as u32)?,
+        });
+        ctx.emit(MInst::AluRRR {
+            op: AluRRROP::SubW,
+            rd,
+            rs1: shifted,
+            rs2: x,
+        });
+        return Some(());
+    }
+    None
+}
+
 fn lower_binary(
     ctx: &mut LowerContext<'_, MInst>,
     arena: ArenaContext<'_>,
@@ -727,7 +788,24 @@ fn lower_binary(
             }
             BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Min | BinaryOp::Max => {}
         }
-
+        // A constant multiplier that decomposes as 2^n or 2^n +/- 1 folds to
+        // shift plus optional add/sub before either operand is materialized.
+        if !is_float && bop == BinaryOp::Mul {
+            let lhs_imm = integer_constant(arena, binary.lhs());
+            let rhs_imm = integer_constant(arena, binary.rhs());
+            if let Some((value, operand)) = lhs_imm
+                .map(|value| (value, binary.rhs()))
+                .or_else(|| rhs_imm.map(|value| (value, binary.lhs())))
+            {
+                let x = ctx.put_value_in_reg(operand);
+                if value == 1 {
+                    return LoweredOutput::Value(x);
+                }
+                if fold_mul_constant_riscv(ctx, rd, x, value).is_some() {
+                    return LoweredOutput::Value(def);
+                }
+            }
+        }
         let rhs = ctx.put_value_in_reg(binary.rhs());
         let op = (!matches!(bop, BinaryOp::Eq | BinaryOp::NotEq))
             .then(|| alu_op_for_hir_binary(bop, inst_ty));
@@ -2334,6 +2412,36 @@ mod tests {
         let ret = data.new_local_inst().ret(Some(bin));
         data.layout_mut().insert_inst(entry, ret);
         taki_mir::compile::<Riscv64Backend>(&program)
+    }
+
+    #[test]
+    fn constant_binary_folds_to_immediate() {
+        // add: addi, no materialized constant.
+        let asm = compile_constant_binary(BinaryOp::Add, 5);
+        assert!(asm.contains("addi"), "{asm}");
+        assert!(!asm.contains("\n    li "), "{asm}");
+        // sub(x, 5) == addi(x, -5).
+        let asm = compile_constant_binary(BinaryOp::Sub, 5);
+        assert!(asm.contains("addi"), "{asm}");
+        assert!(!asm.contains("\n    li "), "{asm}");
+        // and: andi.
+        let asm = compile_constant_binary_imm(BinaryOp::And, 0xF);
+        assert!(asm.contains("andi"), "{asm}");
+        assert!(!asm.contains("\n    li "), "{asm}");
+        // or: ori.
+        let asm = compile_constant_binary_imm(BinaryOp::Or, 0xF);
+        assert!(asm.contains("ori"), "{asm}");
+        assert!(!asm.contains("\n    li "), "{asm}");
+        // shl: slli.
+        let asm = compile_constant_binary_imm(BinaryOp::Shl, 3);
+        assert!(asm.contains("slli"), "{asm}");
+        assert!(!asm.contains("\n    li "), "{asm}");
+        // eq: xori + seqz, no sub, no li.
+        let asm = compile_constant_binary_imm(BinaryOp::Eq, 5);
+        assert!(asm.contains("xori"), "{asm}");
+        assert!(asm.contains("seqz"), "{asm}");
+        assert!(!asm.contains("\n    sub"), "{asm}");
+        assert!(!asm.contains("\n    li "), "{asm}");
     }
 
     #[test]

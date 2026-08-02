@@ -131,6 +131,39 @@ fn alu_op_for_hir_binary(op: BinaryOp, ty: &HirType) -> AluRRROP {
     }
 }
 
+/// Whether `inst`'s 64-bit register representation is guaranteed to be a
+/// sign-extended i32 on RISC-V.
+///
+/// Sources whose results are sign-extended: integer constants (remat goes
+/// through `gen_load_imm`, which sign-extends 32-bit values, abi.rs), loads
+/// (`lw` sign-extends), i32 arithmetic/shift binaries (lowered to the `w`
+/// variants), and float->int casts (`fcvt.w.s`). Function arguments, phis,
+/// selects (built from 64-bit Xor), and unknown sources are not guaranteed;
+/// callers must keep the explicit extension.
+fn is_sign_extended_i32(arena: ArenaContext<'_>, inst: HirInst) -> bool {
+    let is_i32 = matches!(arena.inst_data(inst).ty().kind(), HirTypeKind::Int32);
+    match arena.inst_data(inst).kind() {
+        InstKind::Integer(_) => true,
+        InstKind::Load(_) => true,
+        InstKind::Binary(binary) => {
+            is_i32
+                && matches!(
+                    binary.op(),
+                    BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Div
+                        | BinaryOp::Rem
+                        | BinaryOp::Shl
+                        | BinaryOp::Shr
+                        | BinaryOp::Sar
+                )
+        }
+        InstKind::Cast(_) => is_i32,
+        _ => false,
+    }
+}
+
 fn integer_constant(arena: ArenaContext<'_>, inst: HirInst) -> Option<i32> {
     match arena.inst_data(inst).kind() {
         InstKind::Integer(value) => Some(value.value()),
@@ -640,13 +673,20 @@ fn lower_get_elem_ptr(
 
     for term in analysis.dynamic_terms {
         let index = ctx.put_value_in_reg(term.index);
-        let extended = ctx.alloc_tmp(pointer_ty.clone());
-        ctx.emit(MInst::AluRRR {
-            op: AluRRROP::AddW,
-            rd: Writable::from_reg(extended),
-            rs1: index,
-            rs2: zero_reg(),
-        });
+        // A sign-extended i32 index can be scaled directly; otherwise it must
+        // be extended to 64 bits first (addw rd, rd, zero).
+        let extended = if is_sign_extended_i32(arena, term.index) {
+            index
+        } else {
+            let extended = ctx.alloc_tmp(pointer_ty.clone());
+            ctx.emit(MInst::AluRRR {
+                op: AluRRROP::AddW,
+                rd: Writable::from_reg(extended),
+                rs1: index,
+                rs2: zero_reg(),
+            });
+            extended
+        };
 
         let scaled = if term.stride == 1 {
             extended
@@ -1489,5 +1529,92 @@ mod tests {
         let asm = taki_mir::compile::<Riscv64Backend>(&program);
         // Two users: the GEP must be materialized, so no direct-offset store.
         assert!(!asm.contains(", 4("), "{asm}");
+    }
+
+    #[test]
+    fn sign_extended_i32_index_skips_extension_addw() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            HirType::get_i32(),
+            "gep_ext_skip".to_string(),
+            vec![HirType::get_pointer(HirType::get_i32())],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let two = data.new_local_inst().integer(2);
+        let three = data.new_local_inst().integer(3);
+        let index = data.new_local_inst().binary(BinaryOp::Add, two, three);
+        let gep = data.new_local_inst().get_elem_ptr(base, vec![index]);
+        let load = data.new_local_inst().load(gep);
+        for inst in [index, gep, load] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let ret = data.new_local_inst().ret(Some(load));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<Riscv64Backend>(&program);
+        // addw sign-extends, so the dynamic index needs no extension.
+        assert!(asm.contains("slli"), "{asm}");
+        // No `addw rd, rd, zero` extension (zero appears nowhere here).
+        assert!(!asm.contains("zero"), "{asm}");
+    }
+
+    #[test]
+    fn loaded_i32_index_skips_extension_addw() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            HirType::get_i32(),
+            "gep_ext_load".to_string(),
+            vec![
+                HirType::get_pointer(HirType::get_i32()),
+                HirType::get_pointer(HirType::get_i32()),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let src = data.params()[1];
+        let index = data.new_local_inst().load(src);
+        let gep = data.new_local_inst().get_elem_ptr(base, vec![index]);
+        let load = data.new_local_inst().load(gep);
+        for inst in [index, gep, load] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let ret = data.new_local_inst().ret(Some(load));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<Riscv64Backend>(&program);
+        // lw sign-extends, so the loaded index needs no extension.
+        assert!(asm.contains("slli"), "{asm}");
+        assert!(!asm.contains("addw"), "{asm}");
+    }
+
+    #[test]
+    fn parameter_index_keeps_extension_addw() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            HirType::get_i32(),
+            "gep_ext_param".to_string(),
+            vec![
+                HirType::get_pointer(HirType::get_i32()),
+                HirType::get_i32(),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let index = data.params()[1];
+        let gep = data.new_local_inst().get_elem_ptr(base, vec![index]);
+        let load = data.new_local_inst().load(gep);
+        for inst in [gep, load] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let ret = data.new_local_inst().ret(Some(load));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<Riscv64Backend>(&program);
+        // ABI args are not guaranteed sign-extended: extension must stay.
+        assert!(asm.contains("addw"), "{asm}");
     }
 }

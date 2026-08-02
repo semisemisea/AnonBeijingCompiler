@@ -111,6 +111,15 @@ impl Inline {
             if program.func_data(callee).layout().is_decl() {
                 continue;
             }
+            // A callee in a recursion cycle is never inlined: after the
+            // first clone its in-cycle callsites live inside the caller,
+            // where the reachability guard no longer excludes them, so the
+            // pass would keep inlining the cycle forever. The conservative
+            // cranelift rule (`does_not_inline_across_a_recursive_call_cycle`)
+            // is to leave cyclic callees as calls.
+            if call_graph.reaches(callee, callee) {
+                continue;
+            }
             let callee_data = program.func_data(callee);
             let callsites: Vec<_> = call_graph.be_called_at(callee).collect();
             if callsites.is_empty() {
@@ -180,7 +189,7 @@ impl Inline {
 mod tests {
     use super::Inline;
     use crate::{
-        ir::{BinaryOp, InstKind, Program, Type, arena::Arena, builder_trait::*},
+        ir::{BinaryOp, Inst, InstKind, Program, Type, arena::Arena, builder_trait::*},
         opt::pass::Pass,
     };
 
@@ -234,14 +243,23 @@ mod tests {
     }
 
     #[test]
-    fn does_not_inline_a_function_with_multiple_callsites() {
+    fn does_not_inline_a_leaf_with_a_large_total_callsite_cost() {
+        // A leaf with several callsites is only inlined while the total
+        // estimated size (size x callsites) stays within the budget. This
+        // callee's body exceeds the per-call limit, so it stays a call.
         let mut program = Program::new();
         let callee = program.new_function(Type::get_i32(), "value".into(), vec![]);
         {
             let data = program.func_data_mut(callee);
             let entry = data.add_entry_block();
-            let one = data.new_local_inst().integer(1);
-            let ret = data.new_local_inst().ret(Some(one));
+            let mut acc: Inst = data.new_local_inst().integer(0);
+            for i in 1..=super::CALL_SIZE_LIMIT + 1 {
+                let int = data.new_local_inst().integer(i as i32);
+                let add = data.new_local_inst().binary(BinaryOp::Add, acc, int);
+                data.layout_mut().insert_inst(entry, add);
+                acc = add;
+            }
+            let ret = data.new_local_inst().ret(Some(acc));
             data.layout_mut().insert_inst(entry, ret);
         }
         let main = program.new_function(Type::get_i32(), "main".into(), vec![]);

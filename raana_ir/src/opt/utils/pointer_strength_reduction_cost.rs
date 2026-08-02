@@ -47,6 +47,8 @@ pub fn estimate_aarch64_pointer_strength_reduction(
     looop: &Loop,
     gep: &crate::ir::GetElemPtr,
     pointer_byte_delta: i64,
+    removable_derived_insts: usize,
+    derived_setup_insts: usize,
 ) -> Option<PointerStrengthReductionCost> {
     if loop_has_call(data, looop)
         || looop.latches().len() > MAX_BACKEDGE_SOURCES
@@ -56,7 +58,7 @@ pub fn estimate_aarch64_pointer_strength_reduction(
         return None;
     }
 
-    let old_iteration_insts = aarch64_gep_cost(data, gep)?;
+    let old_iteration_insts = aarch64_gep_cost(data, gep)?.checked_add(removable_derived_insts)?;
     let pointer_update_insts = aarch64_add_offset_cost(pointer_byte_delta);
 
     let (entry_count, preheader_penalty) = match looop.get_preheader(cfg) {
@@ -78,7 +80,8 @@ pub fn estimate_aarch64_pointer_strength_reduction(
         pointer_update_insts,
         setup_insts: old_iteration_insts
             .checked_mul(entry_count)?
-            .checked_add(preheader_penalty)?,
+            .checked_add(preheader_penalty)?
+            .checked_add(derived_setup_insts.checked_mul(entry_count)?)?,
     })
 }
 
@@ -155,9 +158,9 @@ fn aarch64_add_offset_cost(offset: i64) -> usize {
     if magnitude <= 0xfff || (magnitude & 0xfff == 0 && magnitude >> 12 <= 0xfff) {
         1
     } else {
-        // A materialized 64-bit constant plus the final add. The exact constant
-        // sequence varies, so use a conservative Cortex-A53 estimate.
-        4
+        // A 64-bit constant can require four move-wide instructions before the
+        // final add, so use the worst-case Cortex-A53 instruction count.
+        5
     }
 }
 
@@ -192,6 +195,8 @@ mod tests {
         assert_eq!(aarch64_add_offset_cost(4095), 1);
         assert_eq!(aarch64_add_offset_cost(-4095), 1);
         assert_eq!(aarch64_add_offset_cost(4096), 1);
-        assert_eq!(aarch64_add_offset_cost(4097), 4);
+        assert_eq!(aarch64_add_offset_cost(64), 1);
+        assert_eq!(aarch64_add_offset_cost(-64), 1);
+        assert_eq!(aarch64_add_offset_cost(4097), 5);
     }
 }

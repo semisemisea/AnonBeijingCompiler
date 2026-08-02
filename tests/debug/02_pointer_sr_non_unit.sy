@@ -1,0 +1,30 @@
+int values[16][16];
+
+int sum_even() {
+    int sum = 0;
+    int i = 0;
+    while (i < 16) {
+        sum = sum + values[i][0];
+        i = i + 2;
+    }
+    return sum;
+}
+
+int sum_odd_backward() {
+    int sum = 0;
+    int i = 15;
+    while (i > -1) {
+        sum = sum + values[i][0];
+        i = i - 2;
+    }
+    return sum;
+}
+
+int main() {
+    int i = 0;
+    while (i < 16) {
+        values[i][0] = i + 1;
+        i = i + 1;
+    }
+    return sum_even() * 2 + sum_odd_backward() - 200;
+}

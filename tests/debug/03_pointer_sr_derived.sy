@@ -1,0 +1,20 @@
+int values[32][16];
+
+int sum_affine() {
+    int sum = 0;
+    int i = 0;
+    while (i < 8) {
+        sum = sum + values[i * 2 + 1][0];
+        i = i + 1;
+    }
+    return sum;
+}
+
+int main() {
+    int i = 0;
+    while (i < 32) {
+        values[i][0] = i * i + 3;
+        i = i + 1;
+    }
+    return sum_affine() - 704;
+}

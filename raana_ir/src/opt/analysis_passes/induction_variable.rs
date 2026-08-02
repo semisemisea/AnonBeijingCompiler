@@ -54,6 +54,92 @@ pub enum InductionDirection {
     Backward,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NormalizedInductionExit {
+    direction: InductionDirection,
+    signed_step: i32,
+    bound: Inst,
+}
+
+impl NormalizedInductionExit {
+    pub fn direction(self) -> InductionDirection {
+        self.direction
+    }
+
+    pub fn signed_step(self) -> i32 {
+        self.signed_step
+    }
+
+    pub fn bound(self) -> Inst {
+        self.bound
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstantInductionRange {
+    min: i32,
+    max: i32,
+}
+
+impl ConstantInductionRange {
+    pub fn min(self) -> i32 {
+        self.min
+    }
+
+    pub fn max(self) -> i32 {
+        self.max
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedInductionVariable {
+    value: Inst,
+    base: Inst,
+    coefficient: i64,
+    offset: i64,
+    chain: SmallVec<[Inst; 4]>,
+}
+
+impl DerivedInductionVariable {
+    pub fn value(&self) -> Inst {
+        self.value
+    }
+
+    pub fn base(&self) -> Inst {
+        self.base
+    }
+
+    pub fn coefficient(&self) -> i64 {
+        self.coefficient
+    }
+
+    pub fn offset(&self) -> i64 {
+        self.offset
+    }
+
+    pub fn evaluate(&self, base_value: i32) -> Option<i32> {
+        i64::from(base_value)
+            .checked_mul(self.coefficient)?
+            .checked_add(self.offset)?
+            .try_into()
+            .ok()
+    }
+
+    pub fn removable_chain_cost(&self, data: &FunctionData, consumer: Inst) -> usize {
+        let chain = self.chain.iter().copied().collect::<FxHashSet<_>>();
+        self.chain
+            .iter()
+            .all(|&inst| {
+                data.inst_data(inst)
+                    .used_by()
+                    .iter()
+                    .all(|user| *user == consumer || chain.contains(user))
+            })
+            .then_some(self.chain.len())
+            .unwrap_or(0)
+    }
+}
+
 pub struct BasicInductionVariableAnalysis {
     by_header: FxHashMap<BasicBlock, Vec<BasicInductionVariable>>,
 }
@@ -103,24 +189,22 @@ impl BasicInductionVariableAnalysis {
     }
 }
 
-/// Normalize a unit-step header exit to `iv < bound` or `iv > bound` while the
-/// selected branch arm remains inside the loop.
-pub fn normalize_strict_unit_exit(
+/// Normalize a constant-step header exit to `iv < bound` or `iv > bound` while
+/// the selected branch arm remains inside the loop. Non-unit steps require a
+/// constant bound that proves the continuing update cannot wrap `i32`.
+pub fn normalize_strict_exit(
     data: &ArenaContextMut<'_>,
     looop: &Loop,
     iv: &BasicInductionVariable,
-) -> Option<InductionDirection> {
-    let direction = match iv.step() {
-        InductionStep::Add(step) => match integer_constant(data, step)? {
-            1 => InductionDirection::Forward,
-            -1 => InductionDirection::Backward,
-            _ => return None,
-        },
-        InductionStep::Sub(step) => match integer_constant(data, step)? {
-            1 => InductionDirection::Backward,
-            -1 => InductionDirection::Forward,
-            _ => return None,
-        },
+) -> Option<NormalizedInductionExit> {
+    let signed_step = match iv.step() {
+        InductionStep::Add(step) => integer_constant(data, step)?,
+        InductionStep::Sub(step) => integer_constant(data, step)?.checked_neg()?,
+    };
+    let direction = match signed_step.cmp(&0) {
+        std::cmp::Ordering::Greater => InductionDirection::Forward,
+        std::cmp::Ordering::Less => InductionDirection::Backward,
+        std::cmp::Ordering::Equal => return None,
     };
 
     let terminator = data.layout().basicblock(looop.header()).terminator();
@@ -145,18 +229,181 @@ pub fn normalize_strict_unit_exit(
     if !true_inside {
         op = op.complement_integer_compare()?;
     }
-    if compare.lhs() == iv.parameter() {
+    let bound = if compare.lhs() == iv.parameter() {
+        compare.rhs()
     } else if compare.rhs() == iv.parameter() {
         op = op.swap_compare_args()?;
+        compare.lhs()
     } else {
         return None;
-    }
+    };
 
     match (direction, op) {
         (InductionDirection::Forward, BinaryOp::Lt)
-        | (InductionDirection::Backward, BinaryOp::Gt) => Some(direction),
-        _ => None,
+        | (InductionDirection::Backward, BinaryOp::Gt) => {}
+        _ => return None,
+    };
+
+    if signed_step.unsigned_abs() != 1 {
+        let bound = i64::from(integer_constant(data, bound)?);
+        let signed_step = i64::from(signed_step);
+        let no_wrap = match direction {
+            InductionDirection::Forward => bound + signed_step - 1 <= i64::from(i32::MAX),
+            InductionDirection::Backward => bound + signed_step + 1 >= i64::from(i32::MIN),
+        };
+        if !no_wrap {
+            return None;
+        }
     }
+
+    Some(NormalizedInductionExit {
+        direction,
+        signed_step,
+        bound,
+    })
+}
+
+pub fn constant_induction_range(
+    data: &ArenaContextMut<'_>,
+    iv: &BasicInductionVariable,
+    exit: NormalizedInductionExit,
+) -> Option<ConstantInductionRange> {
+    let bound = integer_constant(data, exit.bound())?;
+    let initial_values = iv
+        .initial_values()
+        .iter()
+        .map(|&value| integer_constant(data, value))
+        .collect::<Option<Vec<_>>>()?;
+    let initial_min = initial_values.iter().copied().min()?;
+    let initial_max = initial_values.iter().copied().max()?;
+
+    match exit.direction() {
+        InductionDirection::Forward => {
+            let terminal = i64::from(bound)
+                .checked_sub(1)?
+                .checked_add(i64::from(exit.signed_step()))?;
+            Some(ConstantInductionRange {
+                min: initial_min,
+                max: initial_max.max(i32::try_from(terminal).ok()?),
+            })
+        }
+        InductionDirection::Backward => {
+            let terminal = i64::from(bound)
+                .checked_add(1)?
+                .checked_add(i64::from(exit.signed_step()))?;
+            Some(ConstantInductionRange {
+                min: initial_min.min(i32::try_from(terminal).ok()?),
+                max: initial_max,
+            })
+        }
+    }
+}
+
+pub fn classify_derived_induction_variable(
+    data: &ArenaContextMut<'_>,
+    looop: &Loop,
+    base: Inst,
+    value: Inst,
+    range: ConstantInductionRange,
+) -> Option<DerivedInductionVariable> {
+    fn range_fits(coefficient: i64, offset: i64, range: ConstantInductionRange) -> bool {
+        let at_min = coefficient
+            .checked_mul(i64::from(range.min()))
+            .and_then(|value| value.checked_add(offset));
+        let at_max = coefficient
+            .checked_mul(i64::from(range.max()))
+            .and_then(|value| value.checked_add(offset));
+        let (Some(at_min), Some(at_max)) = (at_min, at_max) else {
+            return false;
+        };
+        let min = at_min.min(at_max);
+        let max = at_min.max(at_max);
+        min >= i64::from(i32::MIN) && max <= i64::from(i32::MAX)
+    }
+
+    fn classify(
+        data: &ArenaContextMut<'_>,
+        looop: &Loop,
+        base: Inst,
+        value: Inst,
+        range: ConstantInductionRange,
+    ) -> Option<(i64, i64, SmallVec<[Inst; 4]>)> {
+        if value == base {
+            return Some((1, 0, SmallVec::new()));
+        }
+        if let Some(constant) = integer_constant(data, value) {
+            return Some((0, i64::from(constant), SmallVec::new()));
+        }
+        if data
+            .layout()
+            .parent_bb(value)
+            .is_none_or(|block| !looop.contains(block))
+            || !data.inst_data(value).ty().is_i32()
+        {
+            return None;
+        }
+        let InstKind::Binary(binary) = data.inst_data(value).kind() else {
+            return None;
+        };
+        let (lhs_coefficient, lhs_offset, mut lhs_chain) =
+            classify(data, looop, base, binary.lhs(), range)?;
+        let (rhs_coefficient, rhs_offset, rhs_chain) =
+            classify(data, looop, base, binary.rhs(), range)?;
+        let (coefficient, offset) = match binary.op() {
+            BinaryOp::Add => (
+                lhs_coefficient.checked_add(rhs_coefficient)?,
+                lhs_offset.checked_add(rhs_offset)?,
+            ),
+            BinaryOp::Sub => (
+                lhs_coefficient.checked_sub(rhs_coefficient)?,
+                lhs_offset.checked_sub(rhs_offset)?,
+            ),
+            BinaryOp::Mul if lhs_coefficient == 0 => (
+                rhs_coefficient.checked_mul(lhs_offset)?,
+                rhs_offset.checked_mul(lhs_offset)?,
+            ),
+            BinaryOp::Mul if rhs_coefficient == 0 => (
+                lhs_coefficient.checked_mul(rhs_offset)?,
+                lhs_offset.checked_mul(rhs_offset)?,
+            ),
+            BinaryOp::Shl if rhs_coefficient == 0 && (0..32).contains(&rhs_offset) => {
+                let factor = 1_i64.checked_shl(u32::try_from(rhs_offset).ok()?)?;
+                (
+                    lhs_coefficient.checked_mul(factor)?,
+                    lhs_offset.checked_mul(factor)?,
+                )
+            }
+            _ => return None,
+        };
+        if !range_fits(coefficient, offset, range) {
+            return None;
+        }
+        for inst in rhs_chain {
+            if !lhs_chain.contains(&inst) {
+                lhs_chain.push(inst);
+            }
+        }
+        if !lhs_chain.contains(&value) {
+            lhs_chain.push(value);
+        }
+        Some((coefficient, offset, lhs_chain))
+    }
+
+    let (coefficient, offset, chain) = classify(data, looop, base, value, range)?;
+    if coefficient == 0
+        || chain.is_empty()
+        || i32::try_from(coefficient).is_err()
+        || i32::try_from(offset).is_err()
+    {
+        return None;
+    }
+    Some(DerivedInductionVariable {
+        value,
+        base,
+        coefficient,
+        offset,
+        chain,
+    })
 }
 
 fn header_incoming(
@@ -328,22 +575,30 @@ mod tests {
         variables[0].clone()
     }
 
-    fn normalized_direction(
+    fn normalized_step(
         update_op: BinaryOp,
         step_value: i32,
         compare_op: BinaryOp,
         iv_on_left: bool,
         continue_on_true: bool,
-    ) -> Option<InductionDirection> {
+        constant_bound: Option<i32>,
+    ) -> Option<(InductionDirection, i32)> {
         let mut program = Program::new();
         let function = program.new_function(
             Type::get_unit(),
             "normalized_exit".into(),
-            vec![Type::get_i32()],
+            if constant_bound.is_some() {
+                vec![]
+            } else {
+                vec![Type::get_i32()]
+            },
         );
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
-        let bound = data.params()[0];
+        let bound = match constant_bound {
+            Some(value) => data.new_local_inst().integer(value),
+            None => data.params()[0],
+        };
         let header = data
             .new_basic_block()
             .basic_block("header".into(), vec![Type::get_i32()]);
@@ -386,41 +641,112 @@ mod tests {
             program: &mut program,
             curr_func: Some(function),
         };
-        normalize_strict_unit_exit(&context, looop, iv)
+        normalize_strict_exit(&context, looop, iv)
+            .map(|exit| (exit.direction(), exit.signed_step()))
     }
 
     #[test]
     fn normalizes_forward_and_backward_strict_unit_exits() {
         assert_eq!(
-            normalized_direction(BinaryOp::Add, 1, BinaryOp::Lt, true, true),
-            Some(InductionDirection::Forward)
+            normalized_step(BinaryOp::Add, 1, BinaryOp::Lt, true, true, None),
+            Some((InductionDirection::Forward, 1))
         );
         assert_eq!(
-            normalized_direction(BinaryOp::Sub, -1, BinaryOp::Ge, true, false),
-            Some(InductionDirection::Forward)
+            normalized_step(BinaryOp::Sub, -1, BinaryOp::Ge, true, false, None),
+            Some((InductionDirection::Forward, 1))
         );
         assert_eq!(
-            normalized_direction(BinaryOp::Sub, 1, BinaryOp::Gt, true, true),
-            Some(InductionDirection::Backward)
+            normalized_step(BinaryOp::Sub, 1, BinaryOp::Gt, true, true, None),
+            Some((InductionDirection::Backward, -1))
         );
         assert_eq!(
-            normalized_direction(BinaryOp::Add, -1, BinaryOp::Le, true, false),
-            Some(InductionDirection::Backward)
+            normalized_step(BinaryOp::Add, -1, BinaryOp::Le, true, false, None),
+            Some((InductionDirection::Backward, -1))
+        );
+    }
+
+    #[test]
+    fn normalizes_non_unit_steps_with_a_constant_no_wrap_bound() {
+        assert_eq!(
+            normalized_step(BinaryOp::Add, 2, BinaryOp::Lt, true, true, Some(100)),
+            Some((InductionDirection::Forward, 2))
+        );
+        assert_eq!(
+            normalized_step(BinaryOp::Sub, 2, BinaryOp::Gt, true, true, Some(-100)),
+            Some((InductionDirection::Backward, -2))
+        );
+        assert_eq!(
+            normalized_step(BinaryOp::Add, -3, BinaryOp::Gt, true, true, Some(-100)),
+            Some((InductionDirection::Backward, -3))
+        );
+        assert_eq!(
+            normalized_step(BinaryOp::Sub, -3, BinaryOp::Lt, true, true, Some(100)),
+            Some((InductionDirection::Forward, 3))
+        );
+        assert_eq!(
+            normalized_step(BinaryOp::Add, 2, BinaryOp::Gt, false, true, Some(100)),
+            Some((InductionDirection::Forward, 2))
+        );
+        assert_eq!(
+            normalized_step(BinaryOp::Add, 2, BinaryOp::Ge, true, false, Some(100)),
+            Some((InductionDirection::Forward, 2))
+        );
+        assert_eq!(
+            normalized_step(BinaryOp::Add, 2, BinaryOp::Le, false, false, Some(100)),
+            Some((InductionDirection::Forward, 2))
+        );
+        assert_eq!(
+            normalized_step(
+                BinaryOp::Add,
+                2,
+                BinaryOp::Lt,
+                true,
+                true,
+                Some(i32::MAX - 1),
+            ),
+            Some((InductionDirection::Forward, 2))
+        );
+        assert_eq!(
+            normalized_step(
+                BinaryOp::Sub,
+                2,
+                BinaryOp::Gt,
+                true,
+                true,
+                Some(i32::MIN + 1),
+            ),
+            Some((InductionDirection::Backward, -2))
+        );
+    }
+
+    #[test]
+    fn rejects_non_unit_steps_without_a_no_wrap_proof() {
+        assert_eq!(
+            normalized_step(BinaryOp::Add, 2, BinaryOp::Lt, true, true, None),
+            None
+        );
+        assert_eq!(
+            normalized_step(BinaryOp::Add, 2, BinaryOp::Lt, true, true, Some(i32::MAX),),
+            None
+        );
+        assert_eq!(
+            normalized_step(BinaryOp::Sub, 2, BinaryOp::Gt, true, true, Some(i32::MIN),),
+            None
+        );
+        assert_eq!(
+            normalized_step(BinaryOp::Sub, i32::MIN, BinaryOp::Lt, true, true, Some(0),),
+            None
         );
     }
 
     #[test]
     fn rejects_non_strict_mismatched_and_non_unit_exits() {
         assert_eq!(
-            normalized_direction(BinaryOp::Add, 1, BinaryOp::Le, true, true),
+            normalized_step(BinaryOp::Add, 1, BinaryOp::Le, true, true, None),
             None
         );
         assert_eq!(
-            normalized_direction(BinaryOp::Add, 1, BinaryOp::Gt, true, true),
-            None
-        );
-        assert_eq!(
-            normalized_direction(BinaryOp::Add, 2, BinaryOp::Lt, true, true),
+            normalized_step(BinaryOp::Add, 1, BinaryOp::Gt, true, true, None),
             None
         );
     }
@@ -481,8 +807,9 @@ mod tests {
             curr_func: Some(function),
         };
         assert_eq!(
-            normalize_strict_unit_exit(&context, looop, iv),
-            Some(InductionDirection::Forward)
+            normalize_strict_exit(&context, looop, iv)
+                .map(|exit| (exit.direction(), exit.signed_step())),
+            Some((InductionDirection::Forward, 1))
         );
     }
 

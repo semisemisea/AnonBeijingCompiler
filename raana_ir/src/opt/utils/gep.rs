@@ -50,6 +50,45 @@ pub fn gep_index_stride<A: Arena + ?Sized>(
     })
 }
 
+pub fn gep_constant_offset_with_replacement_fits<A: Arena + ?Sized>(
+    data: &A,
+    base: Inst,
+    offsets: &[Inst],
+    replacement_position: usize,
+    replacement: i32,
+) -> bool {
+    let mut current_ty = data.inst_data(base).ty().clone();
+    let mut constant_offset = 0_i64;
+    for (position, &index) in offsets.iter().enumerate() {
+        current_ty = match current_ty.kind() {
+            TypeKind::Pointer(element) | TypeKind::Array(element, _) => element.clone(),
+            _ => return false,
+        };
+        let Some(stride) = checked_type_size(&current_ty).and_then(|size| i64::try_from(size).ok())
+        else {
+            return false;
+        };
+        let constant = if position == replacement_position {
+            Some(replacement)
+        } else {
+            match data.inst_data(index).kind() {
+                InstKind::Integer(integer) => Some(integer.value()),
+                _ => None,
+            }
+        };
+        if let Some(constant) = constant {
+            let Some(contribution) = i64::from(constant).checked_mul(stride) else {
+                return false;
+            };
+            let Some(offset) = constant_offset.checked_add(contribution) else {
+                return false;
+            };
+            constant_offset = offset;
+        }
+    }
+    true
+}
+
 fn checked_type_size(ty: &Type) -> Option<usize> {
     match ty.kind() {
         TypeKind::ArgList | TypeKind::Unit => Some(0),

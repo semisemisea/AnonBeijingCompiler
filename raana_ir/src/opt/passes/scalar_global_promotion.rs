@@ -4,7 +4,7 @@
 //! (never address-taken, never passed to a call) behaves like a local
 //! variable as long as no called function can observe it. Promotion threads
 //! the global's value through the function in SSA form (load once at entry,
-//! stores become defs, one write-back before each return), so the backend
+//! stores become defs, one write-back before each return or tail call), so the backend
 //! keeps it in registers instead of reloading/re-storing on every access —
 //! clang's shape for the `bits`/`pos`/`size` globals in huffman-01.
 //!
@@ -81,7 +81,7 @@ fn eligible_globals(program: &Program) -> HashSet<Inst> {
 }
 
 /// Function -> set of globals it may load or store, transitively through
-/// direct calls.
+/// direct calls and tail calls.
 fn call_analysis(program: &Program) -> HashMap<Function, HashSet<Inst>> {
     let mut direct: HashMap<Function, HashSet<Inst>> = HashMap::new();
     for func in program.function_layout() {
@@ -103,7 +103,7 @@ fn call_analysis(program: &Program) -> HashMap<Function, HashSet<Inst>> {
         direct.insert(*func, touched);
     }
 
-    // Transitive closure over direct calls.
+    // Transitive closure over direct calls and tail calls.
     let mut may_touch = direct.clone();
     let mut changed = true;
     while changed {
@@ -115,10 +115,7 @@ fn call_analysis(program: &Program) -> HashMap<Function, HashSet<Inst>> {
                 .basicblocks()
                 .iter()
                 .flat_map(|layout| layout.insts().iter())
-                .filter_map(|&inst| match func_data.inst_data(inst).kind() {
-                    InstKind::Call(call) => Some(call.callee()),
-                    _ => None,
-                })
+                .filter_map(|&inst| callee_of(func_data.inst_data(inst).kind()))
                 .collect();
             let own: HashSet<Inst> = may_touch[func].clone();
             let mut extra = Vec::new();
@@ -134,6 +131,14 @@ fn call_analysis(program: &Program) -> HashMap<Function, HashSet<Inst>> {
         }
     }
     may_touch
+}
+
+fn callee_of(kind: &InstKind) -> Option<Function> {
+    match kind {
+        InstKind::Call(call) => Some(call.callee()),
+        InstKind::TailCall(call) => Some(call.callee()),
+        _ => None,
+    }
 }
 
 /// Promote every eligible global inside the current function.
@@ -185,11 +190,8 @@ fn promotable_in(
 ) -> bool {
     for layout in data.layout().basicblocks() {
         for &inst in layout.insts() {
-            if let InstKind::Call(call) = data.inst_data(inst).kind() {
-                if may_touch
-                    .get(&call.callee())
-                    .is_some_and(|g| g.contains(&global))
-                {
+            if let Some(callee) = callee_of(data.inst_data(inst).kind()) {
+                if may_touch.get(&callee).is_some_and(|g| g.contains(&global)) {
                     return false;
                 }
             }
@@ -378,7 +380,7 @@ fn thread(
                 pushes += 1;
                 remove_list.push((inst, bb));
             }
-            InstKind::Return(..) => {
+            InstKind::Return(..) | InstKind::TailCall(..) => {
                 if let Some(&last) = stack.last() {
                     write_backs.push((last, bb));
                 }
@@ -435,5 +437,196 @@ fn thread(
 
     for _ in 0..pushes {
         stack.pop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::builder_trait::{GlobalInstBuilder, LocalInstBuilder, ScalarInstBuilder};
+
+    fn scalar_global(program: &mut Program) -> Inst {
+        let zero = program.new_value().integer(0);
+        program.new_value().global_alloc(zero)
+    }
+
+    fn add_unit_function(program: &mut Program, name: &str) -> (Function, BasicBlock) {
+        let function = program.new_function(Type::get_unit(), name.into(), vec![]);
+        let entry = program.func_data_mut(function).add_entry_block();
+        (function, entry)
+    }
+
+    fn stores_to(data: &FunctionData, global: Inst) -> Vec<Inst> {
+        data.layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|layout| layout.insts().iter().copied())
+            .filter(|&inst| {
+                matches!(data.inst_data(inst).kind(), InstKind::Store(store) if store.dest() == global)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn writes_back_before_tail_call_to_non_touching_callee() {
+        let mut program = Program::new();
+        let global = scalar_global(&mut program);
+        let callee = program.new_function(Type::get_unit(), "callee".into(), vec![]);
+        let (caller, entry) = add_unit_function(&mut program, "caller");
+        let original_store = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(caller),
+            };
+            let value = data.new_local_value().integer(42);
+            let store = data.new_local_value().store(value, global);
+            let tail_call = data.new_local_value().tail_call(callee, vec![]);
+            data.layout_mut().insert_inst(entry, store);
+            data.layout_mut().insert_inst(entry, tail_call);
+            store
+        };
+
+        assert!(ScalarGlobalPromotion.run(&mut program));
+
+        let data = program.func_data(caller);
+        assert_eq!(data.layout().parent_bb(original_store), None);
+        let insts = data
+            .layout()
+            .basicblock(entry)
+            .insts()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let terminator = *insts.last().unwrap();
+        assert!(matches!(
+            data.inst_data(terminator).kind(),
+            InstKind::TailCall(call) if call.callee() == callee
+        ));
+        let write_back = insts[insts.len() - 2];
+        assert!(matches!(
+            data.inst_data(write_back).kind(),
+            InstKind::Store(store) if store.dest() == global
+        ));
+    }
+
+    #[test]
+    fn rejects_promotion_when_tail_callee_touches_global() {
+        let mut program = Program::new();
+        let global = scalar_global(&mut program);
+        let (callee, callee_entry) = add_unit_function(&mut program, "callee");
+        {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(callee),
+            };
+            let load = data.new_local_value().load(global);
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(callee_entry, load);
+            data.layout_mut().insert_inst(callee_entry, ret);
+        }
+        let (caller, caller_entry) = add_unit_function(&mut program, "caller");
+        let original_store = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(caller),
+            };
+            let value = data.new_local_value().integer(42);
+            let store = data.new_local_value().store(value, global);
+            let tail_call = data.new_local_value().tail_call(callee, vec![]);
+            data.layout_mut().insert_inst(caller_entry, store);
+            data.layout_mut().insert_inst(caller_entry, tail_call);
+            store
+        };
+
+        ScalarGlobalPromotion.run(&mut program);
+
+        assert_eq!(
+            program.func_data(caller).layout().parent_bb(original_store),
+            Some(caller_entry)
+        );
+    }
+
+    #[test]
+    fn may_touch_follows_transitive_tail_calls() {
+        let mut program = Program::new();
+        let global = scalar_global(&mut program);
+        let (leaf, leaf_entry) = add_unit_function(&mut program, "leaf");
+        {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(leaf),
+            };
+            let load = data.new_local_value().load(global);
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(leaf_entry, load);
+            data.layout_mut().insert_inst(leaf_entry, ret);
+        }
+        let (middle, middle_entry) = add_unit_function(&mut program, "middle");
+        {
+            let data = program.func_data_mut(middle);
+            let tail_call = data.new_local_inst().tail_call(leaf, vec![]);
+            data.layout_mut().insert_inst(middle_entry, tail_call);
+        }
+        let (caller, caller_entry) = add_unit_function(&mut program, "caller");
+        let original_store = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(caller),
+            };
+            let value = data.new_local_value().integer(42);
+            let store = data.new_local_value().store(value, global);
+            let call = data
+                .new_local_value()
+                .call_with_type(middle, vec![], Type::get_unit());
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(caller_entry, store);
+            data.layout_mut().insert_inst(caller_entry, call);
+            data.layout_mut().insert_inst(caller_entry, ret);
+            store
+        };
+
+        ScalarGlobalPromotion.run(&mut program);
+
+        assert_eq!(
+            program.func_data(caller).layout().parent_bb(original_store),
+            Some(caller_entry)
+        );
+    }
+
+    #[test]
+    fn writes_back_before_tail_call_to_declaration() {
+        let mut program = Program::new();
+        let global = scalar_global(&mut program);
+        let declaration = program.new_function(Type::get_unit(), "external".into(), vec![]);
+        let (caller, entry) = add_unit_function(&mut program, "caller");
+        {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(caller),
+            };
+            let value = data.new_local_value().integer(42);
+            let store = data.new_local_value().store(value, global);
+            let tail_call = data.new_local_value().tail_call(declaration, vec![]);
+            data.layout_mut().insert_inst(entry, store);
+            data.layout_mut().insert_inst(entry, tail_call);
+        }
+
+        assert!(ScalarGlobalPromotion.run(&mut program));
+
+        let data = program.func_data(caller);
+        let stores = stores_to(data, global);
+        assert_eq!(stores.len(), 1);
+        let insts = data
+            .layout()
+            .basicblock(entry)
+            .insts()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(stores[0], insts[insts.len() - 2]);
+        assert!(matches!(
+            data.inst_data(*insts.last().unwrap()).kind(),
+            InstKind::TailCall(call) if call.callee() == declaration
+        ));
     }
 }

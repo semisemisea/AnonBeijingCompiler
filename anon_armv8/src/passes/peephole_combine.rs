@@ -232,7 +232,10 @@ fn fuse_flag_triple(
                 imm: cmp_imm,
             },
             MInst::CondBr { cond, .. },
-        ) if *cmp_size == *size && cmp_imm.value() == 0 && *lhs == dst.reg && subs_safe_cond(*cond) =>
+        ) if *cmp_size == *size
+            && cmp_imm.value() == 0
+            && *lhs == dst.reg
+            && subs_safe_cond(*cond) =>
         {
             Some(MInst::SubsRRImm12 {
                 size: *size,
@@ -255,7 +258,10 @@ fn fuse_flag_triple(
                 imm: cmp_imm,
             },
             MInst::CondBr { cond, .. },
-        ) if *cmp_size == *size && cmp_imm.value() == 0 && *lhs == dst.reg && logical_safe_cond(*cond) =>
+        ) if *cmp_size == *size
+            && cmp_imm.value() == 0
+            && *lhs == dst.reg
+            && logical_safe_cond(*cond) =>
         {
             if use_counts.get(&dst.reg).copied().unwrap_or(0) == 1 {
                 Some(MInst::TstRRImmLogic {
@@ -316,7 +322,9 @@ fn combine_flag_fusion(vcode: &mut VCodeContainer<MInst>, use_counts: &HashMap<R
     let block_count = vcode.num_blocks();
     for block_idx in 0..block_count {
         let range = vcode.block_inst_range(block_idx);
-        let first = range.clone().find(|&i| !matches!(vcode.inst(i), MInst::Removed));
+        let first = range
+            .clone()
+            .find(|&i| !matches!(vcode.inst(i), MInst::Removed));
         let Some(cmp_idx) = first else {
             continue;
         };
@@ -447,7 +455,12 @@ mod tests {
 
     #[test]
     fn fuses_sub_cmp_condbr_into_subs() {
-        let fused = fuse_flag_triple(&sub_imm(0, 0, 1), &cmp_zero(0), &cond_br(Cond::Ne), &no_uses());
+        let fused = fuse_flag_triple(
+            &sub_imm(0, 0, 1),
+            &cmp_zero(0),
+            &cond_br(Cond::Ne),
+            &no_uses(),
+        );
         assert!(matches!(
             fused,
             Some(MInst::SubsRRImm12 {
@@ -461,31 +474,59 @@ mod tests {
 
     #[test]
     fn refuses_unsigned_condition_for_sub_fusion() {
-        let fused = fuse_flag_triple(&sub_imm(0, 0, 1), &cmp_zero(0), &cond_br(Cond::Ls), &no_uses());
-        assert!(fused.is_none(), "subs changes C, so unsigned conds must not fuse");
+        let fused = fuse_flag_triple(
+            &sub_imm(0, 0, 1),
+            &cmp_zero(0),
+            &cond_br(Cond::Ls),
+            &no_uses(),
+        );
+        assert!(
+            fused.is_none(),
+            "subs changes C, so unsigned conds must not fuse"
+        );
     }
 
     #[test]
     fn fuses_live_and_into_ands_and_dead_and_into_tst() {
         let mut uses = HashMap::new();
         uses.insert(vreg(0), 2);
-        let fused = fuse_flag_triple(&and_imm(0, 1, 0x8000_0001), &cmp_zero(0), &cond_br(Cond::Eq), &uses);
+        let fused = fuse_flag_triple(
+            &and_imm(0, 1, 0x8000_0001),
+            &cmp_zero(0),
+            &cond_br(Cond::Eq),
+            &uses,
+        );
         assert!(matches!(fused, Some(MInst::AndsRRImmLogic { .. })));
 
         let mut uses = HashMap::new();
         uses.insert(vreg(0), 1);
-        let fused = fuse_flag_triple(&and_imm(0, 1, 0x8000_0001), &cmp_zero(0), &cond_br(Cond::Eq), &uses);
+        let fused = fuse_flag_triple(
+            &and_imm(0, 1, 0x8000_0001),
+            &cmp_zero(0),
+            &cond_br(Cond::Eq),
+            &uses,
+        );
         assert!(matches!(fused, Some(MInst::TstRRImmLogic { .. })));
     }
 
     #[test]
     fn refuses_mismatched_registers_and_nonzero_compare() {
-        assert!(fuse_flag_triple(&sub_imm(0, 1, 1), &cmp_zero(2), &cond_br(Cond::Ne), &no_uses()).is_none());
+        assert!(
+            fuse_flag_triple(
+                &sub_imm(0, 1, 1),
+                &cmp_zero(2),
+                &cond_br(Cond::Ne),
+                &no_uses()
+            )
+            .is_none()
+        );
         let bad_cmp = MInst::CmpImm {
             size: OperandSize::Size32,
             lhs: vreg(0),
             imm: Imm12::new(1, false).unwrap(),
         };
-        assert!(fuse_flag_triple(&sub_imm(0, 0, 1), &bad_cmp, &cond_br(Cond::Ne), &no_uses()).is_none());
+        assert!(
+            fuse_flag_triple(&sub_imm(0, 0, 1), &bad_cmp, &cond_br(Cond::Ne), &no_uses()).is_none()
+        );
     }
 }

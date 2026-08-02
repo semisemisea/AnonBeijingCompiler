@@ -884,7 +884,9 @@ impl MachInst for MInst {
             | Self::LoadAddr { dst, .. }
             | Self::StackAddr { dst, .. }
             | Self::CSet { dst, .. } => collector.reg_def(dst),
-            Self::CmpSelect { cmp, ccmp, value, .. } => {
+            Self::CmpSelect {
+                cmp, ccmp, value, ..
+            } => {
                 match cmp {
                     SelectCmp::IntRR { lhs, rhs, .. } => {
                         collector.reg_use(lhs);
@@ -919,9 +921,7 @@ impl MachInst for MInst {
                     SelectValue::Bool { dst } => collector.reg_def(dst),
                 }
             }
-            Self::CCmp {
-                lhs, rhs, imm, ..
-            } => {
+            Self::CCmp { lhs, rhs, imm, .. } => {
                 collector.reg_use(lhs);
                 use_reg_or_zr(collector, rhs);
                 let _ = imm;
@@ -1237,7 +1237,12 @@ impl MachInstEmit for MInst {
                 }
                 Ok(())
             }
-            Self::AndsRRImmLogic { size, dst, src, imm } => {
+            Self::AndsRRImmLogic {
+                size,
+                dst,
+                src,
+                imm,
+            } => {
                 write!(ctx, "ands ")?;
                 emit_reg(ctx, dst.to_reg(), *size)?;
                 write!(ctx, ", ")?;
@@ -1347,12 +1352,7 @@ impl MachInstEmit for MInst {
                     .expect("Cbz/Cbnz target must be an intra-function block");
                 let prefix = branch_prefix(ctx, mnemonic, *reg, *size)?;
                 let inv_prefix = branch_prefix(ctx, inverted_mnemonic, *reg, *size)?;
-                ctx.put_branch(
-                    &prefix,
-                    Some(&inv_prefix),
-                    true_target,
-                    LabelKind::BRANCH19,
-                )?;
+                ctx.put_branch(&prefix, Some(&inv_prefix), true_target, LabelKind::BRANCH19)?;
                 ctx.put_uncond_branch("b ", false_target, LabelKind::BRANCH26)
             }
             Self::Tbz {
@@ -1381,12 +1381,7 @@ impl MachInstEmit for MInst {
                     .expect("Tbz/Tbnz target must be an intra-function block");
                 let prefix = branch_prefix_bit(ctx, mnemonic, *reg, *size, *bit)?;
                 let inv_prefix = branch_prefix_bit(ctx, inverted_mnemonic, *reg, *size, *bit)?;
-                ctx.put_branch(
-                    &prefix,
-                    Some(&inv_prefix),
-                    true_target,
-                    LabelKind::BRANCH14,
-                )?;
+                ctx.put_branch(&prefix, Some(&inv_prefix), true_target, LabelKind::BRANCH14)?;
                 ctx.put_uncond_branch("b ", false_target, LabelKind::BRANCH26)
             }
             Self::CondBr {
@@ -1429,11 +1424,18 @@ impl MachInstEmit for MInst {
                 nzcv,
                 cond,
             } => emit_ccmp(ctx, *size, *lhs, rhs, *imm, *nzcv, *cond),
-            Self::CmpSelect { cmp, ccmp, cond, value } => {
+            Self::CmpSelect {
+                cmp,
+                ccmp,
+                cond,
+                value,
+            } => {
                 emit_select_cmp(ctx, cmp)?;
                 ctx.end_inst()?;
                 if let Some(ccmp) = ccmp {
-                    emit_ccmp(ctx, ccmp.size, ccmp.lhs, &ccmp.rhs, ccmp.imm, ccmp.nzcv, ccmp.cond)?;
+                    emit_ccmp(
+                        ctx, ccmp.size, ccmp.lhs, &ccmp.rhs, ccmp.imm, ccmp.nzcv, ccmp.cond,
+                    )?;
                     ctx.end_inst()?;
                 }
                 match value {
@@ -2303,10 +2305,7 @@ mod tests {
                 dst: Writable::from_reg(int_reg(0)),
             },
         });
-        assert_eq!(
-            text,
-            "cmp w1, w2\n    ccmp w3, #1, #4, ne\n    cset w0, eq"
-        );
+        assert_eq!(text, "cmp w1, w2\n    ccmp w3, #1, #4, ne\n    cset w0, eq");
     }
 
     #[test]

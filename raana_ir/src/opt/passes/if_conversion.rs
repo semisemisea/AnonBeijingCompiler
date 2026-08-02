@@ -188,7 +188,12 @@ impl IfConversion {
         if insts.len() > 1 {
             let chain_len = insts.len() - 1;
             for (idx, &inst) in insts[..chain_len].iter().enumerate() {
-                if !self.safe_arm_binary(data, inst, head, &move_insts.iter().map(|&(_, i)| i).collect::<Vec<_>>()) {
+                if !self.safe_arm_binary(
+                    data,
+                    inst,
+                    head,
+                    &move_insts.iter().map(|&(_, i)| i).collect::<Vec<_>>(),
+                ) {
                     return None;
                 }
                 let users = data.inst_data(inst).used_by();
@@ -203,15 +208,12 @@ impl IfConversion {
                 move_insts.push((arm, inst));
             }
         }
-        if arm_args
+        if arm_args.iter().any(|&value| {
+            !move_insts.iter().any(|&(_, inst)| inst == value)
+                && !self.available_at(data, value, head)
+        }) || direct_args
             .iter()
-            .any(|&value| {
-                !move_insts.iter().any(|&(_, inst)| inst == value)
-                    && !self.available_at(data, value, head)
-            })
-            || direct_args
-                .iter()
-                .any(|&value| !self.available_at(data, value, head))
+            .any(|&value| !self.available_at(data, value, head))
         {
             return None;
         }
@@ -277,10 +279,12 @@ impl IfConversion {
                 MergedValue::Select { if_true, if_false }
             });
         }
-        if !values
-            .iter()
-            .any(|value| matches!(value, MergedValue::Select { .. } | MergedValue::BoolBinary { .. }))
-        {
+        if !values.iter().any(|value| {
+            matches!(
+                value,
+                MergedValue::Select { .. } | MergedValue::BoolBinary { .. }
+            )
+        }) {
             return None;
         }
         Some(Candidate {
@@ -312,10 +316,7 @@ impl IfConversion {
             return Some((BinaryOp::And, cond, if_true));
         }
         // `c1 ? c1 : c2` with c1, c2 in {0,1} == `c1 || c2`.
-        if self.zero_one(data, cond)
-            && if_true == cond
-            && self.zero_one(data, if_false)
-        {
+        if self.zero_one(data, cond) && if_true == cond && self.zero_one(data, if_false) {
             return Some((BinaryOp::Or, cond, if_false));
         }
         None
@@ -376,7 +377,8 @@ impl IfConversion {
         let InstKind::Binary(binary) = data.inst_data(inst).kind() else {
             return false;
         };
-        let operand_ok = |value: Inst| chain.contains(&value) || self.available_at(data, value, head);
+        let operand_ok =
+            |value: Inst| chain.contains(&value) || self.available_at(data, value, head);
         data.inst_data(inst).ty().is_i32()
             && data.inst_data(binary.lhs()).ty().is_i32()
             && data.inst_data(binary.rhs()).ty().is_i32()
@@ -827,7 +829,9 @@ mod tests {
         let two_a = data.new_local_inst().integer(2);
         let c2 = data.new_local_inst().binary(BinaryOp::Eq, a, two_a);
         data.layout_mut().insert_inst(rhs, c2);
-        let branch = data.new_local_inst().branch(c1, rhs, vec![], merge, vec![zero, pass]);
+        let branch = data
+            .new_local_inst()
+            .branch(c1, rhs, vec![], merge, vec![zero, pass]);
         data.layout_mut().insert_inst(head, branch);
         let rhs_jump = data.new_local_inst().jump(merge, vec![c2, pass]);
         data.layout_mut().insert_inst(rhs, rhs_jump);
@@ -881,7 +885,9 @@ mod tests {
         let seven = data.new_local_inst().integer(7);
         let pass = data.new_local_inst().binary(BinaryOp::Add, a, seven);
         data.layout_mut().insert_inst(head, pass);
-        let branch = data.new_local_inst().branch(c1, merge, vec![c1, pass], rhs, vec![]);
+        let branch = data
+            .new_local_inst()
+            .branch(c1, merge, vec![c1, pass], rhs, vec![]);
         data.layout_mut().insert_inst(head, branch);
         let two_a = data.new_local_inst().integer(2);
         let c2 = data.new_local_inst().binary(BinaryOp::Eq, a, two_a);
@@ -917,8 +923,7 @@ mod tests {
         // `reaches(merge, head)` guard rejected. head dominates merge, so the
         // accumulator now converts to a select.
         let mut program = Program::new();
-        let function =
-            program.new_function(Type::get_i32(), "acc".into(), vec![Type::get_i32()]);
+        let function = program.new_function(Type::get_i32(), "acc".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
         let __pty = data.params_ty().to_vec();
         let head = data.new_basic_block().basic_block("head".into(), __pty);
@@ -936,7 +941,9 @@ mod tests {
         let one_a = data.new_local_inst().integer(1);
         let cond = data.new_local_inst().binary(BinaryOp::Eq, a, one_a);
         data.layout_mut().insert_inst(head, cond);
-        let branch = data.new_local_inst().branch(cond, arm, vec![], merge, vec![a]);
+        let branch = data
+            .new_local_inst()
+            .branch(cond, arm, vec![], merge, vec![a]);
         data.layout_mut().insert_inst(head, branch);
         // arm: result' = result + power (operands dominate head).
         let one_b = data.new_local_inst().integer(1);

@@ -847,8 +847,15 @@ impl Edits {
             if from.is_reg() && to.is_reg() {
                 debug_assert_eq!(from.as_reg().unwrap().class(), to.as_reg().unwrap().class());
             }
-            self.edits
-                .push((pos_prio, Edit::Move { from, to, class, vreg }));
+            self.edits.push((
+                pos_prio,
+                Edit::Move {
+                    from,
+                    to,
+                    class,
+                    vreg,
+                },
+            ));
         }
     }
 }

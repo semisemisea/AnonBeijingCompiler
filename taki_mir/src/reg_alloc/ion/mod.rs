@@ -50,7 +50,7 @@ use crate::{
     VecExt,
     reg_alloc::{
         function::Function,
-        reg::{MachineEnv, Output},
+        reg::{Edit, MachineEnv, Output, RegClass, VReg},
     },
 };
 
@@ -147,7 +147,33 @@ pub fn run<F: Function>(func: &F, mach_env: &MachineEnv) -> Result<Output, Strin
         env.init()?;
         env.run()?
     };
-    ctx.output.edits.extend(edits.drain_edits());
+    // Map allocator-local vreg indices in the edits back to the original
+    // function's vregs so the emitter can size moves from real value types.
+    let remapped = edits.drain_edits().map(|(point, edit)| {
+        let edit = match edit {
+            Edit::Move {
+                from,
+                to,
+                class,
+                vreg: Some(idx),
+            } => {
+                let local = VReg::new(idx as usize, RegClass::Int);
+                let original = dense_func
+                    .original_vreg(local)
+                    .map(|v| v.vreg() as u32)
+                    .unwrap_or(idx);
+                Edit::Move {
+                    from,
+                    to,
+                    class,
+                    vreg: Some(original),
+                }
+            }
+            other => other,
+        };
+        (point, edit)
+    });
+    ctx.output.edits.extend(remapped);
     Ok(core::mem::take(&mut ctx.output))
 }
 

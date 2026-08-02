@@ -279,15 +279,25 @@ GSP/LICM/load-CSE，余下）：
   workspace 298、functional/h_functional × -O0/1/2、RISC-V 全通过
   （35_math.sy -O2 FP 分歧仍为旧有）。已独立提交。
 
-#### M35：RA 回边拷贝消除 + Mov 宽度
+#### M35：RA 回边拷贝消除 + Mov 宽度（已完成 Mov 宽度；回边拷贝已完成诊断）
 
-- 文件：`taki_mir/src/lower.rs`（blockparam 拷贝生成，line 431-521）、
-  `taki_mir/src/reg_alloc/ion/merge.rs`、`redundant_moves.rs`。
-- 设计：先诊断回边 5 条 `mov` 来源（lower 层按前驱插入的拷贝 vs ion bundle
-  合并未命中）；(a) 分配前轻量 copy-propagation 折叠纯 `Mov`（LLVM 式）；
-  (b) 修 merge 的 blockparam-out 合并路径。附带：`Mov` 按 vreg 类型选 32 位
-  宽度（`mov w0,w2` 而非 `mov x0,x2`）。
-- 验收：`_and/_xor/_or` 回边零 mov；5 次确定性门禁。
+- **Mov 宽度（已完成）**：`Edit::Move` 携带目标 vreg 索引（ion 局部编号在
+  `ion::run` 出口经 `original_vreg` 映射回原函数编号），`finalize_for_emission`
+  按 `vreg_types` 选宽度：i32 拷贝发射 `mov w,w`（清零上半），不再一律
+  `mov x,x`。`_and/_xor/_or` 回边拷贝 3 条均为 `mov w,w`。
+- **回边 blockparam 拷贝（诊断结论）**：ion `merge_vreg_bundles` 的
+  blockparam-out 合并路径已被触发且逻辑正确；对旋转后循环体，
+  from-vreg（新值，如 `asr` 结果 [10,24]）与 param（旧值，[8,13+]）的
+  活区间**真实相交**——`bit_a = a%2` 在旋转（`a/2`）之后才读旧 `a`，
+  旧值必须活到 `and`，新值在 `asr` 即定义 → 不能同寄存器，拷贝是语义
+  必需的。M33 时代 1 条拷贝是因为循环体首条 `mov x5,x3` 提前改名旧值
+  缩短其活区间（代价是该 mov 本身）。消除路径：(a) 循环体重排——把
+  旧值读取（bit 计算）提到新值定义之前（IR/MIR 层，可使回边零 mov）；
+  (b) ion 活区间按块参数 in/out 拷贝分裂（regalloc2 的 half-move 语义）。
+- 验收（调整）：i32 拷贝宽度正确（5 次确定性门禁）；回边拷贝数如实
+  记录，不夸大；`_and` 循环回边 3 条 `mov w,w`（M33 时代为 2 条
+  `mov x,x` 含体首改名拷贝，净指令数 24 对 22 差在入口多 1 条 + 拷贝
+  宽度变 w）。
 
 #### M36：内联代价模型
 

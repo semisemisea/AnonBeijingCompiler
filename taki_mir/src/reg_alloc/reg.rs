@@ -382,10 +382,14 @@ pub enum Edit {
     /// Edits are ordered by program point and in the exact execution order for
     /// edits sharing a point.
     /// Stack endpoints carry no class, so the move records it explicitly.
+    /// `vreg` identifies the destination value (when it is a register move)
+    /// so the emitter can size the move from the value's actual type
+    /// (e.g. `mov w0, w2` for an i32 instead of `mov x0, x2`).
     Move {
         from: Allocation,
         to: Allocation,
         class: RegClass,
+        vreg: Option<u32>,
     },
 }
 

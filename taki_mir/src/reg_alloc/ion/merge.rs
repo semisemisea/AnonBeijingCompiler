@@ -127,8 +127,13 @@ impl<'a, F: Function> Env<'a, F> {
             } else {
                 // Overlap -- cannot merge.
                 trace!(
-                    " -> overlap between {:?} and {:?}, exiting",
-                    ranges_from[idx_from].index, ranges_to[idx_to].index
+                    " -> overlap between {:?} and {:?}, exiting (from={:?} to={:?} r_from={:?} r_to={:?})",
+                    ranges_from[idx_from].index,
+                    ranges_to[idx_to].index,
+                    ranges_from[idx_from].range,
+                    ranges_to[idx_to].range,
+                    self.ranges[ranges_from[idx_from].index].vreg,
+                    self.ranges[ranges_to[idx_to].index].vreg,
                 );
                 return false;
             }

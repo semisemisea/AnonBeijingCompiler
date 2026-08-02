@@ -485,12 +485,11 @@ fn process_instruction(
             InstKind::Cast(cast) => {
                 if data.inst_data(inst).ty().is_i32() {
                     if let InstKind::Float(float) = data.inst_data(cast.src()).kind() {
-                        return value_status_map
-                            .insert_or_merge(
-                                inst,
-                                VariableStatus::new_with_const(float.value() as i32),
-                            )
-                            .then_some(ret_with!(inst));
+                        if let Some(value) = super::ipsccp::fold_f32_to_i32(float.value()) {
+                            return value_status_map
+                                .insert_or_merge(inst, VariableStatus::new_with_const(value))
+                                .then_some(ret_with!(inst));
+                        }
                     }
                 }
                 value_status_map

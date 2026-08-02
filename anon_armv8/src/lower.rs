@@ -101,6 +101,13 @@ fn lower_binary(
         }
         return LoweredOutput::Value(result);
     }
+    // A constant multiplier with a single-instruction form folds before any
+    // operand is materialized, so the constant itself never loads.
+    if binary.op() == BinaryOp::Mul {
+        if let Some(output) = try_fold_mul_constant(ctx, arena, inst, binary, dst) {
+            return output;
+        }
+    }
     let lhs = ctx.put_value_in_reg(binary.lhs());
     let rhs_imm = integer_constant(arena, binary.rhs());
 
@@ -1713,6 +1720,107 @@ fn lower_signed_div_rem_magic(
     true
 }
 
+/// Fold `lhs * rhs` when exactly one operand is a constant whose multiplier
+/// has a single-instruction form (see `fold_mul_constant`). Runs before any
+/// operand is materialized so the constant itself never loads. Returns
+/// `Some` when folded; the caller then skips normal multiplication selection.
+fn try_fold_mul_constant(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    binary: &Binary,
+    dst: Writable<taki_mir::register::Reg>,
+) -> Option<LoweredOutput> {
+    let lhs_imm = integer_constant(arena, binary.lhs());
+    let rhs_imm = integer_constant(arena, binary.rhs());
+    let value = lhs_imm.or(rhs_imm)?;
+    let operand = if lhs_imm.is_some() {
+        binary.rhs()
+    } else {
+        binary.lhs()
+    };
+    let x = ctx.put_value_in_reg(operand);
+    if value == 1 {
+        return Some(LoweredOutput::Value(x));
+    }
+    let size = operand_size(arena.inst_data(inst).ty().kind());
+    let form = fold_mul_constant(value, size)?;
+    match form {
+        MulConstForm::Lsl(shift) => ctx.emit(MInst::AluRRImmShift {
+            op: alu_op(BinaryOp::Shl),
+            size,
+            dst,
+            src: x,
+            shift,
+        }),
+        MulConstForm::AddLsl(amount) => ctx.emit(MInst::AluRRRShift {
+            op: AluOp::Add,
+            size,
+            dst,
+            lhs: RegOrZr::Reg(x),
+            rhs: RegOrZr::Reg(x),
+            shift: ShiftOp::Lsl,
+            amount,
+        }),
+        MulConstForm::SubLsl(amount) => ctx.emit(MInst::AluRRRShift {
+            op: AluOp::Sub,
+            size,
+            dst,
+            lhs: RegOrZr::Reg(x),
+            rhs: RegOrZr::Reg(x),
+            shift: ShiftOp::Lsl,
+            amount,
+        }),
+        MulConstForm::NegLsl(amount) => ctx.emit(MInst::AluRRRShift {
+            op: AluOp::Sub,
+            size,
+            dst,
+            lhs: RegOrZr::Zr,
+            rhs: RegOrZr::Reg(x),
+            shift: ShiftOp::Lsl,
+            amount,
+        }),
+    }
+    Some(LoweredOutput::Value(ctx.result_reg(inst)))
+}
+
+/// A single-instruction rewrite of `x * constant`.
+enum MulConstForm {
+    /// `x << n` for value = 2^n (n >= 1).
+    Lsl(ImmShift),
+    /// `x + (x << n)` for value = 2^n + 1 (n >= 1).
+    AddLsl(ImmShift),
+    /// `x - (x << n)` for value = -(2^n - 1) (n >= 0).
+    SubLsl(ImmShift),
+    /// `xzr - (x << n)` for value = -2^n (n >= 1).
+    NegLsl(ImmShift),
+}
+
+/// Fold `x * value` into a single AArch64 instruction: powers of two
+/// (`lsl`), 2^n+1 (`add x, x, x, lsl #n`), -(2^n-1) (`sub x, x, x, lsl #n`),
+/// and -2^n (`sub x, xzr, x, lsl #n`). Returns `None` when no single
+/// instruction encodes the multiplier; the caller falls back to `mul`.
+fn fold_mul_constant(value: i32, size: OperandSize) -> Option<MulConstForm> {
+    let pow2_shift = |v: i64| -> Option<ImmShift> {
+        let n = u8::try_from(v.trailing_zeros()).ok()?;
+        ImmShift::new(n, size)
+    };
+    if value > 1 && (value as u32).is_power_of_two() {
+        return pow2_shift(value.into()).map(MulConstForm::Lsl);
+    }
+    if value > 2 && ((value - 1) as u32).is_power_of_two() {
+        return pow2_shift((value - 1).into()).map(MulConstForm::AddLsl);
+    }
+    let magnitude = value.unsigned_abs();
+    if value < 0 && (magnitude + 1).is_power_of_two() {
+        return pow2_shift((magnitude + 1).into()).map(MulConstForm::SubLsl);
+    }
+    if value < -1 && magnitude.is_power_of_two() {
+        return pow2_shift(magnitude.into()).map(MulConstForm::NegLsl);
+    }
+    None
+}
+
 /// Fold a single-use integer or pointer multiplication into an add/sub
 /// consumer. The sink claim happens only after all shape and type checks, so
 /// a rejected candidate follows normal instruction selection unchanged.
@@ -2183,9 +2291,12 @@ fn float_comparison_cond(op: BinaryOp) -> Cond {
 
 #[cfg(test)]
 mod tests {
-    use super::{nzcv_making_cond_false, nzcv_making_cond_true, signed_power_of_two};
-    use crate::instructions::Cond;
-    use crate::instructions::MInst;
+    use super::{
+        MulConstForm, fold_mul_constant, nzcv_making_cond_false, nzcv_making_cond_true,
+        signed_power_of_two,
+    };
+    use crate::instructions::{Cond, ImmShift, MInst};
+    use crate::regs::OperandSize;
     use raana_ir::ir::{BinaryOp, Program, Type};
     use taki_mir::{
         reg_alloc::reg::{PReg, RegClass, SpillSlot},
@@ -2637,5 +2748,76 @@ mod tests {
         assert_eq!(assembly.matches("madd").count(), 0, "{assembly}");
         assert_eq!(assembly.matches("\n    mul ").count(), 2, "{assembly}");
         assert!(assembly.contains("\n    add w"), "{assembly}");
+    }
+
+    #[test]
+    fn classifies_mul_constants() {
+        let s32 = OperandSize::Size32;
+        let shift = |v: u8| ImmShift::new(v, s32).unwrap();
+        assert!(matches!(fold_mul_constant(2, s32), Some(MulConstForm::Lsl(s)) if s == shift(1)));
+        assert!(matches!(fold_mul_constant(8, s32), Some(MulConstForm::Lsl(s)) if s == shift(3)));
+        assert!(matches!(fold_mul_constant(3, s32), Some(MulConstForm::AddLsl(s)) if s == shift(1)));
+        assert!(matches!(fold_mul_constant(5, s32), Some(MulConstForm::AddLsl(s)) if s == shift(2)));
+        assert!(matches!(fold_mul_constant(9, s32), Some(MulConstForm::AddLsl(s)) if s == shift(3)));
+        assert!(matches!(fold_mul_constant(-1, s32), Some(MulConstForm::SubLsl(s)) if s == shift(1)));
+        assert!(matches!(fold_mul_constant(-3, s32), Some(MulConstForm::SubLsl(s)) if s == shift(2)));
+        assert!(matches!(fold_mul_constant(-7, s32), Some(MulConstForm::SubLsl(s)) if s == shift(3)));
+        assert!(matches!(fold_mul_constant(-2, s32), Some(MulConstForm::NegLsl(s)) if s == shift(1)));
+        assert!(matches!(fold_mul_constant(-8, s32), Some(MulConstForm::NegLsl(s)) if s == shift(3)));
+        // Not encodable in one instruction.
+        assert!(fold_mul_constant(6, s32).is_none());
+        assert!(fold_mul_constant(7, s32).is_none());
+        assert!(fold_mul_constant(0, s32).is_none());
+        assert!(fold_mul_constant(1, s32).is_none());
+    }
+
+    #[test]
+    fn constant_mul_folds_to_shift_or_add_shift() {
+        use raana_ir::ir::builder_trait::*;
+
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "mul_const".into(),
+            vec![Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let x = data.params()[0];
+        let three = data.new_local_inst().integer(3);
+        let mul = data.new_local_inst().binary(BinaryOp::Mul, x, three);
+        data.layout_mut().insert_inst(entry, mul);
+        let ret = data.new_local_inst().ret(Some(mul));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+        // x * 3 = x + (x << 1): one add-shift, no mul, no movz 3.
+        assert!(assembly.contains("lsl #1"), "{assembly}");
+        assert!(!assembly.contains("\n    mul "), "{assembly}");
+        assert!(!assembly.contains("movz"), "{assembly}");
+    }
+
+    #[test]
+    fn unencodable_constant_mul_falls_back() {
+        use raana_ir::ir::builder_trait::*;
+
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "mul_const_fallback".into(),
+            vec![Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let x = data.params()[0];
+        let six = data.new_local_inst().integer(6);
+        let mul = data.new_local_inst().binary(BinaryOp::Mul, x, six);
+        data.layout_mut().insert_inst(entry, mul);
+        let ret = data.new_local_inst().ret(Some(mul));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+        // 6 is not a single-instruction multiplier: keep mul.
+        assert_eq!(assembly.matches("\n    mul ").count(), 1, "{assembly}");
     }
 }

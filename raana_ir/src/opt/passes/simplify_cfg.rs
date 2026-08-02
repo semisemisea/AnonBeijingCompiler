@@ -1,4 +1,5 @@
 use crate::opt::prelude::*;
+use crate::opt::utils::logical_edge::{LogicalEdgeRewriter, outgoing_edges};
 
 pub struct SimplifyCFG;
 
@@ -103,25 +104,12 @@ impl SimplifyCFG {
     }
 
     pub fn remove_trivial_jump_block(data: &mut ArenaContextMut<'_>) -> bool {
-        enum Edit {
-            Jump {
-                to_modify: Inst,
-                new: BasicBlock,
-            },
-            Branch {
-                to_modify: Inst,
-                cond: Inst,
-                t_target: BasicBlock,
-                t_args: Vec<Inst>,
-                f_target: BasicBlock,
-                f_args: Vec<Inst>,
-            },
-        }
-
-        let mut edits = Vec::new();
-        let mut trivial_block = Vec::new();
+        let mut candidates = HashMap::default();
         // Skip entry bb
         for bb_layout in data.layout().basicblocks().iter().skip(1) {
+            if bb_layout.insts().len() != 1 {
+                continue;
+            }
             let first = *bb_layout.insts().get_first().unwrap();
             // Find a block that only have a jump instruction with no argument.
             let InstKind::Jump(jump) = data.inst_data(first).kind() else {
@@ -135,59 +123,64 @@ impl SimplifyCFG {
             if jump.target() == bb_layout.bb() {
                 continue;
             }
-            for &used in data.bb_data(bb_layout.bb()).used_by() {
-                match data.inst_data(used).kind() {
-                    InstKind::Jump(..) => {
-                        edits.push(Edit::Jump {
-                            to_modify: used,
-                            new: jump.target(),
-                        });
-                    }
-                    InstKind::Branch(branch) => {
-                        edits.push(Edit::Branch {
-                            to_modify: used,
-                            cond: branch.cond(),
-                            t_target: if branch.t_target() == bb_layout.bb() {
-                                jump.target()
-                            } else {
-                                branch.t_target()
-                            },
-                            t_args: branch.t_args().to_vec(),
-                            f_target: if branch.f_target() == bb_layout.bb() {
-                                jump.target()
-                            } else {
-                                branch.f_target()
-                            },
-                            f_args: branch.f_args().to_vec(),
-                        });
-                    }
-                    _ => unreachable!(),
+            candidates.insert(bb_layout.bb(), jump.target());
+        }
+
+        let mut final_targets: HashMap<BasicBlock, Option<BasicBlock>> = HashMap::default();
+        for &start in candidates.keys() {
+            if final_targets.contains_key(&start) {
+                continue;
+            }
+            let mut path = Vec::new();
+            let mut path_indices = HashMap::default();
+            let mut current = start;
+            let final_target = loop {
+                if let Some(&resolved) = final_targets.get(&current) {
+                    break resolved;
+                }
+                if path_indices.insert(current, path.len()).is_some() {
+                    break None;
+                }
+                path.push(current);
+                let target = candidates[&current];
+                if !candidates.contains_key(&target) {
+                    break Some(target);
+                }
+                current = target;
+            };
+            for block in path {
+                final_targets.insert(block, final_target);
+            }
+        }
+
+        let removable = final_targets
+            .iter()
+            .filter_map(|(&block, target)| target.map(|target| (block, target)))
+            .collect::<HashMap<_, _>>();
+        if removable.is_empty() {
+            return false;
+        }
+
+        let blocks = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .map(|layout| layout.bb())
+            .collect::<Vec<_>>();
+        let mut rewrites = LogicalEdgeRewriter::new();
+        for source in blocks {
+            for edge in outgoing_edges(data.curr_func_data(), source) {
+                if let Some(&target) = removable.get(&edge.target(data.curr_func_data())) {
+                    let args = edge.args(data.curr_func_data()).to_vec();
+                    rewrites.retarget(data.curr_func_data(), edge, target, args);
                 }
             }
-            trivial_block.push(bb_layout.bb());
-            break;
         }
-        let changed = !edits.is_empty();
-        edits.into_iter().for_each(|edit| match edit {
-            Edit::Jump { to_modify, new } => {
-                data.replace_inst_with(to_modify).jump(new, vec![]);
-            }
-            Edit::Branch {
-                to_modify,
-                cond,
-                t_target,
-                t_args,
-                f_target,
-                f_args,
-            } => {
-                data.replace_inst_with(to_modify)
-                    .branch(cond, t_target, t_args, f_target, f_args);
-            }
-        });
-        trivial_block.into_iter().for_each(|bb| {
+        rewrites.apply(data);
+        for &bb in removable.keys() {
             data.curr_func_data_mut().remove_layout_basicblock(bb);
-        });
-        changed
+        }
+        true
     }
 }
 
@@ -261,6 +254,73 @@ mod tests {
         assert_eq!(branch_data.t_target(), exit);
         assert_eq!(branch_data.f_target(), exit);
         assert!(!context.bb_data(exit).used_by().contains(&bypass));
+        assert!(CFG::new(context.curr_func_data()).is_some());
+    }
+
+    #[test]
+    fn removes_a_chain_of_trivial_blocks_in_one_run() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "trivial_chain".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let mut blocks = Vec::new();
+        for index in 0..1_000 {
+            let block = data
+                .new_basic_block()
+                .basic_block(format!("trivial_{index}"), vec![]);
+            data.layout_mut().push_bb_back(block);
+            blocks.push(block);
+        }
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        data.layout_mut().push_bb_back(exit);
+
+        let enter = data.new_local_inst().jump(blocks[0], vec![]);
+        data.layout_mut().insert_inst(entry, enter);
+        for (index, &block) in blocks.iter().enumerate() {
+            let target = blocks.get(index + 1).copied().unwrap_or(exit);
+            let jump = data.new_local_inst().jump(target, vec![]);
+            data.layout_mut().insert_inst(block, jump);
+        }
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        let mut context = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(function),
+        };
+        assert!(SimplifyCFG::remove_trivial_jump_block(&mut context));
+        assert_eq!(context.curr_func_data().layout().basicblocks().len(), 2);
+        assert!(matches!(
+            context.inst_data(enter).kind(),
+            InstKind::Jump(jump) if jump.target() == exit
+        ));
+        assert!(CFG::new(context.curr_func_data()).is_some());
+    }
+
+    #[test]
+    fn keeps_a_trivial_block_cycle() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "trivial_cycle".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let first = data.new_basic_block().basic_block("first".into(), vec![]);
+        let second = data.new_basic_block().basic_block("second".into(), vec![]);
+        data.layout_mut().push_bb_back(first);
+        data.layout_mut().push_bb_back(second);
+
+        let enter = data.new_local_inst().jump(first, vec![]);
+        data.layout_mut().insert_inst(entry, enter);
+        let to_second = data.new_local_inst().jump(second, vec![]);
+        data.layout_mut().insert_inst(first, to_second);
+        let to_first = data.new_local_inst().jump(first, vec![]);
+        data.layout_mut().insert_inst(second, to_first);
+
+        let mut context = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(function),
+        };
+        assert!(!SimplifyCFG::remove_trivial_jump_block(&mut context));
+        assert_eq!(context.curr_func_data().layout().basicblocks().len(), 3);
         assert!(CFG::new(context.curr_func_data()).is_some());
     }
 }

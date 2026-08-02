@@ -1,8 +1,10 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+use crate::opt::analysis_passes::dom_tree::v2::DominanceTree;
 use crate::opt::prelude::*;
+use crate::opt::utils::cfg::CFG;
 use crate::opt::utils::logical_edge::{
-    LogicalEdge as Edge, LogicalEdgeArm as EdgeArm, LogicalEdgeRewriter,
+    LogicalEdge as Edge, LogicalEdgeArm as EdgeArm, LogicalEdgeRewriter, incoming_edges,
 };
 
 // GVN-PRE implementation status and roadmap:
@@ -51,7 +53,6 @@ use crate::opt::utils::logical_edge::{
 pub struct GVNPRE;
 
 type ValueNumber = u32;
-type Available = HashMap<Expr, Inst>;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct Expr {
@@ -73,6 +74,37 @@ struct ValueNumbers {
     next: ValueNumber,
     values: HashMap<Inst, ValueNumber>,
     keys: HashMap<ValueKey, ValueNumber>,
+}
+
+#[derive(Default)]
+struct ScopedLeaders {
+    leaders: HashMap<Expr, Inst>,
+    scopes: Vec<Vec<(Expr, Option<Inst>)>>,
+}
+
+impl ScopedLeaders {
+    fn enter_scope(&mut self) {
+        self.scopes.push(Vec::new());
+    }
+
+    fn insert(&mut self, expr: Expr, leader: Inst) {
+        let previous = self.leaders.insert(expr.clone(), leader);
+        self.scopes.last_mut().unwrap().push((expr, previous));
+    }
+
+    fn get(&self, expr: &Expr) -> Option<Inst> {
+        self.leaders.get(expr).copied()
+    }
+
+    fn exit_scope(&mut self) {
+        for (expr, previous) in self.scopes.pop().unwrap().into_iter().rev() {
+            if let Some(previous) = previous {
+                self.leaders.insert(expr, previous);
+            } else {
+                self.leaders.remove(&expr);
+            }
+        }
+    }
 }
 
 impl ValueNumbers {
@@ -166,161 +198,158 @@ impl ValueNumbers {
 }
 
 impl GVNPRE {
-    fn reachable_edges(
+    fn incoming_edges(
         &self,
         data: &ArenaContextMut<'_>,
-    ) -> (Vec<BasicBlock>, HashMap<BasicBlock, Vec<Edge>>) {
-        let Some(entry) = data.layout().entry_bb().map(|layout| layout.bb()) else {
-            return (Vec::new(), HashMap::default());
-        };
-        let mut order = Vec::new();
+        cfg: &CFG,
+    ) -> HashMap<BasicBlock, Vec<Edge>> {
         let mut incoming: HashMap<BasicBlock, Vec<Edge>> = HashMap::default();
-        let mut seen = HashSet::default();
-        let mut work = vec![entry];
-        while let Some(bb) = work.pop() {
-            if !seen.insert(bb) {
-                continue;
-            }
-            order.push(bb);
-            let terminator = data.layout().basicblock(bb).terminator();
-            match data.inst_data(terminator).kind() {
-                InstKind::Jump(jump) => {
-                    incoming.entry(jump.target()).or_default().push(Edge::new(
-                        bb,
-                        terminator,
-                        EdgeArm::Jump,
-                    ));
-                    work.push(jump.target());
-                }
-                InstKind::Branch(branch) => {
-                    incoming
-                        .entry(branch.t_target())
-                        .or_default()
-                        .push(Edge::new(bb, terminator, EdgeArm::True));
-                    incoming
-                        .entry(branch.f_target())
-                        .or_default()
-                        .push(Edge::new(bb, terminator, EdgeArm::False));
-                    work.push(branch.f_target());
-                    work.push(branch.t_target());
-                }
-                InstKind::Return(..) => {}
-                _ => return (Vec::new(), HashMap::default()),
+        for &bb in cfg.blocks() {
+            let edges = incoming_edges(data.curr_func_data(), cfg, bb);
+            if !edges.is_empty() {
+                incoming.insert(bb, edges.into_iter().collect());
             }
         }
-        (order, incoming)
+        incoming
     }
 
-    fn availability(
+    fn parameter_indices(
         &self,
         data: &ArenaContextMut<'_>,
-        blocks: &[BasicBlock],
-        incoming: &HashMap<BasicBlock, Vec<Edge>>,
-        numbers: &mut ValueNumbers,
-    ) -> HashMap<BasicBlock, Available> {
-        let mut output: HashMap<BasicBlock, Available> = HashMap::default();
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for &bb in blocks {
-                let mut available = incoming
-                    .get(&bb)
-                    .and_then(|edges| {
-                        let first = output.get(&edges.first()?.from)?.clone();
-                        Some(first)
-                    })
-                    .unwrap_or_default();
-                if let Some(edges) = incoming.get(&bb) {
-                    for edge in edges.iter().skip(1) {
-                        let Some(other) = output.get(&edge.from) else {
-                            available.clear();
-                            break;
-                        };
-                        available.retain(|expr, leader| other.get(expr) == Some(leader));
-                    }
-                }
-                for &inst in data.layout().basicblock(bb).insts() {
-                    let InstKind::Binary(binary) = data.inst_data(inst).kind() else {
-                        continue;
-                    };
-                    if let Some(expr) = numbers.expr(data, binary.op(), binary.lhs(), binary.rhs())
-                    {
-                        available.insert(expr, inst);
-                    }
-                }
-                if output.get(&bb) != Some(&available) {
-                    output.insert(bb, available);
-                    changed = true;
-                }
-            }
-        }
-        output
+        cfg: &CFG,
+    ) -> HashMap<BasicBlock, HashMap<Inst, usize>> {
+        cfg.blocks()
+            .iter()
+            .copied()
+            .map(|bb| {
+                let indices = data
+                    .bb_data(bb)
+                    .params()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &param)| (param, index))
+                    .collect();
+                (bb, indices)
+            })
+            .collect()
     }
 
     fn translated_operand(
         &self,
         data: &ArenaContextMut<'_>,
-        bb: BasicBlock,
+        parameter_indices: &HashMap<Inst, usize>,
         edge: Edge,
         operand: Inst,
     ) -> Option<Inst> {
-        let params = data.bb_data(bb).params();
-        let Some(index) = params.iter().position(|&param| param == operand) else {
+        let Some(&index) = parameter_indices.get(&operand) else {
             return Some(operand);
         };
         edge.args(data).get(index).copied()
     }
 
-    fn dominators(
+    fn requested_leaders(
         &self,
-        blocks: &[BasicBlock],
+        data: &ArenaContextMut<'_>,
+        cfg: &CFG,
+        dom_tree: &DominanceTree,
         incoming: &HashMap<BasicBlock, Vec<Edge>>,
-    ) -> HashMap<BasicBlock, HashSet<BasicBlock>> {
-        let all = blocks.iter().copied().collect::<HashSet<_>>();
-        let mut dominators = HashMap::default();
-        let Some(&entry) = blocks.first() else {
-            return dominators;
-        };
-        for &bb in blocks {
-            dominators.insert(
-                bb,
-                if bb == entry {
-                    HashSet::from_iter([entry])
-                } else {
-                    all.clone()
-                },
-            );
-        }
-
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for &bb in blocks.iter().skip(1) {
-                let Some(edges) = incoming.get(&bb) else {
+        parameter_indices: &HashMap<BasicBlock, HashMap<Inst, usize>>,
+        numbers: &mut ValueNumbers,
+    ) -> HashMap<(BasicBlock, Expr), Inst> {
+        let mut requested: HashMap<BasicBlock, HashSet<Expr>> = HashMap::default();
+        for &bb in cfg.blocks() {
+            let Some(edges) = incoming.get(&bb).filter(|edges| edges.len() >= 2) else {
+                continue;
+            };
+            let indices = &parameter_indices[&bb];
+            for &inst in data.layout().basicblock(bb).insts() {
+                let InstKind::Binary(binary) = data.inst_data(inst).kind() else {
                     continue;
                 };
-                let mut predecessors = edges.iter().map(|edge| edge.from);
-                let Some(first) = predecessors.next() else {
-                    continue;
-                };
-                let mut next = dominators[&first].clone();
-                for predecessor in predecessors {
-                    next.retain(|dominator| dominators[&predecessor].contains(dominator));
-                }
-                next.insert(bb);
-                if dominators.get(&bb) != Some(&next) {
-                    dominators.insert(bb, next);
-                    changed = true;
+                for &edge in edges {
+                    let Some(lhs) = self.translated_operand(data, indices, edge, binary.lhs())
+                    else {
+                        continue;
+                    };
+                    let Some(rhs) = self.translated_operand(data, indices, edge, binary.rhs())
+                    else {
+                        continue;
+                    };
+                    if let Some(expr) = numbers.expr(data, binary.op(), lhs, rhs) {
+                        requested.entry(edge.from).or_default().insert(expr);
+                    }
                 }
             }
         }
-        dominators
+
+        #[derive(Clone, Copy)]
+        enum Visit {
+            Enter(BasicBlock),
+            Exit,
+        }
+
+        let mut output = HashMap::default();
+        let mut leaders = ScopedLeaders::default();
+        let mut stack = vec![Visit::Enter(cfg.entry())];
+        while let Some(visit) = stack.pop() {
+            match visit {
+                Visit::Enter(bb) => {
+                    leaders.enter_scope();
+                    for &inst in data.layout().basicblock(bb).insts() {
+                        let InstKind::Binary(binary) = data.inst_data(inst).kind() else {
+                            continue;
+                        };
+                        if let Some(expr) =
+                            numbers.expr(data, binary.op(), binary.lhs(), binary.rhs())
+                        {
+                            leaders.insert(expr, inst);
+                        }
+                    }
+                    if let Some(expressions) = requested.get(&bb) {
+                        for expr in expressions {
+                            if let Some(leader) = leaders.get(expr) {
+                                output.insert((bb, expr.clone()), leader);
+                            }
+                        }
+                    }
+                    stack.push(Visit::Exit);
+                    for &child in dom_tree.children_of(bb).iter().rev() {
+                        stack.push(Visit::Enter(child));
+                    }
+                }
+                Visit::Exit => leaders.exit_scope(),
+            }
+        }
+        output
+    }
+
+    fn value_locations(
+        &self,
+        data: &ArenaContextMut<'_>,
+        cfg: &CFG,
+    ) -> (
+        HashMap<Inst, BasicBlock>,
+        HashMap<Inst, (BasicBlock, usize)>,
+    ) {
+        let mut parameter_blocks = HashMap::default();
+        let mut instruction_positions = HashMap::default();
+        for &bb in cfg.blocks() {
+            for &param in data.bb_data(bb).params() {
+                parameter_blocks.insert(param, bb);
+            }
+            for (index, &inst) in data.layout().basicblock(bb).insts().iter().enumerate() {
+                instruction_positions.insert(inst, (bb, index));
+            }
+        }
+        (parameter_blocks, instruction_positions)
     }
 
     fn value_available_before(
         &self,
         data: &ArenaContextMut<'_>,
-        dominators: &HashMap<BasicBlock, HashSet<BasicBlock>>,
+        dom_tree: &DominanceTree,
+        parameter_blocks: &HashMap<Inst, BasicBlock>,
+        instruction_positions: &HashMap<Inst, (BasicBlock, usize)>,
         bb: BasicBlock,
         terminator: Inst,
         value: Inst,
@@ -332,27 +361,20 @@ impl GVNPRE {
             return true;
         }
 
-        if let Some(def_bb) = data.layout().parent_bb(value) {
+        if let Some(&(def_bb, position)) = instruction_positions.get(&value) {
             if def_bb != bb {
-                return dominators.get(&bb).is_some_and(|set| set.contains(&def_bb));
+                return dom_tree.dominates(def_bb, bb);
             }
-            for &inst in data.layout().basicblock(bb).insts() {
-                if inst == terminator {
-                    return false;
-                }
-                if inst == value {
-                    return true;
-                }
-            }
-            return false;
+            return instruction_positions
+                .get(&terminator)
+                .is_some_and(|&(_, terminator_position)| position < terminator_position);
         }
 
-        data.layout().basicblocks().iter().any(|layout| {
-            data.bb_data(layout.bb()).params().contains(&value)
-                && dominators
-                    .get(&bb)
-                    .is_some_and(|set| set.contains(&layout.bb()))
-        })
+        if let Some(&def_bb) = parameter_blocks.get(&value) {
+            return dom_tree.dominates(def_bb, bb);
+        }
+
+        false
     }
 
     fn edge_is_valid(&self, data: &ArenaContextMut<'_>, bb: BasicBlock, edge: Edge) -> bool {
@@ -442,28 +464,35 @@ impl GVNPRE {
 
 impl Pass for GVNPRE {
     fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
-        let (blocks, incoming) = self.reachable_edges(data);
-        if blocks.is_empty() {
+        let Some(cfg) = CFG::new(data.curr_func_data()) else {
             return false;
-        }
+        };
+        let dom_tree = DominanceTree::from_cfg(&cfg);
+        let incoming = self.incoming_edges(data, &cfg);
+        let parameter_indices = self.parameter_indices(data, &cfg);
         let mut numbers = ValueNumbers::new();
-        let output = self.availability(data, &blocks, &incoming, &mut numbers);
-        let dominators = self.dominators(&blocks, &incoming);
+        let output = self.requested_leaders(
+            data,
+            &cfg,
+            &dom_tree,
+            &incoming,
+            &parameter_indices,
+            &mut numbers,
+        );
+        let (parameter_blocks, instruction_positions) = self.value_locations(data, &cfg);
 
-        for &bb in &blocks {
+        for &bb in cfg.blocks() {
             let Some(edges) = incoming.get(&bb).filter(|edges| edges.len() >= 2) else {
                 continue;
             };
-            if edges.iter().any(|edge| {
-                dominators
-                    .get(&edge.from)
-                    .is_some_and(|set| set.contains(&bb))
-            }) || edges
-                .iter()
-                .any(|&edge| !self.edge_is_valid(data, bb, edge))
+            if edges.iter().any(|edge| dom_tree.dominates(bb, edge.from))
+                || edges
+                    .iter()
+                    .any(|&edge| !self.edge_is_valid(data, bb, edge))
             {
                 continue;
             }
+            let indices = &parameter_indices[&bb];
             let insts = data
                 .layout()
                 .basicblock(bb)
@@ -485,11 +514,11 @@ impl Pass for GVNPRE {
                 let mut leaders = Vec::with_capacity(edges.len());
                 let mut translated = Vec::with_capacity(edges.len());
                 for &edge in edges {
-                    let Some(lhs) = self.translated_operand(data, bb, edge, lhs) else {
+                    let Some(lhs) = self.translated_operand(data, indices, edge, lhs) else {
                         leaders.clear();
                         break;
                     };
-                    let Some(rhs) = self.translated_operand(data, bb, edge, rhs) else {
+                    let Some(rhs) = self.translated_operand(data, indices, edge, rhs) else {
                         leaders.clear();
                         break;
                     };
@@ -500,14 +529,18 @@ impl Pass for GVNPRE {
                     if expr.result_ty != candidate_expr.result_ty
                         || !self.value_available_before(
                             data,
-                            &dominators,
+                            &dom_tree,
+                            &parameter_blocks,
+                            &instruction_positions,
                             edge.from,
                             edge.terminator,
                             lhs,
                         )
                         || !self.value_available_before(
                             data,
-                            &dominators,
+                            &dom_tree,
+                            &parameter_blocks,
+                            &instruction_positions,
                             edge.from,
                             edge.terminator,
                             rhs,
@@ -516,20 +549,18 @@ impl Pass for GVNPRE {
                         leaders.clear();
                         break;
                     }
-                    let leader = output
-                        .get(&edge.from)
-                        .and_then(|map| map.get(&expr))
-                        .copied()
-                        .filter(|&leader| {
-                            data.inst_data(leader).ty() == data.inst_data(recomputation).ty()
-                                && self.value_available_before(
-                                    data,
-                                    &dominators,
-                                    edge.from,
-                                    edge.terminator,
-                                    leader,
-                                )
-                        });
+                    let leader = output.get(&(edge.from, expr)).copied().filter(|&leader| {
+                        data.inst_data(leader).ty() == data.inst_data(recomputation).ty()
+                            && self.value_available_before(
+                                data,
+                                &dom_tree,
+                                &parameter_blocks,
+                                &instruction_positions,
+                                edge.from,
+                                edge.terminator,
+                                leader,
+                            )
+                    });
                     translated.push((lhs, rhs));
                     leaders.push(leader);
                 }

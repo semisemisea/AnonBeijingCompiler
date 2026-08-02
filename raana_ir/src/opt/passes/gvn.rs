@@ -267,15 +267,23 @@ impl Pass for GlobalInstNumbering {
         let mut numbers = ValueNumbering::new();
         let mut leaders = ScopedLeaders::new();
 
-        fn dfs(
-            bb_id: BId,
-            dominance_tree: &DomTree,
-            leaders: &mut ScopedLeaders,
-            numbers: &mut ValueNumbering,
-            load_leaders: &mut ScopedLoadLeaders,
-            bb_alloc: &BIDAlloc,
-            data: &mut ArenaContextMut<'_>,
-        ) -> bool {
+        enum Visit {
+            Enter(BId),
+            Exit,
+        }
+
+        let mut changed = false;
+        let mut load_leaders = ScopedLoadLeaders::new();
+        let mut visits = vec![Visit::Enter(0)];
+        while let Some(visit) = visits.pop() {
+            let bb_id = match visit {
+                Visit::Enter(bb_id) => bb_id,
+                Visit::Exit => {
+                    load_leaders.exit_scope();
+                    leaders.exit_scope();
+                    continue;
+                }
+            };
             leaders.enter_scope();
             load_leaders.enter_scope();
             let bb = bb_alloc.search_id(bb_id);
@@ -286,8 +294,6 @@ impl Pass for GlobalInstNumbering {
                 .chain(data.layout().basicblock(bb).insts().iter())
                 .copied()
                 .collect::<Vec<_>>();
-            let mut changed = false;
-
             for value in values {
                 match data.inst_data(value).kind() {
                     InstKind::Load(load) => {
@@ -330,31 +336,11 @@ impl Pass for GlobalInstNumbering {
                 }
             }
 
-            for &child in &dominance_tree[bb_id] {
-                changed |= dfs(
-                    child,
-                    dominance_tree,
-                    leaders,
-                    numbers,
-                    load_leaders,
-                    bb_alloc,
-                    data,
-                );
+            visits.push(Visit::Exit);
+            for &child in dominance_tree[bb_id].iter().rev() {
+                visits.push(Visit::Enter(child));
             }
-            load_leaders.exit_scope();
-            leaders.exit_scope();
-            changed
         }
-
-        let changed = dfs(
-            0,
-            &dominance_tree,
-            &mut leaders,
-            &mut numbers,
-            &mut ScopedLoadLeaders::new(),
-            &bb_alloc,
-            data,
-        );
         debug!("----------------------------------------------------");
         changed
     }

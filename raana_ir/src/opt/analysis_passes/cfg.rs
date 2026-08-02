@@ -8,18 +8,31 @@ use crate::{
 };
 
 pub fn rpo_path(g: &CFGGraph) -> GPath {
+    #[derive(Clone, Copy)]
+    enum Visit {
+        Enter(BId),
+        Exit(BId),
+    }
+
     let mut path = Vec::new();
     let mut visited = Set::default();
-    fn dfs(node: usize, g: &CFGGraph, ans: &mut GPath, visited: &mut Set) {
-        visited.insert(node);
-        for &succ in g[&node].iter() {
-            if !visited.contains(&succ) {
-                dfs(succ, g, ans, visited);
+    let mut stack = vec![Visit::Enter(0)];
+    while let Some(visit) = stack.pop() {
+        match visit {
+            Visit::Enter(node) => {
+                if !visited.insert(node) {
+                    continue;
+                }
+                stack.push(Visit::Exit(node));
+                for &successor in g[&node].iter().rev() {
+                    if !visited.contains(&successor) {
+                        stack.push(Visit::Enter(successor));
+                    }
+                }
             }
+            Visit::Exit(node) => path.push(node),
         }
-        ans.push(node);
     }
-    dfs(0, g, &mut path, &mut visited);
     path.reverse();
     debug!("Graph/Path: {:?} {:?}", g, path);
     path
@@ -31,63 +44,56 @@ pub fn build_cfg_both(
     data: &FunctionData,
     bb_alloc: &mut IDAllocator<BasicBlock, BId>,
 ) -> (CFGGraph, CFGGraph) {
-    fn dfs(
-        node: BasicBlock,
-        data: &FunctionData,
-        bb_alloc: &mut BIDAlloc,
-        graph: &mut CFGGraph,
-        prece: &mut CFGGraph,
-        visited: &mut HashSet<BasicBlock>,
-    ) {
-        if visited.contains(&node) {
-            return;
-        }
-        visited.insert(node);
-        let id = bb_alloc.check_or_alloc_id_same(node);
-        let val = get_terminator_inst(data, node);
-        match data.inst_data(val).kind() {
-            InstKind::Jump(jump) => {
-                let target_id = bb_alloc.check_or_alloc_id_same(jump.target());
-
-                graph.entry(id).or_default().push(target_id);
-                prece.entry(target_id).or_default().push(id);
-
-                dfs(jump.target(), data, bb_alloc, graph, prece, visited);
-            }
-            InstKind::Branch(branch) => {
-                let true_id = bb_alloc.check_or_alloc_id_same(branch.t_target());
-
-                graph.entry(id).or_default().push(true_id);
-                prece.entry(true_id).or_default().push(id);
-
-                dfs(branch.t_target(), data, bb_alloc, graph, prece, visited);
-
-                let false_id = bb_alloc.check_or_alloc_id_same(branch.f_target());
-
-                graph.entry(id).or_default().push(false_id);
-                prece.entry(false_id).or_default().push(id);
-
-                dfs(branch.f_target(), data, bb_alloc, graph, prece, visited);
-            }
-            InstKind::Return(..) | InstKind::TailCall(..) => {
-                graph.entry(id).or_default();
-            }
-            _ => unreachable!(),
-        }
+    #[derive(Clone, Copy)]
+    enum Visit {
+        Enter(BasicBlock),
+        FalseArm(BId, BasicBlock),
     }
+
     // <a,b> in set E when a can directly jump to b
     let mut graph = CFGGraph::default();
     // reverse graph
     let mut prece = CFGGraph::default();
     prece.entry(0).or_default();
     let mut visited = HashSet::default();
-    dfs(
-        data.layout().entry_bb().unwrap().bb(),
-        data,
-        bb_alloc,
-        &mut graph,
-        &mut prece,
-        &mut visited,
-    );
+    let mut stack = vec![Visit::Enter(data.layout().entry_bb().unwrap().bb())];
+    while let Some(visit) = stack.pop() {
+        match visit {
+            Visit::Enter(node) => {
+                if !visited.insert(node) {
+                    continue;
+                }
+                let id = bb_alloc.check_or_alloc_id_same(node);
+                let terminator = get_terminator_inst(data, node);
+                match data.inst_data(terminator).kind() {
+                    InstKind::Jump(jump) => {
+                        let target = jump.target();
+                        let target_id = bb_alloc.check_or_alloc_id_same(target);
+                        graph.entry(id).or_default().push(target_id);
+                        prece.entry(target_id).or_default().push(id);
+                        stack.push(Visit::Enter(target));
+                    }
+                    InstKind::Branch(branch) => {
+                        let true_target = branch.t_target();
+                        let true_id = bb_alloc.check_or_alloc_id_same(true_target);
+                        graph.entry(id).or_default().push(true_id);
+                        prece.entry(true_id).or_default().push(id);
+                        stack.push(Visit::FalseArm(id, branch.f_target()));
+                        stack.push(Visit::Enter(true_target));
+                    }
+                    InstKind::Return(..) | InstKind::TailCall(..) => {
+                        graph.entry(id).or_default();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Visit::FalseArm(source_id, target) => {
+                let target_id = bb_alloc.check_or_alloc_id_same(target);
+                graph.entry(source_id).or_default().push(target_id);
+                prece.entry(target_id).or_default().push(source_id);
+                stack.push(Visit::Enter(target));
+            }
+        }
+    }
     (graph, prece)
 }

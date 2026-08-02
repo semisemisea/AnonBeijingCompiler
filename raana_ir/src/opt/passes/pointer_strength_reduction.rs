@@ -34,6 +34,7 @@ struct Candidate {
     derived_iv: Option<DerivedInductionVariable>,
 }
 
+#[derive(Clone)]
 struct BackedgeGroup {
     source: BasicBlock,
     edges: SmallVec<[LogicalEdge; 2]>,
@@ -76,6 +77,7 @@ impl PointerStrengthReduction {
             }
         }
 
+        let mut best = None;
         for iv in ivs.for_loop(looop) {
             let Some(exit) = normalize_strict_exit(data, looop, iv) else {
                 continue;
@@ -206,21 +208,27 @@ impl PointerStrengthReduction {
                     if !cost.is_profitable() {
                         continue;
                     }
-                    return Some(Candidate {
+                    let candidate = Candidate {
                         gep: inst,
                         header_iv_position,
                         gep_iv_position,
-                        backedge_groups,
+                        backedge_groups: backedge_groups.clone(),
                         pointer_step: signed_pointer_step,
                         base: gep.base(),
                         offsets: gep.offsets().to_vec(),
                         pointer_ty: data.inst_data(inst).ty().clone(),
                         derived_iv,
-                    });
+                    };
+                    if best
+                        .as_ref()
+                        .is_none_or(|(best_cost, _)| cost.is_better_than(*best_cost))
+                    {
+                        best = Some((cost, candidate));
+                    }
                 }
             }
         }
-        None
+        best.map(|(_, candidate)| candidate)
     }
 
     fn available_at_header(
@@ -1580,6 +1588,180 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn prefers_the_larger_iteration_saving_when_pressure_allows_one_pointer() {
+        let low_array_ty = Type::get_array(Type::get_i32(), 32);
+        let high_array_ty = Type::get_array(low_array_ty.clone(), 4);
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "pointer_sr_best_candidate".into(),
+            vec![
+                Type::get_pointer(low_array_ty),
+                Type::get_pointer(high_array_ty),
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_i32(),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let low_base = data.params()[0];
+        let high_base = data.params()[1];
+        let bound = data.params()[2];
+        let low_outer = data.params()[3];
+        let high_middle = data.params()[4];
+        let high_inner = data.params()[5];
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32(); 5]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, latch, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_inst().integer(0);
+        let one = data.new_local_inst().integer(1);
+        let two = data.new_local_inst().integer(2);
+        let three = data.new_local_inst().integer(3);
+        let four = data.new_local_inst().integer(4);
+        let entry_jump = data
+            .new_local_inst()
+            .jump(header, vec![zero, one, two, three, four]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let params = data.bb_data(header).params().to_vec();
+        let iv = params[0];
+        let low_gep = data
+            .new_local_inst()
+            .get_elem_ptr(low_base, vec![low_outer, iv]);
+        let low_load = data.new_local_inst().load(low_gep);
+        let high_gep = data
+            .new_local_inst()
+            .get_elem_ptr(high_base, vec![iv, high_middle, high_inner]);
+        let high_load = data.new_local_inst().load(high_gep);
+        let next_iv = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        let compare = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+        for inst in [low_gep, low_load, high_gep, high_load, next_iv, compare] {
+            data.layout_mut().insert_inst(header, inst);
+        }
+        let branch = data
+            .new_local_inst()
+            .branch(compare, latch, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, branch);
+        let backedge = data.new_local_inst().jump(
+            header,
+            vec![next_iv, params[1], params[2], params[3], params[4]],
+        );
+        data.layout_mut().insert_inst(latch, backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(data.bb_data(header).params().len(), 6);
+        let pointer = data.bb_data(header).params()[5];
+
+        let InstKind::GetElemPtr(low) = data.inst_data(low_gep).kind() else {
+            unreachable!()
+        };
+        assert_eq!(low.base(), low_base);
+        assert_eq!(low.offsets(), [low_outer, iv]);
+
+        let InstKind::GetElemPtr(high) = data.inst_data(high_gep).kind() else {
+            unreachable!()
+        };
+        assert_eq!(high.base(), pointer);
+        assert_eq!(integer_constant(data, high.offsets()[0]), Some(0));
+        assert!(!run(&mut program, function));
+    }
+
+    #[test]
+    fn carries_at_most_three_pointers_through_one_loop() {
+        let array_ty = Type::get_array(Type::get_i32(), 32);
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "pointer_sr_three_pointer_budget".into(),
+            vec![
+                Type::get_pointer(array_ty.clone()),
+                Type::get_pointer(array_ty.clone()),
+                Type::get_pointer(array_ty.clone()),
+                Type::get_pointer(array_ty),
+                Type::get_i32(),
+                Type::get_i32(),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let bases = [
+            data.params()[0],
+            data.params()[1],
+            data.params()[2],
+            data.params()[3],
+        ];
+        let bound = data.params()[4];
+        let outer = data.params()[5];
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, latch, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let iv = data.bb_data(header).params()[0];
+        let mut geps = Vec::new();
+        for base in bases {
+            let gep = data.new_local_inst().get_elem_ptr(base, vec![outer, iv]);
+            let load = data.new_local_inst().load(gep);
+            data.layout_mut().insert_inst(header, gep);
+            data.layout_mut().insert_inst(header, load);
+            geps.push(gep);
+        }
+        let one = data.new_local_inst().integer(1);
+        let next_iv = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        let compare = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+        data.layout_mut().insert_inst(header, next_iv);
+        data.layout_mut().insert_inst(header, compare);
+        let branch = data
+            .new_local_inst()
+            .branch(compare, latch, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, branch);
+        let backedge = data.new_local_inst().jump(header, vec![next_iv]);
+        data.layout_mut().insert_inst(latch, backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(data.bb_data(header).params().len(), 4);
+        for (&gep, &base) in geps.iter().zip(&bases).take(3) {
+            let InstKind::GetElemPtr(gep) = data.inst_data(gep).kind() else {
+                unreachable!()
+            };
+            assert_ne!(gep.base(), base);
+            assert_eq!(integer_constant(data, gep.offsets()[0]), Some(0));
+        }
+        let InstKind::GetElemPtr(untransformed) = data.inst_data(geps[3]).kind() else {
+            unreachable!()
+        };
+        assert_eq!(untransformed.base(), bases[3]);
+        assert_eq!(untransformed.offsets(), [outer, iv]);
+
+        let InstKind::Jump(backedge) = data.inst_data(backedge).kind() else {
+            panic!("latch must remain a jump");
+        };
+        assert_eq!(backedge.args().len(), 4);
+        assert!(!run(&mut program, function));
     }
 
     #[test]

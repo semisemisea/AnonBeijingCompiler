@@ -159,7 +159,7 @@ M34 基线：huffman-01 静态指令数 599（awk 方法，M33 基线 648）。�
 | `decode_fixed_huffman` | 等价结构 | 死空块跳转 `then_13: b while_entry_5` | simplify_cfg 缺口（M38） |
 
 根因分层（M32 已修后端 `ccmp`，M33 已修循环计数 `subs` 融合，M34 已修
-GSP/LICM/load-CSE，余下）：
+GSP/LICM/load-CSE，M36 已修内联代价模型，余下）：
 
 ### 1.3 当前结论边界
 
@@ -299,14 +299,19 @@ GSP/LICM/load-CSE，余下）：
   `mov x,x` 含体首改名拷贝，净指令数 24 对 22 差在入口多 1 条 + 拷贝
   宽度变 w）。
 
-#### M36：内联代价模型
+#### M36：内联代价模型（已完成）
 
-- 文件：`raana_ir/src/opt/passes/inline.rs`（现"仅单调用点"）。
-- 设计：改为 cranelift `inline.rs` 风格：指令数代价估计 + 允许多调用点 +
-  递归环按深度限界（保留 `does_not_inline_across_a_recursive_call_cycle`
-  语义）；目标：`read_bits` 内 `rotlN` 的 3 处调用全部内联 → 热循环无
-  `bl`/栈帧；内联后由定点管线 IPSCCP/GVN 折叠 `rotlN(1,5)` → `lsl #5`。
-- 验收：`read_bits` 无 `bl rotlN`；corpus 编译时间与代码体积回归监控。
+- 文件：`raana_ir/src/opt/passes/inline.rs`。
+- 设计（仿 cranelift `inline.rs` 代价估计）：移除"仅单调用点"限制，改为
+  `estimate_size`（块内指令数之和）与调用点数（`be_called_at` 收集）的
+  预算：单调用点 helper 只要 `size ≤ 40` 即内联；多调用点函数仅当
+  `size × 调用点数 ≤ 100` 才内联（防多调用点叶函数膨胀程序）。递归环
+  守卫（`reaches(callee, caller)`）保持不变，保留
+  `does_not_inline_across_a_recursive_call_cycle` 语义。
+- 结果：`read_bits` 内 `rotlN` 的 2 处调用全部内联（8-cmp 链 ×2），热循环
+  无 `bl`、无栈帧（无调用即无需 callee-saved 保存/恢复），出口一次写回
+  保留；huffman-01 599 → 580（-19）；内联后 `rotlN(1,5)` 常量折叠留待
+  M37 决策树。corpus 编译时间与代码体积无异常放大。
 
 #### M37：if 链 → switch 决策树
 

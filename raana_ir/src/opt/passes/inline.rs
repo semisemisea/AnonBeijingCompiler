@@ -3,8 +3,17 @@ use crate::{
     opt::{prelude::*, utils::body_clone::BodyClonePlan},
 };
 
-/// Inline functions with one statically reachable ordinary callsite.
+/// Inline functions with a bounded total cloning cost. A callee is inlined
+/// when its estimated instruction count times its number of statically
+/// reachable callsites stays within a budget, so hot helpers (e.g.
+/// `rotlN`/`rotrN` in huffman-01) are inlined at every callsite without
+/// letting a many-callsite leaf blow the program up.
 pub struct Inline;
+
+/// Per-callsite clone budget (estimated instructions of the callee body).
+const CALL_SIZE_LIMIT: usize = 40;
+/// Total budget for one callee across all of its callsites.
+const TOTAL_SIZE_LIMIT: usize = 100;
 
 impl Pass for Inline {
     fn run(&self, program: &mut Program) -> bool {
@@ -14,6 +23,16 @@ impl Pass for Inline {
         }
         changed
     }
+}
+
+/// Estimated clone size: ordinary instructions plus a small constant for the
+/// block-argument routing the inliner has to splice around each edge.
+fn estimate_size(data: &FunctionData) -> usize {
+    data.layout()
+        .basicblocks()
+        .iter()
+        .map(|layout| layout.insts().len())
+        .sum()
 }
 
 struct Candidate {
@@ -89,17 +108,28 @@ impl Inline {
     fn find_candidate(program: &Program) -> Option<Candidate> {
         let call_graph = call_graph::CallGraph::new(program);
         for &callee in program.function_layout() {
-            if call_graph.in_degree_of(callee) != 1 || program.func_data(callee).layout().is_decl()
-            {
+            if program.func_data(callee).layout().is_decl() {
                 continue;
             }
-            let Some(callsite) = call_graph.be_called_at(callee).next() else {
+            let callee_data = program.func_data(callee);
+            let callsites: Vec<_> = call_graph.be_called_at(callee).collect();
+            if callsites.is_empty() {
+                continue;
+            }
+            // Cost model: the estimated clone size times the number of
+            // callsites must stay within budget. A single-callsite helper of
+            // any reasonable size is always inlined; a many-callsite leaf is
+            // only inlined when the total stays small.
+            let size = estimate_size(callee_data);
+            if size > CALL_SIZE_LIMIT || size.saturating_mul(callsites.len()) > TOTAL_SIZE_LIMIT {
+                continue;
+            }
+            let Some(&callsite) = callsites
+                .iter()
+                .find(|callsite| callsite.func != callee && !call_graph.reaches(callee, callsite.func))
+            else {
                 continue;
             };
-            if callsite.func == callee || call_graph.reaches(callee, callsite.func) {
-                continue;
-            }
-
             let caller_data = program.func_data(callsite.func);
             let Some(call_block) = caller_data.layout().parent_bb(callsite.inst) else {
                 continue;
@@ -111,7 +141,6 @@ impl Inline {
                 continue;
             }
 
-            let callee_data = program.func_data(callee);
             if caller_data.inst_data(callsite.inst).ty() != callee_data.ret_ty()
                 || call.args().len() != callee_data.params_ty().len()
                 || call

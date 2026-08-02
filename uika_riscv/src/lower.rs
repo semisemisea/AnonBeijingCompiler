@@ -98,8 +98,10 @@ fn try_fold_gep_amode(
     gep: HirInst,
     consumer: HirInst,
 ) -> Option<AMode> {
-    fold_gep_constant_offset(ctx, arena, gep, consumer, |off| (-2048..2048).contains(&off))
-        .map(|(base, off)| AMode::RegOffest(base, off))
+    fold_gep_constant_offset(ctx, arena, gep, consumer, |off| {
+        (-2048..2048).contains(&off)
+    })
+    .map(|(base, off)| AMode::RegOffest(base, off))
 }
 
 fn alu_op_for_hir_binary(op: BinaryOp, ty: &HirType) -> AluRRROP {
@@ -942,11 +944,7 @@ fn lower_load(
         // (`lw rd, off(base)`); otherwise materialize the address.
         let addr = try_fold_gep_amode(ctx, arena, src, inst)
             .unwrap_or_else(|| AMode::RegOffest(ctx.put_value_in_reg(src), 0));
-        ctx.emit(MInst::LoadWord {
-            rd,
-            op,
-            addr,
-        });
+        ctx.emit(MInst::LoadWord { rd, op, addr });
     } else {
         // For SysY, this branch only happen when SSA is disabled.
         // All load from integer/float is translated into SSA from.
@@ -1596,10 +1594,7 @@ mod tests {
         let function = program.new_function(
             HirType::get_i32(),
             "gep_ext_param".to_string(),
-            vec![
-                HirType::get_pointer(HirType::get_i32()),
-                HirType::get_i32(),
-            ],
+            vec![HirType::get_pointer(HirType::get_i32()), HirType::get_i32()],
         );
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();

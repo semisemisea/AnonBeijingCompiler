@@ -8,7 +8,10 @@ use taki_mir::{
     abi::{ABIMachineSpec, ArgSlot, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::{LoweredBlock, MirBlockIndex},
     div_magic::{MagicCorrection, signed_magic_i32},
-    lower::{LowerBackend, LowerContext, LoweredOutput, analyze_gep, fold_gep_constant_offset, sink_gep_into_address},
+    lower::{
+        LowerBackend, LowerContext, LoweredOutput, analyze_gep, fold_gep_constant_offset,
+        sink_gep_into_address,
+    },
     prelude::{ArenaContext, HirFunctionData, HirInst},
     reg_alloc::reg::PReg,
     register::Writable,
@@ -472,9 +475,13 @@ fn lower_load(
                 try_fold_gep_offset(ctx, arena, src, inst, memory_ty.byte_size())
                     .map(|(base, off)| memory_address(ctx, base, off, memory_ty))
             })
-            .unwrap_or_else(|| AMode::Reg { base: ctx.put_value_in_reg(src) })
+            .unwrap_or_else(|| AMode::Reg {
+                base: ctx.put_value_in_reg(src),
+            })
     } else {
-        AMode::Reg { base: ctx.put_value_in_reg(src) }
+        AMode::Reg {
+            base: ctx.put_value_in_reg(src),
+        }
     };
     ctx.emit(MInst::Load {
         ty: memory_ty,
@@ -2166,26 +2173,19 @@ fn try_fold_dynamic_gep_amode(
     memory_ty: MemoryType,
 ) -> Option<AMode> {
     let analysis = sink_gep_into_address(ctx, arena, gep, consumer, |a| {
-        a.dynamic_terms.len() == 1
-            && a.dynamic_terms[0].stride.is_power_of_two()
-            && {
-                let shift = a.dynamic_terms[0].stride.trailing_zeros() as u8;
-                // The extended-register scale must equal the access size's
-                // log2 (or be 0); anything else is not encodable.
-                shift == 0 || shift == memory_ty.byte_size().trailing_zeros() as u8
-            }
+        a.dynamic_terms.len() == 1 && a.dynamic_terms[0].stride.is_power_of_two() && {
+            let shift = a.dynamic_terms[0].stride.trailing_zeros() as u8;
+            // The extended-register scale must equal the access size's
+            // log2 (or be 0); anything else is not encodable.
+            shift == 0 || shift == memory_ty.byte_size().trailing_zeros() as u8
+        }
     })?;
     let term = &analysis.dynamic_terms[0];
     let shift = term.stride.trailing_zeros() as u8;
     let base = ctx.put_value_in_reg(analysis.base);
     let base = if analysis.constant_offset != 0 {
         let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
-        emit_add_offset(
-            ctx,
-            Writable::from_reg(tmp),
-            base,
-            analysis.constant_offset,
-        );
+        emit_add_offset(ctx, Writable::from_reg(tmp), base, analysis.constant_offset);
         tmp
     } else {
         base
@@ -2621,9 +2621,7 @@ mod tests {
         let base = data.params()[0];
         let index = data.params()[1];
         let one = data.new_local_inst().integer(1);
-        let gep = data
-            .new_local_inst()
-            .get_elem_ptr(base, vec![index, one]);
+        let gep = data.new_local_inst().get_elem_ptr(base, vec![index, one]);
         let forty_two = data.new_local_inst().integer(42);
         let store = data.new_local_inst().store(forty_two, gep);
         data.layout_mut().insert_inst(entry, store);
@@ -2756,14 +2754,30 @@ mod tests {
         let shift = |v: u8| ImmShift::new(v, s32).unwrap();
         assert!(matches!(fold_mul_constant(2, s32), Some(MulConstForm::Lsl(s)) if s == shift(1)));
         assert!(matches!(fold_mul_constant(8, s32), Some(MulConstForm::Lsl(s)) if s == shift(3)));
-        assert!(matches!(fold_mul_constant(3, s32), Some(MulConstForm::AddLsl(s)) if s == shift(1)));
-        assert!(matches!(fold_mul_constant(5, s32), Some(MulConstForm::AddLsl(s)) if s == shift(2)));
-        assert!(matches!(fold_mul_constant(9, s32), Some(MulConstForm::AddLsl(s)) if s == shift(3)));
-        assert!(matches!(fold_mul_constant(-1, s32), Some(MulConstForm::SubLsl(s)) if s == shift(1)));
-        assert!(matches!(fold_mul_constant(-3, s32), Some(MulConstForm::SubLsl(s)) if s == shift(2)));
-        assert!(matches!(fold_mul_constant(-7, s32), Some(MulConstForm::SubLsl(s)) if s == shift(3)));
-        assert!(matches!(fold_mul_constant(-2, s32), Some(MulConstForm::NegLsl(s)) if s == shift(1)));
-        assert!(matches!(fold_mul_constant(-8, s32), Some(MulConstForm::NegLsl(s)) if s == shift(3)));
+        assert!(
+            matches!(fold_mul_constant(3, s32), Some(MulConstForm::AddLsl(s)) if s == shift(1))
+        );
+        assert!(
+            matches!(fold_mul_constant(5, s32), Some(MulConstForm::AddLsl(s)) if s == shift(2))
+        );
+        assert!(
+            matches!(fold_mul_constant(9, s32), Some(MulConstForm::AddLsl(s)) if s == shift(3))
+        );
+        assert!(
+            matches!(fold_mul_constant(-1, s32), Some(MulConstForm::SubLsl(s)) if s == shift(1))
+        );
+        assert!(
+            matches!(fold_mul_constant(-3, s32), Some(MulConstForm::SubLsl(s)) if s == shift(2))
+        );
+        assert!(
+            matches!(fold_mul_constant(-7, s32), Some(MulConstForm::SubLsl(s)) if s == shift(3))
+        );
+        assert!(
+            matches!(fold_mul_constant(-2, s32), Some(MulConstForm::NegLsl(s)) if s == shift(1))
+        );
+        assert!(
+            matches!(fold_mul_constant(-8, s32), Some(MulConstForm::NegLsl(s)) if s == shift(3))
+        );
         // Not encodable in one instruction.
         assert!(fold_mul_constant(6, s32).is_none());
         assert!(fold_mul_constant(7, s32).is_none());
@@ -2776,11 +2790,8 @@ mod tests {
         use raana_ir::ir::builder_trait::*;
 
         let mut program = Program::new();
-        let function = program.new_function(
-            Type::get_i32(),
-            "mul_const".into(),
-            vec![Type::get_i32()],
-        );
+        let function =
+            program.new_function(Type::get_i32(), "mul_const".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
         let x = data.params()[0];

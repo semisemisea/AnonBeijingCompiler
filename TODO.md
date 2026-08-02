@@ -89,8 +89,18 @@
    融合（含 tst vs ands、条件排除）。已知遗留：h_functional
    35_math.sy 在 -O2 下为旧有 FP 分歧（负参数 Newton 迭代混沌发散，
    M30-M33 行为一致，-O0 通过，非本里程碑引入）。
+- GSP + LICM + load-CSE（M34）：`scalar_global_promotion` 把不可观测的
+   标量全局以 SSA 形式穿过函数（入口一次载入、出口统一回写；call-graph
+   "可能触及"分析 + 无取址 + 标量检查，宁漏勿错）；`licm` 对单前驱头
+   自然循环提升纯不变量指令（块参数仅当所有入边同值才视为不变量，提升
+   时替换为入边值）；`gvn` 增加作用域化 load-CSE（任何 store/call 使
+   leader 失效）。huffman-01 648 → 599：`read_bits` 循环内零
+   `adrp/ldr`/store（入口一次载入、出口一次回写，149 条 < clang 161）；
+   `output_data` 全局只加载一次；abi_matrix R4 用例因写回布局改变改断言
+   ccmp 链 + 写回；workspace 298、functional/h_functional ×
+   -O0/1/2、RISC-V 全通过。
 
-备注：M27/M30/M31/M32/M33 已完成并独立提交；M28（RISC-V slot 化）待做。
+备注：M27/M30/M31/M32/M33/M34 已完成并独立提交；M28（RISC-V slot 化）待做。
 
 目标硬件是 Xilinx XCZU15EG 上的 Cortex-A53 MPCore。
 
@@ -136,19 +146,20 @@ DCE。相关 pass 见 `raana_ir/src/opt/passes/`。
 
 ### 1.2 现状与差距总览（huffman-01 对照 clang -O2）
 
-M33 基线：huffman-01 静态指令数 648（awk 方法，M32 基线 640）。对照
-`results/perf/huffman-01_clang.s`（clang -O2），差距集中在循环不变量
-外提与 RA 拷贝消除：
+M34 基线：huffman-01 静态指令数 599（awk 方法，M33 基线 648）。对照
+`results/perf/huffman-01_clang.s`（clang -O2），差距集中在 RA 拷贝、
+内联与决策树：
 
 | 函数 | clang | 本项目 | 差距根因 |
 |---|---|---|---|
 | `_and/_xor/_or` 循环体（32 次迭代） | ~10 条/迭代：`ccmp`+`csel` 无分支，回边 `adds;b.lo` | 8 条/迭代：`cmp`+`ccmp`+`csel` + 回边 `subs;b.eq`（M33 后与 clang 同构） | 回边 blockparam 拷贝（M35） |
 | `rotrN/rotlN` | 二分比较树（最坏 ~3 次 cmp） | 8 次线性 cmp 链（内联后重复复制） | 无 if 链→switch/决策树（M37） |
-| `read_bits`（热点，2000×10⁵/5 调用） | 全局一次载入寄存器、出口统一写回；switch 表提取；无函数调用 | 循环内重复 `adrp+ldr` 全局；循环体 store 回写；热循环保留 `bl rotlN`（栈帧+8-cmp 链） | 缺 GSP/LICM（M34）；内联仅"单调用点"（M36） |
-| `output_data` | `gv_out_num` 一次加载；尾调用 `b putch` | 重复加载 3 次；`bl putch`+栈帧 | 缺 load-CSE/GSP（M34）；TCO 未覆盖 if 链末尾调用（M38） |
+| `read_bits`（热点，2000×10⁵/5 调用） | 全局一次载入寄存器、出口统一写回；switch 表提取；无函数调用 | 149 条（< clang 161）：入口一次载入、出口一次回写；热循环保留 `bl rotlN`（栈帧+8-cmp 链） | 内联仅"单调用点"（M36） |
+| `output_data` | `gv_out_num` 一次加载；尾调用 `b putch` | `gv_out_num` 一次加载一次写回（M34）；`bl putch`+栈帧 | TCO 未覆盖 if 链末尾调用（M38） |
 | `decode_fixed_huffman` | 等价结构 | 死空块跳转 `then_13: b while_entry_5` | simplify_cfg 缺口（M38） |
 
-根因分层（M32 已修后端 `ccmp`，M33 已修循环计数 `subs` 融合，余下）：
+根因分层（M32 已修后端 `ccmp`，M33 已修循环计数 `subs` 融合，M34 已修
+GSP/LICM/load-CSE，余下）：
 
 ### 1.3 当前结论边界
 
@@ -245,23 +256,28 @@ M33 基线：huffman-01 静态指令数 648（awk 方法，M32 基线 640）。�
   单测覆盖旋转与融合；RISC-V × functional/h_functional 无回归；
   35_math.sy -O2 FP 分歧为 M30 起旧有（-O0 通过）。已独立提交。
 
-#### M34：GSP + LICM + load-CSE（IR 层）
+#### M34：GSP + LICM + load-CSE（已完成）
 
-- 文件：`raana_ir/src/opt/passes/` 新增 `scalar_global_promotion.rs`、
-  `licm.rs`；改 `gvn.rs`。
-- 设计：
-  1. **GSP**：无 `getelemptr`/取址、函数内无"可能触及该全局"的非白名单调用
-     的标量全局 → load 变 SSA 参数、store 变 def、函数出口统一回写
-     （clang 对 `bits/pos/size` 正是此形态：寄存器保持、出口一次写回）；
-  2. **LICM**：新增 IR 级 domtree + 自然循环分析（仿 cranelift
-     `loop_analysis.rs`），把纯不变量指令提升到循环前驱头（仿
-     `elaborate.rs:555-635` 的 loop_stack 层级选择）；GSP 后全局读取已是
-     SSA，天然可提升；
-  3. **load-CSE**：GVN 扩展 load 值编号 + 简单别名分析（仿
-     `alias_analysis.rs` `LastStores`）：无 intervening may-alias store 时
-     同址 load 合并。
-- 验收：`read_bits` 循环内无 `adrp/ldr` 重载、循环体内无 store（入口一次
-  载入、出口一次回写）；`output_data` 全局只加载一次。
+- **GSP**（`scalar_global_promotion.rs`）：程序级"可能触及"分析（call
+  graph 传递闭包）；仅标量、无取址、被调用方不触及的全局，把值以 SSA
+  形式穿过函数（入口一次载入、store 变 def、每个 return 前统一回写），
+  用与 SSA pass 相同的 dom-frontier + 参数插入 + domtree 前序值栈穿线。
+  陷阱：值栈的 store 压栈须在子树结束时弹出；`LocalBuilder` 无法寻址
+  全局，需用 program-aware arena 建 load/store。`read_bits` 循环体不再
+  有 `adrp/ldr` 与 store（入口 4 个全局一次载入、出口一次回写，与 clang
+  同构）；`output_data` 的 `gv_out_num` 只加载一次。
+- **LICM**（`licm.rs`）：自然循环（`prece[h]` 前驱中 `h` 支配 `m` 的
+  回边）+ 回边反向工作列表求循环体；单一非循环前驱头；纯
+  Binary/Cast 且操作数不变量的指令提升；块参数仅当所有入边传同一不变
+  量指令时视为不变量，**提升时把参数替换为入边值**（否则提升出的指令
+  引用只在循环边上定义的值，破坏 SSA 支配性）。
+- **load-CSE**（`gvn.rs`）：作用域化 load leader（按地址指令）+ 全局
+  store 计数器（任何 store/call 使 leader 失效）；同址、无介入 store 的
+  load 合并。
+- 结果：huffman-01 648 → 599（-49）；`read_bits` 149 条 vs clang 161；
+  abi_matrix 的 R4 用例因 GSP 写回改变布局改为断言 ccmp 链 + 写回；
+  workspace 298、functional/h_functional × -O0/1/2、RISC-V 全通过
+  （35_math.sy -O2 FP 分歧仍为旧有）。已独立提交。
 
 #### M35：RA 回边拷贝消除 + Mov 宽度
 

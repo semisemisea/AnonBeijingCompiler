@@ -203,6 +203,53 @@ impl ScopedLeaders {
     }
 }
 
+/// Scoped leaders for loads keyed by their address instruction, invalidated
+/// by any store or call (conservative may-alias: any store may hit any
+/// address). A global store counter records whether a memory writer
+/// intervened between the leader and the candidate load.
+struct ScopedLoadLeaders {
+    leaders: FxHashMap<Inst, (Inst, u64)>,
+    scopes: Vec<Vec<Inst>>,
+    store_counter: u64,
+}
+
+impl ScopedLoadLeaders {
+    fn new() -> Self {
+        Self {
+            leaders: FxHashMap::default(),
+            scopes: Vec::new(),
+            store_counter: 0,
+        }
+    }
+
+    fn enter_scope(&mut self) {
+        self.scopes.push(Vec::new());
+    }
+
+    fn record_store(&mut self) {
+        self.store_counter += 1;
+    }
+
+    /// The leader for `addr` that no store/call has invalidated.
+    fn get(&self, addr: Inst) -> Option<Inst> {
+        self.leaders
+            .get(&addr)
+            .filter(|(_, counter)| *counter == self.store_counter)
+            .map(|(leader, _)| *leader)
+    }
+
+    fn insert(&mut self, addr: Inst, leader: Inst) {
+        self.leaders.insert(addr, (leader, self.store_counter));
+        self.scopes.last_mut().unwrap().push(addr);
+    }
+
+    fn exit_scope(&mut self) {
+        for addr in self.scopes.pop().unwrap() {
+            self.leaders.remove(&addr);
+        }
+    }
+}
+
 impl Pass for GlobalInstNumbering {
     fn run_on(&self, data: &mut ArenaContextMut<'_>) -> bool {
         if data.layout().entry_bb().is_none() {
@@ -225,10 +272,12 @@ impl Pass for GlobalInstNumbering {
             dominance_tree: &DomTree,
             leaders: &mut ScopedLeaders,
             numbers: &mut ValueNumbering,
+            load_leaders: &mut ScopedLoadLeaders,
             bb_alloc: &BIDAlloc,
             data: &mut ArenaContextMut<'_>,
         ) -> bool {
             leaders.enter_scope();
+            load_leaders.enter_scope();
             let bb = bb_alloc.search_id(bb_id);
             let values = data
                 .bb_data(bb)
@@ -240,6 +289,27 @@ impl Pass for GlobalInstNumbering {
             let mut changed = false;
 
             for value in values {
+                match data.inst_data(value).kind() {
+                    InstKind::Load(load) => {
+                        let addr = load.src();
+                        // Any store or call invalidates load leaders.
+                        if let Some(leader) = load_leaders.get(addr) {
+                            if value != leader && !data.inst_data(value).used_by().is_empty() {
+                                utils::visit_and_replace(data, value, leader);
+                                changed = true;
+                            }
+                        } else {
+                            load_leaders.insert(addr, value);
+                        }
+                        let numbered = numbers.number(data, value);
+                        let _ = numbered;
+                        continue;
+                    }
+                    InstKind::Store(..) | InstKind::Call(..) | InstKind::MemZero(..) => {
+                        load_leaders.record_store();
+                    }
+                    _ => {}
+                }
                 let numbered = numbers.number(data, value);
                 if !numbered.eliminable {
                     continue;
@@ -261,8 +331,17 @@ impl Pass for GlobalInstNumbering {
             }
 
             for &child in &dominance_tree[bb_id] {
-                changed |= dfs(child, dominance_tree, leaders, numbers, bb_alloc, data);
+                changed |= dfs(
+                    child,
+                    dominance_tree,
+                    leaders,
+                    numbers,
+                    load_leaders,
+                    bb_alloc,
+                    data,
+                );
             }
+            load_leaders.exit_scope();
             leaders.exit_scope();
             changed
         }
@@ -272,6 +351,7 @@ impl Pass for GlobalInstNumbering {
             &dominance_tree,
             &mut leaders,
             &mut numbers,
+            &mut ScopedLoadLeaders::new(),
             &bb_alloc,
             data,
         );
@@ -517,10 +597,39 @@ mod tests {
             data.layout_mut().insert_inst(entry, value);
         }
 
+        assert!(GlobalInstNumbering.run(&mut program));
+        let data = program.func_data(function);
+        // Calls are never CSE'd; loads of the same address are, unless a
+        // store intervenes.
+        assert_eq!(binary_operands(data, loads), (load_a, load_a));
+        assert_eq!(binary_operands(data, calls), (call_a, call_b));
+    }
+
+    #[test]
+    fn store_invalidates_load_leader() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_i32(), "store".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
+        data.layout_mut().push_bb_back(entry);
+        let alloc = data.new_local_inst().alloc(Type::get_i32());
+        let load_a = data.new_local_inst().load(alloc);
+        let zero = data.new_local_inst().integer(0);
+        let store = data.new_local_inst().store(zero, alloc);
+        let load_b = data.new_local_inst().load(alloc);
+        let sum = data.new_local_inst().binary(BinaryOp::Add, load_a, load_b);
+        let ret = data.new_local_inst().ret(Some(sum));
+        for value in [alloc, load_a, zero, store, load_b, sum, ret] {
+            data.layout_mut().insert_inst(entry, value);
+        }
+
         assert!(!GlobalInstNumbering.run(&mut program));
         let data = program.func_data(function);
-        assert_eq!(binary_operands(data, loads), (load_a, load_b));
-        assert_eq!(binary_operands(data, calls), (call_a, call_b));
+        assert_eq!(
+            binary_operands(data, sum),
+            (load_a, load_b),
+            "the store between the loads must prevent CSE"
+        );
     }
 
     #[test]

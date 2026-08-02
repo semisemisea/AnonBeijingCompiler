@@ -7,6 +7,8 @@ pub mod if_conversion;
 pub mod inline;
 pub mod ipsccp;
 pub mod rotate_loops;
+pub mod licm;
+pub mod scalar_global_promotion;
 pub mod simplify_cfg;
 pub mod specialize;
 pub mod sr;

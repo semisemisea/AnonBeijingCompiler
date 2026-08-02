@@ -45,6 +45,7 @@ pub fn estimate_aarch64_pointer_strength_reduction(
     cfg: &CFG,
     looop: &Loop,
     gep: &crate::ir::GetElemPtr,
+    pointer_byte_delta: i64,
 ) -> Option<PointerStrengthReductionCost> {
     if loop_has_call(data, looop)
         || pointer_recurrence_count(data, looop) >= MAX_EXISTING_POINTER_RECURRENCES
@@ -53,8 +54,8 @@ pub fn estimate_aarch64_pointer_strength_reduction(
         return None;
     }
 
-    let (old_iteration_insts, pointer_stride) = aarch64_gep_cost(data, gep)?;
-    let pointer_update_insts = aarch64_add_offset_cost(i64::try_from(pointer_stride).ok()?);
+    let old_iteration_insts = aarch64_gep_cost(data, gep)?;
+    let pointer_update_insts = aarch64_add_offset_cost(pointer_byte_delta);
 
     let (entry_count, preheader_penalty) = match looop.get_preheader(cfg) {
         Some(preheader) => {
@@ -109,14 +110,10 @@ fn header_gpr_parameter_count(data: &ArenaContextMut<'_>, looop: &Loop) -> usize
         .count()
 }
 
-fn aarch64_gep_cost(
-    data: &ArenaContextMut<'_>,
-    gep: &crate::ir::GetElemPtr,
-) -> Option<(usize, u64)> {
+fn aarch64_gep_cost(data: &ArenaContextMut<'_>, gep: &crate::ir::GetElemPtr) -> Option<usize> {
     let mut current_ty = data.inst_data(gep.base()).ty().clone();
     let mut dynamic_cost = 0_usize;
     let mut constant_offset = 0_i64;
-    let mut final_stride = None;
 
     for &index in gep.offsets() {
         current_ty = match current_ty.kind() {
@@ -124,7 +121,6 @@ fn aarch64_gep_cost(
             _ => return None,
         };
         let stride = u64::try_from(current_ty.size()).ok()?;
-        final_stride = Some(stride);
 
         match data.inst_data(index).kind() {
             InstKind::Integer(integer) => {
@@ -139,7 +135,7 @@ fn aarch64_gep_cost(
     if constant_offset != 0 {
         dynamic_cost = dynamic_cost.checked_add(aarch64_add_offset_cost(constant_offset))?;
     }
-    Some((dynamic_cost, final_stride?))
+    Some(dynamic_cost)
 }
 
 fn aarch64_dynamic_term_cost(stride: u64) -> usize {
@@ -192,6 +188,7 @@ mod tests {
         assert_eq!(aarch64_dynamic_term_cost(128), 3);
         assert_eq!(aarch64_dynamic_term_cost(12), 4);
         assert_eq!(aarch64_add_offset_cost(4095), 1);
+        assert_eq!(aarch64_add_offset_cost(-4095), 1);
         assert_eq!(aarch64_add_offset_cost(4096), 1);
         assert_eq!(aarch64_add_offset_cost(4097), 4);
     }

@@ -350,19 +350,48 @@ impl Pass for UnreachableBasicBlock {
             let mut island = Vec::new();
             for layout in data.layout().basicblocks() {
                 if id_allocator.get_id_safe(&layout.bb()).is_none() {
-                    island.push(layout.bb());
+                    // Only remove blocks whose instructions are all unused:
+                    // an unreachable block may still feed values into
+                    // reachable blocks (e.g. LICM-hoisted GEPs used by a
+                    // surviving loop body), and removing it would leave
+                    // dangling operands.
+                    let all_unused = layout
+                        .insts()
+                        .iter()
+                        .all(|&inst| data.inst_data(inst).used_by().is_empty());
+                    if all_unused {
+                        island.push(layout.bb());
+                    }
                 }
             }
 
+            let mut removed_any = false;
             for bb in island {
                 data.remove_layout_basicblock(bb);
+                removed_any = true;
             }
 
             for id in unreachable_bb {
                 let bb = id_allocator.search_id(id);
-                data.remove_layout_basicblock(bb);
+                let all_unused = data
+                    .layout()
+                    .basicblock(bb)
+                    .insts()
+                    .iter()
+                    .all(|&inst| data.inst_data(inst).used_by().is_empty());
+                if all_unused {
+                    data.remove_layout_basicblock(bb);
+                    removed_any = true;
+                }
             }
-            changed = true;
+            if removed_any {
+                changed = true;
+            } else {
+                // Unreachable blocks remain but none are removable (their
+                // values are still live). Further iterations cannot make
+                // progress, so stop.
+                return changed;
+            }
         }
     }
 }

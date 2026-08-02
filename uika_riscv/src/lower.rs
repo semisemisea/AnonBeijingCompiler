@@ -19,7 +19,7 @@ use taki_mir::{
     block_order::LoweredBlock,
     div_magic::{MagicCorrection, signed_magic_i32},
     libcall::LibCall,
-    lower::{LowerBackend, LowerContext, LoweredOutput, analyze_gep},
+    lower::{LowerBackend, LowerContext, LoweredOutput, analyze_gep, fold_gep_constant_offset},
     prelude::{ArenaContext, HirFunctionData, HirInst},
     reg_alloc::reg::PReg,
     register::{Reg, Writable},
@@ -86,6 +86,20 @@ fn normalize_amode(amode: AMode, ctx: &mut LowerContext<'_, MInst>) -> AMode {
         rs2: tmp_off,
     });
     AMode::RegOffest(tmp_addr, 0)
+}
+
+/// Fold a single-use constant GEP into a RISC-V addressing mode
+/// (`off(base)`), falling back to `None` when the GEP has dynamic indices,
+/// the offset does not fit the 12-bit signed immediate, or the GEP has other
+/// users. Callers then materialize the address as before.
+fn try_fold_gep_amode(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    gep: HirInst,
+    consumer: HirInst,
+) -> Option<AMode> {
+    fold_gep_constant_offset(ctx, arena, gep, consumer, |off| (-2048..2048).contains(&off))
+        .map(|(base, off)| AMode::RegOffest(base, off))
 }
 
 fn alu_op_for_hir_binary(op: BinaryOp, ty: &HirType) -> AluRRROP {
@@ -707,6 +721,7 @@ fn lower_get_elem_ptr(
 fn lower_store(
     ctx: &mut LowerContext<'_, MInst>,
     arena: ArenaContext<'_>,
+    inst: HirInst,
     store: &Store,
 ) -> LoweredOutput {
     let src = store.src();
@@ -759,12 +774,11 @@ fn lower_store(
         } else {
             match arena.inst_data(dst).kind() {
                 InstKind::GetElemPtr(..) => {
-                    let addr = ctx.put_value_in_reg(dst);
-                    ctx.emit(MInst::StoreWord {
-                        rs,
-                        op,
-                        addr: AMode::RegOffest(addr, 0),
-                    });
+                    // Fold a single-use constant GEP into the store addressing
+                    // mode (`sw rs, off(base)`); otherwise materialize.
+                    let addr = try_fold_gep_amode(ctx, arena, dst, inst)
+                        .unwrap_or_else(|| AMode::RegOffest(ctx.put_value_in_reg(dst), 0));
+                    ctx.emit(MInst::StoreWord { rs, op, addr });
                 }
                 InstKind::Alloc => {
                     let pointee_ty = arena.inst_data(dst).ty().derefernce();
@@ -884,12 +898,14 @@ fn lower_load(
             addr: AMode::Label(Label::GlobalValue(src)),
         })
     } else if matches!(arena.inst_data(src).kind(), InstKind::GetElemPtr(..)) {
-        // relative pointer.
-        let rs = ctx.put_value_in_reg(src);
+        // Fold a single-use constant GEP into the load addressing mode
+        // (`lw rd, off(base)`); otherwise materialize the address.
+        let addr = try_fold_gep_amode(ctx, arena, src, inst)
+            .unwrap_or_else(|| AMode::RegOffest(ctx.put_value_in_reg(src), 0));
         ctx.emit(MInst::LoadWord {
             rd,
             op,
-            addr: AMode::RegOffest(rs, 0),
+            addr,
         });
     } else {
         // For SysY, this branch only happen when SSA is disabled.
@@ -1045,7 +1061,7 @@ impl LowerBackend for Riscv64Backend {
             InstKind::GetElemPtr(get_elem_ptr) => {
                 lower_get_elem_ptr(ctx, arena, inst, get_elem_ptr)
             }
-            InstKind::Store(store) => lower_store(ctx, arena, store),
+            InstKind::Store(store) => lower_store(ctx, arena, inst, store),
             InstKind::MemZero(mem_zero) => lower_mem_zero(ctx, arena, mem_zero),
             InstKind::Load(load) => lower_load(ctx, arena, inst, load),
             InstKind::Call(call) => lower_call(ctx, arena, inst, call),
@@ -1416,5 +1432,62 @@ mod tests {
         let asm = taki_mir::compile::<Riscv64Backend>(&program);
         assert!(!asm.contains("call memset"), "{asm}");
         assert_eq!(asm.matches("sw zero").count(), 4, "{asm}");
+    }
+
+    #[test]
+    fn single_use_constant_gep_folds_into_store_addressing() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            HirType::get_i32(),
+            "gep_fold".to_string(),
+            vec![HirType::get_pointer(HirType::get_i32())],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+
+        let base = data.params()[0];
+        let one = data.new_local_inst().integer(1);
+        let gep = data.new_local_inst().get_elem_ptr(base, vec![one]);
+        let forty_two = data.new_local_inst().integer(42);
+        let store = data.new_local_inst().store(forty_two, gep);
+        let zero = data.new_local_inst().integer(0);
+        for inst in [gep, store] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let ret = data.new_local_inst().ret(Some(zero));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<Riscv64Backend>(&program);
+        // The GEP address addi is sunk; the store uses the folded offset
+        // directly (`sw rs, 4(base)`).
+        assert!(asm.contains(", 4("), "{asm}");
+    }
+
+    #[test]
+    fn multi_use_gep_is_not_folded() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            HirType::get_i32(),
+            "gep_multi".to_string(),
+            vec![HirType::get_pointer(HirType::get_i32())],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+
+        let base = data.params()[0];
+        let one = data.new_local_inst().integer(1);
+        let gep = data.new_local_inst().get_elem_ptr(base, vec![one]);
+        let forty_two = data.new_local_inst().integer(42);
+        let store = data.new_local_inst().store(forty_two, gep);
+        let load = data.new_local_inst().load(gep);
+        for inst in [gep, store, load] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let ret = data.new_local_inst().ret(Some(load));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let asm = taki_mir::compile::<Riscv64Backend>(&program);
+        // Two users: the GEP must be materialized, so no direct-offset store.
+        assert!(!asm.contains(", 4("), "{asm}");
     }
 }

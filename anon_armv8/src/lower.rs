@@ -8,7 +8,7 @@ use taki_mir::{
     abi::{ABIMachineSpec, ArgSlot, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::{LoweredBlock, MirBlockIndex},
     div_magic::{MagicCorrection, signed_magic_i32},
-    lower::{LowerBackend, LowerContext, LoweredOutput, analyze_gep},
+    lower::{LowerBackend, LowerContext, LoweredOutput, analyze_gep, fold_gep_constant_offset, sink_gep_into_address},
     prelude::{ArenaContext, HirFunctionData, HirInst},
     reg_alloc::reg::PReg,
     register::Writable,
@@ -452,11 +452,27 @@ fn lower_load(
 ) -> LoweredOutput {
     let result = ctx.result_reg(inst);
     let dst = Writable::from_reg(result);
-    let src = ctx.put_value_in_reg(load.src());
+    let memory_ty = memory_type(arena.inst_data(inst).ty().kind());
+    let src = load.src();
+    // Fold a single-use constant GEP into the load addressing mode; otherwise
+    // materialize the address.
+    let addr = if matches!(arena.inst_data(src).kind(), InstKind::GetElemPtr(..)) {
+        // v2: single dynamic index folds into extended-register addressing;
+        // v1: constant offset folds into immediate addressing; else
+        // materialize the address.
+        try_fold_dynamic_gep_amode(ctx, arena, src, inst, memory_ty)
+            .or_else(|| {
+                try_fold_gep_offset(ctx, arena, src, inst, memory_ty.byte_size())
+                    .map(|(base, off)| memory_address(ctx, base, off, memory_ty))
+            })
+            .unwrap_or_else(|| AMode::Reg { base: ctx.put_value_in_reg(src) })
+    } else {
+        AMode::Reg { base: ctx.put_value_in_reg(src) }
+    };
     ctx.emit(MInst::Load {
-        ty: memory_type(arena.inst_data(inst).ty().kind()),
+        ty: memory_ty,
         dst,
-        addr: AMode::Reg { base: src },
+        addr,
     });
     LoweredOutput::Value(result)
 }
@@ -1016,7 +1032,7 @@ impl LowerBackend for AArch64Backend {
             InstKind::Alloc => lower_alloc(ctx, arena, inst),
             InstKind::GetElemPtr(gep) => lower_get_elem_ptr(ctx, arena, inst, gep),
             InstKind::Load(load) => lower_load(ctx, arena, inst, load),
-            InstKind::Store(store) => lower_store(ctx, arena, store),
+            InstKind::Store(store) => lower_store(ctx, arena, inst, store),
             InstKind::MemZero(mem_zero) => lower_mem_zero(ctx, arena, mem_zero),
             InstKind::ZeroInit => unreachable!("zero initialization is lowered by its store"),
             InstKind::Call(call) => lower_call(ctx, arena, inst, call),
@@ -1863,14 +1879,15 @@ fn memory_type(ty: &TypeKind) -> MemoryType {
 fn lower_store(
     ctx: &mut LowerContext<'_, MInst>,
     arena: ArenaContext<'_>,
+    inst: HirInst,
     store: &Store,
 ) -> LoweredOutput {
     let src = store.src();
     let dest = store.dest();
-    let base = ctx.put_value_in_reg(dest);
     match arena.inst_data(src).kind() {
         InstKind::Aggregate(aggregate) => {
-            let mut offset = 0i64;
+            let (base, base_offset) = store_base(ctx, arena, dest, inst);
+            let mut offset = base_offset;
             for value in aggregate.flatten(&arena) {
                 let ty = arena.inst_data(value).ty();
                 if matches!(arena.inst_data(value).kind(), InstKind::ZeroInit) {
@@ -1883,14 +1900,47 @@ fn lower_store(
             }
         }
         InstKind::ZeroInit => {
-            emit_zero_init(ctx, base, arena.inst_data(src).ty(), 0);
+            let (base, base_offset) = store_base(ctx, arena, dest, inst);
+            emit_zero_init(ctx, base, arena.inst_data(src).ty(), base_offset);
         }
         _ => {
             let value = ctx.put_value_in_reg(src);
-            emit_store_at(ctx, value, arena.inst_data(src).ty(), base, 0);
+            let ty = arena.inst_data(src).ty();
+            // v2: a single dynamic index folds into extended-register
+            // addressing for single-element stores.
+            if matches!(arena.inst_data(dest).kind(), InstKind::GetElemPtr(..)) {
+                let memory_ty = memory_type(ty.kind());
+                if let Some(addr) = try_fold_dynamic_gep_amode(ctx, arena, dest, inst, memory_ty) {
+                    ctx.emit(MInst::Store {
+                        ty: memory_ty,
+                        src: value,
+                        addr,
+                    });
+                    return LoweredOutput::None;
+                }
+            }
+            let (base, base_offset) = store_base(ctx, arena, dest, inst);
+            emit_store_at(ctx, value, ty, base, base_offset);
         }
     }
     LoweredOutput::None
+}
+
+/// Fold a GEP destination into a `(base, offset)` pair via constant-offset
+/// folding, or materialize the destination address. Used where the store needs
+/// a base register plus a running element offset (aggregate/zero expansion);
+/// dynamic-index folding is handled separately in `lower_store`.
+fn store_base(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    dest: HirInst,
+    inst: HirInst,
+) -> (taki_mir::register::Reg, i64) {
+    match arena.inst_data(dest).kind() {
+        InstKind::GetElemPtr(..) => try_fold_gep_offset(ctx, arena, dest, inst, 4)
+            .unwrap_or_else(|| (ctx.put_value_in_reg(dest), 0)),
+        _ => (ctx.put_value_in_reg(dest), 0),
+    }
 }
 
 fn emit_zero_init(
@@ -1969,6 +2019,73 @@ fn memory_address(
     let address = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
     emit_add_offset(ctx, Writable::from_reg(address), base, offset);
     AMode::Reg { base: address }
+}
+
+/// Fold a single-use constant GEP into a `(base, offset)` pair whose offset is
+/// encodable in AArch64 load/store addressing for `width`-byte accesses.
+/// Returns `None` for dynamic-index GEPs, unencodable offsets, or multi-user
+/// GEPs; callers then materialize the address as before.
+fn try_fold_gep_offset(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    gep: HirInst,
+    consumer: HirInst,
+    width: u8,
+) -> Option<(taki_mir::register::Reg, i64)> {
+    fold_gep_constant_offset(ctx, arena, gep, consumer, |off| {
+        crate::instructions::UImm12Scaled::new(off as u64, width).is_some()
+            || i16::try_from(off)
+                .ok()
+                .and_then(crate::instructions::SImm9::new)
+                .is_some()
+    })
+}
+
+/// Fold a single-use GEP with exactly one dynamic index whose stride matches
+/// the access width (or is 1) into AArch64 extended-register addressing
+/// (`[base, index, sxtw #scale]`). A nonzero constant offset is folded into a
+/// fresh base temporary so the original base register is not clobbered.
+/// Returns `None` for other GEP shapes; callers then try constant-offset
+/// folding or materialize the address.
+fn try_fold_dynamic_gep_amode(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    gep: HirInst,
+    consumer: HirInst,
+    memory_ty: MemoryType,
+) -> Option<AMode> {
+    let analysis = sink_gep_into_address(ctx, arena, gep, consumer, |a| {
+        a.dynamic_terms.len() == 1
+            && a.dynamic_terms[0].stride.is_power_of_two()
+            && {
+                let shift = a.dynamic_terms[0].stride.trailing_zeros() as u8;
+                // The extended-register scale must equal the access size's
+                // log2 (or be 0); anything else is not encodable.
+                shift == 0 || shift == memory_ty.byte_size().trailing_zeros() as u8
+            }
+    })?;
+    let term = &analysis.dynamic_terms[0];
+    let shift = term.stride.trailing_zeros() as u8;
+    let base = ctx.put_value_in_reg(analysis.base);
+    let base = if analysis.constant_offset != 0 {
+        let tmp = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+        emit_add_offset(
+            ctx,
+            Writable::from_reg(tmp),
+            base,
+            analysis.constant_offset,
+        );
+        tmp
+    } else {
+        base
+    };
+    let index = ctx.put_value_in_reg(term.index);
+    Some(AMode::ExtendedRegOffset {
+        base,
+        index,
+        extend: ExtendOp::Sxtw,
+        shift,
+    })
 }
 
 fn emit_add_offset(
@@ -2342,5 +2459,97 @@ mod tests {
             Cond::Gt => !z && n == v,
             Cond::Le => z || n != v,
         }
+    }
+
+    #[test]
+    fn single_use_dynamic_gep_folds_into_extended_addressing() {
+        use raana_ir::ir::arena::Arena;
+        use raana_ir::ir::builder_trait::*;
+
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "gep_dyn".into(),
+            vec![Type::get_pointer(Type::get_i32()), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let index = data.params()[1];
+        let gep = data.new_local_inst().get_elem_ptr(base, vec![index]);
+        let load = data.new_local_inst().load(gep);
+        data.layout_mut().insert_inst(entry, load);
+        let ret = data.new_local_inst().ret(Some(load));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+        // The dynamic index folds into the load addressing mode:
+        // `ldr w?, [x?, x?, sxtw #2]` (stride 4 → scale 2).
+        assert!(assembly.contains("sxtw #2]"), "{assembly}");
+    }
+
+    #[test]
+    fn dynamic_gep_with_constant_offset_folds_into_extended_addressing() {
+        use raana_ir::ir::arena::Arena;
+        use raana_ir::ir::builder_trait::*;
+
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "gep_dyn_const".into(),
+            vec![
+                Type::get_pointer(Type::get_array(Type::get_i32(), 1)),
+                Type::get_i32(),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let index = data.params()[1];
+        let one = data.new_local_inst().integer(1);
+        let gep = data
+            .new_local_inst()
+            .get_elem_ptr(base, vec![index, one]);
+        let forty_two = data.new_local_inst().integer(42);
+        let store = data.new_local_inst().store(forty_two, gep);
+        data.layout_mut().insert_inst(entry, store);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+        // Dynamic term: stride 4 → scale 2 (matches the 4-byte store);
+        // constant +4 folds into a fresh base temporary.
+        assert!(assembly.contains("sxtw #2]"), "{assembly}");
+    }
+
+    #[test]
+    fn multi_use_dynamic_gep_is_not_folded() {
+        use raana_ir::ir::arena::Arena;
+        use raana_ir::ir::builder_trait::*;
+
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "gep_dyn_multi".into(),
+            vec![Type::get_pointer(Type::get_i32()), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let index = data.params()[1];
+        let gep = data.new_local_inst().get_elem_ptr(base, vec![index]);
+        let load = data.new_local_inst().load(gep);
+        let forty_two = data.new_local_inst().integer(42);
+        let store = data.new_local_inst().store(forty_two, gep);
+        data.layout_mut().insert_inst(entry, gep);
+        data.layout_mut().insert_inst(entry, load);
+        data.layout_mut().insert_inst(entry, store);
+        let ret = data.new_local_inst().ret(Some(load));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+        // Two users: the GEP must be materialized, so no extended-register
+        // *addressing* form (an ALU `add ..., sxtw #2` may still appear).
+        assert!(!assembly.contains("sxtw #2]"), "{assembly}");
     }
 }

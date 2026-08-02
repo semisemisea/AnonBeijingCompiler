@@ -153,7 +153,7 @@ impl Pass for SSATransform {
 
 #[allow(clippy::too_many_arguments)]
 fn dfs(
-    node: BId,
+    entry: BId,
     tree: &DomTree,
     st: &mut ValStack,
     val_id: &IDAllocator<Inst, VId>,
@@ -162,120 +162,124 @@ fn dfs(
     insert_table: &InsertTable,
     remove_list: &mut Vec<(Inst, BasicBlock)>,
 ) {
-    let mut history = Vec::new();
-    // Step 1:   Update `st` if block arguments update the value.
-    let bb = bb_id.search_id(node);
-    let bb_data = data.bb_data(bb);
-    for &(vid, idx) in insert_table[node].iter() {
-        st[vid].push(bb_data.params()[idx]);
-        history.push(vid);
+    enum Visit {
+        Enter(BId),
+        Exit(Vec<VId>),
     }
 
-    // Step 2:   Traverse the instruction list and find `alloc`, `store` and `load`.
-    let bb_data = data.layout().basicblock(bb_id.search_id(node));
-    let values = bb_data.insts().iter().copied().collect::<Vec<_>>();
-    for val in values {
-        let val_data = data.inst_data(val);
-        let ty = val_data.ty().clone();
-        // Step 2.3: Delete `load` and replace every use of `load` with value of variable.
-        // Step 2.4: For `jump` and `branch`, update its arguments.
-        match val_data.kind() {
-            // Step 2.1: Straight delete `alloc`.
-            // `alloc` can only be deleted when all `load` and `store` is deleted.
-            InstKind::Alloc => {
-                if val_id.get_id_safe(&val).is_some() {
-                    remove_list.push((val, bb));
+    let mut visits = vec![Visit::Enter(entry)];
+    while let Some(visit) = visits.pop() {
+        let node = match visit {
+            Visit::Enter(node) => node,
+            Visit::Exit(history) => {
+                for id in history {
+                    st[id].pop();
                 }
+                continue;
             }
-            // Step 2.2: Update the value in stack with corresponding variable if we met `store`.
-            InstKind::Store(store) => {
-                if let Some(&dest_id) = val_id.get_id_safe(&store.dest()) {
-                    st[dest_id].push(store.src());
-                    history.push(dest_id);
+        };
 
-                    remove_list.push((val, bb));
-                }
-            }
-            InstKind::Load(load) => {
-                if let Some(&load_id) = val_id.get_id_safe(&load.src()) {
-                    let rep_with = st[load_id]
-                        .last()
-                        .copied()
-                        .unwrap_or_else(|| data.new_local_inst().undef(ty));
-                    utils::visit_and_replace(data, val, rep_with);
-                    remove_list.push((val, bb));
-                }
-            }
-            InstKind::Jump(jump) => {
-                let target = jump.target();
-                let target_id = bb_id.get_id(&target);
-                let mut args = jump.args().to_vec();
-                for (i, &(vid, _)) in (args.len()..).zip(insert_table[target_id].iter()) {
-                    let item = match st[vid].last() {
-                        Some(&val) => val,
-                        None => {
-                            let v = data.bb_data(target).params()[i];
-                            let ty = data.inst_data(v).ty().clone();
-                            data.new_local_inst().undef(ty)
-                        }
-                    };
-                    args.push(item);
-                }
-                data.replace_inst_with(val).jump(target, args);
-            }
-            InstKind::Branch(branch) => {
-                let cond = branch.cond();
-                let t_target = branch.t_target();
-                let t_target_id = bb_id.get_id(&t_target);
-                let f_target = branch.f_target();
-                let f_target_id = bb_id.get_id(&f_target);
-                let mut f_args = branch.f_args().to_vec();
-                let mut t_args = branch.t_args().to_vec();
-                for (i, &(vid, _)) in (f_args.len()..).zip(insert_table[f_target_id].iter()) {
-                    let item = match st[vid].last() {
-                        Some(&val) => val,
-                        None => {
-                            let v = data.bb_data(f_target).params()[i];
-                            let ty = data.inst_data(v).ty().clone();
-                            data.new_local_inst().undef(ty)
-                        }
-                    };
-                    f_args.push(item);
-                }
-                for (i, &(vid, _)) in (t_args.len()..).zip(insert_table[t_target_id].iter()) {
-                    let item = match st[vid].last() {
-                        Some(&val) => val,
-                        None => {
-                            let v = data.bb_data(t_target).params()[i];
-                            let ty = data.inst_data(v).ty().clone();
-                            data.new_local_inst().undef(ty)
-                        }
-                    };
-                    t_args.push(item);
-                }
-                data.replace_inst_with(val)
-                    .branch(cond, t_target, t_args, f_target, f_args);
-            }
-            _ => {}
+        let mut history = Vec::new();
+        // Step 1: Update `st` if block arguments update the value.
+        let bb = bb_id.search_id(node);
+        let bb_data = data.bb_data(bb);
+        for &(vid, idx) in &insert_table[node] {
+            st[vid].push(bb_data.params()[idx]);
+            history.push(vid);
         }
-    }
 
-    // Step 3: Recursively call the function.
-    tree[node].iter().for_each(|&child| {
-        dfs(
-            child,
-            tree,
-            st,
-            val_id,
-            bb_id,
-            data,
-            insert_table,
-            remove_list,
-        )
-    });
+        // Step 2: Traverse the instruction list and find `alloc`, `store` and `load`.
+        let values = data
+            .layout()
+            .basicblock(bb)
+            .insts()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for val in values {
+            let val_data = data.inst_data(val);
+            let ty = val_data.ty().clone();
+            match val_data.kind() {
+                InstKind::Alloc => {
+                    if val_id.get_id_safe(&val).is_some() {
+                        remove_list.push((val, bb));
+                    }
+                }
+                InstKind::Store(store) => {
+                    if let Some(&dest_id) = val_id.get_id_safe(&store.dest()) {
+                        st[dest_id].push(store.src());
+                        history.push(dest_id);
+                        remove_list.push((val, bb));
+                    }
+                }
+                InstKind::Load(load) => {
+                    if let Some(&load_id) = val_id.get_id_safe(&load.src()) {
+                        let rep_with = st[load_id]
+                            .last()
+                            .copied()
+                            .unwrap_or_else(|| data.new_local_inst().undef(ty));
+                        utils::visit_and_replace(data, val, rep_with);
+                        remove_list.push((val, bb));
+                    }
+                }
+                InstKind::Jump(jump) => {
+                    let target = jump.target();
+                    let target_id = bb_id.get_id(&target);
+                    let mut args = jump.args().to_vec();
+                    for (i, &(vid, _)) in (args.len()..).zip(&insert_table[target_id]) {
+                        let item = match st[vid].last() {
+                            Some(&val) => val,
+                            None => {
+                                let value = data.bb_data(target).params()[i];
+                                let ty = data.inst_data(value).ty().clone();
+                                data.new_local_inst().undef(ty)
+                            }
+                        };
+                        args.push(item);
+                    }
+                    data.replace_inst_with(val).jump(target, args);
+                }
+                InstKind::Branch(branch) => {
+                    let cond = branch.cond();
+                    let t_target = branch.t_target();
+                    let t_target_id = bb_id.get_id(&t_target);
+                    let f_target = branch.f_target();
+                    let f_target_id = bb_id.get_id(&f_target);
+                    let mut f_args = branch.f_args().to_vec();
+                    let mut t_args = branch.t_args().to_vec();
+                    for (i, &(vid, _)) in (f_args.len()..).zip(&insert_table[f_target_id]) {
+                        let item = match st[vid].last() {
+                            Some(&val) => val,
+                            None => {
+                                let value = data.bb_data(f_target).params()[i];
+                                let ty = data.inst_data(value).ty().clone();
+                                data.new_local_inst().undef(ty)
+                            }
+                        };
+                        f_args.push(item);
+                    }
+                    for (i, &(vid, _)) in (t_args.len()..).zip(&insert_table[t_target_id]) {
+                        let item = match st[vid].last() {
+                            Some(&val) => val,
+                            None => {
+                                let value = data.bb_data(t_target).params()[i];
+                                let ty = data.inst_data(value).ty().clone();
+                                data.new_local_inst().undef(ty)
+                            }
+                        };
+                        t_args.push(item);
+                    }
+                    data.replace_inst_with(val)
+                        .branch(cond, t_target, t_args, f_target, f_args);
+                }
+                _ => {}
+            }
+        }
 
-    for id in history {
-        st[id].pop();
+        visits.push(Visit::Exit(history));
+        for &child in tree[node].iter().rev() {
+            visits.push(Visit::Enter(child));
+        }
     }
 }
 

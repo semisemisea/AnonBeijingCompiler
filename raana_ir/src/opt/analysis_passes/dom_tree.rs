@@ -159,16 +159,7 @@ pub mod v2 {
             let mut depths = FxHashMap::default();
             let mut dfs_in = FxHashMap::default();
             let mut dfs_out = FxHashMap::default();
-            let mut timestamp = 0;
-            number_tree(
-                entry,
-                0,
-                &children,
-                &mut depths,
-                &mut dfs_in,
-                &mut dfs_out,
-                &mut timestamp,
-            );
+            number_tree(entry, &children, &mut depths, &mut dfs_in, &mut dfs_out);
 
             let tree = Self {
                 entry,
@@ -285,30 +276,37 @@ pub mod v2 {
     }
 
     fn number_tree(
-        block: BasicBlock,
-        depth: usize,
+        entry: BasicBlock,
         children: &FxHashMap<BasicBlock, DomTreeChildren>,
         depths: &mut FxHashMap<BasicBlock, usize>,
         dfs_in: &mut FxHashMap<BasicBlock, usize>,
         dfs_out: &mut FxHashMap<BasicBlock, usize>,
-        timestamp: &mut usize,
     ) {
-        depths.insert(block, depth);
-        dfs_in.insert(block, *timestamp);
-        *timestamp += 1;
-        for &child in &children[&block] {
-            number_tree(
-                child,
-                depth + 1,
-                children,
-                depths,
-                dfs_in,
-                dfs_out,
-                timestamp,
-            );
+        #[derive(Clone, Copy)]
+        enum Visit {
+            Enter(BasicBlock, usize),
+            Exit(BasicBlock),
         }
-        dfs_out.insert(block, *timestamp);
-        *timestamp += 1;
+
+        let mut timestamp = 0;
+        let mut stack = vec![Visit::Enter(entry, 0)];
+        while let Some(visit) = stack.pop() {
+            match visit {
+                Visit::Enter(block, depth) => {
+                    depths.insert(block, depth);
+                    dfs_in.insert(block, timestamp);
+                    timestamp += 1;
+                    stack.push(Visit::Exit(block));
+                    for &child in children[&block].iter().rev() {
+                        stack.push(Visit::Enter(child, depth + 1));
+                    }
+                }
+                Visit::Exit(block) => {
+                    dfs_out.insert(block, timestamp);
+                    timestamp += 1;
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -414,6 +412,35 @@ pub mod v2 {
             assert!(tree.dominates(header, latch));
             assert!(!tree.dominates(body, header));
             assert!(!tree.contains(dead));
+        }
+
+        #[test]
+        fn numbers_a_deep_dominance_tree_without_recursion() {
+            let mut program = Program::new();
+            let function = program.new_function(Type::get_unit(), "deep_dom".into(), vec![]);
+            let data = program.func_data_mut(function);
+            let entry = data.add_entry_block();
+            let mut blocks = vec![entry];
+            for index in 0..20_000 {
+                let block = data
+                    .new_basic_block()
+                    .basic_block(format!("block_{index}"), vec![]);
+                data.layout_mut().push_bb_back(block);
+                blocks.push(block);
+            }
+            for pair in blocks.windows(2) {
+                let jump = data.new_local_inst().jump(pair[1], vec![]);
+                data.layout_mut().insert_inst(pair[0], jump);
+            }
+            let ret = data.new_local_inst().ret(None);
+            data.layout_mut().insert_inst(*blocks.last().unwrap(), ret);
+
+            let cfg = CFG::new(data).unwrap();
+            let tree = DominanceTree::from_cfg(&cfg);
+            let last = *blocks.last().unwrap();
+            assert_eq!(tree.depth_of(last), blocks.len() - 1);
+            assert!(tree.dominates(entry, last));
+            assert!(!tree.dominates(last, entry));
         }
 
         #[test]

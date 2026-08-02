@@ -168,6 +168,13 @@ impl PassesManager {
             let tco_initial = Box::new(tco::TailCallElim);
             p.register_initial(tco_initial);
 
+            // Promote unobservable scalar globals to SSA values so the
+            // backend keeps them in registers (load once, write back once).
+            // One-shot (not a fixpoint rewrite): it must run after inlining
+            // so the callee-touch analysis sees the final call graph.
+            let gsp = Box::new(scalar_global_promotion::ScalarGlobalPromotion);
+            p.register_initial(gsp);
+
             let ipsccp = Box::new(ipsccp::IPSCCP);
             p.register(ipsccp);
 
@@ -178,6 +185,10 @@ impl PassesManager {
             // backend can fuse the decrement with the loop test.
             let rotate_loops = Box::new(rotate_loops::RotateLoops);
             p.register(rotate_loops);
+
+            // Hoist loop-invariant pure expressions to the preheader.
+            let licm = Box::new(licm::Licm);
+            p.register(licm);
 
             let gvn = Box::new(gvn::GlobalInstNumbering);
             p.register(gvn);

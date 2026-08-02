@@ -327,6 +327,9 @@ mod tests {
 
     #[test]
     fn branch_optimization_removes_fallthrough_and_inverts_jumps() {
+        // `f` exercises the R1 fallthrough elimination and R2 threading;
+        // `g` exercises the M32 `ccmp` chain and M34 GSP write-backs, whose
+        // direct branch form needs no R4 inversion.
         let source = "int f(int x) { if (x > 3) { return 1; } return 0; }\n\
                       int h(int c) { return c; }\n\
                       int ga, gb;\n\
@@ -345,12 +348,17 @@ mod tests {
         );
         let g = function_stats(&output, "g");
         assert!(
-            g.branch_opt.branches_inverted >= 1,
-            "`g` must invert its condition to skip the trailing jump"
+            g.branch_opt.fallthrough_removed >= 1,
+            "`g` must eliminate its fallthrough branches"
+        );
+        let g_section = function_section(&output.assembly, "g");
+        assert!(
+            g_section.contains("ccmp"),
+            "`g` must fold its `||` into a ccmp chain:\n{g_section}"
         );
         assert!(
-            g.branch_opt.labels_threaded >= 1,
-            "`g` must thread empty edge-block labels"
+            g_section.contains("gv_ga") && g_section.contains("gv_gb"),
+            "`g` must write the promoted globals back at the exit:\n{g_section}"
         );
 
         let f_section = function_section(&output.assembly, "f");

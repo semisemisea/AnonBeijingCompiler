@@ -617,7 +617,12 @@ fn lower_select(
         (cond, value)
     };
 
-    ctx.emit(MInst::CmpSelect { cmp, ccmp, cond, value });
+    ctx.emit(MInst::CmpSelect {
+        cmp,
+        ccmp,
+        cond,
+        value,
+    });
     LoweredOutput::Value(result)
 }
 
@@ -751,20 +756,20 @@ fn comparison_cmp(
 /// written by `ccmp` when its condition does not hold, for `band`).
 fn nzcv_making_cond_false(cond: Cond) -> u8 {
     match cond {
-        Cond::Eq => 0,   // Z=0
-        Cond::Ne => 4,   // Z=1
-        Cond::Hs => 0,   // C=0
-        Cond::Lo => 2,   // C=1
-        Cond::Mi => 0,   // N=0
-        Cond::Pl => 8,   // N=1
-        Cond::Vs => 0,   // V=0
-        Cond::Vc => 1,   // V=1
-        Cond::Hi => 4,   // Z=1
-        Cond::Ls => 2,   // C=1,Z=0
-        Cond::Ge => 8,   // N=1,V=0
-        Cond::Lt => 0,   // N=0,V=0
-        Cond::Gt => 4,   // Z=1
-        Cond::Le => 0,   // Z=0,N=0,V=0
+        Cond::Eq => 0, // Z=0
+        Cond::Ne => 4, // Z=1
+        Cond::Hs => 0, // C=0
+        Cond::Lo => 2, // C=1
+        Cond::Mi => 0, // N=0
+        Cond::Pl => 8, // N=1
+        Cond::Vs => 0, // V=0
+        Cond::Vc => 1, // V=1
+        Cond::Hi => 4, // Z=1
+        Cond::Ls => 2, // C=1,Z=0
+        Cond::Ge => 8, // N=1,V=0
+        Cond::Lt => 0, // N=0,V=0
+        Cond::Gt => 4, // Z=1
+        Cond::Le => 0, // Z=0,N=0,V=0
     }
 }
 
@@ -772,20 +777,20 @@ fn nzcv_making_cond_false(cond: Cond) -> u8 {
 /// written by `ccmp` when its condition does not hold, for `bor`).
 fn nzcv_making_cond_true(cond: Cond) -> u8 {
     match cond {
-        Cond::Eq => 4,   // Z=1
-        Cond::Ne => 0,   // Z=0
-        Cond::Hs => 2,   // C=1
-        Cond::Lo => 0,   // C=0
-        Cond::Mi => 8,   // N=1
-        Cond::Pl => 0,   // N=0
-        Cond::Vs => 1,   // V=1
-        Cond::Vc => 0,   // V=0
-        Cond::Hi => 2,   // C=1,Z=0
-        Cond::Ls => 4,   // Z=1
-        Cond::Ge => 0,   // N=0,V=0
-        Cond::Lt => 8,   // N=1,V=0
-        Cond::Gt => 0,   // Z=0,N=0,V=0
-        Cond::Le => 4,   // Z=1
+        Cond::Eq => 4, // Z=1
+        Cond::Ne => 0, // Z=0
+        Cond::Hs => 2, // C=1
+        Cond::Lo => 0, // C=0
+        Cond::Mi => 8, // N=1
+        Cond::Pl => 0, // N=0
+        Cond::Vs => 1, // V=1
+        Cond::Vc => 0, // V=0
+        Cond::Hi => 2, // C=1,Z=0
+        Cond::Ls => 4, // Z=1
+        Cond::Ge => 0, // N=0,V=0
+        Cond::Lt => 8, // N=1,V=0
+        Cond::Gt => 0, // Z=0,N=0,V=0
+        Cond::Le => 4, // Z=1
     }
 }
 
@@ -2733,7 +2738,8 @@ mod tests {
         let mul1 = data.new_local_inst().binary(BinaryOp::Mul, a, b);
         let mul2 = data.new_local_inst().binary(BinaryOp::Mul, c, d);
         let add = data.new_local_inst().binary(BinaryOp::Add, mul1, mul2);
-        // mul1 has a second user (the store): the fold must fall back.
+        // mul1 has a second user (the store), so it must remain materialized.
+        // The single-use mul2 may still fold with mul1 as the madd addend.
         let store = data.new_local_inst().store(mul1, ptr);
         data.layout_mut().insert_inst(entry, mul1);
         data.layout_mut().insert_inst(entry, mul2);
@@ -2743,9 +2749,10 @@ mod tests {
         data.layout_mut().insert_inst(entry, ret);
 
         let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
-        assert_eq!(assembly.matches("madd").count(), 0, "{assembly}");
-        assert_eq!(assembly.matches("\n    mul ").count(), 2, "{assembly}");
-        assert!(assembly.contains("\n    add w"), "{assembly}");
+        assert_eq!(assembly.matches("madd").count(), 1, "{assembly}");
+        assert_eq!(assembly.matches("\n    mul ").count(), 1, "{assembly}");
+        assert!(!assembly.contains("\n    add w"), "{assembly}");
+        assert!(assembly.contains("str w"), "{assembly}");
     }
 
     #[test]

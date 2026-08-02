@@ -233,7 +233,8 @@ impl<I: VCodeInst> VCodeContainer<I> {
                                         // Size register moves from the value's
                                         // actual type: an i32 copy is a
                                         // `mov w, w` (clears the upper half).
-                                        let vreg_ty = vreg.and_then(|v| self.vreg_types.get(v as usize));
+                                        let vreg_ty =
+                                            vreg.and_then(|v| self.vreg_types.get(v as usize));
                                         match vreg_ty {
                                             Some(&I32) => I32,
                                             _ => I64,
@@ -455,7 +456,9 @@ impl<I: VCodeInst> VCodeContainer<I> {
             }
             previous_point = Some(*point);
 
-            let Edit::Move { from, to, class, .. } = edit;
+            let Edit::Move {
+                from, to, class, ..
+            } = edit;
             if from.is_none() || to.is_none() {
                 return Err(format!(
                     "allocator edit {edit_index} at {point:?} has an unresolved endpoint: {from} -> {to}"

@@ -71,12 +71,7 @@ fn removable_compare(
     pred_br: &MInst,
     split_idx: usize,
 ) -> bool {
-    let MInst::CmpImm {
-        size,
-        lhs,
-        imm,
-    } = split_cmp
-    else {
+    let MInst::CmpImm { size, lhs, imm } = split_cmp else {
         return false;
     };
     let MInst::CondBr {
@@ -139,7 +134,9 @@ fn fuse_block(vcode: &mut VCodeContainer<MInst>, split: Block) -> u64 {
     // The predecessor's terminator region must end with a compare followed
     // by a conditional branch.
     let pred_range = vcode.block_inst_range(pred_idx);
-    let mut tail = pred_range.rev().filter(|&i| !matches!(vcode.inst(i), MInst::Removed));
+    let mut tail = pred_range
+        .rev()
+        .filter(|&i| !matches!(vcode.inst(i), MInst::Removed));
     let Some(pred_br_idx) = tail.next() else {
         return 0;
     };
@@ -148,7 +145,9 @@ fn fuse_block(vcode: &mut VCodeContainer<MInst>, split: Block) -> u64 {
     };
     let pred_cmp = vcode.inst(pred_cmp_idx).clone();
     let pred_br = vcode.inst(pred_br_idx).clone();
-    if !matches!(&split_br, MInst::CondBr { .. }) || !removable_compare(&split_cmp, &pred_cmp, &pred_br, split_idx) {
+    if !matches!(&split_br, MInst::CondBr { .. })
+        || !removable_compare(&split_cmp, &pred_cmp, &pred_br, split_idx)
+    {
         return 0;
     }
 
@@ -159,11 +158,7 @@ fn fuse_block(vcode: &mut VCodeContainer<MInst>, split: Block) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        instructions::Cond,
-        labels::Label,
-        regs::OperandSize,
-    };
+    use crate::{instructions::Cond, labels::Label, regs::OperandSize};
     use taki_mir::{
         block_order::MirBlockIndex,
         reg_alloc::reg::{RegClass, VReg},

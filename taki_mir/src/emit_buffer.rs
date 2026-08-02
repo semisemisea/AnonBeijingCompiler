@@ -322,7 +322,11 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
                     for &label in &b.labels_at_this_branch {
                         self.label_aliases[label.index()] = Some(target);
                     }
-                    self.latest_branches.last_mut().unwrap().labels_at_this_branch.clear();
+                    self.latest_branches
+                        .last_mut()
+                        .unwrap()
+                        .labels_at_this_branch
+                        .clear();
                     if redirected > 0 {
                         self.stats.changed = true;
                         self.stats.labels_threaded += redirected as u64;
@@ -343,7 +347,12 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
 
                     if prev_is_uncond
                         && prev_adjacent
-                        && self.latest_branches.last().unwrap().labels_at_this_branch.is_empty()
+                        && self
+                            .latest_branches
+                            .last()
+                            .unwrap()
+                            .labels_at_this_branch
+                            .is_empty()
                     {
                         self.stats.changed = true;
                         self.stats.dead_jumps_removed += 1;
@@ -750,11 +759,7 @@ mod tests {
             TestInst
         }
 
-        fn gen_store_stack(
-            _src: Reg,
-            _mem: crate::abi::StackAMode,
-            _ty: LoweredType,
-        ) -> Self::I {
+        fn gen_store_stack(_src: Reg, _mem: crate::abi::StackAMode, _ty: LoweredType) -> Self::I {
             TestInst
         }
 
@@ -763,9 +768,7 @@ mod tests {
             TestInst
         }
 
-        fn compute_arg_loc(
-            _arena: ArenaContext<'_>,
-        ) -> (Vec<crate::abi::ArgSlot>, u32) {
+        fn compute_arg_loc(_arena: ArenaContext<'_>) -> (Vec<crate::abi::ArgSlot>, u32) {
             (vec![], 0)
         }
 
@@ -801,9 +804,7 @@ mod tests {
             smallvec::SmallVec::new()
         }
 
-        fn gen_clobber_save(
-            _frame: &crate::abi::FrameLayout,
-        ) -> smallvec::SmallVec<[Self::I; 16]> {
+        fn gen_clobber_save(_frame: &crate::abi::FrameLayout) -> smallvec::SmallVec<[Self::I; 16]> {
             smallvec::SmallVec::new()
         }
 
@@ -827,9 +828,7 @@ mod tests {
             MachTerminator::None
         }
 
-        fn rc_for_type(
-            _ty: LoweredType,
-        ) -> (&'static [RegClass], &'static [LoweredType]) {
+        fn rc_for_type(_ty: LoweredType) -> (&'static [RegClass], &'static [LoweredType]) {
             (&[], &[])
         }
 
@@ -917,10 +916,7 @@ mod tests {
         Program::new()
     }
 
-    fn buffer<'a>(
-        program: &'a HirProgram,
-        block_labels: Vec<&str>,
-    ) -> EmitBuffer<'a, TestBackend> {
+    fn buffer<'a>(program: &'a HirProgram, block_labels: Vec<&str>) -> EmitBuffer<'a, TestBackend> {
         buffer_with_opt(program, block_labels, true)
     }
 
@@ -1001,7 +997,11 @@ mod tests {
         core::fmt::write(&mut buffer, format_args!("cbz w0, ")).unwrap();
         let prefix = buffer.take_inst_text();
         assert_eq!(prefix, "cbz w0, ");
-        assert_eq!(buffer.cur_slot(), 0, "take_inst_text must not create a slot");
+        assert_eq!(
+            buffer.cur_slot(),
+            0,
+            "take_inst_text must not create a slot"
+        );
         buffer
             .put_branch(
                 &prefix,
@@ -1250,23 +1250,13 @@ mod tests {
         };
         buffer.bind_label(MirBlockIndex::new(0));
         buffer
-            .put_branch(
-                "b.eq ",
-                Some("b.ne "),
-                MirBlockIndex::new(1),
-                tiny,
-            )
+            .put_branch("b.eq ", Some("b.ne "), MirBlockIndex::new(1), tiny)
             .unwrap();
         buffer
             .put_uncond_branch("b ", MirBlockIndex::new(2), tiny)
             .unwrap();
         buffer
-            .put_branch(
-                "b.ne ",
-                Some("b.eq "),
-                MirBlockIndex::new(3),
-                tiny,
-            )
+            .put_branch("b.ne ", Some("b.eq "), MirBlockIndex::new(3), tiny)
             .unwrap();
         buffer.bind_label(MirBlockIndex::new(1));
         put_inst(&mut buffer, "nop");

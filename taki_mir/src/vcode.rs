@@ -197,7 +197,7 @@ impl<I: VCodeInst> VCodeContainer<I> {
     /// Block structure (block ranges, successors, predecessors, params) is
     /// preserved; only the per-block instruction count may grow.
     pub fn finalize_for_emission(&mut self, output: &Output) {
-        use crate::types::{F32, I64};
+        use crate::types::{F32, I32, I64};
 
         let frame = self.abi.frame_layout().clone();
         let spill_unit_bytes = self.abi.spill_unit_bytes();
@@ -219,12 +219,26 @@ impl<I: VCodeInst> VCodeContainer<I> {
                         }
                     }
                     InstOrEdit::Edit(edit) => {
-                        let Edit::Move { from, to, class } = edit;
+                        let Edit::Move {
+                            from,
+                            to,
+                            class,
+                            vreg,
+                        } = edit;
                         match (from.as_reg(), to.as_reg()) {
                             (Some(from_reg), Some(to_reg)) => {
                                 let ty = match class {
                                     RegClass::Float => F32,
-                                    RegClass::Int => I64,
+                                    RegClass::Int => {
+                                        // Size register moves from the value's
+                                        // actual type: an i32 copy is a
+                                        // `mov w, w` (clears the upper half).
+                                        let vreg_ty = vreg.and_then(|v| self.vreg_types.get(v as usize));
+                                        match vreg_ty {
+                                            Some(&I32) => I32,
+                                            _ => I64,
+                                        }
+                                    }
                                     RegClass::Vector => {
                                         unreachable!("vector register moves are unsupported")
                                     }
@@ -441,7 +455,7 @@ impl<I: VCodeInst> VCodeContainer<I> {
             }
             previous_point = Some(*point);
 
-            let Edit::Move { from, to, class } = edit;
+            let Edit::Move { from, to, class, .. } = edit;
             if from.is_none() || to.is_none() {
                 return Err(format!(
                     "allocator edit {edit_index} at {point:?} has an unresolved endpoint: {from} -> {to}"
@@ -1489,6 +1503,7 @@ mod tests {
                     ),
                     to: crate::reg_alloc::reg::Allocation::reg(PReg::new(5, RegClass::Int)),
                     class: RegClass::Int,
+                    vreg: None,
                 },
             )],
             ..Output::default()
@@ -1513,6 +1528,7 @@ mod tests {
                         crate::reg_alloc::reg::SpillSlot::new(0),
                     ),
                     class: RegClass::Vector,
+                    vreg: None,
                 },
             )],
             num_spillslots: 1,

@@ -15,6 +15,7 @@ use crate::{
 const MAX_BREAK_EVEN_TRIPS: usize = 4;
 const MAX_EXISTING_POINTER_RECURRENCES: usize = 2;
 const MAX_HEADER_GPR_PARAMS_BEFORE_POINTER: usize = 6;
+const MAX_BACKEDGE_SOURCES: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PointerStrengthReductionCost {
@@ -48,6 +49,7 @@ pub fn estimate_aarch64_pointer_strength_reduction(
     pointer_byte_delta: i64,
 ) -> Option<PointerStrengthReductionCost> {
     if loop_has_call(data, looop)
+        || looop.latches().len() > MAX_BACKEDGE_SOURCES
         || pointer_recurrence_count(data, looop) >= MAX_EXISTING_POINTER_RECURRENCES
         || header_gpr_parameter_count(data, looop) >= MAX_HEADER_GPR_PARAMS_BEFORE_POINTER
     {

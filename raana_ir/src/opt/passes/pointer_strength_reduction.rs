@@ -1,4 +1,5 @@
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use crate::opt::{
     analysis_passes::{
@@ -24,12 +25,16 @@ struct Candidate {
     gep: Inst,
     header_iv_position: usize,
     gep_iv_position: usize,
-    latch: BasicBlock,
-    backedge: LogicalEdge,
+    backedge_groups: SmallVec<[BackedgeGroup; 2]>,
     pointer_step: i32,
     base: Inst,
     offsets: Vec<Inst>,
     pointer_ty: Type,
+}
+
+struct BackedgeGroup {
+    source: BasicBlock,
+    edges: SmallVec<[LogicalEdge; 2]>,
 }
 
 enum ApplyResult {
@@ -47,22 +52,26 @@ impl PointerStrengthReduction {
         looop: &Loop,
         parameter_blocks: &FxHashMap<Inst, BasicBlock>,
     ) -> Option<Candidate> {
-        let &[latch] = looop.latches() else {
-            return None;
-        };
-        if latch == looop.header() {
-            return None;
-        }
-
         let backedges = incoming_edges(data, cfg, looop.header())
             .into_iter()
             .filter(|edge| looop.contains(edge.source()))
             .collect::<Vec<_>>();
-        let &[backedge] = backedges.as_slice() else {
+        if backedges.is_empty() {
             return None;
-        };
-        if backedge.source() != latch {
-            return None;
+        }
+        let mut backedge_groups = SmallVec::<[BackedgeGroup; 2]>::new();
+        for &edge in &backedges {
+            if let Some(group) = backedge_groups
+                .iter_mut()
+                .find(|group| group.source == edge.source())
+            {
+                group.edges.push(edge);
+            } else {
+                backedge_groups.push(BackedgeGroup {
+                    source: edge.source(),
+                    edges: SmallVec::from_slice(&[edge]),
+                });
+            }
         }
 
         for iv in ivs.for_loop(looop) {
@@ -77,10 +86,11 @@ impl PointerStrengthReduction {
             else {
                 continue;
             };
-            if backedge.args(data).get(header_iv_position).copied()
-                != iv.update_values().first().copied()
-                || iv.update_values().len() != 1
-            {
+            if backedges.iter().any(|edge| {
+                edge.args(data)
+                    .get(header_iv_position)
+                    .is_none_or(|value| !iv.update_values().contains(value))
+            }) {
                 continue;
             }
 
@@ -131,6 +141,9 @@ impl PointerStrengthReduction {
                                 )
                             })
                         || !Self::has_only_loop_memory_users(data, looop, inst)
+                        || !backedge_groups
+                            .iter()
+                            .all(|group| dom_tree.dominates(block, group.source))
                     {
                         continue;
                     }
@@ -171,8 +184,7 @@ impl PointerStrengthReduction {
                         gep: inst,
                         header_iv_position,
                         gep_iv_position,
-                        latch,
-                        backedge,
+                        backedge_groups,
                         pointer_step: signed_pointer_step,
                         base: gep.base(),
                         offsets: gep.offsets().to_vec(),
@@ -264,13 +276,17 @@ impl PointerStrengthReduction {
             .new_basic_block()
             .add_param(looop.header(), candidate.pointer_ty.clone());
         let pointer_step = data.new_local_value().integer(candidate.pointer_step);
-        let next_pointer = data
-            .new_local_value()
-            .get_elem_ptr(pointer, vec![pointer_step]);
-        debug_assert_eq!(data.inst_data(next_pointer).ty(), &candidate.pointer_ty);
-        data.layout_mut()
-            .insert_before_terminator(candidate.latch, next_pointer);
-        rewrites.append_arg(data, candidate.backedge, next_pointer);
+        for group in candidate.backedge_groups {
+            let next_pointer = data
+                .new_local_value()
+                .get_elem_ptr(pointer, vec![pointer_step]);
+            debug_assert_eq!(data.inst_data(next_pointer).ty(), &candidate.pointer_ty);
+            data.layout_mut()
+                .insert_before_terminator(group.source, next_pointer);
+            for edge in group.edges {
+                rewrites.append_arg(data, edge, next_pointer);
+            }
+        }
         assert!(rewrites.apply(data));
 
         let zero = data.new_local_value().integer(0);
@@ -552,6 +568,391 @@ mod tests {
         assert_eq!(next.base(), pointer);
         assert_eq!(integer_constant(data, next.offsets()[0]), Some(-1));
         assert!(!run(&mut program, fixture.function));
+    }
+
+    #[test]
+    fn carries_a_pointer_across_two_latches() {
+        let array_ty = Type::get_array(Type::get_i32(), 32);
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "pointer_sr_two_latches".into(),
+            vec![
+                Type::get_pointer(array_ty),
+                Type::get_i32(),
+                Type::get_i32(),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let bound = data.params()[1];
+        let outer_index = data.params()[2];
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let dispatch = data
+            .new_basic_block()
+            .basic_block("dispatch".into(), vec![]);
+        let left = data.new_basic_block().basic_block("left".into(), vec![]);
+        let right = data.new_basic_block().basic_block("right".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, dispatch, left, right, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let iv = data.bb_data(header).params()[0];
+        let gep = data
+            .new_local_inst()
+            .get_elem_ptr(base, vec![outer_index, iv]);
+        let load = data.new_local_inst().load(gep);
+        let compare = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+        for inst in [gep, load, compare] {
+            data.layout_mut().insert_inst(header, inst);
+        }
+        let header_branch = data
+            .new_local_inst()
+            .branch(compare, dispatch, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, header_branch);
+
+        let choose = data.new_local_inst().integer(1);
+        let dispatch_branch = data
+            .new_local_inst()
+            .branch(choose, left, vec![], right, vec![]);
+        data.layout_mut().insert_inst(dispatch, dispatch_branch);
+
+        let one_left = data.new_local_inst().integer(1);
+        let left_update = data.new_local_inst().binary(BinaryOp::Add, iv, one_left);
+        data.layout_mut().insert_inst(left, left_update);
+        let left_backedge = data.new_local_inst().jump(header, vec![left_update]);
+        data.layout_mut().insert_inst(left, left_backedge);
+
+        let one_right = data.new_local_inst().integer(1);
+        let right_update = data.new_local_inst().binary(BinaryOp::Add, one_right, iv);
+        data.layout_mut().insert_inst(right, right_update);
+        let right_backedge = data.new_local_inst().jump(header, vec![right_update]);
+        data.layout_mut().insert_inst(right, right_backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        let pointer = data.bb_data(header).params()[1];
+        for (latch, terminator, update) in [
+            (left, left_backedge, left_update),
+            (right, right_backedge, right_update),
+        ] {
+            let InstKind::Jump(backedge) = data.inst_data(terminator).kind() else {
+                panic!("latch must remain a jump");
+            };
+            assert_eq!(backedge.args()[0], update);
+            let next_pointer = backedge.args()[1];
+            assert_eq!(data.layout().parent_bb(next_pointer), Some(latch));
+            let InstKind::GetElemPtr(next) = data.inst_data(next_pointer).kind() else {
+                panic!("latch must compute the next pointer");
+            };
+            assert_eq!(next.base(), pointer);
+            assert_eq!(integer_constant(data, next.offsets()[0]), Some(1));
+        }
+        assert!(!run(&mut program, function));
+    }
+
+    #[test]
+    fn shares_one_pointer_update_across_parallel_backedge_arms() {
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        let data = program.func_data_mut(fixture.function);
+        let condition = data.new_local_value().integer(1);
+        let one = data.new_local_value().integer(1);
+        let alternate_update = data
+            .new_local_value()
+            .binary(BinaryOp::Add, one, fixture.iv);
+        data.layout_mut()
+            .insert_inst_before(fixture.backedge, alternate_update);
+        data.replace_inst_with(fixture.backedge).branch(
+            condition,
+            fixture.header,
+            vec![fixture.next_iv],
+            fixture.header,
+            vec![alternate_update],
+        );
+
+        assert!(run(&mut program, fixture.function));
+        let data = program.func_data(fixture.function);
+        let pointer = data.bb_data(fixture.header).params()[1];
+        let InstKind::Branch(backedge) = data.inst_data(fixture.backedge).kind() else {
+            panic!("backedge must remain a branch");
+        };
+        assert_eq!(backedge.t_args().len(), 2);
+        assert_eq!(backedge.f_args().len(), 2);
+        let next_pointer = backedge.t_args()[1];
+        assert_eq!(backedge.f_args()[1], next_pointer);
+        assert_eq!(data.layout().parent_bb(next_pointer), Some(fixture.latch));
+        let InstKind::GetElemPtr(next) = data.inst_data(next_pointer).kind() else {
+            panic!("latch must compute the next pointer");
+        };
+        assert_eq!(next.base(), pointer);
+        assert!(!run(&mut program, fixture.function));
+    }
+
+    #[test]
+    fn rejects_inconsistent_parallel_backedge_updates() {
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        let data = program.func_data_mut(fixture.function);
+        let condition = data.new_local_value().integer(1);
+        let two = data.new_local_value().integer(2);
+        let alternate_update = data
+            .new_local_value()
+            .binary(BinaryOp::Add, fixture.iv, two);
+        data.layout_mut()
+            .insert_inst_before(fixture.backedge, alternate_update);
+        data.replace_inst_with(fixture.backedge).branch(
+            condition,
+            fixture.header,
+            vec![fixture.next_iv],
+            fixture.header,
+            vec![alternate_update],
+        );
+
+        assert!(!run(&mut program, fixture.function));
+        assert_eq!(
+            program
+                .func_data(fixture.function)
+                .bb_data(fixture.header)
+                .params()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn rejects_a_path_conditional_gep_with_multiple_latches() {
+        let array_ty = Type::get_array(Type::get_i32(), 32);
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "pointer_sr_conditional_gep".into(),
+            vec![
+                Type::get_pointer(array_ty),
+                Type::get_i32(),
+                Type::get_i32(),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let bound = data.params()[1];
+        let outer_index = data.params()[2];
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let dispatch = data
+            .new_basic_block()
+            .basic_block("dispatch".into(), vec![]);
+        let left = data.new_basic_block().basic_block("left".into(), vec![]);
+        let right = data.new_basic_block().basic_block("right".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, dispatch, left, right, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let iv = data.bb_data(header).params()[0];
+        let compare = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+        data.layout_mut().insert_inst(header, compare);
+        let header_branch = data
+            .new_local_inst()
+            .branch(compare, dispatch, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, header_branch);
+
+        let choose = data.new_local_inst().integer(1);
+        let dispatch_branch = data
+            .new_local_inst()
+            .branch(choose, left, vec![], right, vec![]);
+        data.layout_mut().insert_inst(dispatch, dispatch_branch);
+
+        let gep = data
+            .new_local_inst()
+            .get_elem_ptr(base, vec![outer_index, iv]);
+        let load = data.new_local_inst().load(gep);
+        let one_left = data.new_local_inst().integer(1);
+        let left_update = data.new_local_inst().binary(BinaryOp::Add, iv, one_left);
+        for inst in [gep, load, left_update] {
+            data.layout_mut().insert_inst(left, inst);
+        }
+        let left_backedge = data.new_local_inst().jump(header, vec![left_update]);
+        data.layout_mut().insert_inst(left, left_backedge);
+
+        let one_right = data.new_local_inst().integer(1);
+        let right_update = data.new_local_inst().binary(BinaryOp::Add, iv, one_right);
+        data.layout_mut().insert_inst(right, right_update);
+        let right_backedge = data.new_local_inst().jump(header, vec![right_update]);
+        data.layout_mut().insert_inst(right, right_backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(!run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(data.bb_data(header).params().len(), 1);
+        let InstKind::GetElemPtr(gep) = data.inst_data(gep).kind() else {
+            unreachable!()
+        };
+        assert_eq!(gep.offsets().last().copied(), Some(iv));
+    }
+
+    #[test]
+    fn carries_a_pointer_through_a_header_self_loop() {
+        let array_ty = Type::get_array(Type::get_i32(), 32);
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "pointer_sr_self_loop".into(),
+            vec![
+                Type::get_pointer(array_ty),
+                Type::get_i32(),
+                Type::get_i32(),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let bound = data.params()[1];
+        let outer_index = data.params()[2];
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let iv = data.bb_data(header).params()[0];
+        let gep = data
+            .new_local_inst()
+            .get_elem_ptr(base, vec![outer_index, iv]);
+        let load = data.new_local_inst().load(gep);
+        let one = data.new_local_inst().integer(1);
+        let update = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        let compare = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+        for inst in [gep, load, update, compare] {
+            data.layout_mut().insert_inst(header, inst);
+        }
+        let backedge = data
+            .new_local_inst()
+            .branch(compare, header, vec![update], exit, vec![]);
+        data.layout_mut().insert_inst(header, backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        let pointer = data.bb_data(header).params()[1];
+        let InstKind::Branch(backedge) = data.inst_data(backedge).kind() else {
+            panic!("header terminator must remain a branch");
+        };
+        assert_eq!(backedge.t_args().len(), 2);
+        assert!(backedge.f_args().is_empty());
+        let next_pointer = backedge.t_args()[1];
+        assert_eq!(data.layout().parent_bb(next_pointer), Some(header));
+        let InstKind::GetElemPtr(next) = data.inst_data(next_pointer).kind() else {
+            panic!("header must compute the next pointer");
+        };
+        assert_eq!(next.base(), pointer);
+        assert!(!run(&mut program, function));
+    }
+
+    #[test]
+    fn rejects_more_than_two_backedge_sources() {
+        let array_ty = Type::get_array(Type::get_i32(), 32);
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "pointer_sr_three_latches".into(),
+            vec![
+                Type::get_pointer(array_ty),
+                Type::get_i32(),
+                Type::get_i32(),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let bound = data.params()[1];
+        let outer_index = data.params()[2];
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let dispatch_a = data
+            .new_basic_block()
+            .basic_block("dispatch_a".into(), vec![]);
+        let dispatch_b = data
+            .new_basic_block()
+            .basic_block("dispatch_b".into(), vec![]);
+        let latches = [
+            data.new_basic_block().basic_block("left".into(), vec![]),
+            data.new_basic_block().basic_block("middle".into(), vec![]),
+            data.new_basic_block().basic_block("right".into(), vec![]),
+        ];
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, dispatch_a, dispatch_b]
+            .into_iter()
+            .chain(latches)
+            .chain([exit])
+        {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let iv = data.bb_data(header).params()[0];
+        let gep = data
+            .new_local_inst()
+            .get_elem_ptr(base, vec![outer_index, iv]);
+        let load = data.new_local_inst().load(gep);
+        let compare = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+        for inst in [gep, load, compare] {
+            data.layout_mut().insert_inst(header, inst);
+        }
+        let header_branch = data
+            .new_local_inst()
+            .branch(compare, dispatch_a, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, header_branch);
+
+        let choose = data.new_local_inst().integer(1);
+        let dispatch_a_branch =
+            data.new_local_inst()
+                .branch(choose, latches[0], vec![], dispatch_b, vec![]);
+        data.layout_mut().insert_inst(dispatch_a, dispatch_a_branch);
+        let dispatch_b_branch =
+            data.new_local_inst()
+                .branch(choose, latches[1], vec![], latches[2], vec![]);
+        data.layout_mut().insert_inst(dispatch_b, dispatch_b_branch);
+
+        for latch in latches {
+            let one = data.new_local_inst().integer(1);
+            let update = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+            data.layout_mut().insert_inst(latch, update);
+            let backedge = data.new_local_inst().jump(header, vec![update]);
+            data.layout_mut().insert_inst(latch, backedge);
+        }
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(!run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(data.bb_data(header).params().as_slice(), [iv]);
+        let InstKind::GetElemPtr(gep) = data.inst_data(gep).kind() else {
+            unreachable!()
+        };
+        assert_eq!(gep.offsets().last().copied(), Some(iv));
     }
 
     #[test]

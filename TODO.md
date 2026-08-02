@@ -159,7 +159,7 @@ M34 基线：huffman-01 静态指令数 599（awk 方法，M33 基线 648）。�
 | `decode_fixed_huffman` | 等价结构 | 死空块跳转 `then_13: b while_entry_5` | simplify_cfg 缺口（M38） |
 
 根因分层（M32 已修后端 `ccmp`，M33 已修循环计数 `subs` 融合，M34 已修
-GSP/LICM/load-CSE，M36 已修内联代价模型，余下）：
+GSP/LICM/load-CSE，M36 已修内联代价模型，M37 已修 if 链决策树，余下）：
 
 ### 1.3 当前结论边界
 
@@ -313,14 +313,26 @@ GSP/LICM/load-CSE，M36 已修内联代价模型，余下）：
   保留；huffman-01 599 → 580（-19）；内联后 `rotlN(1,5)` 常量折叠留待
   M37 决策树。corpus 编译时间与代码体积无异常放大。
 
-#### M37：if 链 → switch 决策树
+#### M37：if 链 → switch 决策树（已完成）
 
-- 文件：`raana_ir/src/opt/passes/` 新增 `chain_to_switch.rs`；
-  `anon_armv8/src/lower.rs`。
-- 设计：值域连续的 `if (x==k) return f(k);` 链 → `switch`（跨基本块值流
-  分析）；后端小稠密 → 二分决策树（clang `rotrN` 形态，最坏 ~3 次 cmp），
-  大 → 跳转表（仿 cranelift `br_table_impl`）。
-- 验收：`rotrN/rotlN` 内联体最坏 3 次 cmp。
+- 文件：`raana_ir/src/opt/passes/chain_to_switch.rs`；
+  `anon_armv8/src/passes/chain_fusion.rs`。
+- **IR 层**：检测 `%t = eq x, k; br %t, handler, next` 线性链（每块仅
+  测试+终结符、常量互异、长度 ≥ 4、非头块无参数），转为平衡决策树：
+  内部节点为 (check, split) 块对（`eq x, k → handler` / `lt x, k →
+  左子树, 右子树`），叶子 `eq → handler` 否则落 default；链头就地成为
+  树根（保留其参数——函数参数或内联克隆参数——入边无需改接）。
+- **后端**（`chain_fusion`，pre-RA，`-O1/2` 开启）：split 块（单前驱、
+  恰好 `CmpImm(x,k); CondBr`）的比较与 check 块同值同寄存器时删除——
+  其分支改读 check 块的标志（跨块 NZCV，分支不破坏标志），形成 clang
+  形态 `cmp; b.eq case; b.lt left; b.ge right`。
+- 结果：`rotrN/rotlN`（8 case）最坏 4 次 cmp（= clang；8 case 的完美
+  二叉树最坏深度即 4，验收"~3"按此如实记录），平均 2.6（线性 4.5、
+  clang ~3.1）；`read_bits` 内联链同样成树。**静态指令数 580 → 600
+  （+20）**：树的分裂块与叶子到 default 的边增加分支，静态变差、动态
+  （cmp 深度与平均）变好；相对 M26 基线 687 仍下降。RISC-V 不注册
+  `chain_to_switch`（其条件物化到寄存器，树无法摊销），pipeline 按
+  target 选择（`aarch64_ref` vs `default_ref`）。
 
 #### M38：TCO 与死块清理收尾
 

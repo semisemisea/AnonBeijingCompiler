@@ -89,7 +89,7 @@ fn compile_sy(source: &str, target: Target, opt_level: u8) -> String {
     ast.convert(&mut ctx);
     let mut program = ctx.program;
     if opt_level > 0 {
-        let pass_manager = raana_ir::opt::pass::PassesManager::default_ref();
+        let pass_manager = raana_ir::opt::pass::PassesManager::aarch64_ref();
         pass_manager.run_passes(&mut program);
     }
     let aarch64_config = match opt_level {
@@ -100,6 +100,7 @@ fn compile_sy(source: &str, target: Target, opt_level: u8) -> String {
             list_scheduler: false,
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
             branch_opt: false,
+            chain_fusion: false,
         },
         1 => anon_armv8::AArch64CodegenConfig {
             dce: true,
@@ -108,6 +109,7 @@ fn compile_sy(source: &str, target: Target, opt_level: u8) -> String {
             list_scheduler: false,
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
             branch_opt: true,
+            chain_fusion: true,
         },
         _ => anon_armv8::AArch64CodegenConfig {
             dce: true,
@@ -116,6 +118,7 @@ fn compile_sy(source: &str, target: Target, opt_level: u8) -> String {
             list_scheduler: true,
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
             branch_opt: true,
+            chain_fusion: true,
         },
     };
     match target {
@@ -228,7 +231,7 @@ mod tests {
         let mut ctx = AstGenContext::new();
         ast.convert(&mut ctx);
         let mut program = ctx.program;
-        let pass_manager = raana_ir::opt::pass::PassesManager::default_ref();
+        let pass_manager = raana_ir::opt::pass::PassesManager::aarch64_ref();
         pass_manager.run_passes(&mut program);
         let config = AArch64CodegenConfig {
             dce: true,
@@ -237,6 +240,7 @@ mod tests {
             list_scheduler: true,
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
             branch_opt: true,
+            chain_fusion: true,
         };
         let output = taki_mir::compile_with_config::<AArch64Backend>(&program, &config);
 
@@ -267,7 +271,7 @@ mod tests {
         let mut ctx = AstGenContext::new();
         ast.convert(&mut ctx);
         let mut program = ctx.program;
-        let pass_manager = raana_ir::opt::pass::PassesManager::default_ref();
+        let pass_manager = raana_ir::opt::pass::PassesManager::aarch64_ref();
         pass_manager.run_passes(&mut program);
         let config = AArch64CodegenConfig {
             dce: true,
@@ -276,6 +280,7 @@ mod tests {
             list_scheduler: true,
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
             branch_opt: true,
+            chain_fusion: true,
         };
         let output = taki_mir::compile_with_config::<AArch64Backend>(&program, &config);
 
@@ -300,7 +305,7 @@ mod tests {
         let mut ctx = AstGenContext::new();
         ast.convert(&mut ctx);
         let mut program = ctx.program;
-        let pass_manager = raana_ir::opt::pass::PassesManager::default_ref();
+        let pass_manager = raana_ir::opt::pass::PassesManager::aarch64_ref();
         pass_manager.run_passes(&mut program);
         let config = AArch64CodegenConfig {
             dce: true,
@@ -309,6 +314,7 @@ mod tests {
             list_scheduler: true,
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
             branch_opt,
+            chain_fusion: false,
         };
         taki_mir::compile_with_config::<AArch64Backend>(&program, &config)
     }

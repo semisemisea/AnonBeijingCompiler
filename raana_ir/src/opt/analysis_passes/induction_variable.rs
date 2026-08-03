@@ -81,6 +81,32 @@ pub struct ConstantInductionRange {
     max: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstantTripCount {
+    iterations: usize,
+    initial: i32,
+    bound: i32,
+    signed_step: i32,
+}
+
+impl ConstantTripCount {
+    pub fn iterations(self) -> usize {
+        self.iterations
+    }
+
+    pub fn initial(self) -> i32 {
+        self.initial
+    }
+
+    pub fn bound(self) -> i32 {
+        self.bound
+    }
+
+    pub fn signed_step(self) -> i32 {
+        self.signed_step
+    }
+}
+
 impl ConstantInductionRange {
     pub fn min(self) -> i32 {
         self.min
@@ -250,6 +276,169 @@ pub fn constant_induction_range(
     }
 }
 
+pub fn constant_trip_count(
+    data: &ArenaContextMut<'_>,
+    iv: &BasicInductionVariable,
+    exit: NormalizedInductionExit,
+) -> Option<ConstantTripCount> {
+    let [initial] = iv.initial_values() else {
+        return None;
+    };
+    let initial = integer_constant(data, *initial)?;
+    let bound = integer_constant(data, exit.bound())?;
+    let iterations =
+        constant_trip_count_values(initial, bound, exit.signed_step(), exit.direction())?;
+    Some(ConstantTripCount {
+        iterations,
+        initial,
+        bound,
+        signed_step: exit.signed_step(),
+    })
+}
+
+fn constant_trip_count_values(
+    initial: i32,
+    bound: i32,
+    signed_step: i32,
+    direction: InductionDirection,
+) -> Option<usize> {
+    let (distance, step) = match direction {
+        InductionDirection::Forward => {
+            if signed_step <= 0 {
+                return None;
+            }
+            if initial >= bound {
+                return Some(0);
+            }
+            (
+                i64::from(bound).checked_sub(i64::from(initial))?,
+                i64::from(signed_step),
+            )
+        }
+        InductionDirection::Backward => {
+            if signed_step >= 0 {
+                return None;
+            }
+            if initial <= bound {
+                return Some(0);
+            }
+            (
+                i64::from(initial).checked_sub(i64::from(bound))?,
+                i64::from(signed_step).checked_neg()?,
+            )
+        }
+    };
+    let rounded = distance.checked_add(step.checked_sub(1)?)?;
+    usize::try_from(rounded.checked_div(step)?).ok()
+}
+
+pub fn classify_derived_induction_variable(
+    data: &ArenaContextMut<'_>,
+    looop: &Loop,
+    base: Inst,
+    value: Inst,
+    range: ConstantInductionRange,
+) -> Option<DerivedInductionVariable> {
+    fn range_fits(coefficient: i64, offset: i64, range: ConstantInductionRange) -> bool {
+        let at_min = coefficient
+            .checked_mul(i64::from(range.min()))
+            .and_then(|value| value.checked_add(offset));
+        let at_max = coefficient
+            .checked_mul(i64::from(range.max()))
+            .and_then(|value| value.checked_add(offset));
+        let (Some(at_min), Some(at_max)) = (at_min, at_max) else {
+            return false;
+        };
+        let min = at_min.min(at_max);
+        let max = at_min.max(at_max);
+        min >= i64::from(i32::MIN) && max <= i64::from(i32::MAX)
+    }
+
+    fn classify(
+        data: &ArenaContextMut<'_>,
+        looop: &Loop,
+        base: Inst,
+        value: Inst,
+        range: ConstantInductionRange,
+    ) -> Option<(i64, i64, SmallVec<[Inst; 4]>)> {
+        if value == base {
+            return Some((1, 0, SmallVec::new()));
+        }
+        if let Some(constant) = integer_constant(data, value) {
+            return Some((0, i64::from(constant), SmallVec::new()));
+        }
+        if data
+            .layout()
+            .parent_bb(value)
+            .is_none_or(|block| !looop.contains(block))
+            || !data.inst_data(value).ty().is_i32()
+        {
+            return None;
+        }
+        let InstKind::Binary(binary) = data.inst_data(value).kind() else {
+            return None;
+        };
+        let (lhs_coefficient, lhs_offset, mut lhs_chain) =
+            classify(data, looop, base, binary.lhs(), range)?;
+        let (rhs_coefficient, rhs_offset, rhs_chain) =
+            classify(data, looop, base, binary.rhs(), range)?;
+        let (coefficient, offset) = match binary.op() {
+            BinaryOp::Add => (
+                lhs_coefficient.checked_add(rhs_coefficient)?,
+                lhs_offset.checked_add(rhs_offset)?,
+            ),
+            BinaryOp::Sub => (
+                lhs_coefficient.checked_sub(rhs_coefficient)?,
+                lhs_offset.checked_sub(rhs_offset)?,
+            ),
+            BinaryOp::Mul if lhs_coefficient == 0 => (
+                rhs_coefficient.checked_mul(lhs_offset)?,
+                rhs_offset.checked_mul(lhs_offset)?,
+            ),
+            BinaryOp::Mul if rhs_coefficient == 0 => (
+                lhs_coefficient.checked_mul(rhs_offset)?,
+                lhs_offset.checked_mul(rhs_offset)?,
+            ),
+            BinaryOp::Shl if rhs_coefficient == 0 && (0..32).contains(&rhs_offset) => {
+                let factor = 1_i64.checked_shl(u32::try_from(rhs_offset).ok()?)?;
+                (
+                    lhs_coefficient.checked_mul(factor)?,
+                    lhs_offset.checked_mul(factor)?,
+                )
+            }
+            _ => return None,
+        };
+        if !range_fits(coefficient, offset, range) {
+            return None;
+        }
+        for inst in rhs_chain {
+            if !lhs_chain.contains(&inst) {
+                lhs_chain.push(inst);
+            }
+        }
+        if !lhs_chain.contains(&value) {
+            lhs_chain.push(value);
+        }
+        Some((coefficient, offset, lhs_chain))
+    }
+
+    let (coefficient, offset, chain) = classify(data, looop, base, value, range)?;
+    if coefficient == 0
+        || chain.is_empty()
+        || i32::try_from(coefficient).is_err()
+        || i32::try_from(offset).is_err()
+    {
+        return None;
+    }
+    Some(DerivedInductionVariable {
+        value,
+        base,
+        coefficient,
+        offset,
+        chain,
+    })
+}
+
 fn header_incoming(
     data: &FunctionData,
     cfg: &CFG,
@@ -403,6 +592,38 @@ mod tests {
     fn only_loop(loops: &LoopAnalysis) -> &Loop {
         assert_eq!(loops.loops().len(), 1);
         &loops.loops()[0]
+    }
+
+    #[test]
+    fn computes_exact_constant_trip_counts() {
+        for (initial, bound, step, direction, expected) in [
+            (0, 0, 1, InductionDirection::Forward, Some(0)),
+            (0, 1, 1, InductionDirection::Forward, Some(1)),
+            (0, 7, 2, InductionDirection::Forward, Some(4)),
+            (5, 0, -1, InductionDirection::Backward, Some(5)),
+            (7, 0, -2, InductionDirection::Backward, Some(4)),
+            (
+                i32::MIN,
+                i32::MIN + 1,
+                1,
+                InductionDirection::Forward,
+                Some(1),
+            ),
+            (
+                i32::MAX,
+                i32::MAX - 1,
+                -1,
+                InductionDirection::Backward,
+                Some(1),
+            ),
+            (0, 4, -1, InductionDirection::Forward, None),
+            (4, 0, 1, InductionDirection::Backward, None),
+        ] {
+            assert_eq!(
+                constant_trip_count_values(initial, bound, step, direction),
+                expected
+            );
+        }
     }
 
     fn assert_single_iv(

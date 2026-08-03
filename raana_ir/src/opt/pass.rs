@@ -189,6 +189,11 @@ impl PassesManager {
         let simplify_cfg = Box::new(simplify_cfg::SimplifyCFG);
         p.register(simplify_cfg);
 
+        // Fully unroll small exact-trip loops while they are still in the
+        // test-at-top form recognized by the induction analysis.
+        let loop_unroll = Box::new(loop_unroll::LoopUnroll);
+        p.register(loop_unroll);
+
         // Rotate test-at-top countdown loops to test-at-bottom so the
         // backend can fuse the decrement with the loop test.
         let rotate_loops = Box::new(rotate_loops::RotateLoops);

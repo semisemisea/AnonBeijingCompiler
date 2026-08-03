@@ -855,9 +855,9 @@ pub enum MInst {
         clobbers: PRegSet,
         label: Label,
     },
-    /// A tail transfer with arguments forced into the ABI registers. A
-    /// function target restores the current frame before jumping; a local
-    /// target keeps it and is used for self-tail-recursion loops.
+    /// A tail call: the epilogue (frame restore) is emitted ahead of this
+    /// instruction, then control transfers to `label` with `b`, reusing the
+    /// caller's frame. `args` are forced into the ABI argument registers.
     TailCall {
         args: Vec<CallArgPair>,
         clobbers: PRegSet,
@@ -957,14 +957,6 @@ impl From<StackAMode> for AMode {
 impl MachInst for MInst {
     fn verify(&self) -> Result<(), String> {
         MInst::verify(self).map_err(str::to_owned)
-    }
-
-    fn needs_epilogue(&self) -> bool {
-        match self {
-            Self::Ret => true,
-            Self::TailCall { label, .. } => label.block().is_none(),
-            _ => false,
-        }
     }
 
     type ABISpec = AArch64Abi;

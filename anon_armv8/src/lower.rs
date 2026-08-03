@@ -1174,8 +1174,8 @@ fn lower_call(
 /// register arguments are forced into the ABI argument registers via the
 /// `TailCall` instruction's fixed-register operands, and stack arguments are
 /// stored to the incoming-argument slots ahead of it. The emitter prepends the
-/// epilogue before cross-function transfers. Self-recursive calls instead jump
-/// to the local entry block and keep the current frame.
+/// epilogue (frame restore) to the `TailCall`, after which it emits `b callee`
+/// — reusing the caller's frame so the recursion runs in constant stack space.
 ///
 /// Tail-call elimination guarantees that caller and callee signatures match,
 /// so `abi.arg_slot(idx)` gives the correct destination for every argument.
@@ -1200,20 +1200,11 @@ fn lower_tail_call(
             }),
         }
     }
-    let callee = tail_call.callee();
-    let self_recursive = ctx.arena.curr_func == Some(callee);
-    let label = if self_recursive {
-        // Stay in the current invocation: argument moves target the same ABI
-        // locations and control resumes after the one-time prologue.
-        Label::from_block(ctx.entry_block())
-    } else {
-        ctx.set_has_calls();
-        Label::from_function(callee)
-    };
+    ctx.set_has_calls();
     ctx.emit(MInst::TailCall {
         args,
         clobbers: regs::DEFAULT_CLOBBERS,
-        label,
+        label: Label::from_function(tail_call.callee()),
     });
     LoweredOutput::None
 }

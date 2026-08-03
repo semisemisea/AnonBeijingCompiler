@@ -41,13 +41,6 @@ pub trait MachInst: Clone + Debug {
 
     fn is_term(&self) -> MachTerminator;
 
-    /// Whether the emitter must restore the current frame before this
-    /// instruction. Backends may override this for return-like instructions
-    /// that stay within the current invocation.
-    fn needs_epilogue(&self) -> bool {
-        matches!(self.is_term(), MachTerminator::Return)
-    }
-
     fn rc_for_type(ty: LoweredType) -> (&'static [RegClass], &'static [LoweredType]);
 
     fn gen_jump(target: MirBlockIndex) -> Self;

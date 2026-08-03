@@ -1055,21 +1055,6 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         self.vcode.vcode.abi.arg_slot(idx)
     }
 
-    /// Return the lowered block that receives control on function entry.
-    pub fn entry_block(&self) -> MirBlockIndex {
-        let entry = self
-            .arena
-            .f()
-            .layout()
-            .entry_bb()
-            .expect("lowered function must have an entry block")
-            .bb();
-        self.vcode
-            .block_order()
-            .lowered_index_for_block(entry)
-            .expect("entry block must be present in lowering order")
-    }
-
     pub fn emit(&mut self, mach_inst: I) {
         trace!(target: "taki_mir::lower", "function={} HIR inst={:?} selected MInst={mach_inst:?}", self.arena.f().name(), self.cur_inst);
         self.ir_inst.push(mach_inst);

@@ -280,29 +280,28 @@ vectorizer pass（源码检索无 vectorize/unroll/slp）。clang/gcc 才做自�
 
 ### 5.3 Phase 1：机器层显式 SIMD 通路
 
-M39 已完成（见「已完成里程碑摘要」）。遗留说明：`From<&HirType>` 的向量映射
-与显式向量 IR 入口在 M40 引入（M39 验收用后端单测直接构造 VCode）。
+M39 已完成（见「已完成里程碑摘要」）。M40 进行中：NEON 指令集已完成，剩余见下。
 
 #### M40：最小 NEON ISel（显式向量指令通路）
 
-- `anon_armv8/src/instructions.rs` 新增 `MInst` variant：
-  - 数据移动：`VecSplat`（`dup`）、`VecMovImm`（`movi/mvni`）、lane 存取
-    `VecExtractLane`/`VecInsertLane`；
-  - 访存：`VecLd1{Align,Unalign}`/`VecSt1{Align,Unalign}`（`ld1/st1`，128-bit）；
-  - 运算：向量 `add/sub/mul/fmla/and/or/xor/min/max`（整型 `V4I32` + 浮点
-    `V4F32`/`V2F64`）；
-  - 比较/选择：`cmeq/cmgt/bsl`（为 if-conversion 后 select 的向量化备料）；
-  - 转换/归约：`V4I32<->V4F32` cvt、`addv` 水平归约。
-- `anon_armv8/src/lower.rs`：`lower_inst` 分派新增向量分支；`reg_class_for_type`
-  把向量类型映射到 `RegClass::Vector`；向量 load/store 复用
-  `fold_gep_constant_offset` / `sink_gep_into_address`（连续 offset 走 addressing
-  mode）。
-- 对齐访存：已知 16 字节对齐（`alignof` 可证）用对齐 `ld1`；未知用非对齐，
-  宁慢勿错。
-- 显式向量 IR 入口：`raana_ir` 增加临时显式向量 inst kind（或在后端单测直接构造
-  VCode）——Phase 1 只验证"IR/单测 → NEON 汇编"通路，不要求前端语法。
-- 验收：emit 单测（仿 `emits_adjacent_*`）覆盖各 variant 的 GNU 汇编文本；显式
-  向量用例能生成 NEON 指令并 QEMU 差分正确。
+已完成：
+- `anon_armv8/src/instructions.rs`：`VecLd1/VecSt1`（`ld1/st1 {vN.16b}, [base]`）、
+  `VecDup`（`dup`，GPR/浮点标量源）、`VecArithRRR`（`add/sub/mul .4s/.2d`）、
+  `VecFmla`、`VecBitwise`（`and/orr/eor .16b`）、`VecCmp`（`cmeq/cmgt`）、
+  `VecBsl`、`VecCvt`（`scvtf/fcvtzs`）、`VecAddv`（`addv s,v.4s`）。get_operands、
+  emit（GNU 汇编文本）、DCE 白名单、scheduler 依赖均已接入。
+- `taki_mir/src/emit.rs`：`emit_vcode_assembly` 公开接口——后端可直构显式 SIMD
+  VCode 并渲染为汇编。
+- 验证：各 variant emit 单测（GNU 文本 + clang 交叉汇编）；`explicit_vector_vcode_
+  emits_neon_assembly` 走完整 AArch64 管线（RA→finalize→emit）生成 NEON。
+
+剩余：
+- `VecMovImm`（`movi/mvni`）、lane 存取 `VecExtractLane/VecInsertLane`、向量
+  `min/max` 未加（M44 需要时补）。
+- `lower.rs` 向量分派 + 显式向量 IR 入口（`raana_ir` 临时 inst kind）未加——
+  QEMU 差分验证留给 M41（向量 ABI 使函数可调用后）。
+- 对齐访存：已知 16 字节对齐用对齐 `ld1`；未知用非对齐，宁慢勿错（M43
+  versioning 保证）。
 
 #### M41：向量 ABI + 调度 profile + 显式向量验证
 

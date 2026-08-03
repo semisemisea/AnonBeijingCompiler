@@ -130,6 +130,9 @@ fn alu_op_for_hir_binary(op: BinaryOp, ty: &HirType) -> AluRRROP {
         (BinaryOp::Eq | BinaryOp::NotEq, _) => {
             unreachable!("eq/ne lower through sub + seqz/snez")
         }
+        (BinaryOp::Min | BinaryOp::Max, _) => {
+            unreachable!("vector min/max requires a vector-capable backend")
+        }
     }
 }
 
@@ -533,6 +536,14 @@ fn lower_binary(
                     rs: less,
                     imm: Imm12::ONE,
                 });
+            }
+            BinaryOp::Min | BinaryOp::Max => {
+                ctx.lowering_panic(
+                    "RISC-V instruction selection",
+                    "vector min/max requires a vector-capable backend",
+                    Some(arena.inst_data(binary.lhs()).ty()),
+                    Some(arena.inst_data(inst).ty()),
+                );
             }
         }
     }
@@ -1105,6 +1116,13 @@ impl LowerBackend for Riscv64Backend {
             InstKind::Call(call) => lower_call(ctx, arena, inst, call),
             InstKind::TailCall(tail_call) => lower_tail_call(ctx, arena, tail_call),
             InstKind::Return(ret) => lower_return(ctx, arena, ret),
+            InstKind::Fma(..)
+            | InstKind::VectorSplat(..)
+            | InstKind::VectorExtractElement(..)
+            | InstKind::VectorInsertElement(..)
+            | InstKind::VectorReduce(..) => {
+                unreachable!("vector IR requires a vector-capable backend")
+            }
             InstKind::Jump(..) | InstKind::Branch(..) => {
                 unreachable!("should not lower branch instruction in here.")
             }

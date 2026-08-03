@@ -3,9 +3,9 @@
 本文档只记录尚未完成的工作。已完成里程碑只保留一行摘要，历史设计与实现细节
 以 Git 提交记录和代码测试为准，不在这里重复维护。
 
-> 进行中：§2 主计划 E——matmul 标量收敛（M49-M51 已完成，进行 M52-M55），
-> 以 `01_mm1` 为基线收敛内层循环到 gcc 标量水平（内层 ~8 条/element）。
-> SIMD Phase 2（M42-M46）仍搁置，见 §3。
+> 进行中：§2 主计划 E——matmul 标量收敛（M49-M52 已完成，进行 M53-M55），
+> 以 `01_mm1` 为基线收敛内层循环到 gcc 标量水平（内层 ~9 条/element 含
+> `subs;b.ne`）。SIMD Phase 2（M42-M46）仍搁置，见 §3。
 
 ## 已完成里程碑摘要
 
@@ -20,6 +20,9 @@
   （BRANCH14/19/26 与 RISC-V B/JAL）。
 - **M28-M29**：分支发射重构（对照 Cranelift MachBuffer）——RISC-V `CondBr`
   slot 化、`beqz/bnez` 收敛、veneer 全覆盖、buffer 行为测试与门禁。
+- **M52**：count-up 循环旋转 + `subs` 融合——`rotate_count_up`（守卫 + 倒计时
+  header param + exit 参数化重映射）；内层 j 循环变 `subs x,#1; b.ne`（~9
+  条/element）。functional 109/109、h_functional 40/40、RISC-V 109/109。
 - **M50**：PSR 触发（含 loop-invariant header 参数支持）+ LICM 同类修复——
   `C[i][j]`/`B[k][j]` 指针化、`A[i][k]` GEP 外提；内层 j 循环 ~20 → ~8
   条/element。functional 109/109、h_functional 40/40、RISC-V 109/109。
@@ -236,23 +239,19 @@ alloca（`%v_A/%v_B/%v_C`）类型是 `**[i32;1024]`（**指针**），被排除
   `hoists_pure_binary_ops_but_not_memory_side_effects` 约束一致）。别名分析
   属 M42（SIMD 前置），后续再评估。无需新增代码。
 
-#### M52：count-up 循环旋转 + `subs` 融合（L2a）
+#### M52：count-up 循环旋转 + `subs` 融合（L2a）✅
 
-- 文件：`raana_ir/src/opt/passes/rotate_loops.rs`（或新增 `countdown.rs`）、
-  `anon_armv8` pre-RA peephole
-- 现状：`rotate_loops` 只处理 `while(len){len-=1}`（header 直接测计数器）；
-  SysY `while(i<n){i+=1}` 是 count-up（`lt i bound` 比较 + BIV step=1），不触发。
-- 改动：
-  1. 识别：header 测试 `lt i bound`，bound 为 header 前可用不变值，i 为 BIV
-     step=1；
-  2. 转换：header 直通 body；新增倒计时 header param t（初值 = bound），
-     latch `t' = t-1; br t', header(t'), exit`；i 若已被 M50 指针替换则删除，
-     否则保留原更新；
-  3. 后端 AArch64：`sub`+`cmp` → `subs`（branch 吃 NZCV）。`MInst::SubsRRImm`
-     M33 已落地，确认标志融合发射正确；
-  4. 只在 AArch64 注册，RISC-V 保持现状。
-- 验收：中间/内层循环出现 `subs x,#1; b.ne`；trip=0/1 边界正确（头测试经
-  "入口非零"证明保留）；专项单测 + QEMU 差分。
+- 状态：**已完成**。`rotate_loops` 新增 `rotate_count_up`（与既有 countdown
+  旋转并列）：识别 `br lt(i, bound), body, exit` + 回边 `add i, 1`；新增倒计时
+  header param `t`（初值 `bound - i0`），preheader 加 `t > 0` 守卫（保 trip=0
+  语义），latch 变 `subs t,#1; b.ne`。exit 若读 header 参数则参数化 + 用
+  `remap_refs` 重映射（守卫/latch 分别传 entry/末次迭代值，SSA 支配正确）。
+- 验收通过：内层 j 循环出现 `subs x,#1; b.ne`（~9 条/element，含 j 更新）；
+  零 C 循环、i 循环、main 5 次 mm 循环均旋转；trip=0 守卫单测 + QEMU 差分
+  （functional 109/109、h_functional 40/40、perf 01_mm1/01_mm2/01_mm3/
+  huffman-01 PASS、RISC-V 109/109、双 target byte-identical）。新增单测：
+  `rotates_count_up_loop_into_guarded_countdown`、
+  `gives_the_exit_block_parameters_when_it_reads_the_induction_variable`。
 
 #### M53：零 store 循环 → MemZero/memset（L2b）
 

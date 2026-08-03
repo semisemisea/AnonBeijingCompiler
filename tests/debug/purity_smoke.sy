@@ -1,0 +1,18 @@
+// 纯函数：无副作用，返回值未被使用
+int sq(int n) { return n * n; }
+
+// 读全局但不写：read-only
+int g[4];
+int read_g() { return g[0]; }
+
+int main() {
+    int i = 0;
+    int sum = 0;
+    while (i < 10) {
+        sum = sum + i;
+        sq(i);       // 纯调用，返回值未用 -> DCE 应删除
+        sum = sum + read_g();  // read-only 调用，返回值被用 -> 保留，但循环内无写 g -> LICM 可外提
+        i = i + 1;
+    }
+    return sum;
+}

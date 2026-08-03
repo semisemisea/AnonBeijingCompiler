@@ -111,9 +111,9 @@ impl LoweredType {
             (TypeKind::Int32, 4) => V4I32,
             (TypeKind::Float32, 4) => V4F32,
             (TypeKind::Pointer(_), 2) => V2I64,
-            _ => panic!(
-                "unsupported machine vector type: <{lanes} x {elem}> (only 128-bit vectors)"
-            ),
+            _ => {
+                panic!("unsupported machine vector type: <{lanes} x {elem}> (only 128-bit vectors)")
+            }
         }
     }
 }
@@ -178,7 +178,14 @@ mod tests {
     fn vector_type_encoding_is_disjoint_from_scalars() {
         // Regression guard: the vector marker bit must not alias any scalar
         // type (F32 in particular shares a byte with the earlier lane field).
-        for scalar in [I32, I64, F32, LoweredType::new_i32(), LoweredType::new_i64(), LoweredType::new_f32()] {
+        for scalar in [
+            I32,
+            I64,
+            F32,
+            LoweredType::new_i32(),
+            LoweredType::new_i64(),
+            LoweredType::new_f32(),
+        ] {
             assert!(!scalar.is_vector(), "{scalar:?} must not be a vector");
             assert_eq!(scalar.lanes(), 0);
         }

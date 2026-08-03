@@ -699,7 +699,10 @@ entry_0:
         assert!(output.contains("fma undef, undef, undef"), "{output}");
         assert!(output.contains("vector_splat 7"), "{output}");
         assert!(output.contains("vector_extract_element %1, 0"), "{output}");
-        assert!(output.contains("vector_insert_element %1, 7, 0"), "{output}");
+        assert!(
+            output.contains("vector_insert_element %1, 7, 0"),
+            "{output}"
+        );
         assert!(output.contains("vector_reduce Add, %1"), "{output}");
         assert!(output.contains("<4 x i32>, size = 16"), "{output}");
     }

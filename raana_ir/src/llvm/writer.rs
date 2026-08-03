@@ -732,8 +732,7 @@ impl<'a> LlvmWriter<'a> {
         let is_vector = self.arena.inst_data(binary.lhs()).ty().is_vector();
 
         if is_vector {
-            let TypeKind::Vector(_elem, lanes) =
-                self.arena.inst_data(binary.lhs()).ty().kind()
+            let TypeKind::Vector(_elem, lanes) = self.arena.inst_data(binary.lhs()).ty().kind()
             else {
                 unreachable!("vector operand has a vector type");
             };
@@ -1001,7 +1000,12 @@ impl<'a> LlvmWriter<'a> {
         )
     }
 
-    fn visit_vector_splat(&mut self, splat: &VectorSplat, inst: Inst, ty: &Type) -> std::fmt::Result {
+    fn visit_vector_splat(
+        &mut self,
+        splat: &VectorSplat,
+        inst: Inst,
+        ty: &Type,
+    ) -> std::fmt::Result {
         let TypeKind::Vector(elem, lanes) = ty.kind() else {
             unreachable!("splat produces a vector");
         };
@@ -1062,14 +1066,24 @@ impl<'a> LlvmWriter<'a> {
         )
     }
 
-    fn visit_vector_reduce(&mut self, reduce: &VectorReduce, inst: Inst, ty: &Type) -> std::fmt::Result {
+    fn visit_vector_reduce(
+        &mut self,
+        reduce: &VectorReduce,
+        inst: Inst,
+        ty: &Type,
+    ) -> std::fmt::Result {
         let TypeKind::Vector(elem, lanes) = self.arena.inst_data(reduce.src()).ty().kind() else {
             unreachable!("reduce source is a vector");
         };
         let elem_llvm = self.type_to_llvm(elem);
         let src_llvm = self.type_to_llvm(self.arena.inst_data(reduce.src()).ty());
         let intrinsic = format!("@llvm.vector.reduce.add.v{lanes}e{}", elem_llvm);
-        let decl = format!("declare {} {}({})", self.type_to_llvm(ty), intrinsic, src_llvm);
+        let decl = format!(
+            "declare {} {}({})",
+            self.type_to_llvm(ty),
+            intrinsic,
+            src_llvm
+        );
         self.reduce_decls.insert(decl);
         writeln!(
             self.buffer,

@@ -5,6 +5,7 @@ use rustc_hash::FxHashMap as HashMap;
 pub(crate) mod body_clone;
 pub mod call;
 pub mod cfg;
+pub mod column_major_cost;
 pub mod gep;
 pub mod global_handle;
 pub mod logical_edge;

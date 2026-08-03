@@ -229,6 +229,16 @@ impl Pass for IPSCCP {
                         };
                         merge_and_extend(node, status, &mut lattice_map);
                     }
+                    // Vector operations never carry an i32 constant lattice; the
+                    // frontend (and any future vectorizer) emits them on vector
+                    // operands, which are always Top here.
+                    InstKind::Fma(..)
+                    | InstKind::VectorSplat(..)
+                    | InstKind::VectorExtractElement(..)
+                    | InstKind::VectorInsertElement(..)
+                    | InstKind::VectorReduce(..) => {
+                        merge_and_extend(node, Lattice::Top, &mut lattice_map);
+                    }
                     InstKind::Jump(jump) => {
                         let params = data.bb_data(jump.target()).params();
                         for (&arg, &param) in jump.args().iter().zip(params) {
@@ -555,6 +565,8 @@ fn mathematic_operation(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
         BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
         BinaryOp::Shr => (lhs as u32).wrapping_shr(rhs as u32) as i32,
         BinaryOp::Sar => lhs.wrapping_shr(rhs as u32),
+        BinaryOp::Min => lhs.min(rhs),
+        BinaryOp::Max => lhs.max(rhs),
     }
 }
 

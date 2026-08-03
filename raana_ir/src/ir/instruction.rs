@@ -4,8 +4,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ir::{
     inst_kind::{
-        Aggregate, BasicBlockUsage, Binary, Branch, Call, Cast, GetElemPtr, GlobalAlloc, InstKind,
-        InstUsage, Jump, Load, MemZero, Return, Select, Store, TailCall,
+        Aggregate, BasicBlockUsage, Binary, Branch, Call, Cast, Fma, GetElemPtr, GlobalAlloc,
+        InstKind, InstUsage, Jump, Load, MemZero, Return, Select, Store, TailCall,
+        VectorExtractElement, VectorInsertElement, VectorReduce, VectorSplat,
     },
     remap::EntityMapper,
     types::Type,
@@ -205,6 +206,43 @@ impl InstData {
                         .iter()
                         .map(|&value| mapper.map_inst(value))
                         .collect::<Result<Vec<_>, _>>()?,
+                )
+                .kind
+            }
+            InstKind::Fma(fma) => {
+                Fma::new_data(
+                    mapper.map_inst(fma.acc())?,
+                    mapper.map_inst(fma.lhs())?,
+                    mapper.map_inst(fma.rhs())?,
+                    self.ty().clone(),
+                )
+                .kind
+            }
+            InstKind::VectorSplat(splat) => {
+                VectorSplat::new_data(mapper.map_inst(splat.src())?, self.ty().clone()).kind
+            }
+            InstKind::VectorExtractElement(extract) => {
+                VectorExtractElement::new_data(
+                    mapper.map_inst(extract.src())?,
+                    mapper.map_inst(extract.index())?,
+                    self.ty().clone(),
+                )
+                .kind
+            }
+            InstKind::VectorInsertElement(insert) => {
+                VectorInsertElement::new_data(
+                    mapper.map_inst(insert.vector())?,
+                    mapper.map_inst(insert.element())?,
+                    mapper.map_inst(insert.index())?,
+                    self.ty().clone(),
+                )
+                .kind
+            }
+            InstKind::VectorReduce(reduce) => {
+                VectorReduce::new_data(
+                    reduce.op(),
+                    mapper.map_inst(reduce.src())?,
+                    self.ty().clone(),
                 )
                 .kind
             }

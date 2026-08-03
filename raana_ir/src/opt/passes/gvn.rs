@@ -156,7 +156,12 @@ impl ValueNumbering {
             | InstKind::Return(..)
             | InstKind::Jump(..)
             | InstKind::Branch(..)
-            | InstKind::TailCall(..) => (ValueKey::Identity { ty, value }, false),
+            | InstKind::TailCall(..)
+            | InstKind::Fma(..)
+            | InstKind::VectorSplat(..)
+            | InstKind::VectorExtractElement(..)
+            | InstKind::VectorInsertElement(..)
+            | InstKind::VectorReduce(..) => (ValueKey::Identity { ty, value }, false),
         };
 
         let number = *self.by_key.entry(key).or_insert_with(|| {

@@ -20,8 +20,9 @@ pub use basic_block::BasicBlock;
 pub use builder::{BasicBlockBuilders, GlobalBuilder, LocalBuilder};
 pub use function::{Function, FunctionData};
 pub use inst_kind::{
-    Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Cast, GetElemPtr, InstKind, Integer,
-    Jump, Load, Return, Select, Store, TailCall,
+    Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Cast, Fma, GetElemPtr, InstKind,
+    Integer, Jump, Load, Return, Select, Store, TailCall, VectorExtractElement,
+    VectorInsertElement, VectorReduce, VectorReduceOp, VectorSplat,
 };
 pub use instruction::{Inst, InstData};
 pub use program::Program;

@@ -25,7 +25,13 @@ impl Binary {
     }
 
     pub fn new_data(lhs: Inst, rhs: Inst, op: BinaryOp, ty: Type) -> InstData {
-        let ty = if op.is_compare() { Type::get_i32() } else { ty };
+        // Scalar comparisons produce an i32 boolean. Vector comparisons produce
+        // a vector mask (all-ones / zero lanes) of the operand's vector type.
+        let ty = if op.is_compare() && !ty.is_vector() {
+            Type::get_i32()
+        } else {
+            ty
+        };
         InstData::new(ty, InstKind::Binary(Binary { lhs, rhs, op }))
     }
 }
@@ -49,6 +55,10 @@ pub enum BinaryOp {
     Shl,
     Shr,
     Sar,
+    /// Vector lane-wise minimum (signed for integers).
+    Min,
+    /// Vector lane-wise maximum (signed for integers).
+    Max,
 }
 
 impl BinaryOp {
@@ -94,7 +104,7 @@ impl BinaryOp {
     }
 
     pub fn is_commutative_for(&self, operand_ty: &Type) -> bool {
-        matches!(self, BinaryOp::NotEq | BinaryOp::Eq)
+        matches!(self, BinaryOp::NotEq | BinaryOp::Eq | BinaryOp::Min | BinaryOp::Max)
             || (operand_ty.is_i32()
                 && matches!(
                     self,
@@ -126,6 +136,8 @@ impl std::fmt::Display for BinaryOp {
                 BinaryOp::Shl => "shl",
                 BinaryOp::Shr => "shr",
                 BinaryOp::Sar => "sar",
+                BinaryOp::Min => "min",
+                BinaryOp::Max => "max",
             }
         )
     }
@@ -180,7 +192,7 @@ mod tests {
             assert!(op.is_commutative_for(&i32_ty));
             assert!(!op.is_commutative_for(&f32_ty));
         }
-        for op in [BinaryOp::Eq, BinaryOp::NotEq] {
+        for op in [BinaryOp::Eq, BinaryOp::NotEq, BinaryOp::Min, BinaryOp::Max] {
             assert!(op.is_commutative_for(&i32_ty));
             assert!(op.is_commutative_for(&f32_ty));
         }
@@ -194,5 +206,15 @@ mod tests {
             assert!(!op.is_commutative_for(&i32_ty));
             assert!(!op.is_commutative_for(&f32_ty));
         }
+    }
+
+    #[test]
+    fn min_and_max_display_and_are_not_comparisons() {
+        assert_eq!(BinaryOp::Min.to_string(), "min");
+        assert_eq!(BinaryOp::Max.to_string(), "max");
+        assert!(!BinaryOp::Min.is_compare());
+        assert!(!BinaryOp::Max.is_compare());
+        assert_eq!(BinaryOp::Min.complement_integer_compare(), None);
+        assert_eq!(BinaryOp::Max.swap_compare_args(), None);
     }
 }

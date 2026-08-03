@@ -9,7 +9,8 @@ use crate::ir::{
     Aggregate, Function, FunctionData, InstKind, Program, Type,
     arena::Arena,
     inst_kind::{
-        Binary, Branch, Call, Cast, GetElemPtr, Jump, Load, Return, Select, Store, TailCall,
+        Binary, Branch, Call, Cast, Fma, GetElemPtr, Jump, Load, Return, Select, Store, TailCall,
+        VectorExtractElement, VectorInsertElement, VectorReduce, VectorSplat,
     },
     instruction::{Inst, InstData},
     layout::BasicBlockLayout,
@@ -291,6 +292,15 @@ impl Writer<'_> {
             ),
             InstKind::Return(ret) => self.visit_return(ret),
             InstKind::Store(store) => self.visit_store(store),
+            InstKind::Fma(fma) => self.visit_fma(fma, data.ty()),
+            InstKind::VectorSplat(splat) => self.visit_vector_splat(splat, data.ty()),
+            InstKind::VectorExtractElement(extract) => {
+                self.visit_vector_extract_element(extract, data.ty())
+            }
+            InstKind::VectorInsertElement(insert) => {
+                self.visit_vector_insert_element(insert, data.ty())
+            }
+            InstKind::VectorReduce(reduce) => self.visit_vector_reduce(reduce, data.ty()),
             _ => panic!("invalid local instruction"),
         }?;
         writeln!(self.buffer)
@@ -474,6 +484,70 @@ impl Writer<'_> {
             get_name!(self, store.dest()),
         )
     }
+
+    fn visit_fma(&mut self, fma: &Fma, ty: &Type) -> std::fmt::Result {
+        write!(
+            self.buffer,
+            "fma {}, {}, {} <type = {}, size = {}>",
+            get_name!(self, fma.acc()),
+            get_name!(self, fma.lhs()),
+            get_name!(self, fma.rhs()),
+            ty,
+            ty.size()
+        )
+    }
+
+    fn visit_vector_splat(&mut self, splat: &VectorSplat, ty: &Type) -> std::fmt::Result {
+        write!(
+            self.buffer,
+            "vector_splat {} <type = {}, size = {}>",
+            get_name!(self, splat.src()),
+            ty,
+            ty.size()
+        )
+    }
+
+    fn visit_vector_extract_element(
+        &mut self,
+        extract: &VectorExtractElement,
+        ty: &Type,
+    ) -> std::fmt::Result {
+        write!(
+            self.buffer,
+            "vector_extract_element {}, {} <type = {}, size = {}>",
+            get_name!(self, extract.src()),
+            get_name!(self, extract.index()),
+            ty,
+            ty.size()
+        )
+    }
+
+    fn visit_vector_insert_element(
+        &mut self,
+        insert: &VectorInsertElement,
+        ty: &Type,
+    ) -> std::fmt::Result {
+        write!(
+            self.buffer,
+            "vector_insert_element {}, {}, {} <type = {}, size = {}>",
+            get_name!(self, insert.vector()),
+            get_name!(self, insert.element()),
+            get_name!(self, insert.index()),
+            ty,
+            ty.size()
+        )
+    }
+
+    fn visit_vector_reduce(&mut self, reduce: &VectorReduce, ty: &Type) -> std::fmt::Result {
+        write!(
+            self.buffer,
+            "vector_reduce {:?}, {} <type = {}, size = {}>",
+            reduce.op(),
+            get_name!(self, reduce.src()),
+            ty,
+            ty.size()
+        )
+    }
 }
 
 #[cfg(test)]
@@ -590,5 +664,43 @@ entry_0:
         assert!(output.contains("memzero %"), "{output}");
         assert!(output.contains(", 16"), "{output}");
         assert!(!output.contains("= memzero"), "{output}");
+    }
+
+    #[test]
+    fn formats_vector_ops() {
+        let mut p = Program::new();
+        let f = p.new_function(Type::get_i32(), "vec_ops".to_string(), vec![]);
+        let fd = p.func_data_mut(f);
+        let b = fd
+            .new_basic_block()
+            .basic_block("entry".to_string(), vec![]);
+        fd.layout_mut().push_bb_back(b);
+        let v4i32 = Type::get_vector(Type::get_i32(), 4);
+        let a = fd.new_local_inst().undef(v4i32.clone());
+        let b2 = fd.new_local_inst().undef(v4i32.clone());
+        let src = fd.new_local_inst().integer(7);
+        let zero = fd.new_local_inst().integer(0);
+        let fma = fd.new_local_inst().fma(a, b2, a);
+        let splat = fd.new_local_inst().vector_splat(src, v4i32.clone());
+        let extract = fd.new_local_inst().vector_extract_element(splat, zero);
+        let insert = fd.new_local_inst().vector_insert_element(splat, src, zero);
+        let reduce = fd
+            .new_local_inst()
+            .vector_reduce(crate::ir::VectorReduceOp::Add, splat);
+        for inst in [fma, splat, extract, insert, reduce] {
+            fd.layout_mut().insert_inst(b, inst);
+        }
+        let ret = fd.new_local_inst().ret(Some(reduce));
+        fd.layout_mut().insert_inst(b, ret);
+
+        let mut writer = Writer::new(&p);
+        writer.write().unwrap();
+        let output = writer.finish();
+        assert!(output.contains("fma undef, undef, undef"), "{output}");
+        assert!(output.contains("vector_splat 7"), "{output}");
+        assert!(output.contains("vector_extract_element %1, 0"), "{output}");
+        assert!(output.contains("vector_insert_element %1, 7, 0"), "{output}");
+        assert!(output.contains("vector_reduce Add, %1"), "{output}");
+        assert!(output.contains("<4 x i32>, size = 16"), "{output}");
     }
 }

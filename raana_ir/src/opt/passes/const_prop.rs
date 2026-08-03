@@ -527,5 +527,7 @@ fn mathematic_operation(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
         BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
         BinaryOp::Shr => (lhs as u32).wrapping_shr(rhs as u32) as i32,
         BinaryOp::Sar => lhs.wrapping_shr(rhs as u32),
+        BinaryOp::Min => lhs.min(rhs),
+        BinaryOp::Max => lhs.max(rhs),
     }
 }

@@ -4,6 +4,7 @@ pub mod binary;
 pub mod branch;
 pub mod call;
 pub mod cast;
+pub mod fma;
 pub mod global_alloc;
 pub mod jump;
 pub mod mem_zero;
@@ -13,6 +14,9 @@ pub mod scalar;
 pub mod select;
 pub mod stack_mem;
 pub mod tail_call;
+pub mod vector_lane;
+pub mod vector_reduce;
+pub mod vector_splat;
 
 pub use aggregate::Aggregate;
 pub use arg_ref::BlockArgRef;
@@ -21,6 +25,7 @@ pub use binary::BinaryOp;
 pub use branch::Branch;
 pub use call::Call;
 pub use cast::Cast;
+pub use fma::Fma;
 pub use global_alloc::GlobalAlloc;
 pub use jump::Jump;
 pub use mem_zero::MemZero;
@@ -32,6 +37,11 @@ pub use select::Select;
 pub use stack_mem::Load;
 pub use stack_mem::Store;
 pub use tail_call::TailCall;
+pub use vector_lane::VectorExtractElement;
+pub use vector_lane::VectorInsertElement;
+pub use vector_reduce::VectorReduce;
+pub use vector_reduce::VectorReduceOp;
+pub use vector_splat::VectorSplat;
 
 use crate::ir::basic_block::BasicBlock;
 use crate::ir::instruction::Inst;
@@ -58,6 +68,11 @@ pub enum InstKind {
     TailCall(TailCall),
     BlockArgRef(BlockArgRef),
     Aggregate(Aggregate),
+    Fma(Fma),
+    VectorSplat(VectorSplat),
+    VectorExtractElement(VectorExtractElement),
+    VectorInsertElement(VectorInsertElement),
+    VectorReduce(VectorReduce),
 }
 
 impl InstKind {
@@ -171,6 +186,15 @@ impl Iterator for InstUsage<'_> {
                 field_use!(select.cond(), select.if_true(), select.if_false())
             }
             InstKind::Jump(jump) => jump.args().get(cur_index).copied(),
+            InstKind::Fma(fma) => field_use!(fma.acc(), fma.lhs(), fma.rhs()),
+            InstKind::VectorSplat(splat) => field_use!(splat.src()),
+            InstKind::VectorExtractElement(extract) => {
+                field_use!(extract.src(), extract.index())
+            }
+            InstKind::VectorInsertElement(insert) => {
+                field_use!(insert.vector(), insert.element(), insert.index())
+            }
+            InstKind::VectorReduce(reduce) => field_use!(reduce.src()),
         }
     }
 }

@@ -335,6 +335,75 @@ fn visit_and_replace_single(
                 data.replace_inst_with(used_by).ret(Some(rep_with));
             }
         }
+        InstKind::Fma(fma) => {
+            let acc = if fma.acc() == rep {
+                rep_with
+            } else {
+                fma.acc()
+            };
+            let lhs = if fma.lhs() == rep {
+                rep_with
+            } else {
+                fma.lhs()
+            };
+            let rhs = if fma.rhs() == rep {
+                rep_with
+            } else {
+                fma.rhs()
+            };
+            data.replace_inst_with(used_by).fma(acc, lhs, rhs);
+        }
+        InstKind::VectorSplat(splat) => {
+            let src = if splat.src() == rep {
+                rep_with
+            } else {
+                splat.src()
+            };
+            let ty = rep_val_data.ty().clone();
+            data.replace_inst_with(used_by).vector_splat(src, ty);
+        }
+        InstKind::VectorExtractElement(extract) => {
+            let src = if extract.src() == rep {
+                rep_with
+            } else {
+                extract.src()
+            };
+            let index = if extract.index() == rep {
+                rep_with
+            } else {
+                extract.index()
+            };
+            data.replace_inst_with(used_by)
+                .vector_extract_element(src, index);
+        }
+        InstKind::VectorInsertElement(insert) => {
+            let vector = if insert.vector() == rep {
+                rep_with
+            } else {
+                insert.vector()
+            };
+            let element = if insert.element() == rep {
+                rep_with
+            } else {
+                insert.element()
+            };
+            let index = if insert.index() == rep {
+                rep_with
+            } else {
+                insert.index()
+            };
+            data.replace_inst_with(used_by)
+                .vector_insert_element(vector, element, index);
+        }
+        InstKind::VectorReduce(reduce) => {
+            let op = reduce.op();
+            let src = if reduce.src() == rep {
+                rep_with
+            } else {
+                reduce.src()
+            };
+            data.replace_inst_with(used_by).vector_reduce(op, src);
+        }
     }
 }
 

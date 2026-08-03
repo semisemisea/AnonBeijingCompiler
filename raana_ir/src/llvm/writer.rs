@@ -634,11 +634,20 @@ impl<'a> LlvmWriter<'a> {
             }
             InstKind::MemZero(mem_zero) => {
                 put_name!(self, mem_zero.dest());
+                let len = match mem_zero.byte_len_len() {
+                    crate::ir::inst_kind::mem_zero::MemZeroLen::Const(byte_len) => {
+                        byte_len.to_string()
+                    }
+                    crate::ir::inst_kind::mem_zero::MemZeroLen::Value(byte_len) => {
+                        let name = get_name!(self, *byte_len);
+                        format!("zext i32 {name} to i64")
+                    }
+                };
                 writeln!(
                     self.buffer,
                     "call void @llvm.memset.p0.i64(ptr {}, i8 0, i64 {}, i1 false)",
                     get_name!(self, mem_zero.dest()),
-                    mem_zero.byte_len()
+                    len
                 )?;
                 self.used_memset = true;
                 Ok(())

@@ -20,3 +20,4 @@ pub mod specialize;
 pub mod sr;
 pub mod ssa;
 pub mod tco;
+pub mod zero_store_loop;

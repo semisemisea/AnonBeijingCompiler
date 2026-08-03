@@ -1,6 +1,8 @@
 use raana_ir::ir::{
     Binary, BinaryOp, Call, Cast, GetElemPtr, InstKind, Load, Return, Select, Store, TailCall,
-    Type as HirType, TypeKind as HirTypeKind, arena::Arena, inst_kind::MemZero,
+    Type as HirType, TypeKind as HirTypeKind,
+    arena::Arena,
+    inst_kind::{MemZero, MemZeroLen},
 };
 use smallvec::{SmallVec, smallvec};
 
@@ -851,8 +853,50 @@ fn lower_mem_zero(
     arena: ArenaContext<'_>,
     mem_zero: &MemZero,
 ) -> LoweredOutput {
-    let inline_store_count = mem_zero.byte_len() / 4;
-    if mem_zero.byte_len() % 4 == 0 && inline_store_count <= INLINE_MEMZERO_MAX_STORES {
+    match mem_zero.byte_len_len() {
+        MemZeroLen::Const(byte_len) => lower_const_mem_zero(ctx, arena, mem_zero, *byte_len),
+        MemZeroLen::Value(byte_len) => {
+            let dest = ctx.put_value_in_reg(mem_zero.dest());
+            let zero = ctx.alloc_tmp(HirType::get_i32());
+            let byte_len = ctx.put_value_in_reg(*byte_len);
+            ctx.emit(MInst::LoadImm {
+                rd: Writable::from_reg(zero),
+                value: 0,
+            });
+            ctx.emit(MInst::Call {
+                arg_pairs: smallvec![
+                    CallArgPair {
+                        vreg: dest,
+                        preg: a0(),
+                    },
+                    CallArgPair {
+                        vreg: zero,
+                        preg: a1(),
+                    },
+                    CallArgPair {
+                        vreg: byte_len,
+                        preg: a2(),
+                    },
+                ],
+                ret: None,
+                clobbers: DEFAULT_CLOBBERS,
+                label: Label::LibCall(LibCall::Memset),
+            });
+            ctx.set_has_calls();
+            ctx.set_outgoing_arg_size(0);
+            LoweredOutput::None
+        }
+    }
+}
+
+fn lower_const_mem_zero(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    mem_zero: &MemZero,
+    byte_len: usize,
+) -> LoweredOutput {
+    let inline_store_count = byte_len / 4;
+    if byte_len % 4 == 0 && inline_store_count <= INLINE_MEMZERO_MAX_STORES {
         let alloc = matches!(arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
             .then_some(mem_zero.dest());
         let (dest, stack_offset) = if let Some(alloc) = alloc {
@@ -894,7 +938,7 @@ fn lower_mem_zero(
         (ctx.put_value_in_reg(mem_zero.dest()), None)
     };
     let zero = ctx.alloc_tmp(HirType::get_i32());
-    let byte_len = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+    let byte_len_reg = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
     if let Some(offset) = stack_offset {
         ctx.emit(<Riscv64ABI as ABIMachineSpec>::gen_get_stack_addr(
             StackAMode::Slot(offset),
@@ -906,8 +950,8 @@ fn lower_mem_zero(
         value: 0,
     });
     ctx.emit(MInst::LoadImm {
-        rd: Writable::from_reg(byte_len),
-        value: mem_zero.byte_len() as u64,
+        rd: Writable::from_reg(byte_len_reg),
+        value: byte_len as u64,
     });
     ctx.emit(MInst::Call {
         arg_pairs: smallvec![
@@ -920,7 +964,7 @@ fn lower_mem_zero(
                 preg: a1(),
             },
             CallArgPair {
-                vreg: byte_len,
+                vreg: byte_len_reg,
                 preg: a2(),
             },
         ],

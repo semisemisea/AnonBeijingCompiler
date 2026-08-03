@@ -223,6 +223,34 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_self_tail_call_loops_without_rebuilding_a_frame() {
+        let case = MATRIX.iter().find(|c| c.name == "tail_recursion").unwrap();
+        let asm = compile_deterministically(case, Target::Aarch64, 1);
+        let fact = function_section(&asm, "fact");
+
+        assert!(
+            fact.lines().any(|line| {
+                let line = line.trim();
+                line.starts_with("b .L_fact_") && line.contains("entry")
+            }),
+            "self tail call must branch to the local entry block:\n{fact}"
+        );
+        assert!(
+            !fact.contains("b fact"),
+            "self tail call must not re-enter through the function symbol:\n{fact}"
+        );
+        assert_eq!(
+            fact.matches("ret").count(),
+            1,
+            "only the base case should return:\n{fact}"
+        );
+        assert!(
+            !fact.contains("x29") && !fact.contains("x30"),
+            "pure self tail recursion should not create a call frame:\n{fact}"
+        );
+    }
+
+    #[test]
     fn leaf_register_arguments_are_bound_without_spills_or_moves() {
         use anon_armv8::AArch64CodegenConfig;
         use taki_mir::stats::FunctionCodegenStats;

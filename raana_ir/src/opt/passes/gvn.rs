@@ -423,7 +423,16 @@ impl Pass for GlobalInstNumbering {
                         call_leaders.invalidate_matching(|e| write_base_may_hit(base, e));
                     }
                     InstKind::Call(call) => {
-                        load_leaders.record_store();
+                        // A call that writes no external memory (a read-only
+                        // or pure-I/O callee) cannot clobber a loaded value,
+                        // so load leaders stay valid across it.
+                        let may_write = match effects.get(&call.callee()) {
+                            Some(e) => e.has_external_writes(),
+                            None => true,
+                        };
+                        if may_write {
+                            load_leaders.record_store();
+                        }
                         // A sibling call may write what a call leader reads.
                         match effects.get(&call.callee()) {
                             Some(e) => {
@@ -884,6 +893,37 @@ mod tests {
         let data = program.func_data(function);
         // A local store cannot alias gv, so the second call merges.
         assert_eq!(binary_operands(data, sum), (call_a, call_a));
+    }
+
+    #[test]
+    fn read_only_call_does_not_invalidate_load_leaders() {
+        let mut program = Program::new();
+        // A pure void callee: no I/O, no writes.
+        let callee = program.new_function(Type::get_unit(), "pure_void".into(), vec![]);
+        let data = program.func_data_mut(callee);
+        let entry = data.add_entry_block();
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let function = program.new_function(Type::get_i32(), "loads_across_call".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let slot = data.new_local_inst().alloc(Type::get_i32());
+        let load_a = data.new_local_inst().load(slot);
+        let call = data
+            .new_local_inst()
+            .call_with_type(callee, vec![], Type::get_unit());
+        let load_b = data.new_local_inst().load(slot);
+        let sum = data.new_local_inst().binary(BinaryOp::Add, load_a, load_b);
+        let ret = data.new_local_inst().ret(Some(sum));
+        for value in [slot, load_a, call, load_b, sum, ret] {
+            data.layout_mut().insert_inst(entry, value);
+        }
+
+        assert!(GlobalInstNumbering.run(&mut program));
+        let data = program.func_data(function);
+        // A read-only call cannot clobber the slot, so the second load merges.
+        assert_eq!(binary_operands(data, sum), (load_a, load_a));
     }
 
     #[test]

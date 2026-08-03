@@ -107,6 +107,14 @@ impl FunctionSideEffects {
         self.writes_unknown_memory || self.written_array_params.contains(&index)
     }
 
+    /// Does this function write any external memory at all (a global, an
+    /// array parameter, or an unresolved address)?
+    pub fn has_external_writes(&self) -> bool {
+        self.writes_unknown_memory
+            || !self.written_globals.is_empty()
+            || !self.written_array_params.is_empty()
+    }
+
     /// Does this function read any external memory at all (a global, an array
     /// parameter, or an unresolved address)?
     pub fn has_any_read(&self) -> bool {

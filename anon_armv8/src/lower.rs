@@ -1636,14 +1636,58 @@ fn select_branch_condition(
     let InstKind::Binary(outer) = arena.inst_data(cond).kind() else {
         return false;
     };
-    if !is_comparison(outer.op()) || !has_only_user(ctx, cond, branch) {
-        return false;
-    }
-
     let labels = (
         Label::from_block(true_target),
         Label::from_block(false_target),
     );
+    let direct_bit = single_bit_mask(ctx, arena, outer, cond, branch);
+    if let Some((tested, bit)) = direct_bit {
+        if bit == 0 {
+            if let InstKind::Binary(product) = arena.inst_data(tested).kind() {
+                if product.op() == BinaryOp::Mul && has_only_user(ctx, tested, cond) {
+                    if !ctx.sink_pure_single_use_chain(tested, cond, branch) {
+                        return false;
+                    }
+                    let result = ctx.result_reg(tested);
+                    let lhs = ctx.put_value_in_reg(product.lhs());
+                    let rhs = ctx.put_value_in_reg(product.rhs());
+                    ctx.emit(MInst::AluRRR {
+                        op: AluOp::And,
+                        size: OperandSize::Size32,
+                        dst: Writable::from_reg(result),
+                        lhs: RegOrZr::Reg(lhs),
+                        rhs: RegOrZr::Reg(rhs),
+                    });
+                    let (true_label, false_label) = labels;
+                    ctx.emit(MInst::Tbnz {
+                        size: OperandSize::Size32,
+                        reg: result,
+                        bit,
+                        true_label,
+                        false_label,
+                    });
+                    return true;
+                }
+            }
+        }
+        if !ctx.sink_pure_single_use_producer(cond, branch) {
+            return false;
+        }
+        let tested = ctx.put_value_in_reg(tested);
+        let (true_label, false_label) = labels;
+        ctx.emit(MInst::Tbnz {
+            size: OperandSize::Size32,
+            reg: tested,
+            bit,
+            true_label,
+            false_label,
+        });
+        return true;
+    }
+    if !is_comparison(outer.op()) || !has_only_user(ctx, cond, branch) {
+        return false;
+    }
+
     let zero_outer = zero_comparison(arena, outer);
     if let Some((value, is_eq)) = zero_outer {
         if let InstKind::Binary(inner) = arena.inst_data(value).kind() {

@@ -4,7 +4,9 @@ use crate::opt::{
     analysis_passes::{
         dom_tree::v2::DominanceTree,
         effects::EffectAnalysis,
-        function_side_effects::{FunctionSideEffects, MemoryBase, analyze, resolve_base},
+        function_side_effects::{
+            FunctionSideEffects, MemoryBase, analyze, resolve_base, write_base_may_hit,
+        },
         loop_analysis::Loop,
     },
     prelude::*,
@@ -85,12 +87,7 @@ impl LICM {
 
         /// May a write through `base` hit something `reader` reads?
         fn write_may_hit(base: MemoryBase, reader: &FunctionSideEffects) -> bool {
-            match base {
-                MemoryBase::Global(g) => reader.may_read_global(g),
-                MemoryBase::Param(i) => reader.may_read_array_param(i),
-                MemoryBase::Local => false,
-                MemoryBase::Unknown => reader.has_any_read(),
-            }
+            write_base_may_hit(base, reader)
         }
 
         fn is_integer_zero(data: &ArenaContextMut<'_>, inst: Inst) -> bool {

@@ -243,6 +243,17 @@ fn calls_in(data: &FunctionData) -> Vec<(Function, Vec<Inst>)> {
     calls
 }
 
+/// May a write through `base` hit something `reader` reads? Shared by LICM
+/// (loop writes vs hoisted callee reads) and GVN (call CSE invalidation).
+pub(crate) fn write_base_may_hit(base: MemoryBase, reader: &FunctionSideEffects) -> bool {
+    match base {
+        MemoryBase::Global(g) => reader.may_read_global(g),
+        MemoryBase::Param(i) => reader.may_read_array_param(i),
+        MemoryBase::Local => false,
+        MemoryBase::Unknown => reader.has_any_read(),
+    }
+}
+
 /// Intra-procedural collection: the effects a function produces on its own,
 /// without considering calls it makes.
 fn collect_direct(data: &FunctionData, global: &GlobalArena) -> FunctionSideEffects {

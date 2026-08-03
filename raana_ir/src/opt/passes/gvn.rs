@@ -1,6 +1,11 @@
 use rustc_hash::FxHashMap;
 
-use crate::opt::prelude::*;
+use crate::opt::{
+    analysis_passes::function_side_effects::{
+        FunctionSideEffects, analyze, resolve_base, write_base_may_hit,
+    },
+    prelude::*,
+};
 
 pub struct GlobalInstNumbering;
 
@@ -41,6 +46,11 @@ enum ValueKey {
         base: ValueNumber,
         offsets: Vec<ValueNumber>,
     },
+    Call {
+        callee: Function,
+        result_ty: Type,
+        args: Vec<ValueNumber>,
+    },
     Identity {
         ty: Type,
         value: Inst,
@@ -57,14 +67,16 @@ struct ValueNumbering {
     next: u32,
     by_inst: FxHashMap<Inst, NumberedValue>,
     by_key: FxHashMap<ValueKey, ValueNumber>,
+    effects: FxHashMap<Function, FunctionSideEffects>,
 }
 
 impl ValueNumbering {
-    fn new() -> Self {
+    fn new(effects: FxHashMap<Function, FunctionSideEffects>) -> Self {
         Self {
             next: 0,
             by_inst: FxHashMap::default(),
             by_key: FxHashMap::default(),
+            effects,
         }
     }
 
@@ -143,8 +155,31 @@ impl ValueNumbering {
                 },
                 true,
             ),
+            InstKind::Call(call) => {
+                // Calls are only mergeable when the callee is read-only (no
+                // I/O, no timer, no external write); the caller must also
+                // prove no intervening write, which the leader tracking in
+                // run_on handles. Other calls still get a (shared) number so
+                // their arguments are numbered consistently, but are never
+                // eliminated.
+                let eliminable = self
+                    .effects
+                    .get(&call.callee())
+                    .is_some_and(FunctionSideEffects::is_read_only);
+                (
+                    ValueKey::Call {
+                        callee: call.callee(),
+                        result_ty: ty,
+                        args: call
+                            .args()
+                            .iter()
+                            .map(|&arg| self.number(data, arg).number)
+                            .collect(),
+                    },
+                    eliminable,
+                )
+            }
             InstKind::Load(..)
-            | InstKind::Call(..)
             | InstKind::Alloc
             | InstKind::GlobalAlloc(..)
             | InstKind::BlockArgRef(..)
@@ -255,6 +290,59 @@ impl ScopedLoadLeaders {
     }
 }
 
+/// Scoped leaders for read-only calls keyed by value number, invalidated by
+/// writes that may hit what the callee reads. Unlike loads (where any store
+/// conservatively invalidates every leader), invalidation is precise: a
+/// store through a resolved base only kills leaders whose callee may read
+/// that base, and a sibling call only kills leaders whose callee's read set
+/// intersects the sibling's write set.
+struct ScopedCallLeaders {
+    leaders: FxHashMap<ValueNumber, (Inst, FunctionSideEffects)>,
+    scopes: Vec<Vec<ValueNumber>>,
+}
+
+impl ScopedCallLeaders {
+    fn new() -> Self {
+        Self {
+            leaders: FxHashMap::default(),
+            scopes: Vec::new(),
+        }
+    }
+
+    fn enter_scope(&mut self) {
+        self.scopes.push(Vec::new());
+    }
+
+    fn get(&self, number: ValueNumber) -> Option<Inst> {
+        self.leaders.get(&number).map(|(leader, _)| *leader)
+    }
+
+    fn insert(&mut self, number: ValueNumber, leader: Inst, effects: FunctionSideEffects) {
+        self.leaders.insert(number, (leader, effects));
+        self.scopes.last_mut().unwrap().push(number);
+    }
+
+    /// Drop every leader whose callee's read set may be hit by a write
+    /// described by `predicate`.
+    fn invalidate_matching(&mut self, predicate: impl Fn(&FunctionSideEffects) -> bool) {
+        let stale = self
+            .leaders
+            .iter()
+            .filter(|(_, (_, effects))| predicate(effects))
+            .map(|(&number, _)| number)
+            .collect::<Vec<_>>();
+        for number in stale {
+            self.leaders.remove(&number);
+        }
+    }
+
+    fn exit_scope(&mut self) {
+        for number in self.scopes.pop().unwrap() {
+            self.leaders.remove(&number);
+        }
+    }
+}
+
 impl Pass for GlobalInstNumbering {
     fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         if data.layout().entry_bb().is_none() {
@@ -269,7 +357,10 @@ impl Pass for GlobalInstNumbering {
         let rpo = cfg::rpo_path(&graph);
         let idom = dom_tree::idom(&predecessors, &rpo);
         let dominance_tree = dom_tree::build_dominance_tree(&idom, rpo.len());
-        let mut numbers = ValueNumbering::new();
+        // Function-level effects do not change while this pass runs (GVN
+        // only replaces values), so analyze once per invocation.
+        let effects = analyze(data.program);
+        let mut numbers = ValueNumbering::new(effects.clone());
         let mut leaders = ScopedLeaders::new();
 
         enum Visit {
@@ -279,18 +370,21 @@ impl Pass for GlobalInstNumbering {
 
         let mut changed = false;
         let mut load_leaders = ScopedLoadLeaders::new();
+        let mut call_leaders = ScopedCallLeaders::new();
         let mut visits = vec![Visit::Enter(0)];
         while let Some(visit) = visits.pop() {
             let bb_id = match visit {
                 Visit::Enter(bb_id) => bb_id,
                 Visit::Exit => {
                     load_leaders.exit_scope();
+                    call_leaders.exit_scope();
                     leaders.exit_scope();
                     continue;
                 }
             };
             leaders.enter_scope();
             load_leaders.enter_scope();
+            call_leaders.enter_scope();
             let bb = bb_alloc.search_id(bb_id);
             let values = data
                 .bb_data(bb)
@@ -316,8 +410,32 @@ impl Pass for GlobalInstNumbering {
                         let _ = numbered;
                         continue;
                     }
-                    InstKind::Store(..) | InstKind::Call(..) | InstKind::MemZero(..) => {
+                    InstKind::Store(store) => {
                         load_leaders.record_store();
+                        // Precisely invalidate call leaders whose callee may
+                        // read the stored location.
+                        let base = resolve_base(data, data.global(), store.dest());
+                        call_leaders.invalidate_matching(|e| write_base_may_hit(base, e));
+                    }
+                    InstKind::MemZero(mem_zero) => {
+                        load_leaders.record_store();
+                        let base = resolve_base(data, data.global(), mem_zero.dest());
+                        call_leaders.invalidate_matching(|e| write_base_may_hit(base, e));
+                    }
+                    InstKind::Call(call) => {
+                        load_leaders.record_store();
+                        // A sibling call may write what a call leader reads.
+                        match effects.get(&call.callee()) {
+                            Some(e) => {
+                                let e = e.clone();
+                                call_leaders.invalidate_matching(move |leader| {
+                                    e.may_conflict_with_reads_of(leader)
+                                });
+                            }
+                            // Library calls are not in the analysis map;
+                            // conservatively assume they may write anything.
+                            None => call_leaders.invalidate_matching(|_| true),
+                        }
                     }
                     _ => {}
                 }
@@ -325,7 +443,15 @@ impl Pass for GlobalInstNumbering {
                 if !numbered.eliminable {
                     continue;
                 }
-                if let Some(leader) = leaders.get(numbered.number) {
+                // Call leaders are tracked separately so a write can
+                // invalidate exactly the calls whose callee reads what it
+                // writes; the generic leaders map has no such invalidation.
+                let leader = if matches!(data.inst_data(value).kind(), InstKind::Call(..)) {
+                    call_leaders.get(numbered.number)
+                } else {
+                    leaders.get(numbered.number)
+                };
+                if let Some(leader) = leader {
                     assert_eq!(data.inst_data(value).ty(), data.inst_data(leader).ty());
                     if value != leader && !data.inst_data(value).used_by().is_empty() {
                         trace!(
@@ -337,7 +463,16 @@ impl Pass for GlobalInstNumbering {
                         changed = true;
                     }
                 } else {
-                    leaders.insert(numbered.number, value);
+                    // Read-only calls are managed exclusively by
+                    // call_leaders; everything else goes through the generic
+                    // leaders map.
+                    if let InstKind::Call(call) = data.inst_data(value).kind() {
+                        if let Some(e) = effects.get(&call.callee()) {
+                            call_leaders.insert(numbered.number, value, e.clone());
+                        }
+                    } else {
+                        leaders.insert(numbered.number, value);
+                    }
                 }
             }
 
@@ -564,7 +699,8 @@ mod tests {
     #[test]
     fn does_not_cse_memory_or_calls() {
         let mut program = Program::new();
-        let callee = program.new_function(Type::get_i32(), "callee".into(), vec![]);
+        // A side-effecting callee: getint performs I/O.
+        let callee = program.new_function(Type::get_i32(), "getint".into(), vec![]);
         let function = program.new_function(Type::get_i32(), "effects".into(), vec![]);
         let data = program.func_data_mut(function);
         let entry = data.new_basic_block().basic_block("entry".into(), vec![]);
@@ -590,10 +726,164 @@ mod tests {
 
         assert!(GlobalInstNumbering.run(&mut program));
         let data = program.func_data(function);
-        // Calls are never CSE'd; loads of the same address are, unless a
-        // store intervenes.
+        // Loads of the same address are CSE'd unless a store intervenes;
+        // side-effecting calls are never CSE'd.
         assert_eq!(binary_operands(data, loads), (load_a, load_a));
         assert_eq!(binary_operands(data, calls), (call_a, call_b));
+    }
+
+    #[test]
+    fn cses_identical_pure_calls() {
+        let mut program = Program::new();
+        // A strictly pure callee returning its argument.
+        let callee = program.new_function(Type::get_i32(), "pure_fn".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(callee);
+        let entry = data.add_entry_block();
+        let p = data.params()[0];
+        let ret = data.new_local_inst().ret(Some(p));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let function =
+            program.new_function(Type::get_i32(), "cse_calls".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let x = data.params()[0];
+        let call_a = data
+            .new_local_inst()
+            .call_with_type(callee, vec![x], Type::get_i32());
+        let call_b = data
+            .new_local_inst()
+            .call_with_type(callee, vec![x], Type::get_i32());
+        let sum = data.new_local_inst().binary(BinaryOp::Add, call_a, call_b);
+        let ret = data.new_local_inst().ret(Some(sum));
+        for value in [call_a, call_b, sum, ret] {
+            data.layout_mut().insert_inst(entry, value);
+        }
+
+        assert!(GlobalInstNumbering.run(&mut program));
+        let data = program.func_data(function);
+        assert_eq!(binary_operands(data, sum), (call_a, call_a));
+        assert!(data.inst_data(call_b).used_by().is_empty());
+    }
+
+    #[test]
+    fn store_to_read_global_blocks_call_cse() {
+        let mut program = Program::new();
+        let zero_init = program.new_value().integer(0);
+        let gv = program.new_value().global_alloc(zero_init);
+        // A read-only callee reading gv[0].
+        let callee = program.new_function(Type::get_i32(), "reads_global".into(), vec![]);
+        program.func_data_mut(callee).add_entry_block();
+        {
+            let mut ctx = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(callee),
+            };
+            let entry = ctx.layout().entry_bb().unwrap().bb();
+            let zero = ctx.new_local_value().integer(0);
+            let gep = ctx.new_local_value().get_elem_ptr(gv, vec![zero]);
+            let load = ctx.new_local_value().load(gep);
+            let ret = ctx.new_local_value().ret(Some(load));
+            ctx.layout_mut().insert_inst(entry, zero);
+            ctx.layout_mut().insert_inst(entry, gep);
+            ctx.layout_mut().insert_inst(entry, load);
+            ctx.layout_mut().insert_inst(entry, ret);
+        }
+        let function = program.new_function(Type::get_i32(), "conflicted".into(), vec![]);
+        program.func_data_mut(function).add_entry_block();
+        let call_a;
+        let call_b;
+        let sum;
+        {
+            let mut ctx = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = ctx.layout().entry_bb().unwrap().bb();
+            call_a = ctx
+                .new_local_value()
+                .call_with_type(callee, vec![], Type::get_i32());
+            ctx.layout_mut().insert_inst(entry, call_a);
+            let zero = ctx.new_local_value().integer(0);
+            let gep = ctx.new_local_value().get_elem_ptr(gv, vec![zero]);
+            let one = ctx.new_local_value().integer(1);
+            let store = ctx.new_local_value().store(one, gep);
+            ctx.layout_mut().insert_inst(entry, gep);
+            ctx.layout_mut().insert_inst(entry, store);
+            call_b = ctx
+                .new_local_value()
+                .call_with_type(callee, vec![], Type::get_i32());
+            ctx.layout_mut().insert_inst(entry, call_b);
+            sum = ctx.new_local_value().binary(BinaryOp::Add, call_a, call_b);
+            ctx.layout_mut().insert_inst(entry, sum);
+            let ret = ctx.new_local_value().ret(Some(sum));
+            ctx.layout_mut().insert_inst(entry, ret);
+        }
+
+        // Nothing else in this function is CSE-able, so the pass may report
+        // no change; the guarantee is that the call was not merged.
+        GlobalInstNumbering.run(&mut program);
+        let data = program.func_data(function);
+        // The store to a global the callee reads must invalidate the leader.
+        assert_eq!(binary_operands(data, sum), (call_a, call_b));
+    }
+
+    #[test]
+    fn store_to_local_does_not_block_call_cse() {
+        let mut program = Program::new();
+        let zero_init = program.new_value().integer(0);
+        let gv = program.new_value().global_alloc(zero_init);
+        let callee = program.new_function(Type::get_i32(), "reads_global".into(), vec![]);
+        program.func_data_mut(callee).add_entry_block();
+        {
+            let mut ctx = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(callee),
+            };
+            let entry = ctx.layout().entry_bb().unwrap().bb();
+            let zero = ctx.new_local_value().integer(0);
+            let gep = ctx.new_local_value().get_elem_ptr(gv, vec![zero]);
+            let load = ctx.new_local_value().load(gep);
+            let ret = ctx.new_local_value().ret(Some(load));
+            ctx.layout_mut().insert_inst(entry, zero);
+            ctx.layout_mut().insert_inst(entry, gep);
+            ctx.layout_mut().insert_inst(entry, load);
+            ctx.layout_mut().insert_inst(entry, ret);
+        }
+        let function = program.new_function(Type::get_i32(), "unconflicted".into(), vec![]);
+        program.func_data_mut(function).add_entry_block();
+        let call_a;
+        let call_b;
+        let sum;
+        {
+            let mut ctx = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = ctx.layout().entry_bb().unwrap().bb();
+            call_a = ctx
+                .new_local_value()
+                .call_with_type(callee, vec![], Type::get_i32());
+            ctx.layout_mut().insert_inst(entry, call_a);
+            let slot = ctx.new_local_value().alloc(Type::get_i32());
+            let one = ctx.new_local_value().integer(1);
+            let store = ctx.new_local_value().store(one, slot);
+            ctx.layout_mut().insert_inst(entry, slot);
+            ctx.layout_mut().insert_inst(entry, store);
+            call_b = ctx
+                .new_local_value()
+                .call_with_type(callee, vec![], Type::get_i32());
+            ctx.layout_mut().insert_inst(entry, call_b);
+            sum = ctx.new_local_value().binary(BinaryOp::Add, call_a, call_b);
+            ctx.layout_mut().insert_inst(entry, sum);
+            let ret = ctx.new_local_value().ret(Some(sum));
+            ctx.layout_mut().insert_inst(entry, ret);
+        }
+
+        assert!(GlobalInstNumbering.run(&mut program));
+        let data = program.func_data(function);
+        // A local store cannot alias gv, so the second call merges.
+        assert_eq!(binary_operands(data, sum), (call_a, call_a));
     }
 
     #[test]

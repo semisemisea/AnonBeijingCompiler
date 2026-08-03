@@ -58,7 +58,7 @@
   `VecFmla/VecBsl/VecInsertLane` 改为显式读操作数 + 自发射前导 copy（early def，
   SSA 单 def）。RISC-V/frontend 防御臂。验收：端到端向量函数（v0-v7 ABI）生成
   NEON 汇编、`-O0/1/2` × 5 次 byte-identical、双 target 标量回归。
-- **M41**：向量 ABI——`ArgLayoutPlanner` Vector bank、向量参数
+- **M41（机器层部分）**：向量 ABI——`ArgLayoutPlanner` Vector bank、向量参数
   占 NEON v0-v7/溢出 16B 槽、返回 v0、`DEFAULT_CLOBBERS` 含 NEON、callee-saved
   v8-v15 按 16B 槽保存恢复；ABI 单测通过。收尾见 M41b。
 - **M41b**：向量 SchedClass（`VecArith/VecMul/VecFmla/VecLoad/VecStore/VecMov`，
@@ -86,8 +86,6 @@
 - **M45 U1**：小常量精确 trip-count 循环全展开——支持正向/反向、非单位步进、
   zero-trip 与 loop-carried header 参数；保留最终失败 header visit，限制 8 次迭代/
   64 条非终结指令，复杂 CFG 保守拒绝；双 target QEMU 与 5 次确定性门禁通过。
-- **RISC-V 栈参数修复**：非对齐访问 + psABI widened-to-XLEN 槽宽（见 §8，FPGA
-  实机复跑待验证）。
 
 huffman-01 静态指令数（awk 方法）基线：M26 687 → M34 599 → M36 580 → M37 600
 （决策树静态 +20、动态 cmp 深度变好），详见 `results/perf_compare/`。

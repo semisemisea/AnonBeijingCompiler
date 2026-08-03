@@ -61,6 +61,15 @@ pub enum EffectObject {
     Param(usize),
 }
 
+/// A concrete root a callee may write, in the caller's terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WriteRoot {
+    /// A global object.
+    Global(Inst),
+    /// A stack object of the caller function.
+    Local(Function, Inst),
+}
+
 /// Memory / I/O effects of one function.
 #[derive(Debug, Clone, Default)]
 pub struct FunctionEffects {
@@ -274,6 +283,40 @@ impl EffectAnalysis {
                     AbstractObject::Unknown => true,
                 }),
         })
+    }
+
+    /// The roots (in `func`'s own terms) a call to `callee` may write.
+    /// `None` means the callee may write anything (unknown writes or
+    /// unknown parameter targets). Callee-frame allocs are invisible to
+    /// `func` and omitted.
+    pub fn call_write_roots(&self, callee: Function, func: Function) -> Option<Vec<WriteRoot>> {
+        let fx = self.effects_of(callee);
+        if fx.writes_unknown {
+            return None;
+        }
+        let mut roots = Vec::new();
+        for w in &fx.writes {
+            match w {
+                EffectObject::Global(g) => roots.push(WriteRoot::Global(*g)),
+                EffectObject::Alloc(cf, a) if *cf == func => {
+                    roots.push(WriteRoot::Local(func, *a));
+                }
+                EffectObject::Alloc(..) => {}
+                EffectObject::Param(j) => {
+                    for o in self.points_to.get(&(callee, *j)).into_iter().flatten() {
+                        match o {
+                            AbstractObject::Global(g) => roots.push(WriteRoot::Global(*g)),
+                            AbstractObject::Alloc(cf, a) if *cf == func => {
+                                roots.push(WriteRoot::Local(func, *a));
+                            }
+                            AbstractObject::Alloc(..) => {}
+                            AbstractObject::Unknown => return None,
+                        }
+                    }
+                }
+            }
+        }
+        Some(roots)
     }
 
     /// Interprocedural alias result between two addresses inside `func`,

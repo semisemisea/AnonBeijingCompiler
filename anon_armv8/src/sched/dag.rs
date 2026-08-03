@@ -1008,9 +1008,30 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
         | MInst::VecFmla { dst, lhs, rhs, .. }
         | MInst::VecBitwise { dst, lhs, rhs, .. }
         | MInst::VecCmp { dst, lhs, rhs, .. }
-        | MInst::VecBsl { dst, lhs, rhs } => InstDeps {
+        | MInst::VecBsl { dst, lhs, rhs }
+        | MInst::VecMinMax { dst, lhs, rhs, .. } => InstDeps {
             defs: preg(dst.reg),
             uses: [preg(*lhs), preg(*rhs)].into_iter().flatten().collect(),
+            flags_def: false,
+            flags_use: false,
+            class: SchedClass::Other,
+            mem: None,
+            is_barrier: false,
+        },
+
+        MInst::VecMovImm { dst, .. } => InstDeps {
+            defs: preg(dst.reg),
+            uses: vec![],
+            flags_def: false,
+            flags_use: false,
+            class: SchedClass::Other,
+            mem: None,
+            is_barrier: false,
+        },
+
+        MInst::VecExtractLane { dst, src, .. } | MInst::VecInsertLane { dst, src, .. } => InstDeps {
+            defs: preg(dst.reg),
+            uses: preg(*src),
             flags_def: false,
             flags_use: false,
             class: SchedClass::Other,

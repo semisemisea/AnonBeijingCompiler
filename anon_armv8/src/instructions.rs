@@ -396,6 +396,16 @@ pub enum VecCvtOp {
     Fcvtzs,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecMinMaxOp {
+    Smin,
+    Smax,
+    Umin,
+    Umax,
+    Fmin,
+    Fmax,
+}
+
 /// The flag-producing half of an atomic conditional-select pseudo.
 ///
 /// Keeping this in the same [`MInst`] as the flag consumer is intentional:
@@ -754,6 +764,39 @@ pub enum MInst {
         dst: WritableReg,
         src: Reg,
     },
+    /// `movi v{d}.<shape>, #imm` (optionally `, lsl #shift`): materialize a
+    /// vector with every lane set from an 8-bit immediate, zero-extended to
+    /// the lane width and shifted to a byte position within each lane.
+    VecMovImm {
+        shape: VecShape,
+        dst: WritableReg,
+        imm: u8,
+        shift: u8,
+    },
+    /// `mov w/x{d}, v{s}.s/d[lane]`: extract one lane to a general-purpose
+    /// register.
+    VecExtractLane {
+        size: OperandSize,
+        dst: WritableReg,
+        src: Reg,
+        lane: u8,
+    },
+    /// `mov v{d}.s/d[lane], w/x{src}`: insert a general-purpose value into
+    /// one lane.
+    VecInsertLane {
+        size: OperandSize,
+        dst: WritableReg,
+        src: Reg,
+        lane: u8,
+    },
+    /// Vector min/max: `smin/smax/umin/umax/fmin/fmax`.
+    VecMinMax {
+        op: VecMinMaxOp,
+        shape: VecShape,
+        dst: WritableReg,
+        lhs: Reg,
+        rhs: Reg,
+    },
     FMovFromZero {
         dst: WritableReg,
     },
@@ -968,9 +1011,19 @@ impl MachInst for MInst {
             | Self::VecFmla { dst, lhs, rhs, .. }
             | Self::VecBitwise { dst, lhs, rhs, .. }
             | Self::VecCmp { dst, lhs, rhs, .. }
-            | Self::VecBsl { dst, lhs, rhs } => {
+            | Self::VecBsl { dst, lhs, rhs }
+            | Self::VecMinMax { dst, lhs, rhs, .. } => {
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
+                collector.reg_def(dst);
+            }
+            Self::VecMovImm { dst, .. } => collector.reg_def(dst),
+            Self::VecExtractLane { dst, src, .. } => {
+                collector.reg_use(src);
+                collector.reg_def(dst);
+            }
+            Self::VecInsertLane { dst, src, .. } => {
+                collector.reg_use(src);
                 collector.reg_def(dst);
             }
             Self::AluRRRShift { dst, lhs, rhs, .. } => {
@@ -1736,6 +1789,43 @@ impl MachInstEmit for MInst {
                 emit_vec_reg(ctx, *src)?;
                 write!(ctx, ".4s")
             }
+            Self::VecMovImm { shape, dst, imm, shift } => {
+                write!(ctx, "movi ")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".{}, #0x{:x}", shape.arrangement(), imm)?;
+                if *shift != 0 {
+                    write!(ctx, ", lsl #{shift}")?;
+                }
+                Ok(())
+            }
+            Self::VecExtractLane { size, dst, src, lane } => {
+                write!(ctx, "mov ")?;
+                emit_reg(ctx, dst.to_reg(), *size)?;
+                write!(ctx, ", ")?;
+                emit_vec_reg(ctx, *src)?;
+                write!(ctx, ".{}[{}]", if *size == OperandSize::Size64 { "d" } else { "s" }, lane)
+            }
+            Self::VecInsertLane { size, dst, src, lane } => {
+                write!(ctx, "mov ")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".{}[{}], ", if *size == OperandSize::Size64 { "d" } else { "s" }, lane)?;
+                emit_reg(ctx, *src, *size)
+            }
+            Self::VecMinMax {
+                op,
+                shape,
+                dst,
+                lhs,
+                rhs,
+            } => {
+                write!(ctx, "{} ", vec_minmax_name(*op))?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".{}, ", shape.arrangement())?;
+                emit_vec_reg(ctx, *lhs)?;
+                write!(ctx, ".{}, ", shape.arrangement())?;
+                emit_vec_reg(ctx, *rhs)?;
+                write!(ctx, ".{}", shape.arrangement())
+            }
             Self::FMovFromZero { dst } => {
                 write!(ctx, "fmov ")?;
                 emit_float_reg(ctx, dst.to_reg(), false)?;
@@ -2116,6 +2206,16 @@ fn vec_cvt_name(op: VecCvtOp) -> &'static str {
     match op {
         VecCvtOp::Scvtf => "scvtf",
         VecCvtOp::Fcvtzs => "fcvtzs",
+    }
+}
+fn vec_minmax_name(op: VecMinMaxOp) -> &'static str {
+    match op {
+        VecMinMaxOp::Smin => "smin",
+        VecMinMaxOp::Smax => "smax",
+        VecMinMaxOp::Umin => "umin",
+        VecMinMaxOp::Umax => "umax",
+        VecMinMaxOp::Fmin => "fmin",
+        VecMinMaxOp::Fmax => "fmax",
     }
 }
 fn emit_gpr(ctx: &mut dyn EmitContext, reg: &Gpr, size: OperandSize) -> core::fmt::Result {
@@ -2940,6 +3040,67 @@ mod tests {
             src: vec_reg(1),
         });
         assert_eq!(addv, "addv s0, v1.4s");
+    }
+
+    #[test]
+    fn emits_vector_mov_imm_lane_and_minmax_forms() {
+        let movi = emit(MInst::VecMovImm {
+            shape: super::VecShape::FourS,
+            dst: Writable::from_reg(vec_reg(0)),
+            imm: 0x3f,
+            shift: 0,
+        });
+        assert_eq!(movi, "movi v0.4s, #0x3f");
+
+        let movi_shift = emit(MInst::VecMovImm {
+            shape: super::VecShape::FourS,
+            dst: Writable::from_reg(vec_reg(0)),
+            imm: 0xff,
+            shift: 8,
+        });
+        assert_eq!(movi_shift, "movi v0.4s, #0xff, lsl #8");
+
+        let extract = emit(MInst::VecExtractLane {
+            size: OperandSize::Size32,
+            dst: Writable::from_reg(int_reg(0)),
+            src: vec_reg(1),
+            lane: 2,
+        });
+        assert_eq!(extract, "mov w0, v1.s[2]");
+
+        let extract_64 = emit(MInst::VecExtractLane {
+            size: OperandSize::Size64,
+            dst: Writable::from_reg(int_reg(0)),
+            src: vec_reg(1),
+            lane: 1,
+        });
+        assert_eq!(extract_64, "mov x0, v1.d[1]");
+
+        let insert = emit(MInst::VecInsertLane {
+            size: OperandSize::Size32,
+            dst: Writable::from_reg(vec_reg(2)),
+            src: int_reg(3),
+            lane: 0,
+        });
+        assert_eq!(insert, "mov v2.s[0], w3");
+
+        for (op, mnemonic) in [
+            (super::VecMinMaxOp::Smin, "smin"),
+            (super::VecMinMaxOp::Smax, "smax"),
+            (super::VecMinMaxOp::Umin, "umin"),
+            (super::VecMinMaxOp::Umax, "umax"),
+            (super::VecMinMaxOp::Fmin, "fmin"),
+            (super::VecMinMaxOp::Fmax, "fmax"),
+        ] {
+            let text = emit(MInst::VecMinMax {
+                op,
+                shape: super::VecShape::FourS,
+                dst: Writable::from_reg(vec_reg(0)),
+                lhs: vec_reg(1),
+                rhs: vec_reg(2),
+            });
+            assert_eq!(text, format!("{mnemonic} v0.4s, v1.4s, v2.4s"));
+        }
     }
 
     #[test]

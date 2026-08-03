@@ -170,6 +170,25 @@ GSP/LICM/load-CSE，M36 已修内联代价模型，M37 已修 if 链决策树，
 - 未获得实机数据前，文档和提交信息只能声称"静态模型改进"，不能声称
   "XCZU15EG runtime 提升"。
 
+### 1.4 实机超时排查（已归档）
+
+针对"实体机 TLE / qemu 正常"的排查结论（详见 git 提交 2ef0555）：
+
+- **死循环：未发现**。209 个用例（functional/h_functional/perf）在 qemu 下全部
+  确定性跑完；同一 ELF 在 qemu 与实机的指令语义一致，死循环若存在会在 qemu
+  同样出现。`while (getint())` 等输入循环都靠输入末尾显式 0 终止，不依赖 EOF。
+- **架构差异：仅一处，已修复**。内嵌 memzero 用 `id_aa64isar2_el1` 探测 MOPS
+  （ARMv8.6 `setp/setm/sete`）。qemu 上报 mops=1 走 MOPS 路径，实机 A53 无
+  MOPS 走 `dc zva` 路径；两条路径功能等价，但 MOPS 是输出中唯一非 ARMv8-A
+  指令，且依赖 `.arch_extension mops` 被评测汇编器（gcc 11.2 / binutils 2.38
+  `-march=armv8-a`）接受。已删除 MOPS 分支，输出 100% ARMv8-A。
+- **TLE 根因：性能差，属 IR 层优化缺口，非后端指令选择问题**。以 gcc -O2 为
+  基线（qemu 实测，单输入）：huffman-01 ~3.5x、LUDCMP(h-5-01) ~2.1x、sl1/
+  matmul1/03_sort ~1.6-1.8x、many_mat_cal-1 ~400x（gcc 将 R 外层循环内的整
+  个 T×T 内层循环识别为循环不变、外提后按 trip count 乘一次，我们逐次重算
+  15.7e9 次）。后端内层循环本身已足够紧（4-18 条，多与 gcc 持平或更短）。
+  待做：嵌套循环不变性外提（最高优先）、read_bits 结构优化（huffman 热点）。
+
 ---
 
 ## 2. 主计划 A：huffman 类基准的性能重构（M30-M38，对照 Cranelift 与 clang）

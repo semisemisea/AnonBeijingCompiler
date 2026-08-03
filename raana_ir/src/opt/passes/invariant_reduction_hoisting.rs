@@ -77,14 +77,14 @@ impl InvariantReductionHoisting {
         let InstKind::Branch(branch) = data.inst_data(terminator).kind() else {
             return None;
         };
-        let (entry, exit) = if looop.contains(branch.t_target()) && !looop.contains(branch.f_target())
-        {
-            (branch.t_target(), branch.f_target())
-        } else if !looop.contains(branch.t_target()) && looop.contains(branch.f_target()) {
-            (branch.f_target(), branch.t_target())
-        } else {
-            return None;
-        };
+        let (entry, exit) =
+            if looop.contains(branch.t_target()) && !looop.contains(branch.f_target()) {
+                (branch.t_target(), branch.f_target())
+            } else if !looop.contains(branch.t_target()) && looop.contains(branch.f_target()) {
+                (branch.f_target(), branch.t_target())
+            } else {
+                return None;
+            };
         // The nest entry has no parameters: the clone starts with an empty jump.
         if !data.bb_data(entry).params().is_empty() {
             return None;
@@ -151,11 +151,13 @@ impl InvariantReductionHoisting {
         }
 
         // (5) The latch jumps back to the header.
-        let orig_back_args =
-            match data.inst_data(data.layout().basicblock(latch).terminator()).kind() {
-                InstKind::Jump(jump) if jump.target() == header => jump.args().to_vec(),
-                _ => return None,
-            };
+        let orig_back_args = match data
+            .inst_data(data.layout().basicblock(latch).terminator())
+            .kind()
+        {
+            InstKind::Jump(jump) if jump.target() == header => jump.args().to_vec(),
+            _ => return None,
+        };
         if orig_back_args.len() != params.len() {
             return None;
         }
@@ -180,7 +182,10 @@ impl InvariantReductionHoisting {
         let (acc, acc_idx, final_acc) = match acc_candidate {
             Some(value) => value,
             None => {
-                eprintln!("IRH: header {} rejected: no additive accumulator", data.bb_data(header).name());
+                eprintln!(
+                    "IRH: header {} rejected: no additive accumulator",
+                    data.bb_data(header).name()
+                );
                 return None;
             }
         };
@@ -281,9 +286,7 @@ impl InvariantReductionHoisting {
                 .map(|&p| data.inst_data(p).ty().clone())
                 .collect::<Vec<_>>();
             let name = format!("irh_{}", data.bb_data(block).name());
-            let cloned = data
-                .new_basic_block()
-                .basic_block(name, param_types);
+            let cloned = data.new_basic_block().basic_block(name, param_types);
             data.layout_mut().insert_bb_after(anchor, cloned);
             anchor = cloned;
             block_map.insert(block, cloned);
@@ -333,7 +336,9 @@ impl InvariantReductionHoisting {
         // `compute_done`: carry `D_total` back into the (degraded) loop via a
         // fresh loop-carried header parameter. Add the carrier first so the
         // jump argument count matches the header parameter count.
-        let carrier = data.new_basic_block().add_param(cand.header, i32_ty.clone());
+        let carrier = data
+            .new_basic_block()
+            .add_param(cand.header, i32_ty.clone());
         let done_param = data.bb_data(compute_done).params()[0];
         let mut done_args = orig_args.clone();
         done_args.push(done_param);
@@ -364,7 +369,8 @@ impl InvariantReductionHoisting {
         let degraded_latch = data
             .new_basic_block()
             .basic_block("irh_latch".into(), vec![]);
-        data.layout_mut().insert_bb_after(compute_done, degraded_latch);
+        data.layout_mut()
+            .insert_bb_after(compute_done, degraded_latch);
         let acc2 = data
             .new_local_value()
             .binary(BinaryOp::Add, params[cand.acc_idx], carrier);
@@ -448,7 +454,12 @@ fn trace_accumulator(
         if !visited.insert(cur) {
             continue;
         }
-        let users = data.inst_data(cur).used_by().iter().copied().collect::<Vec<_>>();
+        let users = data
+            .inst_data(cur)
+            .used_by()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
         for user in users {
             let parent = data.layout().parent_bb(user);
             let in_region = parent.is_some_and(|block| region.contains(&block));
@@ -486,8 +497,22 @@ fn trace_accumulator(
                     if branch.cond() == cur {
                         return None;
                     }
-                    push_param_targets(data, region, &mut worklist, branch.t_target(), branch.t_args(), cur);
-                    push_param_targets(data, region, &mut worklist, branch.f_target(), branch.f_args(), cur);
+                    push_param_targets(
+                        data,
+                        region,
+                        &mut worklist,
+                        branch.t_target(),
+                        branch.t_args(),
+                        cur,
+                    );
+                    push_param_targets(
+                        data,
+                        region,
+                        &mut worklist,
+                        branch.f_target(),
+                        branch.f_args(),
+                        cur,
+                    );
                 }
                 InstKind::Binary(..) | InstKind::Select(..) | InstKind::Cast(..) => {
                     // non-additive pure use of the accumulator
@@ -505,11 +530,7 @@ fn trace_accumulator(
             }
         }
     }
-    if accumulated {
-        final_value
-    } else {
-        None
-    }
+    if accumulated { final_value } else { None }
 }
 
 fn push_param_targets(
@@ -548,7 +569,12 @@ fn trace_invariant(
         if !visited.insert(cur) {
             continue;
         }
-        let users = data.inst_data(cur).used_by().iter().copied().collect::<Vec<_>>();
+        let users = data
+            .inst_data(cur)
+            .used_by()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
         for user in users {
             let parent = data.layout().parent_bb(user);
             // The header's own `r < bound` test is the loop's trip test.
@@ -579,14 +605,35 @@ fn trace_invariant(
                 // Non-latch blocks may only thread `cur` into a nested header.
                 match data.inst_data(user).kind() {
                     InstKind::Jump(jump) => {
-                        push_param_targets(data, region, &mut worklist, jump.target(), jump.args(), cur);
+                        push_param_targets(
+                            data,
+                            region,
+                            &mut worklist,
+                            jump.target(),
+                            jump.args(),
+                            cur,
+                        );
                     }
                     InstKind::Branch(branch) => {
                         if branch.cond() == cur {
                             return false;
                         }
-                        push_param_targets(data, region, &mut worklist, branch.t_target(), branch.t_args(), cur);
-                        push_param_targets(data, region, &mut worklist, branch.f_target(), branch.f_args(), cur);
+                        push_param_targets(
+                            data,
+                            region,
+                            &mut worklist,
+                            branch.t_target(),
+                            branch.t_args(),
+                            cur,
+                        );
+                        push_param_targets(
+                            data,
+                            region,
+                            &mut worklist,
+                            branch.f_target(),
+                            branch.f_args(),
+                            cur,
+                        );
                     }
                     _ => return false,
                 }
@@ -667,32 +714,52 @@ mod tests {
         let function = program.new_function(
             Type::get_i32(),
             "nest".into(),
-            vec![Type::get_i32(), Type::get_i32(), Type::get_pointer(Type::get_array(
+            vec![
                 Type::get_i32(),
-                16,
-            ))],
+                Type::get_i32(),
+                Type::get_pointer(Type::get_array(Type::get_i32(), 16)),
+            ],
         );
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
         let (r_bound, t_bound) = if symbolic_bound {
             (data.params()[0], data.params()[1])
         } else {
-            (data.new_local_inst().integer(2), data.new_local_inst().integer(8))
+            (
+                data.new_local_inst().integer(2),
+                data.new_local_inst().integer(8),
+            )
         };
         let base = data.params()[2];
 
         let outer = data
             .new_basic_block()
             .basic_block("outer".into(), vec![Type::get_i32(), Type::get_i32()]);
-        let outer_body = data.new_basic_block().basic_block("outer_body".into(), vec![]);
+        let outer_body = data
+            .new_basic_block()
+            .basic_block("outer_body".into(), vec![]);
         let inner = data
             .new_basic_block()
             .basic_block("inner".into(), vec![Type::get_i32(), Type::get_i32()]);
-        let inner_body = data.new_basic_block().basic_block("inner_body".into(), vec![]);
-        let inner_exit = data.new_basic_block().basic_block("inner_exit".into(), vec![]);
-        let outer_latch = data.new_basic_block().basic_block("outer_latch".into(), vec![]);
+        let inner_body = data
+            .new_basic_block()
+            .basic_block("inner_body".into(), vec![]);
+        let inner_exit = data
+            .new_basic_block()
+            .basic_block("inner_exit".into(), vec![]);
+        let outer_latch = data
+            .new_basic_block()
+            .basic_block("outer_latch".into(), vec![]);
         let outer_exit = data.new_basic_block().basic_block("exit".into(), vec![]);
-        for block in [outer, outer_body, inner, inner_body, inner_exit, outer_latch, outer_exit] {
+        for block in [
+            outer,
+            outer_body,
+            inner,
+            inner_body,
+            inner_exit,
+            outer_latch,
+            outer_exit,
+        ] {
             data.layout_mut().push_bb_back(block);
         }
 
@@ -704,9 +771,9 @@ mod tests {
         let r = data.bb_data(outer).params()[0];
         let acc = data.bb_data(outer).params()[1];
         let r_test = data.new_local_inst().binary(BinaryOp::Lt, r, r_bound);
-        let outer_branch = data
-            .new_local_inst()
-            .branch(r_test, outer_body, vec![], outer_exit, vec![]);
+        let outer_branch =
+            data.new_local_inst()
+                .branch(r_test, outer_body, vec![], outer_exit, vec![]);
         data.layout_mut().insert_inst(outer, r_test);
         data.layout_mut().insert_inst(outer, outer_branch);
 
@@ -716,9 +783,9 @@ mod tests {
         let i = data.bb_data(inner).params()[0];
         let inner_acc = data.bb_data(inner).params()[1];
         let i_test = data.new_local_inst().binary(BinaryOp::Lt, i, t_bound);
-        let inner_branch = data
-            .new_local_inst()
-            .branch(i_test, inner_body, vec![], inner_exit, vec![]);
+        let inner_branch =
+            data.new_local_inst()
+                .branch(i_test, inner_body, vec![], inner_exit, vec![]);
         data.layout_mut().insert_inst(inner, i_test);
         data.layout_mut().insert_inst(inner, inner_branch);
 
@@ -788,7 +855,12 @@ mod tests {
         else {
             panic!("outer header must branch");
         };
-        assert_eq!(data.bb_data(branch.f_target()).name().trim_end_matches(|c: char| c.is_ascii_digit() || c == '_'), "exit");
+        assert_eq!(
+            data.bb_data(branch.f_target())
+                .name()
+                .trim_end_matches(|c: char| c.is_ascii_digit() || c == '_'),
+            "exit"
+        );
         let latch = branch.t_target();
         let latch_insts = data.layout().basicblock(latch).insts();
         let InstKind::Jump(latch_jump) = data.inst_data(*latch_insts.iter().last().unwrap()).kind()
@@ -801,13 +873,17 @@ mod tests {
         // The second application must be stable (the degraded loop is no longer
         // a non-trivial nest).
         assert!(!run(&mut program, function));
-        assert_eq!(program.func_data(function).layout().basicblocks().len(), new_blocks);
+        assert_eq!(
+            program.func_data(function).layout().basicblocks().len(),
+            new_blocks
+        );
     }
 
     #[test]
     fn skips_a_nest_with_a_store_in_the_outer_body() {
         let mut program = Program::new();
-        let function = program.new_function(Type::get_i32(), "store_nest".into(), vec![Type::get_i32()]);
+        let function =
+            program.new_function(Type::get_i32(), "store_nest".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
         let bound = data.params()[0];
@@ -844,7 +920,13 @@ mod tests {
         data.layout_mut().insert_inst(exit, ret);
 
         let blocks = program.func_data(function).layout().basicblocks().len();
-        assert!(!run(&mut program, function), "a store in the body must veto");
-        assert_eq!(program.func_data(function).layout().basicblocks().len(), blocks);
+        assert!(
+            !run(&mut program, function),
+            "a store in the body must veto"
+        );
+        assert_eq!(
+            program.func_data(function).layout().basicblocks().len(),
+            blocks
+        );
     }
 }

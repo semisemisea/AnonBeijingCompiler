@@ -2838,4 +2838,97 @@ mod tests {
         // 6 is not a single-instruction multiplier: keep mul.
         assert_eq!(assembly.matches("\n    mul ").count(), 1, "{assembly}");
     }
+
+    #[test]
+    fn explicit_vector_vcode_emits_neon_assembly() {
+        use crate::abi::AArch64Abi;
+        use crate::instructions::{VecArithOp, VecShape};
+        use raana_ir::ir::builder_trait::*;
+        use taki_mir::abi::CalleeABI;
+        use taki_mir::block_order::BlockLoweringOrder;
+        use taki_mir::prelude::ArenaContext;
+        use taki_mir::register::Writable;
+        use taki_mir::types::V4I32;
+        use taki_mir::vcode::VCodeBuilder;
+
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "vec_test".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+        let func_data = program.func_data(function);
+
+        let arena = ArenaContext {
+            program: &program,
+            curr_func: Some(function),
+        };
+        let abi = CalleeABI::<AArch64Abi>::new(arena);
+        let order = BlockLoweringOrder::new(arena);
+        let mut builder = VCodeBuilder::new(abi, order);
+        let mut vregs = VRegAllocator::<MInst>::with_capaticy(6);
+        let z0 = vregs.alloc(I32);
+        let z1 = vregs.alloc(I32);
+        let v0 = vregs.alloc(V4I32);
+        let v1 = vregs.alloc(V4I32);
+        let sum = vregs.alloc(V4I32);
+        let acc = vregs.alloc(F32);
+        // Pushed in reverse of final order: dup(0)+dup(0) -> add -> addv -> ret.
+        builder.push(MInst::Ret);
+        builder.push(MInst::VecAddv {
+            dst: Writable::from_reg(acc),
+            src: sum,
+        });
+        builder.push(MInst::VecArithRRR {
+            op: VecArithOp::Add,
+            shape: VecShape::FourS,
+            dst: Writable::from_reg(sum),
+            lhs: v0,
+            rhs: v1,
+        });
+        builder.push(MInst::VecDup {
+            shape: VecShape::FourS,
+            dst: Writable::from_reg(v1),
+            src: z1,
+        });
+        builder.push(MInst::VecDup {
+            shape: VecShape::FourS,
+            dst: Writable::from_reg(v0),
+            src: z0,
+        });
+        builder.push(MInst::MovFromZero {
+            size: OperandSize::Size32,
+            dst: Writable::from_reg(z1),
+        });
+        builder.push(MInst::MovFromZero {
+            size: OperandSize::Size32,
+            dst: Writable::from_reg(z0),
+        });
+        builder.end_bb();
+        let mut vcode = builder.build(vregs);
+
+        let output = taki_mir::reg_alloc::ion::run(&vcode, vcode.abi.machine_env())
+            .expect("vector VCode allocation should succeed");
+        assert!(vcode.verify_alloc_output(&output).is_ok());
+        vcode.write_back_allocs(&output);
+        let spill_size = u32::try_from(output.num_spillslots).unwrap() * vcode.abi.spill_unit_bytes();
+        vcode
+            .abi
+            .compute_frame_layout(spill_size, &output)
+            .expect("frame layout should accept vector spill units");
+        vcode.finalize_for_emission(&output);
+
+        let assembly = taki_mir::emit::emit_vcode_assembly::<crate::lower::AArch64Backend>(
+            &program,
+            func_data,
+            &vcode,
+        );
+        // Register allocation assigns arbitrary vector numbers, so assert the
+        // NEON forms rather than specific physical registers.
+        assert!(assembly.contains("dup v"), "{assembly}");
+        assert!(assembly.contains(".4s, w"), "{assembly}");
+        assert!(assembly.contains("add v"), "{assembly}");
+        assert!(assembly.contains(".4s, v"), "{assembly}");
+        assert!(assembly.contains("addv s"), "{assembly}");
+    }
 }

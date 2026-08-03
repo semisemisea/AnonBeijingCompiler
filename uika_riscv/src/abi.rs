@@ -173,7 +173,14 @@ impl ABIMachineSpec for Riscv64ABI {
                 TypeKind::Float32 => ArgRegBank::Float,
                 kind => panic!("unsupported RISC-V scalar argument type: {kind:?}"),
             },
-            |ty| u32::try_from(ty.size()).expect("stack argument size exceeds ABI range"),
+            // psABI (riscv-cc.adoc, Integer Calling Convention): scalars
+            // narrower than XLEN are widened to XLEN bits when passed on the
+            // stack, so every RV64 stack argument slot is 8 bytes and 8-aligned.
+            // Packing by ty.size() would put a 64-bit argument after a 32-bit
+            // one at a 4-mod-8 offset, trapping on BOOM (QEMU silently allows
+            // unaligned accesses). All current scalar parameter types fit in
+            // one XLEN slot; re-evaluate if a wider scalar type is added.
+            |_| Self::word_bytes(),
         )
     }
 
@@ -462,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn argument_layout_preserves_scalar_stack_widths() {
+    fn argument_layout_uses_fixed_eight_byte_stack_slots() {
         let mut types = vec![HirType::get_pointer(HirType::get_i32()); 9];
         types.extend(vec![HirType::get_i32(); 1]);
         types.extend(vec![HirType::get_f32(); 9]);
@@ -476,8 +483,8 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(stack_offsets, vec![0, 8, 12, 16]);
-        assert_eq!(stack_size, 24);
+        assert_eq!(stack_offsets, vec![0, 8, 16, 24]);
+        assert_eq!(stack_size, 32);
     }
 }
 

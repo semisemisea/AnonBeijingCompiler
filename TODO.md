@@ -507,3 +507,180 @@ fallthrough 收益。SysY 前端暂无冷热信息，本期仅在 `BlockLowering
 | 发射层改造破坏 RISC-V 或 tail-call | 中 | M28 双 target + tail-call 矩阵回归；`ArgSlot` 布局不变 |
 | QEMU wall time 被误用为 A53 性能数据 | 中 | QEMU 仅进入 correctness gate |
 | 实机环境频率/温度噪声掩盖结果 | 中 | core pinning、paired samples、95% CI、环境元数据 |
+
+---
+
+## 7. RISC-V 栈参数非对齐访问（BOOM 实机 RE，QEMU 不可见）
+
+### 现象
+
+- Judge RISC-V 实机运行：`h_functional/39_fp_params` WA/RE（FPGA 输出
+  "Failed"），其余 139/140 functional + 60/60 perf 全过。QEMU 下同一
+  case 通过，输出哈希正确。
+- 只有混合 32/64 位大量栈参数的函数受影响；纯 float / 纯 int /
+  纯指针参数函数（`params_f40`、`params_f40_i24`、`params_fa40`）在
+  QEMU 与实机均正常。
+
+### 根因链
+
+1. `taki_mir/src/abi.rs` `ArgLayoutPlanner::compute`（51-89 行）对栈参数
+   密集打包：`stack_offset` 只按 `stack_slot_size(ty)` 累加，**无任何
+   对齐填充**。
+2. `uika_riscv/src/abi.rs:166-178` `compute_call_arg_loc` 传入
+   `|ty| ty.size()`：float/int 槽 4 字节、指针槽 8 字节。于是跟在
+   32 位参数后面的指针参数落在 `4 mod 8` 偏移上。
+3. callee 侧经 `s0(=entry sp)` 读栈参数（`ld s7, 64(s0)`、`ld a3, 124(s0)`
+   等），caller 侧经 `sp` 写 outgoing args（`sd a1, 1132(sp)` 等），两侧
+   布局一致、取值正确——所以 QEMU 全对，**唯一症状是地址非对齐**。
+4. 实测 `/tmp/39_fp_params.s`：131 处 64 位访问落在 `4 mod 8` 地址
+   （`params_mix` 26 处 + `main` 105 处），32 位访问 0 处非对齐。
+5. BOOM 硬件不支持非对齐 ld/sd（缺 M-mode trap handler 时直接异常），
+   QEMU user-mode 静默放行 → 实机 RE / QEMU AC 的分歧。
+6. 栈帧本身 16 对齐（432/640/928/1024/1504 均 16 的倍数），局部栈槽
+   `allocate_stackslot` 按 `stack_align()` 逐对象 round 到 8 字节
+   （`taki_mir/src/abi.rs:452-464`），局部区无此问题——因此只有
+   多栈参函数中招。
+
+### 附带问题：psABI 不合规
+
+RISC-V psABI（riscv-cc.adoc Integer Calling Convention）明确定义：窄于
+XLEN 的标量在栈上传参时 **widened to XLEN bits**（整数按符号扩展、
+浮点上位未定义），RV64 即每个栈参数槽 8 字节、8 对齐，GCC/Clang 每参数
+占满 8 字节。当前 4 字节密集打包既非对齐、又违反 widening 规则：与 GCC
+编译的 callee 互调时不仅地址非对齐，槽位取值也会错位。目前 sysylib
+函数参数 ≤ 2 个全走寄存器所以没暴露，属潜在隐患。
+
+注意：`anon_armv8` 早就用了正确实现（`anon_armv8/src/abi.rs:133`
+`|_| 8`，单测 `aapcs64_overflow_arguments_use_fixed_eight_byte_slots`
+断言 [0,8,16]/24）。同一 `ArgLayoutPlanner`、同一设计意图，aarch64
+写对了、riscv 写成了 `ty.size()`——这是 RISC-V 侧的孤立回归，不是
+通用层缺陷。
+
+### 候选方案
+
+- A（唯一正确方案）：`uika_riscv/src/abi.rs:176` 的 `stack_slot_size`
+  闭包从 `ty.size()` 改为 `|_| 8`（与 aarch64 完全一致，注释引 psABI
+  widening 规则）。这不是"代价"：8 字节槽就是规范定义的唯一形态，
+  40 float 调用参数区 128→256B 是合规布局本身，不是修复带来的开销。
+  调用方/被调方/尾调用共用同一 planner 输出，偏移自动一致；float 栈
+  参数仍以 sw/flw 存取低 4 字节，上位未定义，规范允许，无需改存取宽度。
+  性能影响为零（访存指令数不变，仅帧多 4B × 栈上 32 位参数数）。
+- B（被规范否决）：只做 `align_up` 不统一槽宽。即使消除非对齐，float
+  栈参槽 4 字节仍违反 widened-to-XLEN 规则，与 GCC 编译的 callee 互调
+  取值错误；且混合步长布局（槽序 ≠ 偏移/8）难推理、易再错。淘汰。
+- A 需同步更新 `uika_riscv/src/abi.rs:465-481`
+  `argument_layout_preserves_scalar_stack_widths`：断言
+  `[0, 8, 12, 16]` / `stack_size 24` → `[0, 8, 16, 24]` / `32`。
+- 回归 tail-call 路径（`uika_riscv/src/lower.rs:1016-1035` 复用同一
+  ArgSlot 布局）与 `abi_matrix` 门禁。
+
+### 验证计划
+
+1. 单测：构造 `compute_call_arg_loc` 混合类型序列（如 9×i32 + 8×f32 +
+   指针），断言所有 64 位槽 offset % 8 == 0、32 位槽 offset % 4 == 0。
+2. `make test-riscv h_functional/39_fp_params.sy`（或全量）QEMU 通过；
+   静态检查 `.s`：`ld/sd/fld/fsd` 偏移全部 8 对齐（脚本扫描）。
+3. 确认 `make test`（aarch64）无回归。
+4. 有 FPGA 通道时实机复跑 39_fp_params。
+
+状态：已实现（`|_| Self::word_bytes()` + 单测更新，见 git diff）。QEMU
+单测与 riscv functional+h_functional 全量通过，39_fp_params.s 非对齐
+131→0 处；FPGA 实机复跑仍待验证。
+
+---
+
+## 8. RISC-V 跑分长耗时用例分析（judge_rv64_8_2_03_00）
+
+数据源：`judge_rv64_8_2_03_00.txt`（rv 实机 BOOM 跑分）。汇编证据用
+`./target/release/compiler -S -O1 tests/perf/<case>.sy` 复现，生成物在
+`/tmp/perf_analysis/`（临时目录，需重新生成）。
+
+### 耗时排名（秒）
+
+- many_mat_cal-1/2/3：106.7 / 106.0 / 105.0（三连，绝对大头）
+- conv2d-1：58.4；knapsack_naive-1/2/3：39.8×3；matmul2：28.5
+- transpose2：24.4；sl2：17.5；conv2d-2：15.9；h-4-03：15.7；matmul3：
+  15.6；01_mm2：14.8
+- crypto-1：11.5；huffman-01/02/03：9.3×3；01_mm3：9.6；sl1：8.7；
+  h-1-03：8.6；crypto-2：8.1；matmul1：7.7
+- 次长带：conv2d-3 5.3 / crypto-3 4.6 / crc×3 4.5 / fft1 4.4 / shuffle1
+  4.2 / 01_mm1 4.3 / h-10-03 3.7 / 03_sort×3 3.1 / h-9-01 2.1
+
+### 系统性 codegen 问题（所有用例热循环均受影响）
+
+- A1 无条件跳转 `la t6,label; jr t6`（auipc+addi+jr=3 条）而非 `j`
+  （jal x0=1 条）。每循环回边、每分支目标都付。数量：huffman 281、
+  crypto 216、conv2d-1 111、many_mat_cal 80、03_sort1 78。BOOM 分支
+  代价高，收益被放大。
+- A2 不用立即数槽：`li 1; addw` → `addiw`；`li 1; subw` → `addiw -1`；
+  `li 0x40; slt` → `slti`；`li 0; slt a,b` → `slt a,zero,b`。li 数量：
+  huffman 337、crypto 240、conv2d 130、crc 122、many_mat_cal 83。
+- A3 循环条件 `slt+beqz`（2 条）→ `blt`（1 条）。配合 A1 循环头实际
+  8 条、理想 2 条。
+- A4 地址强度削减不完整且不对称：
+  - a. 内层元素地址每轮从 IV 重算（addw+slli+add）而非指针递增：sl2
+    每轮 7 次邻域重算（42 行循环体 21 行地址运算）、many_mat_cal
+    C[i][k]、01_mm2、h-10-03、shuffle1 value/nextvalue、transpose2
+    j*colsize mul、matmul2。
+  - b. 循环不变行基址在 k 循环内重算：matmul2 每轮 `mul i×4000`（i 在
+    k 循环不变）、01_mm2/h-10-03 行基址。
+  - c. 全局基址每轮 `la` 重载：matmul2 gv_c、01_mm2 gv_B、shuffle1
+    gv_value+gv_nextvalue、h-10-03 gv_B。
+  - d. SR 部分生效（many_mat_cal A[k][j] 已指针 +0x1000、transpose2
+    i*rowsize 已提出 j 循环）→ pass 存在但匹配面有限，漏了 slli+add
+    形状与全局基址。
+- A5 `mulw+addw` 未融合 `maddw`（M 扩展）：many_mat_cal 矩阵乘内循环、
+  transpose2 ans 循环。
+- A6 累加器 phi 拷贝往返：many_mat_cal 平方和 `mv s2,s5; addw; mv s5,s2`、
+  01_mm2 同。每轮 2 条 mv。
+- A7 基址溢出到栈每轮重载：transpose2 matrix 基址 `ld 0(sp)` 每轮 2 次、
+  fft1 数组基址每轮 1 次（寄存器压力导致 spill）。
+
+### 用例特定
+
+- B8 内层循环调用未内联：
+  - fft1：蝶形内层每元素 2-3 次 `call multiply`，multiply 为递归倍增
+    模乘（b 减半 ~30 层，每层 32B 帧 + 4 对 sd/ld）——fft1 绝对热点。
+  - huffman-01/02/03：每符号 `call read_bits_specialized_2`。
+  - crc1/2/3：每字节 `call crc32_specialized_0`。
+  - 已走 specialization 机制但未内联进循环，查内联阈值/形状限制。
+- B9 conv2d-1：边界检查 rr 半条件（只随 kr 变）未 hoist 出 kc 循环；
+  cc>=0 用 `li 0 + slt + xori`；K[kr*5+kc] GEP 每轮重算。
+- B10 knapsack_naive（指数递归）：零比较编译成 `li 0; subw; seqz` 三条
+  （应为 `seqz` 一条）；`li 1; subw` 应为 `addiw`；每帧 5 对 sd/ld +
+  48B。指数复杂度下每省 1 条都被 2^N 放大。
+- 已达标项：h-4-03 常量除法全部 magic-mul（div=0，19 mul），剩余仅为
+  A1/A2 循环开销。
+
+### 每用例主导瓶颈映射
+
+- many_mat_cal(106s)：A4a+A1+A2+A5+A6
+- conv2d-1(58s)：B9+A1/A2/A4
+- knapsack(40s)：B10+A1/A2
+- matmul2/01_mm2(28/15s)：A4b/A4c/A4a+A1/A2
+- transpose2(24s)：A4a+A7+A1
+- sl2(17s)：A4a(7次/轮)+A2（运行时除法无法消除）
+- crypto-1(11.5s)：A1(216)+A2(240)
+- huffman(9.3s)：B8+A2(337)+A1(281)
+- fft1(4.4s)：B8+A7
+- crc(4.5s)：B8
+
+### 优先级与候选方案（通用性 × 收益 × 风险）
+
+- P0 发射层纯改进（覆盖所有热循环，每回边省 2+ 条）：A1 局部跳转
+  la+jr→j（超范围走既有 veneer）；A2 li+ALU→立即数指令（addiw/slti，
+  li 0 用 zero 寄存器）；A3 slt+beqz→blt。风险低，指令数可直接统计。
+- P1 IR 层地址 SR 补全：元素地址指针递增、不变行基址 hoist、全局基址
+  提升进循环前寄存器（覆盖 A4 全家 + A7 的基址重载）。
+- P2 maddw 融合（M 扩展）；内层调用内联（huffman/crc/fft1，查
+  specialization 未内联原因）；A6 累加器 phi 拷贝消除。
+- P3 conv2d 边界检查半条件 hoist（依赖 LICM 条件部分提升能力）。
+
+### 验证计划
+
+1. P0 每项改造后：全 corpus 重编，脚本统计 .s 指令数下降 + 每循环回边
+   指令数；QEMU 差分（`make test-riscv functional h_functional`）。
+2. P1 用 sl2 / many_mat_cal / matmul2 的内层循环指令数（42→约 24 等）
+   量化；BOOM 实机复跑头部用例确认（QEMU 时间不可作为性能依据）。
+3. P2 内联用 huffman/crc/fft1 的 .s call 计数清零 + 实机耗时对比。
+4. 所有优化保持通用触发条件，禁止按用例名/函数名匹配（AGENTS.md）。

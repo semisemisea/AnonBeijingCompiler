@@ -214,6 +214,18 @@ impl PassesManager {
         let sr = Box::new(sr::StrengthReduction);
         p.register(sr);
 
+        // Degrade an outer trip loop whose body is an invariant reduction nest
+        // to a single `acc += D_total` per iteration (many_mat_cal hotspot).
+        // Runs before reduction_unroll so it sees the pristine nested loops.
+        let invariant_reduction_hoisting =
+            Box::new(invariant_reduction_hoisting::InvariantReductionHoisting);
+        p.register(invariant_reduction_hoisting);
+
+        // Split single-accumulator reduction loops into four independent lanes
+        // (breaks the serial accumulation dependency chain on AArch64).
+        let reduction_unroll = Box::new(reduction_unroll::ReductionUnroll);
+        p.register(reduction_unroll);
+
         let if_conversion = Box::new(if_conversion::IfConversion);
         p.register(if_conversion);
 

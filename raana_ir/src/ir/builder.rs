@@ -4,7 +4,7 @@ use crate::ir::{
     basic_block::{BasicBlock, BasicBlockData},
     function::Function,
     inst_kind::{
-        Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Cast, Fma, Float, GetElemPtr,
+        Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Cast, Float, Fma, GetElemPtr,
         GlobalAlloc, InstKind, Integer, Jump, Load, MemZero, Return, Select, Store, TailCall,
         VectorExtractElement, VectorInsertElement, VectorReduce, VectorReduceOp, VectorSplat,
     },
@@ -294,7 +294,9 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
             self.inst_type(index)
         );
         assert_lane_constant(self, index, *lanes, "vector_insert_element");
-        self.insert_inst(VectorInsertElement::new_data(vector, element, index, vector_ty))
+        self.insert_inst(VectorInsertElement::new_data(
+            vector, element, index, vector_ty,
+        ))
     }
 
     /// Horizontally reduce `src` with `op`, producing the vector's element type.
@@ -565,7 +567,9 @@ mod tests {
         let zero = data.new_local_inst().integer(0);
         let extracted = data.new_local_inst().vector_extract_element(splat, zero);
         assert!(data.inst_data(extracted).ty().is_i32());
-        let inserted = data.new_local_inst().vector_insert_element(splat, src, zero);
+        let inserted = data
+            .new_local_inst()
+            .vector_insert_element(splat, src, zero);
         assert_eq!(data.inst_data(inserted).ty().kind(), v4i32.kind());
     }
 
@@ -634,10 +638,7 @@ mod tests {
 
     #[test]
     fn vector_kind_remap_round_trips_all_operands() {
-        use crate::ir::{
-            BasicBlock, Function, Inst,
-            remap::EntityMapper,
-        };
+        use crate::ir::{BasicBlock, Function, Inst, remap::EntityMapper};
 
         struct IdentityMapper;
         impl EntityMapper for IdentityMapper {
@@ -666,7 +667,9 @@ mod tests {
         let fma = data.new_local_inst().fma(a, b, c);
         let splat = data.new_local_inst().vector_splat(src, v4i32.clone());
         let extract = data.new_local_inst().vector_extract_element(splat, zero);
-        let insert = data.new_local_inst().vector_insert_element(splat, src, zero);
+        let insert = data
+            .new_local_inst()
+            .vector_insert_element(splat, src, zero);
         let reduce = data
             .new_local_inst()
             .vector_reduce(crate::ir::VectorReduceOp::Add, splat);

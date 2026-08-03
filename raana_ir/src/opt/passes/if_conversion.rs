@@ -404,9 +404,8 @@ impl IfConversion {
         let InstKind::Binary(binary) = data.inst_data(inst).kind() else {
             return false;
         };
-        let operand_ok = |value: Inst| {
-            chain.contains(&value) || self.available_at(data, value, head, tree)
-        };
+        let operand_ok =
+            |value: Inst| chain.contains(&value) || self.available_at(data, value, head, tree);
         data.inst_data(inst).ty().is_i32()
             && data.inst_data(binary.lhs()).ty().is_i32()
             && data.inst_data(binary.rhs()).ty().is_i32()

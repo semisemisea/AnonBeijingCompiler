@@ -1175,13 +1175,22 @@ mod tests {
     #[derive(Clone, Debug)]
     enum TestInst {
         Ret,
-        LoadImm { rd: Writable<Reg> },
-        Mov { src: Reg, dst: Writable<Reg> },
+        LoadImm {
+            rd: Writable<Reg>,
+        },
+        Mov {
+            src: Reg,
+            dst: Writable<Reg>,
+        },
         /// Fake sink: keeps every listed register live through the block end.
-        UseAll { regs: Vec<Reg> },
+        UseAll {
+            regs: Vec<Reg>,
+        },
         /// Fake call: clobbers the given physical registers, forcing values
         /// live across it to spill (mirrors a real call site).
-        Call { clobbers: PRegSet },
+        Call {
+            clobbers: PRegSet,
+        },
         Jump,
         Nop,
     }
@@ -1637,9 +1646,7 @@ mod tests {
         // Instructions are pushed in reverse of their final order (the block
         // terminator goes first). Final order: defs, moves, call, sink, ret.
         builder.push(TestInst::Ret);
-        builder.push(TestInst::UseAll {
-            regs: vec![o0, o1],
-        });
+        builder.push(TestInst::UseAll { regs: vec![o0, o1] });
         builder.push(TestInst::Call {
             clobbers: clobber_all,
         });

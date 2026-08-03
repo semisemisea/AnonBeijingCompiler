@@ -1,8 +1,8 @@
 //! AArch64 selection from Raana HIR into generic VCode.
 
 use raana_ir::ir::{
-    Binary, BinaryOp, Call, Cast, Fma, GetElemPtr, InstKind, Load, Return, Select, Store,
-    TailCall, Type as HirType, TypeKind, VectorExtractElement, VectorInsertElement, VectorReduce,
+    Binary, BinaryOp, Call, Cast, Fma, GetElemPtr, InstKind, Load, Return, Select, Store, TailCall,
+    Type as HirType, TypeKind, VectorExtractElement, VectorInsertElement, VectorReduce,
     VectorReduceOp, VectorSplat, arena::Arena, inst_kind::MemZero,
 };
 use taki_mir::{
@@ -457,9 +457,7 @@ fn vector_shape(ty: &TypeKind) -> VecShape {
     match (lanes, elem.size()) {
         (4, 4) => VecShape::FourS,
         (2, 8) => VecShape::TwoD,
-        _ => panic!(
-            "unsupported AArch64 vector shape: <{lanes} x {elem}> (only 128-bit .4s/.2d)"
-        ),
+        _ => panic!("unsupported AArch64 vector shape: <{lanes} x {elem}> (only 128-bit .4s/.2d)"),
     }
 }
 
@@ -1289,7 +1287,12 @@ fn lower_vector_extract_element(
     let size = operand_size(arena.inst_data(inst).ty().kind());
     let src = ctx.put_value_in_reg(extract.src());
     let lane = lane_constant(arena, extract.index());
-    ctx.emit(MInst::VecExtractLane { size, dst, src, lane });
+    ctx.emit(MInst::VecExtractLane {
+        size,
+        dst,
+        src,
+        lane,
+    });
     LoweredOutput::Value(result)
 }
 
@@ -3280,7 +3283,8 @@ mod tests {
             .expect("vector VCode allocation should succeed");
         assert!(vcode.verify_alloc_output(&output).is_ok());
         vcode.write_back_allocs(&output);
-        let spill_size = u32::try_from(output.num_spillslots).unwrap() * vcode.abi.spill_unit_bytes();
+        let spill_size =
+            u32::try_from(output.num_spillslots).unwrap() * vcode.abi.spill_unit_bytes();
         vcode
             .abi
             .compute_frame_layout(spill_size, &output)
@@ -3288,9 +3292,7 @@ mod tests {
         vcode.finalize_for_emission(&output);
 
         let assembly = taki_mir::emit::emit_vcode_assembly::<crate::lower::AArch64Backend>(
-            &program,
-            func_data,
-            &vcode,
+            &program, func_data, &vcode,
         );
         // Register allocation assigns arbitrary vector numbers, so assert the
         // NEON forms rather than specific physical registers.
@@ -3333,9 +3335,7 @@ mod tests {
         let zero = data.new_local_inst().integer(0);
         let e0 = data.new_local_inst().vector_extract_element(mx, zero);
         let one = data.new_local_inst().integer(1);
-        let ins = data
-            .new_local_inst()
-            .vector_insert_element(mx, e0, one);
+        let ins = data.new_local_inst().vector_insert_element(mx, e0, one);
 
         for inst in [splat, add, mul, mask, sel, mn, mx, sum, e0, ins] {
             data.layout_mut().insert_inst(entry, inst);
@@ -3474,13 +3474,15 @@ mod tests {
                     chain_fusion: true,
                 },
             ] {
-                let first =
-                    taki_mir::compile_with_config::<crate::lower::AArch64Backend>(&program, &config)
-                        .assembly;
+                let first = taki_mir::compile_with_config::<crate::lower::AArch64Backend>(
+                    &program, &config,
+                )
+                .assembly;
                 for _ in 0..4 {
-                    let again =
-                        taki_mir::compile_with_config::<crate::lower::AArch64Backend>(&program, &config)
-                            .assembly;
+                    let again = taki_mir::compile_with_config::<crate::lower::AArch64Backend>(
+                        &program, &config,
+                    )
+                    .assembly;
                     assert_eq!(first, again, "recompilation diverged");
                 }
                 programs.push(first);

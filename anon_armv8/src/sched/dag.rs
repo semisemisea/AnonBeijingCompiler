@@ -1017,20 +1017,26 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             is_barrier: false,
         },
 
-        MInst::VecFmla { dst, acc, lhs, rhs, .. } | MInst::VecBsl { dst, mask: acc, lhs, rhs } => {
-            InstDeps {
-                defs: preg(dst.reg),
-                uses: [preg(*acc), preg(*lhs), preg(*rhs)]
-                    .into_iter()
-                    .flatten()
-                    .collect(),
-                flags_def: false,
-                flags_use: false,
-                class: SchedClass::Other,
-                mem: None,
-                is_barrier: false,
-            }
+        MInst::VecFmla {
+            dst, acc, lhs, rhs, ..
         }
+        | MInst::VecBsl {
+            dst,
+            mask: acc,
+            lhs,
+            rhs,
+        } => InstDeps {
+            defs: preg(dst.reg),
+            uses: [preg(*acc), preg(*lhs), preg(*rhs)]
+                .into_iter()
+                .flatten()
+                .collect(),
+            flags_def: false,
+            flags_use: false,
+            class: SchedClass::Other,
+            mem: None,
+            is_barrier: false,
+        },
 
         MInst::VecMovImm { dst, .. } => InstDeps {
             defs: preg(dst.reg),
@@ -1052,7 +1058,9 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             is_barrier: false,
         },
 
-        MInst::VecInsertLane { dst, vector, src, .. } => InstDeps {
+        MInst::VecInsertLane {
+            dst, vector, src, ..
+        } => InstDeps {
             defs: preg(dst.reg),
             uses: [preg(*vector), preg(*src)].into_iter().flatten().collect(),
             flags_def: false,

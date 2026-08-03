@@ -1028,7 +1028,10 @@ impl MachInst for MInst {
                 dst, acc, lhs, rhs, ..
             }
             | Self::VecBsl {
-                dst, mask: acc, lhs, rhs,
+                dst,
+                mask: acc,
+                lhs,
+                rhs,
             } => {
                 // The leading `mov` writes `dst` before the read-modify-write
                 // reads `lhs`/`rhs`, so `dst` is an *early* def: it must not
@@ -1220,9 +1223,9 @@ impl MachInst for MInst {
 
     fn is_move(&self) -> Option<(Writable<Reg>, Reg)> {
         match self {
-            Self::Mov { dst, src, .. }
-            | Self::FMov { dst, src }
-            | Self::VecMov { dst, src } => Some((*dst, *src)),
+            Self::Mov { dst, src, .. } | Self::FMov { dst, src } | Self::VecMov { dst, src } => {
+                Some((*dst, *src))
+            }
             _ => None,
         }
     }
@@ -1799,7 +1802,12 @@ impl MachInstEmit for MInst {
                 emit_vec_reg(ctx, *rhs)?;
                 write!(ctx, ".{}", shape.arrangement())
             }
-            Self::VecBsl { dst, mask, lhs, rhs } => {
+            Self::VecBsl {
+                dst,
+                mask,
+                lhs,
+                rhs,
+            } => {
                 write!(ctx, "mov ")?;
                 emit_vec_reg(ctx, dst.to_reg())?;
                 write!(ctx, ".16b, ")?;
@@ -1814,7 +1822,12 @@ impl MachInstEmit for MInst {
                 emit_vec_reg(ctx, *rhs)?;
                 write!(ctx, ".16b")
             }
-            Self::VecCvt { op, shape, dst, src } => {
+            Self::VecCvt {
+                op,
+                shape,
+                dst,
+                src,
+            } => {
                 write!(ctx, "{} ", vec_cvt_name(*op))?;
                 emit_vec_reg(ctx, dst.to_reg())?;
                 write!(ctx, ".{}, ", shape.arrangement())?;
@@ -1828,7 +1841,12 @@ impl MachInstEmit for MInst {
                 emit_vec_reg(ctx, *src)?;
                 write!(ctx, ".4s")
             }
-            Self::VecMovImm { shape, dst, imm, shift } => {
+            Self::VecMovImm {
+                shape,
+                dst,
+                imm,
+                shift,
+            } => {
                 write!(ctx, "movi ")?;
                 emit_vec_reg(ctx, dst.to_reg())?;
                 write!(ctx, ".{}, #0x{:x}", shape.arrangement(), imm)?;
@@ -1837,12 +1855,26 @@ impl MachInstEmit for MInst {
                 }
                 Ok(())
             }
-            Self::VecExtractLane { size, dst, src, lane } => {
+            Self::VecExtractLane {
+                size,
+                dst,
+                src,
+                lane,
+            } => {
                 write!(ctx, "mov ")?;
                 emit_reg(ctx, dst.to_reg(), *size)?;
                 write!(ctx, ", ")?;
                 emit_vec_reg(ctx, *src)?;
-                write!(ctx, ".{}[{}]", if *size == OperandSize::Size64 { "d" } else { "s" }, lane)
+                write!(
+                    ctx,
+                    ".{}[{}]",
+                    if *size == OperandSize::Size64 {
+                        "d"
+                    } else {
+                        "s"
+                    },
+                    lane
+                )
             }
             Self::VecInsertLane {
                 size,
@@ -1859,7 +1891,16 @@ impl MachInstEmit for MInst {
                 ctx.end_inst()?;
                 write!(ctx, "mov ")?;
                 emit_vec_reg(ctx, dst.to_reg())?;
-                write!(ctx, ".{}[{}], ", if *size == OperandSize::Size64 { "d" } else { "s" }, lane)?;
+                write!(
+                    ctx,
+                    ".{}[{}], ",
+                    if *size == OperandSize::Size64 {
+                        "d"
+                    } else {
+                        "s"
+                    },
+                    lane
+                )?;
                 emit_reg(ctx, *src, *size)
             }
             Self::VecMinMax {
@@ -2218,18 +2259,12 @@ fn emit_vec_reg(ctx: &mut dyn EmitContext, reg: Reg) -> core::fmt::Result {
 fn emit_vec_scalar_reg(ctx: &mut dyn EmitContext, reg: Reg, shape: VecShape) -> core::fmt::Result {
     let wide = shape == VecShape::TwoD;
     match reg.to_real_reg() {
-        Some(preg) if preg.class() == RegClass::Int => write!(
-            ctx,
-            "{}{}",
-            if wide { "x" } else { "w" },
-            preg.hw_enc()
-        ),
-        Some(preg) if preg.class() == RegClass::Float => write!(
-            ctx,
-            "{}{}",
-            if wide { "d" } else { "s" },
-            preg.hw_enc()
-        ),
+        Some(preg) if preg.class() == RegClass::Int => {
+            write!(ctx, "{}{}", if wide { "x" } else { "w" }, preg.hw_enc())
+        }
+        Some(preg) if preg.class() == RegClass::Float => {
+            write!(ctx, "{}{}", if wide { "d" } else { "s" }, preg.hw_enc())
+        }
         _ => ctx.write_reg(&reg),
     }
 }

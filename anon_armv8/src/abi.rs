@@ -523,10 +523,7 @@ mod tests {
                 "vector arg {index}: {location:?}"
             );
         }
-        assert!(matches!(
-            locations[8],
-            ArgSlot::Stack { offset: 0, .. }
-        ));
+        assert!(matches!(locations[8], ArgSlot::Stack { offset: 0, .. }));
         assert_eq!(stack_size, 16);
     }
 

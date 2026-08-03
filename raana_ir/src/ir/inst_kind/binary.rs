@@ -104,12 +104,14 @@ impl BinaryOp {
     }
 
     pub fn is_commutative_for(&self, operand_ty: &Type) -> bool {
-        matches!(self, BinaryOp::NotEq | BinaryOp::Eq | BinaryOp::Min | BinaryOp::Max)
-            || (operand_ty.is_i32()
-                && matches!(
-                    self,
-                    BinaryOp::Add | BinaryOp::Mul | BinaryOp::And | BinaryOp::Or | BinaryOp::Xor
-                ))
+        matches!(
+            self,
+            BinaryOp::NotEq | BinaryOp::Eq | BinaryOp::Min | BinaryOp::Max
+        ) || (operand_ty.is_i32()
+            && matches!(
+                self,
+                BinaryOp::Add | BinaryOp::Mul | BinaryOp::And | BinaryOp::Or | BinaryOp::Xor
+            ))
     }
 }
 

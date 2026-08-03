@@ -29,13 +29,6 @@ impl Fma {
     }
 
     pub fn new_data(acc: Inst, lhs: Inst, rhs: Inst, ty: Type) -> InstData {
-        InstData::new(
-            ty,
-            InstKind::Fma(Fma {
-                acc,
-                lhs,
-                rhs,
-            }),
-        )
+        InstData::new(ty, InstKind::Fma(Fma { acc, lhs, rhs }))
     }
 }

@@ -29,6 +29,7 @@ pub use fma::Fma;
 pub use global_alloc::GlobalAlloc;
 pub use jump::Jump;
 pub use mem_zero::MemZero;
+pub use mem_zero::MemZeroLen;
 pub use ptr::GetElemPtr;
 pub use r3turn::Return;
 pub use scalar::Float;
@@ -175,7 +176,14 @@ impl Iterator for InstUsage<'_> {
             }
             InstKind::GlobalAlloc(global_alloc) => field_use!(global_alloc.init()),
             InstKind::Store(store) => field_use!(store.src(), store.dest()),
-            InstKind::MemZero(mem_zero) => field_use!(mem_zero.dest()),
+            InstKind::MemZero(mem_zero) => match mem_zero.byte_len_len() {
+                crate::ir::inst_kind::mem_zero::MemZeroLen::Const(_) => {
+                    field_use!(mem_zero.dest())
+                }
+                crate::ir::inst_kind::mem_zero::MemZeroLen::Value(len) => {
+                    field_use!(mem_zero.dest(), *len)
+                }
+            },
             InstKind::Load(load) => field_use!(load.src()),
             InstKind::Cast(cast) => field_use!(cast.src()),
             InstKind::Call(call) => call.args().get(cur_index).copied(),

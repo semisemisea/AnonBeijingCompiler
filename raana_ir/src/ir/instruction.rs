@@ -6,7 +6,7 @@ use crate::ir::{
     inst_kind::{
         Aggregate, BasicBlockUsage, Binary, Branch, Call, Cast, Fma, GetElemPtr, GlobalAlloc,
         InstKind, InstUsage, Jump, Load, MemZero, Return, Select, Store, TailCall,
-        VectorExtractElement, VectorInsertElement, VectorReduce, VectorSplat,
+        VectorExtractElement, VectorInsertElement, VectorReduce, VectorSplat, mem_zero::MemZeroLen,
     },
     remap::EntityMapper,
     types::Type,
@@ -172,7 +172,13 @@ impl InstData {
                 .kind
             }
             InstKind::MemZero(mem_zero) => {
-                MemZero::new_data(mapper.map_inst(mem_zero.dest())?, mem_zero.byte_len()).kind
+                let dest = mapper.map_inst(mem_zero.dest())?;
+                match mem_zero.byte_len_len() {
+                    MemZeroLen::Const(byte_len) => MemZero::new_data(dest, *byte_len).kind,
+                    MemZeroLen::Value(byte_len) => {
+                        MemZero::new_dynamic_data(dest, mapper.map_inst(*byte_len)?).kind
+                    }
+                }
             }
             InstKind::Load(load) => {
                 Load::new_data(mapper.map_inst(load.src())?, self.ty().clone()).kind

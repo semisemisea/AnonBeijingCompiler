@@ -3,7 +3,9 @@
 use raana_ir::ir::{
     Binary, BinaryOp, Call, Cast, Fma, GetElemPtr, InstKind, Load, Return, Select, Store, TailCall,
     Type as HirType, TypeKind, VectorExtractElement, VectorInsertElement, VectorReduce,
-    VectorReduceOp, VectorSplat, arena::Arena, inst_kind::MemZero,
+    VectorReduceOp, VectorSplat,
+    arena::Arena,
+    inst_kind::{MemZero, MemZeroLen},
 };
 use taki_mir::{
     abi::{ABIMachineSpec, ArgSlot, CallArgPair, CallRetPair, RetPair, StackAMode},
@@ -1042,8 +1044,41 @@ fn lower_mem_zero(
     arena: ArenaContext<'_>,
     mem_zero: &MemZero,
 ) -> LoweredOutput {
-    let inline_store_count = mem_zero.byte_len() / 4;
-    if runtime::mem_zero_is_inline(mem_zero.byte_len()) {
+    match mem_zero.byte_len_len() {
+        MemZeroLen::Const(byte_len) => lower_const_mem_zero(ctx, arena, mem_zero, *byte_len),
+        MemZeroLen::Value(byte_len) => {
+            let dest = ctx.put_value_in_reg(mem_zero.dest());
+            let byte_len = ctx.put_value_in_reg(*byte_len);
+            ctx.emit(MInst::Call {
+                args: vec![
+                    CallArgPair {
+                        vreg: dest,
+                        preg: regs::INT_ARG_REGS[0],
+                    },
+                    CallArgPair {
+                        vreg: byte_len,
+                        preg: regs::INT_ARG_REGS[1],
+                    },
+                ],
+                ret: None,
+                clobbers: regs::DEFAULT_CLOBBERS,
+                label: Label::Embedded(EmbeddedSymbol::Memset),
+            });
+            ctx.set_has_calls();
+            ctx.set_outgoing_arg_size(0);
+            LoweredOutput::None
+        }
+    }
+}
+
+fn lower_const_mem_zero(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    mem_zero: &MemZero,
+    byte_len: usize,
+) -> LoweredOutput {
+    let inline_store_count = byte_len / 4;
+    if runtime::mem_zero_is_inline(byte_len) {
         let alloc = matches!(arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
             .then_some(mem_zero.dest());
         let (dest, stack_offset) = if let Some(alloc) = alloc {
@@ -1085,7 +1120,7 @@ fn lower_mem_zero(
     } else {
         (ctx.put_value_in_reg(mem_zero.dest()), None)
     };
-    let byte_len = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+    let byte_len_reg = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
     if let Some(offset) = stack_offset {
         ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
             StackAMode::Slot(offset),
@@ -1094,8 +1129,8 @@ fn lower_mem_zero(
     }
     ctx.emit(MInst::LoadImm {
         size: OperandSize::Size64,
-        dst: Writable::from_reg(byte_len),
-        value: mem_zero.byte_len() as u64,
+        dst: Writable::from_reg(byte_len_reg),
+        value: byte_len as u64,
     });
     ctx.emit(MInst::Call {
         args: vec![
@@ -1104,7 +1139,7 @@ fn lower_mem_zero(
                 preg: regs::INT_ARG_REGS[0],
             },
             CallArgPair {
-                vreg: byte_len,
+                vreg: byte_len_reg,
                 preg: regs::INT_ARG_REGS[1],
             },
         ],

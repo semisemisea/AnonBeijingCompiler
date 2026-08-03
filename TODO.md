@@ -3,9 +3,9 @@
 本文档只记录尚未完成的工作。已完成里程碑只保留一行摘要，历史设计与实现细节
 以 Git 提交记录和代码测试为准，不在这里重复维护。
 
-> 进行中：§2 主计划 E——matmul 标量收敛（M49-M52 已完成，进行 M53-M55），
+> 进行中：§2 主计划 E——matmul 标量收敛（M49-M53 已完成，进行 M54-M55），
 > 以 `01_mm1` 为基线收敛内层循环到 gcc 标量水平（内层 ~9 条/element 含
-> `subs;b.ne`）。SIMD Phase 2（M42-M46）仍搁置，见 §3。
+> `subs;b.ne`，零循环 `bl memset`）。SIMD Phase 2（M42-M46）仍搁置，见 §3。
 
 ## 已完成里程碑摘要
 
@@ -20,6 +20,9 @@
   （BRANCH14/19/26 与 RISC-V B/JAL）。
 - **M28-M29**：分支发射重构（对照 Cranelift MachBuffer）——RISC-V `CondBr`
   slot 化、`beqz/bnez` 收敛、veneer 全覆盖、buffer 行为测试与门禁。
+- **M53**：零 store 循环 → MemZero/memset——`MemZero` 动态长度支持 +
+  `zero_store_loop` pass（AArch64）；`mm` 零 C 循环变 `bl .Lsoyo_memzero`。
+  functional 109/109、h_functional 40/40、RISC-V 109/109。
 - **M52**：count-up 循环旋转 + `subs` 融合——`rotate_count_up`（守卫 + 倒计时
   header param + exit 参数化重映射）；内层 j 循环变 `subs x,#1; b.ne`（~9
   条/element）。functional 109/109、h_functional 40/40、RISC-V 109/109。
@@ -265,6 +268,18 @@ alloca（`%v_A/%v_B/%v_C`）类型是 `**[i32;1024]`（**指针**），被排除
   3. 只转换纯内部循环，不破坏 `A[i][k]==1` 短路分支结构。
 - 验收：`.s` 出现 `bl memset`；与逐元素结果 QEMU 差分一致；`-O0` 保留标量
   形式作 on/off 差分基线。
+
+#### M53：零 store 循环 → MemZero/memset（L2b）✅
+
+- 状态：**已完成**。`MemZero` 扩展支持**动态长度**（`MemZeroLen::Const/Value`，
+  涉及 IR 类型、builder、inst_usage、remap_refs、DCE、aarch64/riscv lowering、
+  runtime 链接、LLVM/fmt writer）；新增 `zero_store_loop` pass（AArch64 注册，
+  在 `rotate_loops` 之后）：匹配倒计时零 store 循环（体 = 单条 `store 0` 到
+  `gep(base, row_offsets, j)` + j/t 更新），collapse 为 `MemZero(C[i], n*4)`。
+- 验收通过：`mm` 零 C 循环变 `bl .Lsoyo_memzero`（逐行 memset，同 gcc 形态）；
+  functional 109/109、h_functional 40/40、perf 01_mm1/01_mm2/01_mm3 PASS、
+  RISC-V 109/109、双 target byte-identical。新增单测：`converts_a_zeroing_countdown_loop_to_memzero`、
+  `refuses_loops_that_store_a_nonzero_value`。
 
 #### M54：地址折叠 / 冗余消除（L2c）
 

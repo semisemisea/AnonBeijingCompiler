@@ -1,4 +1,5 @@
 use raana_ir::ir::InstKind;
+use raana_ir::ir::inst_kind::MemZeroLen;
 use taki_mir::prelude::{Arena, HirProgram};
 
 const INLINE_MEMZERO_MAX_STORES: usize = 4;
@@ -66,7 +67,10 @@ fn needs_memset(program: &HirProgram) -> bool {
             .flat_map(|block| block.insts().iter())
             .any(
                 |&inst| match program.func_data(function).inst_data(inst).kind() {
-                    InstKind::MemZero(mem_zero) => !mem_zero_is_inline(mem_zero.byte_len()),
+                    InstKind::MemZero(mem_zero) => match mem_zero.byte_len_len() {
+                        MemZeroLen::Const(byte_len) => !mem_zero_is_inline(*byte_len),
+                        MemZeroLen::Value(_) => true,
+                    },
                     _ => false,
                 },
             )

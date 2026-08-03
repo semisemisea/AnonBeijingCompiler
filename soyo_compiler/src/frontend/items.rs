@@ -133,6 +133,17 @@ pub enum ConstInitVal {
 }
 
 impl ConstInitVal {
+    /// An array initializer that contributes no leaf expression (e.g. `{}` or
+    /// `{{}}`) initializes every element to zero. Callers may collapse such
+    /// initializers into a single `ZeroInit` instead of materializing one
+    /// element per array slot.
+    pub fn is_empty_init(&self) -> bool {
+        match self {
+            ConstInitVal::Normal(_) => false,
+            ConstInitVal::Array(init_vals) => init_vals.iter().all(Self::is_empty_init),
+        }
+    }
+
     pub fn explicit_init_vals(&self, array_shape: &[i32]) -> Vec<(usize, &ConstExp)> {
         let Self::Array(_) = self else { unreachable!() };
         let mut entries = Vec::new();
@@ -252,6 +263,17 @@ pub enum InitVal {
 }
 
 impl InitVal {
+    /// An array initializer that contributes no leaf expression (e.g. `{}` or
+    /// `{{}}`) initializes every element to zero. Callers may collapse such
+    /// initializers into a single `ZeroInit` instead of materializing one
+    /// element per array slot.
+    pub fn is_empty_init(&self) -> bool {
+        match self {
+            InitVal::Normal(_) => false,
+            InitVal::Array(init_vals) => init_vals.iter().all(Self::is_empty_init),
+        }
+    }
+
     pub fn explicit_init_vals(&self, array_shape: &[i32]) -> Vec<(usize, &Exp)> {
         let Self::Array(_) = self else { unreachable!() };
         let mut entries = Vec::new();

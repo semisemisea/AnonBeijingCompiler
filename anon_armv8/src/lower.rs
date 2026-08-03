@@ -3433,4 +3433,94 @@ mod tests {
         assert!(assembly.contains("ldr q"), "{assembly}");
         assert!(assembly.contains("addv s"), "{assembly}");
     }
+
+    /// Determinism gate: compiling the vector kernel at each `-O` level must be
+    /// byte-identical across recompilations.
+    #[test]
+    fn vector_kernel_is_deterministic_across_opt_levels() {
+        use crate::config::AArch64CodegenConfig;
+        use raana_ir::ir::builder_trait::*;
+
+        let v4i32 = Type::get_vector(Type::get_i32(), 4);
+        let build = |program: &Program| {
+            let mut program = program.clone();
+            let mut programs = Vec::new();
+            for config in [
+                AArch64CodegenConfig {
+                    dce: false,
+                    peephole_combine: false,
+                    pair_combine: false,
+                    list_scheduler: false,
+                    sched_model: Default::default(),
+                    branch_opt: false,
+                    chain_fusion: false,
+                },
+                AArch64CodegenConfig {
+                    dce: true,
+                    peephole_combine: true,
+                    pair_combine: true,
+                    list_scheduler: false,
+                    sched_model: Default::default(),
+                    branch_opt: true,
+                    chain_fusion: true,
+                },
+                AArch64CodegenConfig {
+                    dce: true,
+                    peephole_combine: true,
+                    pair_combine: true,
+                    list_scheduler: true,
+                    sched_model: Default::default(),
+                    branch_opt: true,
+                    chain_fusion: true,
+                },
+            ] {
+                let first =
+                    taki_mir::compile_with_config::<crate::lower::AArch64Backend>(&program, &config)
+                        .assembly;
+                for _ in 0..4 {
+                    let again =
+                        taki_mir::compile_with_config::<crate::lower::AArch64Backend>(&program, &config)
+                            .assembly;
+                    assert_eq!(first, again, "recompilation diverged");
+                }
+                programs.push(first);
+            }
+            programs
+        };
+
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "vec_det".into(),
+            vec![v4i32.clone(), v4i32.clone(), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let v = data.params()[0];
+        let w = data.params()[1];
+        let s = data.params()[2];
+        let splat = data.new_local_inst().vector_splat(s, v4i32.clone());
+        let add = data.new_local_inst().binary(BinaryOp::Add, v, splat);
+        let mul = data.new_local_inst().binary(BinaryOp::Mul, add, w);
+        let mask = data.new_local_inst().binary(BinaryOp::Eq, v, w);
+        let sel = data.new_local_inst().select(mask, add, mul);
+        let mn = data.new_local_inst().binary(BinaryOp::Min, sel, w);
+        let mx = data.new_local_inst().binary(BinaryOp::Max, mn, splat);
+        let sum = data
+            .new_local_inst()
+            .vector_reduce(raana_ir::ir::VectorReduceOp::Add, mx);
+        for inst in [splat, add, mul, mask, sel, mn, mx, sum] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let ret = data.new_local_inst().ret(Some(sum));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let programs = build(&program);
+        // Every optimization level must produce the NEON lowering.
+        for assembly in &programs {
+            assert!(assembly.contains("add v"), "{assembly}");
+            assert!(assembly.contains("bsl"), "{assembly}");
+            assert!(assembly.contains("addv s"), "{assembly}");
+        }
+    }
 }

@@ -43,6 +43,7 @@ CODES = {
     "green": "\x1b[32m",
     "red": "\x1b[31m",
     "yellow": "\x1b[33m",
+    "cyan": "\x1b[36m",
     "magenta": "\x1b[35m",
 }
 TEST_TIMEOUT = 600
@@ -282,7 +283,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline, runne
     arch_config = TARGET_CONFIG[target]
     sysylib = ROOT / "sysylib" / arch_config["sysylib"]
     if str(src_rel) in SKIP_TESTS:
-        return None, "SKIP", "skipped (missing input)", ""
+        return None, None, "SKIP", "skipped (missing input)", ""
     base = src.with_suffix("")
     copy_testcase_files(src, out_dir)
 
@@ -347,6 +348,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline, runne
     except subprocess.TimeoutExpired as err:
         write_timeout_output(err, compile_stdout, compile_stderr, compile_returncode)
         return (
+            time.perf_counter() - start,
             None,
             " TLE",
             f"compile timeout after {TEST_TIMEOUT}s",
@@ -362,6 +364,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline, runne
             .strip()
         )
         return (
+            time.perf_counter() - start,
             None,
             " CE ",
             f"exit {compile_proc.returncode}\n{output or '(no output)'}",
@@ -383,10 +386,17 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline, runne
             )
         except subprocess.TimeoutExpired as err:
             write_timeout_output(err, compile_stdout, compile_stderr, compile_returncode)
-            return None, " TLE", f"ir timeout after {TEST_TIMEOUT}s", ""
+            return (
+                time.perf_counter() - start,
+                None,
+                " TLE",
+                f"ir timeout after {TEST_TIMEOUT}s",
+                "",
+            )
         if ir_proc.returncode:
             output = (ir_proc.stdout + ir_proc.stderr).decode("utf-8", "replace").strip()
             return (
+                time.perf_counter() - start,
                 None,
                 " CE ",
                 f"ir exit {ir_proc.returncode}\n{output or '(no output)'}",
@@ -415,6 +425,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline, runne
                 err, runtime_stdout, runtime_stderr, runtime_returncode
             )
             return (
+                time.perf_counter() - start,
                 None,
                 " TLE",
                 f"llc timeout after {TEST_TIMEOUT}s",
@@ -428,6 +439,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline, runne
                 llc_proc, runtime_stdout, runtime_stderr, runtime_returncode
             )
             return (
+                time.perf_counter() - start,
                 None,
                 " CE ",
                 f"llc exit {llc_proc.returncode}\n{output or '(no output)'}",
@@ -459,21 +471,25 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline, runne
     except subprocess.TimeoutExpired as err:
         write_timeout_output(err, runtime_stdout, runtime_stderr, runtime_returncode)
         return (
+            time.perf_counter() - start,
             None,
             " TLE",
             f"link timeout after {TEST_TIMEOUT}s",
+            "",
         )
     if link_proc.returncode:
         write_process_output(
             link_proc, runtime_stdout, runtime_stderr, runtime_returncode
         )
         return (
+            time.perf_counter() - start,
             None,
             " RE ",
             f"link exit {link_proc.returncode}\n{link_proc.stderr.decode('utf-8', 'replace').strip() or '(no output)'}",
             "",
         )
 
+    compile_elapsed = time.perf_counter() - start
     stdin = base.with_suffix(".in")
     stdin_file = stdin.open("rb") if stdin.exists() else None
     runtime_start = time.perf_counter()
@@ -497,6 +513,7 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline, runne
                 err, runtime_stdout, runtime_stderr, runtime_returncode
             )
             return (
+                compile_elapsed,
                 time.perf_counter() - runtime_start,
                 " TLE",
                 f"runtime timeout after {TEST_TIMEOUT}s",
@@ -517,18 +534,31 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline, runne
         actual = combined_output(run_proc.stdout, run_proc.returncode)
     status, msg = compare_output(actual, base.with_suffix(".out"), run_proc.stderr)
     if status == "PASS":
-        return time.perf_counter() - runtime_start, status, msg, gem5_summary
+        return (
+            compile_elapsed,
+            time.perf_counter() - runtime_start,
+            status,
+            msg,
+            gem5_summary,
+        )
 
     if run_proc.returncode != 0 and run_proc.stderr.strip():
         output = (run_proc.stdout + run_proc.stderr).decode("utf-8", "replace").strip()
         return (
+            compile_elapsed,
             time.perf_counter() - runtime_start,
             " RE ",
             f"exit {run_proc.returncode}\n{output or '(no output)'}",
             gem5_summary,
         )
 
-    return time.perf_counter() - runtime_start, status, msg, gem5_summary
+    return (
+        compile_elapsed,
+        time.perf_counter() - runtime_start,
+        status,
+        msg,
+        gem5_summary,
+    )
 
 
 def parse_args(argv):
@@ -615,6 +645,25 @@ def check_mounts(compiler, target, baseline, runner):
     return True
 
 
+def print_timing_summary(plural, singular, timings):
+    if not timings:
+        return
+    print(f"\nTop 5 slowest {plural}:")
+    for elapsed, path in sorted(timings, reverse=True)[:5]:
+        print(f"{elapsed * 1000:>10.2f}ms {paint(path, 'dim')}")
+    elapsed_times = [elapsed for elapsed, _ in timings]
+    sorted_elapsed = sorted(elapsed_times)
+    p95 = sorted_elapsed[math.ceil(len(sorted_elapsed) * 0.95) - 1]
+    print(
+        f"\n{singular.capitalize()} summary:"
+        f"\n  Average: {statistics.mean(elapsed_times) * 1000:.2f}ms"
+        f"\n  Median:  {statistics.median(elapsed_times) * 1000:.2f}ms"
+        f"\n  P95:     {p95 * 1000:.2f}ms"
+        f"\n  Fastest: {min(elapsed_times) * 1000:.2f}ms"
+        f"\n  Slowest: {max(elapsed_times) * 1000:.2f}ms"
+    )
+
+
 def run_tests(args):
     compiler = args.compiler.resolve()
     if not check_mounts(compiler, args.target, args.baseline, args.runner):
@@ -637,6 +686,7 @@ def run_tests(args):
 
     counts = {status: 0 for status in STATUSES}
     timings = []
+    compile_timings = []
     statusline = ""
 
     def clear_status():
@@ -693,18 +743,29 @@ def run_tests(args):
         set_status(0, rel_test(files[0]))
         for done, future in enumerate(as_completed(futures), 1):
             src = futures[future]
-            elapsed, status, msg, gem5_summary = future.result()
+            compile_elapsed, run_elapsed, status, msg, gem5_summary = future.result()
             path = rel_test(src)
-            if elapsed is not None:
-                timings.append((elapsed, path))
+            if compile_elapsed is not None:
+                compile_timings.append((compile_elapsed, path))
+            if run_elapsed is not None:
+                timings.append((run_elapsed, path))
             counts[status] += 1
 
             running = next(
                 (rel_test(futures[item]) for item in futures if not item.done()), None
             )
+            if compile_elapsed is not None:
+                compile_time = paint(f"{compile_elapsed * 1000:8.2f}ms", "cyan")
+            else:
+                compile_time = paint(f"{'n/a':>10}", "dim")
+            if run_elapsed is not None:
+                run_time = paint(f"{run_elapsed * 1000:8.2f}ms", "yellow")
+            else:
+                run_time = paint(f"{'n/a':>10}", "dim")
             log(
                 f"{paint_status(status)} "
-                f"{f'{elapsed * 1000:.2f}ms' if elapsed is not None else 'runtime n/a'} "
+                f"{paint('c:', 'bold')} {compile_time} "
+                f"{paint('r:', 'bold')} {run_time} "
                 f"{paint(str(path), 'dim')}",
                 running is not None,
             )
@@ -738,21 +799,8 @@ def run_tests(args):
         paint(f"\n{counts[' TLE']:>5} TLE (timeout error)", "yellow", "bold"),
         paint(f"\n{skipped:>5} Skipped", "dim"),
     )
-    if timings:
-        print("\nTop 5 slowest tests (runtime only):")
-        for elapsed, path in sorted(timings, reverse=True)[:5]:
-            print(f"{elapsed * 1000:>10.2f}ms {paint(path, 'dim')}")
-        sorted_elapsed_times = sorted(elapsed for elapsed, _ in timings)
-        p95 = sorted_elapsed_times[math.ceil(len(sorted_elapsed_times) * 0.95) - 1]
-        elapsed_times = [elapsed for elapsed, _ in timings]
-        print(
-            "\nRuntime summary:"
-            f"\n  Average: {statistics.mean(elapsed_times) * 1000:.2f}ms"
-            f"\n  Median:  {statistics.median(elapsed_times) * 1000:.2f}ms"
-            f"\n  P95:     {p95 * 1000:.2f}ms"
-            f"\n  Fastest: {min(elapsed_times) * 1000:.2f}ms"
-            f"\n  Slowest: {max(elapsed_times) * 1000:.2f}ms"
-        )
+    print_timing_summary("compiles", "compile", compile_timings)
+    print_timing_summary("runs", "runtime", timings)
     return 0 if failed == 0 else 1
 
 

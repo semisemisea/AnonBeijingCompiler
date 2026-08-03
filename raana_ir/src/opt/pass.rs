@@ -202,7 +202,7 @@ impl PassesManager {
         }
 
         // Hoist loop-invariant pure expressions to the preheader.
-        let licm = Box::new(licm::LICM);
+        let licm = Box::new(licm::LICM::new());
         p.register(licm);
 
         let gvn = Box::new(gvn::GlobalInstNumbering);

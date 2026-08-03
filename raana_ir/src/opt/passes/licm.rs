@@ -1,7 +1,11 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::opt::{
-    analysis_passes::{dom_tree::v2::DominanceTree, loop_analysis::Loop},
+    analysis_passes::{
+        dom_tree::v2::DominanceTree,
+        effects::EffectAnalysis,
+        loop_analysis::Loop,
+    },
     prelude::*,
     utils::{
         cfg::CFG,
@@ -10,7 +14,25 @@ use crate::opt::{
 };
 
 /// Loop invariant code motion
-pub struct LICM;
+pub struct LICM {
+    /// Whole-program purity / alias analysis, rebuilt on every `Pass::run`.
+    /// Loads are only hoisted when no loop instruction may write the loaded
+    /// address (see `load_hoist_safe`); without the analysis (direct
+    /// `run_on` use) loads stay put.
+    analysis: Option<EffectAnalysis>,
+}
+
+impl LICM {
+    pub fn new() -> LICM {
+        LICM { analysis: None }
+    }
+}
+
+impl Default for LICM {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lattice {
@@ -28,6 +50,7 @@ enum LoopResult {
 impl LICM {
     fn solve(
         looop: &Loop,
+        analysis: &Option<EffectAnalysis>,
         data: &mut ArenaContextMut<'_>,
         cfg: &CFG,
         dom_tree: &DominanceTree,
@@ -50,6 +73,7 @@ impl LICM {
                     | InstKind::Cast(..)
                     | InstKind::GetElemPtr(..)
                     | InstKind::Select(..)
+                    | InstKind::Load(..)
             )
         }
 
@@ -90,6 +114,22 @@ impl LICM {
             }
         };
 
+        // All memory-writing instructions in the loop body: any of them
+        // that may alias a load's address blocks hoisting that load.
+        let loop_writes = loop_insts
+            .iter()
+            .copied()
+            .filter(|inst| {
+                matches!(
+                    data.inst_data(*inst).kind(),
+                    InstKind::Store(..)
+                        | InstKind::MemZero(..)
+                        | InstKind::Call(..)
+                        | InstKind::TailCall(..)
+                )
+            })
+            .collect::<Vec<_>>();
+
         let mut invariant_order = vec![];
         let mut worklist = VecDeque::from_iter(loop_insts.iter().copied());
         while let Some(inst) = worklist.pop_front() {
@@ -98,6 +138,13 @@ impl LICM {
                 && inst_data
                     .inst_usage()
                     .all(|operand| operand_is_invariant(operand, &map))
+                && load_hoist_safe(
+                    analysis,
+                    inst,
+                    data.curr_func.unwrap(),
+                    data,
+                    &loop_writes,
+                )
             {
                 Lattice::Invariant
             } else {
@@ -207,7 +254,63 @@ impl LICM {
     }
 }
 
+/// Whether hoisting `inst` out of the loop is safe with respect to memory
+/// ordering. Non-loads are always safe; a load is safe only when no loop
+/// write (store, MemZero, or call) may write its address. Without the
+/// whole-program analysis, loads are conservatively not hoisted.
+fn load_hoist_safe(
+    analysis: &Option<EffectAnalysis>,
+    inst: Inst,
+    func: Function,
+    data: &ArenaContextMut<'_>,
+    loop_writes: &[Inst],
+) -> bool {
+    let InstKind::Load(load) = data.inst_data(inst).kind() else {
+        return true;
+    };
+    let Some(analysis) = analysis else {
+        return false;
+    };
+    let addr = load.src();
+    loop_writes.iter().all(|&write| {
+        match data.inst_data(write).kind() {
+            InstKind::Store(store) => {
+                !analysis.alias(data, func, addr, store.dest()).may_alias()
+            }
+            InstKind::MemZero(mem_zero) => {
+                !analysis.alias(data, func, addr, mem_zero.dest()).may_alias()
+            }
+            InstKind::Call(call) => {
+                let targets = analysis.targets_of(data, func, addr);
+                !analysis.call_may_write(call.callee(), targets.as_ref())
+            }
+            InstKind::TailCall(tail_call) => {
+                let targets = analysis.targets_of(data, func, addr);
+                !analysis.call_may_write(tail_call.callee(), targets.as_ref())
+            }
+            _ => true,
+        }
+    })
+}
+
 impl Pass for LICM {
+    fn run(&mut self, program: &mut Program) -> bool {
+        // Rebuild the whole-program purity / alias analysis: the fixed-point
+        // manager re-invokes run() after every IR change, so a stale
+        // snapshot must never be reused.
+        self.analysis = Some(EffectAnalysis::new(program));
+        let func_layout = program.function_layout().to_vec();
+        let mut changed = false;
+        for func in func_layout {
+            let mut arena_context = ArenaContextMut {
+                program,
+                curr_func: Some(func),
+            };
+            changed |= self.run_on(&mut arena_context);
+        }
+        changed
+    }
+
     fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         if data.layout().is_decl() {
             return false;
@@ -237,7 +340,14 @@ impl Pass for LICM {
             // Loops are ordered from small to big. This lets an instruction
             // hoisted from an inner loop be considered by its outer loop.
             for looop in loop_analysis.loops() {
-                match Self::solve(looop, data, &cfg, &dom_tree, &parameter_blocks) {
+                match Self::solve(
+                    looop,
+                    &self.analysis,
+                    data,
+                    &cfg,
+                    &dom_tree,
+                    &parameter_blocks,
+                ) {
                     LoopResult::Unchanged => {}
                     LoopResult::Changed => changed = true,
                     LoopResult::CfgChanged => {
@@ -268,7 +378,7 @@ mod tests {
             program,
             curr_func: Some(function),
         };
-        LICM.run_on(&mut context)
+        LICM::new().run_on(&mut context)
     }
 
     #[test]
@@ -736,5 +846,187 @@ mod tests {
         assert!(!data.inst_data(base).used_by().contains(&gep));
 
         assert!(!run(&mut program, function));
+    }
+
+    // --- load hoisting (requires the whole-program purity / alias analysis) ---
+
+    fn run_with_analysis(program: &mut Program) -> bool {
+        LICM::new().run(program)
+    }
+
+    fn new_global(program: &mut Program) -> Inst {
+        let init = program.new_value().zero_init(Type::get_i32());
+        program.new_value().global_alloc(init)
+    }
+
+    /// A loop `entry -> header -> (body -> header | exit)` where `entry` is
+    /// the dedicated preheader; `fill_header` adds the header instructions
+    /// (the terminator is appended by the helper).
+    fn build_loop(
+        program: &mut Program,
+        name: &str,
+        fill_header: impl FnOnce(&mut ArenaContextMut<'_>, BasicBlock, BasicBlock, BasicBlock),
+    ) -> Function {
+        let function = program.new_function(Type::get_unit(), name.into(), vec![]);
+        let mut data = ArenaContextMut {
+            program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+        let entry_jump = data.new_local_value().jump(header, vec![]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        fill_header(&mut data, header, body, exit);
+
+        let condition = data.new_local_value().integer(1);
+        let branch = data
+            .new_local_value()
+            .branch(condition, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, branch);
+        let backedge = data.new_local_value().jump(header, vec![]);
+        data.layout_mut().insert_inst(body, backedge);
+        let ret = data.new_local_value().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+        function
+    }
+
+    #[test]
+    fn hoists_load_with_no_may_alias_write() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        let mut load = None;
+        let function = build_loop(&mut program, "licm_load", |data, header, _body, _exit| {
+            let l = data.new_local_value().load(global);
+            data.layout_mut().insert_inst(header, l);
+            load = Some(l);
+        });
+
+        assert!(run_with_analysis(&mut program));
+        let load = load.unwrap();
+        let data = program.func_data(function);
+        assert_eq!(
+            data.layout().parent_bb(load),
+            Some(data.layout().entry_bb().unwrap().bb())
+        );
+    }
+
+    #[test]
+    fn does_not_hoist_load_when_loop_writes_same_global() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        let mut load = None;
+        let function = build_loop(&mut program, "licm_load_write", |data, header, _b, _e| {
+            let l = data.new_local_value().load(global);
+            data.layout_mut().insert_inst(header, l);
+            load = Some(l);
+            let one = data.new_local_value().integer(1);
+            let store = data.new_local_value().store(one, global);
+            data.layout_mut().insert_inst(header, store);
+        });
+
+        // Nothing is hoistable: the store cannot move and the load is
+        // blocked by the same-global write, so the pass reports no change.
+        assert!(!run_with_analysis(&mut program));
+        let data = program.func_data(function);
+        let entry = data.layout().entry_bb().unwrap().bb();
+        assert_ne!(data.layout().parent_bb(load.unwrap()), Some(entry));
+    }
+
+    #[test]
+    fn hoists_load_across_write_to_different_global() {
+        let mut program = Program::new();
+        let global_a = new_global(&mut program);
+        let global_b = new_global(&mut program);
+        let mut load = None;
+        let function = build_loop(&mut program, "licm_load_noalias", |data, header, _b, _e| {
+            let l = data.new_local_value().load(global_a);
+            data.layout_mut().insert_inst(header, l);
+            load = Some(l);
+            let one = data.new_local_value().integer(1);
+            let store = data.new_local_value().store(one, global_b);
+            data.layout_mut().insert_inst(header, store);
+        });
+
+        assert!(run_with_analysis(&mut program));
+        let data = program.func_data(function);
+        assert_eq!(
+            data.layout().parent_bb(load.unwrap()),
+            Some(data.layout().entry_bb().unwrap().bb())
+        );
+    }
+
+    #[test]
+    fn does_not_hoist_load_across_call_that_writes() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        // `writer` stores into the global.
+        let writer = program.new_function(Type::get_unit(), "writer".into(), vec![]);
+        {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(writer),
+            };
+            let entry = data.add_entry_block();
+            let one = data.new_local_value().integer(1);
+            let store = data.new_local_value().store(one, global);
+            data.layout_mut().insert_inst(entry, store);
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+        }
+        let mut load = None;
+        let function = build_loop(&mut program, "licm_load_call", |data, header, _b, _e| {
+            let l = data.new_local_value().load(global);
+            data.layout_mut().insert_inst(header, l);
+            load = Some(l);
+            let call = data.new_local_value().call(writer, vec![]);
+            data.layout_mut().insert_inst(header, call);
+        });
+
+        // The call may write the loaded global, so the load is not
+        // hoistable and the pass reports no change.
+        assert!(!run_with_analysis(&mut program));
+        let data = program.func_data(function);
+        let entry = data.layout().entry_bb().unwrap().bb();
+        assert_ne!(data.layout().parent_bb(load.unwrap()), Some(entry));
+    }
+
+    #[test]
+    fn hoists_load_across_pure_call() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        // `helper` has no memory or I/O effects.
+        let helper = program.new_function(Type::get_unit(), "helper".into(), vec![]);
+        {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(helper),
+            };
+            let entry = data.add_entry_block();
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+        }
+        let mut load = None;
+        let function = build_loop(&mut program, "licm_load_purecall", |data, header, _b, _e| {
+            let l = data.new_local_value().load(global);
+            data.layout_mut().insert_inst(header, l);
+            load = Some(l);
+            let call = data.new_local_value().call(helper, vec![]);
+            data.layout_mut().insert_inst(header, call);
+        });
+
+        assert!(run_with_analysis(&mut program));
+        let data = program.func_data(function);
+        assert_eq!(
+            data.layout().parent_bb(load.unwrap()),
+            Some(data.layout().entry_bb().unwrap().bb())
+        );
     }
 }

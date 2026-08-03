@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
@@ -9,7 +11,9 @@ use crate::{
             },
             loop_analysis::{Loop, LoopAnalysis},
         },
+        config::LoopUnrollMode,
         prelude::*,
+        stats::{LoopUnrollEvent, LoopUnrollOutcome, LoopUnrollRejectReason, PassesRunStats},
         utils::{
             cfg::CFG,
             logical_edge::{LogicalEdge, incoming_edges, outgoing_edges},
@@ -20,7 +24,27 @@ use crate::{
 const MAX_FULL_UNROLL_TRIPS: usize = 8;
 const MAX_UNROLLED_NON_TERMINATORS: usize = 64;
 
-pub struct LoopUnroll;
+pub struct LoopUnroll {
+    mode: LoopUnrollMode,
+    stats: Arc<Mutex<PassesRunStats>>,
+    collect_stats: bool,
+    observed: FxHashMap<(Function, BasicBlock), ObservedLoop>,
+}
+
+impl LoopUnroll {
+    pub fn new(
+        mode: LoopUnrollMode,
+        stats: Arc<Mutex<PassesRunStats>>,
+        collect_stats: bool,
+    ) -> Self {
+        Self {
+            mode,
+            stats,
+            collect_stats,
+            observed: FxHashMap::default(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct UnrollCandidate {
@@ -38,10 +62,48 @@ enum CloneError {
     MissingLoopValue(Inst),
 }
 
+#[derive(Debug, Clone)]
+struct CandidateRejection {
+    reason: LoopUnrollRejectReason,
+    trip_count: Option<usize>,
+    header_size: usize,
+    body_size: usize,
+    projected_size: Option<usize>,
+    shape_candidate: bool,
+    exact_trip_candidate: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedLoop {
+    outcome: LoopUnrollOutcome,
+    trip_count: Option<usize>,
+    body_size: usize,
+    projected_size: Option<usize>,
+    shape_candidate: bool,
+    exact_trip_candidate: bool,
+}
+
+impl CandidateRejection {
+    fn new(reason: LoopUnrollRejectReason) -> Self {
+        Self {
+            reason,
+            trip_count: None,
+            header_size: 0,
+            body_size: 0,
+            projected_size: None,
+            shape_candidate: false,
+            exact_trip_candidate: false,
+        }
+    }
+}
+
 impl Pass for LoopUnroll {
     fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
         if data.layout().is_decl() {
             return false;
+        }
+        if self.collect_stats {
+            self.stats.lock().unwrap().loop_unroll.pass_invocations += 1;
         }
         let mut changed = false;
         loop {
@@ -53,10 +115,47 @@ impl Pass for LoopUnroll {
             }
             let (cfg, _dom_tree, loops) = LoopAnalysis::from_cfg(cfg);
             let ivs = BasicInductionVariableAnalysis::new(data, &cfg, &loops);
-            let candidate = loops
-                .loops()
-                .iter()
-                .find_map(|looop| find_candidate(data, &cfg, &loops, &ivs, looop));
+            let mut candidate = None;
+            for looop in loops.loops() {
+                match analyze_candidate(data, &cfg, &loops, &ivs, looop) {
+                    Ok(found) => {
+                        let outcome = match self.mode {
+                            LoopUnrollMode::Enabled => LoopUnrollOutcome::Applied,
+                            LoopUnrollMode::DryRun => LoopUnrollOutcome::WouldApply,
+                            LoopUnrollMode::Disabled => unreachable!(),
+                        };
+                        self.record(
+                            data,
+                            looop,
+                            outcome,
+                            Some(found.trip_count),
+                            non_terminators(data, found.header).len(),
+                            non_terminators(data, found.body).len(),
+                            Some(projected_size(data, &found).unwrap()),
+                            true,
+                            true,
+                        );
+                        if self.mode == LoopUnrollMode::Enabled {
+                            candidate = Some(found);
+                            break;
+                        }
+                    }
+                    Err(rejection) => self.record(
+                        data,
+                        looop,
+                        LoopUnrollOutcome::Rejected(rejection.reason),
+                        rejection.trip_count,
+                        rejection.header_size,
+                        rejection.body_size,
+                        rejection.projected_size,
+                        rejection.shape_candidate,
+                        rejection.exact_trip_candidate,
+                    ),
+                }
+            }
+            if self.mode == LoopUnrollMode::DryRun {
+                return changed;
+            }
             let Some(candidate) = candidate else {
                 return changed;
             };
@@ -66,35 +165,194 @@ impl Pass for LoopUnroll {
     }
 }
 
-fn find_candidate(
+impl LoopUnroll {
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        data: &ArenaContextMut<'_>,
+        looop: &Loop,
+        outcome: LoopUnrollOutcome,
+        trip_count: Option<usize>,
+        header_size: usize,
+        body_size: usize,
+        projected_size: Option<usize>,
+        shape_candidate: bool,
+        exact_trip_candidate: bool,
+    ) {
+        if !self.collect_stats {
+            return;
+        }
+        let key = (data.curr_func.unwrap(), looop.header());
+        let current = ObservedLoop {
+            outcome,
+            trip_count,
+            body_size,
+            projected_size,
+            shape_candidate,
+            exact_trip_candidate,
+        };
+        let previous = self.observed.insert(key, current);
+        let mut run_stats = self.stats.lock().unwrap();
+        let stats = &mut run_stats.loop_unroll;
+        stats.loop_observations += 1;
+        if previous.is_none() {
+            stats.unique_loops_seen += 1;
+        } else if previous == Some(current) {
+            return;
+        }
+        if let Some(previous) = previous {
+            remove_observation(stats, previous);
+        }
+        add_observation(stats, current);
+        match outcome {
+            LoopUnrollOutcome::Applied
+            | LoopUnrollOutcome::WouldApply
+            | LoopUnrollOutcome::Rejected(_) => {}
+        }
+        stats.events.push(LoopUnrollEvent {
+            function: data.name().to_owned(),
+            header: data.bb_data(looop.header()).name().to_owned(),
+            outcome,
+            trip_count,
+            header_size,
+            body_size,
+            projected_size,
+        });
+    }
+}
+
+fn add_observation(stats: &mut crate::opt::stats::LoopUnrollStats, observation: ObservedLoop) {
+    if observation.shape_candidate {
+        stats.shape_candidates += 1;
+    }
+    if observation.exact_trip_candidate {
+        stats.exact_trip_candidates += 1;
+    }
+    if let Some(trip_count) = observation.trip_count {
+        *stats.trip_count_histogram.entry(trip_count).or_default() += 1;
+    }
+    *stats
+        .body_size_histogram
+        .entry(observation.body_size)
+        .or_default() += 1;
+    if let Some(projected_size) = observation.projected_size {
+        *stats
+            .projected_size_histogram
+            .entry(projected_size)
+            .or_default() += 1;
+    }
+    match observation.outcome {
+        LoopUnrollOutcome::Applied => {
+            stats.applied += 1;
+            if let Some(trip_count) = observation.trip_count {
+                *stats
+                    .accepted_trip_count_histogram
+                    .entry(trip_count)
+                    .or_default() += 1;
+            }
+        }
+        LoopUnrollOutcome::WouldApply => {
+            stats.would_apply += 1;
+            if let Some(trip_count) = observation.trip_count {
+                *stats
+                    .accepted_trip_count_histogram
+                    .entry(trip_count)
+                    .or_default() += 1;
+            }
+        }
+        LoopUnrollOutcome::Rejected(reason) => {
+            *stats.reject_reasons.entry(reason).or_default() += 1;
+        }
+    }
+}
+
+fn remove_observation(stats: &mut crate::opt::stats::LoopUnrollStats, observation: ObservedLoop) {
+    if observation.shape_candidate {
+        stats.shape_candidates -= 1;
+    }
+    if observation.exact_trip_candidate {
+        stats.exact_trip_candidates -= 1;
+    }
+    if let Some(trip_count) = observation.trip_count {
+        decrement_histogram(&mut stats.trip_count_histogram, trip_count);
+    }
+    decrement_histogram(&mut stats.body_size_histogram, observation.body_size);
+    if let Some(projected_size) = observation.projected_size {
+        decrement_histogram(&mut stats.projected_size_histogram, projected_size);
+    }
+    match observation.outcome {
+        LoopUnrollOutcome::Applied => {
+            stats.applied -= 1;
+            if let Some(trip_count) = observation.trip_count {
+                decrement_histogram(&mut stats.accepted_trip_count_histogram, trip_count);
+            }
+        }
+        LoopUnrollOutcome::WouldApply => {
+            stats.would_apply -= 1;
+            if let Some(trip_count) = observation.trip_count {
+                decrement_histogram(&mut stats.accepted_trip_count_histogram, trip_count);
+            }
+        }
+        LoopUnrollOutcome::Rejected(reason) => {
+            let count = stats.reject_reasons.get_mut(&reason).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                stats.reject_reasons.remove(&reason);
+            }
+        }
+    }
+}
+
+fn decrement_histogram(histogram: &mut std::collections::BTreeMap<usize, u64>, key: usize) {
+    let count = histogram.get_mut(&key).unwrap();
+    *count -= 1;
+    if *count == 0 {
+        histogram.remove(&key);
+    }
+}
+
+fn analyze_candidate(
     data: &ArenaContextMut<'_>,
     cfg: &CFG,
     loops: &LoopAnalysis,
     ivs: &BasicInductionVariableAnalysis,
     looop: &Loop,
-) -> Option<UnrollCandidate> {
+) -> Result<UnrollCandidate, CandidateRejection> {
     let header = looop.header();
-    if Some(header) == data.layout().entry_bb().map(|block| block.bb())
-        || looop.body().len() != 2
-        || looop.latches().len() != 1
-    {
-        return None;
+    if Some(header) == data.layout().entry_bb().map(|block| block.bb()) {
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::HeaderIsEntry,
+        ));
+    }
+    if looop.body().len() != 2 || looop.latches().len() != 1 {
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::UnsupportedLoopShape,
+        ));
     }
     let body = looop.latches()[0];
-    if body == header
-        || !looop.contains(body)
-        || !data.bb_data(body).params().is_empty()
-        || loops
-            .loops()
-            .iter()
-            .any(|nested| nested.header() != header && looop.contains(nested.header()))
+    if body == header || !looop.contains(body) {
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::UnsupportedLoopShape,
+        ));
+    }
+    if !data.bb_data(body).params().is_empty() {
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::BodyHasParameters,
+        ));
+    }
+    if loops
+        .loops()
+        .iter()
+        .any(|nested| nested.header() != header && looop.contains(nested.header()))
     {
-        return None;
+        return Err(CandidateRejection::new(LoopUnrollRejectReason::NestedLoop));
     }
 
     let header_edges = outgoing_edges(data, header);
     if header_edges.len() != 2 {
-        return None;
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::UnsupportedHeaderEdges,
+        ));
     }
     let continue_edges = header_edges
         .iter()
@@ -107,27 +365,39 @@ fn find_candidate(
         .filter(|edge| !looop.contains(edge.target(data)))
         .collect::<Vec<_>>();
     let [continue_edge] = continue_edges.as_slice() else {
-        return None;
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::UnsupportedHeaderEdges,
+        ));
     };
     let [exit_edge] = exit_edges.as_slice() else {
-        return None;
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::UnsupportedHeaderEdges,
+        ));
     };
     if continue_edge.target(data) != body || !continue_edge.args(data).is_empty() {
-        return None;
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::UnsupportedHeaderEdges,
+        ));
     }
     let exit = exit_edge.target(data);
 
     let body_edges = outgoing_edges(data, body);
     let [backedge] = body_edges.as_slice() else {
-        return None;
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::UnsupportedBackedge,
+        ));
     };
     if backedge.target(data) != header {
-        return None;
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::UnsupportedBackedge,
+        ));
     }
 
     let incoming = incoming_edges(data, cfg, header);
     if incoming.len() != 2 {
-        return None;
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::NonCanonicalEntry,
+        ));
     }
     let entries = incoming
         .iter()
@@ -140,40 +410,107 @@ fn find_candidate(
         .filter(|edge| looop.contains(edge.source()))
         .collect::<Vec<_>>();
     let [entry_edge] = entries.as_slice() else {
-        return None;
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::NonCanonicalEntry,
+        ));
     };
     let [incoming_backedge] = backedges.as_slice() else {
-        return None;
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::NonCanonicalEntry,
+        ));
     };
-    if incoming_backedge != backedge
-        || looop.get_preheader(cfg) != Some(entry_edge.source())
-        || entry_edge.args(data).len() != data.bb_data(header).params().len()
+    if incoming_backedge != backedge || looop.get_preheader(cfg) != Some(entry_edge.source()) {
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::NonCanonicalEntry,
+        ));
+    }
+    if entry_edge.args(data).len() != data.bb_data(header).params().len()
         || backedge.args(data).len() != data.bb_data(header).params().len()
     {
-        return None;
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::EdgeArgumentMismatch,
+        ));
     }
 
-    let trip_count = ivs.for_loop(looop).iter().find_map(|iv| {
-        let exit = normalize_strict_exit(data, looop, iv)?;
-        constant_trip_count(data, iv, exit).map(|trip| trip.iterations())
-    })?;
-    if trip_count > MAX_FULL_UNROLL_TRIPS {
-        return None;
+    let variables = ivs.for_loop(looop);
+    if variables.is_empty() {
+        return Err(CandidateRejection {
+            shape_candidate: true,
+            ..CandidateRejection::new(LoopUnrollRejectReason::NoBasicInductionVariable)
+        });
     }
-
+    let exits = variables
+        .iter()
+        .filter_map(|iv| normalize_strict_exit(data, looop, iv).map(|exit| (iv, exit)))
+        .collect::<Vec<_>>();
+    if exits.is_empty() {
+        return Err(CandidateRejection {
+            shape_candidate: true,
+            ..CandidateRejection::new(LoopUnrollRejectReason::NoSupportedStrictExit)
+        });
+    }
+    let trip_count = exits
+        .into_iter()
+        .find_map(|(iv, exit)| constant_trip_count(data, iv, exit).map(|trip| trip.iterations()))
+        .ok_or_else(|| CandidateRejection {
+            shape_candidate: true,
+            ..CandidateRejection::new(LoopUnrollRejectReason::NonConstantTripCount)
+        })?;
     let header_insts = non_terminators(data, header);
     let body_insts = non_terminators(data, body);
     let total = header_insts
         .len()
-        .checked_mul(trip_count.checked_add(1)?)?
-        .checked_add(body_insts.len().checked_mul(trip_count)?)?;
-    if total > MAX_UNROLLED_NON_TERMINATORS
-        || header_insts
-            .iter()
-            .chain(&body_insts)
-            .any(|&inst| matches!(data.inst_data(inst).kind(), InstKind::Alloc))
+        .checked_mul(trip_count.saturating_add(1))
+        .and_then(|header| {
+            body_insts
+                .len()
+                .checked_mul(trip_count)
+                .and_then(|body| header.checked_add(body))
+        })
+        .ok_or_else(|| CandidateRejection {
+            trip_count: Some(trip_count),
+            header_size: header_insts.len(),
+            body_size: body_insts.len(),
+            shape_candidate: true,
+            exact_trip_candidate: true,
+            ..CandidateRejection::new(LoopUnrollRejectReason::ProjectedSizeTooLarge)
+        })?;
+    if trip_count > MAX_FULL_UNROLL_TRIPS {
+        return Err(CandidateRejection {
+            trip_count: Some(trip_count),
+            header_size: header_insts.len(),
+            body_size: body_insts.len(),
+            projected_size: Some(total),
+            shape_candidate: true,
+            exact_trip_candidate: true,
+            ..CandidateRejection::new(LoopUnrollRejectReason::TripCountTooLarge)
+        });
+    }
+    if total > MAX_UNROLLED_NON_TERMINATORS {
+        return Err(CandidateRejection {
+            trip_count: Some(trip_count),
+            header_size: header_insts.len(),
+            body_size: body_insts.len(),
+            projected_size: Some(total),
+            shape_candidate: true,
+            exact_trip_candidate: true,
+            ..CandidateRejection::new(LoopUnrollRejectReason::ProjectedSizeTooLarge)
+        });
+    }
+    if header_insts
+        .iter()
+        .chain(&body_insts)
+        .any(|&inst| matches!(data.inst_data(inst).kind(), InstKind::Alloc))
     {
-        return None;
+        return Err(CandidateRejection {
+            trip_count: Some(trip_count),
+            header_size: header_insts.len(),
+            body_size: body_insts.len(),
+            projected_size: Some(total),
+            shape_candidate: true,
+            exact_trip_candidate: true,
+            ..CandidateRejection::new(LoopUnrollRejectReason::ContainsAlloc)
+        });
     }
 
     let header_values = data
@@ -197,11 +534,19 @@ fn find_candidate(
                 .is_none_or(|block| !looop.contains(block))
         })
     }) {
-        return None;
+        return Err(CandidateRejection {
+            trip_count: Some(trip_count),
+            header_size: header_insts.len(),
+            body_size: body_insts.len(),
+            projected_size: Some(total),
+            shape_candidate: true,
+            exact_trip_candidate: true,
+            ..CandidateRejection::new(LoopUnrollRejectReason::BodyValueEscapesLoop)
+        });
     }
     let loop_values = header_values.union(&body_values).copied().collect();
 
-    Some(UnrollCandidate {
+    Ok(UnrollCandidate {
         header,
         body,
         exit,
@@ -210,6 +555,17 @@ fn find_candidate(
         trip_count,
         loop_values,
     })
+}
+
+fn projected_size(data: &FunctionData, candidate: &UnrollCandidate) -> Option<usize> {
+    non_terminators(data, candidate.header)
+        .len()
+        .checked_mul(candidate.trip_count.checked_add(1)?)?
+        .checked_add(
+            non_terminators(data, candidate.body)
+                .len()
+                .checked_mul(candidate.trip_count)?,
+        )
 }
 
 fn apply_candidate(data: &mut ArenaContextMut<'_>, candidate: &UnrollCandidate) {
@@ -536,7 +892,12 @@ mod tests {
             program: &mut fixture.program,
             curr_func: Some(fixture.function),
         };
-        LoopUnroll.run_on(&mut data)
+        LoopUnroll::new(
+            LoopUnrollMode::Enabled,
+            Arc::new(Mutex::new(PassesRunStats::default())),
+            false,
+        )
+        .run_on(&mut data)
     }
 
     fn assert_edge_arguments_well_typed(data: &FunctionData) {

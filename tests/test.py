@@ -277,7 +277,19 @@ def copy_testcase_files(src, out_dir):
             shutil.copy2(path, dst_base.with_suffix(path.suffix))
 
 
-def run_test(src, out_dir, opt_level, compiler, backend, target, baseline, runner):
+def run_test(
+    src,
+    out_dir,
+    opt_level,
+    compiler,
+    backend,
+    target,
+    baseline,
+    runner,
+    loop_unroll,
+    pass_stats,
+    compile_only,
+):
     start = time.perf_counter()
     src_rel = rel_test(src)
     arch_config = TARGET_CONFIG[target]
@@ -326,11 +338,14 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline, runne
         compile_args = [str(compiler)]
         if opt_level:
             compile_args.append(f"-O{opt_level}")
+        compile_args += ["--target", target]
+        if loop_unroll:
+            compile_args += ["--loop-unroll", loop_unroll]
+        if pass_stats:
+            compile_args.append("--pass-stats")
         if backend == "asm":
             compile_args += [
                 "-S",
-                "--target",
-                target,
                 "-o",
                 str(compile_artifact),
                 str(src),
@@ -375,6 +390,9 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline, runne
         ir_args = [str(compiler)]
         if opt_level:
             ir_args.append(f"-O{opt_level}")
+        ir_args += ["--target", target]
+        if loop_unroll:
+            ir_args += ["--loop-unroll", loop_unroll]
         ir_args += ["--emit", "ir", "-o", str(ir), str(src)]
 
         try:
@@ -402,6 +420,9 @@ def run_test(src, out_dir, opt_level, compiler, backend, target, baseline, runne
                 f"ir exit {ir_proc.returncode}\n{output or '(no output)'}",
                 "",
             )
+
+    if compile_only:
+        return time.perf_counter() - start, None, "PASS", "compile only", ""
 
     # LLVM backend: lower .ll to .o via llc before linking
     if backend == "llvm":
@@ -606,6 +627,21 @@ def parse_args(argv):
         help="runtime used to execute ELFs (default: qemu)",
     )
     parser.add_argument(
+        "--loop-unroll",
+        choices=["on", "off", "dry-run"],
+        help="override the compiler loop-unroll mode",
+    )
+    parser.add_argument(
+        "--pass-stats",
+        action="store_true",
+        help="save structured IR pass statistics in .compile.stderr",
+    )
+    parser.add_argument(
+        "--compile-only",
+        action="store_true",
+        help="stop after producing the compiler artifact and final IR",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="show test case output details",
@@ -737,6 +773,9 @@ def run_tests(args):
                 args.target,
                 args.baseline,
                 args.runner,
+                args.loop_unroll,
+                args.pass_stats,
+                args.compile_only,
             ): src
             for src in files
         }

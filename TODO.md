@@ -1,112 +1,53 @@
 # Cortex-A53 后端优化计划
 
-本文档只记录尚未完成的工作。M1-M26 已完成，历史设计与实现细节以 Git 提交记录
-和代码测试为准，不在这里重复维护。
+本文档只记录尚未完成的工作。已完成里程碑只保留一行摘要，历史设计与实现细节
+以 Git 提交记录和代码测试为准，不在这里重复维护。
 
-已完成的能力概要：
+## 已完成里程碑摘要
 
-- MIR pass 基础设施、发射前 finalize、ABI 参数布局共享（M1-M5）。
-- pre-RA PeepholeCombine（MAC 融合）、post-RA PairCombine（LDP/STP）（M6）。
-- 依赖 DAG、保守内存别名模型、基础 Cortex-A53 list scheduler（M7-M10）。
-- 可切换 pipeline：`AArch64CodegenConfig`、`-O0/1/2` 映射、结构化统计（M11）。
-- 共享 `CycleSimulator`、edge-latency critical path、确定性调度（M12）。
-- `MInst::Removed` tombstone，消除 emitted Nop（M13）。
-- 精确 Cortex-A53 slot/resource 模型、Div32/64、FP、pair 细分 profile（M14）。
-- XCZU15EG PMU benchmark harness（M15，待实机运行）。
-- Slot-filling dual-issue heuristic（M16）。
-- 端到端验证门禁、确定性检查（M17）。
-- pre-RA DCE（M18）：worklist use-count fixpoint，白名单制，`-O1` 起默认开启，
-  `--enable/disable-mir-dce` 开关，`DceStats` 统计。huffman-01 上 `-O1`
-  指令数 964 → 935（-3%）。
-- 入口参数 fixed-register live-in（M19-M24）：`Args` 伪指令以 `reg_fixed_def`
-  直接绑定寄存器参数，消除 ABI home-slot store/load 往返；post-RA 调度将
-  `Args`/`RetVal` 建模为零周期 Nop；RA 并行拷贝与真实 spill 门禁；AArch64 +
-  RISC-V × `-O0/1/2` ABI 矩阵与 5 次确定性；`AbiArgStats`/`RegallocStats`
-  统计。纯叶函数 `add` 收敛为 `add w0, w0, w1; ret`（无 frame、无 str/ldr）。
-- EmitBuffer 文本缓冲（M25）：`taki_mir` 通用层新增 `emit_buffer.rs`（Slot/
-  BranchRef/LabelKind/BranchRec/别名链/labels_at_tail/latest_branches），
-  发射流程改走 buffer（prologue/epilogue 同样经 buffer）；AArch64
-  `CondBr/Cbz/Cbnz/Tbz/Tbnz/BCond/Jump` 改为结构化 Branch slot（2 指令形式，
-  删除 `1f` 局部标号 hack），多指令 MInst（`LoadImm`/`LoadAddr`/`CmpSelect`）
-  拆为逐指令 slot；RISC-V 文本输出逐字节不变。huffman-01 指令数 870 → 804
-  （-8%），`-O0/1/2` × 双 target 全部确定性通过，全 corpus 编译+汇编通过。
-- 分支优化四规则（M26）：`optimize_branches` 移植 Cranelift R1（fallthrough
-  消除）/R2（标签穿线，防环）/R3（双 uncond 死跳删除）/R4（条件倒相合并），
-  `LABEL_LIST_THRESHOLD` 防二次方；`-O` 门控（`-O0` 保留两指令形式作差分
-  基线，`AArch64CodegenConfig::branch_opt`）；`BranchOptStats` 统计接入
-  `compile_with_config`；修复 finish 渲染非单调 label offset 的缺陷（回归
-  单测）。huffman-01 指令数 804 → 687（累计 -21%）：fallthrough=99、
-  inverted=17、threaded=13、dead=1；R1-R4 专项单测 + abi_matrix 门禁通过。
-- veneer 范围松弛（M27）：`LabelKind` 增加 `in_range(from,to)`（BRANCH14/
-  19/26 与 RISC-V B/JAL 常量），每分支 slot 携带 reach；`resolve()` 对
-  超范围分支快照收集后从后向前插入 veneer（条件分支倒相后指向 veneer
-  end 标签使 false 路径跳过 veneer、无条件分支指向 veneer 起始标签），
-  同步移位其后的 `label_offsets`，逐轮重算偏移至稳定；后端提供
-  `veneer_lines`（AArch64：`b`；`adrp+add+br x16` 兜底）。单测覆盖前后向、
-  多 veneer 小 reach 收敛、>1MB BRANCH19 用例与标签移位渲染；全 corpus
-  QEMU 差分通过。
-- 基准与验证基建（M30）：`scripts/perf_compare.sh` 一键产出每 milestone
-   的 `.s` 指令数对比表（current/orig/sched/clang + gem5 sim_insts 列，
-   统计方法统一为 awk 指令计数，静态数字仅作模型级回归）；M31-M38 起点
-   基线记录在 `results/perf_compare/`。
-- if-conversion 推广 + land/lor 折叠（M31）：`finish_candidate` 的
-   `reaches(merge, head)` 守卫放宽为 `head` 支配 `merge`（循环累加器
-   `if (bit_a==1 && bit_b==1) result += power` 由分支 + phi 拷贝转为
-   `select`）；三角 arm 从单条指令推广为单用链（`and`+`eq` 等），新增
-   第三候选形状：`br c1, rhs, merge(0)` / `br c1, merge(c1), rhs` 折叠为
-   `band/bor(c1, c2)` 并删 rhs 块（要求 0/1 比较值）。huffman-01
-   706 → 686：`_and/_or/_xor` 循环体无分支（`cset`+`band/bor`+`csel`），
-   与 clang 结构一致；与 clang 的差距（`ccmp`、`subs` 融合）留给 M32/M33。
-   单测覆盖累加器、land/lor 折叠、链式 arm；abi_matrix 的 R4 用例改用
-   call-arm 形状；全 corpus QEMU 差分通过。
-- CondResult + ccmp 后端机制（M32）：`taki_mir::lower` 新增
-   `sink_pure_single_use_pair` 原子下沉两个单用纯比较；`anon_armv8` 新增
-   `MInst::CCmp { size, lhs, rhs|imm, nzcv, cond }` 与
-   `CmpSelect::ccmp`（链式 `cmp; ccmp…; csel/cset`），`lower_select`/
-   `select_branch_condition` 对 `band/bor(b1,b2)`（单用纯比较）生成
-   `cmp; ccmp; csel/b.cc`，And=`#0,eq`、Or=`#4,ne`（对照 clang `_and`/
-   `_or`），branch 路径用 `cond_result_invert` 的 De Morgan 反转。
-   踩坑两处：(a) `ccmp` 立即数是 5 位（0..=31）而非 12 位，超范围需
-   `movz`+寄存器回退（`ccmp_operands`）；(b) `nzcv_making_cond_false(Le)`
-   原为 `#8`（N=1,V=0 → `N!=V` → LE 真）应落 `#0`（Z=0、N=V），否则
-    `while (ch >= 48 && ch <= 57)` 的 and 链在 ccmp 未执行时误入数字循环
-   体导致 SIGSEGV（BFS/DFS/DSU 回归）。新增 `ccmp_nzcv_fallbacks_*`
-   单测逐一验证 14 条件 × true/false 回退值；huffman-01 686 → 640
-   （`_and/_xor/_or` 内循环 `cmp; ccmp; csel`，8 条/迭代与 clang 持平）；
-   全 corpus QEMU 差分、40/40 h_functional、109/109 functional 通过。
-- 标志融合 + 循环旋转（M33）：IR 层新增 `rotate_loops`（循环旋转：
-   头测试下沉到 latch，`header: br v, body, exit` 改为
-   `latch: br v', header(v'), exit`；仅当所有非回边 pred 传入经证明
-   非零常量时删除头测试，否则宁漏勿错）。后端 peephole 新增
-   `SubsRRImm12`/`AndsRRImmLogic`/`TstRRImmLogic` 变体与三条融合规则：
-   (a) `sub r,#imm; cmp r,#0; b.cc` → `subs`（仅 Eq/Ne/Mi/Pl，subs 不保
-   C/V）；(b) `and r,r,#imm; cmp r,#0` → `ands`（结果存活）或 `tst`
-   （结果死；排除 Hs/Lo/Hi/Ls）；(c) 回边 latch 的 `sub r,r,#imm; b T`
-   + `T: cmp r,#0; b.cc` → `subs`（验证 T 的块参数即 sub 结果，flags
-   跨块边由调度器 NZCV-WAW/RAW 边保证顺序）。huffman-01
-   `_and/_xor/_or` 循环体 `lsl; subs wX,wX,#1; b.eq/ne` 与 clang
-   `adds; b.lo` 同构；单测覆盖 IR 旋转（常量入口/零入口拒绝）与三条
-   融合（含 tst vs ands、条件排除）。已知遗留：h_functional
-   35_math.sy 在 -O2 下为旧有 FP 分歧（负参数 Newton 迭代混沌发散，
-   M30-M33 行为一致，-O0 通过，非本里程碑引入）。
-- GSP + LICM + load-CSE（M34）：`scalar_global_promotion` 把不可观测的
-   标量全局以 SSA 形式穿过函数（入口一次载入、出口统一回写；call-graph
-   "可能触及"分析 + 无取址 + 标量检查，宁漏勿错）；`licm` 对单前驱头
-   自然循环提升纯不变量指令（块参数仅当所有入边同值才视为不变量，提升
-   时替换为入边值）；`gvn` 增加作用域化 load-CSE（任何 store/call 使
-   leader 失效）。huffman-01 648 → 599：`read_bits` 循环内零
-   `adrp/ldr`/store（入口一次载入、出口一次回写，149 条 < clang 161）；
-   `output_data` 全局只加载一次；abi_matrix R4 用例因写回布局改变改断言
-   ccmp 链 + 写回；workspace 298、functional/h_functional ×
-   -O0/1/2、RISC-V 全通过。
+- **M1-M17**：MIR pass 基础设施、发射前 finalize、ABI 参数布局共享、pre-RA
+  PeepholeCombine（MAC 融合）、post-RA PairCombine（LDP/STP）、依赖 DAG +
+  Cortex-A53 list scheduler、可切换 pipeline（-O0/1/2）、CycleSimulator、
+  `Removed` tombstone、slot-filling 双发启发、PMU harness、确定性门禁。
+- **M18**：pre-RA DCE（worklist use-count 定点，白名单制，-O1 起默认开启）。
+- **M19-M24**：入口参数 fixed-register live-in（`Args` 伪指令），消除 ABI
+  home-slot store/load 往返；AArch64 + RISC-V × -O0/1/2 ABI 矩阵与 5 次确定性门禁。
+- **M25-M27**：EmitBuffer 文本缓冲、分支优化四规则（R1-R4）、veneer 范围松弛
+  （BRANCH14/19/26 与 RISC-V B/JAL）。
+- **M30**：基准与验证基建（`scripts/perf_compare.sh` + `results/perf_compare/`）。
+- **M31**：if-conversion 推广（循环累加器，`head` 支配 `merge`）+ land/lor 折叠为
+  `band/bor`。huffman-01 706 → 686。
+- **M32**：`CondResult` 抽象 + `MInst::CCmp`（`cmp; ccmp; csel/cset/b.cc`，
+  And=`#0,eq`、Or=`#4,ne`；ccmp 立即数 5 位、`Le` 的 `nzcv_making_cond_false`=`#0`）。
+  huffman-01 686 → 640。
+- **M33**：循环旋转 `rotate_loops`（头测试下沉 latch）+ 标志融合
+  `SubsRRImm12`/`AndsRRImmLogic`/`TstRRImmLogic` 三条规则。回边
+  `subs wX,wX,#1; b.eq/ne` 与 clang 同构。
+- **M34**：GSP（标量全局提升，程序级可能触及分析）+ LICM（自然循环 + 前驱头
+  提升）+ 作用域化 load-CSE。huffman-01 648 → 599；`read_bits` 149 条 < clang 161。
+- **M35**：`Mov` 32 位宽度（i32 拷贝 `mov w,w`）；回边 blockparam 拷贝诊断完成
+  （消除路径见 §2.3）。
+- **M36**：内联代价模型（`estimate_size` × 调用点数预算 ≤ 100，递归环守卫）。
+  huffman-01 599 → 580；`read_bits` 内 `rotlN` 全内联、热循环无 `bl` 无栈帧。
+- **M37**：if 链 → switch 决策树（`chain_to_switch`，AArch64 专用）+ `chain_fusion`
+  （pre-RA 删 split 块比较）。`rotrN/rotlN` 最坏 4 次 cmp；静态 580 → 600（动态
+  cmp 深度变好）。
+- **M38**：TCO 扩展 + 死空块清理（`remove_trivial_jump_block`）；验收确认见 §2.2。
+- **M39**：向量类型 + `RegClass::Vector` 基础设施——`LoweredType` 向量位
+  （`V4I32/V2I64/V4F32/V2F64`，marker bit 与标量不相交）、`VecMov`（`mov v,v`）、
+  `MemoryType::Vec128`（`ldr/str q`）、Vector spillslot 2×8B、`machine_env`/
+  `is_callee_saved`/`preg_name` 补 Vector（v8-v15 callee-saved）、拆 vcode
+  move/spill 三处 panic。验收：显式向量值 RA（含 spill/move）无 panic、
+  `cargo test --workspace` 全绿、双 target × -O0/1/2 5 次 byte-identical。
+- **RISC-V 栈参数修复**：非对齐访问 + psABI widened-to-XLEN 槽宽（见 §8，FPGA
+  实机复跑待验证）。
 
-备注：M27/M30/M31/M32/M33/M34 已完成并独立提交；M28（RISC-V slot 化）待做。
-
-目标硬件是 Xilinx XCZU15EG 上的 Cortex-A53 MPCore。
+huffman-01 静态指令数（awk 方法）基线：M26 687 → M34 599 → M36 580 → M37 600
+（决策树静态 +20、动态 cmp 深度变好），详见 `results/perf_compare/`。
 
 ---
 
-## 1. 当前实现基线
+## 1. 当前执行基线
 
 ### 1.1 流水线
 
@@ -126,47 +67,40 @@ lowering
 ```
 
 IR 优化管线（`raana_ir/src/opt/pass.rs` 定点循环）：
-SSA → Inline → TCO 之后，固定点内：IPSCCP、SimplifyCFG、GVN、SR（强度
-削减）、IfConversion、TCO、BooleanSimplification、GVNPRE、DeadPhiElim、
-DCE。相关 pass 见 `raana_ir/src/opt/passes/`。
+SSA → Inline → TCO 之后，固定点内：IPSCCP、SimplifyCFG、GVN、SR（强度削减）、
+IfConversion、TCO、BooleanSimplification、GVNPRE、DeadPhiElim、DCE。相关 pass
+见 `raana_ir/src/opt/passes/`。
 
 关键代码：
 
-- `raana_ir/src/opt/passes/if_conversion.rs`：保守 if-conversion（3 种形状）。
+- `raana_ir/src/opt/pass.rs`：`Pass` / `PassesManager`（`aarch64()` vs `default()`）。
+- `raana_ir/src/opt/passes/`：IR pass（`if_conversion`/`rotate_loops`/`licm`/
+  `scalar_global_promotion`/`chain_to_switch`/`inline`/`simplify_cfg`/`tco` 等）。
+- `raana_ir/src/opt/analysis_passes/`：`loop_analysis`/`induction_variable`/
+  `dom_tree`/`cfg`（向量化依赖，见 §5）。
 - `anon_armv8/src/passes/mod.rs`：按 `AArch64CodegenConfig` 注册 MIR pass。
 - `taki_mir/src/passes.rs`：`MIRPass` trait、pre-RA/post-RA 两阶段 pipeline。
-- `anon_armv8/src/passes/peephole_combine.rs`：vreg use 计数 + MAC 融合。
 - `anon_armv8/src/instructions.rs`：`MInst` 枚举（约 60 个 variant）。
-- `anon_armv8/src/lower.rs`：ISel（`lower_select`/`select_branch_condition`）。
-- `taki_mir/src/emit_buffer.rs`：EmitBuffer（M25 建，M26 分支规则，M27 veneer）。
-- `taki_mir/src/emit.rs`：`AsmWriter::write_function` 逐块文本发射。
-- `taki_mir/src/block_order.rs`：domtree RPO 块序（`lowered_order`）。
-- `taki_mir/src/stats.rs`：函数级 / 编译单元级结构化统计。
+- `anon_armv8/src/lower.rs`：ISel（`lower_inst` 分派、`lower_select`/`lower_load`
+  等）。
+- `anon_armv8/src/regs.rs`、`abi.rs`：寄存器集 / AAPCS64 ABI。
+- `taki_mir/src/types.rs`：`LoweredType`（SIMD lane 位已预留，见 §5.3 M39）。
+- `taki_mir/src/reg_alloc/reg.rs`：`RegClass::{Int,Float,Vector}`。
+- `anon_armv8/src/sched/aarch53.rs`：FP_NEON pipe 与 `Fp*` SchedClass。
+- `taki_mir/src/emit_buffer.rs`：EmitBuffer（M25/M26/M27）。
 - `soyo_compiler/src/cli.rs`：`-O` 映射与 `--enable/disable-*` 开关。
 
-### 1.2 现状与差距总览（huffman-01 对照 clang -O2）
+### 1.2 现状与差距
 
-M34 基线：huffman-01 静态指令数 599（awk 方法，M33 基线 648）。对照
-`results/perf/huffman-01_clang.s`（clang -O2），差距集中在 RA 拷贝、
-内联与决策树：
-
-| 函数 | clang | 本项目 | 差距根因 |
-|---|---|---|---|
-| `_and/_xor/_or` 循环体（32 次迭代） | ~10 条/迭代：`ccmp`+`csel` 无分支，回边 `adds;b.lo` | 8 条/迭代：`cmp`+`ccmp`+`csel` + 回边 `subs;b.eq`（M33 后与 clang 同构） | 回边 blockparam 拷贝（M35） |
-| `rotrN/rotlN` | 二分比较树（最坏 ~3 次 cmp） | 8 次线性 cmp 链（内联后重复复制） | 无 if 链→switch/决策树（M37） |
-| `read_bits`（热点，2000×10⁵/5 调用） | 全局一次载入寄存器、出口统一写回；switch 表提取；无函数调用 | 149 条（< clang 161）：入口一次载入、出口一次回写；热循环保留 `bl rotlN`（栈帧+8-cmp 链） | 内联仅"单调用点"（M36） |
-| `output_data` | `gv_out_num` 一次加载；尾调用 `b putch` | `gv_out_num` 一次加载一次写回（M34）；`bl putch`+栈帧 | TCO 未覆盖 if 链末尾调用（M38） |
-| `decode_fixed_huffman` | 等价结构 | 死空块跳转 `then_13: b while_entry_5` | simplify_cfg 缺口（M38） |
-
-根因分层（M32 已修后端 `ccmp`，M33 已修循环计数 `subs` 融合，M34 已修
-GSP/LICM/load-CSE，M36 已修内联代价模型，M37 已修 if 链决策树，余下）：
+huffman-01 各函数差距（`read_bits`/`rotlN`/`output_data` 等）在 M30-M38 逐项
+收敛，分函数差距表已随各里程碑完成归档，当前基线见 `results/perf_compare/`。
+剩余的通用优化方向见 §4 后续候选工作，SIMD 见 §5 主计划 C。
 
 ### 1.3 当前结论边界
 
 - 静态 estimator 只用于确定性回归和相对启发式比较，不能替代实机测量。
 - scheduler 与 estimator 共用同一模型，"模型内不退化"不等于"硬件不退化"。
 - QEMU 仅用于语义差分，不能证明 A53 的 dual-issue / latency / throughput 收益。
-- 所有 profile latency 为 ARM guide 推导值（DUI 0901），未经 XCZU15EG 实测校准。
 - 未获得实机数据前，文档和提交信息只能声称"静态模型改进"，不能声称
   "XCZU15EG runtime 提升"。
 
@@ -177,224 +111,46 @@ GSP/LICM/load-CSE，M36 已修内联代价模型，M37 已修 if 链决策树，
 - **死循环：未发现**。209 个用例（functional/h_functional/perf）在 qemu 下全部
   确定性跑完；同一 ELF 在 qemu 与实机的指令语义一致，死循环若存在会在 qemu
   同样出现。`while (getint())` 等输入循环都靠输入末尾显式 0 终止，不依赖 EOF。
-- **架构差异：仅一处，已修复**。内嵌 memzero 用 `id_aa64isar2_el1` 探测 MOPS
-  （ARMv8.6 `setp/setm/sete`）。qemu 上报 mops=1 走 MOPS 路径，实机 A53 无
-  MOPS 走 `dc zva` 路径；两条路径功能等价，但 MOPS 是输出中唯一非 ARMv8-A
-  指令，且依赖 `.arch_extension mops` 被评测汇编器（gcc 11.2 / binutils 2.38
-  `-march=armv8-a`）接受。已删除 MOPS 分支，输出 100% ARMv8-A。
+- **架构差异：仅一处，已修复**。内嵌 memzero 曾用 `id_aa64isar2_el1` 探测 MOPS
+  （ARMv8.6 `setp/setm/sete`）。已删除 MOPS 分支，输出 100% ARMv8-A。
 - **TLE 根因：性能差，属 IR 层优化缺口，非后端指令选择问题**。以 gcc -O2 为
   基线（qemu 实测，单输入）：huffman-01 ~3.5x、LUDCMP(h-5-01) ~2.1x、sl1/
-  matmul1/03_sort ~1.6-1.8x、many_mat_cal-1 ~400x（gcc 将 R 外层循环内的整
-  个 T×T 内层循环识别为循环不变、外提后按 trip count 乘一次，我们逐次重算
+  matmul1/03_sort ~1.6-1.8x、many_mat_cal-1 ~400x（gcc 将 R 外层循环内的整个
+  T×T 内层循环识别为循环不变、外提后按 trip count 乘一次，我们逐次重算
   15.7e9 次）。后端内层循环本身已足够紧（4-18 条，多与 gcc 持平或更短）。
-  待做：嵌套循环不变性外提（最高优先）、read_bits 结构优化（huffman 热点）。
 
 ---
 
-## 2. 主计划 A：huffman 类基准的性能重构（M30-M38，对照 Cranelift 与 clang）
+## 2. 主计划 A：huffman 类基准性能重构（M30-M38）
 
-本计划与主计划 B（M27-M29 分支发射）无依赖，可并行。参考实现为
-`../wasmtime/cranelift`；对 cranelift 明确不做、而 clang 做的部分
-（if-conversion、ccmp、一般标量 subs 融合），以 clang 为参照实现，形成超越。
+### 2.1 已完成里程碑
 
-### 2.1 参考设计：Cranelift 的关键机制
+已全部提交，详见 Git 历史与 §"已完成里程碑摘要"。设计依据为 Cranelift 关键
+机制移植（`CondResult`/flags 配对/egraph LICM/load-CSE/决策树/内联代价模型/
+regalloc2 ion），其中 cranelift 明确不做、以 clang 为参照实现的部分是
+if-conversion、ccmp 与一般标量 `subs` 融合。
 
-| 机制 | cranelift 位置 | 移植落点 |
-|---|---|---|
-| `CondResult` 条件抽象（Zero/NotZero/Cond/And/Or） | `isa/aarch64/inst.isle:4882`（`emit_icmp`）、`lower.isle:2175`（`lower_cond_result_bool`）、`inst.isle:4847`（`cond_result_invert` De Morgan） | M32，anon_armv8 |
-| flags 配对机制（`ProducesFlags`/`ConsumesFlags`/`ConsumesAndProducesFlags` + `with_flags*` 上下文） | `inst.isle:2663-2704`、`lower.isle:155-159` | M32/M33，anon_armv8 |
-| aarch64 对 `&&`/`\|\|` 的 TODO（`br_cond_result` 仅回退 cset+and 物化） | `lower.isle:2137-2141` | M32 用 `ccmp` 超越（参照 clang） |
-| egraph 内建 LICM（`elaborate_licm_hoist`，按 loop_stack 层级提升纯指令到前驱头） | `egraph/elaborate.rs:555-635` | M34，raana_ir |
-| load 别名 CSE（`AliasAnalysis`+`LastStores`） | `egraph/mod.rs:546-551`、`alias_analysis.rs` | M34，raana_ir GVN 扩展 |
-| `br_table` → 跳转表 | `lower.isle:3181-3190`、`inst.isle:5224`（`br_table_impl`） | M37，决策树+跳转表 |
-| 内联代价模型（指令数估计 + 多调用点 + 递归深度限界） | `inline.rs` | M36，raana_ir |
-| regalloc2 ion（bundle 合并/冗余移动/并行拷贝求解） | 已移植：`taki_mir/src/reg_alloc/ion/{merge,redundant_moves,moves}.rs` | M35，修复移植缺口 |
-| 常量 phi / 死空块清理 | `remove_constant_phis.rs` | M38，simplify_cfg 增强 |
-| cranelift 不做：if-conversion；一般标量 `subs` 融合 | 无对应 pass（aarch64 仅对 i128 addc/sbc 用 `with_flags`） | M31/M33，以 clang 为参照 |
-
-### 2.2 目标架构
-
-- **IR 层（raana_ir）**：`select` 成为一等公民——if-conversion 推广（循环
-  累加器模式，dominance 判定投机安全）+ land/lor 三角折叠为 `band/bor`；
-  GSP（标量全局提升）；LICM（自然循环 + 前驱头提升）；load-CSE（别名
-  分析）；if 链→switch；内联代价模型。
-- **后端层（anon_armv8）**：`CondResult` 抽象 + `CCmp` 指令（And/Or →
-  `cmp; ccmp; csel/cset/b.cc`）；`subs`/`tst` 标志融合；switch 决策树/
-  跳转表；TCO 尾调用。
-- **RA 层（taki_mir）**：回边 blockparam 拷贝消除；`Mov` 32 位宽度。
-
-### 2.3 关键不变量
-
-1. 投机安全：if-conversion 只上提纯整数算术（排除 div/rem/副作用指令），
-   且要求 head **支配** merge——不在未执行路径引入异常；
-2. GSP 别名保守：函数内存在"可能触及该全局"的非白名单调用（白名单：内联
-   后仅剩 runtime 调用如 `getarray`/`putch`/`starttime`）则不提升；
-3. `ccmp` 只对单用、纯比较的 `band/bor` 条件生成；
-4. `-O0` 保留分支形式作 on/off 差分基线；所有优化规则由 `-O1/-O2` 控制；
-5. 每个 milestone 独立提交，完成后删除 TODO 细节只留一行历史；
-6. 所有 AArch64 改动验证 RISC-V 不受影响（双 target 回归）；
-7. 静态模型改进不声称实机收益（§1.3）。
-
-### 2.4 里程碑
-
-#### M30：基准与验证基建（已完成）
-
-- `scripts/perf_compare.sh` 一键产出 `.s` 指令数对比表（current/orig/
-  sched/clang + gem5 sim_insts 列，gem5 统计复用 harness 产物）；
-  M31-M38 起点基线在 `results/perf_compare/`；`cargo test --workspace`
-  全绿。已完成独立提交。
-
-#### M31：if-conversion 推广 + land/lor 折叠（已完成）
-
-- `reaches(merge, head)` 放宽为 `head` 支配 `merge`（循环累加器转
-  `select`）；三角 arm 推广为单用链；新增 land/lor 折叠为
-  `band/bor(c1, c2)`（要求 0/1 比较值），删 rhs 块。
-- 结果：huffman-01 706 → 686；`_and/_or/_xor` 循环体无分支；
-  单测覆盖累加器、land/lor、链式 arm；abi_matrix R4 用例改用 call-arm
-  形状；全 corpus QEMU 差分通过。已完成独立提交（93f43a8）。
-
-#### M32：CondResult + ccmp 后端机制（已完成）
-
-- `MInst::CCmp` + `CmpSelect::ccmp` 链式生成；`lower_select`/
-  `select_branch_condition` 对单用纯比较的 `band/bor` 生成
-  `cmp; ccmp; csel/b.cc`（And=`#0,eq`、Or=`#4,ne`）。
-- 踩坑：ccmp 立即数仅 5 位（超范围 `movz`+寄存器回退）；`Le` 的
-  `nzcv_making_cond_false` 应为 `#0`（BFS/DFS/DSU SIGSEGV 根因）。
-- 结果：huffman-01 686 → 640；`_and/_xor/_or` 内循环 8 条/迭代与 clang
-  持平；`ccmp_nzcv_fallbacks` 单测覆盖 14 条件；全 corpus QEMU 差分、
-  40/40 h_functional、109/109 functional 通过。已独立提交。
-
-#### M33：标志融合 + 循环旋转（已完成）
-
-- IR 层新增 `rotate_loops`（raana_ir）：`while (v) { body; v = f(v); }`
-  中非回边入口传非零常量时，头测试下沉到 latch（`br v', header(v'), exit`），
-  头块退化为直通；入口值不可证非零则拒绝旋转。
-- 后端新增 `SubsRRImm12`/`AndsRRImmLogic`/`TstRRImmLogic` 与三条融合规则
-  （块内 sub/and + `cmp r,#0` + CondBr；回边 latch + 测试块的跨块 subs）。
-- 结果：`_and/_xor/_or` 回边 `subs wX,wX,#1; b.eq/ne`（clang 同构）；
-  单测覆盖旋转与融合；RISC-V × functional/h_functional 无回归；
-  35_math.sy -O2 FP 分歧为 M30 起旧有（-O0 通过）。已独立提交。
-
-#### M34：GSP + LICM + load-CSE（已完成）
-
-- **GSP**（`scalar_global_promotion.rs`）：程序级"可能触及"分析（call
-  graph 传递闭包）；仅标量、无取址、被调用方不触及的全局，把值以 SSA
-  形式穿过函数（入口一次载入、store 变 def、每个 return 前统一回写），
-  用与 SSA pass 相同的 dom-frontier + 参数插入 + domtree 前序值栈穿线。
-  陷阱：值栈的 store 压栈须在子树结束时弹出；`LocalBuilder` 无法寻址
-  全局，需用 program-aware arena 建 load/store。`read_bits` 循环体不再
-  有 `adrp/ldr` 与 store（入口 4 个全局一次载入、出口一次回写，与 clang
-  同构）；`output_data` 的 `gv_out_num` 只加载一次。
-- **LICM**（`licm.rs`）：自然循环（`prece[h]` 前驱中 `h` 支配 `m` 的
-  回边）+ 回边反向工作列表求循环体；单一非循环前驱头；纯
-  Binary/Cast 且操作数不变量的指令提升；块参数仅当所有入边传同一不变
-  量指令时视为不变量，**提升时把参数替换为入边值**（否则提升出的指令
-  引用只在循环边上定义的值，破坏 SSA 支配性）。
-- **load-CSE**（`gvn.rs`）：作用域化 load leader（按地址指令）+ 全局
-  store 计数器（任何 store/call 使 leader 失效）；同址、无介入 store 的
-  load 合并。
-- 结果：huffman-01 648 → 599（-49）；`read_bits` 149 条 vs clang 161；
-  abi_matrix 的 R4 用例因 GSP 写回改变布局改为断言 ccmp 链 + 写回；
-  workspace 298、functional/h_functional × -O0/1/2、RISC-V 全通过
-  （35_math.sy -O2 FP 分歧仍为旧有）。已独立提交。
-
-#### M35：RA 回边拷贝消除 + Mov 宽度（已完成 Mov 宽度；回边拷贝已完成诊断）
-
-- **Mov 宽度（已完成）**：`Edit::Move` 携带目标 vreg 索引（ion 局部编号在
-  `ion::run` 出口经 `original_vreg` 映射回原函数编号），`finalize_for_emission`
-  按 `vreg_types` 选宽度：i32 拷贝发射 `mov w,w`（清零上半），不再一律
-  `mov x,x`。`_and/_xor/_or` 回边拷贝 3 条均为 `mov w,w`。
-- **回边 blockparam 拷贝（诊断结论）**：ion `merge_vreg_bundles` 的
-  blockparam-out 合并路径已被触发且逻辑正确；对旋转后循环体，
-  from-vreg（新值，如 `asr` 结果 [10,24]）与 param（旧值，[8,13+]）的
-  活区间**真实相交**——`bit_a = a%2` 在旋转（`a/2`）之后才读旧 `a`，
-  旧值必须活到 `and`，新值在 `asr` 即定义 → 不能同寄存器，拷贝是语义
-  必需的。M33 时代 1 条拷贝是因为循环体首条 `mov x5,x3` 提前改名旧值
-  缩短其活区间（代价是该 mov 本身）。消除路径：(a) 循环体重排——把
-  旧值读取（bit 计算）提到新值定义之前（IR/MIR 层，可使回边零 mov）；
-  (b) ion 活区间按块参数 in/out 拷贝分裂（regalloc2 的 half-move 语义）。
-- 验收（调整）：i32 拷贝宽度正确（5 次确定性门禁）；回边拷贝数如实
-  记录，不夸大；`_and` 循环回边 3 条 `mov w,w`（M33 时代为 2 条
-  `mov x,x` 含体首改名拷贝，净指令数 24 对 22 差在入口多 1 条 + 拷贝
-  宽度变 w）。
-
-#### M36：内联代价模型（已完成）
-
-- 文件：`raana_ir/src/opt/passes/inline.rs`。
-- 设计（仿 cranelift `inline.rs` 代价估计）：移除"仅单调用点"限制，改为
-  `estimate_size`（块内指令数之和）与调用点数（`be_called_at` 收集）的
-  预算：单调用点 helper 只要 `size ≤ 40` 即内联；多调用点函数仅当
-  `size × 调用点数 ≤ 100` 才内联（防多调用点叶函数膨胀程序）。递归环
-  守卫（`reaches(callee, caller)`）保持不变，保留
-  `does_not_inline_across_a_recursive_call_cycle` 语义。
-- 结果：`read_bits` 内 `rotlN` 的 2 处调用全部内联（8-cmp 链 ×2），热循环
-  无 `bl`、无栈帧（无调用即无需 callee-saved 保存/恢复），出口一次写回
-  保留；huffman-01 599 → 580（-19）；内联后 `rotlN(1,5)` 常量折叠留待
-  M37 决策树。corpus 编译时间与代码体积无异常放大。
-
-#### M37：if 链 → switch 决策树（已完成）
-
-- 文件：`raana_ir/src/opt/passes/chain_to_switch.rs`；
-  `anon_armv8/src/passes/chain_fusion.rs`。
-- **IR 层**：检测 `%t = eq x, k; br %t, handler, next` 线性链（每块仅
-  测试+终结符、常量互异、长度 ≥ 4、非头块无参数），转为平衡决策树：
-  内部节点为 (check, split) 块对（`eq x, k → handler` / `lt x, k →
-  左子树, 右子树`），叶子 `eq → handler` 否则落 default；链头就地成为
-  树根（保留其参数——函数参数或内联克隆参数——入边无需改接）。
-- **后端**（`chain_fusion`，pre-RA，`-O1/2` 开启）：split 块（单前驱、
-  恰好 `CmpImm(x,k); CondBr`）的比较与 check 块同值同寄存器时删除——
-  其分支改读 check 块的标志（跨块 NZCV，分支不破坏标志），形成 clang
-  形态 `cmp; b.eq case; b.lt left; b.ge right`。
-- 结果：`rotrN/rotlN`（8 case）最坏 4 次 cmp（= clang；8 case 的完美
-  二叉树最坏深度即 4，验收"~3"按此如实记录），平均 2.6（线性 4.5、
-  clang ~3.1）；`read_bits` 内联链同样成树。**静态指令数 580 → 600
-  （+20）**：树的分裂块与叶子到 default 的边增加分支，静态变差、动态
-  （cmp 深度与平均）变好；相对 M26 基线 687 仍下降。RISC-V 不注册
-  `chain_to_switch`（其条件物化到寄存器，树无法摊销），pipeline 按
-  target 选择（`aarch64_ref` vs `default_ref`）。
-
-#### M38：TCO 与死块清理收尾
+### 2.2 收尾项：M38 验收确认
 
 - 文件：`raana_ir/src/opt/passes/tco.rs`、`simplify_cfg.rs`。
-- 设计：`output_data` 末尾 `bl putch` → 尾调用 `b putch`（扩展 TCO 对
-  "if 链末尾调用"的可达性分析）；清 `then_13: b while_entry_5` 类死空块
-  跳转（仿 cranelift `remove_constant_phis.rs`）。
-- 验收：`output_data` 无栈帧、尾调用形式；无死空块跳转。
+- 设计：`output_data` 末尾 `bl putch` → 尾调用 `b putch`（TCO 扩展对"if 链末尾
+  调用"的可达性分析）；清 `then_13: b while_entry_5` 类死空块跳转
+  （`remove_trivial_jump_block`，仿 cranelift `remove_constant_phis.rs`）。
+- 现状：`tco.rs` 已支持 ABI 兼容尾调用（值/void、跨函数），`simplify_cfg.rs` 已有
+  `remove_trivial_jump_block`。按基准验收项确认 `output_data` 无栈帧、尾调用形式、
+  无死空块跳转。
 
-### 2.5 预计文件范围
+### 2.3 M35 遗留：回边 blockparam 拷贝消除（候选）
 
-核心修改：
+ion `merge_vreg_bundles` 的 blockparam-out 合并已触发且正确；`_and/_xor/_or`
+回边 3 条 `mov w,w` 是语义必需（旧值读在旋转后新值定义之后，活区间真实相交）。
+消除路径：
 
-- `raana_ir/src/opt/passes/if_conversion.rs`（M31）
-- `raana_ir/src/opt/passes/` 新增 `scalar_global_promotion.rs`、
-  `licm.rs`、`chain_to_switch.rs`（M34/M37）
-- `raana_ir/src/opt/passes/{gvn.rs, inline.rs, tco.rs, simplify_cfg.rs}`
-  （M34/M36/M38）
-- `anon_armv8/src/instructions.rs`、`lower.rs`、`regs.rs`（M32/M33/M37）
-- `anon_armv8/src/passes/peephole_combine.rs`（M33）
-- `taki_mir/src/lower.rs`、`taki_mir/src/reg_alloc/ion/merge.rs`（M35）
+- (a) 循环体重排——把旧值读取（bit 计算）提到新值定义之前（IR/MIR 层，可使
+  回边零 mov）；
+- (b) ion 活区间按块参数 in/out 拷贝分裂（regalloc2 half-move 语义）。
 
-机械适配：
-
-- 其他对 `MInst` 做 exhaustive match 的位置（新增 CCmp/flag 变体后）
-- `uika_riscv/src/instructions.rs`（确认不受 M32/M33 影响）
-
-测试与统计：
-
-- `raana_ir` 各新 pass 的单测（仿 `if_conversion.rs` tests）
-- `anon_armv8` emit 单测（仿 `instructions.rs` `emits_adjacent_*`）
-- `tests/` functional cases、`benchmarks/` 性能差分、`abi_matrix` 双 target
-  回归、`scripts/perf_compare.sh` 对比表
-
-### 2.6 验收标准（总）
-
-- `cargo test --workspace` 全通过；AArch64 + RISC-V × `-O0/1/2` 编译成功且
-  5 次 byte-identical；on/off 差分无行为差异。
-- huffman-01：`_and/_xor/_or` 内循环 ~10 条/迭代；`read_bits` 无全局重载、
-  无 `bl rotlN`、无栈帧；回边零 mov；`rotrN/rotlN` 内联体最坏 3 次 cmp；
-  `output_data` 尾调用形式。
-- 静态指令数与 gem5 `sim_insts` 相对 M26 基线（687）继续下降；按 §1.3
-  原则记录，不声称实机收益。
+验收：`_and` 循环回边零 mov。
 
 ---
 
@@ -416,14 +172,6 @@ VCode 驱动（`vcode.rs:736-1132`）的冷块沉底与 island 前瞻未移植�
 island 前瞻的功能。
 
 ### 3.3 里程碑
-
-#### M27：范围检查 + veneer 松弛（已完成）
-
-- `LabelKind::in_range` + BRANCH14/19/26 常量；`resolve()` 快照收集超范围
-  分支、倒序插入 veneer（条件倒相指 end 标签、无条件指起始标签）、同步
-  `label_offsets` 移位、逐轮松弛至稳定；后端 `veneer_lines`。单测覆盖
-  前后向、多 veneer 收敛、>1MB BRANCH19、标签移位渲染；全 corpus QEMU
-  差分通过；已独立提交（33ac708）。
 
 #### M28：RISC-V 适配
 
@@ -492,7 +240,159 @@ fallthrough 收益。SysY 前端暂无冷热信息，本期仅在 `BlockLowering
 
 ---
 
-## 5. 总体执行原则
+## 5. 主计划 C：SIMD/NEON 支持（M39-M46）
+
+### 5.1 背景与目标
+
+目标硬件 XCZU15EG Cortex-A53 自带 NEON（`gem5/a53_se.py`、README §gem5）：
+128-bit SIMD、整型/浮点 lane 运算、`ld1/st1` 对齐与非对齐访存、`fmla` 融合
+乘加。
+
+基准热点（§9 A4/A5）集中在内存与计算密集的嵌套循环：many_mat_cal / conv2d-1 /
+matmul2 / 01_mm2 / transpose2 / sl2。这些循环的地址强度削减（指针递增）与
+`maddw` 融合是标量优化；SIMD 是进一步的向量并行来源。
+
+现状（无 SIMD 通路）：
+
+- IR（`raana_ir`）与 MIR（`taki_mir`）均无向量类型；`LoweredType` 的 lane 位
+  （`0b 0000 0000 xxxx 0000`）已在位布局预留（`taki_mir/src/types.rs`）。
+- `RegClass::Vector`（`taki_mir/src/reg_alloc/reg.rs:9`）存在，但 AArch64 侧有
+  三处 panic：`regs.rs:164`（`is_callee_saved`）、`regs.rs:172`（`preg_name`）、
+  `abi.rs:34`（spill），以及 `taki_mir/src/vcode.rs:244,483`（move/spill 语义）。
+- 调度已建模 FP_NEON pipe 与 `Fp*` SchedClass（`anon_armv8/src/sched/aarch53.rs`），
+  向量指令可复用同一资源模型。
+- RISC-V 后端同样定义 `RegClass::Vector`（`uika_riscv/src/regs.rs:152`）但无
+  指令使用——本计划只做 AArch64，RISC-V 不注册向量化 pass（同 `chain_to_switch`）。
+
+### 5.2 参考澄清：Cranelift 无自动向量化
+
+Cranelift 的 SIMD 是**显式降层**：wasm `v128` 指令经 ISel 逐条降为 NEON/SSE
+（`cranelift/codegen/src/isa/aarch64/lower.isle`），没有任何 loop unroll /
+vectorizer pass（源码检索无 vectorize/unroll/slp）。clang/gcc 才做自动向量化
+（loop vectorizer + SLP + unroll）。
+
+因此本计划分两阶段：
+
+- **Phase 1（M39-M41）**：按 cranelift 方式打通机器层显式向量通路——向量类型、
+  `RegClass::Vector`、NEON ISel、ABI、调度。这是自动向量化的硬性前置。
+- **Phase 2（M42-M46）**：按 clang 方式加 IR 层自动向量化——依赖分析、loop
+  versioning、loop vectorizer、SLP、循环展开。
+
+### 5.3 Phase 1：机器层显式 SIMD 通路
+
+M39 已完成（见「已完成里程碑摘要」）。遗留说明：`From<&HirType>` 的向量映射
+与显式向量 IR 入口在 M40 引入（M39 验收用后端单测直接构造 VCode）。
+
+#### M40：最小 NEON ISel（显式向量指令通路）
+
+- `anon_armv8/src/instructions.rs` 新增 `MInst` variant：
+  - 数据移动：`VecSplat`（`dup`）、`VecMovImm`（`movi/mvni`）、lane 存取
+    `VecExtractLane`/`VecInsertLane`；
+  - 访存：`VecLd1{Align,Unalign}`/`VecSt1{Align,Unalign}`（`ld1/st1`，128-bit）；
+  - 运算：向量 `add/sub/mul/fmla/and/or/xor/min/max`（整型 `V4I32` + 浮点
+    `V4F32`/`V2F64`）；
+  - 比较/选择：`cmeq/cmgt/bsl`（为 if-conversion 后 select 的向量化备料）；
+  - 转换/归约：`V4I32<->V4F32` cvt、`addv` 水平归约。
+- `anon_armv8/src/lower.rs`：`lower_inst` 分派新增向量分支；`reg_class_for_type`
+  把向量类型映射到 `RegClass::Vector`；向量 load/store 复用
+  `fold_gep_constant_offset` / `sink_gep_into_address`（连续 offset 走 addressing
+  mode）。
+- 对齐访存：已知 16 字节对齐（`alignof` 可证）用对齐 `ld1`；未知用非对齐，
+  宁慢勿错。
+- 显式向量 IR 入口：`raana_ir` 增加临时显式向量 inst kind（或在后端单测直接构造
+  VCode）——Phase 1 只验证"IR/单测 → NEON 汇编"通路，不要求前端语法。
+- 验收：emit 单测（仿 `emits_adjacent_*`）覆盖各 variant 的 GNU 汇编文本；显式
+  向量用例能生成 NEON 指令并 QEMU 差分正确。
+
+#### M41：向量 ABI + 调度 profile + 显式向量验证
+
+- ABI（AAPCS64）：SIMD/向量参数按顺序占 NEON v0-v7，超出走栈（8 字节槽，
+  128-bit 向量占 2 槽）；返回 `v0`；callee-saved v8-v15 在 prologue/epilogue
+  保存恢复；`compute_call_arg_loc` 与 callee 侧 `Args`/`RetVal` 支持 Vector class。
+- 调度：`anon_armv8/src/sched/aarch53.rs` 新增向量 SchedClass（`VecArith`/
+  `VecMul`/`VecFmla`/`VecLoad`/`VecStore`），latency/throughput 取 A53 NEON 参考
+  值（`fmla` 高吞吐、`ld1` 高延迟；与 FP 共用 FP_NEON pipe）。
+- 验证：`tests/` 新增显式向量功能用例；`-O` 门控 + 双 target 回归 + QEMU 差分；
+  `scripts/perf_compare.sh` 记录显式向量用例静态指令数基线。
+
+### 5.4 Phase 2：IR 层自动向量化
+
+#### M42：循环依赖 / 别名分析（向量化合法性前置）
+
+- 现状缺口：调度用保守别名模型（`anon_armv8/src/sched/dag.rs`）只能保正确，不能
+  证明"循环无携带依赖、load/store 可向量化"。
+- 新增 `raana_ir/src/opt/analysis_passes/dependence.rs`：基于访问函数（GEP 仿射
+  index）做循环级依赖分析——同一迭代内与跨迭代的 load/store 冲突（reuse
+  distance / gcd 测试）；输出每循环"可向量化 / 可归约 / 禁止"判定与原因。
+- 复用已有分析：`loop_analysis`（自然循环 + preheader）、`induction_variable`
+  （Add/Sub 步进）、`dom_tree`、`cfg`。
+- 验收：对 many_mat_cal / conv2d-1 / matmul 内层循环能正确判定；宁漏勿错，无法
+  证明一律保守拒绝（误报 = 0）。
+
+#### M43：loop versioning / 运行时 guard
+
+- SysY 的 trip count 与数组对齐编译期未知 → 向量化循环必须版本化：
+  `if (n >= VF && aligned16(a) && aligned16(b)) { 向量主循环 } else { 标量回退 }`。
+- 输出形状：标量入口 + 向量主循环（trip count 取下取整到 VF 的倍数）+ 标量
+  epilogue（余数）；对齐检查可用 `tst x, #15` + 条件分支。
+- 与既有 `rotate_loops`/`if_conversion` 交互：版本化在循环旋转后做，向量主循环
+  体内条件已转 select。
+- 验收：n < VF、未对齐、n % VF ≠ 0 边界用例 QEMU 差分正确；on/off（-O0 标量）
+  差分无行为差异。
+
+#### M44：loop vectorizer（核心 pass）
+
+- 文件：`raana_ir/src/opt/passes/loop_vectorize.rs`（AArch64 专用注册，仿
+  `chain_to_switch` 的 `PassesManager::aarch64` 分支）。
+- 识别条件：可计数（trip count ≥ VF 可证或 versioning）、单出口、无 break、IV
+  仿射（Add/Sub 步进，`induction_variable`）、体为纯标量运算 + load/store。
+- 变换：
+  - IV：步进 ×VF，循环条件按向量迭代计数；
+  - load/store：连续 offset 的标量 load/store 合并为 `VecLd1/VecSt1`；
+  - Binary/Arith → 对应向量 op；条件（select）→ `VecCsel/bsl`；
+  - 归约累加器（`sum += a[i]`、`C[i][j] += A[i][k]*B[k][j]`）→ `fmla` 向量累加，
+    退出前水平归约（`addv`）；
+  - 对齐由 M42 分析结果 + M43 versioning 保证。
+- 前置依赖：M42（依赖分析）、M43（versioning）、既有 `rotate_loops`/
+  `if_conversion`/`licm`/`pointer_strength_reduction`。
+- 验收：many_mat_cal / matmul 内层出现 `fmla` 与 `ld1/st1`；全 corpus QEMU 差分 +
+  on/off 差分；-O0/1/2 × 双 target 5 次 byte-identical。
+
+#### M45：SLP 基本块向量化 + 循环展开
+
+- SLP（`raana_ir/src/opt/passes/slp.rs`）：把同一基本块内相邻、类型一致的独立
+  标量运算打包为向量 op（配对 add/mul/load/store 的菱形结构）；补 loop
+  vectorizer 覆盖不到的直通代码（conv2d 邻域、展开后的短链）。
+- 循环展开（`raana_ir/src/opt/passes/loop_unroll.rs`）：常数 trip count（≤ 阈值）
+  的小循环全展开；非常数循环按 2-4 倍部分展开，为 SLP 提供相邻迭代、为 A53
+  双发射暴露 ILP（与 post-RA ListScheduler + slot-filling 配合）。
+- 顺序：vectorize（M44）→ unroll → SLP；或先小规模 unroll 再 SLP（按基准数据定）。
+- 验收：conv2d-1 内层出现 `ld1/fmla/st1`；静态指令数与 gem5 sim_insts 对照 clang
+  记录在 `results/perf_compare/`。
+
+#### M46：收尾与回归门禁
+
+- 双 target × -O0/1/2 全量编译 + 5 次 byte-identical；functional/h_functional/
+  perf 全量 QEMU 差分；on/off 差分无行为差异。
+- `scripts/perf_compare.sh` 增加 SIMD 列；对 many_mat_cal/conv2d/matmul 记录静态
+  指令数与 gem5 sim_insts 相对标量基线的变化（按 §1.3 原则，不声称实机收益）。
+- 调度验证器（§4 P2 `verify_sched_deps`）覆盖向量 NZCV / 寄存器依赖。
+
+### 5.5 关键不变量（SIMD）
+
+1. 向量化只对 M42 依赖分析可证安全、或经 M43 运行时 versioning 保证的循环进行；
+   无法证明时保守拒绝（宁漏勿错）。
+2. `-O0` 保留标量形式作 on/off 差分基线；向量化/展开规则由 `-O1/-O2` 控制；
+   M39-M41 机器层能力是 ABI/codegen 架构改动，任何优化级别都必须正确。
+3. 向量化 pass 只在 AArch64 注册（同 `chain_to_switch`）；RISC-V 保持标量，
+   双 target 回归。
+4. 对齐未知时用非对齐 `ld1/st1` 或 versioning，绝不在编译期假设 16 字节对齐。
+5. 每个 milestone 独立提交，完成后删除 TODO 细节只留一行历史；静态模型改进
+   不声称实机收益（§1.3）。
+
+---
+
+## 6. 总体执行原则
 
 1. 每个 milestone 独立提交；`TODO.md` 在 milestone 完成后删除对应已完成
    细节，只保留后续工作。
@@ -500,21 +400,27 @@ fallthrough 收益。SysY 前端暂无冷热信息，本期仅在 `BlockLowering
 3. 所有 AArch64 改动必须同时验证 RISC-V 不受影响。
 4. 新 pass 默认走"白名单 + 保守保留"策略，宁漏勿错。
 5. 未获得实机数据前，只能声称"静态模型改进"。
-6. ABI/codegen 架构改动（M19-M24、M25-M29、M30-M38）不由优化 flag 控制，
-   任何优化级别都必须保持正确；优化规则本身由 `-O` 控制。
+6. ABI/codegen 架构改动（M19-M24、M25-M29、M30-M38、M39-M46）不由优化 flag
+   控制，任何优化级别都必须保持正确；优化规则本身由 `-O` 控制。
 7. 发射层改造以行为等价为第一优先级，优化规则在等价基线上逐步开启。
 
 ---
 
-## 6. 风险与缓解
+## 7. 风险与缓解
 
 | 风险 | 严重度 | 缓解措施 |
 |------|--------|---------|
+| 向量化依赖分析误判导致语义错误 | 高 | 保守依赖分析（gcd/reuse）+ 只向量化可证安全循环 + on/off 差分 + 全量功能回归 |
+| 向量寄存器压力导致大量 spill | 中 | Vector 独立分配域 + v8-v15 优先 + 先小 VF 验证 |
+| 对齐假设错误导致 SIGBUS | 中 | 已知对齐才用对齐 `ld1/st1`；未知走非对齐或 versioning |
+| RISC-V 无 NEON 引入回归 | 中 | 向量化 pass 按 target 注册；双 target 回归 |
+| regalloc ion 对 Vector class 支持缺口 | 中 | 先拆 vcode move/spill panic + ion 单测，再启用向量化 |
+| 显式向量类型污染标量流水线 | 中 | 类型下沉到 MIR 后由 `reg_class_for_type` 分流，标量路径不动 |
 | if-conversion 投机上提改变执行语义（除 div/rem 外算术无副作用，风险低） | 中 | 仅纯整数算术 + head 支配 merge 才转换；on/off 差分 + 全量功能回归 |
 | GSP 提升全局破坏跨函数可见性 / 与调用交互 | 高 | 白名单（仅无取址、无"可能触及"调用的标量全局）；出口统一回写；保守宁漏勿错 |
-| `ccmp` 链破坏 NZCV 使用顺序（与现有 `CmpSelect` 邻接配对机制整合） | 中 | 条件仅限单用纯比较；emit 单测；on/off 差分 |
+| `ccmp` 链破坏 NZCV 使用顺序 | 中 | 条件仅限单用纯比较；emit 单测；on/off 差分 |
 | RA 拷贝消除与并行拷贝求解器交互导致确定性回归 | 中 | 5 次 byte-identical 门禁；redundant_moves 语义保留 |
-| 内联膨胀（多调用点 + 递归深度）增加编译时间与代码体积 | 中 | 代价估计 + 阈值 + 深度限界；corpus 编译时间监控 |
+| 内联膨胀增加编译时间与代码体积 | 中 | 代价估计 + 阈值 + 深度限界；corpus 编译时间监控 |
 | 别名链成环 / 截断后标签簿记错误 | 高 | 完整移植 Cranelift 不变量；专项单测；on/off 差分 |
 | 多指令 MInst slot 化破坏"每 slot 4B"假设 | 中 | slot 粒度 = 单条指令；verify 断言发射 slot 数 == 指令数 |
 | veneer 插入改变偏移导致松弛不收敛 | 中 | 单调性（只增不减）+ 快照收集/倒序插入 + 每轮全量范围断言 |
@@ -529,7 +435,7 @@ fallthrough 收益。SysY 前端暂无冷热信息，本期仅在 `BlockLowering
 
 ---
 
-## 7. RISC-V 栈参数非对齐访问（BOOM 实机 RE，QEMU 不可见）
+## 8. RISC-V 栈参数非对齐访问（已修复，BOOM 实机复跑待验证）
 
 ### 现象
 
@@ -575,40 +481,25 @@ XLEN 的标量在栈上传参时 **widened to XLEN bits**（整数按符号扩�
 写对了、riscv 写成了 `ty.size()`——这是 RISC-V 侧的孤立回归，不是
 通用层缺陷。
 
-### 候选方案
+### 修复与验证计划
 
-- A（唯一正确方案）：`uika_riscv/src/abi.rs:176` 的 `stack_slot_size`
-  闭包从 `ty.size()` 改为 `|_| 8`（与 aarch64 完全一致，注释引 psABI
-  widening 规则）。这不是"代价"：8 字节槽就是规范定义的唯一形态，
-  40 float 调用参数区 128→256B 是合规布局本身，不是修复带来的开销。
-  调用方/被调方/尾调用共用同一 planner 输出，偏移自动一致；float 栈
-  参数仍以 sw/flw 存取低 4 字节，上位未定义，规范允许，无需改存取宽度。
-  性能影响为零（访存指令数不变，仅帧多 4B × 栈上 32 位参数数）。
-- B（被规范否决）：只做 `align_up` 不统一槽宽。即使消除非对齐，float
-  栈参槽 4 字节仍违反 widened-to-XLEN 规则，与 GCC 编译的 callee 互调
-  取值错误；且混合步长布局（槽序 ≠ 偏移/8）难推理、易再错。淘汰。
-- A 需同步更新 `uika_riscv/src/abi.rs:465-481`
+- 方案 A（已实现）：`uika_riscv/src/abi.rs:176` 的 `stack_slot_size`
+  闭包从 `ty.size()` 改为 `|_| Self::word_bytes()`（与 aarch64 完全一致，
+  注释引 psABI widening 规则）。8 字节槽就是规范定义的唯一形态，
+  40 float 调用参数区 128→256B 是合规布局本身；调用方/被调方/尾调用共用
+  同一 planner 输出，偏移自动一致；float 栈参数仍以 sw/flw 存取低 4 字节，
+  上位未定义，规范允许；性能影响为零。
+- 同步更新 `uika_riscv/src/abi.rs:465-481`
   `argument_layout_preserves_scalar_stack_widths`：断言
   `[0, 8, 12, 16]` / `stack_size 24` → `[0, 8, 16, 24]` / `32`。
 - 回归 tail-call 路径（`uika_riscv/src/lower.rs:1016-1035` 复用同一
   ArgSlot 布局）与 `abi_matrix` 门禁。
-
-### 验证计划
-
-1. 单测：构造 `compute_call_arg_loc` 混合类型序列（如 9×i32 + 8×f32 +
-   指针），断言所有 64 位槽 offset % 8 == 0、32 位槽 offset % 4 == 0。
-2. `make test-riscv h_functional/39_fp_params.sy`（或全量）QEMU 通过；
-   静态检查 `.s`：`ld/sd/fld/fsd` 偏移全部 8 对齐（脚本扫描）。
-3. 确认 `make test`（aarch64）无回归。
-4. 有 FPGA 通道时实机复跑 39_fp_params。
-
-状态：已实现（`|_| Self::word_bytes()` + 单测更新，见 git diff）。QEMU
-单测与 riscv functional+h_functional 全量通过，39_fp_params.s 非对齐
-131→0 处；FPGA 实机复跑仍待验证。
+- 状态：已实现，QEMU 单测与 riscv functional+h_functional 全量通过，
+  39_fp_params.s 非对齐 131→0 处；**FPGA 实机复跑仍待验证**。
 
 ---
 
-## 8. RISC-V 跑分长耗时用例分析（judge_rv64_8_2_03_00）
+## 9. RISC-V 跑分长耗时用例分析（judge_rv64_8_2_03_00）
 
 数据源：`judge_rv64_8_2_03_00.txt`（rv 实机 BOOM 跑分）。汇编证据用
 `./target/release/compiler -S -O1 tests/perf/<case>.sy` 复现，生成物在
@@ -694,6 +585,8 @@ XLEN 的标量在栈上传参时 **widened to XLEN bits**（整数按符号扩�
 - P2 maddw 融合（M 扩展）；内层调用内联（huffman/crc/fft1，查
   specialization 未内联原因）；A6 累加器 phi 拷贝消除。
 - P3 conv2d 边界检查半条件 hoist（依赖 LICM 条件部分提升能力）。
+- SIMD（§5）对 many_mat_cal / conv2d / matmul / transpose 的向量并行是
+  A4/A5 标量优化之后的下一层收益来源。
 
 ### 验证计划
 
@@ -702,4 +595,3 @@ XLEN 的标量在栈上传参时 **widened to XLEN bits**（整数按符号扩�
 2. P1 用 sl2 / many_mat_cal / matmul2 的内层循环指令数（42→约 24 等）
    量化；BOOM 实机复跑头部用例确认（QEMU 时间不可作为性能依据）。
 3. P2 内联用 huffman/crc/fft1 的 .s call 计数清零 + 实机耗时对比。
-4. 所有优化保持通用触发条件，禁止按用例名/函数名匹配（AGENTS.md）。

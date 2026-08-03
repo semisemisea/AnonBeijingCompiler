@@ -119,6 +119,17 @@ fn lower_binary(
             return output;
         }
     }
+    if binary.op() == BinaryOp::Sub && integer_constant(arena, binary.lhs()) == Some(-1) {
+        let rhs = ctx.put_value_in_reg(binary.rhs());
+        ctx.emit(MInst::AluRRR {
+            op: AluOp::Orn,
+            size,
+            dst,
+            lhs: RegOrZr::Zr,
+            rhs: RegOrZr::Reg(rhs),
+        });
+        return LoweredOutput::Value(result);
+    }
     let lhs = ctx.put_value_in_reg(binary.lhs());
     let rhs_imm = integer_constant(arena, binary.rhs());
 
@@ -2850,6 +2861,29 @@ mod tests {
 
         let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
         assert!(assembly.contains("sdiv"), "{assembly}");
+    }
+
+    #[test]
+    fn minus_one_subtraction_selects_bitwise_not() {
+        use raana_ir::ir::builder_trait::*;
+
+        let mut program = Program::new();
+        let function =
+            program.new_function(Type::get_i32(), "bitwise_not".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let value = data.params()[0];
+        let minus_one = data.new_local_inst().integer(-1);
+        let result = data
+            .new_local_inst()
+            .binary(BinaryOp::Sub, minus_one, value);
+        let ret = data.new_local_inst().ret(Some(result));
+        data.layout_mut().insert_inst(entry, result);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+        assert!(assembly.contains("orn "), "{assembly}");
+        assert!(!assembly.contains("movn "), "{assembly}");
     }
 
     #[test]

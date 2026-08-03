@@ -120,6 +120,7 @@ fn is_dce_removable(inst: &MInst) -> bool {
         | MInst::CSet { .. }
         | MInst::CmpSelect { .. }
         | MInst::FMov { .. }
+        | MInst::VecMov { .. }
         | MInst::FMovFromZero { .. }
         | MInst::FAlu { .. }
         | MInst::Scvtf { .. }

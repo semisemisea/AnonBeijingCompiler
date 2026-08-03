@@ -1090,6 +1090,16 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             is_barrier: false,
         },
 
+        MInst::Sxtw { dst, src, .. } => InstDeps {
+            defs: preg(dst.reg),
+            uses: preg(*src),
+            flags_def: false,
+            flags_use: false,
+            class: SchedClass::Alu,
+            mem: None,
+            is_barrier: false,
+        },
+
         MInst::Scvtf { dst, src } | MInst::Fcvtzs { dst, src } => InstDeps {
             defs: preg(dst.reg),
             uses: preg(*src),

@@ -589,20 +589,11 @@ fn lower_get_elem_ptr(
                 shift,
             });
         } else {
-            let zero = ctx.alloc_tmp(pointer_ty.clone());
-            ctx.emit(MInst::MovFromZero {
-                size: OperandSize::Size64,
-                dst: Writable::from_reg(zero),
-            });
             let extended = ctx.alloc_tmp(pointer_ty.clone());
-            ctx.emit(MInst::AluRRRExtend {
-                op: AluOp::Add,
-                size: OperandSize::Size64,
+            ctx.emit(MInst::Sxtw {
+                size: OperandSize::Size32,
                 dst: Writable::from_reg(extended),
-                lhs: zero,
-                rhs: index,
-                extend: ExtendOp::Sxtw,
-                shift: 0,
+                src: index,
             });
             if term.stride.is_power_of_two() {
                 let shift = u8::try_from(term.stride.trailing_zeros())

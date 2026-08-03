@@ -6,7 +6,9 @@ use crate::emit_buffer::EmitBuffer;
 use crate::lower::LowerBackend;
 use crate::prelude::*;
 use crate::stats::FunctionCodegenStats;
-use crate::vcode::{EmitContext, MachInst, MachInstEmit, VCodeContainer, VCodeInst};
+use crate::vcode::{
+    EmitContext, MachInst, MachInstEmit, MachTerminator, VCodeContainer, VCodeInst,
+};
 
 pub(crate) struct AsmWriter<'a, B: LowerBackend> {
     pub buf: &'a mut String,
@@ -65,7 +67,7 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
         for (bi, _lb) in vcode.block_order().lowered_order().iter().enumerate() {
             buffer.bind_label(MirBlockIndex::new(bi));
             for inst in vcode.block_insts(bi) {
-                if inst.needs_epilogue() {
+                if matches!(inst.is_term(), MachTerminator::Return) {
                     for epi in &vcode.abi.gen_epilogue() {
                         emit_legalized::<B::MInst, B>(&frame, epi, &mut buffer);
                     }

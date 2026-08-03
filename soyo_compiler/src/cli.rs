@@ -30,13 +30,13 @@ pub(crate) struct Arg {
         help = "logging filter (overrides RUST_LOG; default: warn)"
     )]
     pub(crate) log: Option<String>,
-    #[arg(short = 'S', default_value_t = false, conflicts_with = "emit")]
+    #[arg(short = 'S', default_value_t = true, conflicts_with = "emit")]
     pub(crate) assembly_only: bool,
     #[arg(value_name = "INPUT")]
     pub(crate) input_path: PathBuf,
     #[arg(short = 'o', value_name = "OUTPUT")]
     pub(crate) output_path: PathBuf,
-    #[arg(short = 'O', default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=2))]
+    #[arg(short = 'O', default_value_t = 2, value_parser = clap::value_parser!(u8).range(0..=2))]
     pub(crate) opt_level: u8,
     #[arg(
         long,
@@ -48,7 +48,7 @@ pub(crate) struct Arg {
     #[arg(
         long = "target",
         value_enum,
-        default_value_t = Target::Riscv64
+        default_value_t = Target::Aarch64
     )]
     pub(crate) target: Target,
     #[arg(

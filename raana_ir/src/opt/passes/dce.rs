@@ -1,4 +1,7 @@
-use crate::opt::prelude::*;
+use crate::opt::{
+    analysis_passes::effects::EffectAnalysis,
+    prelude::*,
+};
 
 pub struct DeadPhiElimination;
 pub struct DeadCodeElimination;
@@ -11,18 +14,52 @@ pub struct JumpOnlyElimination;
 /// Function (call to function)
 /// Branches and Return
 impl Pass for DeadCodeElimination {
+    fn run(&mut self, program: &mut Program) -> bool {
+        // Whole-program purity analysis lets the mark phase drop calls to
+        // effect-free callees whose result is unused (getint and friends
+        // are preserved through the I/O flags).
+        let analysis = EffectAnalysis::new(program);
+        let mut changed = false;
+        for func in program.function_layout().to_vec() {
+            let mut removable_calls = HashSet::default();
+            let data = program.func_data(func);
+            for bb_layout in data.layout().basicblocks() {
+                for &inst in bb_layout.insts() {
+                    if let InstKind::Call(call) = data.inst_data(inst).kind() {
+                        if analysis.is_removable(call.callee()) {
+                            removable_calls.insert(inst);
+                        }
+                    }
+                }
+            }
+            let mut arena_context = ArenaContextMut {
+                program,
+                curr_func: Some(func),
+            };
+            changed |= DeadCodeElimination::run_on_func(
+                self,
+                &mut arena_context,
+                &removable_calls,
+            );
+        }
+        changed
+    }
+
     fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
-        self.run_on_func(data)
+        // Direct per-function invocation without the purity analysis: no
+        // call is removable (the historical conservative behavior).
+        self.run_on_func(data, &HashSet::default())
     }
 }
 
 // TODO: side-effet function rules.
+#[allow(dead_code)]
 fn has_side_effect(_func: Function) -> bool {
     true
 }
 
 #[inline]
-fn is_critical(value: Inst, data: &FunctionData) -> bool {
+fn is_critical(value: Inst, data: &FunctionData, removable_calls: &HashSet<Inst>) -> bool {
     match data.inst_data(value).kind() {
         InstKind::Branch(..)
         | InstKind::Jump(..)
@@ -49,12 +86,16 @@ fn is_critical(value: Inst, data: &FunctionData) -> bool {
         | InstKind::VectorInsertElement(..)
         | InstKind::VectorReduce(..) => false,
         // rdf is not ready
-        InstKind::Call(call) => has_side_effect(call.callee()),
+        InstKind::Call(call) => !removable_calls.contains(&value),
     }
 }
 
 impl DeadCodeElimination {
-    pub(crate) fn run_on_func(&self, data: &mut ArenaContextMut<'_>) -> bool {
+    pub(crate) fn run_on_func(
+        &self,
+        data: &mut ArenaContextMut<'_>,
+        removable_calls: &HashSet<Inst>,
+    ) -> bool {
         let mut worklist = VecDeque::new();
         let mut live_inst = HashSet::default();
 
@@ -70,7 +111,7 @@ impl DeadCodeElimination {
         // 1.1 Mark: Initiate
         for layout in data.layout().basicblocks() {
             for &inst in layout.insts() {
-                if is_critical(inst, data) {
+                if is_critical(inst, data, removable_calls) {
                     mark_live!(inst);
                 }
             }
@@ -193,7 +234,23 @@ impl DeadCodeElimination {
 #[cfg(test)]
 mod tests {
     use super::{DeadCodeElimination, Pass};
-    use crate::ir::{Program, Type, arena::Arena, builder_trait::*};
+    use crate::{
+        ir::{Program, Type, arena::Arena, builder_trait::*},
+        opt::pass::ArenaContextMut,
+    };
+
+    /// A function with an entry block and a bare `ret`.
+    fn empty_function(program: &mut Program, name: &str) -> crate::ir::Function {
+        let function = program.new_function(Type::get_unit(), name.into(), vec![]);
+        let mut data = ArenaContextMut {
+            program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let ret = data.new_local_value().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+        function
+    }
 
     #[test]
     fn preserves_mem_zero_and_its_allocation() {
@@ -220,6 +277,127 @@ mod tests {
         assert!(insts.iter().any(|&inst| inst == clear));
         assert!(!insts.iter().any(|&inst| inst == dead));
         assert!(data.inst_data(alloc).used_by().contains(&clear));
+    }
+
+    #[test]
+    fn removes_call_to_pure_function_with_unused_result() {
+        let mut program = Program::new();
+        let callee = empty_function(&mut program, "callee");
+        let caller = program.new_function(Type::get_unit(), "caller".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(caller),
+        };
+        let entry = data.add_entry_block();
+        let call = data.new_local_value().call(callee, vec![]);
+        data.layout_mut().insert_inst(entry, call);
+        let ret = data.new_local_value().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        assert!(DeadCodeElimination.run(&mut program));
+        let data = program.func_data(caller);
+        let insts = data.layout().basicblock(entry).insts();
+        assert!(!insts.iter().any(|&inst| inst == call));
+        assert_eq!(insts.len(), 1); // only the ret remains
+    }
+
+    #[test]
+    fn keeps_call_to_io_function() {
+        let mut program = Program::new();
+        // A declaration is enough: the analysis keys on the callee name.
+        let getint = program.new_function(Type::get_i32(), "getint".into(), vec![]);
+        let caller = program.new_function(Type::get_unit(), "caller".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(caller),
+        };
+        let entry = data.add_entry_block();
+        let call = data.new_local_value().call(getint, vec![]);
+        data.layout_mut().insert_inst(entry, call);
+        let ret = data.new_local_value().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        assert!(!DeadCodeElimination.run(&mut program));
+        let data = program.func_data(caller);
+        assert!(data
+            .layout()
+            .basicblock(entry)
+            .insts()
+            .iter()
+            .any(|&inst| inst == call));
+    }
+
+    #[test]
+    fn keeps_call_to_function_writing_a_global() {
+        let mut program = Program::new();
+        let init = program.new_value().zero_init(Type::get_i32());
+        let global = program.new_value().global_alloc(init);
+        let writer = program.new_function(Type::get_unit(), "writer".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(writer),
+        };
+        let entry = data.add_entry_block();
+        let one = data.new_local_value().integer(1);
+        let store = data.new_local_value().store(one, global);
+        data.layout_mut().insert_inst(entry, store);
+        let ret = data.new_local_value().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        let caller = program.new_function(Type::get_unit(), "caller".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(caller),
+        };
+        let entry = data.add_entry_block();
+        let call = data.new_local_value().call(writer, vec![]);
+        data.layout_mut().insert_inst(entry, call);
+        let ret = data.new_local_value().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        assert!(!DeadCodeElimination.run(&mut program));
+        let data = program.func_data(caller);
+        assert!(data
+            .layout()
+            .basicblock(entry)
+            .insts()
+            .iter()
+            .any(|&inst| inst == call));
+    }
+
+    #[test]
+    fn keeps_call_whose_result_is_used() {
+        let mut program = Program::new();
+        let callee = program.new_function(Type::get_i32(), "callee".into(), vec![]);
+        {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(callee),
+            };
+            let entry = data.add_entry_block();
+            let one = data.new_local_value().integer(1);
+            let ret = data.new_local_value().ret(Some(one));
+            data.layout_mut().insert_inst(entry, ret);
+        }
+        let caller = program.new_function(Type::get_i32(), "caller".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(caller),
+        };
+        let entry = data.add_entry_block();
+        let call = data.new_local_value().call(callee, vec![]);
+        data.layout_mut().insert_inst(entry, call);
+        let ret = data.new_local_value().ret(Some(call));
+        data.layout_mut().insert_inst(entry, ret);
+
+        assert!(!DeadCodeElimination.run(&mut program));
+        let data = program.func_data(caller);
+        assert!(data
+            .layout()
+            .basicblock(entry)
+            .insts()
+            .iter()
+            .any(|&inst| inst == call));
     }
 }
 

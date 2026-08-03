@@ -3,9 +3,10 @@
 本文档只记录尚未完成的工作。已完成里程碑只保留一行摘要，历史设计与实现细节
 以 Git 提交记录和代码测试为准，不在这里重复维护。
 
-> 进行中：§2 主计划 E——matmul 标量收敛（M49-M53 已完成，进行 M54-M55），
-> 以 `01_mm1` 为基线收敛内层循环到 gcc 标量水平（内层 ~9 条/element 含
-> `subs;b.ne`，零循环 `bl memset`）。SIMD Phase 2（M42-M46）仍搁置，见 §3。
+> 进行中：§2 主计划 E——matmul 标量收敛（M49-M54 已完成，进行 M55 收尾），
+> 以 `01_mm1` 为基线收敛内层循环到 gcc 标量水平（内层 ~10 条/element 含
+> `subs;b.ne` + 索引折叠，零循环 `bl memset`）。SIMD Phase 2（M42-M46）
+> 仍搁置，见 §3。
 
 ## 已完成里程碑摘要
 
@@ -20,6 +21,9 @@
   （BRANCH14/19/26 与 RISC-V B/JAL）。
 - **M28-M29**：分支发射重构（对照 Cranelift MachBuffer）——RISC-V `CondBr`
   slot 化、`beqz/bnez` 收敛、veneer 全覆盖、buffer 行为测试与门禁。
+- **M54**：地址折叠 / 冗余消除——`MInst::Sxtw`（`mov xzr; add xzr` → `sxtw`）；
+  内层 ~10 条/element、`[x,x,sxtw#2]` 折叠确认。functional 109/109、
+  h_functional 40/40、RISC-V 109/109。
 - **M53**：零 store 循环 → MemZero/memset——`MemZero` 动态长度支持 +
   `zero_store_loop` pass（AArch64）；`mm` 零 C 循环变 `bl .Lsoyo_memzero`。
   functional 109/109、h_functional 40/40、RISC-V 109/109。
@@ -281,18 +285,17 @@ alloca（`%v_A/%v_B/%v_C`）类型是 `**[i32;1024]`（**指针**），被排除
   RISC-V 109/109、双 target byte-identical。新增单测：`converts_a_zeroing_countdown_loop_to_memzero`、
   `refuses_loops_that_store_a_nonzero_value`。
 
-#### M54：地址折叠 / 冗余消除（L2c）
+#### M54：地址折叠 / 冗余消除（L2c）✅
 
-- 文件：`anon_armv8/src/lower.rs`
-- 改动：
-  1. 消除 `mov xzr; add xzr, w, sxtw` 冗余序列（32→64 符号扩展直接
-     `sxtw xd, wm`）；
-  2. 单动态索引折叠 `[x, x, sxtw #2]` 已实现（`extended_index_shift`，
-     lower.rs:2313，测试 2965/2992）；双索引 `i<<4096` 因 `lsl #12` 超
-     extended-reg 范围保持两段（`add x,x,w,lsl#12` 一条 + 标量索引 load），
-     确认不退化。
-- 验收：`mov xzr`+`add xzr` 冗余清零；静态指令数下降；双 target
-  byte-identical。
+- 状态：**已完成**。消除 `mov xzr; add xzr, w, sxtw` 冗余对——新增
+  `MInst::Sxtw`（emit/reg_uses/DCE/sched 全接入），GEP 非 1/2/4/8/16 stride
+  索引的 32→64 符号扩展直接 `sxtw xd, wm`（preheader 每个基址省 1 条）。
+  单动态索引折叠 `[x, x, sxtw #2]` 已确认工作（内层 j 循环 B/C 索引 load）；
+  双索引 `i<<4096` 因 `lsl #12` 超 extended-reg 范围保持两段，未退化。
+- 验收通过：`mm` 内层 j 循环 ~10 条/element（C 地址被 load+store 共用无法折
+  叠，`subs;b.ne` 保持）；`mov xzr` 清零对全部消失；functional 109/109、
+  h_functional 40/40、perf/01_mm1 PASS、RISC-V 109/109、双 target
+  byte-identical。新增单测 `emits_sign_extension`。
 
 #### M55：收尾与回归门禁
 

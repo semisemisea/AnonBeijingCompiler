@@ -1,19 +1,20 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use crate::opt::{
     analysis_passes::{
         dom_tree::v2::DominanceTree,
         induction_variable::{
-            BasicInductionVariableAnalysis, DerivedInductionVariable,
-            classify_derived_induction_variable, constant_induction_range, normalize_strict_exit,
+            BasicInductionVariableAnalysis, ConstantInductionRange, constant_induction_range,
+            normalize_strict_exit,
         },
         loop_analysis::{Loop, LoopAnalysis},
+        range::{IntRange, RangeAnalysis, RangeContext},
     },
     prelude::*,
     utils::{
         cfg::CFG,
-        gep::{gep_constant_offset_with_replacement_fits, gep_index_stride},
+        gep::gep_index_stride,
         logical_edge::{LogicalEdge, LogicalEdgeRewriter, incoming_edges, outgoing_edges},
         pointer_strength_reduction_cost::estimate_aarch64_pointer_strength_reduction,
         preheader::{EnsurePreheader, ensure_preheader},
@@ -24,14 +25,77 @@ pub struct PointerStrengthReduction;
 
 struct Candidate {
     gep: Inst,
+    iv: Inst,
     header_iv_position: usize,
-    gep_iv_position: usize,
     backedge_groups: SmallVec<[BackedgeGroup; 2]>,
-    pointer_step: i32,
     base: Inst,
     offsets: Vec<Inst>,
     pointer_ty: Type,
-    derived_iv: Option<DerivedInductionVariable>,
+    address_evolution: FlattenedAddressEvolution,
+}
+
+#[derive(Clone)]
+enum IndexEvolution {
+    Invariant,
+    Direct,
+    Affine(AffineI32Expr),
+}
+
+#[derive(Clone)]
+struct AffineI32Expr {
+    value: Inst,
+    coefficient: i64,
+    offset_range: I64Range,
+    chain: SmallVec<[Inst; 4]>,
+    invariants: SmallVec<[Inst; 4]>,
+}
+
+struct FlattenedAddressEvolution {
+    indices: Vec<IndexEvolution>,
+    coefficient: i64,
+    pointer_step: i32,
+}
+
+#[derive(Clone, Copy)]
+struct I64Range {
+    min: i64,
+    max: i64,
+}
+
+impl I64Range {
+    fn from_i32(range: IntRange) -> Option<Self> {
+        Some(Self {
+            min: i64::from(range.min()?),
+            max: i64::from(range.max()?),
+        })
+    }
+
+    fn add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            min: self.min.checked_add(other.min)?,
+            max: self.max.checked_add(other.max)?,
+        })
+    }
+
+    fn sub(self, other: Self) -> Option<Self> {
+        Some(Self {
+            min: self.min.checked_sub(other.max)?,
+            max: self.max.checked_sub(other.min)?,
+        })
+    }
+
+    fn mul(self, other: Self) -> Option<Self> {
+        let values = [
+            self.min.checked_mul(other.min)?,
+            self.min.checked_mul(other.max)?,
+            self.max.checked_mul(other.min)?,
+            self.max.checked_mul(other.max)?,
+        ];
+        Some(Self {
+            min: *values.iter().min().unwrap(),
+            max: *values.iter().max().unwrap(),
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -52,6 +116,7 @@ impl PointerStrengthReduction {
         dom_tree: &DominanceTree,
         loops: &LoopAnalysis,
         ivs: &BasicInductionVariableAnalysis,
+        ranges: &RangeAnalysis,
         looop: &Loop,
         parameter_blocks: &FxHashMap<Inst, BasicBlock>,
     ) -> Option<Candidate> {
@@ -82,8 +147,10 @@ impl PointerStrengthReduction {
             let Some(exit) = normalize_strict_exit(data, looop, iv) else {
                 continue;
             };
+            let Some(iv_range) = constant_induction_range(data, iv, exit) else {
+                continue;
+            };
             let signed_step = exit.signed_step();
-            let constant_range = constant_induction_range(data, iv, exit);
             let Some(header_iv_position) = data
                 .bb_data(looop.header())
                 .params()
@@ -111,89 +178,127 @@ impl PointerStrengthReduction {
                     let InstKind::GetElemPtr(gep) = data.inst_data(inst).kind() else {
                         continue;
                     };
-                    let mut iv_offsets =
-                        gep.offsets()
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(position, &offset)| {
-                                if offset == iv.parameter() {
-                                    return Some((position, None));
-                                }
-                                constant_range.and_then(|range| {
-                                    classify_derived_induction_variable(
-                                        data,
-                                        looop,
-                                        iv.parameter(),
-                                        offset,
-                                        range,
-                                    )
-                                    .map(|derived| (position, Some(derived)))
-                                })
-                            });
-                    let Some((gep_iv_position, derived_iv)) = iv_offsets.next() else {
-                        continue;
-                    };
-                    if iv_offsets.next().is_some() {
-                        continue;
-                    }
                     if !Self::available_at_header(
                         data,
                         dom_tree,
                         looop,
                         parameter_blocks,
                         gep.base(),
-                    ) || !gep
-                        .offsets()
-                        .iter()
-                        .enumerate()
-                        .filter(|(position, _)| *position != gep_iv_position)
-                        .all(|(_, &offset)| {
-                            Self::available_at_header(
-                                data,
-                                dom_tree,
-                                looop,
-                                parameter_blocks,
-                                offset,
-                            )
-                        })
-                        || !Self::has_only_loop_memory_users(data, looop, inst)
+                    ) || !Self::has_only_loop_memory_users(data, looop, inst)
                         || !backedge_groups
                             .iter()
                             .all(|group| dom_tree.dominates(block, group.source))
                     {
                         continue;
                     }
-                    let Some(stride) = gep_index_stride(data, inst, gep_iv_position) else {
+                    let mut index_evolutions = Vec::with_capacity(gep.offsets().len());
+                    let mut flat_coefficient = 0_i64;
+                    let mut removable_chain = FxHashSet::default();
+                    let mut valid = true;
+                    for (position, &offset) in gep.offsets().iter().enumerate() {
+                        let evolution = Self::classify_index_evolution(
+                            data,
+                            ranges,
+                            looop,
+                            iv.parameter(),
+                            iv_range,
+                            inst,
+                            offset,
+                        );
+                        let Some(evolution) = evolution else {
+                            valid = false;
+                            break;
+                        };
+                        let (coefficient, chain, invariants) = match &evolution {
+                            IndexEvolution::Invariant => {
+                                if !Self::available_at_header(
+                                    data,
+                                    dom_tree,
+                                    looop,
+                                    parameter_blocks,
+                                    offset,
+                                ) {
+                                    valid = false;
+                                    break;
+                                }
+                                index_evolutions.push(evolution);
+                                continue;
+                            }
+                            IndexEvolution::Direct => (1, None, None),
+                            IndexEvolution::Affine(affine) => (
+                                affine.coefficient,
+                                Some(&affine.chain),
+                                Some(&affine.invariants),
+                            ),
+                        };
+                        let Some(stride) = gep_index_stride(data, inst, position) else {
+                            valid = false;
+                            break;
+                        };
+                        if !invariants.into_iter().flatten().all(|&invariant| {
+                            Self::available_at_header(
+                                data,
+                                dom_tree,
+                                looop,
+                                parameter_blocks,
+                                invariant,
+                            )
+                        }) {
+                            valid = false;
+                            break;
+                        }
+                        let Some(contribution) =
+                            coefficient.checked_mul(i64::from(stride.result_element_stride))
+                        else {
+                            valid = false;
+                            break;
+                        };
+                        let Some(coefficient) = flat_coefficient.checked_add(contribution) else {
+                            valid = false;
+                            break;
+                        };
+                        flat_coefficient = coefficient;
+                        if let Some(chain) = chain {
+                            removable_chain.extend(chain.iter().copied());
+                        }
+                        index_evolutions.push(evolution);
+                    }
+                    if !valid || flat_coefficient == 0 {
                         continue;
-                    };
-                    let coefficient = derived_iv
-                        .as_ref()
-                        .map(DerivedInductionVariable::coefficient)
-                        .unwrap_or(1);
-                    let Some(index_delta) = i64::from(signed_step).checked_mul(coefficient) else {
-                        continue;
-                    };
-                    let Some(signed_pointer_step) = index_delta
-                        .checked_mul(i64::from(stride.result_element_stride))
-                        .and_then(|step| i32::try_from(step).ok())
+                    }
+                    let Some(index_delta) = i64::from(signed_step).checked_mul(flat_coefficient)
                     else {
                         continue;
                     };
-                    let Some(signed_byte_delta) = index_delta.checked_mul(stride.byte_stride)
+                    let Some(signed_pointer_step) = i32::try_from(index_delta).ok() else {
+                        continue;
+                    };
+                    let result_element_size = match data.inst_data(inst).ty().kind() {
+                        crate::ir::TypeKind::Pointer(element) => i64::try_from(element.size()).ok(),
+                        _ => None,
+                    };
+                    let Some(signed_byte_delta) =
+                        result_element_size.and_then(|size| index_delta.checked_mul(size))
                     else {
                         continue;
                     };
-                    let removable_derived_insts = derived_iv
-                        .as_ref()
-                        .map(|derived| derived.removable_chain_cost(data, inst))
-                        .unwrap_or(0);
-                    let derived_setup_insts = derived_iv
-                        .as_ref()
-                        .map(|derived| {
-                            usize::from(derived.coefficient() != 1)
-                                + usize::from(derived.offset() != 0)
+                    let removable_derived_insts = removable_chain
+                        .iter()
+                        .all(|derived| {
+                            data.inst_data(*derived)
+                                .used_by()
+                                .iter()
+                                .all(|user| *user == inst || removable_chain.contains(user))
                         })
+                        .then_some(removable_chain.len())
                         .unwrap_or(0);
+                    let derived_setup_insts = index_evolutions
+                        .iter()
+                        .map(|evolution| match evolution {
+                            IndexEvolution::Affine(affine) => affine.chain.len(),
+                            IndexEvolution::Invariant | IndexEvolution::Direct => 0,
+                        })
+                        .sum();
                     let Some(cost) = estimate_aarch64_pointer_strength_reduction(
                         data,
                         cfg,
@@ -210,14 +315,17 @@ impl PointerStrengthReduction {
                     }
                     let candidate = Candidate {
                         gep: inst,
+                        iv: iv.parameter(),
                         header_iv_position,
-                        gep_iv_position,
                         backedge_groups: backedge_groups.clone(),
-                        pointer_step: signed_pointer_step,
                         base: gep.base(),
                         offsets: gep.offsets().to_vec(),
                         pointer_ty: data.inst_data(inst).ty().clone(),
-                        derived_iv,
+                        address_evolution: FlattenedAddressEvolution {
+                            indices: index_evolutions,
+                            coefficient: flat_coefficient,
+                            pointer_step: signed_pointer_step,
+                        },
                     };
                     if best
                         .as_ref()
@@ -254,6 +362,267 @@ impl PointerStrengthReduction {
         }
     }
 
+    fn classify_index_evolution(
+        data: &ArenaContextMut<'_>,
+        ranges: &RangeAnalysis,
+        looop: &Loop,
+        iv: Inst,
+        iv_range: ConstantInductionRange,
+        gep: Inst,
+        value: Inst,
+    ) -> Option<IndexEvolution> {
+        if value == iv {
+            return Some(IndexEvolution::Direct);
+        }
+        if value.is_global()
+            || data.inst_data(value).kind().is_const()
+            || data
+                .layout()
+                .parent_bb(value)
+                .is_none_or(|block| !looop.contains(block))
+        {
+            return Some(IndexEvolution::Invariant);
+        }
+
+        fn classify(
+            data: &ArenaContextMut<'_>,
+            ranges: &RangeAnalysis,
+            looop: &Loop,
+            iv: Inst,
+            iv_range: ConstantInductionRange,
+            gep: Inst,
+            value: Inst,
+        ) -> Option<AffineI32Expr> {
+            if value == iv {
+                return Some(AffineI32Expr {
+                    value,
+                    coefficient: 1,
+                    offset_range: I64Range { min: 0, max: 0 },
+                    chain: SmallVec::new(),
+                    invariants: SmallVec::new(),
+                });
+            }
+            if value.is_global()
+                || data.inst_data(value).kind().is_const()
+                || data
+                    .layout()
+                    .parent_bb(value)
+                    .is_none_or(|block| !looop.contains(block))
+            {
+                return Some(AffineI32Expr {
+                    value,
+                    coefficient: 0,
+                    offset_range: I64Range::from_i32(ranges.range_before(gep, value))?,
+                    chain: SmallVec::new(),
+                    invariants: if data.inst_data(value).kind().is_const() {
+                        SmallVec::new()
+                    } else {
+                        SmallVec::from_slice(&[value])
+                    },
+                });
+            }
+            if !data.inst_data(value).ty().is_i32() {
+                return None;
+            }
+            let InstKind::Binary(binary) = data.inst_data(value).kind() else {
+                return None;
+            };
+            let lhs = classify(data, ranges, looop, iv, iv_range, gep, binary.lhs())?;
+            let rhs = classify(data, ranges, looop, iv, iv_range, gep, binary.rhs())?;
+            let (coefficient, offset_range) = match binary.op() {
+                BinaryOp::Add => (
+                    lhs.coefficient.checked_add(rhs.coefficient)?,
+                    lhs.offset_range.add(rhs.offset_range)?,
+                ),
+                BinaryOp::Sub => (
+                    lhs.coefficient.checked_sub(rhs.coefficient)?,
+                    lhs.offset_range.sub(rhs.offset_range)?,
+                ),
+                BinaryOp::Mul if lhs.coefficient == 0 => {
+                    let factor = PointerStrengthReduction::integer_constant(data, binary.lhs())?;
+                    (
+                        rhs.coefficient.checked_mul(i64::from(factor))?,
+                        rhs.offset_range.mul(I64Range {
+                            min: i64::from(factor),
+                            max: i64::from(factor),
+                        })?,
+                    )
+                }
+                BinaryOp::Mul if rhs.coefficient == 0 => {
+                    let factor = PointerStrengthReduction::integer_constant(data, binary.rhs())?;
+                    (
+                        lhs.coefficient.checked_mul(i64::from(factor))?,
+                        lhs.offset_range.mul(I64Range {
+                            min: i64::from(factor),
+                            max: i64::from(factor),
+                        })?,
+                    )
+                }
+                BinaryOp::Shl if rhs.coefficient == 0 => {
+                    let shift = PointerStrengthReduction::integer_constant(data, binary.rhs())?;
+                    let factor = 1_i64.checked_shl(u32::try_from(shift).ok()?)?;
+                    (
+                        lhs.coefficient.checked_mul(factor)?,
+                        lhs.offset_range.mul(I64Range {
+                            min: factor,
+                            max: factor,
+                        })?,
+                    )
+                }
+                _ => return None,
+            };
+            let depends_on_iv = lhs.coefficient != 0 || rhs.coefficient != 0;
+            if depends_on_iv
+                && (!ranges.proves_binary_no_signed_wrap(
+                    binary.op(),
+                    binary.lhs(),
+                    binary.rhs(),
+                    RangeContext::Before(gep),
+                ) || !PointerStrengthReduction::affine_range_fits_i32(
+                    coefficient,
+                    offset_range,
+                    iv_range,
+                ))
+            {
+                return None;
+            }
+            let mut chain = lhs.chain;
+            for inst in rhs.chain {
+                if !chain.contains(&inst) {
+                    chain.push(inst);
+                }
+            }
+            if !chain.contains(&value) {
+                chain.push(value);
+            }
+            let mut invariants = lhs.invariants;
+            for invariant in rhs.invariants {
+                if !invariants.contains(&invariant) {
+                    invariants.push(invariant);
+                }
+            }
+            Some(AffineI32Expr {
+                value,
+                coefficient,
+                offset_range,
+                chain,
+                invariants,
+            })
+        }
+
+        let affine = classify(data, ranges, looop, iv, iv_range, gep, value)?;
+        (affine.coefficient != 0).then_some(IndexEvolution::Affine(affine))
+    }
+
+    fn affine_range_fits_i32(
+        coefficient: i64,
+        offset: I64Range,
+        iv: ConstantInductionRange,
+    ) -> bool {
+        let iv_min = i64::from(iv.min());
+        let iv_max = i64::from(iv.max());
+        let (scaled_min, scaled_max) = if coefficient >= 0 {
+            (
+                coefficient.checked_mul(iv_min),
+                coefficient.checked_mul(iv_max),
+            )
+        } else {
+            (
+                coefficient.checked_mul(iv_max),
+                coefficient.checked_mul(iv_min),
+            )
+        };
+        let (Some(scaled_min), Some(scaled_max)) = (scaled_min, scaled_max) else {
+            return false;
+        };
+        let Some(min) = scaled_min.checked_add(offset.min) else {
+            return false;
+        };
+        let Some(max) = scaled_max.checked_add(offset.max) else {
+            return false;
+        };
+        min >= i64::from(i32::MIN) && max <= i64::from(i32::MAX)
+    }
+
+    fn integer_constant(data: &ArenaContextMut<'_>, value: Inst) -> Option<i32> {
+        match data.inst_data(value).kind() {
+            InstKind::Integer(integer) => Some(integer.value()),
+            _ => None,
+        }
+    }
+
+    fn evaluate_affine_initial(
+        data: &ArenaContextMut<'_>,
+        affine: &AffineI32Expr,
+        iv: Inst,
+        initial_iv: i32,
+    ) -> Option<i32> {
+        fn evaluate(
+            data: &ArenaContextMut<'_>,
+            chain: &[Inst],
+            iv: Inst,
+            initial_iv: i32,
+            value: Inst,
+        ) -> Option<i32> {
+            if value == iv {
+                return Some(initial_iv);
+            }
+            if !chain.contains(&value) {
+                return PointerStrengthReduction::integer_constant(data, value);
+            }
+            let InstKind::Binary(binary) = data.inst_data(value).kind() else {
+                return None;
+            };
+            let lhs = evaluate(data, chain, iv, initial_iv, binary.lhs())?;
+            let rhs = evaluate(data, chain, iv, initial_iv, binary.rhs())?;
+            Some(match binary.op() {
+                BinaryOp::Add => lhs.wrapping_add(rhs),
+                BinaryOp::Sub => lhs.wrapping_sub(rhs),
+                BinaryOp::Mul => lhs.wrapping_mul(rhs),
+                BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
+                _ => return None,
+            })
+        }
+
+        evaluate(data, &affine.chain, iv, initial_iv, affine.value)
+    }
+
+    fn clone_affine_initial(
+        data: &mut ArenaContextMut<'_>,
+        preheader: BasicBlock,
+        affine: &AffineI32Expr,
+        iv: Inst,
+        initial_iv: Inst,
+    ) -> Inst {
+        fn clone_value(
+            data: &mut ArenaContextMut<'_>,
+            preheader: BasicBlock,
+            chain: &[Inst],
+            iv: Inst,
+            initial_iv: Inst,
+            value: Inst,
+        ) -> Inst {
+            if value == iv {
+                return initial_iv;
+            }
+            if !chain.contains(&value) {
+                return value;
+            }
+            let InstKind::Binary(binary) = data.inst_data(value).kind() else {
+                unreachable!("affine chains contain only binary instructions")
+            };
+            let (op, lhs, rhs) = (binary.op(), binary.lhs(), binary.rhs());
+            let lhs = clone_value(data, preheader, chain, iv, initial_iv, lhs);
+            let rhs = clone_value(data, preheader, chain, iv, initial_iv, rhs);
+            let cloned = data.new_local_value().binary(op, lhs, rhs);
+            data.layout_mut()
+                .insert_before_terminator(preheader, cloned);
+            cloned
+        }
+
+        clone_value(data, preheader, &affine.chain, iv, initial_iv, affine.value)
+    }
+
     fn has_only_loop_memory_users(data: &ArenaContextMut<'_>, looop: &Loop, gep: Inst) -> bool {
         let users = data.inst_data(gep).used_by();
         !users.is_empty()
@@ -275,6 +644,7 @@ impl PointerStrengthReduction {
         looop: &Loop,
         candidate: Candidate,
     ) -> ApplyResult {
+        debug_assert_ne!(candidate.address_evolution.coefficient, 0);
         let preheader = match ensure_preheader(data, cfg, looop) {
             Some(EnsurePreheader::Existing(preheader) | EnsurePreheader::Created(preheader)) => {
                 preheader
@@ -297,74 +667,66 @@ impl PointerStrengthReduction {
         let mut initial_indices_by_edge = Vec::with_capacity(entry_edges.len());
         for edge in entry_edges {
             let initial_iv = edge.args(data)[candidate.header_iv_position];
-            let derived_initial_index = match &candidate.derived_iv {
-                Some(derived) => match data.inst_data(initial_iv).kind() {
-                    InstKind::Integer(initial) => {
-                        let Some(initial_index) = derived.evaluate(initial.value()) else {
-                            return ApplyResult::Unchanged;
-                        };
-                        Some(initial_index)
+            let constant_offsets = match data.inst_data(initial_iv).kind() {
+                InstKind::Integer(initial) => {
+                    let mut offsets = Vec::with_capacity(candidate.offsets.len());
+                    for (offset, evolution) in candidate
+                        .offsets
+                        .iter()
+                        .zip(&candidate.address_evolution.indices)
+                    {
+                        offsets.push(match evolution {
+                            IndexEvolution::Invariant => match data.inst_data(*offset).kind() {
+                                InstKind::Integer(integer) => Some(integer.value()),
+                                _ => None,
+                            },
+                            IndexEvolution::Direct => Some(initial.value()),
+                            IndexEvolution::Affine(affine) => Self::evaluate_affine_initial(
+                                data,
+                                affine,
+                                candidate.iv,
+                                initial.value(),
+                            ),
+                        });
                     }
-                    _ => None,
-                },
-                None => {
-                    if let InstKind::Integer(initial) = data.inst_data(initial_iv).kind() {
-                        if !gep_constant_offset_with_replacement_fits(
-                            data,
-                            candidate.base,
-                            &candidate.offsets,
-                            candidate.gep_iv_position,
-                            initial.value(),
-                        ) {
-                            return ApplyResult::Unchanged;
-                        }
-                    }
-                    initial_indices_by_edge.push((edge, None, initial_iv));
-                    continue;
+                    Some(offsets)
                 }
+                _ => None,
             };
-            if let Some(initial_index) = derived_initial_index {
-                if !gep_constant_offset_with_replacement_fits(
-                    data,
-                    candidate.base,
-                    &candidate.offsets,
-                    candidate.gep_iv_position,
-                    initial_index,
-                ) {
+            if let Some(offsets) = constant_offsets
+                .as_ref()
+                .and_then(|offsets| offsets.iter().copied().collect::<Option<Vec<_>>>())
+            {
+                if !crate::opt::utils::gep::gep_constant_offsets_fit(data, candidate.base, &offsets)
+                {
                     return ApplyResult::Unchanged;
                 }
             }
-            initial_indices_by_edge.push((edge, derived_initial_index, initial_iv));
+            initial_indices_by_edge.push((edge, constant_offsets, initial_iv));
         }
 
         let mut rewrites = LogicalEdgeRewriter::new();
-        for (edge, derived_initial_index, initial_iv) in initial_indices_by_edge {
+        for (edge, constant_offsets, initial_iv) in initial_indices_by_edge {
             let mut initial_offsets = candidate.offsets.clone();
-            initial_offsets[candidate.gep_iv_position] =
-                match (&candidate.derived_iv, derived_initial_index) {
-                    (_, Some(initial_index)) => data.new_local_value().integer(initial_index),
-                    (Some(derived), None) => {
-                        let mut value = initial_iv;
-                        if derived.coefficient() != 1 {
-                            let coefficient = data
-                                .new_local_value()
-                                .integer(i32::try_from(derived.coefficient()).unwrap());
-                            value =
-                                data.new_local_value()
-                                    .binary(BinaryOp::Mul, value, coefficient);
-                            data.layout_mut().insert_before_terminator(preheader, value);
-                        }
-                        if derived.offset() != 0 {
-                            let offset = data
-                                .new_local_value()
-                                .integer(i32::try_from(derived.offset()).unwrap());
-                            value = data.new_local_value().binary(BinaryOp::Add, value, offset);
-                            data.layout_mut().insert_before_terminator(preheader, value);
-                        }
-                        value
-                    }
-                    (None, None) => initial_iv,
+            for (position, evolution) in candidate.address_evolution.indices.iter().enumerate() {
+                initial_offsets[position] = match evolution {
+                    IndexEvolution::Invariant => initial_offsets[position],
+                    IndexEvolution::Direct => initial_iv,
+                    IndexEvolution::Affine(affine) => match constant_offsets
+                        .as_ref()
+                        .and_then(|offsets| offsets[position])
+                    {
+                        Some(offset) => data.new_local_value().integer(offset),
+                        None => Self::clone_affine_initial(
+                            data,
+                            preheader,
+                            affine,
+                            candidate.iv,
+                            initial_iv,
+                        ),
+                    },
                 };
+            }
             let initial_pointer = data
                 .new_local_value()
                 .get_elem_ptr(candidate.base, initial_offsets);
@@ -377,7 +739,9 @@ impl PointerStrengthReduction {
         let pointer = data
             .new_basic_block()
             .add_param(looop.header(), candidate.pointer_ty.clone());
-        let pointer_step = data.new_local_value().integer(candidate.pointer_step);
+        let pointer_step = data
+            .new_local_value()
+            .integer(candidate.address_evolution.pointer_step);
         for group in candidate.backedge_groups {
             let next_pointer = data
                 .new_local_value()
@@ -425,6 +789,11 @@ impl Pass for PointerStrengthReduction {
                 .collect::<FxHashMap<_, _>>();
             let (cfg, dom_tree, loops) = LoopAnalysis::from_cfg(cfg);
             let ivs = BasicInductionVariableAnalysis::new(data, &cfg, &loops);
+            let range_arena = ArenaContext {
+                program: &*data.program,
+                curr_func: data.curr_func,
+            };
+            let ranges = RangeAnalysis::new(&range_arena, &cfg, &loops, &ivs);
             let mut transformed = false;
             for looop in loops.loops() {
                 let Some(candidate) = Self::find_candidate(
@@ -433,6 +802,7 @@ impl Pass for PointerStrengthReduction {
                     &dom_tree,
                     &loops,
                     &ivs,
+                    &ranges,
                     looop,
                     &parameter_blocks,
                 ) else {
@@ -458,6 +828,7 @@ impl Pass for PointerStrengthReduction {
 mod tests {
     use super::*;
     use crate::ir::{Program, builder_trait::*};
+    use crate::opt::analysis_passes::induction_variable::constant_induction_range;
 
     struct LoopFixture {
         function: Function,
@@ -679,6 +1050,7 @@ mod tests {
     #[test]
     fn carries_a_pointer_for_a_forward_unit_step_loop() {
         let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        replace_bound_with_constant(&mut program, &fixture, 10);
         assert!(run(&mut program, fixture.function));
 
         let data = program.func_data(fixture.function);
@@ -748,6 +1120,7 @@ mod tests {
     #[test]
     fn carries_a_pointer_for_a_backward_unit_step_loop() {
         let (mut program, fixture) = build_loop_with_update(BinaryOp::Sub, 1, BinaryOp::Gt, true);
+        replace_bound_with_constant(&mut program, &fixture, -10);
         assert!(run(&mut program, fixture.function));
 
         let data = program.func_data(fixture.function);
@@ -907,6 +1280,70 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_direct_induction_index_without_a_constant_range_proof() {
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        assert!(!run(&mut program, fixture.function));
+    }
+
+    #[test]
+    fn carries_an_affine_index_with_a_bounded_invariant_offset() {
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        replace_bound_with_constant(&mut program, &fixture, 10);
+        let data = program.func_data_mut(fixture.function);
+        let invariant = data.params()[2];
+        let mask = data.new_local_value().integer(7);
+        let bounded = data
+            .new_local_value()
+            .binary(BinaryOp::And, invariant, mask);
+        data.layout_mut()
+            .insert_inst_before(fixture.entry_jump, bounded);
+        let derived = data
+            .new_local_value()
+            .binary(BinaryOp::Add, fixture.iv, bounded);
+        data.layout_mut().insert_inst_before(fixture.gep, derived);
+        let InstKind::GetElemPtr(gep) = data.inst_data(fixture.gep).kind() else {
+            unreachable!()
+        };
+        let mut offsets = gep.offsets().to_vec();
+        let position = offsets
+            .iter()
+            .position(|&offset| offset == fixture.iv)
+            .unwrap();
+        let base = gep.base();
+        offsets[position] = derived;
+        data.replace_inst_with(fixture.gep)
+            .get_elem_ptr(base, offsets);
+
+        assert!(run(&mut program, fixture.function));
+    }
+
+    #[test]
+    fn rejects_an_affine_index_with_an_unknown_invariant_offset_range() {
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        replace_bound_with_constant(&mut program, &fixture, 10);
+        let data = program.func_data_mut(fixture.function);
+        let invariant = data.params()[2];
+        let derived = data
+            .new_local_value()
+            .binary(BinaryOp::Add, fixture.iv, invariant);
+        data.layout_mut().insert_inst_before(fixture.gep, derived);
+        let InstKind::GetElemPtr(gep) = data.inst_data(fixture.gep).kind() else {
+            unreachable!()
+        };
+        let mut offsets = gep.offsets().to_vec();
+        let position = offsets
+            .iter()
+            .position(|&offset| offset == fixture.iv)
+            .unwrap();
+        let base = gep.base();
+        offsets[position] = derived;
+        data.replace_inst_with(fixture.gep)
+            .get_elem_ptr(base, offsets);
+
+        assert!(!run(&mut program, fixture.function));
+    }
+
+    #[test]
     fn rejects_affine_wrap_on_the_final_header_visit() {
         let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
         replace_bound_with_constant(&mut program, &fixture, 2);
@@ -935,9 +1372,56 @@ mod tests {
         let range = constant_induction_range(&context, iv, exit).unwrap();
         assert_eq!(range.min(), 0);
         assert_eq!(range.max(), 2);
+        drop(context);
+        assert!(!run(&mut program, fixture.function));
         assert!(
-            classify_derived_induction_variable(&context, looop, fixture.iv, derived, range,)
-                .is_none()
+            !program
+                .func_data(fixture.function)
+                .inst_data(derived)
+                .used_by()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rejects_affine_cancellation_when_an_intermediate_operation_can_wrap() {
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        replace_bound_with_constant(&mut program, &fixture, 3);
+        let data = program.func_data_mut(fixture.function);
+        let coefficient = data.new_local_value().integer(i32::MAX);
+        let product = data
+            .new_local_value()
+            .binary(BinaryOp::Mul, fixture.iv, coefficient);
+        let cancelled = data
+            .new_local_value()
+            .binary(BinaryOp::Sub, product, product);
+        let derived = data
+            .new_local_value()
+            .binary(BinaryOp::Add, cancelled, fixture.iv);
+        for inst in [product, cancelled, derived] {
+            data.layout_mut().insert_inst_before(fixture.gep, inst);
+        }
+        let InstKind::GetElemPtr(gep) = data.inst_data(fixture.gep).kind() else {
+            unreachable!()
+        };
+        let mut offsets = gep.offsets().to_vec();
+        let position = offsets
+            .iter()
+            .position(|&offset| offset == fixture.iv)
+            .unwrap();
+        let base = gep.base();
+        offsets[position] = derived;
+        data.replace_inst_with(fixture.gep)
+            .get_elem_ptr(base, offsets);
+
+        assert!(!run(&mut program, fixture.function));
+        assert_eq!(
+            program
+                .func_data(fixture.function)
+                .bb_data(fixture.header)
+                .params()
+                .len(),
+            1
         );
     }
 
@@ -957,7 +1441,7 @@ mod tests {
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
         let base = data.params()[0];
-        let bound = data.params()[1];
+        let bound = data.new_local_inst().integer(10);
         let outer_index = data.params()[2];
         let header = data
             .new_basic_block()
@@ -1034,6 +1518,7 @@ mod tests {
     #[test]
     fn shares_one_pointer_update_across_parallel_backedge_arms() {
         let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        replace_bound_with_constant(&mut program, &fixture, 10);
         let data = program.func_data_mut(fixture.function);
         let condition = data.new_local_value().integer(1);
         let one = data.new_local_value().integer(1);
@@ -1114,7 +1599,7 @@ mod tests {
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
         let base = data.params()[0];
-        let bound = data.params()[1];
+        let bound = data.new_local_inst().integer(10);
         let outer_index = data.params()[2];
         let header = data
             .new_basic_block()
@@ -1191,7 +1676,7 @@ mod tests {
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
         let base = data.params()[0];
-        let bound = data.params()[1];
+        let bound = data.new_local_inst().integer(10);
         let outer_index = data.params()[2];
         let header = data
             .new_basic_block()
@@ -1428,6 +1913,7 @@ mod tests {
     #[test]
     fn carries_a_pointer_for_an_induction_index_before_the_final_gep_index() {
         let (mut program, fixture) = build_loop(BinaryOp::Lt, false);
+        replace_bound_with_constant(&mut program, &fixture, 10);
         assert!(run(&mut program, fixture.function));
         let data = program.func_data(fixture.function);
         let pointer = data.bb_data(fixture.header).params()[1];
@@ -1495,7 +1981,7 @@ mod tests {
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
         let base = data.params()[0];
-        let bound = data.params()[1];
+        let bound = data.new_local_inst().integer(-10);
         let suffix = data.params()[2];
         let header = data
             .new_basic_block()
@@ -1553,22 +2039,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_gep_that_uses_the_same_induction_variable_twice() {
+    fn combines_the_same_induction_variable_across_gep_dimensions() {
         let (mut program, fixture) = build_loop(BinaryOp::Lt, false);
+        replace_bound_with_constant(&mut program, &fixture, 10);
         let data = program.func_data_mut(fixture.function);
         let base = data.params()[0];
         data.replace_inst_with(fixture.gep)
             .get_elem_ptr(base, vec![fixture.iv, fixture.iv]);
 
-        assert!(!run(&mut program, fixture.function));
-        assert_eq!(
-            program
-                .func_data(fixture.function)
-                .bb_data(fixture.header)
-                .params()
-                .len(),
-            1
-        );
+        assert!(run(&mut program, fixture.function));
+        let data = program.func_data(fixture.function);
+        let InstKind::Jump(backedge) = data.inst_data(fixture.backedge).kind() else {
+            panic!("latch must remain a jump");
+        };
+        let InstKind::GetElemPtr(next) = data.inst_data(backedge.args()[1]).kind() else {
+            panic!("latch must compute the next pointer");
+        };
+        assert_eq!(integer_constant(data, next.offsets()[0]), Some(33));
     }
 
     #[test]
@@ -1611,7 +2098,7 @@ mod tests {
         let entry = data.add_entry_block();
         let low_base = data.params()[0];
         let high_base = data.params()[1];
-        let bound = data.params()[2];
+        let bound = data.new_local_inst().integer(10);
         let low_outer = data.params()[3];
         let high_middle = data.params()[4];
         let high_inner = data.params()[5];
@@ -1704,7 +2191,7 @@ mod tests {
             data.params()[2],
             data.params()[3],
         ];
-        let bound = data.params()[4];
+        let bound = data.new_local_inst().integer(10);
         let outer = data.params()[5];
         let header = data
             .new_basic_block()
@@ -1908,7 +2395,7 @@ mod tests {
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
         let base = data.params()[0];
-        let bound = data.params()[1];
+        let bound = data.new_local_inst().integer(10);
         let outer_index = data.params()[2];
         let header = data
             .new_basic_block()

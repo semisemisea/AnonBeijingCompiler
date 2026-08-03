@@ -3,8 +3,9 @@
 本文档只记录尚未完成的工作。已完成里程碑只保留一行摘要，历史设计与实现细节
 以 Git 提交记录和代码测试为准，不在这里重复维护。
 
-> 进行中：§2 主计划 D（M47 `reduction_unroll` / M48 `invariant_reduction_hoisting`）
-> 已完成。下一优先级见 §3 SIMD Phase 2（M42-M46，搁置中）与 §4 后续候选。
+> 进行中：§2 主计划 E——matmul 标量收敛（M49 已完成，进行 M50-M55，L1+L2），
+> 以 `01_mm1` 为基线收敛内层循环到 gcc 标量水平。SIMD Phase 2（M42-M46）
+> 仍搁置，见 §3。
 
 ## 已完成里程碑摘要
 
@@ -19,6 +20,9 @@
   （BRANCH14/19/26 与 RISC-V B/JAL）。
 - **M28-M29**：分支发射重构（对照 Cranelift MachBuffer）——RISC-V `CondBr`
   slot 化、`beqz/bnez` 收敛、veneer 全覆盖、buffer 行为测试与门禁。
+- **M49**：SSA 参数/指针 alloca 提升扩展（L1 根因）——`variable_analysis`
+  放开为单机器字类型 + 逃逸检查；`mm` 参数栈重载消失、基址进寄存器。functional
+  109/109、h_functional 40/40、RISC-V 109/109、双 target byte-identical。
 - **M30**：基准与验证基建（`scripts/perf_compare.sh` + `results/perf_compare/`）。
 - **M31**：if-conversion 推广（循环累加器，`head` 支配 `merge`）+ land/lor 折叠为
   `band/bor`。huffman-01 706 → 686。
@@ -139,7 +143,7 @@ DeadPhiElim、DCE。相关 pass 见 `raana_ir/src/opt/passes/`。
 
 huffman-01 各函数差距（`read_bits`/`rotlN`/`output_data` 等）在 M30-M38 逐项
 收敛，分函数差距表已随各里程碑完成归档，当前基线见 `results/perf_compare/`。
-剩余的通用优化方向见 §4 后续候选工作；热循环标量优化（§2 主计划 D）已完成，
+剩余的通用优化方向见 §4 后续候选工作；热循环标量优化（主计划 D，M47/M48）已完成，
 SIMD 见 §3。
 
 ### 1.3 当前结论边界
@@ -152,30 +156,154 @@ SIMD 见 §3。
 
 ### 1.4 实机超时排查（已归档）
 
-针对"实体机 TLE / qemu 正常"的排查结论（详见 git 提交 2ef0555）：
-
-- **死循环：未发现**。209 个用例（functional/h_functional/perf）在 qemu 下全部
-  确定性跑完；同一 ELF 在 qemu 与实机的指令语义一致，死循环若存在会在 qemu
-  同样出现。`while (getint())` 等输入循环都靠输入末尾显式 0 终止，不依赖 EOF。
-- **架构差异：仅一处，已修复**。内嵌 memzero 曾用 `id_aa64isar2_el1` 探测 MOPS
-  （ARMv8.6 `setp/setm/sete`）。已删除 MOPS 分支，输出 100% ARMv8-A。
-- **TLE 根因：性能差，属 IR 层优化缺口，非后端指令选择问题**。以 gcc -O2 为
-  基线（qemu 实测，单输入）：huffman-01 ~3.5x、LUDCMP(h-5-01) ~2.1x、sl1/
-  matmul1/03_sort ~1.6-1.8x、many_mat_cal-1 ~400x（gcc 将 R 外层循环内的整个
-  T×T 内层循环识别为循环不变、外提后按 trip count 乘一次，我们逐次重算
-  15.7e9 次；该差距已由 §2 主计划 D 的 M48 消除）。后端内层循环本身已足够紧
-  （4-18 条，多与 gcc 持平或更短）。
+结论（详见 git 提交 2ef0555）：无死循环；ARMv8.6 MOPS 探测已删除，输出 100%
+ARMv8-A；TLE 根因是 IR 层优化缺口而非后端指令选择。其中 many_mat_cal 的 ~400x
+差距已由主计划 D 的 M48 消除，其余见主计划 E（§2）/§3/§4。
 
 ---
 
-## 2. 主计划 D：热循环标量优化（已完成）
+## 2. 主计划 E：matmul 标量收敛（L1+L2，进行中）
 
-M47 `reduction_unroll`（标量多累加器 + 4× 部分展开）与 M48
-`invariant_reduction_hoisting`（外层不变归约外提 + 退化体）已全部落地并验收，
-详见"已完成里程碑摘要"M47/M48 与 Git 历史，本节不再维护。many_mat_cal-1/2/3
-的 R×T² 平方和热点从 ~1.5×10¹⁰ 元素操作降为单次 ~10⁶ + R 次平凡累加，qemu 下
-~82s → ~2s。合规审计与实现护栏记录于 M47/M48 提交信息；§4.11 保留 M48 泛化
-（容忍幂等写的整体循环巢外提）候选。
+以 `01_mm1`（1024 阶矩阵乘：`C[i][j] = C[i][j]*A[i][k] + B[k][j]` +
+`A[i][k]==1` 短路）为基线，对照 gcc -O2 产物（`results/perf/01_mm1_gcc.s`）。
+当前 `results/perf/01_mm1.s` 是过期 -O0 产物，仅用于量化差距；落地前先重建
+-O2 基线（M49 前置，见 §2.4）。
+
+### 2.1 现状差距（-O0 产物 vs gcc -O2）
+
+| 项 | 当前产物 | gcc -O2 |
+|----|----------|---------|
+| `mm` 内层 j 循环 | ~20 条/element（每轮重算 3 个地址 + 3 次栈重载） | 标量 ~7 条/element、向量 ~1 条/element（`ld1r`+`mla` 8-wide） |
+| 零 C 循环 | ~9 条/element 逐元素 `str` | `bl memset` |
+| 循环测试 | `cmp` + `b.lt`（每轮独立比较） | `subs` + `b.ne` 融合 |
+| 参数/基址 | 每轮 `ldr x,[sp]` 重载 | callee-saved 寄存器 + 递增指针 |
+| 最终求和 | 标量累加、每行 `adrp` 重载 | `addv` SIMD 水平归约 |
+
+### 2.2 根因定位（IR 层，非后端指令选择）
+
+`raana_ir/src/opt/passes/ssa.rs:316` 的 `variable_analysis` 只收集
+`ty.is_scalar()`（i32/f32，`ir/types.rs:131`）的 alloca 参与提升。`mm` 的参数
+alloca（`%v_A/%v_B/%v_C`）类型是 `**[i32;1024]`（**指针**），被排除在 SSA
+提升之外 → 参数驻留栈槽，内层循环每轮 `ldr x,[sp]` 重载；GEP base 定义在循环
+体内 → 挡住 PSR（base 须 header 可用）与 LICM。这是标量差距的结构性原因。
+
+### 2.3 目标与验收指标
+
+- M49 后 `mm` 无 `alloc`/`store`/`load %v_*`；内层 j 循环无栈重载。
+- M50 后内层 j 循环收敛到 ~8-9 条/element（C/B 指针递增 + `A[i][k]` 外提到
+  j 循环前 + `madd` + `str`）。
+- M52 后循环测试变 `subs`+`b.ne`；M53 后零循环变 `bl memset`。
+- 全量回归：functional/h_functional 149/149、perf 60/60、-O0/1/2 × 双 target
+  5 次 byte-identical、RISC-V 全量不受影响。
+- `scripts/perf_compare.sh 01_mm1` 静态指令数对照 gcc 记录到
+  `results/perf_compare/`。
+
+### 2.4 里程碑
+
+#### M49：SSA 参数/指针 alloca 提升扩展（L1 根因修复）✅
+
+- 状态：**已完成**。`variable_analysis`（`ssa.rs`）放开为单机器字类型
+  （i32/f32/pointer）+ 新增 `alloca_does_not_escape` 逃逸检查（仅 `Load`/
+  `Store` 使用才提升）。`mm` 参数 alloca（`**[i32;1024]`）全部提升，入口无
+  `alloc`/`store %v_*`，内层 j 循环栈重载消失（基址进寄存器）。
+- 验收通过：functional 109/109、h_functional 40/40、perf/01_mm1 PASS、
+  RISC-V functional 109/109、-O0/1/2 × 双 target byte-identical 5×、
+  新增单测 `promotes_pointer_slot_alloca`。详见 git 提交历史。
+
+#### M50：PSR 触发验证与 cost model 校准（L1）
+
+- 前置：M49
+- 文件：`raana_ir/src/opt/passes/pointer_strength_reduction.rs`、
+  `raana_ir/src/opt/utils/pointer_strength_reduction_cost.rs`
+- 改动：
+  1. M49 后 GEP base 成为 header 可用 param，`find_candidate` 应命中
+     `C[i][j]`/`A[i][k]`/`B[k][j]` 三组 GEP；
+  2. 若 cost model 拒绝（`MAX_BREAK_EVEN_TRIPS=4` 偏保守），按 01_mm1 实际
+     迭代量级（n³）校准阈值；核对 `old_iteration_insts` 对"多 GEP 循环"的
+     收益估计（A[i][k] 应只外提一次、C/B 各一条递增指针）。
+- 验收：内层 j 循环变「C/B 指针递增 + `A[i][k]` 外提 + `madd` + `str`」，
+  ~8-9 条/element；`.raana` 中 GEP 被替换为 header 指针 param + latch
+  `getelemptr(ptr, step)`。
+
+#### M51：LICM 循环不变 load 核对（L1）
+
+- 文件：`raana_ir/src/opt/passes/licm.rs`
+- 现状：LICM 只提升纯运算、不提升 load（测试
+  `hoists_pure_binary_ops_but_not_memory_side_effects`）。`mm` 的栈重载随
+  M49 消失后不再需要 load 外提。
+- 改动：核对全局数组场景——`main` 最终求和循环对 `gv_B` 是否仍每行重发
+  `adrp`（应由 M50 的 PSR 消除）；若否，评估给 LICM 增加"循环不变地址 load
+  外提"，并核对 TODO §4 声称"循环不变 load 外提已并入 M31-M35"的现状。
+- 验收：`.s` 中 `main` 求和循环无循环内 `adrp`；内存访问只剩地址递增。
+
+#### M52：count-up 循环旋转 + `subs` 融合（L2a）
+
+- 文件：`raana_ir/src/opt/passes/rotate_loops.rs`（或新增 `countdown.rs`）、
+  `anon_armv8` pre-RA peephole
+- 现状：`rotate_loops` 只处理 `while(len){len-=1}`（header 直接测计数器）；
+  SysY `while(i<n){i+=1}` 是 count-up（`lt i bound` 比较 + BIV step=1），不触发。
+- 改动：
+  1. 识别：header 测试 `lt i bound`，bound 为 header 前可用不变值，i 为 BIV
+     step=1；
+  2. 转换：header 直通 body；新增倒计时 header param t（初值 = bound），
+     latch `t' = t-1; br t', header(t'), exit`；i 若已被 M50 指针替换则删除，
+     否则保留原更新；
+  3. 后端 AArch64：`sub`+`cmp` → `subs`（branch 吃 NZCV）。`MInst::SubsRRImm`
+     M33 已落地，确认标志融合发射正确；
+  4. 只在 AArch64 注册，RISC-V 保持现状。
+- 验收：中间/内层循环出现 `subs x,#1; b.ne`；trip=0/1 边界正确（头测试经
+  "入口非零"证明保留）；专项单测 + QEMU 差分。
+
+#### M53：零 store 循环 → MemZero/memset（L2b）
+
+- 文件：新增 `raana_ir/src/opt/passes/zero_store_loop.rs`（AArch64 注册，仿
+  `chain_to_switch` 的 `PassesManager::aarch64` 分支）
+- 改动：
+  1. 识别内层循环体仅 `store 0, gep(base,(i,j))`、索引步进 1、trip 数可证 →
+     内层转 `MemZero(row_ptr, n*4)`；两层皆零 → 合并 `MemZero(C, n*n*4)`；
+  2. 后端已有 `lower_mem_zero` → `bl memset`
+     （`anon_armv8/src/lower.rs:1032,1102`，`taki_mir/src/libcall.rs`）；
+  3. 只转换纯内部循环，不破坏 `A[i][k]==1` 短路分支结构。
+- 验收：`.s` 出现 `bl memset`；与逐元素结果 QEMU 差分一致；`-O0` 保留标量
+  形式作 on/off 差分基线。
+
+#### M54：地址折叠 / 冗余消除（L2c）
+
+- 文件：`anon_armv8/src/lower.rs`
+- 改动：
+  1. 消除 `mov xzr; add xzr, w, sxtw` 冗余序列（32→64 符号扩展直接
+     `sxtw xd, wm`）；
+  2. 单动态索引折叠 `[x, x, sxtw #2]` 已实现（`extended_index_shift`，
+     lower.rs:2313，测试 2965/2992）；双索引 `i<<4096` 因 `lsl #12` 超
+     extended-reg 范围保持两段（`add x,x,w,lsl#12` 一条 + 标量索引 load），
+     确认不退化。
+- 验收：`mov xzr`+`add xzr` 冗余清零；静态指令数下降；双 target
+  byte-identical。
+
+#### M55：收尾与回归门禁
+
+- 双 target × -O0/1/2 全量编译 + 5 次 byte-identical；
+  functional/h_functional/perf 全量 QEMU 差分；on/off 差分无行为差异。
+- `scripts/perf_compare.sh 01_mm1` 记录静态指令数。
+- 新增单测：指针 alloca 提升、count-up 旋转、zero-store、`subs` 融合、PSR
+  触发。
+
+### 2.5 与 §3 SIMD 的交接
+
+本计划把 matmul 收敛到标量基线（内层 ~8-9 条/element）。向量化
+（§3 M42-M46，搁置）在标量收敛后启动：`C[i][j]=C[i][j]*a+B[k][j]`（a 为循环
+不变）是 `ld1r`+`mla` 的天然形态，最终求和循环是 `addv` 的天然形态；M52 的
+count-up 旋转与 M50 的指针形式是 M44 loop vectorizer 的 IV 前置。
+
+### 2.6 本计划风险与缓解
+
+| 风险 | 严重度 | 缓解 |
+|------|--------|------|
+| 指针 alloca 提升逃逸判定漏判导致语义错误 | 高 | 仅 `Load`/`Store` 使用才提升 + 全量差分 + on/off 差分 |
+| PSR cost model 误判亏损而拒绝 | 中 | 按实际迭代量级校准阈值；多 GEP 收益核算单测 |
+| count-up 旋转 trip=0/1 边界错误 | 中 | 头测试语义保留（入口非零证明）+ 专项单测 |
+| LICM load 外提扩大化改变跨调用可见性 | 中 | 仅循环不变地址 + 白名单；宁漏勿错 |
+| RISC-V 引入回归 | 中 | 新 pass 按 target 注册；双 target 回归 |
 
 ## 3. 主计划 C：SIMD/NEON 支持（M42-M46，搁置中）
 
@@ -189,7 +317,8 @@ M39-M41b。参考澄清：Cranelift 的 SIMD 是**显式降层**（wasm `v128` �
 
 ### 3.2 Phase 2：IR 层自动向量化
 
-> 搁置（2026-08 调整）：§2 主计划 D 已完成后，本节为下一优先级。
+> 搁置（2026-08 调整）：主计划 D（M47/M48）已完成；当前优先级为 §2 主计划 E
+> 标量收敛，本节保持搁置。
 
 #### M42：循环依赖 / 别名分析（向量化合法性前置）
 
@@ -407,43 +536,13 @@ M48 的"零 store"守卫拒绝了 conv2d `repeat` 外层（巢内写 `Out`，但
 
 ## 附 A：RISC-V 栈参数非对齐访问（已修复，归档）
 
-### 现象
-
-Judge RISC-V 实机：`h_functional/39_fp_params` WA/RE（FPGA 输出 "Failed"），
-QEMU 下通过；只有混合 32/64 位大量栈参数函数受影响。
-
-### 根因链
-
-1. `taki_mir/src/abi.rs` `ArgLayoutPlanner::compute`（51-89 行）对栈参数密集
-   打包，`stack_offset` 只按 `stack_slot_size(ty)` 累加，无对齐填充；
-2. `uika_riscv/src/abi.rs:166-178` 传入 `|ty| ty.size()`：float/int 槽 4 字节、
-   指针槽 8 字节 → 跟在 32 位参数后的指针落在 `4 mod 8` 偏移；
-3. 两侧布局一致、取值正确 → QEMU 全对，唯一症状是地址非对齐；
-4. 实测 `/tmp/39_fp_params.s`：131 处 64 位访问落在 `4 mod 8` 地址
-   （`params_mix` 26 + `main` 105），32 位访问 0 处非对齐；
-5. BOOM 硬件不支持非对齐 ld/sd → 实机 RE / QEMU AC 分歧；
-6. 栈帧与局部栈槽本身按 8/16 对齐，只有多栈参函数中招。
-
-### 附带问题：psABI 不合规
-
-RISC-V psABI 规定窄于 XLEN 的标量栈参数 **widened to XLEN bits**（RV64 每槽
-8 字节、8 对齐）。当前 4 字节密集打包既非对齐、又违反 widening 规则，与 GCC
-编译的 callee 互调时槽位取值错位。`anon_armv8` 早已用正确实现
-（`anon_armv8/src/abi.rs:133` `|_| 8`，单测断言 [0,8,16]/24），是 RISC-V 侧
-孤立回归。
-
-### 修复（已实现）
-
-`uika_riscv/src/abi.rs:176` 的 `stack_slot_size` 从 `ty.size()` 改为
-`|_| Self::word_bytes()`（与 aarch64 一致）；同步更新
-`argument_layout_preserves_scalar_stack_widths` 断言（[0,8,12,16]/24 →
-[0,8,16,24]/32）；tail-call 路径与 `abi_matrix` 回归。状态：QEMU 单测与
-riscv functional+h_functional 全量通过，非对齐 131→0 处；**FPGA 实机复跑
-待验证（§4.9）**。
+`uika_riscv/src/abi.rs:176` 栈槽宽从 `ty.size()` 改为 `word_bytes()`（与 aarch64
+一致），非对齐 131→0 处；QEMU 单测与 riscv functional+h_functional 全量通过。
+根因链与修复细节见 git 提交历史；FPGA 实机复跑待验证（§4.9）。
 
 ---
 
-## 附 B：RISC-V 跑分长耗时用例分析（judge_rv64_8_2_03_00，已归档）
+## 附 B：RISC-V 跑分长耗时用例分析（已归档）
 
 数据源：`judge_rv64_8_2_03_00.txt`（rv 实机 BOOM 跑分）。汇编证据用
 `./target/release/compiler -S -O1 tests/perf/<case>.sy` 复现，生成物在
@@ -556,3 +655,4 @@ riscv functional+h_functional 全量通过，非对齐 131→0 处；**FPGA 实�
 - crc(4.5s)：B8
 
 候选行动项（P0-P3）已并入 §4.10。
+

@@ -338,6 +338,64 @@ pub enum FpuOp {
     Div,
 }
 
+/// NEON 128-bit vector arrangement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecShape {
+    /// 4 x 32-bit lanes (`v.d.4s`).
+    FourS,
+    /// 2 x 64-bit lanes (`v.d.2d`).
+    TwoD,
+}
+
+impl VecShape {
+    pub const fn arrangement(self) -> &'static str {
+        match self {
+            Self::FourS => "4s",
+            Self::TwoD => "2d",
+        }
+    }
+
+    pub const fn element_bytes(self) -> u8 {
+        match self {
+            Self::FourS => 4,
+            Self::TwoD => 8,
+        }
+    }
+
+    pub const fn lanes(self) -> u8 {
+        match self {
+            Self::FourS => 4,
+            Self::TwoD => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecArithOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecBitOp {
+    And,
+    Orr,
+    Eor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecCmpOp {
+    Eq,
+    Gt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecCvtOp {
+    Scvtf,
+    Fcvtzs,
+}
+
 /// The flag-producing half of an atomic conditional-select pseudo.
 ///
 /// Keeping this in the same [`MInst`] as the flag consumer is intentional:
@@ -632,6 +690,70 @@ pub enum MInst {
         dst: WritableReg,
         src: Reg,
     },
+    /// 128-bit vector load: `ld1 {v{d}.16b}, [base]`.
+    VecLd1 {
+        dst: WritableReg,
+        base: Reg,
+    },
+    /// 128-bit vector store: `st1 {v{s}.16b}, [base]`.
+    VecSt1 {
+        src: Reg,
+        base: Reg,
+    },
+    /// `dup v{d}.<shape>, <scalar>`: replicate a scalar across all lanes.
+    VecDup {
+        shape: VecShape,
+        dst: WritableReg,
+        src: Reg,
+    },
+    /// Vector add/sub/mul: `{op} v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>`.
+    VecArithRRR {
+        op: VecArithOp,
+        shape: VecShape,
+        dst: WritableReg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    /// `fmla v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>`.
+    VecFmla {
+        shape: VecShape,
+        dst: WritableReg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    /// Vector bitwise and/orr/eor: `{op} v{d}.16b, v{lhs}.16b, v{rhs}.16b`.
+    VecBitwise {
+        op: VecBitOp,
+        dst: WritableReg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    /// Vector compare: `cmeq/cmgt v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>`.
+    VecCmp {
+        op: VecCmpOp,
+        shape: VecShape,
+        dst: WritableReg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    /// `bsl v{d}.16b, v{lhs}.16b, v{rhs}.16b`.
+    VecBsl {
+        dst: WritableReg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    /// Vector int<->float convert: `scvtf/fcvtzs v{d}.<shape>, v{s}.<shape>`.
+    VecCvt {
+        op: VecCvtOp,
+        shape: VecShape,
+        dst: WritableReg,
+        src: Reg,
+    },
+    /// Horizontal reduction: `addv s{d}, v{s}.4s`.
+    VecAddv {
+        dst: WritableReg,
+        src: Reg,
+    },
     FMovFromZero {
         dst: WritableReg,
     },
@@ -826,9 +948,29 @@ impl MachInst for MInst {
             | Self::Mov { dst, src, .. }
             | Self::FMov { dst, src }
             | Self::VecMov { dst, src }
+            | Self::VecDup { dst, src, .. }
+            | Self::VecCvt { dst, src, .. }
+            | Self::VecAddv { dst, src }
             | Self::Scvtf { dst, src }
             | Self::Fcvtzs { dst, src } => {
                 collector.reg_use(src);
+                collector.reg_def(dst);
+            }
+            Self::VecLd1 { dst, base } => {
+                use_sp_aware_reg(collector, base);
+                collector.reg_def(dst);
+            }
+            Self::VecSt1 { src, base } => {
+                collector.reg_use(src);
+                use_sp_aware_reg(collector, base);
+            }
+            Self::VecArithRRR { dst, lhs, rhs, .. }
+            | Self::VecFmla { dst, lhs, rhs, .. }
+            | Self::VecBitwise { dst, lhs, rhs, .. }
+            | Self::VecCmp { dst, lhs, rhs, .. }
+            | Self::VecBsl { dst, lhs, rhs } => {
+                collector.reg_use(lhs);
+                collector.reg_use(rhs);
                 collector.reg_def(dst);
             }
             Self::AluRRRShift { dst, lhs, rhs, .. } => {
@@ -1498,6 +1640,102 @@ impl MachInstEmit for MInst {
                 emit_vec_reg(ctx, *src)?;
                 write!(ctx, ".16b")
             }
+            Self::VecLd1 { dst, base } => {
+                write!(ctx, "ld1 {{")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".16b}}, [")?;
+                emit_reg(ctx, *base, OperandSize::Size64)?;
+                write!(ctx, "]")
+            }
+            Self::VecSt1 { src, base } => {
+                write!(ctx, "st1 {{")?;
+                emit_vec_reg(ctx, *src)?;
+                write!(ctx, ".16b}}, [")?;
+                emit_reg(ctx, *base, OperandSize::Size64)?;
+                write!(ctx, "]")
+            }
+            Self::VecDup { shape, dst, src } => {
+                write!(ctx, "dup ")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".{}, ", shape.arrangement())?;
+                emit_vec_scalar_reg(ctx, *src, *shape)
+            }
+            Self::VecArithRRR {
+                op,
+                shape,
+                dst,
+                lhs,
+                rhs,
+            } => {
+                write!(ctx, "{} ", vec_arith_name(*op))?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".{}, ", shape.arrangement())?;
+                emit_vec_reg(ctx, *lhs)?;
+                write!(ctx, ".{}, ", shape.arrangement())?;
+                emit_vec_reg(ctx, *rhs)?;
+                write!(ctx, ".{}", shape.arrangement())
+            }
+            Self::VecFmla {
+                shape,
+                dst,
+                lhs,
+                rhs,
+            } => {
+                write!(ctx, "fmla ")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".{}, ", shape.arrangement())?;
+                emit_vec_reg(ctx, *lhs)?;
+                write!(ctx, ".{}, ", shape.arrangement())?;
+                emit_vec_reg(ctx, *rhs)?;
+                write!(ctx, ".{}", shape.arrangement())
+            }
+            Self::VecBitwise { op, dst, lhs, rhs } => {
+                write!(ctx, "{} ", vec_bit_name(*op))?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".16b, ")?;
+                emit_vec_reg(ctx, *lhs)?;
+                write!(ctx, ".16b, ")?;
+                emit_vec_reg(ctx, *rhs)?;
+                write!(ctx, ".16b")
+            }
+            Self::VecCmp {
+                op,
+                shape,
+                dst,
+                lhs,
+                rhs,
+            } => {
+                write!(ctx, "{} ", vec_cmp_name(*op))?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".{}, ", shape.arrangement())?;
+                emit_vec_reg(ctx, *lhs)?;
+                write!(ctx, ".{}, ", shape.arrangement())?;
+                emit_vec_reg(ctx, *rhs)?;
+                write!(ctx, ".{}", shape.arrangement())
+            }
+            Self::VecBsl { dst, lhs, rhs } => {
+                write!(ctx, "bsl ")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".16b, ")?;
+                emit_vec_reg(ctx, *lhs)?;
+                write!(ctx, ".16b, ")?;
+                emit_vec_reg(ctx, *rhs)?;
+                write!(ctx, ".16b")
+            }
+            Self::VecCvt { op, shape, dst, src } => {
+                write!(ctx, "{} ", vec_cvt_name(*op))?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".{}, ", shape.arrangement())?;
+                emit_vec_reg(ctx, *src)?;
+                write!(ctx, ".{}", shape.arrangement())
+            }
+            Self::VecAddv { dst, src } => {
+                write!(ctx, "addv ")?;
+                emit_float_reg(ctx, dst.to_reg(), false)?;
+                write!(ctx, ", ")?;
+                emit_vec_reg(ctx, *src)?;
+                write!(ctx, ".4s")
+            }
             Self::FMovFromZero { dst } => {
                 write!(ctx, "fmov ")?;
                 emit_float_reg(ctx, dst.to_reg(), false)?;
@@ -1832,6 +2070,52 @@ fn emit_vec_reg(ctx: &mut dyn EmitContext, reg: Reg) -> core::fmt::Result {
     match reg.to_real_reg() {
         Some(preg) if preg.class() == RegClass::Vector => write!(ctx, "v{}", preg.hw_enc()),
         _ => ctx.write_reg(&reg),
+    }
+}
+/// Render a scalar source for `dup`: a GPR is `w`/`x`, a float register `s`/`d`
+/// depending on the lane element size of the destination arrangement.
+fn emit_vec_scalar_reg(ctx: &mut dyn EmitContext, reg: Reg, shape: VecShape) -> core::fmt::Result {
+    let wide = shape == VecShape::TwoD;
+    match reg.to_real_reg() {
+        Some(preg) if preg.class() == RegClass::Int => write!(
+            ctx,
+            "{}{}",
+            if wide { "x" } else { "w" },
+            preg.hw_enc()
+        ),
+        Some(preg) if preg.class() == RegClass::Float => write!(
+            ctx,
+            "{}{}",
+            if wide { "d" } else { "s" },
+            preg.hw_enc()
+        ),
+        _ => ctx.write_reg(&reg),
+    }
+}
+fn vec_arith_name(op: VecArithOp) -> &'static str {
+    match op {
+        VecArithOp::Add => "add",
+        VecArithOp::Sub => "sub",
+        VecArithOp::Mul => "mul",
+    }
+}
+fn vec_bit_name(op: VecBitOp) -> &'static str {
+    match op {
+        VecBitOp::And => "and",
+        VecBitOp::Orr => "orr",
+        VecBitOp::Eor => "eor",
+    }
+}
+fn vec_cmp_name(op: VecCmpOp) -> &'static str {
+    match op {
+        VecCmpOp::Eq => "cmeq",
+        VecCmpOp::Gt => "cmgt",
+    }
+}
+fn vec_cvt_name(op: VecCvtOp) -> &'static str {
+    match op {
+        VecCvtOp::Scvtf => "scvtf",
+        VecCvtOp::Fcvtzs => "fcvtzs",
     }
 }
 fn emit_gpr(ctx: &mut dyn EmitContext, reg: &Gpr, size: OperandSize) -> core::fmt::Result {
@@ -2525,6 +2809,153 @@ mod tests {
             },
         });
         assert_eq!(store, "str q4, [x0, #16]");
+    }
+
+    #[test]
+    fn emits_ld1_st1_vector_memory_forms() {
+        let load = emit(MInst::VecLd1 {
+            dst: Writable::from_reg(vec_reg(0)),
+            base: int_reg(1),
+        });
+        assert_eq!(load, "ld1 {v0.16b}, [x1]");
+
+        let store = emit(MInst::VecSt1 {
+            src: vec_reg(5),
+            base: int_reg(2),
+        });
+        assert_eq!(store, "st1 {v5.16b}, [x2]");
+    }
+
+    #[test]
+    fn emits_dup_from_gpr_and_float_scalars() {
+        let dup_i32 = emit(MInst::VecDup {
+            shape: super::VecShape::FourS,
+            dst: Writable::from_reg(vec_reg(0)),
+            src: int_reg(3),
+        });
+        assert_eq!(dup_i32, "dup v0.4s, w3");
+
+        let dup_i64 = emit(MInst::VecDup {
+            shape: super::VecShape::TwoD,
+            dst: Writable::from_reg(vec_reg(0)),
+            src: int_reg(4),
+        });
+        assert_eq!(dup_i64, "dup v0.2d, x4");
+
+        let dup_f32 = emit(MInst::VecDup {
+            shape: super::VecShape::FourS,
+            dst: Writable::from_reg(vec_reg(0)),
+            src: float_reg(5),
+        });
+        assert_eq!(dup_f32, "dup v0.4s, s5");
+    }
+
+    #[test]
+    fn emits_vector_arith_forms() {
+        for (op, mnemonic) in [
+            (super::VecArithOp::Add, "add"),
+            (super::VecArithOp::Sub, "sub"),
+            (super::VecArithOp::Mul, "mul"),
+        ] {
+            let text = emit(MInst::VecArithRRR {
+                op,
+                shape: super::VecShape::FourS,
+                dst: Writable::from_reg(vec_reg(0)),
+                lhs: vec_reg(1),
+                rhs: vec_reg(2),
+            });
+            assert_eq!(text, format!("{mnemonic} v0.4s, v1.4s, v2.4s"));
+        }
+        let two_d = emit(MInst::VecArithRRR {
+            op: super::VecArithOp::Add,
+            shape: super::VecShape::TwoD,
+            dst: Writable::from_reg(vec_reg(0)),
+            lhs: vec_reg(1),
+            rhs: vec_reg(2),
+        });
+        assert_eq!(two_d, "add v0.2d, v1.2d, v2.2d");
+    }
+
+    #[test]
+    fn emits_fmla_and_bitwise_and_compare_forms() {
+        let fmla = emit(MInst::VecFmla {
+            shape: super::VecShape::FourS,
+            dst: Writable::from_reg(vec_reg(0)),
+            lhs: vec_reg(1),
+            rhs: vec_reg(2),
+        });
+        assert_eq!(fmla, "fmla v0.4s, v1.4s, v2.4s");
+
+        for (op, mnemonic) in [
+            (super::VecBitOp::And, "and"),
+            (super::VecBitOp::Orr, "orr"),
+            (super::VecBitOp::Eor, "eor"),
+        ] {
+            let text = emit(MInst::VecBitwise {
+                op,
+                dst: Writable::from_reg(vec_reg(0)),
+                lhs: vec_reg(1),
+                rhs: vec_reg(2),
+            });
+            assert_eq!(text, format!("{mnemonic} v0.16b, v1.16b, v2.16b"));
+        }
+
+        let cmeq = emit(MInst::VecCmp {
+            op: super::VecCmpOp::Eq,
+            shape: super::VecShape::FourS,
+            dst: Writable::from_reg(vec_reg(0)),
+            lhs: vec_reg(1),
+            rhs: vec_reg(2),
+        });
+        assert_eq!(cmeq, "cmeq v0.4s, v1.4s, v2.4s");
+
+        let bsl = emit(MInst::VecBsl {
+            dst: Writable::from_reg(vec_reg(0)),
+            lhs: vec_reg(1),
+            rhs: vec_reg(2),
+        });
+        assert_eq!(bsl, "bsl v0.16b, v1.16b, v2.16b");
+    }
+
+    #[test]
+    fn emits_vector_cvt_and_horizontal_add() {
+        let scvtf = emit(MInst::VecCvt {
+            op: super::VecCvtOp::Scvtf,
+            shape: super::VecShape::FourS,
+            dst: Writable::from_reg(vec_reg(0)),
+            src: vec_reg(1),
+        });
+        assert_eq!(scvtf, "scvtf v0.4s, v1.4s");
+
+        let fcvtzs = emit(MInst::VecCvt {
+            op: super::VecCvtOp::Fcvtzs,
+            shape: super::VecShape::FourS,
+            dst: Writable::from_reg(vec_reg(2)),
+            src: vec_reg(3),
+        });
+        assert_eq!(fcvtzs, "fcvtzs v2.4s, v3.4s");
+
+        let addv = emit(MInst::VecAddv {
+            dst: Writable::from_reg(float_reg(0)),
+            src: vec_reg(1),
+        });
+        assert_eq!(addv, "addv s0, v1.4s");
+    }
+
+    #[test]
+    fn vector_instructions_expose_their_operands() {
+        let mut inst = MInst::VecArithRRR {
+            op: super::VecArithOp::Add,
+            shape: super::VecShape::FourS,
+            dst: Writable::from_reg(virtual_reg(0, RegClass::Vector)),
+            lhs: virtual_reg(1, RegClass::Vector),
+            rhs: virtual_reg(2, RegClass::Vector),
+        };
+        let mut visitor = TestOperandVisitor(Vec::new());
+        inst.get_operands(&mut visitor);
+        assert_eq!(visitor.0.len(), 3);
+        assert_eq!(visitor.0[0].1, OperandConstraint::Reg);
+        assert_eq!(visitor.0[2].2, OperandKind::Def);
     }
 
     #[test]

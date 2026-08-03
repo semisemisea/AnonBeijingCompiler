@@ -111,3 +111,27 @@ where
         buffer.end_inst().unwrap();
     }
 }
+
+/// Emit a finalized [`VCodeContainer`] (post register allocation and
+/// `finalize_for_emission`) as textual assembly for one function. Exposed so a
+/// backend can validate machine-layer programs that are constructed directly
+/// (e.g. explicit SIMD VCode) rather than lowered from HIR.
+pub fn emit_vcode_assembly<B: LowerBackend>(
+    program: &HirProgram,
+    func_data: &HirFunctionData,
+    vcode: &VCodeContainer<B::MInst>,
+) -> String
+where
+    B::MInst: MachInstEmit,
+{
+    let mut buf = String::new();
+    let mut stats = FunctionCodegenStats::default();
+    let mut writer = AsmWriter::<B>::new(
+        &mut buf,
+        func_data,
+        program,
+        B::branch_opt_enabled(&B::CodegenConfig::default()),
+    );
+    writer.write_function(vcode, &mut stats);
+    buf
+}

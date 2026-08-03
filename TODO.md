@@ -83,6 +83,11 @@
 - **RISC-V 栈参数修复**：非对齐访问 + psABI widened-to-XLEN 槽宽（见附 A，FPGA
   实机复跑待验证，见 §4.9）。
 - **RISC-V 跑分长耗时分析**：已完成并归档（见附 B），候选行动项并入 §4.10。
+- **M45 U1**：小常量精确 trip-count 循环全展开——支持正向/反向、非单位步进、
+  zero-trip 与 loop-carried header 参数；保留最终失败 header visit，限制 8 次迭代/
+  64 条非终结指令，复杂 CFG 保守拒绝；双 target QEMU 与 5 次确定性门禁通过。
+- **RISC-V 栈参数修复**：非对齐访问 + psABI widened-to-XLEN 槽宽（见 §8，FPGA
+  实机复跑待验证）。
 
 huffman-01 静态指令数（awk 方法）基线：M26 687 → M34 599 → M36 580 → M37 600
 （决策树静态 +20、动态 cmp 深度变好），详见 `results/perf_compare/`。
@@ -109,9 +114,9 @@ lowering
 ```
 
 IR 优化管线（`raana_ir/src/opt/pass.rs` 定点循环）：
-SSA → Inline → TCO 之后，固定点内：IPSCCP、SimplifyCFG、GVN、SR（强度削减）、
-IfConversion、TCO、BooleanSimplification、GVNPRE、DeadPhiElim、DCE。相关 pass
-见 `raana_ir/src/opt/passes/`。
+SSA → Inline → TCO 之后，固定点内：IPSCCP、SimplifyCFG、LoopUnroll、RotateLoops、
+LICM、GVN、SR（强度削减）、IfConversion、TCO、BooleanSimplification、GVNPRE、
+DeadPhiElim、DCE。相关 pass 见 `raana_ir/src/opt/passes/`。
 
 关键代码：
 
@@ -229,14 +234,16 @@ M39-M41b。参考澄清：Cranelift 的 SIMD 是**显式降层**（wasm `v128` �
 - 验收：many_mat_cal / matmul 内层出现 `fmla` 与 `ld1/st1`；全 corpus QEMU 差分 +
   on/off 差分；-O0/1/2 × 双 target 5 次 byte-identical。
 
-#### M45：SLP 基本块向量化 + 循环展开
+#### M45：SLP 基本块向量化 + 循环部分展开
 
 - SLP（`raana_ir/src/opt/passes/slp.rs`）：把同一基本块内相邻、类型一致的独立
   标量运算打包为向量 op（配对 add/mul/load/store 的菱形结构）；补 loop
   vectorizer 覆盖不到的直通代码（conv2d 邻域、展开后的短链）。
-- 循环展开（`raana_ir/src/opt/passes/loop_unroll.rs`）：常数 trip count（≤ 阈值）
-  的小循环全展开；非常数循环按 2-4 倍部分展开，为 SLP 提供相邻迭代、为 A53
-  双发射暴露 ILP（与 post-RA ListScheduler + slot-filling 配合）。
+- U1 已完成：`raana_ir/src/opt/passes/loop_unroll.rs` 对常数精确 trip count（≤8，
+  展开后非终结指令≤64）的规范双块循环全展开。
+- 后续：非常数循环按 2-4 倍部分展开，为 SLP 提供相邻迭代、为 A53 双发射暴露
+  ILP（与 post-RA ListScheduler + slot-filling 配合）；需先把 opt level/target policy
+  传入 IR pass manager，避免在 `-O1` 固定点中反复展开。
 - 顺序：vectorize（M44）→ unroll → SLP；或先小规模 unroll 再 SLP（按基准数据定）。
 - 验收：conv2d-1 内层出现 `ld1/fmla/st1`；静态指令数与 gem5 sim_insts 对照 clang
   记录在 `results/perf_compare/`。

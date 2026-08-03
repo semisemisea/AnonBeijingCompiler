@@ -60,12 +60,21 @@ pub const fn float_preg(index: u8) -> PReg {
     PReg::new(index as usize, RegClass::Float)
 }
 
+pub const fn vector_preg(index: u8) -> PReg {
+    assert!(index <= 31);
+    PReg::new(index as usize, RegClass::Vector)
+}
+
 pub const fn int_reg(index: u8) -> Reg {
     Reg::from_physical_reg(int_preg(index))
 }
 
 pub const fn float_reg(index: u8) -> Reg {
     Reg::from_physical_reg(float_preg(index))
+}
+
+pub const fn vector_reg(index: u8) -> Reg {
+    Reg::from_physical_reg(vector_preg(index))
 }
 
 /// Internal PReg encoding for the stack pointer. Uses hw_enc 63 in the Int
@@ -108,8 +117,20 @@ pub const FLOAT_ARG_REGS: [Reg; 8] = [
     float_reg(7),
 ];
 
+pub const VECTOR_ARG_REGS: [Reg; 8] = [
+    vector_reg(0),
+    vector_reg(1),
+    vector_reg(2),
+    vector_reg(3),
+    vector_reg(4),
+    vector_reg(5),
+    vector_reg(6),
+    vector_reg(7),
+];
+
 pub const INT_RETURN_REG: Reg = int_reg(0);
 pub const FLOAT_RETURN_REG: Reg = float_reg(0);
+pub const VECTOR_RETURN_REG: Reg = vector_reg(0);
 
 pub const DEFAULT_CLOBBERS: PRegSet = PRegSet::empty()
     .with(int_preg(0))
@@ -155,7 +176,31 @@ pub const DEFAULT_CLOBBERS: PRegSet = PRegSet::empty()
     .with(float_preg(28))
     .with(float_preg(29))
     .with(float_preg(30))
-    .with(float_preg(31));
+    .with(float_preg(31))
+    .with(vector_preg(0))
+    .with(vector_preg(1))
+    .with(vector_preg(2))
+    .with(vector_preg(3))
+    .with(vector_preg(4))
+    .with(vector_preg(5))
+    .with(vector_preg(6))
+    .with(vector_preg(7))
+    .with(vector_preg(16))
+    .with(vector_preg(17))
+    .with(vector_preg(18))
+    .with(vector_preg(19))
+    .with(vector_preg(20))
+    .with(vector_preg(21))
+    .with(vector_preg(22))
+    .with(vector_preg(23))
+    .with(vector_preg(24))
+    .with(vector_preg(25))
+    .with(vector_preg(26))
+    .with(vector_preg(27))
+    .with(vector_preg(28))
+    .with(vector_preg(29))
+    .with(vector_preg(30))
+    .with(vector_preg(31));
 
 pub const fn is_callee_saved(preg: PReg) -> bool {
     match preg.class() {

@@ -31,6 +31,8 @@ pub enum ArgSlot {
 pub enum ArgRegBank {
     Int,
     Float,
+    /// 128-bit SIMD/vector bank (AAPCS64 NEON v0-v7).
+    Vector,
 }
 
 /// Shared register-bank and stack-offset planning for scalar ABI arguments.
@@ -38,6 +40,7 @@ pub enum ArgRegBank {
 pub struct ArgLayoutPlanner<'a> {
     int_regs: &'a [Reg],
     float_regs: &'a [Reg],
+    vector_regs: &'a [Reg],
 }
 
 impl<'a> ArgLayoutPlanner<'a> {
@@ -45,6 +48,19 @@ impl<'a> ArgLayoutPlanner<'a> {
         Self {
             int_regs,
             float_regs,
+            vector_regs: &[],
+        }
+    }
+
+    pub const fn with_vector_regs(
+        int_regs: &'a [Reg],
+        float_regs: &'a [Reg],
+        vector_regs: &'a [Reg],
+    ) -> Self {
+        Self {
+            int_regs,
+            float_regs,
+            vector_regs,
         }
     }
 
@@ -55,12 +71,14 @@ impl<'a> ArgLayoutPlanner<'a> {
         stack_slot_size: impl Fn(&HirType) -> u32,
     ) -> (Vec<ArgSlot>, u32) {
         let mut slots = Vec::with_capacity(types.len());
-        let (mut int_index, mut float_index, mut stack_offset) = (0usize, 0usize, 0u32);
+        let (mut int_index, mut float_index, mut vector_index, mut stack_offset) =
+            (0usize, 0usize, 0usize, 0u32);
 
         for ty in types {
             let (regs, index) = match classify(ty) {
                 ArgRegBank::Int => (self.int_regs, &mut int_index),
                 ArgRegBank::Float => (self.float_regs, &mut float_index),
+                ArgRegBank::Vector => (self.vector_regs, &mut vector_index),
             };
             let reg = regs.get(*index).copied();
             *index = index
@@ -518,10 +536,23 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
 
         let stackslots_size = self.total_stackslots_size;
         let outgoing_args_size = self.outgoing_arg_size;
-        let clobber_size = u32::try_from(callee_saved.len())
-            .map_err(|_| "callee-save count exceeds frame range")?
-            .checked_mul(M::word_bytes())
-            .ok_or("callee-save area exceeds frame range")?;
+        // Callee-saved registers occupy their natural storage size (a 128-bit
+        // vector is 2 spill units). 16-byte slots are aligned to 16 within the
+        // clobber area so `str/ldr q` never sees a misaligned address.
+        let clobber_size = callee_saved.iter().try_fold(0u32, |mut offset, p| {
+            let size = M::spillslot_size(p.class())
+                .checked_mul(M::spill_unit_bytes())
+                .ok_or("callee-save slot size overflow")?;
+            if size > M::word_bytes() {
+                offset = offset
+                    .checked_add(size - 1)
+                    .ok_or("callee-save alignment overflow")?
+                    & !(size - 1);
+            }
+            offset
+                .checked_add(size)
+                .ok_or("callee-save area exceeds frame range")
+        })?;
         let setup_area_size = if self.has_calls
             || self.sized_stack_arg_size > 0
             || self.total_stackslots_size > 0

@@ -39,6 +39,16 @@
   `is_callee_saved`/`preg_name` 补 Vector（v8-v15 callee-saved）、拆 vcode
   move/spill 三处 panic。验收：显式向量值 RA（含 spill/move）无 panic、
   `cargo test --workspace` 全绿、双 target × -O0/1/2 5 次 byte-identical。
+- **M40（机器层部分）**：NEON MInst 全集——`VecLd1/St1`、`VecDup`、
+  `VecArithRRR`、`VecFmla`、`VecBitwise`、`VecCmp`、`VecBsl`、`VecCvt`、
+  `VecAddv`、`VecMovImm`、`VecExtractLane/InsertLane`、`VecMinMax`，emit/DCE/
+  sched 全接入；`emit_vcode_assembly` 公开接口 + 直构 VCode→NEON 汇编端到端测试。
+  剩余（NEON MInst lowering）：`raana_ir` 显式向量 inst kind + `lower.rs` 向量
+  分派，见 §5.3。
+- **M41（机器层部分）**：向量 ABI——`ArgLayoutPlanner` Vector bank、向量参数
+  占 NEON v0-v7/溢出 16B 槽、返回 v0、`DEFAULT_CLOBBERS` 含 NEON、callee-saved
+  v8-v15 按 16B 槽保存恢复；ABI 单测通过。剩余：向量 SchedClass 与 tests/QEMU
+  差分，见 §5.3。
 - **RISC-V 栈参数修复**：非对齐访问 + psABI widened-to-XLEN 槽宽（见 §8，FPGA
   实机复跑待验证）。
 
@@ -280,41 +290,54 @@ vectorizer pass（源码检索无 vectorize/unroll/slp）。clang/gcc 才做自�
 
 ### 5.3 Phase 1：机器层显式 SIMD 通路
 
-M39 已完成（见「已完成里程碑摘要」）。M40 进行中：NEON 指令集已完成，剩余见下。
+执行方向（2026-08 调整）：**先完成完整的 NEON MInst lowering（M40-M41 机器层
+ISel 收口），上层优化 pass（M42-M46）暂时搁置。**
 
 #### M40：最小 NEON ISel（显式向量指令通路）
 
-已完成：
+已完成（`b211bec`）：
 - `anon_armv8/src/instructions.rs`：`VecLd1/VecSt1`（`ld1/st1 {vN.16b}, [base]`）、
   `VecDup`（`dup`，GPR/浮点标量源）、`VecArithRRR`（`add/sub/mul .4s/.2d`）、
   `VecFmla`、`VecBitwise`（`and/orr/eor .16b`）、`VecCmp`（`cmeq/cmgt`）、
-  `VecBsl`、`VecCvt`（`scvtf/fcvtzs`）、`VecAddv`（`addv s,v.4s`）。get_operands、
-  emit（GNU 汇编文本）、DCE 白名单、scheduler 依赖均已接入。
+  `VecBsl`、`VecCvt`（`scvtf/fcvtzs`）、`VecAddv`（`addv s,v.4s`）、`VecMovImm`
+  （`movi`）、`VecExtractLane/VecInsertLane`（`mov w/v .s[lane]`）、`VecMinMax`
+  （`smin/smax/umin/umax/fmin/fmax`）。get_operands、emit（GNU 汇编文本）、DCE
+  白名单、scheduler 依赖均已接入。
 - `taki_mir/src/emit.rs`：`emit_vcode_assembly` 公开接口——后端可直构显式 SIMD
   VCode 并渲染为汇编。
 - 验证：各 variant emit 单测（GNU 文本 + clang 交叉汇编）；`explicit_vector_vcode_
   emits_neon_assembly` 走完整 AArch64 管线（RA→finalize→emit）生成 NEON。
 
-剩余：
-- `VecMovImm`（`movi/mvni`）、lane 存取 `VecExtractLane/VecInsertLane`、向量
-  `min/max` 未加（M44 需要时补）。
-- `lower.rs` 向量分派 + 显式向量 IR 入口（`raana_ir` 临时 inst kind）未加——
-  QEMU 差分验证留给 M41（向量 ABI 使函数可调用后）。
+剩余（NEON MInst lowering 主体）：
+- `raana_ir` 显式向量 inst kind（临时）：`VectorLd/VectorSt/VectorArith/VectorDup/
+  VectorFma/VectorReduceAdd` 等，供后端单测/未来 vectorizer 构造向量 HIR。
+- `anon_armv8/src/lower.rs` `lower_inst` 向量分派：把上述 IR kind 降为已就绪的
+  `Vec*` MInst；`reg_class_for_type` 已由 `rc_for_type` 覆盖（M39）。
 - 对齐访存：已知 16 字节对齐用对齐 `ld1`；未知用非对齐，宁慢勿错（M43
   versioning 保证）。
 
 #### M41：向量 ABI + 调度 profile + 显式向量验证
 
-- ABI（AAPCS64）：SIMD/向量参数按顺序占 NEON v0-v7，超出走栈（8 字节槽，
-  128-bit 向量占 2 槽）；返回 `v0`；callee-saved v8-v15 在 prologue/epilogue
-  保存恢复；`compute_call_arg_loc` 与 callee 侧 `Args`/`RetVal` 支持 Vector class。
+已完成（`8f1771d`）：
+- `ArgLayoutPlanner` 新增 Vector bank；AAPCS64 向量参数占 NEON v0-v7，溢出走
+  16 字节栈槽；返回 `v0`；`Args`/`RetVal`/call 的 vector 返回路径已接；
+  `DEFAULT_CLOBBERS` 含 NEON v0-v7/v16-v31；callee-saved v8-v15 按 16 字节槽
+  保存恢复（`compute_frame_layout` 与 `gen_clobber_save/restore` 对齐）。
+- ABI 单测：`aapcs64_vector_arguments_use_neon_registers` /
+  `aapcs64_vector_overflow_slots_are_sixteen_bytes` / 混合 int+vector 布局。
+
+剩余：
 - 调度：`anon_armv8/src/sched/aarch53.rs` 新增向量 SchedClass（`VecArith`/
-  `VecMul`/`VecFmla`/`VecLoad`/`VecStore`），latency/throughput 取 A53 NEON 参考
-  值（`fmla` 高吞吐、`ld1` 高延迟；与 FP 共用 FP_NEON pipe）。
+  `VecMul`/`VecFmla`/`VecLoad`/`VecStore`/`VecMov`），latency/throughput 取 A53
+  NEON 参考值（`fmla` 高吞吐、`ld1` 高延迟；与 FP 共用 FP_NEON pipe）；dag.rs
+  把 `Vec*` MInst 从 `SchedClass::Other` 改指这些类。
 - 验证：`tests/` 新增显式向量功能用例；`-O` 门控 + 双 target 回归 + QEMU 差分；
-  `scripts/perf_compare.sh` 记录显式向量用例静态指令数基线。
+  `scripts/perf_compare.sh` 记录显式向量用例静态指令数基线（需向量 IR 入口
+  使函数可调用）。
 
 ### 5.4 Phase 2：IR 层自动向量化
+
+> 搁置（2026-08 调整）：先完成 §5.3 的 NEON MInst lowering，再回到本节。
 
 #### M42：循环依赖 / 别名分析（向量化合法性前置）
 

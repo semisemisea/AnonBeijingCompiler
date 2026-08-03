@@ -11,4 +11,3 @@ members = [
 default-members = ["soyo_compiler"]
 
 [profile.release]
-debug = true

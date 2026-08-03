@@ -6,6 +6,7 @@ pub mod gvn;
 pub mod gvn_pre;
 pub mod if_conversion;
 pub mod inline;
+pub mod invariant_reduction_hoisting;
 pub mod ipsccp;
 pub mod licm;
 pub mod pointer_strength_reduction;

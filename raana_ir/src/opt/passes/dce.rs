@@ -399,6 +399,74 @@ mod tests {
             .iter()
             .any(|&inst| inst == call));
     }
+
+    #[test]
+    fn removes_pure_unused_calls_but_keeps_io_calls() {
+        let mut program = Program::new();
+        // A strictly pure callee with no body at all.
+        let pure_callee = program.new_function(Type::get_i32(), "pure".into(), vec![]);
+        let pure_data = program.func_data_mut(pure_callee);
+        let pure_entry = pure_data.add_entry_block();
+        // Constants stay outside the block layout; only the return is laid out.
+        let one = pure_data.new_local_inst().integer(1);
+        let pure_ret = pure_data.new_local_inst().ret(Some(one));
+        pure_data.layout_mut().insert_inst(pure_entry, pure_ret);
+
+        // A library I/O function (no body; identified by name).
+        let io_callee = program.new_function(Type::get_i32(), "getint".into(), vec![]);
+
+        let function = program.new_function(Type::get_unit(), "caller".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let pure_call = data
+            .new_local_inst()
+            .call_with_type(pure_callee, vec![], Type::get_i32());
+        data.layout_mut().insert_inst(entry, pure_call);
+        let io_call = data
+            .new_local_inst()
+            .call_with_type(io_callee, vec![], Type::get_i32());
+        data.layout_mut().insert_inst(entry, io_call);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        assert!(DeadCodeElimination.run(&mut program));
+        let data = program.func_data(function);
+        let insts = data.layout().basicblock(entry).insts();
+        assert!(
+            !insts.iter().any(|&inst| inst == pure_call),
+            "unused pure call must be removed"
+        );
+        assert!(
+            insts.iter().any(|&inst| inst == io_call),
+            "I/O call must be kept"
+        );
+    }
+
+    #[test]
+    fn keeps_pure_calls_whose_result_is_used() {
+        let mut program = Program::new();
+        let pure_callee = program.new_function(Type::get_i32(), "pure".into(), vec![]);
+        let pure_data = program.func_data_mut(pure_callee);
+        let pure_entry = pure_data.add_entry_block();
+        let one = pure_data.new_local_inst().integer(1);
+        let pure_ret = pure_data.new_local_inst().ret(Some(one));
+        pure_data.layout_mut().insert_inst(pure_entry, pure_ret);
+
+        let function = program.new_function(Type::get_i32(), "caller".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let pure_call = data
+            .new_local_inst()
+            .call_with_type(pure_callee, vec![], Type::get_i32());
+        data.layout_mut().insert_inst(entry, pure_call);
+        let ret = data.new_local_inst().ret(Some(pure_call));
+        data.layout_mut().insert_inst(entry, ret);
+
+        assert!(!DeadCodeElimination.run(&mut program));
+        let data = program.func_data(function);
+        let insts = data.layout().basicblock(entry).insts();
+        assert!(insts.iter().any(|&inst| inst == pure_call));
+    }
 }
 
 impl Pass for DeadPhiElimination {

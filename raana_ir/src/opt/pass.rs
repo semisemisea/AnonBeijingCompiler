@@ -214,6 +214,11 @@ impl PassesManager {
         let sr = Box::new(sr::StrengthReduction);
         p.register(sr);
 
+        // Split single-accumulator reduction loops into four independent lanes
+        // (breaks the serial accumulation dependency chain on AArch64).
+        let reduction_unroll = Box::new(reduction_unroll::ReductionUnroll);
+        p.register(reduction_unroll);
+
         let if_conversion = Box::new(if_conversion::IfConversion);
         p.register(if_conversion);
 

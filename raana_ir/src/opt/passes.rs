@@ -9,6 +9,7 @@ pub mod inline;
 pub mod ipsccp;
 pub mod licm;
 pub mod pointer_strength_reduction;
+pub mod reduction_unroll;
 pub mod rotate_loops;
 pub mod scalar_global_promotion;
 pub mod simplify_cfg;

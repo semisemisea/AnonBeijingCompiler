@@ -3,8 +3,11 @@
 本文档只记录尚未完成的工作。已完成里程碑只保留一行摘要，历史设计与实现细节
 以 Git 提交记录和代码测试为准，不在这里重复维护。
 
-> 进行中：§2 主计划 D（M47 `reduction_unroll` / M48 `invariant_reduction_hoisting`）
-> 已完成。下一优先级见 §3 SIMD Phase 2（M42-M46，搁置中）与 §4 后续候选。
+> 已完成：§2 主计划 D（M47 `reduction_unroll` / M48 `invariant_reduction_hoisting`）；
+> §4 主计划 E 的 M49/M50/M53/M54（内存分析底座 + Purity + IPSCCP 主存模拟
+> + LICM load 外提）。
+> 进行中：§4 主计划 E 剩余项（M51 指针槽/SROA、M52 DSE）。
+> 下一优先级见 §3 SIMD Phase 2（M42-M46，搁置中）与 §5 后续候选。
 
 ## 已完成里程碑摘要
 
@@ -31,7 +34,7 @@
 - **M34**：GSP（标量全局提升，程序级可能触及分析）+ LICM（自然循环 + 前驱头
   提升）+ 作用域化 load-CSE。huffman-01 648 → 599；`read_bits` 149 条 < clang 161。
 - **M35**：`Mov` 32 位宽度（i32 拷贝 `mov w,w`）；回边 blockparam 拷贝诊断完成
-  （消除路径见 §4.7）。
+  （消除路径见 §5.7）。
 - **M36**：内联代价模型（`estimate_size` × 调用点数预算 ≤ 100，递归环守卫）。
   huffman-01 599 → 580；`read_bits` 内 `rotlN` 全内联、热循环无 `bl` 无栈帧。
 - **M37**：if 链 → switch 决策树（`chain_to_switch`，AArch64 专用）+ `chain_fusion`
@@ -78,11 +81,16 @@
   many_mat_cal-1/2/3 R 循环消失（或退化），qemu 下 ~82s → ~2s；functional+
   h_functional 149/149、perf 60/60（-O1/-O2）、byte-identical 5×、RISC-V 全量
   回归通过。
+- **主计划 E（M49/M50/M53/M54）**：内存/别名分析底座（GetBaseObject +
+  指针槽解析）、完整 Purity 分析（points-to + mod-ref 摘要）、IPSCCP 主存
+  模拟（常量格 + MemZero 零区间 + call 失效）、LICM load 外提（别名/mod-ref
+  守卫）。conv2d 形参指针槽 load 全部提出热循环；`g[0]=5; ret g[0]` 折叠为
+  `ret 5`。M51/M52/M55/M56 未做，见 §4。
 - **主计划 A（M30-M38）**：huffman 类基准性能重构全部完成，设计依据 Cranelift
   机制移植 + 以 clang 为参照的 if-conversion/ccmp/subs 融合。
 - **RISC-V 栈参数修复**：非对齐访问 + psABI widened-to-XLEN 槽宽（见附 A，FPGA
-  实机复跑待验证，见 §4.9）。
-- **RISC-V 跑分长耗时分析**：已完成并归档（见附 B），候选行动项并入 §4.10。
+  实机复跑待验证，见 §5.9）。
+- **RISC-V 跑分长耗时分析**：已完成并归档（见附 B），候选行动项并入 §5.10。
 
 huffman-01 静态指令数（awk 方法）基线：M26 687 → M34 599 → M36 580 → M37 600
 （决策树静态 +20、动态 cmp 深度变好），详见 `results/perf_compare/`。
@@ -136,7 +144,7 @@ IfConversion、TCO、BooleanSimplification、GVNPRE、DeadPhiElim、DCE。相关
 
 huffman-01 各函数差距（`read_bits`/`rotlN`/`output_data` 等）在 M30-M38 逐项
 收敛，分函数差距表已随各里程碑完成归档，当前基线见 `results/perf_compare/`。
-剩余的通用优化方向见 §4 后续候选工作；热循环标量优化（§2 主计划 D）已完成，
+剩余的通用优化方向见 §5 后续候选工作；热循环标量优化（§2 主计划 D）已完成，
 SIMD 见 §3。
 
 ### 1.3 当前结论边界
@@ -171,7 +179,7 @@ M47 `reduction_unroll`（标量多累加器 + 4× 部分展开）与 M48
 `invariant_reduction_hoisting`（外层不变归约外提 + 退化体）已全部落地并验收，
 详见"已完成里程碑摘要"M47/M48 与 Git 历史，本节不再维护。many_mat_cal-1/2/3
 的 R×T² 平方和热点从 ~1.5×10¹⁰ 元素操作降为单次 ~10⁶ + R 次平凡累加，qemu 下
-~82s → ~2s。合规审计与实现护栏记录于 M47/M48 提交信息；§4.11 保留 M48 泛化
+~82s → ~2s。合规审计与实现护栏记录于 M47/M48 提交信息；§5.11 保留 M48 泛化
 （容忍幂等写的整体循环巢外提）候选。
 
 ## 3. 主计划 C：SIMD/NEON 支持（M42-M46，搁置中）
@@ -247,7 +255,7 @@ M39-M41b。参考澄清：Cranelift 的 SIMD 是**显式降层**（wasm `v128` �
   perf 全量 QEMU 差分；on/off 差分无行为差异。
 - `scripts/perf_compare.sh` 增加 SIMD 列；对 many_mat_cal/conv2d/matmul 记录静态
   指令数与 gem5 sim_insts 相对标量基线的变化（按 §1.3 原则，不声称实机收益）。
-- 调度验证器（§4 P2 `verify_sched_deps`）覆盖向量 NZCV / 寄存器依赖。
+- 调度验证器（§5 P2 `verify_sched_deps`）覆盖向量 NZCV / 寄存器依赖。
 
 ### 3.3 关键不变量（SIMD）
 
@@ -264,19 +272,114 @@ M39-M41b。参考澄清：Cranelift 的 SIMD 是**显式降层**（wasm `v128` �
 
 ---
 
-## 4. 后续候选工作
+## 4. 主计划 E：内存分析 / 别名分析（进行中）
+
+> 已完成：M49（内存对象/别名分析）、M50（完整 Purity 分析）、
+> M53（IPSCCP 主存模拟）、M54（LICM load 外提）。剩余：M51（指针槽
+> 消除/SROA）、M52（DSE）、M55/M56。详细设计见
+> `docs/memory_alias_analysis.md`；本计划为内存类优化提供公共底座：
+> 别名分析 + 函数 mod-ref 摘要。SysY 无指针、无堆，栈内存对象大小与
+> 维度编译期已知（数组维度为 ConstExp），建模成本低、精度高。
+
+#### M49：内存对象 / 别名分析（已完成）
+
+- 交付：`analysis_passes/memory.rs`——MemObject{Alloc,Global,Param,
+  Unknown}、GetBaseObject（指针槽 store-once 解析 + block param phi
+  解析）、GEP 常量字节偏移、过程内别名规则矩阵。验收：单测 10 个。
+- 备注：函数级 builder 无法检视全局 inst，查询统一走 `&impl Arena`。
+
+#### M50：函数副作用摘要 / Purity（已完成）
+
+- 交付：`analysis_passes/effects.rs`——call graph 双不动点：自顶向下
+  points-to（形参 → 具体对象集合，递归收敛）+ 自底向上 mod-ref 摘要
+  （reads/writes/unknown/io）；is_pure / is_removable /
+  may_write_memory / call_write_roots；跨过程 alias 细化（Param vs
+  Global/Param/自身 Alloc）；sysylib 边界显式建模。验收：单测 12 个。
+
+#### M51：指针槽消除 + 栈对象提升（SROA 子集，未做）
+
+- 现状缺口/现象（conv2d-1 实测 IR）：数组形参被前端存入局部指针槽
+  （`%11 = alloc <**i32>; store %24, %11`），热循环每轮
+  `%50 = load %11` / `%88 = load %v_K` 重载形参指针。
+- 注意：M54（LICM load 外提）已捕获该模式的主要收益——三个形参指针槽
+  load 全部提出嵌套循环到 entry，内层 k 循环每轮省 3 条 ldr。SROA 对
+  「常量化元素访问的局部数组」仍有独立收益。
+- 变换：write-once/read-many 的 Alloc 槽（函数内至多一次 store、M50
+  证明无逃逸）→ 用存储值替换全部 load 并删槽；局部 Alloc 全部访问
+  经常量 GEP 偏移且未逃逸 → 逐元素提升为 SSA 值（转发由 M52 承接）。
+
+#### M52：Store-to-load forwarding + 死 Store 消除（DSE/DLE，未做）
+
+- 现状缺口：DCE 不删任何 Store；GVN 只做 load-CSE、无 forwarding。
+- 注意：M53（IPSCCP 主存模拟）已覆盖常量格内的 store→load 转发。
+- 变换：同 root 同 offset 相邻 store→load 转发；覆盖前无可能读取的死
+  store 删除；「load 原值存回同址」冗余回写删除（conv2d main 尾部
+  `store %100, %gv_repeat_factor; store %99, %gv_N_eff` 实证）；MemZero
+  按整区间 store 统一建模。
+- 附带：GVN ScopedLoadLeaders 的全局失效改为按 M49 may_alias 失效
+  （零新增 pass 的 load-CSE 精度提升）。
+
+#### M53：IPSCCP 主存模拟（已完成）
+
+- 交付：常量 GEP 偏移的 per-cell 格（per-writer 贡献 + meet 折叠，src
+  精化可恢复）；MemZero 合并零区间、零初始化全局播种零区间；call 按
+  M50 摘要精确失效（未知写全清）；cell 变更重调度 load（与 relay 同
+  模式 drain）。验收：单测 6 个 + 端到端（`g[0]=5; ret g[0]` → `ret 5`、
+  `int a[4]={0}; ret a[1]` → `ret 0`）。
+
+#### M54：LICM load 外提（已完成）
+
+- 交付：can_be_invariant 增加 Load + 别名/mod-ref 守卫（循环内
+  store/MemZero/call 可能写地址则拒绝；无分析时保守不外提）；LICM
+  增加 analysis 字段（每次 Pass::run 重建，定点安全）。验收：单测 5 个
+  + conv2d 形参指针槽 load 全部提出热循环（汇编确认）。
+
+#### M55：后端调度别名细化（P2，评估先行，未做）
+
+- 现状缺口：sched/dag.rs 已有 root 模型与统计（dag.rs:144-179），
+  IR 层 GEP 仿射信息到不了 MIR；§5.3 记录内存历史 O(M²) 复杂度。
+- 方案：先用现有统计量化 known/unknown root 与 disjoint/may-alias
+  占比——收益有限则记录结论关闭；may-alias 占主导才把 M49 结果随
+  MInst 下沉，与内存历史数据结构优化合并实施。
+
+#### M56（可选）：数组全局部分提升 / 循环不变基址 hoist（未做）
+
+- GSP 泛化：数组全局函数内只经常量 GEP 访问且跨调用只读（M50 证明）
+  → 元素提升为 SSA；地址层与 pointer_strength_reduction 的 A4c 呼应。
+
+### 成本-收益评估（每 milestone 必做，详见设计文档 §7）
+
+- 复杂度：M49 O(N×D)、M50 O(F+E)×迭代、M51/M52 O(N~N log N)、
+  M53 O(N×Σcell)（唯一可能拖慢定点的项）、M55 不增复杂度。
+- 编译耗时：perf corpus 全量编译时间 before/after 中位数对比；定点
+  迭代轮数监控（M53 重点）。
+- 收益：热循环静态指令数（awk 方法）、gem5 sim_insts/qemu wall
+  （仅相对参考）、sched DAG stats（disjoint vs may-alias 占比）。
+- 门禁：functional/h_functional 全量 + perf on/off 差分 + 双 target
+  × -O0/1/2 5 次 byte-identical。
+- 预期收益排序：M51 > M52 > M53 > M54 > M55（按成本/收益比）。
+
+### 合规性
+
+- 别名/副作用/可达性属 AGENTS.md 明示合法优化依据（"effects, alias
+  information"）；全部变换基于 IR 结构推导，不匹配名称/用例/输入特征。
+- 红线：不得因"未初始化局部值不确定"删除前端 mem_zero，除非证明
+  每读路径都被写覆盖（按可观察语义对待，比 UB 更严格）。
+- 保守原则：判不了就是 may-alias，宁漏勿错（§6 执行原则 4）。
+
+## 5. 后续候选工作
 
 按预期收益排序，均需在前一项验证后再启动。被主计划 A 覆盖的旧条目
 （`&&`/`||` flags 融合、phi 拷贝 coalescing、循环不变 load 外提）已并入
 M31-M35，不再单列。
 
-### 4.1 P1：常量 / 分支参数物化源头治理
+### 5.1 P1：常量 / 分支参数物化源头治理
 
 DCE 是兜底；更优解是 lowering 时就不为未使用的 block param 和分支参数物化
 常量与 `mov wzr`。DCE 落地后统计 `instructions_removed` 的构成，若某类来源
 占主导，直接在 `taki_mir/src/lower.rs` 或 `anon_armv8/src/lower.rs` 消除源头。
 
-### 4.2 P2：调度验证器闭环
+### 5.2 P2：调度验证器闭环
 
 - `verify_operand_order_stable`：保护 pre-RA pass 的 operand traversal
   contract。
@@ -284,26 +387,26 @@ DCE 是兜底；更优解是 lowering 时就不为未使用的 block param 和�
   memory 和 barrier 约束。
 - 小 DAG reference simulator / property tests。
 
-### 4.3 P2：内存 DAG 复杂度
+### 5.3 P2：内存 DAG 复杂度
 
 长块最坏 `O(M^2)`。已有统计，先采集编译时间数据，确认是实际问题后再引入
 按 root/range 分组的数据结构。
 
-### 4.4 P2：调度启发式增强（需实机数据证明收益）
+### 5.4 P2：调度启发式增强（需实机数据证明收益）
 
 - Load-use latency hiding 专项。
 - Pair-aware scheduling（调度时考虑 LDP/STP 形成）。
 - post-RA register-pressure tie-break。
 - pre-RA scheduler（需先证明 post-RA false dependency 是主要 ILP 限制）。
 
-### 4.5 P2：冷块沉底与布局
+### 5.5 P2：冷块沉底与布局
 
 Cranelift `BlockLoweringOrder` 的 `cold_blocks` 机制（`blockorder.rs:87-90,
 260-265`）把冷块沉到函数末尾；配合 M25-M29 的 EmitBuffer，冷块天然获得
 fallthrough 收益。SysY 前端暂无冷热信息，本期仅在 `BlockLoweringOrder`
 预留 `is_cold()` 接口。相关遗留：`CmpImm(0)+CondBr{Ne}`→`cbz` 融合未做。
 
-### 4.6 P3：XCZU15EG 实机校准（依赖硬件访问）
+### 5.6 P3：XCZU15EG 实机校准（依赖硬件访问）
 
 - 运行 `benchmarks/src/bench.c`，校准 latency / throughput / pairing 数据。
 - 基于实测调整 guide-derived profile 值。
@@ -312,7 +415,7 @@ fallthrough 收益。SysY 前端暂无冷热信息，本期仅在 `BlockLowering
 - 用 M19-M24 的参数入口 microbenchmark 与 M25-M29 的 huffman 差分量化
   实际收益（实机数字待测）。
 
-### 4.7 M35 遗留：回边 blockparam 拷贝消除（候选）
+### 5.7 M35 遗留：回边 blockparam 拷贝消除（候选）
 
 ion `merge_vreg_bundles` 的 blockparam-out 合并已触发且正确；`_and/_xor/_or`
 回边 3 条 `mov w,w` 是语义必需（旧值读在旋转后新值定义之后，活区间真实相交）。
@@ -324,18 +427,18 @@ ion `merge_vreg_bundles` 的 blockparam-out 合并已触发且正确；`_and/_xo
 
 验收：`_and` 循环回边零 mov。
 
-### 4.8 分支发射遗留（主计划 B 完成后的剩余项）
+### 5.8 分支发射遗留（主计划 B 完成后的剩余项）
 
 - RISC-V `CondBr` 冷块沉底未做（只在 `BlockLoweringOrder` 预留 `is_cold()`
   接口）。
 - `CmpImm(0)+CondBr{Ne}`→`cbz` 融合。
 
-### 4.9 RISC-V 栈参数 FPGA 实机复跑（附 A 收尾）
+### 5.9 RISC-V 栈参数 FPGA 实机复跑（附 A 收尾）
 
 修复已实现（非对齐 131→0 处），**FPGA 实机复跑仍待验证**：`h_functional/
 39_fp_params` 在 BOOM 实机复跑确认 WA/RE 消除。
 
-### 4.10 RISC-V 跑分候选（附 B 收尾，按通用性 × 收益 × 风险）
+### 5.10 RISC-V 跑分候选（附 B 收尾，按通用性 × 收益 × 风险）
 
 - P0 发射层纯改进（覆盖所有热循环，每回边省 2+ 条）：A1 局部跳转
   `la+jr→j`（超范围走既有 veneer）；A2 `li+ALU`→立即数指令（`addiw/slti`，
@@ -348,7 +451,7 @@ ion `merge_vreg_bundles` 的 blockparam-out 合并已触发且正确；`_and/_xo
 - SIMD（§3）对 many_mat_cal / conv2d / matmul / transpose 的向量并行是
   A4/A5 标量优化之后的下一层收益来源。
 
-### 4.11 泛化：整体循环巢外提（容忍幂等写）（M48 后续）
+### 5.11 泛化：整体循环巢外提（容忍幂等写）（M48 后续）
 
 M48 的"零 store"守卫拒绝了 conv2d `repeat` 外层（巢内写 `Out`，但每轮写入
 相同位置、相同值，即**幂等写**，可安全外提）。泛化方向：识别"循环巢整体相对
@@ -357,7 +460,7 @@ M48 的"零 store"守卫拒绝了 conv2d `repeat` 外层（巢内写 `Out`，但
 
 ---
 
-## 5. 总体执行原则
+## 6. 总体执行原则
 
 1. 每个 milestone 独立提交；`TODO.md` 在 milestone 完成后删除对应已完成
    细节，只保留后续工作。
@@ -371,7 +474,7 @@ M48 的"零 store"守卫拒绝了 conv2d `repeat` 外层（巢内写 `Out`，但
 
 ---
 
-## 6. 风险与缓解
+## 7. 风险与缓解
 
 | 风险 | 严重度 | 缓解措施 |
 |------|--------|---------|
@@ -434,7 +537,7 @@ RISC-V psABI 规定窄于 XLEN 的标量栈参数 **widened to XLEN bits**（RV6
 `argument_layout_preserves_scalar_stack_widths` 断言（[0,8,12,16]/24 →
 [0,8,16,24]/32）；tail-call 路径与 `abi_matrix` 回归。状态：QEMU 单测与
 riscv functional+h_functional 全量通过，非对齐 131→0 处；**FPGA 实机复跑
-待验证（§4.9）**。
+待验证（§5.9）**。
 
 ---
 
@@ -489,4 +592,4 @@ riscv functional+h_functional 全量通过，非对齐 131→0 处；**FPGA 实�
 - fft1(4.4s)：B8+A7
 - crc(4.5s)：B8
 
-候选行动项（P0-P3）已并入 §4.10。
+候选行动项（P0-P3）已并入 §5.10。

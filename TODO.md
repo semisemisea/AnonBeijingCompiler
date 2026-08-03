@@ -44,6 +44,14 @@
   `VecAddv`、`VecMovImm`、`VecExtractLane/InsertLane`、`VecMinMax`，emit/DCE/
   sched 全接入；`emit_vcode_assembly` 公开接口 + 直构 VCode→NEON 汇编端到端测试。
   ISel 收口（向量 IR 入口 + lower 分派）见 §5.3 M40b。
+- **M40b（已完成，`99fc903`）**：向量 IR 入口 + 完整 NEON ISel lowering——`Fma`/
+  `VectorSplat`/`VectorExtractElement`/`VectorInsertElement`/`VectorReduce` 五个
+  inst kind + `Binary/Cast/Select` 接受向量类型 + `BinaryOp::Min/Max`；`lower.rs`
+  向量分派（add/sub/mul/and/or/xor/eq/gt/min/max/cvt/bsl/dup/lane/reduce）、
+  `ldr/str q`（`MemoryType::Vec128`）+ 完整 AMode、`emit_zero_init` 向量零初始化；
+  `VecFmla/VecBsl/VecInsertLane` 改为显式读操作数 + 自发射前导 copy（early def，
+  SSA 单 def）。RISC-V/frontend 防御臂。验收：端到端向量函数（v0-v7 ABI）生成
+  NEON 汇编、`-O0/1/2` × 5 次 byte-identical、双 target 标量回归。
 - **M41（机器层部分）**：向量 ABI——`ArgLayoutPlanner` Vector bank、向量参数
   占 NEON v0-v7/溢出 16B 槽、返回 v0、`DEFAULT_CLOBBERS` 含 NEON、callee-saved
   v8-v15 按 16B 槽保存恢复；ABI 单测通过。收尾（向量 SchedClass、功能用例/
@@ -308,108 +316,14 @@ sched 全接入 + emit 单测 + `explicit_vector_vcode_emits_neon_assembly` 端�
 v0、`DEFAULT_CLOBBERS` 含 NEON v0-v7/v16-v31、callee-saved v8-v15 按 16B 槽保存
 恢复；ABI 单测通过。
 
-#### M40b（当前进行）：向量 IR 入口 + 完整 NEON ISel lowering
+#### M40b（已完成，`99fc903`）：向量 IR 入口 + 完整 NEON ISel lowering
 
-目标：**上层（frontend / 未来 vectorizer）生成的向量 IR 可完整、正确地降为 NEON
-汇编**——IR → `taki_mir` 通用 lowering → `anon_armv8` 分派 → 既有 `Vec*` MInst。
-机器层（类型/vreg/`rc_for_type`、MInst 全集、ABI）已就绪，缺的是 IR 表面与
-`lower_inst` 分派。
-
-**1. IR 层（raana_ir）——扩展既有 kind 接受向量类型**
-
-- `Binary`：builder 断言从"双标量"放宽为"双标量或双向量（同类型）"。向量形态：
-  - `Add/Sub/Mul` → `VecArithRRR`。约束：`Mul` + `TwoD`（V2I64）无对应 NEON
-    指令（无 `mul v.2d`）→ lowering 显式 panic。
-  - `And/Or/Xor` → `VecBitwise`（`.16b`）。
-  - `Eq/Gt` → `VecCmp`（`cmeq/cmgt`，整数向量）。`NotEq/Lt/Le/Ge` 向量形式暂不
-    支持 → panic（浮点向量比较需 `fcmgt`，不在 MInst 集）。
-  - 新增 `BinaryOp::Min/Max` → `VecMinMax`：元素类型决定 op（i32→`smin/smax`、
-    f32→`fmin/fmax`；IR 无 u32，i32 按有符号）。**仅向量**，标量 `Min/Max` panic。
-- `Cast`：builder 断言放宽为"双标量或双向量"。向量 `Int32↔Float32` →
-  `VecCvt`（`scvtf/fcvtzs`）；其余向量 cast → panic。
-- `Select`：允许 cond 为向量（与真/假分支同向量类型）→ `VecBsl`（`.16b`，
-  `dst = bsl(mask, if_true, if_false)`）。标量 select 路径不变。
-- `ZeroInit`：向量类型 → `VecMovImm { imm: 0 }`（向量零初始化）。
-- `Load`/`Store`：类型无关，已能承载向量值；仅需 lowering 侧向量分支。
-
-**2. IR 层——新增专用向量 inst kind（对应 LLVM `splat`/`extractelement`/
-`insertelement`/`reduce`）**
-
-- `Fma { acc, lhs, rhs }`（`inst_kind/fma.rs`）→ `VecFmla`：语义
-  `acc = fmla(acc, lhs, rhs)`，acc 为读-写目的操作数。
-- `VectorSplat { src }`（`inst_kind/vector_splat.rs`）→ `VecDup`：标量 splat。
-- `VectorExtractElement { src, index }` / `VectorInsertElement { vector, element,
-  index }`（`inst_kind/vector_lane.rs`）→ `VecExtractLane/VecInsertLane`：`index`
-  为常量 i32 **Inst 操作数**（LLVM 风格）；NEON `mov v.s[lane]` lane 必须为
-  立即数 → builder 断言 index 为 `Integer` 常量且 < lanes。
-- `VectorReduce { op: Add, src }`（`inst_kind/vector_reduce.rs`）→ `VecAddv`
-  （`addv s,v.4s`，结果标量）。仅 `FourS`。
-
-**3. IR 层——注册与 pass 适配**
-
-- `ir/inst_kind.rs`：`InstUsage` 加五个 kind 臂；`is_const`/`is_terminator`/
-  `is_branch`/`is_load`/`is_store`/`is_call` 为 `matches!` 白名单，不受影响。
-- `ir/instruction.rs` `remap_refs`：五新 kind 各加一臂（操作数逐一 map）。
-- `ir/builder.rs` + `builder_trait` + `ir.rs` 导出：五个 builder 方法
-  （`fma`/`vector_splat`/`vector_extract_element`/`vector_insert_element`/
-  `vector_reduce`），含类型与 lane 校验。
-- `ir/types.rs` `type_to_llvm`：`TypeKind::Vector` → `<lanes x elem>`。
-- `fmt/writer.rs`：五新 kind 打印（`visit_local_inst` 现为 `_ => panic!` 兜底）。
-- `llvm/writer.rs` `visit_inst`：向量 `Binary/Cast/Select` 发射 + 五新 kind 发射
-  （或最小占位）。
-- `opt` 适配（编译期 exhaustive match 补臂）：`opt/utils.rs`
-  `visit_and_replace_single`、`opt/passes/dce.rs` `is_critical`（新 kind 视为
-  纯操作、不 critical）、`opt/passes/ipsccp.rs`（新 kind → `Lattice::Top`）、
-  `const_prop.rs`/`gvn.rs`/`ssa.rs`/`scalar_global_promotion.rs`/`cfg.rs`/
-  `icfg.rs`/`induction_variable.rs` 等编译器标记处。向量 Binary 操作数不会落入
-  `Lattice::Constant`，IPSCCP 常量折叠天然安全。
-- `taki_mir`：无需结构改动——`has_side_effect_when_lowering`（Load/Store 经
-  `is_load/is_store` 已判 side-effect）、`remat`（新 kind 不在 remat 白名单，走
-  正常 lowering）、sink 规则、`rc_for_type`（M39）均已兼容向量类型。
-
-**4. lowering（anon_armv8/src/lower.rs）**
-
-- `fn lower` 分派加五臂；`lower_binary`/`lower_cast`/`lower_select` 入口按操作数
-  类型分流——向量 → 新 `lower_vector_*`，标量路径不变。
-- 形状推导 helper `vector_shape(ty) -> VecShape`：`TypeKind::Vector(elem, lanes)`
-  中 lanes==4 → `FourS`、lanes==2 → `TwoD`，其余 panic。
-- 向量访存：`memory_type` 加 `TypeKind::Vector(..) => MemoryType::Vec128`；
-  `lower_load`/`lower_store` 向量类型走既有 `MInst::Load/Store` + AMode 全流程
-  （`UImm12Scaled` access_size 16 已就绪）→ **`ldr/str q` + 完整寻址**（决策：
-  非对齐由 PE=0 容忍，与 clobber 保存同一路径；`ld1/st1` 仅作显式 VCode 形态
-  保留）。`try_fold_gep_offset`/`try_fold_dynamic_gep_amode` 对 16B 宽类型自动生效。
-- `emit_zero_init`：加 `TypeKind::Vector` 臂——`VecMovImm { imm: 0 }` 到临时向量
-  寄存器 + `str q`。
-- 合法形约束（一律 `lowering_panic` 给出明确信息）：`Mul`+`TwoD`、非 `Eq/Gt`
-  向量比较、标量 `Min/Max`、其余向量 cast。
-
-**5. uika_riscv**
-
-- `fn lower` 加五臂 → `unreachable!("vector IR requires a vector-capable
-  backend")`。RISC-V 前端不产生向量 IR，纯防御。
-
-**6. 验证与验收**
-
-- `cargo build --workspace` + `cargo test --workspace` 全绿。
-- 单测：
-  - raana_ir：builder 类型/lane 校验、`InstUsage` 顺序、`remap_refs` 往返、
-    fmt 打印、`Min/Max` 与向量比较 op 语义。
-  - anon_armv8：端到端 `taki_mir::compile::<AArch64Backend>`——构造向量 IR 函数
-    （load→splat→add→fma→bsl→cvt→reduce→extract/insert→minmax→store，向量
-    参数/返回走 v0-v7 ABI），断言汇编含 `ldr q`/`dup`/`add v`/`fmla`/`bsl`/
-    `scvtf`/`addv`/`mov v.s[lane]`/`str q` 形态、RA + finalize 无 panic、
-    `verify_alloc_output` ok。
-- 确定性门禁：新向量用例 -O0/1/2 × 5 次重编译 byte-identical（AArch64）。
-- 功能验证：`make test <case> -- -O2` 跑一个向量功能用例 QEMU 差分；标量样例
-  RISC-V 回归一例。不跑 RISC-V perf、不批量跑全 corpus。
-
-**7. 提交划分**
-
-1. `[Feat(IR)]: Vector SIMD ops (fma/splat/extract/insert/reduce) + vector
-   types in Binary/Cast/Select/ZeroInit`——raana_ir 侧 + opt 适配 + 单测。
-2. `[Feat(AArch64)]: Vector IR lowering to NEON MInst (ISel 收口)`——lower.rs +
-   uika_riscv 防御臂 + 端到端测试。
-3. 文档收尾 + TODO 清理。
+LLVM 风格向量 IR（`Fma`/`VectorSplat`/`VectorExtractElement`/
+`VectorInsertElement`/`VectorReduce` + `Binary/Cast/Select` 向量类型 +
+`BinaryOp::Min/Max`）→ `lower.rs` 向量分派 → NEON `Vec*` MInst；向量访存走
+`ldr/str q` + 完整 AMode；`VecFmla/VecBsl/VecInsertLane` 显式读操作数 +
+自发射前导 copy。端到端测试 + `-O0/1/2` × 5 次 byte-identical 门禁 +
+双 target 标量回归通过。
 
 #### M41b（收尾）：向量 SchedClass + 功能用例 / QEMU 差分
 
@@ -417,8 +331,10 @@ v0、`DEFAULT_CLOBBERS` 含 NEON v0-v7/v16-v31、callee-saved v8-v15 按 16B 槽
   `VecMul`/`VecFmla`/`VecLoad`/`VecStore`/`VecMov`），latency/throughput 取 A53
   NEON 参考值（`fmla` 高吞吐、向量访存高延迟；与 FP 共用 FP_NEON pipe）；
   `sched/dag.rs` 把 `Vec*` MInst 从 `SchedClass::Other` 改指这些类。
-- 验证：`tests/` 向量功能用例进 functional；`scripts/perf_compare.sh` 记录向量
-  用例静态指令数基线；双 target 回归（RISC-V 仅回归，不做向量）。
+- 验证：`tests/` 向量功能用例进 functional——**依赖能产出向量 IR 的前端/测试
+  harness**（当前 frontend 无向量化，QEMU 向量差分推迟到 Phase 2 向量化入口或
+  独立 IR 级 harness 就绪后）；`scripts/perf_compare.sh` 记录向量用例静态指令数
+  基线；双 target 回归（RISC-V 仅回归，不做向量）。
 
 ### 5.4 Phase 2：IR 层自动向量化
 

@@ -297,22 +297,18 @@ impl ReductionUnroll {
             .new_local_value()
             .binary(BinaryOp::And, cand.bound, neg_four);
         let main_args = vec![acc_in, zero, zero, zero, zero, zero];
-        let guard_branch = data.new_local_value().branch(
-            guard,
-            main_header,
-            main_args,
-            cand.header,
-            orig_args,
-        );
+        let guard_branch =
+            data.new_local_value()
+                .branch(guard, main_header, main_args, cand.header, orig_args);
         data.layout_mut().insert_inst(version, guard);
         data.layout_mut().insert_inst(version, masked);
         data.layout_mut().insert_inst(version, guard_branch);
 
         // ---- main loop header: test jm < (T & ~3) ----
         let main_params = data.bb_data(main_header).params().to_vec();
-        let main_cond = data
-            .new_local_value()
-            .binary(BinaryOp::Lt, main_params[UNROLL_FACTOR + 1], masked);
+        let main_cond =
+            data.new_local_value()
+                .binary(BinaryOp::Lt, main_params[UNROLL_FACTOR + 1], masked);
         let body_params = data.bb_data(main_body).params().to_vec();
         let exit_params = data.bb_data(main_exit).params().to_vec();
         // Both targets receive the same loop-carried values as the header
@@ -338,9 +334,11 @@ impl ReductionUnroll {
         let mut next_accs = Vec::with_capacity(UNROLL_FACTOR);
         for lane in 0..UNROLL_FACTOR {
             let lane_const = data.new_local_value().integer(lane as i32);
-            let jmk = data
-                .new_local_value()
-                .binary(BinaryOp::Add, main_params[UNROLL_FACTOR + 1], lane_const);
+            let jmk = data.new_local_value().binary(
+                BinaryOp::Add,
+                main_params[UNROLL_FACTOR + 1],
+                lane_const,
+            );
             data.layout_mut().insert_inst(main_body, jmk);
             let mut mapper = LaneMapper {
                 data: &mut *data,
@@ -365,12 +363,17 @@ impl ReductionUnroll {
                 .expect("the accumulator update must be cloned into the main body");
             next_accs.push(cloned_update);
         }
-        let jm_next = data
-            .new_local_value()
-            .binary(BinaryOp::Add, main_params[UNROLL_FACTOR + 1], four);
+        let jm_next =
+            data.new_local_value()
+                .binary(BinaryOp::Add, main_params[UNROLL_FACTOR + 1], four);
         data.layout_mut().insert_inst(main_body, jm_next);
-        let mut back_args =
-            vec![body_params[0], next_accs[0], next_accs[1], next_accs[2], next_accs[3]];
+        let mut back_args = vec![
+            body_params[0],
+            next_accs[0],
+            next_accs[1],
+            next_accs[2],
+            next_accs[3],
+        ];
         back_args.push(jm_next);
         let back = data.new_local_value().jump(main_header, back_args);
         data.layout_mut().insert_inst(main_body, back);
@@ -384,7 +387,9 @@ impl ReductionUnroll {
             .new_local_value()
             .binary(BinaryOp::Add, exit_params[3], exit_params[4]);
         let total = data.new_local_value().binary(BinaryOp::Add, s01, s23);
-        let acc_final = data.new_local_value().binary(BinaryOp::Add, exit_params[0], total);
+        let acc_final = data
+            .new_local_value()
+            .binary(BinaryOp::Add, exit_params[0], total);
         // The original header's parameter order is `[j, acc]` or `[acc, j]`
         // depending on which parameter is the accumulator; reorder accordingly.
         let mut tail_args = vec![exit_params[UNROLL_FACTOR + 1], acc_final];
@@ -439,9 +444,8 @@ fn dominates_loop_entry(
     looop: &Loop,
     value: Inst,
 ) -> bool {
-    let strictly_dominates = |block: BasicBlock| {
-        block != looop.header() && dom_tree.dominates(block, looop.header())
-    };
+    let strictly_dominates =
+        |block: BasicBlock| block != looop.header() && dom_tree.dominates(block, looop.header());
     if value.is_global() {
         return true;
     }
@@ -468,11 +472,7 @@ fn is_integer_zero(data: &ArenaContextMut<'_>, inst: Inst) -> bool {
 }
 
 /// Match `acc ± E` or `select(c, acc ± E, acc)`. `E` must not be `acc`.
-fn match_acc_update(
-    data: &ArenaContextMut<'_>,
-    acc: Inst,
-    update: Inst,
-) -> Option<AccPattern> {
+fn match_acc_update(data: &ArenaContextMut<'_>, acc: Inst, update: Inst) -> Option<AccPattern> {
     let is_delta = |binary: &Binary, acc: Inst| -> bool {
         match (binary.op(), binary.lhs(), binary.rhs()) {
             (BinaryOp::Add, lhs, rhs) if lhs == acc => rhs != acc,
@@ -482,12 +482,10 @@ fn match_acc_update(
         }
     };
     match data.inst_data(update).kind() {
-        InstKind::Binary(binary) if is_delta(binary, acc) => {
-            Some(AccPattern {
-                add: update,
-                select: None,
-            })
-        }
+        InstKind::Binary(binary) if is_delta(binary, acc) => Some(AccPattern {
+            add: update,
+            select: None,
+        }),
         InstKind::Select(select) if select.if_false() == acc => {
             let InstKind::Binary(add) = data.inst_data(select.if_true()).kind() else {
                 return None;
@@ -589,10 +587,10 @@ mod tests {
         let function = program.new_function(
             Type::get_i32(),
             "reduction".into(),
-            vec![Type::get_i32(), Type::get_pointer(Type::get_array(
+            vec![
                 Type::get_i32(),
-                16,
-            ))],
+                Type::get_pointer(Type::get_array(Type::get_i32(), 16)),
+            ],
         );
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
@@ -615,9 +613,15 @@ mod tests {
         data.layout_mut().insert_inst(entry, entry_jump);
 
         let (acc, j) = if acc_first {
-            (data.bb_data(header).params()[0], data.bb_data(header).params()[1])
+            (
+                data.bb_data(header).params()[0],
+                data.bb_data(header).params()[1],
+            )
         } else {
-            (data.bb_data(header).params()[1], data.bb_data(header).params()[0])
+            (
+                data.bb_data(header).params()[1],
+                data.bb_data(header).params()[0],
+            )
         };
         let one = data.new_local_inst().integer(1);
 
@@ -626,8 +630,7 @@ mod tests {
         let add = data.new_local_inst().binary(BinaryOp::Add, acc, load);
         let update = if select_form {
             let condition = data.new_local_inst().binary(BinaryOp::Gt, load, zero);
-            data.new_local_inst()
-                .select(condition, add, acc)
+            data.new_local_inst().select(condition, add, acc)
         } else {
             add
         };
@@ -686,7 +689,9 @@ mod tests {
             .layout()
             .basicblocks()
             .iter()
-            .find(|layout| layout.bb() != blocks[0] && data.bb_data(layout.bb()).params().len() == 2)
+            .find(|layout| {
+                layout.bb() != blocks[0] && data.bb_data(layout.bb()).params().len() == 2
+            })
             .map(|layout| layout.bb())
             .expect("original two-param header must remain");
         let main_header = blocks
@@ -718,18 +723,21 @@ mod tests {
         let mut latch_ok = false;
         for layout in data.layout().basicblocks() {
             let insts = layout.insts();
-            let InstKind::Jump(jump) = data
-                .inst_data(*insts.iter().last().unwrap())
-                .kind()
-            else {
+            let InstKind::Jump(jump) = data.inst_data(*insts.iter().last().unwrap()).kind() else {
                 continue;
             };
             if jump.target() == header {
                 latch_ok = true;
             }
         }
-        assert!(latch_ok, "scalar epilogue latch must still target the header");
-        assert!(!run(&mut program, function), "second run must be idempotent");
+        assert!(
+            latch_ok,
+            "scalar epilogue latch must still target the header"
+        );
+        assert!(
+            !run(&mut program, function),
+            "second run must be idempotent"
+        );
     }
 
     #[test]

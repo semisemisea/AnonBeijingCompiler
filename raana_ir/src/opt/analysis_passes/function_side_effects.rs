@@ -106,6 +106,35 @@ impl FunctionSideEffects {
     pub fn may_write_array_param(&self, index: usize) -> bool {
         self.writes_unknown_memory || self.written_array_params.contains(&index)
     }
+
+    /// Does this function read any external memory at all (a global, an array
+    /// parameter, or an unresolved address)?
+    pub fn has_any_read(&self) -> bool {
+        self.reads_unknown_memory
+            || !self.read_globals.is_empty()
+            || !self.read_array_params.is_empty()
+    }
+
+    /// May the memory written by `self` (the writer) alias something `reader`
+    /// reads? Used to decide whether a read-only callee's loads stay stable
+    /// across a region containing `self` as a write (store/call).
+    pub fn may_conflict_with_reads_of(&self, reader: &FunctionSideEffects) -> bool {
+        if self.writes_unknown_memory && reader.has_any_read() {
+            return true;
+        }
+        if reader.reads_unknown_memory
+            && (!self.written_globals.is_empty() || !self.written_array_params.is_empty())
+        {
+            return true;
+        }
+        self.written_globals
+            .iter()
+            .any(|g| reader.read_globals.contains(g))
+            || self
+                .written_array_params
+                .iter()
+                .any(|i| reader.read_array_params.contains(i))
+    }
 }
 
 /// Hardcoded side effects of the SysY runtime library functions. These are
@@ -134,7 +163,7 @@ fn library_effects(name: &str) -> Option<FunctionSideEffects> {
 
 /// Where a pointer value ultimately points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MemoryBase {
+pub(crate) enum MemoryBase {
     /// A global allocation (`InstKind::GlobalAlloc`).
     Global(Inst),
     /// The `index`-th formal parameter (an array degraded to a pointer).
@@ -148,7 +177,7 @@ enum MemoryBase {
 /// Resolve a pointer value to its memory base by following the GEP base
 /// chain. SysY has no pointer casts or pointer loads, so the chain is a
 /// single GEP hop at most in practice, but the loop keeps it robust.
-fn resolve_base(data: &FunctionData, global: &GlobalArena, inst: Inst) -> MemoryBase {
+pub(crate) fn resolve_base(data: &FunctionData, global: &GlobalArena, inst: Inst) -> MemoryBase {
     let mut cursor = inst;
     loop {
         if cursor.is_global() {
@@ -171,7 +200,7 @@ fn resolve_base(data: &FunctionData, global: &GlobalArena, inst: Inst) -> Memory
 }
 
 /// Record one resolved memory access into `effects`.
-fn record_access(effects: &mut FunctionSideEffects, base: MemoryBase, is_write: bool) {
+pub(crate) fn record_access(effects: &mut FunctionSideEffects, base: MemoryBase, is_write: bool) {
     let (globals, params, unknown) = if is_write {
         (
             &mut effects.written_globals,

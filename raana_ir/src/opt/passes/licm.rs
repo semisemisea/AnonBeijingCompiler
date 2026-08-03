@@ -4,6 +4,7 @@ use crate::opt::{
     analysis_passes::{
         dom_tree::v2::DominanceTree,
         effects::EffectAnalysis,
+        function_side_effects::{FunctionSideEffects, MemoryBase, analyze, resolve_base},
         loop_analysis::Loop,
     },
     prelude::*,
@@ -55,6 +56,7 @@ impl LICM {
         cfg: &CFG,
         dom_tree: &DominanceTree,
         parameter_blocks: &FxHashMap<Inst, BasicBlock>,
+        effects: &FxHashMap<Function, FunctionSideEffects>,
     ) -> LoopResult {
         fn insts(looop: &Loop, data: &ArenaContextMut<'_>) -> impl Iterator<Item = Inst> {
             looop
@@ -64,7 +66,11 @@ impl LICM {
                 .copied()
         }
 
-        fn can_be_invariant(kind: &InstKind) -> bool {
+        fn can_be_invariant(
+            kind: &InstKind,
+            inst: Inst,
+            hoistable_calls: &FxHashSet<Inst>,
+        ) -> bool {
             matches!(
                 kind,
                 InstKind::Integer(..)
@@ -74,7 +80,17 @@ impl LICM {
                     | InstKind::GetElemPtr(..)
                     | InstKind::Select(..)
                     | InstKind::Load(..)
-            )
+            ) || (matches!(kind, InstKind::Call(..)) && hoistable_calls.contains(&inst))
+        }
+
+        /// May a write through `base` hit something `reader` reads?
+        fn write_may_hit(base: MemoryBase, reader: &FunctionSideEffects) -> bool {
+            match base {
+                MemoryBase::Global(g) => reader.may_read_global(g),
+                MemoryBase::Param(i) => reader.may_read_array_param(i),
+                MemoryBase::Local => false,
+                MemoryBase::Unknown => reader.has_any_read(),
+            }
         }
 
         fn is_integer_zero(data: &ArenaContextMut<'_>, inst: Inst) -> bool {
@@ -92,6 +108,43 @@ impl LICM {
             .copied()
             .map(|inst| (inst, Lattice::Variant))
             .collect::<FxHashMap<_, _>>();
+
+        // Calls that may be hoisted: the callee must be read-only (no I/O, no
+        // timer, no external write), and nothing in the loop may write
+        // anything the callee reads (stores, memzeroes, or other calls).
+        let hoistable_calls =
+            loop_insts
+                .iter()
+                .copied()
+                .filter(|&inst| {
+                    let InstKind::Call(call) = data.inst_data(inst).kind() else {
+                        return false;
+                    };
+                    let Some(callee_effects) = effects.get(&call.callee()) else {
+                        return false;
+                    };
+                    if !callee_effects.is_read_only() {
+                        return false;
+                    }
+                    let conflicts = loop_insts.iter().copied().any(|other| {
+                        match data.inst_data(other).kind() {
+                            InstKind::Store(store) => {
+                                let base = resolve_base(data, data.global(), store.dest());
+                                write_may_hit(base, callee_effects)
+                            }
+                            InstKind::MemZero(mem_zero) => {
+                                let base = resolve_base(data, data.global(), mem_zero.dest());
+                                write_may_hit(base, callee_effects)
+                            }
+                            InstKind::Call(other_call) => effects
+                                .get(&other_call.callee())
+                                .is_some_and(|e| e.may_conflict_with_reads_of(callee_effects)),
+                            _ => false,
+                        }
+                    });
+                    !conflicts
+                })
+                .collect::<FxHashSet<_>>();
 
         let operand_is_invariant = |operand: Inst, states: &FxHashMap<Inst, Lattice>| {
             if operand.is_global() || data.inst_data(operand).kind().is_const() {
@@ -134,7 +187,7 @@ impl LICM {
         let mut worklist = VecDeque::from_iter(loop_insts.iter().copied());
         while let Some(inst) = worklist.pop_front() {
             let inst_data = data.inst_data(inst);
-            let status = if can_be_invariant(inst_data.kind())
+            let status = if can_be_invariant(inst_data.kind(), inst, &hoistable_calls)
                 && inst_data
                     .inst_usage()
                     .all(|operand| operand_is_invariant(operand, &map))
@@ -315,6 +368,9 @@ impl Pass for LICM {
         if data.layout().is_decl() {
             return false;
         }
+        // Function-level side effects do not change while this pass runs
+        // (LICM only relocates instructions), so analyze once per invocation.
+        let effects = analyze(data.program);
         let mut changed = false;
         loop {
             let Some(cfg) = CFG::new(data) else {
@@ -347,6 +403,7 @@ impl Pass for LICM {
                     &cfg,
                     &dom_tree,
                     &parameter_blocks,
+                    &effects,
                 ) {
                     LoopResult::Unchanged => {}
                     LoopResult::Changed => changed = true,
@@ -1026,6 +1083,316 @@ mod tests {
         let data = program.func_data(function);
         assert_eq!(
             data.layout().parent_bb(load.unwrap()),
+            Some(data.layout().entry_bb().unwrap().bb())
+        );
+    }
+
+    /// A leaf callee whose body is a bare `ret` of its first parameter (or
+    /// `ret void` when `ret_ty` is unit): strictly pure.
+    fn make_pure_callee(
+        program: &mut Program,
+        name: &str,
+        params_ty: Vec<Type>,
+        ret_ty: Type,
+    ) -> Function {
+        let func = program.new_function(ret_ty.clone(), name.into(), params_ty);
+        let data = program.func_data_mut(func);
+        let entry = data.add_entry_block();
+        let value = if ret_ty.is_unit() {
+            None
+        } else {
+            Some(data.params()[0])
+        };
+        let r = data.new_local_inst().ret(value);
+        data.layout_mut().insert_inst(entry, r);
+        func
+    }
+
+    /// A leaf callee that reads global element `gv[0]` and returns it.
+    fn make_global_reader(program: &mut Program, name: &str, gv: Inst) -> Function {
+        let func = program.new_function(Type::get_i32(), name.into(), vec![]);
+        let data = program.func_data_mut(func);
+        data.add_entry_block();
+        drop(data);
+        let mut ctx = ArenaContextMut {
+            program,
+            curr_func: Some(func),
+        };
+        let entry = ctx.layout().entry_bb().unwrap().bb();
+        let zero = ctx.new_local_value().integer(0);
+        let gep = ctx.new_local_value().get_elem_ptr(gv, vec![zero]);
+        let load = ctx.new_local_value().load(gep);
+        let r = ctx.new_local_value().ret(Some(load));
+        ctx.layout_mut().insert_inst(entry, zero);
+        ctx.layout_mut().insert_inst(entry, gep);
+        ctx.layout_mut().insert_inst(entry, load);
+        ctx.layout_mut().insert_inst(entry, r);
+        func
+    }
+
+    #[test]
+    fn hoists_invariant_pure_call() {
+        let mut program = Program::new();
+        let callee = make_pure_callee(
+            &mut program,
+            "pure_fn",
+            vec![Type::get_i32()],
+            Type::get_i32(),
+        );
+        let function =
+            program.new_function(Type::get_unit(), "licm_call".into(), vec![Type::get_i32()]);
+        program.func_data_mut(function).add_entry_block();
+        let call;
+        {
+            let mut ctx = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let external = ctx.curr_func_data().params()[0];
+            let entry = ctx.layout().entry_bb().unwrap().bb();
+            let header = ctx.new_basic_block().basic_block("header".into(), vec![]);
+            let body = ctx.new_basic_block().basic_block("body".into(), vec![]);
+            let exit = ctx.new_basic_block().basic_block("exit".into(), vec![]);
+            for block in [header, body, exit] {
+                ctx.layout_mut().push_bb_back(block);
+            }
+            let entry_jump = ctx.new_local_value().jump(header, vec![]);
+            ctx.layout_mut().insert_inst(entry, entry_jump);
+            call = ctx
+                .new_local_value()
+                .call_with_type(callee, vec![external], Type::get_i32());
+            ctx.layout_mut().insert_inst(header, call);
+            let condition = ctx.new_local_value().integer(1);
+            let branch = ctx
+                .new_local_value()
+                .branch(condition, body, vec![], exit, vec![]);
+            ctx.layout_mut().insert_inst(header, branch);
+            let backedge = ctx.new_local_value().jump(header, vec![]);
+            ctx.layout_mut().insert_inst(body, backedge);
+            let ret = ctx.new_local_value().ret(None);
+            ctx.layout_mut().insert_inst(exit, ret);
+        }
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(
+            data.layout().parent_bb(call),
+            Some(data.layout().entry_bb().unwrap().bb())
+        );
+    }
+
+    #[test]
+    fn does_not_hoist_io_call() {
+        let mut program = Program::new();
+        let getint = program.new_function(Type::get_i32(), "getint".into(), vec![]);
+        let function = program.new_function(Type::get_unit(), "licm_io".into(), vec![]);
+        program.func_data_mut(function).add_entry_block();
+        let call;
+        let header;
+        {
+            let mut ctx = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = ctx.layout().entry_bb().unwrap().bb();
+            header = ctx.new_basic_block().basic_block("header".into(), vec![]);
+            let body = ctx.new_basic_block().basic_block("body".into(), vec![]);
+            let exit = ctx.new_basic_block().basic_block("exit".into(), vec![]);
+            for block in [header, body, exit] {
+                ctx.layout_mut().push_bb_back(block);
+            }
+            let entry_jump = ctx.new_local_value().jump(header, vec![]);
+            ctx.layout_mut().insert_inst(entry, entry_jump);
+            call = ctx
+                .new_local_value()
+                .call_with_type(getint, vec![], Type::get_i32());
+            ctx.layout_mut().insert_inst(header, call);
+            let condition = ctx.new_local_value().integer(1);
+            let branch = ctx
+                .new_local_value()
+                .branch(condition, body, vec![], exit, vec![]);
+            ctx.layout_mut().insert_inst(header, branch);
+            let backedge = ctx.new_local_value().jump(header, vec![]);
+            ctx.layout_mut().insert_inst(body, backedge);
+            let ret = ctx.new_local_value().ret(None);
+            ctx.layout_mut().insert_inst(exit, ret);
+        }
+
+        assert!(!run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(
+            data.layout().parent_bb(call),
+            Some(data.layout().basicblock(header).bb())
+        );
+    }
+
+    #[test]
+    fn does_not_hoist_call_writing_an_array_parameter() {
+        let mut program = Program::new();
+        let writer = program.new_function(
+            Type::get_unit(),
+            "writes_param".into(),
+            vec![Type::get_pointer(Type::get_i32())],
+        );
+        {
+            let data = program.func_data_mut(writer);
+            let entry = data.add_entry_block();
+            let arr = data.params()[0];
+            let zero = data.new_local_inst().integer(0);
+            let gep = data.new_local_inst().get_elem_ptr(arr, vec![zero]);
+            let one = data.new_local_inst().integer(1);
+            let store = data.new_local_inst().store(one, gep);
+            for inst in [zero, gep, store] {
+                data.layout_mut().insert_inst(entry, inst);
+            }
+            let r = data.new_local_inst().ret(None);
+            data.layout_mut().insert_inst(entry, r);
+        }
+        let function = program.new_function(
+            Type::get_unit(),
+            "licm_writer".into(),
+            vec![Type::get_pointer(Type::get_i32())],
+        );
+        program.func_data_mut(function).add_entry_block();
+        let call;
+        let header;
+        {
+            let mut ctx = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let arr = ctx.curr_func_data().params()[0];
+            let entry = ctx.layout().entry_bb().unwrap().bb();
+            header = ctx.new_basic_block().basic_block("header".into(), vec![]);
+            let body = ctx.new_basic_block().basic_block("body".into(), vec![]);
+            let exit = ctx.new_basic_block().basic_block("exit".into(), vec![]);
+            for block in [header, body, exit] {
+                ctx.layout_mut().push_bb_back(block);
+            }
+            let entry_jump = ctx.new_local_value().jump(header, vec![]);
+            ctx.layout_mut().insert_inst(entry, entry_jump);
+            call = ctx
+                .new_local_value()
+                .call_with_type(writer, vec![arr], Type::get_unit());
+            ctx.layout_mut().insert_inst(header, call);
+            let condition = ctx.new_local_value().integer(1);
+            let branch = ctx
+                .new_local_value()
+                .branch(condition, body, vec![], exit, vec![]);
+            ctx.layout_mut().insert_inst(header, branch);
+            let backedge = ctx.new_local_value().jump(header, vec![]);
+            ctx.layout_mut().insert_inst(body, backedge);
+            let ret = ctx.new_local_value().ret(None);
+            ctx.layout_mut().insert_inst(exit, ret);
+        }
+
+        assert!(!run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(data.layout().parent_bb(call), Some(header));
+    }
+
+    #[test]
+    fn store_to_global_read_by_callee_blocks_hoist() {
+        let mut program = Program::new();
+        let zero_init = program.new_value().integer(0);
+        let gv = program.new_value().global_alloc(zero_init);
+        let reader = make_global_reader(&mut program, "reads_global", gv);
+        let function = program.new_function(Type::get_unit(), "licm_conflict".into(), vec![]);
+        program.func_data_mut(function).add_entry_block();
+        let call;
+        let header;
+        {
+            let mut ctx = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = ctx.layout().entry_bb().unwrap().bb();
+            header = ctx.new_basic_block().basic_block("header".into(), vec![]);
+            let body = ctx.new_basic_block().basic_block("body".into(), vec![]);
+            let exit = ctx.new_basic_block().basic_block("exit".into(), vec![]);
+            for block in [header, body, exit] {
+                ctx.layout_mut().push_bb_back(block);
+            }
+            let entry_jump = ctx.new_local_value().jump(header, vec![]);
+            ctx.layout_mut().insert_inst(entry, entry_jump);
+            call = ctx
+                .new_local_value()
+                .call_with_type(reader, vec![], Type::get_i32());
+            ctx.layout_mut().insert_inst(header, call);
+            let zero = ctx.new_local_value().integer(0);
+            let gep = ctx.new_local_value().get_elem_ptr(gv, vec![zero]);
+            let one = ctx.new_local_value().integer(1);
+            let store = ctx.new_local_value().store(one, gep);
+            for inst in [gep, store] {
+                ctx.layout_mut().insert_inst(body, inst);
+            }
+            let condition = ctx.new_local_value().integer(1);
+            let branch = ctx
+                .new_local_value()
+                .branch(condition, body, vec![], exit, vec![]);
+            ctx.layout_mut().insert_inst(header, branch);
+            let backedge = ctx.new_local_value().jump(header, vec![]);
+            ctx.layout_mut().insert_inst(body, backedge);
+            let ret = ctx.new_local_value().ret(None);
+            ctx.layout_mut().insert_inst(exit, ret);
+        }
+
+        // The address GEP itself is loop-invariant and may be hoisted; the
+        // key guarantee is that the call stays in the loop because a store to
+        // a global the callee reads makes the hoist unsafe.
+        run(&mut program, function);
+        let data = program.func_data(function);
+        assert_eq!(data.layout().parent_bb(call), Some(header));
+    }
+
+    #[test]
+    fn hoists_call_when_loop_writes_are_local() {
+        let mut program = Program::new();
+        let zero_init = program.new_value().integer(0);
+        let gv = program.new_value().global_alloc(zero_init);
+        let reader = make_global_reader(&mut program, "reads_global", gv);
+        let function = program.new_function(Type::get_unit(), "licm_local_write".into(), vec![]);
+        program.func_data_mut(function).add_entry_block();
+        let call;
+        {
+            let mut ctx = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = ctx.layout().entry_bb().unwrap().bb();
+            let header = ctx.new_basic_block().basic_block("header".into(), vec![]);
+            let body = ctx.new_basic_block().basic_block("body".into(), vec![]);
+            let exit = ctx.new_basic_block().basic_block("exit".into(), vec![]);
+            for block in [header, body, exit] {
+                ctx.layout_mut().push_bb_back(block);
+            }
+            let entry_jump = ctx.new_local_value().jump(header, vec![]);
+            ctx.layout_mut().insert_inst(entry, entry_jump);
+            call = ctx
+                .new_local_value()
+                .call_with_type(reader, vec![], Type::get_i32());
+            ctx.layout_mut().insert_inst(header, call);
+            let slot = ctx.new_local_value().alloc(Type::get_i32());
+            let one = ctx.new_local_value().integer(1);
+            let store = ctx.new_local_value().store(one, slot);
+            for inst in [slot, store] {
+                ctx.layout_mut().insert_inst(body, inst);
+            }
+            let condition = ctx.new_local_value().integer(1);
+            let branch = ctx
+                .new_local_value()
+                .branch(condition, body, vec![], exit, vec![]);
+            ctx.layout_mut().insert_inst(header, branch);
+            let backedge = ctx.new_local_value().jump(header, vec![]);
+            ctx.layout_mut().insert_inst(body, backedge);
+            let ret = ctx.new_local_value().ret(None);
+            ctx.layout_mut().insert_inst(exit, ret);
+        }
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(
+            data.layout().parent_bb(call),
             Some(data.layout().entry_bb().unwrap().bb())
         );
     }

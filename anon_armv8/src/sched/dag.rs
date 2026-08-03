@@ -1005,10 +1005,8 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
         },
 
         MInst::VecArithRRR { dst, lhs, rhs, .. }
-        | MInst::VecFmla { dst, lhs, rhs, .. }
         | MInst::VecBitwise { dst, lhs, rhs, .. }
         | MInst::VecCmp { dst, lhs, rhs, .. }
-        | MInst::VecBsl { dst, lhs, rhs }
         | MInst::VecMinMax { dst, lhs, rhs, .. } => InstDeps {
             defs: preg(dst.reg),
             uses: [preg(*lhs), preg(*rhs)].into_iter().flatten().collect(),
@@ -1018,6 +1016,21 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             mem: None,
             is_barrier: false,
         },
+
+        MInst::VecFmla { dst, acc, lhs, rhs, .. } | MInst::VecBsl { dst, mask: acc, lhs, rhs } => {
+            InstDeps {
+                defs: preg(dst.reg),
+                uses: [preg(*acc), preg(*lhs), preg(*rhs)]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+                flags_def: false,
+                flags_use: false,
+                class: SchedClass::Other,
+                mem: None,
+                is_barrier: false,
+            }
+        }
 
         MInst::VecMovImm { dst, .. } => InstDeps {
             defs: preg(dst.reg),
@@ -1029,9 +1042,19 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             is_barrier: false,
         },
 
-        MInst::VecExtractLane { dst, src, .. } | MInst::VecInsertLane { dst, src, .. } => InstDeps {
+        MInst::VecExtractLane { dst, src, .. } => InstDeps {
             defs: preg(dst.reg),
             uses: preg(*src),
+            flags_def: false,
+            flags_use: false,
+            class: SchedClass::Other,
+            mem: None,
+            is_barrier: false,
+        },
+
+        MInst::VecInsertLane { dst, vector, src, .. } => InstDeps {
+            defs: preg(dst.reg),
+            uses: [preg(*vector), preg(*src)].into_iter().flatten().collect(),
             flags_def: false,
             flags_use: false,
             class: SchedClass::Other,

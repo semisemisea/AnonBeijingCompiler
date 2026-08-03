@@ -44,6 +44,9 @@ fn eval_i32_binary(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
         BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
         BinaryOp::Shr => (lhs as u32).wrapping_shr(rhs as u32) as i32,
         BinaryOp::Sar => lhs.wrapping_shr(rhs as u32),
+        BinaryOp::Min | BinaryOp::Max => {
+            unreachable!("min/max is vector-only and never produced by the frontend")
+        }
     }
 }
 
@@ -66,6 +69,9 @@ fn eval_f32_binary(op: BinaryOp, lhs: f32, rhs: f32) -> items::Number {
         | BinaryOp::Shl
         | BinaryOp::Shr
         | BinaryOp::Sar => panic!("Integer-only binary operator used with float operand"),
+        BinaryOp::Min | BinaryOp::Max => {
+            unreachable!("min/max is vector-only and never produced by the frontend")
+        }
     }
 }
 

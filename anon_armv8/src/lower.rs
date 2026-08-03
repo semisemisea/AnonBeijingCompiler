@@ -1,8 +1,9 @@
 //! AArch64 selection from Raana HIR into generic VCode.
 
 use raana_ir::ir::{
-    Binary, BinaryOp, Call, Cast, GetElemPtr, InstKind, Load, Return, Select, Store, TailCall,
-    Type as HirType, TypeKind, arena::Arena, inst_kind::MemZero,
+    Binary, BinaryOp, Call, Cast, Fma, GetElemPtr, InstKind, Load, Return, Select, Store,
+    TailCall, Type as HirType, TypeKind, VectorExtractElement, VectorInsertElement, VectorReduce,
+    VectorReduceOp, VectorSplat, arena::Arena, inst_kind::MemZero,
 };
 use taki_mir::{
     abi::{ABIMachineSpec, ArgSlot, CallArgPair, CallRetPair, RetPair, StackAMode},
@@ -22,7 +23,8 @@ use crate::{
     abi::AArch64Abi,
     instructions::{
         AMode, AluOp, CCmpStep, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift, MInst,
-        MemoryType, SelectCmp, SelectValue, ShiftOp,
+        MemoryType, SelectCmp, SelectValue, ShiftOp, VecArithOp, VecBitOp, VecCmpOp, VecCvtOp,
+        VecMinMaxOp, VecShape,
     },
     labels::Label,
     regs::{self, OperandSize, RegOrZr},
@@ -40,6 +42,12 @@ fn lower_binary(
 ) -> LoweredOutput {
     let result = ctx.result_reg(inst);
     let dst = Writable::from_reg(result);
+    if matches!(
+        arena.inst_data(binary.lhs()).ty().kind(),
+        TypeKind::Vector(..)
+    ) {
+        return lower_vector_binary(ctx, arena, inst, binary);
+    }
     if matches!(arena.inst_data(binary.lhs()).ty().kind(), TypeKind::Float32) {
         let lhs = ctx.put_value_in_reg(binary.lhs());
         let rhs = ctx.put_value_in_reg(binary.rhs());
@@ -315,8 +323,144 @@ fn lower_binary(
                 dst,
             });
         }
+        BinaryOp::Min | BinaryOp::Max => {
+            ctx.lowering_panic(
+                "AArch64 instruction selection",
+                format!(
+                    "scalar {:?} is unsupported; min/max is vector-only",
+                    binary.op()
+                ),
+                Some(arena.inst_data(binary.lhs()).ty()),
+                Some(arena.inst_data(inst).ty()),
+            );
+        }
     }
     LoweredOutput::Value(result)
+}
+
+/// Select a vector binary operation onto the NEON instruction set.
+///
+/// Shape is derived from the vector type (`<4 x i32>`/`<4 x f32>` → `.4s`,
+/// `<2 x i64>` → `.2d`). Operations without a NEON form panic with a clear
+/// message instead of silently mis-selecting.
+fn lower_vector_binary(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    binary: &Binary,
+) -> LoweredOutput {
+    let result = ctx.result_reg(inst);
+    let dst = Writable::from_reg(result);
+    let ty = arena.inst_data(binary.lhs()).ty().kind();
+    let shape = vector_shape(ty);
+    let is_float = matches!(ty, TypeKind::Vector(elem, _) if elem.is_f32());
+    let lhs = ctx.put_value_in_reg(binary.lhs());
+    let rhs = ctx.put_value_in_reg(binary.rhs());
+    match binary.op() {
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+            if binary.op() == BinaryOp::Mul && shape == VecShape::TwoD {
+                ctx.lowering_panic(
+                    "AArch64 instruction selection",
+                    "vector multiply has no .2d form; use a <4 x i32> vector",
+                    Some(arena.inst_data(binary.lhs()).ty()),
+                    Some(arena.inst_data(inst).ty()),
+                );
+            }
+            ctx.emit(MInst::VecArithRRR {
+                op: match binary.op() {
+                    BinaryOp::Add => VecArithOp::Add,
+                    BinaryOp::Sub => VecArithOp::Sub,
+                    _ => VecArithOp::Mul,
+                },
+                shape,
+                dst,
+                lhs,
+                rhs,
+            });
+        }
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
+            ctx.emit(MInst::VecBitwise {
+                op: match binary.op() {
+                    BinaryOp::And => VecBitOp::And,
+                    BinaryOp::Or => VecBitOp::Orr,
+                    _ => VecBitOp::Eor,
+                },
+                dst,
+                lhs,
+                rhs,
+            });
+        }
+        BinaryOp::Eq | BinaryOp::Gt => {
+            if is_float {
+                ctx.lowering_panic(
+                    "AArch64 instruction selection",
+                    "floating vector comparisons (fcmgt) are not in the NEON MInst set",
+                    Some(arena.inst_data(binary.lhs()).ty()),
+                    Some(arena.inst_data(inst).ty()),
+                );
+            }
+            ctx.emit(MInst::VecCmp {
+                op: match binary.op() {
+                    BinaryOp::Eq => VecCmpOp::Eq,
+                    _ => VecCmpOp::Gt,
+                },
+                shape,
+                dst,
+                lhs,
+                rhs,
+            });
+        }
+        BinaryOp::Min | BinaryOp::Max => {
+            if shape == VecShape::TwoD {
+                ctx.lowering_panic(
+                    "AArch64 instruction selection",
+                    "vector min/max has no .2d form",
+                    Some(arena.inst_data(binary.lhs()).ty()),
+                    Some(arena.inst_data(inst).ty()),
+                );
+            }
+            let op = match (is_float, binary.op()) {
+                (false, BinaryOp::Min) => VecMinMaxOp::Smin,
+                (false, BinaryOp::Max) => VecMinMaxOp::Smax,
+                (true, BinaryOp::Min) => VecMinMaxOp::Fmin,
+                (true, BinaryOp::Max) => VecMinMaxOp::Fmax,
+                _ => unreachable!("min/max op checked above"),
+            };
+            ctx.emit(MInst::VecMinMax {
+                op,
+                shape,
+                dst,
+                lhs,
+                rhs,
+            });
+        }
+        op => {
+            ctx.lowering_panic(
+                "AArch64 instruction selection",
+                format!("vector binary operation {op:?} is unsupported"),
+                Some(arena.inst_data(binary.lhs()).ty()),
+                Some(arena.inst_data(inst).ty()),
+            );
+        }
+    }
+    LoweredOutput::Value(result)
+}
+
+/// Map a HIR vector type onto a NEON arrangement. Only the machine-supported
+/// 128-bit shapes reach lowering (`<4 x i32>`, `<4 x f32>` → `.4s`;
+/// `<2 x i64>` → `.2d`); everything else is a frontend bug.
+fn vector_shape(ty: &TypeKind) -> VecShape {
+    let (elem, lanes) = match ty {
+        TypeKind::Vector(elem, lanes) => (elem, *lanes),
+        _ => unreachable!("vector_shape requires a vector type, got {ty:?}"),
+    };
+    match (lanes, elem.size()) {
+        (4, 4) => VecShape::FourS,
+        (2, 8) => VecShape::TwoD,
+        _ => panic!(
+            "unsupported AArch64 vector shape: <{lanes} x {elem}> (only 128-bit .4s/.2d)"
+        ),
+    }
 }
 
 fn lower_cast(
@@ -330,6 +474,47 @@ fn lower_cast(
     let dst_ty = arena.inst_data(inst).ty().kind();
     let result = ctx.result_reg(inst);
     let dst = Writable::from_reg(result);
+    if matches!(src_ty, TypeKind::Vector(..)) || matches!(dst_ty, TypeKind::Vector(..)) {
+        let shape = vector_shape(src_ty);
+        if vector_shape(dst_ty) != shape {
+            ctx.lowering_panic(
+                "AArch64 instruction selection",
+                format!("vector cast changes the arrangement: {src_ty:?} -> {dst_ty:?}"),
+                Some(arena.inst_data(src).ty()),
+                Some(arena.inst_data(inst).ty()),
+            );
+        }
+        let src_reg = ctx.put_value_in_reg(src);
+        let (from_int, from_float) = match (src_ty, dst_ty) {
+            (TypeKind::Vector(from, _), TypeKind::Vector(to, _)) => {
+                (from.is_i32() && to.is_f32(), from.is_f32() && to.is_i32())
+            }
+            _ => (false, false),
+        };
+        if from_int {
+            ctx.emit(MInst::VecCvt {
+                op: VecCvtOp::Scvtf,
+                shape,
+                dst,
+                src: src_reg,
+            });
+        } else if from_float {
+            ctx.emit(MInst::VecCvt {
+                op: VecCvtOp::Fcvtzs,
+                shape,
+                dst,
+                src: src_reg,
+            });
+        } else {
+            ctx.lowering_panic(
+                "AArch64 instruction selection",
+                format!("unsupported vector cast: {src_ty:?} -> {dst_ty:?}"),
+                Some(arena.inst_data(src).ty()),
+                Some(arena.inst_data(inst).ty()),
+            );
+        }
+        return LoweredOutput::Value(result);
+    }
     let src_reg = ctx.put_value_in_reg(src);
     match (src_ty, dst_ty) {
         (TypeKind::Int32, TypeKind::Float32) => ctx.emit(MInst::Scvtf { dst, src: src_reg }),
@@ -498,6 +683,23 @@ fn lower_select(
     select: &Select,
 ) -> LoweredOutput {
     let result_ty = arena.inst_data(inst).ty().kind();
+    if matches!(result_ty, TypeKind::Vector(..)) {
+        // `select(mask, if_true, if_false)` over vectors: bit-select. `VecBsl`
+        // takes the mask as an explicit SSA read and emits its own leading
+        // copy, leaving the mask untouched for any other users.
+        let result = ctx.result_reg(inst);
+        let dst = Writable::from_reg(result);
+        let mask = ctx.put_value_in_reg(select.cond());
+        let if_true = ctx.put_value_in_reg(select.if_true());
+        let if_false = ctx.put_value_in_reg(select.if_false());
+        ctx.emit(MInst::VecBsl {
+            dst,
+            mask,
+            lhs: if_true,
+            rhs: if_false,
+        });
+        return LoweredOutput::Value(result);
+    }
     if !matches!(
         result_ty,
         TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String | TypeKind::Float32
@@ -1035,6 +1237,147 @@ fn lower_return(
     LoweredOutput::None
 }
 
+/// `fma(acc, lhs, rhs)`: `acc` is a read-write accumulator, so copy it into
+/// the result register before the fused multiply-add writes it.
+/// `fma(acc, lhs, rhs)`: `fmla` is read-modify-write on the accumulator; the
+/// `VecFmla` MInst takes the accumulator as an explicit SSA read and emits the
+/// leading copy itself.
+fn lower_fma(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    fma: &Fma,
+) -> LoweredOutput {
+    let result = ctx.result_reg(inst);
+    let dst = Writable::from_reg(result);
+    let shape = vector_shape(arena.inst_data(inst).ty().kind());
+    let acc = ctx.put_value_in_reg(fma.acc());
+    let lhs = ctx.put_value_in_reg(fma.lhs());
+    let rhs = ctx.put_value_in_reg(fma.rhs());
+    ctx.emit(MInst::VecFmla {
+        shape,
+        dst,
+        acc,
+        lhs,
+        rhs,
+    });
+    LoweredOutput::Value(result)
+}
+
+fn lower_vector_splat(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    splat: &VectorSplat,
+) -> LoweredOutput {
+    let result = ctx.result_reg(inst);
+    let dst = Writable::from_reg(result);
+    let shape = vector_shape(arena.inst_data(inst).ty().kind());
+    let src = ctx.put_value_in_reg(splat.src());
+    ctx.emit(MInst::VecDup { shape, dst, src });
+    LoweredOutput::Value(result)
+}
+
+fn lower_vector_extract_element(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    extract: &VectorExtractElement,
+) -> LoweredOutput {
+    let result = ctx.result_reg(inst);
+    let dst = Writable::from_reg(result);
+    let size = operand_size(arena.inst_data(inst).ty().kind());
+    let src = ctx.put_value_in_reg(extract.src());
+    let lane = lane_constant(arena, extract.index());
+    ctx.emit(MInst::VecExtractLane { size, dst, src, lane });
+    LoweredOutput::Value(result)
+}
+
+fn lower_vector_insert_element(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    insert: &VectorInsertElement,
+) -> LoweredOutput {
+    let result = ctx.result_reg(inst);
+    let dst = Writable::from_reg(result);
+    let size = operand_size(arena.inst_data(insert.element()).ty().kind());
+    // `VecInsertLane` is read-modify-write on the destination vector; it takes
+    // the vector as an explicit SSA read and emits its own leading copy.
+    let vector = ctx.put_value_in_reg(insert.vector());
+    let element = ctx.put_value_in_reg(insert.element());
+    let lane = lane_constant(arena, insert.index());
+    ctx.emit(MInst::VecInsertLane {
+        size,
+        dst,
+        vector,
+        src: element,
+        lane,
+    });
+    LoweredOutput::Value(result)
+}
+
+fn lower_vector_reduce(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    reduce: &VectorReduce,
+) -> LoweredOutput {
+    if !matches!(reduce.op(), VectorReduceOp::Add) {
+        ctx.lowering_panic(
+            "AArch64 instruction selection",
+            "only add reduction is supported",
+            Some(arena.inst_data(reduce.src()).ty()),
+            Some(arena.inst_data(inst).ty()),
+        );
+    }
+    let src_ty = arena.inst_data(reduce.src()).ty().kind();
+    if matches!(src_ty, TypeKind::Vector(elem, _) if elem.is_f32()) {
+        ctx.lowering_panic(
+            "AArch64 instruction selection",
+            "float horizontal sums (faddp) are not in the NEON MInst set",
+            Some(arena.inst_data(reduce.src()).ty()),
+            Some(arena.inst_data(inst).ty()),
+        );
+    }
+    if vector_shape(src_ty) != VecShape::FourS {
+        ctx.lowering_panic(
+            "AArch64 instruction selection",
+            "vector add reduction (addv) only supports .4s",
+            Some(arena.inst_data(reduce.src()).ty()),
+            Some(arena.inst_data(inst).ty()),
+        );
+    }
+    let result = ctx.result_reg(inst);
+    let src = ctx.put_value_in_reg(reduce.src());
+    if arena.inst_data(inst).ty().is_i32() {
+        // `addv s0, v1.4s` writes a SIMD register; move the i32 result into
+        // an integer register for the scalar consumer.
+        let acc = ctx.alloc_tmp(HirType::get_f32());
+        ctx.emit(MInst::VecAddv {
+            dst: Writable::from_reg(acc),
+            src,
+        });
+        ctx.emit(MInst::FMov {
+            dst: Writable::from_reg(result),
+            src: acc,
+        });
+    } else {
+        ctx.emit(MInst::VecAddv {
+            dst: Writable::from_reg(result),
+            src,
+        });
+    }
+    LoweredOutput::Value(result)
+}
+
+fn lane_constant(arena: ArenaContext<'_>, index: HirInst) -> u8 {
+    match arena.inst_data(index).kind() {
+        InstKind::Integer(value) => value.value() as u8,
+        _ => unreachable!("vector lane index must be a constant integer"),
+    }
+}
+
 impl LowerBackend for AArch64Backend {
     type MInst = MInst;
     type CodegenConfig = crate::config::AArch64CodegenConfig;
@@ -1062,6 +1405,15 @@ impl LowerBackend for AArch64Backend {
             InstKind::Call(call) => lower_call(ctx, arena, inst, call),
             InstKind::TailCall(tail_call) => lower_tail_call(ctx, arena, tail_call),
             InstKind::Return(ret) => lower_return(ctx, arena, ret),
+            InstKind::Fma(fma) => lower_fma(ctx, arena, inst, fma),
+            InstKind::VectorSplat(splat) => lower_vector_splat(ctx, arena, inst, splat),
+            InstKind::VectorExtractElement(extract) => {
+                lower_vector_extract_element(ctx, arena, inst, extract)
+            }
+            InstKind::VectorInsertElement(insert) => {
+                lower_vector_insert_element(ctx, arena, inst, insert)
+            }
+            InstKind::VectorReduce(reduce) => lower_vector_reduce(ctx, arena, inst, reduce),
             InstKind::Jump(..) | InstKind::Branch(..) => {
                 unreachable!("terminators are lowered by LowerBackend::lower_branch")
             }
@@ -2000,6 +2352,7 @@ fn memory_type(ty: &TypeKind) -> MemoryType {
         TypeKind::Int32 => MemoryType::I32,
         TypeKind::Float32 => MemoryType::F32,
         TypeKind::Pointer(_) | TypeKind::String => MemoryType::I64,
+        TypeKind::Vector(..) => MemoryType::Vec128,
         ty => unreachable!("unsupported AArch64 integer memory type: {ty:?}"),
     }
 }
@@ -2100,6 +2453,17 @@ fn emit_zero_init(
             let zero = ctx.alloc_tmp(HirType::get_f32());
             ctx.emit(MInst::FMovFromZero {
                 dst: Writable::from_reg(zero),
+            });
+            emit_store_at(ctx, zero, ty, base, offset);
+        }
+        TypeKind::Vector(..) => {
+            let zero = ctx.alloc_tmp(ty.clone());
+            let shape = vector_shape(ty.kind());
+            ctx.emit(MInst::VecMovImm {
+                shape,
+                dst: Writable::from_reg(zero),
+                imm: 0,
+                shift: 0,
             });
             emit_store_at(ctx, zero, ty, base, offset);
         }
@@ -2934,6 +3298,139 @@ mod tests {
         assert!(assembly.contains(".4s, w"), "{assembly}");
         assert!(assembly.contains("add v"), "{assembly}");
         assert!(assembly.contains(".4s, v"), "{assembly}");
+        assert!(assembly.contains("addv s"), "{assembly}");
+    }
+
+    /// Construct a `<4 x i32>` kernel over vector parameters (v0-v7 ABI) and a
+    /// scalar splat source, covering the integer NEON lowering surface:
+    /// splat → add → mul → cmeq → bsl → smin/smax → addv → lane extract/insert.
+    fn compile_vector_int_kernel() -> String {
+        use raana_ir::ir::builder_trait::*;
+
+        let v4i32 = Type::get_vector(Type::get_i32(), 4);
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "vec_int_kernel".into(),
+            vec![v4i32.clone(), v4i32.clone(), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let v = data.params()[0];
+        let w = data.params()[1];
+        let s = data.params()[2];
+
+        let splat = data.new_local_inst().vector_splat(s, v4i32.clone());
+        let add = data.new_local_inst().binary(BinaryOp::Add, v, splat);
+        let mul = data.new_local_inst().binary(BinaryOp::Mul, add, w);
+        let mask = data.new_local_inst().binary(BinaryOp::Eq, v, w);
+        let sel = data.new_local_inst().select(mask, add, mul);
+        let mn = data.new_local_inst().binary(BinaryOp::Min, sel, w);
+        let mx = data.new_local_inst().binary(BinaryOp::Max, mn, splat);
+        let sum = data
+            .new_local_inst()
+            .vector_reduce(raana_ir::ir::VectorReduceOp::Add, mx);
+        let zero = data.new_local_inst().integer(0);
+        let e0 = data.new_local_inst().vector_extract_element(mx, zero);
+        let one = data.new_local_inst().integer(1);
+        let ins = data
+            .new_local_inst()
+            .vector_insert_element(mx, e0, one);
+
+        for inst in [splat, add, mul, mask, sel, mn, mx, sum, e0, ins] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let ret = data.new_local_inst().ret(Some(sum));
+        data.layout_mut().insert_inst(entry, ret);
+        taki_mir::compile::<crate::lower::AArch64Backend>(&program)
+    }
+
+    #[test]
+    fn vector_ir_function_emits_neon_integer_surface() {
+        let assembly = compile_vector_int_kernel();
+        assert!(assembly.contains("dup v"), "{assembly}");
+        assert!(assembly.contains("add v"), "{assembly}");
+        assert!(assembly.contains("mul v"), "{assembly}");
+        assert!(assembly.contains("cmeq"), "{assembly}");
+        assert!(assembly.contains("bsl"), "{assembly}");
+        assert!(assembly.contains("smin"), "{assembly}");
+        assert!(assembly.contains("smax"), "{assembly}");
+        assert!(assembly.contains("addv s"), "{assembly}");
+        // Lane ops: extract to a GPR and insert back from it.
+        assert!(assembly.contains("mov w"), "{assembly}");
+        assert!(assembly.contains("v0"), "{assembly}");
+        // addv writes a SIMD register; the i32 result must be moved out.
+        assert!(assembly.contains("fmov w"), "{assembly}");
+    }
+
+    #[test]
+    fn vector_ir_function_emits_neon_float_surface() {
+        use raana_ir::ir::builder_trait::*;
+
+        let v4i32 = Type::get_vector(Type::get_i32(), 4);
+        let v4f32 = Type::get_vector(Type::get_f32(), 4);
+        let mut program = Program::new();
+        let function = program.new_function(
+            v4f32.clone(),
+            "vec_float_kernel".into(),
+            vec![v4i32.clone(), Type::get_f32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let vi = data.params()[0];
+        let s = data.params()[1];
+
+        // f32 splat (from a float register), i32→f32 conversion, fmla.
+        let splat_f = data.new_local_inst().vector_splat(s, v4f32.clone());
+        let vf = data.new_local_inst().cast(vi, v4f32.clone());
+        let acc = data.new_local_inst().fma(vf, splat_f, splat_f);
+
+        for inst in [splat_f, vf, acc] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let ret = data.new_local_inst().ret(Some(acc));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+        // dup from a float scalar is `dup v.4s, s0`; scvtf converts the lanes;
+        // fmla fuses the multiply-add.
+        assert!(assembly.contains("dup v"), "{assembly}");
+        assert!(assembly.contains(".4s, s"), "{assembly}");
+        assert!(assembly.contains("scvtf"), "{assembly}");
+        assert!(assembly.contains("fmla"), "{assembly}");
+    }
+
+    #[test]
+    fn vector_ir_function_emits_neon_load_store_and_reduce() {
+        use raana_ir::ir::builder_trait::*;
+
+        let v4i32 = Type::get_vector(Type::get_i32(), 4);
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "vec_mem_kernel".into(),
+            vec![v4i32.clone(), Type::get_pointer(v4i32.clone())],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let vec = data.params()[0];
+        let ptr = data.params()[1];
+
+        let store = data.new_local_inst().store(vec, ptr);
+        let loaded = data.new_local_inst().load(ptr);
+        let sum = data
+            .new_local_inst()
+            .vector_reduce(raana_ir::ir::VectorReduceOp::Add, loaded);
+
+        for inst in [store, loaded, sum] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let ret = data.new_local_inst().ret(Some(sum));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+        assert!(assembly.contains("str q"), "{assembly}");
+        assert!(assembly.contains("ldr q"), "{assembly}");
         assert!(assembly.contains("addv s"), "{assembly}");
     }
 }

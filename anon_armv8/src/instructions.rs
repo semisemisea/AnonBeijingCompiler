@@ -724,10 +724,13 @@ pub enum MInst {
         lhs: Reg,
         rhs: Reg,
     },
-    /// `fmla v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>`.
+    /// `fmla v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>` with the accumulator
+    /// copied in first: `mov v{d}.16b, v{acc}.16b; fmla v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>`.
+    /// `acc` is an explicit SSA read (read-modify-write on `dst`).
     VecFmla {
         shape: VecShape,
         dst: WritableReg,
+        acc: Reg,
         lhs: Reg,
         rhs: Reg,
     },
@@ -746,9 +749,12 @@ pub enum MInst {
         lhs: Reg,
         rhs: Reg,
     },
-    /// `bsl v{d}.16b, v{lhs}.16b, v{rhs}.16b`.
+    /// `bsl v{d}.16b, v{lhs}.16b, v{rhs}.16b` with the mask copied in first:
+    /// `mov v{d}.16b, v{mask}.16b; bsl v{d}.16b, v{lhs}.16b, v{rhs}.16b`.
+    /// `mask` is an explicit SSA read (read-modify-write on `dst`).
     VecBsl {
         dst: WritableReg,
+        mask: Reg,
         lhs: Reg,
         rhs: Reg,
     },
@@ -782,10 +788,13 @@ pub enum MInst {
         lane: u8,
     },
     /// `mov v{d}.s/d[lane], w/x{src}`: insert a general-purpose value into
-    /// one lane.
+    /// one lane. The destination vector is copied in first:
+    /// `mov v{d}.16b, v{vector}.16b; mov v{d}.s/d[lane], w/x{src}`.
+    /// `vector` is an explicit SSA read (read-modify-write on `dst`).
     VecInsertLane {
         size: OperandSize,
         dst: WritableReg,
+        vector: Reg,
         src: Reg,
         lane: u8,
     },
@@ -1008,23 +1017,40 @@ impl MachInst for MInst {
                 use_sp_aware_reg(collector, base);
             }
             Self::VecArithRRR { dst, lhs, rhs, .. }
-            | Self::VecFmla { dst, lhs, rhs, .. }
             | Self::VecBitwise { dst, lhs, rhs, .. }
             | Self::VecCmp { dst, lhs, rhs, .. }
-            | Self::VecBsl { dst, lhs, rhs }
             | Self::VecMinMax { dst, lhs, rhs, .. } => {
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
                 collector.reg_def(dst);
+            }
+            Self::VecFmla {
+                dst, acc, lhs, rhs, ..
+            }
+            | Self::VecBsl {
+                dst, mask: acc, lhs, rhs,
+            } => {
+                // The leading `mov` writes `dst` before the read-modify-write
+                // reads `lhs`/`rhs`, so `dst` is an *early* def: it must not
+                // alias any use (coalescing dst with rhs would clobber rhs).
+                collector.reg_use(acc);
+                collector.reg_use(lhs);
+                collector.reg_use(rhs);
+                collector.reg_early_def(dst);
             }
             Self::VecMovImm { dst, .. } => collector.reg_def(dst),
             Self::VecExtractLane { dst, src, .. } => {
                 collector.reg_use(src);
                 collector.reg_def(dst);
             }
-            Self::VecInsertLane { dst, src, .. } => {
+            Self::VecInsertLane {
+                dst, vector, src, ..
+            } => {
+                // The leading copy writes `dst` before `src` is read by the
+                // lane insert, so `dst` must not alias either use.
+                collector.reg_use(vector);
                 collector.reg_use(src);
-                collector.reg_def(dst);
+                collector.reg_early_def(dst);
             }
             Self::AluRRRShift { dst, lhs, rhs, .. } => {
                 use_reg_or_zr(collector, lhs);
@@ -1731,9 +1757,16 @@ impl MachInstEmit for MInst {
             Self::VecFmla {
                 shape,
                 dst,
+                acc,
                 lhs,
                 rhs,
             } => {
+                write!(ctx, "mov ")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".16b, ")?;
+                emit_vec_reg(ctx, *acc)?;
+                write!(ctx, ".16b")?;
+                ctx.end_inst()?;
                 write!(ctx, "fmla ")?;
                 emit_vec_reg(ctx, dst.to_reg())?;
                 write!(ctx, ".{}, ", shape.arrangement())?;
@@ -1766,7 +1799,13 @@ impl MachInstEmit for MInst {
                 emit_vec_reg(ctx, *rhs)?;
                 write!(ctx, ".{}", shape.arrangement())
             }
-            Self::VecBsl { dst, lhs, rhs } => {
+            Self::VecBsl { dst, mask, lhs, rhs } => {
+                write!(ctx, "mov ")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".16b, ")?;
+                emit_vec_reg(ctx, *mask)?;
+                write!(ctx, ".16b")?;
+                ctx.end_inst()?;
                 write!(ctx, "bsl ")?;
                 emit_vec_reg(ctx, dst.to_reg())?;
                 write!(ctx, ".16b, ")?;
@@ -1805,7 +1844,19 @@ impl MachInstEmit for MInst {
                 emit_vec_reg(ctx, *src)?;
                 write!(ctx, ".{}[{}]", if *size == OperandSize::Size64 { "d" } else { "s" }, lane)
             }
-            Self::VecInsertLane { size, dst, src, lane } => {
+            Self::VecInsertLane {
+                size,
+                dst,
+                vector,
+                src,
+                lane,
+            } => {
+                write!(ctx, "mov ")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".16b, ")?;
+                emit_vec_reg(ctx, *vector)?;
+                write!(ctx, ".16b")?;
+                ctx.end_inst()?;
                 write!(ctx, "mov ")?;
                 emit_vec_reg(ctx, dst.to_reg())?;
                 write!(ctx, ".{}[{}], ", if *size == OperandSize::Size64 { "d" } else { "s" }, lane)?;
@@ -2981,10 +3032,11 @@ mod tests {
         let fmla = emit(MInst::VecFmla {
             shape: super::VecShape::FourS,
             dst: Writable::from_reg(vec_reg(0)),
+            acc: vec_reg(3),
             lhs: vec_reg(1),
             rhs: vec_reg(2),
         });
-        assert_eq!(fmla, "fmla v0.4s, v1.4s, v2.4s");
+        assert_eq!(fmla, "mov v0.16b, v3.16b\n    fmla v0.4s, v1.4s, v2.4s");
 
         for (op, mnemonic) in [
             (super::VecBitOp::And, "and"),
@@ -3011,10 +3063,11 @@ mod tests {
 
         let bsl = emit(MInst::VecBsl {
             dst: Writable::from_reg(vec_reg(0)),
+            mask: vec_reg(3),
             lhs: vec_reg(1),
             rhs: vec_reg(2),
         });
-        assert_eq!(bsl, "bsl v0.16b, v1.16b, v2.16b");
+        assert_eq!(bsl, "mov v0.16b, v3.16b\n    bsl v0.16b, v1.16b, v2.16b");
     }
 
     #[test]
@@ -3079,10 +3132,11 @@ mod tests {
         let insert = emit(MInst::VecInsertLane {
             size: OperandSize::Size32,
             dst: Writable::from_reg(vec_reg(2)),
+            vector: vec_reg(4),
             src: int_reg(3),
             lane: 0,
         });
-        assert_eq!(insert, "mov v2.s[0], w3");
+        assert_eq!(insert, "mov v2.16b, v4.16b\n    mov v2.s[0], w3");
 
         for (op, mnemonic) in [
             (super::VecMinMaxOp::Smin, "smin"),

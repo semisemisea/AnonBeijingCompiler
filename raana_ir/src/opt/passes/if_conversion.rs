@@ -28,20 +28,36 @@ struct Candidate {
 
 impl Pass for IfConversion {
     fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
-        // Re-scan after every rewrite. Apart from keeping the analysis simple,
-        // this permits an exposed outer candidate to be converted as well.
+        // Greedily convert candidates in layout order. `apply` only rewrites
+        // the applied head and blocks it removes/remerges downstream, never
+        // blocks that appear before the head, so the scan can resume after the
+        // applied head instead of restarting from entry. The initial block list
+        // stays valid because the pass only removes blocks (never adds them).
         let mut changed = false;
+        let Some(tree) = dom_tree::v2::DominanceTree::new(data) else {
+            return false;
+        };
+        let initial_blocks = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .map(|layout| layout.bb())
+            .collect::<Vec<_>>();
+        let mut cursor = 0usize;
         loop {
-            let blocks = data
-                .layout()
-                .basicblocks()
-                .iter()
-                .map(|layout| layout.bb())
-                .collect::<Vec<_>>();
-            let Some(candidate) = blocks
-                .into_iter()
-                .find_map(|head| self.candidate(data, head))
-            else {
+            let mut candidate = None;
+            while cursor < initial_blocks.len() {
+                let head = initial_blocks[cursor];
+                cursor += 1;
+                if !data.layout().contains_bb(head) {
+                    continue;
+                }
+                if let Some(found) = self.candidate(data, head, &tree) {
+                    candidate = Some(found);
+                    break;
+                }
+            }
+            let Some(candidate) = candidate else {
                 return changed;
             };
             self.apply(data, candidate);
@@ -51,7 +67,12 @@ impl Pass for IfConversion {
 }
 
 impl IfConversion {
-    fn candidate(&self, data: &ArenaContextMut<'_>, head: BasicBlock) -> Option<Candidate> {
+    fn candidate(
+        &self,
+        data: &ArenaContextMut<'_>,
+        head: BasicBlock,
+        tree: &dom_tree::v2::DominanceTree,
+    ) -> Option<Candidate> {
         let terminator = *data.layout().basicblock(head).insts().get_last()?;
         let InstKind::Branch(branch) = data.inst_data(terminator).kind() else {
             return None;
@@ -67,7 +88,7 @@ impl IfConversion {
                     .t_args()
                     .iter()
                     .chain(branch.f_args())
-                    .any(|&value| !self.available_at(data, value, head))
+                    .any(|&value| !self.available_at(data, value, head, tree))
             {
                 return None;
             }
@@ -81,6 +102,7 @@ impl IfConversion {
                 branch.f_args(),
                 vec![],
                 vec![],
+                tree,
             );
         }
 
@@ -108,7 +130,7 @@ impl IfConversion {
                 && ta
                     .iter()
                     .chain(fa.iter())
-                    .all(|&value| self.available_at(data, value, head))
+                    .all(|&value| self.available_at(data, value, head, tree))
             {
                 return self.finish_candidate(
                     data,
@@ -120,6 +142,7 @@ impl IfConversion {
                     &fa,
                     vec![t, f],
                     vec![],
+                    tree,
                 );
             }
         }
@@ -193,6 +216,7 @@ impl IfConversion {
                     inst,
                     head,
                     &move_insts.iter().map(|&(_, i)| i).collect::<Vec<_>>(),
+                    tree,
                 ) {
                     return None;
                 }
@@ -210,10 +234,10 @@ impl IfConversion {
         }
         if arm_args.iter().any(|&value| {
             !move_insts.iter().any(|&(_, inst)| inst == value)
-                && !self.available_at(data, value, head)
+                && !self.available_at(data, value, head, tree)
         }) || direct_args
             .iter()
-            .any(|&value| !self.available_at(data, value, head))
+            .any(|&value| !self.available_at(data, value, head, tree))
         {
             return None;
         }
@@ -233,6 +257,7 @@ impl IfConversion {
             false_args,
             vec![arm],
             move_insts,
+            tree,
         )
     }
 
@@ -248,6 +273,7 @@ impl IfConversion {
         false_args: &[Inst],
         remove_blocks: Vec<BasicBlock>,
         move_insts: Vec<(BasicBlock, Inst)>,
+        tree: &dom_tree::v2::DominanceTree,
     ) -> Option<Candidate> {
         // The hoisted instructions are speculated into `head`, so `head` must
         // dominate `merge` (its operands are already checked to be available
@@ -255,7 +281,7 @@ impl IfConversion {
         // `reaches(merge, head)` rejection blocked every loop-carried
         // accumulator (`if (bit_a==1 && bit_b==1) result += power`), which is
         // exactly the profitable case; dominance is the right precondition.
-        if merge == head || !self.dominates(data, head, merge) {
+        if merge == head || !self.dominates(tree, head, merge) {
             return None;
         }
         let params = data.bb_data(merge).params();
@@ -373,12 +399,14 @@ impl IfConversion {
         inst: Inst,
         head: BasicBlock,
         chain: &[Inst],
+        tree: &dom_tree::v2::DominanceTree,
     ) -> bool {
         let InstKind::Binary(binary) = data.inst_data(inst).kind() else {
             return false;
         };
-        let operand_ok =
-            |value: Inst| chain.contains(&value) || self.available_at(data, value, head);
+        let operand_ok = |value: Inst| {
+            chain.contains(&value) || self.available_at(data, value, head, tree)
+        };
         data.inst_data(inst).ty().is_i32()
             && data.inst_data(binary.lhs()).ty().is_i32()
             && data.inst_data(binary.rhs()).ty().is_i32()
@@ -387,7 +415,13 @@ impl IfConversion {
             && operand_ok(binary.rhs())
     }
 
-    fn available_at(&self, data: &ArenaContextMut<'_>, value: Inst, head: BasicBlock) -> bool {
+    fn available_at(
+        &self,
+        data: &ArenaContextMut<'_>,
+        value: Inst,
+        head: BasicBlock,
+        tree: &dom_tree::v2::DominanceTree,
+    ) -> bool {
         if value.is_global()
             || data.inst_data(value).is_const()
             || data.bb_data(head).params().contains(&value)
@@ -401,7 +435,7 @@ impl IfConversion {
         // arguments and dominate the whole body) be hoisted anywhere.
         if matches!(data.inst_data(value).kind(), InstKind::BlockArgRef(..)) {
             return self.block_of_param(data, value).is_some_and(|def_block| {
-                def_block == head || self.dominates(data, def_block, head)
+                def_block == head || self.dominates(tree, def_block, head)
             });
         }
         let Some(def_bb) = data.layout().parent_bb(value) else {
@@ -412,7 +446,7 @@ impl IfConversion {
             return insts.iter().any(|&inst| inst == value)
                 && insts.get_last().is_some_and(|&term| term != value);
         }
-        self.dominates(data, def_bb, head)
+        self.dominates(tree, def_bb, head)
     }
 
     fn block_of_param(&self, data: &ArenaContextMut<'_>, value: Inst) -> Option<BasicBlock> {
@@ -423,50 +457,35 @@ impl IfConversion {
             .map(|layout| layout.bb())
     }
 
+    /// Whether `dominator` dominates `block`. Uses a dominator tree computed
+    /// from the CFG snapshot at the start of this pass invocation. The pass
+    /// only ever removes blocks and edges, which cannot turn a true dominance
+    /// into a false one, so the snapshot stays sound; an occasional
+    /// still-valid candidate may be rejected and simply revisited by the
+    /// pipeline's fixed point on its next iteration.
     fn dominates(
         &self,
-        data: &ArenaContextMut<'_>,
+        tree: &dom_tree::v2::DominanceTree,
         dominator: BasicBlock,
         block: BasicBlock,
     ) -> bool {
         if dominator == block {
             return true;
         }
-        let Some(entry) = data.layout().entry_bb().map(|layout| layout.bb()) else {
-            return false;
-        };
-        if entry == dominator {
+        if tree.entry() == dominator {
             return true;
         }
-
-        // A block is dominated by `dominator` exactly when it is unreachable
-        // from entry after removing `dominator`. Searching forward avoids
-        // treating predecessor cycles as proof of dominance.
-        let mut seen = HashSet::default();
-        let mut work = VecDeque::from([entry]);
-        while let Some(current) = work.pop_front() {
-            if !seen.insert(current) {
-                continue;
-            }
-            if current == block {
-                return false;
-            }
-            let Some(terminator) = data
-                .layout()
-                .basicblock(current)
-                .insts()
-                .get_last()
-                .copied()
-            else {
-                continue;
-            };
-            for successor in data.inst_data(terminator).bb_usage() {
-                if successor != dominator {
-                    work.push_back(successor);
-                }
-            }
+        // Preserve the legacy semantics for blocks outside the snapshot (made
+        // unreachable or removed): an unreachable target is dominated by
+        // everything, and an unreachable dominator does not dominate a
+        // reachable target.
+        if !tree.contains(block) {
+            return true;
         }
-        true
+        if !tree.contains(dominator) {
+            return false;
+        }
+        tree.dominates(dominator, block)
     }
 
     fn exact_users(&self, data: &ArenaContextMut<'_>, bb: BasicBlock, expected: &[Inst]) -> bool {

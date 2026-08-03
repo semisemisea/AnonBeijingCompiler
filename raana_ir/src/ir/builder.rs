@@ -4,16 +4,18 @@ use crate::ir::{
     basic_block::{BasicBlock, BasicBlockData},
     function::Function,
     inst_kind::{
-        Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Cast, Float, GetElemPtr,
+        Aggregate, Binary, BinaryOp, BlockArgRef, Branch, Call, Cast, Fma, Float, GetElemPtr,
         GlobalAlloc, InstKind, Integer, Jump, Load, MemZero, Return, Select, Store, TailCall,
+        VectorExtractElement, VectorInsertElement, VectorReduce, VectorReduceOp, VectorSplat,
     },
     instruction::{Inst, InstData},
-    types::Type,
+    types::{Type, TypeKind},
 };
 
 pub trait InfoQuery {
     fn inst_type(&self, inst: Inst) -> Type;
     fn is_const(&self, inst: Inst) -> bool;
+    fn inst_kind(&self, inst: Inst) -> &InstKind;
     fn bb_params(&self, bb: BasicBlock) -> &[Inst];
     fn func_type(&self, func: Function) -> Type;
 }
@@ -62,8 +64,14 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
     fn binary(&mut self, op: BinaryOp, lhs: Inst, rhs: Inst) -> Inst {
         let lhs_type = self.inst_type(lhs);
         let rhs_type = self.inst_type(rhs);
-        assert!(lhs_type.is_scalar(), "lhs of binary is not scalar");
-        assert!(rhs_type.is_scalar(), "rhs of binary is not scalar");
+        assert!(
+            lhs_type.is_scalar() || lhs_type.is_vector(),
+            "lhs of binary is neither scalar nor vector: {lhs_type}"
+        );
+        assert!(
+            rhs_type.is_scalar() || rhs_type.is_vector(),
+            "rhs of binary is neither scalar nor vector: {rhs_type}"
+        );
         assert!(
             lhs_type == rhs_type,
             "only the same type is supported currently\ntype of lhs: {lhs_type}\ntype of rhs: {rhs_type}"
@@ -76,14 +84,20 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
         let true_ty = self.inst_type(if_true);
         let false_ty = self.inst_type(if_false);
         assert!(
-            cond_ty.is_i32(),
-            "select condition must be i32, got {cond_ty}"
+            cond_ty.is_i32() || cond_ty.is_vector(),
+            "select condition must be i32 or a vector mask, got {cond_ty}"
         );
         assert_eq!(
             true_ty, false_ty,
             "select alternatives must have the same type"
         );
         assert!(!true_ty.is_unit(), "select cannot produce a unit value");
+        if cond_ty.is_vector() {
+            assert_eq!(
+                cond_ty, true_ty,
+                "vector select condition must match the alternative vector type"
+            );
+        }
         self.insert_inst(Select::new_data(cond, if_true, if_false, true_ty))
     }
 
@@ -137,8 +151,14 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
 
     fn cast(&mut self, src: Inst, ty: Type) -> Inst {
         let src_ty = self.inst_type(src);
-        assert!(src_ty.is_scalar(), "cast source is not scalar");
-        assert!(ty.is_scalar(), "cast target is not scalar");
+        assert!(
+            src_ty.is_scalar() || src_ty.is_vector(),
+            "cast source is neither scalar nor vector: {src_ty}"
+        );
+        assert!(
+            ty.is_scalar() || ty.is_vector(),
+            "cast target is neither scalar nor vector: {ty}"
+        );
         self.insert_inst(Cast::new_data(src, ty))
     }
 
@@ -192,6 +212,115 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
         assert!(byte_len > 0, "memzero byte length must be nonzero");
         self.insert_inst(MemZero::new_data(dest, byte_len))
     }
+
+    /// Fused multiply-add over vectors: `result = acc + lhs * rhs`.
+    fn fma(&mut self, acc: Inst, lhs: Inst, rhs: Inst) -> Inst {
+        let acc_ty = self.inst_type(acc);
+        let lhs_ty = self.inst_type(lhs);
+        let rhs_ty = self.inst_type(rhs);
+        assert!(
+            acc_ty.is_vector(),
+            "fma accumulator must be a vector, got {acc_ty}"
+        );
+        assert_eq!(
+            acc_ty, lhs_ty,
+            "fma operands must share the accumulator's type"
+        );
+        assert_eq!(
+            acc_ty, rhs_ty,
+            "fma operands must share the accumulator's type"
+        );
+        self.insert_inst(Fma::new_data(acc, lhs, rhs, acc_ty))
+    }
+
+    /// Splat a scalar across every lane of `ty`.
+    fn vector_splat(&mut self, src: Inst, ty: Type) -> Inst {
+        let src_ty = self.inst_type(src);
+        assert!(
+            src_ty.is_scalar(),
+            "vector_splat source must be scalar, got {src_ty}"
+        );
+        assert!(
+            ty.is_vector(),
+            "vector_splat target must be a vector, got {ty}"
+        );
+        let TypeKind::Vector(elem, _lanes) = ty.kind() else {
+            unreachable!("vector_splat target is a vector");
+        };
+        assert_eq!(
+            elem, &src_ty,
+            "vector_splat element type {elem} must match source type {src_ty}"
+        );
+        self.insert_inst(VectorSplat::new_data(src, ty))
+    }
+
+    /// Extract the lane at constant `index` of a vector into a scalar.
+    fn vector_extract_element(&mut self, src: Inst, index: Inst) -> Inst {
+        let src_ty = self.inst_type(src);
+        assert!(
+            src_ty.is_vector(),
+            "vector_extract_element source must be a vector, got {src_ty}"
+        );
+        let TypeKind::Vector(elem, lanes) = src_ty.kind() else {
+            unreachable!("vector_extract_element source is a vector");
+        };
+        assert!(
+            self.inst_type(index).is_i32(),
+            "vector_extract_element index must be i32, got {}",
+            self.inst_type(index)
+        );
+        assert_lane_constant(self, index, *lanes, "vector_extract_element");
+        self.insert_inst(VectorExtractElement::new_data(src, index, elem.clone()))
+    }
+
+    /// Insert scalar `element` into lane at constant `index` of `vector`.
+    fn vector_insert_element(&mut self, vector: Inst, element: Inst, index: Inst) -> Inst {
+        let vector_ty = self.inst_type(vector);
+        assert!(
+            vector_ty.is_vector(),
+            "vector_insert_element vector operand must be a vector, got {vector_ty}"
+        );
+        let TypeKind::Vector(elem, lanes) = vector_ty.kind() else {
+            unreachable!("vector_insert_element vector operand is a vector");
+        };
+        assert_eq!(
+            elem,
+            &self.inst_type(element),
+            "vector_insert_element element type must match the vector element type"
+        );
+        assert!(
+            self.inst_type(index).is_i32(),
+            "vector_insert_element index must be i32, got {}",
+            self.inst_type(index)
+        );
+        assert_lane_constant(self, index, *lanes, "vector_insert_element");
+        self.insert_inst(VectorInsertElement::new_data(vector, element, index, vector_ty))
+    }
+
+    /// Horizontally reduce `src` with `op`, producing the vector's element type.
+    fn vector_reduce(&mut self, op: VectorReduceOp, src: Inst) -> Inst {
+        let src_ty = self.inst_type(src);
+        assert!(
+            src_ty.is_vector(),
+            "vector_reduce source must be a vector, got {src_ty}"
+        );
+        let TypeKind::Vector(elem, _lanes) = src_ty.kind() else {
+            unreachable!("vector_reduce source is a vector");
+        };
+        self.insert_inst(VectorReduce::new_data(op, src, elem.clone()))
+    }
+}
+
+/// Assert `index` is a constant `Integer` instruction in `[0, lanes)`.
+fn assert_lane_constant(builder: &dyn InfoQuery, index: Inst, lanes: usize, what: &str) {
+    let InstKind::Integer(idx) = builder.inst_kind(index) else {
+        panic!("{what} index must be a constant integer");
+    };
+    let lane = idx.value();
+    assert!(
+        (0..lanes as i32).contains(&lane),
+        "{what} lane index {lane} out of range [0, {lanes})"
+    );
 }
 
 pub trait GlobalInstBuilder: ScalarInstBuilder {
@@ -254,6 +383,10 @@ impl<T: ArenaQuery> InfoQuery for T {
             InstKind::Aggregate(agg) => agg.value().iter().all(|&elem| self.is_const(elem)),
             kind => kind.is_const(),
         }
+    }
+
+    fn inst_kind(&self, inst: Inst) -> &InstKind {
+        self.arena().inst_data(inst).kind()
     }
 
     fn bb_params(&self, bb: BasicBlock) -> &[Inst] {
@@ -382,6 +515,171 @@ mod tests {
         let data = program.func_data_mut(function);
         let alloc = data.new_local_inst().alloc(Type::get_i32());
         data.new_local_inst().mem_zero(alloc, 0);
+    }
+
+    #[test]
+    fn vector_binary_keeps_the_vector_result_type() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "vec_bin".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let v4i32 = Type::get_vector(Type::get_i32(), 4);
+        let a = data.new_local_inst().undef(v4i32.clone());
+        let b = data.new_local_inst().undef(v4i32.clone());
+        let add = data.new_local_inst().binary(crate::ir::BinaryOp::Add, a, b);
+        assert_eq!(data.inst_data(add).ty().kind(), v4i32.kind());
+        // Vector comparisons produce a mask of the operand's vector type, not i32.
+        let eq = data.new_local_inst().binary(crate::ir::BinaryOp::Eq, a, b);
+        assert_eq!(data.inst_data(eq).ty().kind(), v4i32.kind());
+    }
+
+    #[test]
+    fn scalar_binary_results_still_force_i32_for_comparisons() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "scalar_cmp".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let a = data.new_local_inst().integer(1);
+        let b = data.new_local_inst().integer(2);
+        let eq = data.new_local_inst().binary(crate::ir::BinaryOp::Eq, a, b);
+        assert!(data.inst_data(eq).ty().is_i32());
+    }
+
+    #[test]
+    fn vector_splat_validates_source_element_and_lane_indexes() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "vec_splat".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let v4i32 = Type::get_vector(Type::get_i32(), 4);
+
+        let src = data.new_local_inst().integer(7);
+        let splat = data.new_local_inst().vector_splat(src, v4i32.clone());
+        assert!(matches!(
+            data.inst_data(splat).kind(),
+            InstKind::VectorSplat(..)
+        ));
+        assert_eq!(
+            data.inst_data(splat).inst_usage().collect::<Vec<_>>(),
+            vec![src]
+        );
+
+        // Extract/insert accept an in-range constant lane.
+        let zero = data.new_local_inst().integer(0);
+        let extracted = data.new_local_inst().vector_extract_element(splat, zero);
+        assert!(data.inst_data(extracted).ty().is_i32());
+        let inserted = data.new_local_inst().vector_insert_element(splat, src, zero);
+        assert_eq!(data.inst_data(inserted).ty().kind(), v4i32.kind());
+    }
+
+    #[test]
+    #[should_panic(expected = "lane index 4 out of range [0, 4)")]
+    fn vector_lane_index_out_of_range_is_rejected() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "vec_lane_oob".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let v4i32 = Type::get_vector(Type::get_i32(), 4);
+        let a = data.new_local_inst().undef(v4i32.clone());
+        let four = data.new_local_inst().integer(4);
+        data.new_local_inst().vector_extract_element(a, four);
+    }
+
+    #[test]
+    #[should_panic(expected = "index must be a constant integer")]
+    fn vector_lane_index_must_be_constant() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "vec_lane_dyn".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let v4i32 = Type::get_vector(Type::get_i32(), 4);
+        let a = data.new_local_inst().undef(v4i32.clone());
+        let index = data.new_local_inst().undef(Type::get_i32());
+        data.new_local_inst().vector_insert_element(a, index, index);
+    }
+
+    #[test]
+    fn fma_and_reduce_validate_their_operand_types() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "vec_fma_reduce".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let v4f32 = Type::get_vector(Type::get_f32(), 4);
+        let acc = data.new_local_inst().undef(v4f32.clone());
+        let lhs = data.new_local_inst().undef(v4f32.clone());
+        let rhs = data.new_local_inst().undef(v4f32.clone());
+        let fma = data.new_local_inst().fma(acc, lhs, rhs);
+        assert!(matches!(data.inst_data(fma).kind(), InstKind::Fma(..)));
+        assert_eq!(
+            data.inst_data(fma).inst_usage().collect::<Vec<_>>(),
+            vec![acc, lhs, rhs]
+        );
+
+        let reduce = data
+            .new_local_inst()
+            .vector_reduce(crate::ir::VectorReduceOp::Add, fma);
+        assert!(matches!(
+            data.inst_data(reduce).kind(),
+            InstKind::VectorReduce(..)
+        ));
+        assert!(data.inst_data(reduce).ty().is_f32());
+    }
+
+    #[test]
+    #[should_panic(expected = "fma accumulator must be a vector")]
+    fn fma_rejects_scalar_accumulators() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "fma_scalar".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let acc = data.new_local_inst().integer(1);
+        let v4i32 = Type::get_vector(Type::get_i32(), 4);
+        let lhs = data.new_local_inst().undef(v4i32.clone());
+        let rhs = data.new_local_inst().undef(v4i32);
+        data.new_local_inst().fma(acc, lhs, rhs);
+    }
+
+    #[test]
+    fn vector_kind_remap_round_trips_all_operands() {
+        use crate::ir::{
+            BasicBlock, Function, Inst,
+            remap::EntityMapper,
+        };
+
+        struct IdentityMapper;
+        impl EntityMapper for IdentityMapper {
+            type Error = ();
+            fn map_inst(&mut self, inst: Inst) -> Result<Inst, ()> {
+                Ok(inst)
+            }
+            fn map_block(&mut self, block: BasicBlock) -> Result<BasicBlock, ()> {
+                Ok(block)
+            }
+            fn map_function(&mut self, function: Function) -> Result<Function, ()> {
+                Ok(function)
+            }
+        }
+
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "vec_remap".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let v4i32 = Type::get_vector(Type::get_i32(), 4);
+        let a = data.new_local_inst().undef(v4i32.clone());
+        let b = data.new_local_inst().undef(v4i32.clone());
+        let c = data.new_local_inst().undef(v4i32.clone());
+        let src = data.new_local_inst().integer(7);
+        let zero = data.new_local_inst().integer(0);
+
+        let fma = data.new_local_inst().fma(a, b, c);
+        let splat = data.new_local_inst().vector_splat(src, v4i32.clone());
+        let extract = data.new_local_inst().vector_extract_element(splat, zero);
+        let insert = data.new_local_inst().vector_insert_element(splat, src, zero);
+        let reduce = data
+            .new_local_inst()
+            .vector_reduce(crate::ir::VectorReduceOp::Add, splat);
+
+        for inst in [fma, splat, extract, insert, reduce] {
+            let original = data.inst_data(inst);
+            let remapped = original.remap_refs(&mut IdentityMapper).unwrap();
+            assert_eq!(remapped.ty().kind(), original.ty().kind());
+            assert_eq!(
+                remapped.inst_usage().collect::<Vec<_>>(),
+                original.inst_usage().collect::<Vec<_>>()
+            );
+        }
     }
 }
 

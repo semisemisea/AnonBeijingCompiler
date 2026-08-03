@@ -6,7 +6,10 @@ use crate::ir::BasicBlock;
 use crate::ir::arena::Arena;
 use crate::ir::{
     Function, InstKind, Program, Type, TypeKind,
-    inst_kind::{Binary, BinaryOp, Call, Cast, GetElemPtr},
+    inst_kind::{
+        Binary, BinaryOp, Call, Cast, Fma, GetElemPtr, VectorExtractElement, VectorInsertElement,
+        VectorReduce, VectorSplat,
+    },
     instruction::Inst,
 };
 
@@ -20,6 +23,7 @@ pub struct LlvmWriter<'a> {
     name_counter: usize,
     bb_counter: usize,
     used_memset: bool,
+    reduce_decls: FxHashSet<String>,
 }
 
 struct ProgramWrapper<'a> {
@@ -164,6 +168,7 @@ impl<'a> LlvmWriter<'a> {
             name_counter: 0,
             bb_counter: 0,
             used_memset: false,
+            reduce_decls: FxHashSet::default(),
         }
     }
 
@@ -195,6 +200,9 @@ impl<'a> LlvmWriter<'a> {
                 self.visit_define(func)?;
             }
             writeln!(self.buffer)?;
+        }
+        for decl in &self.reduce_decls {
+            writeln!(self.buffer, "{}", decl)?;
         }
         Ok(())
     }
@@ -700,6 +708,15 @@ impl<'a> LlvmWriter<'a> {
                 writeln!(self.buffer, "; value")?;
                 Ok(())
             }
+            InstKind::Fma(fma) => self.visit_fma(fma, inst, &ty),
+            InstKind::VectorSplat(splat) => self.visit_vector_splat(splat, inst, &ty),
+            InstKind::VectorExtractElement(extract) => {
+                self.visit_vector_extract_element(extract, inst, &ty)
+            }
+            InstKind::VectorInsertElement(insert) => {
+                self.visit_vector_insert_element(insert, inst, &ty)
+            }
+            InstKind::VectorReduce(reduce) => self.visit_vector_reduce(reduce, inst, &ty),
         }
     }
 
@@ -712,6 +729,77 @@ impl<'a> LlvmWriter<'a> {
         // For comparisons, the result type is always i32, but operands may be float.
         // Use the lhs operand type to determine int vs float dispatch.
         let is_float = self.arena.inst_data(binary.lhs()).ty().is_f32();
+        let is_vector = self.arena.inst_data(binary.lhs()).ty().is_vector();
+
+        if is_vector {
+            let TypeKind::Vector(_elem, lanes) =
+                self.arena.inst_data(binary.lhs()).ty().kind()
+            else {
+                unreachable!("vector operand has a vector type");
+            };
+            return match binary.op() {
+                BinaryOp::Add if is_float => {
+                    writeln!(self.buffer, "fadd {} {}, {}", llvm_ty, lhs, rhs)
+                }
+                BinaryOp::Add => writeln!(self.buffer, "add {} {}, {}", llvm_ty, lhs, rhs),
+                BinaryOp::Sub if is_float => {
+                    writeln!(self.buffer, "fsub {} {}, {}", llvm_ty, lhs, rhs)
+                }
+                BinaryOp::Sub => writeln!(self.buffer, "sub {} {}, {}", llvm_ty, lhs, rhs),
+                BinaryOp::Mul if is_float => {
+                    writeln!(self.buffer, "fmul {} {}, {}", llvm_ty, lhs, rhs)
+                }
+                BinaryOp::Mul => writeln!(self.buffer, "mul {} {}, {}", llvm_ty, lhs, rhs),
+                BinaryOp::And => writeln!(self.buffer, "and {} {}, {}", llvm_ty, lhs, rhs),
+                BinaryOp::Or => writeln!(self.buffer, "or {} {}, {}", llvm_ty, lhs, rhs),
+                BinaryOp::Xor => writeln!(self.buffer, "xor {} {}, {}", llvm_ty, lhs, rhs),
+                BinaryOp::Min if is_float => {
+                    writeln!(self.buffer, "fmin {} {}, {}", llvm_ty, lhs, rhs)
+                }
+                BinaryOp::Max if is_float => {
+                    writeln!(self.buffer, "fmax {} {}, {}", llvm_ty, lhs, rhs)
+                }
+                BinaryOp::Min => writeln!(self.buffer, "smin {} {}, {}", llvm_ty, lhs, rhs),
+                BinaryOp::Max => writeln!(self.buffer, "smax {} {}, {}", llvm_ty, lhs, rhs),
+                BinaryOp::Eq | BinaryOp::Gt => {
+                    // LLVM vector compares produce `<N x i1>`; RaanaIR masks are
+                    // all-ones lanes of the operand type. Sign-extend to match.
+                    let cmp_name = format!("%vcmp{}", self.name_counter);
+                    self.name_counter += 1;
+                    let cmp_op = if is_float {
+                        match binary.op() {
+                            BinaryOp::Eq => "oeq",
+                            BinaryOp::Gt => "ogt",
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        match binary.op() {
+                            BinaryOp::Eq => "eq",
+                            BinaryOp::Gt => "sgt",
+                            _ => unreachable!(),
+                        }
+                    };
+                    writeln!(
+                        self.buffer,
+                        "{} = {} {} {}, {}",
+                        cmp_name,
+                        format!("icmp {}", cmp_op),
+                        llvm_ty,
+                        lhs,
+                        rhs
+                    )?;
+                    writeln!(
+                        self.buffer,
+                        "  {} = sext <{} x i1> {} to {}",
+                        get_name!(self, inst),
+                        lanes,
+                        cmp_name,
+                        llvm_ty
+                    )
+                }
+                op => panic!("unsupported vector binary operation: {op:?}"),
+            };
+        }
 
         if binary.op().is_compare() {
             // LLVM icmp/fcmp produce i1; RaanaIR comparisons produce i32.
@@ -820,6 +908,17 @@ impl<'a> LlvmWriter<'a> {
             (TypeKind::Float32, TypeKind::Int32) => {
                 writeln!(self.buffer, "fptosi float {} to i32", src)
             }
+            (TypeKind::Vector(_, _), TypeKind::Vector(_, _)) => {
+                let llvm_src = self.type_to_llvm(src_ty);
+                let llvm_dst = self.type_to_llvm(dst_ty);
+                let is_int_src =
+                    matches!(src_ty.kind(), TypeKind::Vector(elem, _) if elem.is_i32());
+                if is_int_src {
+                    writeln!(self.buffer, "sitofp {} {} to {}", llvm_src, src, llvm_dst)
+                } else {
+                    writeln!(self.buffer, "fptosi {} {} to {}", llvm_src, src, llvm_dst)
+                }
+            }
             _ => panic!("unsupported cast: {} -> {}", src_ty, dst_ty),
         }
     }
@@ -830,23 +929,156 @@ impl<'a> LlvmWriter<'a> {
         inst: Inst,
         ty: &Type,
     ) -> std::fmt::Result {
-        let cond_name = format!("%selectcond{}", self.name_counter);
+        let cond_ty = self.arena.inst_data(select.cond()).ty().clone();
+        if cond_ty.is_vector() {
+            // A RaanaIR vector condition is an all-ones/zero mask of the
+            // alternative type. LLVM select needs `<N x i1>`: compare each lane
+            // against zero.
+            let TypeKind::Vector(_, lanes) = cond_ty.kind() else {
+                unreachable!("vector condition has a vector type");
+            };
+            let cond_name = format!("%vselcond{}", self.name_counter);
+            self.name_counter += 1;
+            writeln!(
+                self.buffer,
+                "{} = icmp ne {} {}, zeroinitializer",
+                cond_name,
+                self.type_to_llvm(&cond_ty),
+                get_name!(self, select.cond())
+            )?;
+            writeln!(
+                self.buffer,
+                "  {} = select <{} x i1> {}, {} {}, {} {}",
+                get_name!(self, inst),
+                lanes,
+                cond_name,
+                self.type_to_llvm(ty),
+                get_name!(self, select.if_true()),
+                self.type_to_llvm(ty),
+                get_name!(self, select.if_false())
+            )
+        } else {
+            let cond_name = format!("%selectcond{}", self.name_counter);
+            self.name_counter += 1;
+            writeln!(
+                self.buffer,
+                "{} = icmp ne i32 {}, 0",
+                cond_name,
+                get_name!(self, select.cond())
+            )?;
+            writeln!(
+                self.buffer,
+                "  {} = select i1 {}, {} {}, {} {}",
+                get_name!(self, inst),
+                cond_name,
+                self.type_to_llvm(ty),
+                get_name!(self, select.if_true()),
+                self.type_to_llvm(ty),
+                get_name!(self, select.if_false())
+            )
+        }
+    }
+
+    fn visit_fma(&mut self, fma: &Fma, inst: Inst, ty: &Type) -> std::fmt::Result {
+        let llvm_ty = self.type_to_llvm(ty);
+        let mul = format!("%fma_mul{}", self.name_counter);
         self.name_counter += 1;
         writeln!(
             self.buffer,
-            "{} = icmp ne i32 {}, 0",
-            cond_name,
-            get_name!(self, select.cond())
+            "{} = fmul {} {}, {}",
+            mul,
+            llvm_ty,
+            get_name!(self, fma.lhs()),
+            get_name!(self, fma.rhs())
         )?;
         writeln!(
             self.buffer,
-            "  {} = select i1 {}, {} {}, {} {}",
+            "  {} = fadd {} {}, {}",
             get_name!(self, inst),
-            cond_name,
+            llvm_ty,
+            get_name!(self, fma.acc()),
+            mul
+        )
+    }
+
+    fn visit_vector_splat(&mut self, splat: &VectorSplat, inst: Inst, ty: &Type) -> std::fmt::Result {
+        let TypeKind::Vector(elem, lanes) = ty.kind() else {
+            unreachable!("splat produces a vector");
+        };
+        let elem_llvm = self.type_to_llvm(elem);
+        let inserted = format!("%splat0{}", self.name_counter);
+        self.name_counter += 1;
+        writeln!(
+            self.buffer,
+            "{} = insertelement {} poison, {} {}, i32 0",
+            inserted,
             self.type_to_llvm(ty),
-            get_name!(self, select.if_true()),
+            elem_llvm,
+            get_name!(self, splat.src())
+        )?;
+        writeln!(
+            self.buffer,
+            "  {} = shufflevector {} {}, {} poison, <{} x i32> zeroinitializer",
+            get_name!(self, inst),
             self.type_to_llvm(ty),
-            get_name!(self, select.if_false())
+            inserted,
+            self.type_to_llvm(ty),
+            lanes
+        )
+    }
+
+    fn visit_vector_extract_element(
+        &mut self,
+        extract: &VectorExtractElement,
+        inst: Inst,
+        ty: &Type,
+    ) -> std::fmt::Result {
+        writeln!(
+            self.buffer,
+            "  {} = extractelement {}, {} {}, i32 {}",
+            get_name!(self, inst),
+            self.type_to_llvm(self.arena.inst_data(extract.src()).ty()),
+            self.type_to_llvm(ty),
+            get_name!(self, extract.src()),
+            get_name!(self, extract.index())
+        )
+    }
+
+    fn visit_vector_insert_element(
+        &mut self,
+        insert: &VectorInsertElement,
+        inst: Inst,
+        ty: &Type,
+    ) -> std::fmt::Result {
+        writeln!(
+            self.buffer,
+            "  {} = insertelement {} {}, {} {}, i32 {}",
+            get_name!(self, inst),
+            self.type_to_llvm(ty),
+            get_name!(self, insert.vector()),
+            self.type_to_llvm(self.arena.inst_data(insert.element()).ty()),
+            get_name!(self, insert.element()),
+            get_name!(self, insert.index())
+        )
+    }
+
+    fn visit_vector_reduce(&mut self, reduce: &VectorReduce, inst: Inst, ty: &Type) -> std::fmt::Result {
+        let TypeKind::Vector(elem, lanes) = self.arena.inst_data(reduce.src()).ty().kind() else {
+            unreachable!("reduce source is a vector");
+        };
+        let elem_llvm = self.type_to_llvm(elem);
+        let src_llvm = self.type_to_llvm(self.arena.inst_data(reduce.src()).ty());
+        let intrinsic = format!("@llvm.vector.reduce.add.v{lanes}e{}", elem_llvm);
+        let decl = format!("declare {} {}({})", self.type_to_llvm(ty), intrinsic, src_llvm);
+        self.reduce_decls.insert(decl);
+        writeln!(
+            self.buffer,
+            "  {} = call {} {}({} {})",
+            get_name!(self, inst),
+            self.type_to_llvm(ty),
+            intrinsic,
+            src_llvm,
+            get_name!(self, reduce.src())
         )
     }
 
@@ -895,6 +1127,7 @@ impl<'a> LlvmWriter<'a> {
             TypeKind::Int32 | TypeKind::Float32 => 4,
             TypeKind::Pointer(_) | TypeKind::String => 8,
             TypeKind::Array(elem, len) => (*len as usize) * self.type_size_bytes(elem),
+            TypeKind::Vector(elem, lanes) => (*lanes as usize) * self.type_size_bytes(elem),
             _ => 0,
         }
     }

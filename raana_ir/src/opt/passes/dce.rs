@@ -42,7 +42,12 @@ fn is_critical(value: Inst, data: &FunctionData) -> bool {
         | InstKind::Load(..)
         | InstKind::GetElemPtr(..)
         | InstKind::Binary(..)
-        | InstKind::Select(..) => false,
+        | InstKind::Select(..)
+        | InstKind::Fma(..)
+        | InstKind::VectorSplat(..)
+        | InstKind::VectorExtractElement(..)
+        | InstKind::VectorInsertElement(..)
+        | InstKind::VectorReduce(..) => false,
         // rdf is not ready
         InstKind::Call(call) => has_side_effect(call.callee()),
     }
@@ -122,6 +127,22 @@ impl DeadCodeElimination {
                     mark_live!(select.if_true());
                     mark_live!(select.if_false());
                 }
+                InstKind::Fma(fma) => {
+                    mark_live!(fma.acc());
+                    mark_live!(fma.lhs());
+                    mark_live!(fma.rhs());
+                }
+                InstKind::VectorSplat(splat) => mark_live!(splat.src()),
+                InstKind::VectorExtractElement(extract) => {
+                    mark_live!(extract.src());
+                    mark_live!(extract.index());
+                }
+                InstKind::VectorInsertElement(insert) => {
+                    mark_live!(insert.vector());
+                    mark_live!(insert.element());
+                    mark_live!(insert.index());
+                }
+                InstKind::VectorReduce(reduce) => mark_live!(reduce.src()),
                 InstKind::Branch(branch) => {
                     mark_live!(branch.cond());
                     for &ta in branch.t_args() {

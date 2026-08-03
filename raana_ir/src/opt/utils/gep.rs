@@ -50,16 +50,10 @@ pub fn gep_index_stride<A: Arena + ?Sized>(
     })
 }
 
-pub fn gep_constant_offset_with_replacement_fits<A: Arena + ?Sized>(
-    data: &A,
-    base: Inst,
-    offsets: &[Inst],
-    replacement_position: usize,
-    replacement: i32,
-) -> bool {
+pub fn gep_constant_offsets_fit<A: Arena + ?Sized>(data: &A, base: Inst, offsets: &[i32]) -> bool {
     let mut current_ty = data.inst_data(base).ty().clone();
     let mut constant_offset = 0_i64;
-    for (position, &index) in offsets.iter().enumerate() {
+    for &index in offsets {
         current_ty = match current_ty.kind() {
             TypeKind::Pointer(element) | TypeKind::Array(element, _) => element.clone(),
             _ => return false,
@@ -68,23 +62,13 @@ pub fn gep_constant_offset_with_replacement_fits<A: Arena + ?Sized>(
         else {
             return false;
         };
-        let constant = if position == replacement_position {
-            Some(replacement)
-        } else {
-            match data.inst_data(index).kind() {
-                InstKind::Integer(integer) => Some(integer.value()),
-                _ => None,
-            }
+        let Some(contribution) = i64::from(index).checked_mul(stride) else {
+            return false;
         };
-        if let Some(constant) = constant {
-            let Some(contribution) = i64::from(constant).checked_mul(stride) else {
-                return false;
-            };
-            let Some(offset) = constant_offset.checked_add(contribution) else {
-                return false;
-            };
-            constant_offset = offset;
-        }
+        let Some(offset) = constant_offset.checked_add(contribution) else {
+            return false;
+        };
+        constant_offset = offset;
     }
     true
 }

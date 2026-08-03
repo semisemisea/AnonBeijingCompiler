@@ -30,8 +30,15 @@
 //! iteration is gated by the same test on the same value at the bottom.
 //! Removing the head test is sound exactly when all non-back edges pass a
 //! nonzero value, which the constant check proves.
+//!
+//! SysY `while (i < n) { body; i += 1 }` loops are count-up and test a
+//! comparison (`lt i, bound`) rather than a counter directly. They are
+//! rotated to countdown form by introducing a trip counter `t = bound - i0`
+//! carried in a new header parameter, guarded by a pre-header test `t > 0`
+//! that preserves the trip-zero semantics of the original head test.
 
 use crate::opt::prelude::*;
+use rustc_hash::FxHashMap;
 
 pub struct RotateLoops;
 
@@ -52,7 +59,7 @@ impl Pass for RotateLoops {
             if header == entry {
                 continue;
             }
-            if Self::rotate_loop(data, header) {
+            if Self::rotate_countdown(data, header) || Self::rotate_count_up(data, header) {
                 changed = true;
             }
         }
@@ -63,7 +70,7 @@ impl Pass for RotateLoops {
 impl RotateLoops {
     /// Try to rotate the loop whose header is `header`. Returns true when the
     /// test moved to the bottom of the loop.
-    fn rotate_loop(data: &mut ArenaContextMut<'_>, header: BasicBlock) -> bool {
+    fn rotate_countdown(data: &mut ArenaContextMut<'_>, header: BasicBlock) -> bool {
         let (cond, body, exit) = {
             let terminator = data.layout().basicblock(header).terminator();
             let InstKind::Branch(branch) = data.inst_data(terminator).kind() else {
@@ -153,6 +160,214 @@ impl RotateLoops {
             .jump(body, vec![]);
 
         true
+    }
+
+    /// Rotate a count-up `while (i < bound) { body; i += 1 }` loop to countdown
+    /// form so the backend can fuse the decrement with the loop test. A trip
+    /// counter `t = bound - i0` is carried in a new header parameter; a guard
+    /// in the pre-header preserves the trip-zero semantics.
+    fn rotate_count_up(data: &mut ArenaContextMut<'_>, header: BasicBlock) -> bool {
+        let (body, exit, lt) = {
+            let terminator = data.layout().basicblock(header).terminator();
+            let InstKind::Branch(branch) = data.inst_data(terminator).kind() else {
+                return false;
+            };
+            let body = branch.t_target();
+            let exit = branch.f_target();
+            if body == exit
+                || !branch.t_args().is_empty()
+                || !branch.f_args().is_empty()
+                || !data.bb_data(exit).params().is_empty()
+            {
+                return false;
+            }
+            let InstKind::Binary(lt) = data.inst_data(branch.cond()).kind() else {
+                return false;
+            };
+            if lt.op() != BinaryOp::Lt {
+                return false;
+            }
+            (body, exit, (lt.lhs(), lt.rhs()))
+        };
+        let (iv, bound) = lt;
+
+        let params = data.bb_data(header).params().to_vec();
+        let Some(iv_pos) = params.iter().position(|&p| p == iv) else {
+            return false;
+        };
+        // The bound must be defined before the loop so the trip counter and the
+        // guard can be computed in the pre-header.
+        if params.contains(&bound) || !Self::available_before_loop(data, &params, bound) {
+            return false;
+        }
+
+        // Exactly one entry edge and one back edge, both jumps. The back edge
+        // is the one carrying the `iv + 1` update; the entry edge carries the
+        // initial value.
+        let preds: Vec<Inst> = data.bb_data(header).used_by().iter().copied().collect();
+        let mut back_edge: Option<(Inst, Vec<Inst>)> = None;
+        let mut entry_edge: Option<(Inst, Vec<Inst>)> = None;
+        for &pred in &preds {
+            let InstKind::Jump(jump) = data.inst_data(pred).kind() else {
+                return false;
+            };
+            let args = jump.args().to_vec();
+            if args.len() != params.len() {
+                return false;
+            }
+            let carries_update = matches!(
+                data.inst_data(args[iv_pos]).kind(),
+                InstKind::Binary(b)
+                    if b.op() == BinaryOp::Add
+                        && b.lhs() == iv
+                        && matches!(data.inst_data(b.rhs()).kind(), InstKind::Integer(one) if one.value() == 1)
+            );
+            if carries_update {
+                if back_edge.replace((pred, args)).is_some() {
+                    return false;
+                }
+            } else if entry_edge.replace((pred, args)).is_some() {
+                return false;
+            }
+        }
+        let Some((back_edge_inst, back_args)) = back_edge else {
+            return false;
+        };
+        let Some((entry_edge_inst, entry_args)) = entry_edge else {
+            return false;
+        };
+
+        // Give `exit` block parameters mirroring the header parameters whenever
+        // it reads any of them. The guard and the latch both flow into `exit`
+        // (with the entry or the last-iteration values respectively), so the
+        // reads are remapped from the header parameters to the new block
+        // parameters to keep SSA dominance.
+        let exit_reads_header = data.layout().basicblock(exit).insts().iter().any(|&inst| {
+            data.inst_data(inst)
+                .inst_usage()
+                .any(|operand| params.contains(&operand))
+        });
+        let exit_params: Vec<Inst> = if exit_reads_header {
+            let exit_params = params
+                .iter()
+                .map(|&parameter| {
+                    let ty = data.inst_data(parameter).ty().clone();
+                    data.new_basic_block().add_param(exit, ty)
+                })
+                .collect::<Vec<_>>();
+            let substitution = params
+                .iter()
+                .zip(&exit_params)
+                .map(|(&parameter, &replacement)| (parameter, replacement))
+                .collect::<FxHashMap<_, _>>();
+            let mut mapper = SubstMapper {
+                substitution: &substitution,
+            };
+            let insts: Vec<Inst> = data
+                .layout()
+                .basicblock(exit)
+                .insts()
+                .iter()
+                .copied()
+                .collect();
+            for inst in insts {
+                if data
+                    .inst_data(inst)
+                    .inst_usage()
+                    .any(|operand| substitution.contains_key(&operand))
+                {
+                    let remapped = data
+                        .inst_data(inst)
+                        .clone()
+                        .remap_refs(&mut mapper)
+                        .expect("mapping header parameters cannot fail");
+                    data.replace_inst_with(inst).raw(remapped);
+                }
+            }
+            exit_params
+        } else {
+            Vec::new()
+        };
+
+        // Append the trip counter to the header parameters.
+        let t = data.new_basic_block().add_param(header, Type::get_i32());
+
+        // Guard in the pre-header: `t0 = bound - i0`, enter the loop only when
+        // the trip count is positive.
+        let preheader = data.layout().parent_bb(entry_edge_inst).unwrap();
+        let init_iv = entry_args[iv_pos];
+        let zero = data.new_local_value().integer(0);
+        let one = data.new_local_value().integer(1);
+        let t0 = data.new_local_value().binary(BinaryOp::Sub, bound, init_iv);
+        let positive = data.new_local_value().binary(BinaryOp::Gt, t0, zero);
+        data.layout_mut().insert_before_terminator(preheader, t0);
+        data.layout_mut()
+            .insert_before_terminator(preheader, positive);
+        let mut header_entry_args = entry_args.clone();
+        header_entry_args.push(t0);
+        let exit_entry_args = if exit_reads_header {
+            entry_args.clone()
+        } else {
+            Vec::new()
+        };
+        data.replace_inst_with(entry_edge_inst).branch(
+            positive,
+            header,
+            header_entry_args,
+            exit,
+            exit_entry_args,
+        );
+
+        // The header passes straight through to the body.
+        data.replace_inst_with(data.layout().basicblock(header).terminator())
+            .jump(body, vec![]);
+
+        // Latch: `t_next = t - 1`; test it at the bottom.
+        let latch = data.layout().parent_bb(back_edge_inst).unwrap();
+        let t_next = data.new_local_value().binary(BinaryOp::Sub, t, one);
+        data.layout_mut().insert_before_terminator(latch, t_next);
+        let mut header_back_args = back_args.clone();
+        header_back_args.push(t_next);
+        let exit_back_args = if exit_reads_header {
+            back_args.clone()
+        } else {
+            Vec::new()
+        };
+        data.replace_inst_with(back_edge_inst).branch(
+            t_next,
+            header,
+            header_back_args,
+            exit,
+            exit_back_args,
+        );
+
+        true
+    }
+
+    fn available_before_loop(data: &FunctionData, params: &[Inst], bound: Inst) -> bool {
+        if bound.is_global() || data.inst_data(bound).kind().is_const() {
+            return true;
+        }
+        matches!(data.inst_data(bound).kind(), InstKind::BlockArgRef(..))
+            && !params.contains(&bound)
+    }
+}
+
+/// Remaps header-parameter operands inside the exit block to its own
+/// parameters while the loop rotates.
+struct SubstMapper<'a> {
+    substitution: &'a FxHashMap<Inst, Inst>,
+}
+
+impl crate::ir::remap::EntityMapper for SubstMapper<'_> {
+    type Error = std::convert::Infallible;
+
+    fn map_inst(&mut self, inst: Inst) -> Result<Inst, Self::Error> {
+        Ok(self.substitution.get(&inst).copied().unwrap_or(inst))
+    }
+
+    fn map_block(&mut self, block: BasicBlock) -> Result<BasicBlock, Self::Error> {
+        Ok(block)
     }
 }
 
@@ -262,5 +477,195 @@ mod tests {
             curr_func: Some(func),
         };
         assert!(!run(&mut data), "zero entry value must not rotate");
+    }
+
+    fn build_count_up(
+        program: &mut Program,
+        function_name: &str,
+        init: i32,
+    ) -> (
+        Function,
+        BasicBlock,
+        BasicBlock,
+        BasicBlock,
+        BasicBlock,
+        Inst,
+    ) {
+        let func = program.new_function(
+            Type::get_i32(),
+            function_name.to_owned(),
+            vec![Type::get_i32()],
+        );
+        let (entry, header, body, exit, entry_jump) = {
+            let data = program.func_data_mut(func);
+            let entry = data.add_entry_block();
+            let header = data
+                .new_basic_block()
+                .basic_block("header".to_owned(), vec![Type::get_i32()]);
+            let body = data
+                .new_basic_block()
+                .basic_block("body".to_owned(), vec![]);
+            let exit = data
+                .new_basic_block()
+                .basic_block("exit".to_owned(), vec![]);
+            for block in [header, body, exit] {
+                data.layout_mut().push_bb_back(block);
+            }
+
+            let init_inst = data.new_local_inst().integer(init);
+            let entry_jump = data.new_local_inst().jump(header, vec![init_inst]);
+            data.layout_mut().insert_inst(entry, entry_jump);
+
+            let iv = data.bb_data(header).params()[0];
+            let bound = data.params()[0];
+            let lt = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+            let header_branch = data.new_local_inst().branch(lt, body, vec![], exit, vec![]);
+            data.layout_mut().insert_inst(header, lt);
+            data.layout_mut().insert_inst(header, header_branch);
+
+            let one = data.new_local_inst().integer(1);
+            let next_iv = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+            let backedge = data.new_local_inst().jump(header, vec![next_iv]);
+            data.layout_mut().insert_inst(body, next_iv);
+            data.layout_mut().insert_inst(body, backedge);
+
+            let ret = data.new_local_inst().ret(None);
+            data.layout_mut().insert_inst(exit, ret);
+
+            (entry, header, body, exit, entry_jump)
+        };
+        (func, entry, header, body, exit, entry_jump)
+    }
+
+    #[test]
+    fn rotates_count_up_loop_into_guarded_countdown() {
+        let mut program = Program::new();
+        let (func, entry, header, body, exit, entry_jump) =
+            build_count_up(&mut program, "rot_up", 0);
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(func),
+        };
+
+        assert!(run(&mut data));
+        // The header no longer tests; it jumps straight into the body and now
+        // carries the countdown trip counter as a second parameter.
+        let header_terminator = data.layout().basicblock(header).terminator();
+        assert!(
+            matches!(data.inst_data(header_terminator).kind(), InstKind::Jump(j) if j.target() == body)
+        );
+        assert_eq!(data.bb_data(header).params().len(), 2);
+        // The trip counter is a header parameter.
+        let t = data.bb_data(header).params()[1];
+        assert!(data.inst_data(t).ty().is_i32());
+
+        // The pre-header now guards `trip > 0`: it branches to the header (with
+        // the countdown initial value) or to the exit.
+        let InstKind::Branch(guard) = data.inst_data(entry_jump).kind() else {
+            panic!("pre-header terminator must become a guard branch");
+        };
+        assert_eq!(guard.t_target(), header);
+        assert_eq!(guard.f_target(), exit);
+        assert_eq!(guard.t_args().len(), 2);
+        assert!(guard.f_args().is_empty());
+
+        // The latch tests `t - 1` at the bottom and passes the updated counter.
+        let backedge = data.layout().basicblock(body).terminator();
+        let InstKind::Branch(latch) = data.inst_data(backedge).kind() else {
+            panic!("latch must become the bottom test");
+        };
+        assert_eq!(latch.t_target(), header);
+        assert_eq!(latch.f_target(), exit);
+        assert_eq!(latch.t_args().len(), 2);
+        let InstKind::Binary(step) = data.inst_data(latch.cond()).kind() else {
+            panic!("latch condition must be the decremented counter");
+        };
+        assert_eq!(step.op(), BinaryOp::Sub);
+        assert_eq!(step.lhs(), t);
+    }
+
+    #[test]
+    fn gives_the_exit_block_parameters_when_it_reads_the_induction_variable() {
+        let mut program = Program::new();
+        let func = program.new_function(
+            Type::get_i32(),
+            "rot_up_exit_iv".to_owned(),
+            vec![Type::get_i32()],
+        );
+        let (entry, header, body, exit, entry_jump) = {
+            let data = program.func_data_mut(func);
+            let entry = data.add_entry_block();
+            let header = data
+                .new_basic_block()
+                .basic_block("header".to_owned(), vec![Type::get_i32()]);
+            let body = data
+                .new_basic_block()
+                .basic_block("body".to_owned(), vec![]);
+            let exit = data
+                .new_basic_block()
+                .basic_block("exit".to_owned(), vec![]);
+            for block in [header, body, exit] {
+                data.layout_mut().push_bb_back(block);
+            }
+
+            let init_inst = data.new_local_inst().integer(0);
+            let entry_jump = data.new_local_inst().jump(header, vec![init_inst]);
+            data.layout_mut().insert_inst(entry, entry_jump);
+
+            let iv = data.bb_data(header).params()[0];
+            let bound = data.params()[0];
+            let lt = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+            let header_branch = data.new_local_inst().branch(lt, body, vec![], exit, vec![]);
+            data.layout_mut().insert_inst(header, lt);
+            data.layout_mut().insert_inst(header, header_branch);
+
+            let one = data.new_local_inst().integer(1);
+            let next_iv = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+            let backedge = data.new_local_inst().jump(header, vec![next_iv]);
+            data.layout_mut().insert_inst(body, next_iv);
+            data.layout_mut().insert_inst(body, backedge);
+
+            // The exit reads the induction variable, forcing the rotation to
+            // give it its own parameter.
+            let five = data.new_local_inst().integer(5);
+            let observed = data.new_local_inst().binary(BinaryOp::Add, iv, five);
+            let ret = data.new_local_inst().ret(Some(observed));
+            data.layout_mut().insert_inst(exit, five);
+            data.layout_mut().insert_inst(exit, observed);
+            data.layout_mut().insert_inst(exit, ret);
+
+            (entry, header, body, exit, entry_jump)
+        };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(func),
+        };
+        assert!(run(&mut data));
+
+        // Exit now carries one parameter mirroring the induction variable, and
+        // its computation reads that parameter rather than the header one.
+        assert_eq!(data.bb_data(exit).params().len(), 1);
+        let exit_param = data.bb_data(exit).params()[0];
+        let observed_uses_param = data
+            .layout()
+            .basicblock(exit)
+            .insts()
+            .iter()
+            .any(|&inst| data.inst_data(inst).inst_usage().any(|op| op == exit_param));
+        assert!(observed_uses_param, "exit must use its own parameter");
+
+        // Both the guard (trip zero) and the latch (last iteration) pass the
+        // induction variable to the exit.
+        let InstKind::Branch(guard) = data.inst_data(entry_jump).kind() else {
+            panic!("pre-header must guard");
+        };
+        assert_eq!(guard.f_target(), exit);
+        assert_eq!(guard.f_args().len(), 1);
+        let backedge = data.layout().basicblock(body).terminator();
+        let InstKind::Branch(latch) = data.inst_data(backedge).kind() else {
+            panic!("latch must be a branch");
+        };
+        assert_eq!(latch.f_target(), exit);
+        assert_eq!(latch.f_args().len(), 1);
     }
 }

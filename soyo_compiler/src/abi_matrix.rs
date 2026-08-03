@@ -420,4 +420,21 @@ mod tests {
             "the -O0-style two-instruction form must be strictly larger:\n{off_g}\n{on_g}"
         );
     }
+
+    #[test]
+    fn product_parity_branch_avoids_materializing_the_product() {
+        let source = "int main() { int a = getint(); int b = getint(); if (a * b % 2 == 0) { return 1; } return 0; }\n";
+        let assembly = compile_sy(source, Target::Aarch64, 2);
+        let main = function_section(&assembly, "main");
+        assert!(main.contains("and w"), "{main}");
+        assert!(main.contains("tbnz "), "{main}");
+        assert!(!main.contains("mul "), "{main}");
+
+        let values = [i32::MIN, -3, -2, -1, 0, 1, 2, 3, i32::MAX];
+        for lhs in values {
+            for rhs in values {
+                assert_eq!(lhs.wrapping_mul(rhs) & 1, (lhs & rhs) & 1);
+            }
+        }
+    }
 }

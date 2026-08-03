@@ -3,9 +3,9 @@
 本文档只记录尚未完成的工作。已完成里程碑只保留一行摘要，历史设计与实现细节
 以 Git 提交记录和代码测试为准，不在这里重复维护。
 
-> 进行中：§2 主计划 E——matmul 标量收敛（M49 已完成，进行 M50-M55，L1+L2），
-> 以 `01_mm1` 为基线收敛内层循环到 gcc 标量水平。SIMD Phase 2（M42-M46）
-> 仍搁置，见 §3。
+> 进行中：§2 主计划 E——matmul 标量收敛（M49-M51 已完成，进行 M52-M55），
+> 以 `01_mm1` 为基线收敛内层循环到 gcc 标量水平（内层 ~8 条/element）。
+> SIMD Phase 2（M42-M46）仍搁置，见 §3。
 
 ## 已完成里程碑摘要
 
@@ -20,6 +20,9 @@
   （BRANCH14/19/26 与 RISC-V B/JAL）。
 - **M28-M29**：分支发射重构（对照 Cranelift MachBuffer）——RISC-V `CondBr`
   slot 化、`beqz/bnez` 收敛、veneer 全覆盖、buffer 行为测试与门禁。
+- **M50**：PSR 触发（含 loop-invariant header 参数支持）+ LICM 同类修复——
+  `C[i][j]`/`B[k][j]` 指针化、`A[i][k]` GEP 外提；内层 j 循环 ~20 → ~8
+  条/element。functional 109/109、h_functional 40/40、RISC-V 109/109。
 - **M49**：SSA 参数/指针 alloca 提升扩展（L1 根因）——`variable_analysis`
   放开为单机器字类型 + 逃逸检查；`mm` 参数栈重载消失、基址进寄存器。functional
   109/109、h_functional 40/40、RISC-V 109/109、双 target byte-identical。
@@ -189,9 +192,9 @@ alloca（`%v_A/%v_B/%v_C`）类型是 `**[i32;1024]`（**指针**），被排除
 
 ### 2.3 目标与验收指标
 
-- M49 后 `mm` 无 `alloc`/`store`/`load %v_*`；内层 j 循环无栈重载。
-- M50 后内层 j 循环收敛到 ~8-9 条/element（C/B 指针递增 + `A[i][k]` 外提到
-  j 循环前 + `madd` + `str`）。
+- ✅ M49：`mm` 无 `alloc`/`store`/`load %v_*`；内层 j 循环无栈重载。
+- ✅ M50：内层 j 循环收敛到 ~8-9 条/element（C/B 基址寄存器 + `A[i][k]`
+  外提到 j 循环前 + `madd` + `str`）。
 - M52 后循环测试变 `subs`+`b.ne`；M53 后零循环变 `bl memset`。
 - 全量回归：functional/h_functional 149/149、perf 60/60、-O0/1/2 × 双 target
   5 次 byte-identical、RISC-V 全量不受影响。
@@ -210,31 +213,28 @@ alloca（`%v_A/%v_B/%v_C`）类型是 `**[i32;1024]`（**指针**），被排除
   RISC-V functional 109/109、-O0/1/2 × 双 target byte-identical 5×、
   新增单测 `promotes_pointer_slot_alloca`。详见 git 提交历史。
 
-#### M50：PSR 触发验证与 cost model 校准（L1）
+#### M50：PSR 触发验证与 cost model 校准（L1）✅
 
-- 前置：M49
-- 文件：`raana_ir/src/opt/passes/pointer_strength_reduction.rs`、
-  `raana_ir/src/opt/utils/pointer_strength_reduction_cost.rs`
-- 改动：
-  1. M49 后 GEP base 成为 header 可用 param，`find_candidate` 应命中
-     `C[i][j]`/`A[i][k]`/`B[k][j]` 三组 GEP；
-  2. 若 cost model 拒绝（`MAX_BREAK_EVEN_TRIPS=4` 偏保守），按 01_mm1 实际
-     迭代量级（n³）校准阈值；核对 `old_iteration_insts` 对"多 GEP 循环"的
-     收益估计（A[i][k] 应只外提一次、C/B 各一条递增指针）。
-- 验收：内层 j 循环变「C/B 指针递增 + `A[i][k]` 外提 + `madd` + `str`」，
-  ~8-9 条/element；`.raana` 中 GEP 被替换为 header 指针 param + latch
-  `getelemptr(ptr, step)`。
+- 状态：**已完成**。`find_candidate` 命中外层 j 循环的 `C[i][j]`/`B[k][j]` 两组
+  GEP（指针递减），并扩展 `available_at_header` + `apply_candidate` 支持
+  **loop-invariant header 参数**（回边直通参数，preheader edge arg 代入初始
+  指针）。cost model 无需校准（break-even ≈2 trips ≤ 4）。
+- 同时修复 **LICM** 的同类问题：`solve` 识别直通 header 参数并在外提时用 entry
+  arg 代入操作数 → `A[i][k]` GEP 外提到 j 循环前（load 因潜在别名保守留循环内）。
+- 验收通过：内层 j 循环收敛到 **~8 条/element**（C/B 基址寄存器 + `madd` +
+  `str`，`[x, w, sxtw #2]` 折叠）；`main` 求和循环无循环内 `adrp`；functional
+  109/109、h_functional 40/40、perf/01_mm1 PASS、RISC-V 109/109、双 target
+  byte-identical。新增单测：PSR `substitutes_a_passthrough_invariant_header_parameter_in_the_initial_pointer`、
+  LICM `hoists_an_invariant_referencing_a_passthrough_header_parameter`。
 
-#### M51：LICM 循环不变 load 核对（L1）
+#### M51：LICM 循环不变 load 核对（L1）✅
 
-- 文件：`raana_ir/src/opt/passes/licm.rs`
-- 现状：LICM 只提升纯运算、不提升 load（测试
-  `hoists_pure_binary_ops_but_not_memory_side_effects`）。`mm` 的栈重载随
-  M49 消失后不再需要 load 外提。
-- 改动：核对全局数组场景——`main` 最终求和循环对 `gv_B` 是否仍每行重发
-  `adrp`（应由 M50 的 PSR 消除）；若否，评估给 LICM 增加"循环不变地址 load
-  外提"，并核对 TODO §4 声称"循环不变 load 外提已并入 M31-M35"的现状。
-- 验收：`.s` 中 `main` 求和循环无循环内 `adrp`；内存访问只剩地址递增。
+- 状态：**已完成（核对）**。M50 修复后 LICM 已能外提循环不变 GEP 基址
+  （`main` 求和循环 base 进循环前寄存器，`[x1, w2, sxtw #2]` 索引 load）。
+  关于"循环不变地址 load 外提"：`A[i][k]` load 地址循环不变，但循环内对 C
+  有 store，无别名分析时无法证明不 alias → **保守不外提**（与既有
+  `hoists_pure_binary_ops_but_not_memory_side_effects` 约束一致）。别名分析
+  属 M42（SIMD 前置），后续再评估。无需新增代码。
 
 #### M52：count-up 循环旋转 + `subs` 融合（L2a）
 

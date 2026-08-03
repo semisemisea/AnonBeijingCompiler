@@ -1,6 +1,3 @@
-use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::SmallVec;
-
 use crate::opt::{
     analysis_passes::{
         dom_tree::v2::DominanceTree,
@@ -20,6 +17,8 @@ use crate::opt::{
         preheader::{EnsurePreheader, ensure_preheader},
     },
 };
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 pub struct PointerStrengthReduction;
 
@@ -143,6 +142,21 @@ impl PointerStrengthReduction {
         }
 
         let mut best = None;
+        let header_params = data.bb_data(looop.header()).params().to_vec();
+        // A header block parameter that every backedge passes through unchanged
+        // is loop-invariant: its value on the first entry equals its value in
+        // every iteration, so the preheader edge argument can substitute for it
+        // when the initial pointer is computed.
+        let invariant_header_params = header_params
+            .iter()
+            .enumerate()
+            .filter_map(|(position, &parameter)| {
+                backedges
+                    .iter()
+                    .all(|edge| edge.args(data).get(position) == Some(&parameter))
+                    .then_some(parameter)
+            })
+            .collect::<FxHashSet<_>>();
         for iv in ivs.for_loop(looop) {
             let Some(exit) = normalize_strict_exit(data, looop, iv) else {
                 continue;
@@ -183,6 +197,7 @@ impl PointerStrengthReduction {
                         dom_tree,
                         looop,
                         parameter_blocks,
+                        &invariant_header_params,
                         gep.base(),
                     ) || !Self::has_only_loop_memory_users(data, looop, inst)
                         || !backedge_groups
@@ -216,6 +231,7 @@ impl PointerStrengthReduction {
                                     dom_tree,
                                     looop,
                                     parameter_blocks,
+                                    &invariant_header_params,
                                     offset,
                                 ) {
                                     valid = false;
@@ -241,6 +257,7 @@ impl PointerStrengthReduction {
                                 dom_tree,
                                 looop,
                                 parameter_blocks,
+                                &invariant_header_params,
                                 invariant,
                             )
                         }) {
@@ -344,9 +361,13 @@ impl PointerStrengthReduction {
         dom_tree: &DominanceTree,
         looop: &Loop,
         parameter_blocks: &FxHashMap<Inst, BasicBlock>,
+        invariant_header_params: &FxHashSet<Inst>,
         value: Inst,
     ) -> bool {
         if value.is_global() || data.inst_data(value).kind().is_const() {
+            return true;
+        }
+        if invariant_header_params.contains(&value) {
             return true;
         }
         match data.layout().parent_bb(value) {
@@ -593,6 +614,8 @@ impl PointerStrengthReduction {
         affine: &AffineI32Expr,
         iv: Inst,
         initial_iv: Inst,
+        header_param_positions: &FxHashMap<Inst, usize>,
+        edge_args: &[Inst],
     ) -> Inst {
         fn clone_value(
             data: &mut ArenaContextMut<'_>,
@@ -600,27 +623,59 @@ impl PointerStrengthReduction {
             chain: &[Inst],
             iv: Inst,
             initial_iv: Inst,
+            header_param_positions: &FxHashMap<Inst, usize>,
+            edge_args: &[Inst],
             value: Inst,
         ) -> Inst {
             if value == iv {
                 return initial_iv;
             }
             if !chain.contains(&value) {
+                if let Some(&parameter_position) = header_param_positions.get(&value) {
+                    return edge_args[parameter_position];
+                }
                 return value;
             }
             let InstKind::Binary(binary) = data.inst_data(value).kind() else {
                 unreachable!("affine chains contain only binary instructions")
             };
             let (op, lhs, rhs) = (binary.op(), binary.lhs(), binary.rhs());
-            let lhs = clone_value(data, preheader, chain, iv, initial_iv, lhs);
-            let rhs = clone_value(data, preheader, chain, iv, initial_iv, rhs);
+            let lhs = clone_value(
+                data,
+                preheader,
+                chain,
+                iv,
+                initial_iv,
+                header_param_positions,
+                edge_args,
+                lhs,
+            );
+            let rhs = clone_value(
+                data,
+                preheader,
+                chain,
+                iv,
+                initial_iv,
+                header_param_positions,
+                edge_args,
+                rhs,
+            );
             let cloned = data.new_local_value().binary(op, lhs, rhs);
             data.layout_mut()
                 .insert_before_terminator(preheader, cloned);
             cloned
         }
 
-        clone_value(data, preheader, &affine.chain, iv, initial_iv, affine.value)
+        clone_value(
+            data,
+            preheader,
+            &affine.chain,
+            iv,
+            initial_iv,
+            header_param_positions,
+            edge_args,
+            affine.value,
+        )
     }
 
     fn has_only_loop_memory_users(data: &ArenaContextMut<'_>, looop: &Loop, gep: Inst) -> bool {
@@ -706,11 +761,27 @@ impl PointerStrengthReduction {
         }
 
         let mut rewrites = LogicalEdgeRewriter::new();
+        let header_param_positions = data
+            .bb_data(looop.header())
+            .params()
+            .iter()
+            .enumerate()
+            .map(|(position, &parameter)| (parameter, position))
+            .collect::<FxHashMap<_, _>>();
         for (edge, constant_offsets, initial_iv) in initial_indices_by_edge {
+            // Non-IV offsets may be loop-invariant header parameters; their
+            // preheader edge argument substitutes for them in the initial
+            // pointer (the parameter value is unchanged on every backedge).
+            let edge_args = edge.args(data).to_vec();
             let mut initial_offsets = candidate.offsets.clone();
             for (position, evolution) in candidate.address_evolution.indices.iter().enumerate() {
                 initial_offsets[position] = match evolution {
-                    IndexEvolution::Invariant => initial_offsets[position],
+                    IndexEvolution::Invariant => match header_param_positions
+                        .get(&candidate.offsets[position])
+                    {
+                        Some(&parameter_position) => edge_args[parameter_position],
+                        None => initial_offsets[position],
+                    },
                     IndexEvolution::Direct => initial_iv,
                     IndexEvolution::Affine(affine) => match constant_offsets
                         .as_ref()
@@ -723,6 +794,8 @@ impl PointerStrengthReduction {
                             affine,
                             candidate.iv,
                             initial_iv,
+                            &header_param_positions,
+                            &edge_args,
                         ),
                     },
                 };
@@ -2465,6 +2538,91 @@ mod tests {
         };
         assert_eq!(true_initial.offsets().last().copied(), Some(zero));
         assert_eq!(false_initial.offsets().last().copied(), Some(one));
+        assert!(!run(&mut program, function));
+    }
+
+    #[test]
+    fn substitutes_a_passthrough_invariant_header_parameter_in_the_initial_pointer() {
+        let array_ty = Type::get_array(Type::get_i32(), 32);
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "pointer_sr_header_param".into(),
+            vec![Type::get_pointer(array_ty), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let outer_index = data.params()[1];
+        // The loop header carries [outer_index, iv]; the backedge passes the
+        // first parameter through unchanged, so it is loop-invariant.
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32(), Type::get_i32()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, latch, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![outer_index, zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let header_outer = data.bb_data(header).params()[0];
+        let iv = data.bb_data(header).params()[1];
+        let gep = data
+            .new_local_inst()
+            .get_elem_ptr(base, vec![header_outer, iv]);
+        let load = data.new_local_inst().load(gep);
+        let one = data.new_local_inst().integer(1);
+        let next_iv = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        for inst in [gep, load, next_iv] {
+            data.layout_mut().insert_inst(header, inst);
+        }
+        let bound = data.new_local_inst().integer(32);
+        let compare = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+        data.layout_mut().insert_inst(header, compare);
+        let header_branch = data
+            .new_local_inst()
+            .branch(compare, latch, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, header_branch);
+
+        let backedge = data
+            .new_local_inst()
+            .jump(header, vec![header_outer, next_iv]);
+        data.layout_mut().insert_inst(latch, backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(data.bb_data(header).params().len(), 3);
+
+        let InstKind::Jump(entry_jump) = data.inst_data(entry_jump).kind() else {
+            unreachable!()
+        };
+        let initial_pointer = entry_jump.args()[2];
+        let InstKind::GetElemPtr(initial) = data.inst_data(initial_pointer).kind() else {
+            unreachable!()
+        };
+        assert_eq!(initial.base(), base);
+        // The invariant header parameter is replaced by the preheader edge
+        // argument (the `outer_index` function parameter).
+        assert_eq!(initial.offsets().len(), 2);
+        assert_eq!(initial.offsets()[0], outer_index);
+        assert_eq!(integer_constant(data, initial.offsets()[1]), Some(0));
+
+        let InstKind::Jump(backedge) = data.inst_data(backedge).kind() else {
+            unreachable!()
+        };
+        let next_pointer = backedge.args()[2];
+        let InstKind::GetElemPtr(next) = data.inst_data(next_pointer).kind() else {
+            unreachable!()
+        };
+        let pointer = data.bb_data(header).params()[2];
+        assert_eq!(next.base(), pointer);
+        assert_eq!(integer_constant(data, next.offsets()[0]), Some(1));
         assert!(!run(&mut program, function));
     }
 }

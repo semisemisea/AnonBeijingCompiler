@@ -191,6 +191,11 @@ impl PassesManager {
         let tco_initial = Box::new(tco::TailCallElim);
         p.register_initial(tco_initial);
 
+        // Change eligible two-dimensional arrays to the layout favored by
+        // their hottest innermost-loop accesses before GEPs are reshaped.
+        let column_major = Box::new(column_major::ColumnMajor);
+        p.register_initial(column_major);
+
         // Promote unobservable scalar globals to SSA values so the
         // backend keeps them in registers (load once, write back once).
         // One-shot (not a fixpoint rewrite): it must run after inlining

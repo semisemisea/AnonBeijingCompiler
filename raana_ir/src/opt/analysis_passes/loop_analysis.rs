@@ -46,11 +46,9 @@ pub struct LoopAnalysis {
 
     /// `direct_parent[i] == j`, means `loops[i]`'s direct parent is `loops[j]`
     /// if `i == j`, means `loops[i]` is one of the root in the loop forest.
-    #[cfg(debug_assertions)]
     direct_parent: Vec<usize>,
 
     /// Each loop owns a unique header, so we use it to find the index of `loops`.
-    #[cfg(debug_assertions)]
     loop_index: FxHashMap<BasicBlock, usize>,
 
     /// `block_to_inner_loop[&bb] == i`, means the smallest loop contains the `bb` is `loops[i]`
@@ -63,9 +61,43 @@ impl LoopAnalysis {
     }
 
     pub fn min_loop_contain(&self, block: BasicBlock) -> Option<&Loop> {
-        self.block_to_inner_loop
-            .get(&block)
-            .map(|&i| &self.loops[i])
+        self.min_loop_contain_index(block)
+            .map(|index| &self.loops[index])
+    }
+
+    /// Returns the index of the innermost loop containing `block`.
+    pub fn min_loop_contain_index(&self, block: BasicBlock) -> Option<usize> {
+        self.block_to_inner_loop.get(&block).copied()
+    }
+
+    /// Returns the analysis-local index of the loop with `header`.
+    pub fn loop_index(&self, header: BasicBlock) -> Option<usize> {
+        self.loop_index.get(&header).copied()
+    }
+
+    /// Returns the direct parent index, or `None` when `index` is a root loop.
+    pub fn parent_loop_index(&self, index: usize) -> Option<usize> {
+        let parent = self.direct_parent[index];
+        (parent != index).then_some(parent)
+    }
+
+    /// Returns the direct parent, or `None` when `index` is a root loop.
+    pub fn parent_loop(&self, index: usize) -> Option<&Loop> {
+        self.parent_loop_index(index)
+            .map(|parent| &self.loops[parent])
+    }
+
+    /// Iterates loop indices containing `block`, from innermost to outermost.
+    pub fn containing_loop_indices(&self, block: BasicBlock) -> impl Iterator<Item = usize> + '_ {
+        std::iter::successors(self.min_loop_contain_index(block), |&index| {
+            self.parent_loop_index(index)
+        })
+    }
+
+    /// Iterates loops containing `block`, from innermost to outermost.
+    pub fn containing_loops(&self, block: BasicBlock) -> impl Iterator<Item = &Loop> + '_ {
+        self.containing_loop_indices(block)
+            .map(|index| &self.loops[index])
     }
 
     pub fn new(data: &FunctionData) -> (CFG, DominanceTree, LoopAnalysis) {
@@ -135,9 +167,7 @@ impl LoopAnalysis {
 
         let mut block_to_inner_loop = FxHashMap::default();
         block_to_inner_loop.reserve(cfg.block_count());
-        #[cfg(debug_assertions)]
         let mut direct_parent = Vec::with_capacity(loops.len());
-        #[cfg(debug_assertions)]
         for i in 0..loops.len() {
             direct_parent.push(i);
         }
@@ -145,7 +175,6 @@ impl LoopAnalysis {
             l1.body.iter().for_each(|&bb| {
                 block_to_inner_loop.entry(bb).or_insert(i);
             });
-            #[cfg(debug_assertions)]
             if let Some((j, _)) = loops
                 .iter()
                 .enumerate()
@@ -155,7 +184,6 @@ impl LoopAnalysis {
                 direct_parent[i] = j;
             }
         }
-        #[cfg(debug_assertions)]
         let loop_index = FxHashMap::from_iter(loops.iter().enumerate().map(|(i, l)| (l.header, i)));
         #[cfg(debug_assertions)]
         debug_assert_eq!(
@@ -166,9 +194,7 @@ impl LoopAnalysis {
 
         let analysis = LoopAnalysis {
             loops,
-            #[cfg(debug_assertions)]
             direct_parent,
-            #[cfg(debug_assertions)]
             loop_index,
             block_to_inner_loop,
         };
@@ -316,4 +342,129 @@ fn assert_reducible(cfg: &utils::cfg::CFG, dom_tree: &dom_tree::v2::DominanceTre
         cfg.block_count(),
         "irreducible CFG is not supported by natural loop analysis"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NestedLoops {
+        outer_header: BasicBlock,
+        inner_header: BasicBlock,
+        inner_body: BasicBlock,
+        outer_latch: BasicBlock,
+        exit: BasicBlock,
+    }
+
+    fn build_nested_loops() -> (Program, Function, NestedLoops) {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "nested_loops".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let outer_header = data
+            .new_basic_block()
+            .basic_block("outer_header".into(), vec![]);
+        let inner_header = data
+            .new_basic_block()
+            .basic_block("inner_header".into(), vec![]);
+        let inner_body = data
+            .new_basic_block()
+            .basic_block("inner_body".into(), vec![]);
+        let after_inner = data
+            .new_basic_block()
+            .basic_block("after_inner".into(), vec![]);
+        let outer_latch = data
+            .new_basic_block()
+            .basic_block("outer_latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [
+            outer_header,
+            inner_header,
+            inner_body,
+            after_inner,
+            outer_latch,
+            exit,
+        ] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let condition = data.new_local_inst().integer(1);
+        let entry_jump = data.new_local_inst().jump(outer_header, vec![]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let outer_branch =
+            data.new_local_inst()
+                .branch(condition, inner_header, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(outer_header, outer_branch);
+        let inner_branch =
+            data.new_local_inst()
+                .branch(condition, inner_body, vec![], after_inner, vec![]);
+        data.layout_mut().insert_inst(inner_header, inner_branch);
+        let inner_backedge = data.new_local_inst().jump(inner_header, vec![]);
+        data.layout_mut().insert_inst(inner_body, inner_backedge);
+        let after_inner_jump = data.new_local_inst().jump(outer_latch, vec![]);
+        data.layout_mut().insert_inst(after_inner, after_inner_jump);
+        let outer_backedge = data.new_local_inst().jump(outer_header, vec![]);
+        data.layout_mut().insert_inst(outer_latch, outer_backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        (
+            program,
+            function,
+            NestedLoops {
+                outer_header,
+                inner_header,
+                inner_body,
+                outer_latch,
+                exit,
+            },
+        )
+    }
+
+    #[test]
+    fn exposes_direct_parent_indices_and_loops() {
+        let (program, function, blocks) = build_nested_loops();
+        let (_cfg, _dom_tree, loops) = LoopAnalysis::new(program.func_data(function));
+        let inner = loops.loop_index(blocks.inner_header).unwrap();
+        let outer = loops.loop_index(blocks.outer_header).unwrap();
+
+        assert_eq!(loops.parent_loop_index(inner), Some(outer));
+        assert_eq!(
+            loops.parent_loop(inner).map(Loop::header),
+            Some(blocks.outer_header)
+        );
+        assert_eq!(loops.parent_loop_index(outer), None);
+        assert!(loops.parent_loop(outer).is_none());
+    }
+
+    #[test]
+    fn lists_containing_loops_from_inner_to_outer() {
+        let (program, function, blocks) = build_nested_loops();
+        let (_cfg, _dom_tree, loops) = LoopAnalysis::new(program.func_data(function));
+        let inner = loops.loop_index(blocks.inner_header).unwrap();
+        let outer = loops.loop_index(blocks.outer_header).unwrap();
+
+        assert_eq!(loops.min_loop_contain_index(blocks.inner_body), Some(inner));
+        assert_eq!(
+            loops
+                .containing_loop_indices(blocks.inner_body)
+                .collect::<Vec<_>>(),
+            vec![inner, outer]
+        );
+        assert_eq!(
+            loops
+                .containing_loops(blocks.inner_body)
+                .map(Loop::header)
+                .collect::<Vec<_>>(),
+            vec![blocks.inner_header, blocks.outer_header]
+        );
+        assert_eq!(
+            loops
+                .containing_loop_indices(blocks.outer_latch)
+                .collect::<Vec<_>>(),
+            vec![outer]
+        );
+        assert_eq!(loops.min_loop_contain_index(blocks.exit), None);
+        assert_eq!(loops.containing_loops(blocks.exit).count(), 0);
+    }
 }

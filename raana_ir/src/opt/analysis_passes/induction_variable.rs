@@ -76,6 +76,27 @@ impl NormalizedInductionExit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TripCountEstimate {
+    Exact(u64),
+    UpperBound(u64),
+}
+
+impl TripCountEstimate {
+    pub fn exact(self) -> Option<u64> {
+        match self {
+            Self::Exact(iterations) => Some(iterations),
+            Self::UpperBound(_) => None,
+        }
+    }
+
+    pub fn upper_bound(self) -> u64 {
+        match self {
+            Self::Exact(iterations) | Self::UpperBound(iterations) => iterations,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConstantInductionRange {
     min: i32,
     max: i32,
@@ -274,6 +295,75 @@ pub fn constant_induction_range(
             })
         }
     }
+}
+
+/// Compute a constant trip count for a normalized strict induction exit.
+/// Multiple entry values produce an upper bound unless they all have the same
+/// trip count.
+pub fn induction_trip_count(
+    data: &ArenaContextMut<'_>,
+    iv: &BasicInductionVariable,
+    exit: NormalizedInductionExit,
+) -> Option<TripCountEstimate> {
+    let bound = integer_constant(data, exit.bound())?;
+    let mut counts = iv.initial_values().iter().map(|&initial| {
+        estimated_trip_count_values(
+            integer_constant(data, initial)?,
+            bound,
+            exit.signed_step(),
+            exit.direction(),
+        )
+    });
+    let first = counts.next()??;
+    let mut upper_bound = first;
+    let mut exact = true;
+    for count in counts {
+        let count = count?;
+        exact &= count == first;
+        upper_bound = upper_bound.max(count);
+    }
+    Some(if exact {
+        TripCountEstimate::Exact(first)
+    } else {
+        TripCountEstimate::UpperBound(upper_bound)
+    })
+}
+
+fn estimated_trip_count_values(
+    initial: i32,
+    bound: i32,
+    signed_step: i32,
+    direction: InductionDirection,
+) -> Option<u64> {
+    let (distance, step) = match direction {
+        InductionDirection::Forward => {
+            if signed_step <= 0 {
+                return None;
+            }
+            if initial >= bound {
+                return Some(0);
+            }
+            (
+                i64::from(bound).checked_sub(i64::from(initial))?,
+                i64::from(signed_step),
+            )
+        }
+        InductionDirection::Backward => {
+            if signed_step >= 0 {
+                return None;
+            }
+            if initial <= bound {
+                return Some(0);
+            }
+            (
+                i64::from(initial).checked_sub(i64::from(bound))?,
+                i64::from(signed_step).checked_neg()?,
+            )
+        }
+    };
+    let distance = u64::try_from(distance).ok()?;
+    let step = u64::try_from(step).ok()?;
+    Some(distance.div_ceil(step))
 }
 
 pub fn constant_trip_count(
@@ -517,6 +607,68 @@ mod tests {
                 expected
             );
         }
+    }
+
+    fn trip_count(
+        initial_values: &[i32],
+        bound: i32,
+        signed_step: i32,
+        direction: InductionDirection,
+    ) -> Option<TripCountEstimate> {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "trip_count".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let initial_values = initial_values
+            .iter()
+            .map(|&value| data.new_local_inst().integer(value))
+            .collect();
+        let bound = data.new_local_inst().integer(bound);
+        let step = data.new_local_inst().integer(signed_step);
+        let iv = BasicInductionVariable {
+            parameter: bound,
+            initial_values,
+            update_values: SmallVec::new(),
+            step: InductionStep::Add(step),
+        };
+        let exit = NormalizedInductionExit {
+            direction,
+            signed_step,
+            bound,
+        };
+        let context = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(function),
+        };
+        induction_trip_count(&context, &iv, exit)
+    }
+
+    #[test]
+    fn computes_exact_forward_backward_non_unit_and_zero_trip_counts() {
+        assert_eq!(
+            trip_count(&[0], 7, 2, InductionDirection::Forward),
+            Some(TripCountEstimate::Exact(4))
+        );
+        assert_eq!(
+            trip_count(&[7], 0, -2, InductionDirection::Backward),
+            Some(TripCountEstimate::Exact(4))
+        );
+        assert_eq!(
+            trip_count(&[7], 7, 1, InductionDirection::Forward),
+            Some(TripCountEstimate::Exact(0))
+        );
+    }
+
+    #[test]
+    fn estimates_multiple_initial_values_conservatively() {
+        let estimate = trip_count(&[0, 3, 8], 8, 2, InductionDirection::Forward).unwrap();
+        assert_eq!(estimate, TripCountEstimate::UpperBound(4));
+        assert_eq!(estimate.exact(), None);
+        assert_eq!(estimate.upper_bound(), 4);
+
+        let exact = trip_count(&[0, -1], 7, 2, InductionDirection::Forward).unwrap();
+        assert_eq!(exact, TripCountEstimate::Exact(4));
+        assert_eq!(exact.exact(), Some(4));
+        assert_eq!(exact.upper_bound(), 4);
     }
 
     fn assert_single_iv(

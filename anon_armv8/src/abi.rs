@@ -31,7 +31,8 @@ impl ABIMachineSpec for AArch64Abi {
     fn spillslot_size(regclass: RegClass) -> u32 {
         match regclass {
             RegClass::Int | RegClass::Float => 1,
-            RegClass::Vector => panic!("AArch64 vector spills are unsupported"),
+            // A 128-bit vector occupies two 8-byte spill units.
+            RegClass::Vector => 2,
         }
     }
 
@@ -106,7 +107,12 @@ impl ABIMachineSpec for AArch64Abi {
     }
 
     fn gen_move(src: Reg, dst: Reg, ty: LoweredType) -> MInst {
-        if ty == F32 {
+        if ty.is_vector() {
+            MInst::VecMov {
+                dst: Writable::from_reg(dst),
+                src,
+            }
+        } else if ty == F32 {
             MInst::FMov {
                 dst: Writable::from_reg(dst),
                 src,
@@ -275,7 +281,9 @@ fn operand_size(ty: LoweredType) -> OperandSize {
     }
 }
 fn memory_type(ty: LoweredType) -> MemoryType {
-    if ty == F32 {
+    if ty.is_vector() {
+        MemoryType::Vec128
+    } else if ty == F32 {
         MemoryType::F32
     } else if ty == I32 {
         MemoryType::I32

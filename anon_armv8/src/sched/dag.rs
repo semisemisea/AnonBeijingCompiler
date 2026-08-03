@@ -972,7 +972,7 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
             is_barrier: false,
         },
 
-        MInst::FMov { dst, src } => InstDeps {
+        MInst::FMov { dst, src } | MInst::VecMov { dst, src } => InstDeps {
             defs: preg(dst.reg),
             uses: preg(*src),
             flags_def: false,

@@ -5,7 +5,7 @@ use taki_mir::{
     emit_buffer::LabelKind,
     reg_alloc::reg::{OperandVisitor, OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
-    types::{F32, I32, I64, LoweredType},
+    types::{F32, I32, I64, LoweredType, V2F64, V2I64, V4F32, V4I32},
     vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
 };
 
@@ -183,7 +183,9 @@ pub struct UImm12Scaled {
 impl UImm12Scaled {
     pub const fn new(value: u64, access_size: u8) -> Option<Self> {
         let access_size = access_size as u64;
-        if !matches!(access_size, 4 | 8) || value % access_size != 0 {
+        // Scaled unsigned offsets cover 32/64-bit scalars and 128-bit vectors
+        // (`ldr q`, scale 16); `SImm7Scaled` likewise for pair forms.
+        if !matches!(access_size, 4 | 8 | 16) || value % access_size != 0 {
             return None;
         }
         let scaled = value / access_size;
@@ -211,7 +213,7 @@ pub struct SImm7Scaled {
 impl SImm7Scaled {
     pub const fn new(value: i64, access_size: u8) -> Option<Self> {
         let access_size = access_size as i64;
-        if !matches!(access_size, 4 | 8) || value % access_size != 0 {
+        if !matches!(access_size, 4 | 8 | 16) || value % access_size != 0 {
             return None;
         }
         let scaled = value / access_size;
@@ -237,6 +239,8 @@ pub enum MemoryType {
     F32,
     /// 64-bit floating register preservation; language-level values are f32.
     F64,
+    /// 128-bit vector value (`ldr q` / `str q`).
+    Vec128,
 }
 
 impl MemoryType {
@@ -244,6 +248,7 @@ impl MemoryType {
         match self {
             Self::I32 | Self::F32 => 4,
             Self::I64 | Self::F64 => 8,
+            Self::Vec128 => 16,
         }
     }
 
@@ -622,6 +627,11 @@ pub enum MInst {
         dst: WritableReg,
         src: Reg,
     },
+    /// 128-bit vector register copy: `mov v{d}.16b, v{s}.16b`.
+    VecMov {
+        dst: WritableReg,
+        src: Reg,
+    },
     FMovFromZero {
         dst: WritableReg,
     },
@@ -815,6 +825,7 @@ impl MachInst for MInst {
             Self::AluRRImmShift { dst, src, .. }
             | Self::Mov { dst, src, .. }
             | Self::FMov { dst, src }
+            | Self::VecMov { dst, src }
             | Self::Scvtf { dst, src }
             | Self::Fcvtzs { dst, src } => {
                 collector.reg_use(src);
@@ -988,7 +999,9 @@ impl MachInst for MInst {
 
     fn is_move(&self) -> Option<(Writable<Reg>, Reg)> {
         match self {
-            Self::Mov { dst, src, .. } | Self::FMov { dst, src } => Some((*dst, *src)),
+            Self::Mov { dst, src, .. }
+            | Self::FMov { dst, src }
+            | Self::VecMov { dst, src } => Some((*dst, *src)),
             _ => None,
         }
     }
@@ -1010,6 +1023,10 @@ impl MachInst for MInst {
             I32 => (&[RegClass::Int], &[I32]),
             I64 => (&[RegClass::Int], &[I64]),
             F32 => (&[RegClass::Float], &[F32]),
+            V4I32 => (&[RegClass::Vector], &[V4I32]),
+            V2I64 => (&[RegClass::Vector], &[V2I64]),
+            V4F32 => (&[RegClass::Vector], &[V4F32]),
+            V2F64 => (&[RegClass::Vector], &[V2F64]),
             _ => unreachable!("unsupported AArch64 lowered type"),
         }
     }
@@ -1474,6 +1491,13 @@ impl MachInstEmit for MInst {
                 }
             }
             Self::FMov { dst, src } => emit_fmov(ctx, dst.to_reg(), src),
+            Self::VecMov { dst, src } => {
+                write!(ctx, "mov ")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".16b, ")?;
+                emit_vec_reg(ctx, *src)?;
+                write!(ctx, ".16b")
+            }
             Self::FMovFromZero { dst } => {
                 write!(ctx, "fmov ")?;
                 emit_float_reg(ctx, dst.to_reg(), false)?;
@@ -1781,12 +1805,14 @@ fn emit_reg(ctx: &mut dyn EmitContext, reg: Reg, size: OperandSize) -> core::fmt
     }
 }
 fn emit_data_reg(ctx: &mut dyn EmitContext, reg: Reg, ty: MemoryType) -> core::fmt::Result {
-    if ty == MemoryType::I64 {
-        emit_reg(ctx, reg, OperandSize::Size64)
-    } else if ty == MemoryType::I32 {
-        emit_reg(ctx, reg, OperandSize::Size32)
-    } else {
-        emit_float_reg(ctx, reg, ty == MemoryType::F64)
+    match ty {
+        MemoryType::I64 => emit_reg(ctx, reg, OperandSize::Size64),
+        MemoryType::I32 => emit_reg(ctx, reg, OperandSize::Size32),
+        MemoryType::Vec128 => match reg.to_real_reg() {
+            Some(preg) if preg.class() == RegClass::Vector => write!(ctx, "q{}", preg.hw_enc()),
+            _ => ctx.write_reg(&reg),
+        },
+        MemoryType::F32 | MemoryType::F64 => emit_float_reg(ctx, reg, ty == MemoryType::F64),
     }
 }
 fn emit_float_reg(ctx: &mut dyn EmitContext, reg: Reg, is_double: bool) -> core::fmt::Result {
@@ -1799,6 +1825,12 @@ fn emit_float_reg(ctx: &mut dyn EmitContext, reg: Reg, is_double: bool) -> core:
                 preg.hw_enc()
             )
         }
+        _ => ctx.write_reg(&reg),
+    }
+}
+fn emit_vec_reg(ctx: &mut dyn EmitContext, reg: Reg) -> core::fmt::Result {
+    match reg.to_real_reg() {
+        Some(preg) if preg.class() == RegClass::Vector => write!(ctx, "v{}", preg.hw_enc()),
         _ => ctx.write_reg(&reg),
     }
 }
@@ -2101,7 +2133,7 @@ mod tests {
         abi::ArgPair,
         block_order::MirBlockIndex,
         prelude::{HirFunction, HirInst},
-        reg_alloc::reg::{OperandConstraint, OperandKind, RegClass, VReg},
+        reg_alloc::reg::{OperandConstraint, OperandKind, PReg, RegClass, VReg},
         register::{Reg, Writable},
         vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
     };
@@ -2457,5 +2489,56 @@ mod tests {
             }],
         };
         assert!(args.verify().is_err());
+    }
+
+    fn vec_reg(index: u8) -> Reg {
+        Reg::from_physical_reg(PReg::new(index as usize, RegClass::Vector))
+    }
+
+    #[test]
+    fn emits_vector_move_as_mov_v_b() {
+        let text = emit(MInst::VecMov {
+            dst: Writable::from_reg(vec_reg(1)),
+            src: vec_reg(2),
+        });
+        assert_eq!(text, "mov v1.16b, v2.16b");
+    }
+
+    #[test]
+    fn emits_128_bit_vector_load_and_store() {
+        let load = emit(MInst::Load {
+            ty: super::MemoryType::Vec128,
+            dst: Writable::from_reg(vec_reg(3)),
+            addr: super::AMode::UnsignedOffset {
+                base: int_reg(0),
+                offset: super::UImm12Scaled::new(32, 16).unwrap(),
+            },
+        });
+        assert_eq!(load, "ldr q3, [x0, #32]");
+
+        let store = emit(MInst::Store {
+            ty: super::MemoryType::Vec128,
+            src: vec_reg(4),
+            addr: super::AMode::UnsignedOffset {
+                base: int_reg(0),
+                offset: super::UImm12Scaled::new(16, 16).unwrap(),
+            },
+        });
+        assert_eq!(store, "str q4, [x0, #16]");
+    }
+
+    #[test]
+    fn vector_types_map_to_the_vector_regclass() {
+        use taki_mir::types::*;
+        for (ty, name) in [
+            (V4I32, "V4I32"),
+            (V2I64, "V2I64"),
+            (V4F32, "V4F32"),
+            (V2F64, "V2F64"),
+        ] {
+            let (classes, types) = MInst::rc_for_type(ty);
+            assert_eq!(classes, &[RegClass::Vector], "{name} class");
+            assert_eq!(types, &[ty], "{name} type");
+        }
     }
 }

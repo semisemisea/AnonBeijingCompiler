@@ -12,10 +12,16 @@
 //! Notably, all the integer type is **sign-agnostic**.
 //!
 //! 0b 0000 0000 0000 0000
-//! 0b 0000 0000 0000 00xx -> shows the fundemental type. 01 for Integer, 10 for Float.
-//! 0b 0000 0000 0000 xx00 -> shows the bitwidth of type. 01 for 32 bits, 10 for 64 bits.
-//! 0b 0000 0000 xxxx 0000 -> (planned) to indicate the lanes of vector.
+//! 0b 0000 0000 0000 0001 -> integer scalar
+//! 0b 0000 0000 0000 0010 -> vector (SIMD) marker
+//! 0b 0000 0000 0000 0100 -> (free)
+//! 0b 0000 0000 0001 0000 -> float scalar
+//! 0b 0000 0000 0000 0000 -> (bitwidth): 32-bit set in B32, 64-bit in B64
+//! 0b 0000 0000 0000 00xx -> lanes of vector (bits 5-7), 0 for scalars
 //! 0b 1111 1111 1111 1111 -> invalid type
+//!
+//! The lane-count field sits in bits 5-7 (up to 7 lanes; V2/V4/V8 for now).
+//! Bit 4 is the float marker, so the lane field deliberately avoids it.
 use crate::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,13 +41,27 @@ const fn combine(lhs: LoweredType, rhs: LoweredType) -> LoweredType {
 const INVALID: LoweredType = LoweredType(0xFFFF);
 const INT: LoweredType = LoweredType(0x0001);
 const FLOAT: LoweredType = LoweredType(0x0010);
+const VECTOR: LoweredType = LoweredType(0x0002);
 
 const B32: LoweredType = LoweredType(0x0100);
 const B64: LoweredType = LoweredType(0x1000);
 
+/// Lane-count field at bits 5-7: `N` lanes of the scalar element encode as
+/// `N << 5`. Kept clear of the float marker (bit 4) and the width bits.
+const LANE2: LoweredType = LoweredType(0x0040);
+const LANE4: LoweredType = LoweredType(0x0080);
+
 pub const I32: LoweredType = combine(INT, B32);
 pub const I64: LoweredType = combine(INT, B64);
 pub const F32: LoweredType = combine(FLOAT, B32);
+
+/// 128-bit vector types (NEON `V` registers). The `VECTOR` marker bit
+/// distinguishes them from scalars; element type and lane count are
+/// recoverable from the bit layout.
+pub const V4I32: LoweredType = combine(combine(combine(INT, B32), VECTOR), LANE4);
+pub const V2I64: LoweredType = combine(combine(combine(INT, B64), VECTOR), LANE2);
+pub const V4F32: LoweredType = combine(combine(combine(FLOAT, B32), VECTOR), LANE4);
+pub const V2F64: LoweredType = combine(combine(combine(FLOAT, B64), VECTOR), LANE2);
 
 impl LoweredType {
     pub fn new_i32() -> LoweredType {
@@ -58,6 +78,27 @@ impl LoweredType {
 
     pub fn invalid() -> LoweredType {
         INVALID
+    }
+
+    /// Is this a vector (SIMD) value rather than a scalar?
+    pub fn is_vector(self) -> bool {
+        (self.0 & VECTOR.0) != 0
+    }
+
+    /// Number of vector lanes. Returns 0 for scalars.
+    pub fn lanes(self) -> u32 {
+        (self.0 as u32 >> 5) & 0x7
+    }
+
+    /// Storage size in bytes. All vector types are 128-bit.
+    pub fn size(self) -> u32 {
+        if self.is_vector() {
+            16
+        } else if self == I64 {
+            8
+        } else {
+            4
+        }
     }
 }
 
@@ -104,5 +145,35 @@ impl From<&HirType> for LoweredType {
             raana_ir::ir::TypeKind::Function(..) => unreachable!(),
             raana_ir::ir::TypeKind::ArgList => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vector_type_encoding_is_disjoint_from_scalars() {
+        // Regression guard: the vector marker bit must not alias any scalar
+        // type (F32 in particular shares a byte with the earlier lane field).
+        for scalar in [I32, I64, F32, LoweredType::new_i32(), LoweredType::new_i64(), LoweredType::new_f32()] {
+            assert!(!scalar.is_vector(), "{scalar:?} must not be a vector");
+            assert_eq!(scalar.lanes(), 0);
+        }
+    }
+
+    #[test]
+    fn vector_types_carry_lane_count_and_128_bit_size() {
+        assert_eq!(V4I32.lanes(), 4);
+        assert_eq!(V2I64.lanes(), 2);
+        assert_eq!(V4F32.lanes(), 4);
+        assert_eq!(V2F64.lanes(), 2);
+        for ty in [V4I32, V2I64, V4F32, V2F64] {
+            assert!(ty.is_vector());
+            assert_eq!(ty.size(), 16);
+        }
+        assert_eq!(I32.size(), 4);
+        assert_eq!(I64.size(), 8);
+        assert_eq!(F32.size(), 4);
     }
 }

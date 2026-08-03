@@ -160,16 +160,19 @@ pub const DEFAULT_CLOBBERS: PRegSet = PRegSet::empty()
 pub const fn is_callee_saved(preg: PReg) -> bool {
     match preg.class() {
         RegClass::Int => preg.hw_enc() >= 19 && preg.hw_enc() <= 28,
-        RegClass::Float => preg.hw_enc() >= 8 && preg.hw_enc() <= 15,
-        RegClass::Vector => false,
+        // AAPCS64: v8-v15 are callee-saved for both scalar FP (d8-d15) and
+        // 128-bit NEON vector values (the vector view of the same registers).
+        RegClass::Float | RegClass::Vector => preg.hw_enc() >= 8 && preg.hw_enc() <= 15,
     }
 }
 
 pub fn preg_name(preg: PReg) -> &'static str {
     match preg.class() {
         RegClass::Int => INT_REG_NAMES[preg.hw_enc()],
-        RegClass::Float => FLOAT_REG_NAMES[preg.hw_enc()],
-        RegClass::Vector => panic!("AArch64 vector register allocation is unsupported"),
+        // Both scalar FP and vector values name the same 128-bit NEON
+        // register file; `preg_name` is the generic fallback used by
+        // `ctx.write_reg` when a register is not rendered with a size prefix.
+        RegClass::Float | RegClass::Vector => FLOAT_REG_NAMES[preg.hw_enc()],
     }
 }
 
@@ -187,12 +190,21 @@ pub fn machine_env() -> &'static MachineEnv {
                 ],
                 RegClass::Float,
             ),
-            PRegSet::empty(),
+            // Vector preferred: v0-v7 (ABI arg/return regs) plus v16-v31
+            // (caller-saved upper NEON regs). Callee-saved v8-v15 are
+            // non-preferred so a call-free function never touches them.
+            preg_set(
+                &[
+                    0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+                    30, 31,
+                ],
+                RegClass::Vector,
+            ),
         ],
         non_preferred_regs_by_class: [
             preg_set(&[19, 20, 21, 22, 23, 24, 25, 26, 27, 28], RegClass::Int),
             preg_set(&[8, 9, 10, 11, 12, 13, 14, 15], RegClass::Float),
-            PRegSet::empty(),
+            preg_set(&[8, 9, 10, 11, 12, 13, 14, 15], RegClass::Vector),
         ],
         scratch_by_class: [
             Some(int_preg(INT_ALLOCATOR_SCRATCH)),

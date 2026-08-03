@@ -14,6 +14,8 @@ pub enum TypeKind {
     String,
     /// An array like [base; len]
     Array(Type, usize),
+    /// A SIMD vector of `lanes` copies of `elem`. 128-bit machine vectors.
+    Vector(Type, usize),
     /// Pointer to the base type
     Pointer(Type),
     /// Function with parameters' type and return type.
@@ -29,6 +31,7 @@ impl std::fmt::Display for TypeKind {
             TypeKind::Int32 => write!(f, "i32"),
             TypeKind::Float32 => write!(f, "f32"),
             TypeKind::Array(base, len) => write!(f, "[{base}; {len}]"),
+            TypeKind::Vector(elem, lanes) => write!(f, "<{lanes} x {elem}>"),
             TypeKind::Pointer(base) => write!(f, "*{base}"),
             TypeKind::String => write!(f, "String"),
             TypeKind::Function(params, ret) => {
@@ -100,6 +103,11 @@ impl Type {
         Type::get(TypeKind::Array(base, len))
     }
 
+    pub fn get_vector(elem: Type, lanes: usize) -> Type {
+        assert!(lanes > 0);
+        Type::get(TypeKind::Vector(elem, lanes))
+    }
+
     pub fn get_function(args: Vec<Type>, ret: Type) -> Type {
         Type::get(TypeKind::Function(args, ret))
     }
@@ -132,6 +140,10 @@ impl Type {
         matches!(self.0.as_ref(), TypeKind::Array(..))
     }
 
+    pub fn is_vector(&self) -> bool {
+        matches!(self.0.as_ref(), TypeKind::Vector(..))
+    }
+
     pub fn get_array_info(&self) -> (Type, usize) {
         match self.0.as_ref() {
             TypeKind::Array(base, len) => (base.clone(), *len),
@@ -148,6 +160,7 @@ impl Type {
             TypeKind::ArgList | TypeKind::Unit => 0,
             TypeKind::Int32 | TypeKind::Float32 => 4,
             TypeKind::Array(base, len) => base.size() * len,
+            TypeKind::Vector(elem, lanes) => elem.size() * lanes,
             TypeKind::String | TypeKind::Pointer(..) | TypeKind::Function(..) => POINTER_SIZE,
         }
     }
@@ -156,6 +169,7 @@ impl Type {
         match self.0.as_ref() {
             TypeKind::Int32 | TypeKind::Float32 => 4,
             TypeKind::Array(base, _) => base.alignment(),
+            TypeKind::Vector(elem, _) => elem.alignment(),
             TypeKind::Pointer(_) | TypeKind::Function(..) => POINTER_SIZE,
             _ => 1,
         }

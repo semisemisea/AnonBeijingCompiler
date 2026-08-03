@@ -102,6 +102,22 @@ impl LoweredType {
     }
 }
 
+impl LoweredType {
+    /// Map a HIR vector type onto the supported 128-bit machine vector types.
+    /// Only combinations whose total width is 128 bits are representable.
+    fn from_vector_type(elem: &HirType, lanes: usize) -> LoweredType {
+        use raana_ir::ir::TypeKind;
+        match (elem.kind(), lanes) {
+            (TypeKind::Int32, 4) => V4I32,
+            (TypeKind::Float32, 4) => V4F32,
+            (TypeKind::Pointer(_), 2) => V2I64,
+            _ => panic!(
+                "unsupported machine vector type: <{lanes} x {elem}> (only 128-bit vectors)"
+            ),
+        }
+    }
+}
+
 impl From<HirType> for LoweredType {
     fn from(value: HirType) -> Self {
         match value.kind() {
@@ -115,6 +131,9 @@ impl From<HirType> for LoweredType {
             }
             raana_ir::ir::TypeKind::Array(_, _) => {
                 todo!("should not encounter to allocate a unit type value.")
+            }
+            raana_ir::ir::TypeKind::Vector(elem, lanes) => {
+                LoweredType::from_vector_type(elem, *lanes)
             }
             // Pointer is treated as unsigned 64 bit integer.
             // "i64" doesn't indicate that it's signed integer.
@@ -138,6 +157,9 @@ impl From<&HirType> for LoweredType {
             }
             raana_ir::ir::TypeKind::Array(_, _) => {
                 todo!("should not encounter to allocate a unit type value.")
+            }
+            raana_ir::ir::TypeKind::Vector(elem, lanes) => {
+                LoweredType::from_vector_type(elem, *lanes)
             }
             // Pointer is treated as unsigned 64 bit integer.
             // "i64" doesn't indicate that it's signed integer.

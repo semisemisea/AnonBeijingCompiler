@@ -94,6 +94,7 @@ fn checked_type_size(ty: &Type) -> Option<usize> {
         TypeKind::ArgList | TypeKind::Unit => Some(0),
         TypeKind::Int32 | TypeKind::Float32 => Some(4),
         TypeKind::Array(element, len) => checked_type_size(element)?.checked_mul(*len),
+        TypeKind::Vector(element, lanes) => checked_type_size(element)?.checked_mul(*lanes),
         TypeKind::String | TypeKind::Pointer(_) | TypeKind::Function(_, _) => Some(POINTER_SIZE),
     }
 }

@@ -47,6 +47,7 @@ pub fn analyze_gep(
             HirTypeKind::ArgList | HirTypeKind::Unit => Some(0),
             HirTypeKind::Int32 | HirTypeKind::Float32 => Some(4),
             HirTypeKind::Array(element, len) => checked_size(element)?.checked_mul(*len),
+            HirTypeKind::Vector(element, lanes) => checked_size(element)?.checked_mul(*lanes),
             HirTypeKind::String | HirTypeKind::Pointer(_) | HirTypeKind::Function(_, _) => {
                 Some(core::mem::size_of::<*const ()>())
             }

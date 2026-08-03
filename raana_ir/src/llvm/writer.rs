@@ -212,6 +212,9 @@ impl<'a> LlvmWriter<'a> {
             TypeKind::Float32 => "float".into(),
             TypeKind::Pointer(_) => "ptr".into(),
             TypeKind::Array(base, len) => format!("[{} x {}]", len, self.type_to_llvm(base)),
+            TypeKind::Vector(elem, lanes) => {
+                format!("<{} x {}>", lanes, self.type_to_llvm(elem))
+            }
             TypeKind::Function(params, ret) => {
                 let ps: Vec<String> = params.iter().map(|p| self.type_to_llvm(p)).collect();
                 format!("{} ({})", self.type_to_llvm(ret), ps.join(", "))

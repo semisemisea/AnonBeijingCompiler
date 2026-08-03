@@ -944,6 +944,10 @@ fn lower_call(
             vreg: Writable::from_reg(result.unwrap()),
             preg: regs::FLOAT_RETURN_REG,
         }),
+        TypeKind::Vector(..) => Some(CallRetPair {
+            vreg: Writable::from_reg(result.unwrap()),
+            preg: regs::VECTOR_RETURN_REG,
+        }),
         ty => {
             ctx.lowering_panic(
                 "AArch64 instruction selection",
@@ -1013,6 +1017,7 @@ fn lower_return(
         let preg = match arena.inst_data(value).ty().kind() {
             TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => regs::INT_RETURN_REG,
             TypeKind::Float32 => regs::FLOAT_RETURN_REG,
+            TypeKind::Vector(..) => regs::VECTOR_RETURN_REG,
             ty => {
                 ctx.lowering_panic(
                     "AArch64 instruction selection",

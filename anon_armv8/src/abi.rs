@@ -129,14 +129,20 @@ impl ABIMachineSpec for AArch64Abi {
     fn compute_call_arg_loc(types: &[taki_mir::prelude::HirType]) -> (Vec<ArgSlot>, u32) {
         use raana_ir::ir::TypeKind;
 
-        ArgLayoutPlanner::new(&regs::INT_ARG_REGS, &regs::FLOAT_ARG_REGS).compute(
+        ArgLayoutPlanner::with_vector_regs(
+            &regs::INT_ARG_REGS,
+            &regs::FLOAT_ARG_REGS,
+            &regs::VECTOR_ARG_REGS,
+        )
+        .compute(
             types,
             |ty| match ty.kind() {
                 TypeKind::Float32 => ArgRegBank::Float,
+                TypeKind::Vector(..) => ArgRegBank::Vector,
                 TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => ArgRegBank::Int,
                 _ => unreachable!("non-scalar AAPCS64 parameter: {:?}", ty.kind()),
             },
-            |_| 8,
+            |ty| if ty.is_vector() { 16 } else { 8 },
         )
     }
 
@@ -196,15 +202,17 @@ impl ABIMachineSpec for AArch64Abi {
     fn gen_clobber_save(frame: &FrameLayout) -> SmallVec<[MInst; 16]> {
         let mut insts = smallvec![];
         let base = i64::from(frame.total_size - frame.setup_area_size);
-        for (index, preg) in frame.callee_saved.iter().enumerate() {
+        let mut offset = 0i64;
+        for preg in &frame.callee_saved {
+            let size = i64::from(clobber_slot_size(*preg));
+            if size > 8 {
+                offset = (offset + size - 1) & !(size - 1);
+            }
+            offset += size;
             insts.push(MInst::Store {
-                ty: if preg.class() == RegClass::Float {
-                    MemoryType::F64
-                } else {
-                    MemoryType::I64
-                },
+                ty: clobber_memory_type(*preg),
                 src: Reg::from_physical_reg(*preg),
-                addr: AMode::SpOffset(base - (index as i64 + 1) * 8),
+                addr: AMode::SpOffset(base - offset),
             });
         }
         insts
@@ -213,15 +221,17 @@ impl ABIMachineSpec for AArch64Abi {
     fn gen_clobber_restore(frame: &FrameLayout) -> SmallVec<[MInst; 16]> {
         let mut insts = smallvec![];
         let base = i64::from(frame.total_size - frame.setup_area_size);
-        for (index, preg) in frame.callee_saved.iter().enumerate() {
+        let mut offset = 0i64;
+        for preg in &frame.callee_saved {
+            let size = i64::from(clobber_slot_size(*preg));
+            if size > 8 {
+                offset = (offset + size - 1) & !(size - 1);
+            }
+            offset += size;
             insts.push(MInst::Load {
-                ty: if preg.class() == RegClass::Float {
-                    MemoryType::F64
-                } else {
-                    MemoryType::I64
-                },
+                ty: clobber_memory_type(*preg),
                 dst: Writable::from_reg(Reg::from_physical_reg(*preg)),
-                addr: AMode::SpOffset(base - (index as i64 + 1) * 8),
+                addr: AMode::SpOffset(base - offset),
             });
         }
         insts
@@ -289,6 +299,22 @@ fn memory_type(ty: LoweredType) -> MemoryType {
         MemoryType::I32
     } else {
         MemoryType::I64
+    }
+}
+
+fn clobber_slot_size(preg: PReg) -> u32 {
+    match preg.class() {
+        // v8-v15 are 128-bit NEON registers when used for vectors.
+        RegClass::Vector => 16,
+        _ => 8,
+    }
+}
+
+fn clobber_memory_type(preg: PReg) -> MemoryType {
+    match preg.class() {
+        RegClass::Float => MemoryType::F64,
+        RegClass::Vector => MemoryType::Vec128,
+        _ => MemoryType::I64,
     }
 }
 
@@ -478,5 +504,48 @@ mod tests {
 
         assert_eq!(stack_offsets, vec![0, 8, 16]);
         assert_eq!(stack_size, 24);
+    }
+
+    #[test]
+    fn aapcs64_vector_arguments_use_neon_registers() {
+        let vec = HirType::get_vector(HirType::get_i32(), 4);
+        let types = vec![vec.clone(); 9];
+        let (locations, stack_size) = AArch64Abi::compute_call_arg_loc(&types);
+
+        // First eight vectors land in NEON v0-v7, the ninth overflows to a
+        // 16-byte stack slot.
+        for (index, location) in locations.iter().enumerate().take(8) {
+            assert!(
+                matches!(
+                    location,
+                    ArgSlot::Reg { reg, .. } if *reg == regs::vector_preg(index as u8)
+                ),
+                "vector arg {index}: {location:?}"
+            );
+        }
+        assert!(matches!(
+            locations[8],
+            ArgSlot::Stack { offset: 0, .. }
+        ));
+        assert_eq!(stack_size, 16);
+    }
+
+    #[test]
+    fn aapcs64_vector_overflow_slots_are_sixteen_bytes() {
+        let vec = HirType::get_vector(HirType::get_i32(), 4);
+        let types = vec![
+            HirType::get_i32(),
+            vec.clone(),
+            vec.clone(),
+            HirType::get_i32(),
+        ];
+        let (locations, stack_size) = AArch64Abi::compute_call_arg_loc(&types);
+
+        // int -> x0, vec -> v0, vec -> v1, int -> x1: all registers, no stack.
+        assert_eq!(stack_size, 0);
+        assert!(matches!(locations[0], ArgSlot::Reg { reg, .. } if reg == regs::int_preg(0)));
+        assert!(matches!(locations[1], ArgSlot::Reg { reg, .. } if reg == regs::vector_preg(0)));
+        assert!(matches!(locations[2], ArgSlot::Reg { reg, .. } if reg == regs::vector_preg(1)));
+        assert!(matches!(locations[3], ArgSlot::Reg { reg, .. } if reg == regs::int_preg(1)));
     }
 }

@@ -3,7 +3,7 @@
 本文档只记录尚未完成的工作。已完成里程碑只保留一行摘要，历史设计与实现细节
 以 Git 提交记录和代码测试为准，不在这里重复维护。
 
-> 进行中：§2 主计划 E——matmul 标量收敛（M49-M54 已完成，进行 M55 收尾），
+> 进行中：§2 主计划 E——matmul 标量收敛（M49-M55 已完成），
 > 以 `01_mm1` 为基线收敛内层循环到 gcc 标量水平（内层 ~10 条/element 含
 > `subs;b.ne` + 索引折叠，零循环 `bl memset`）。SIMD Phase 2（M42-M46）
 > 仍搁置，见 §3。
@@ -24,6 +24,9 @@
 - **M54**：地址折叠 / 冗余消除——`MInst::Sxtw`（`mov xzr; add xzr` → `sxtw`）；
   内层 ~10 条/element、`[x,x,sxtw#2]` 折叠确认。functional 109/109、
   h_functional 40/40、RISC-V 109/109。
+- **M55**：收尾与回归门禁——-O2 双 target 全量门禁通过（functional 109/109、
+  h_functional 40/40、RISC-V 109/109、perf 4/4）；修复 count-up 旋转的 exit
+  区域支配回归（sort 族 CE → 全绿）；`01_mm1` 内层保持 `subs;b.ne` + `madd`。
 - **M53**：零 store 循环 → MemZero/memset——`MemZero` 动态长度支持 +
   `zero_store_loop` pass（AArch64）；`mm` 零 C 循环变 `bl .Lsoyo_memzero`。
   functional 109/109、h_functional 40/40、RISC-V 109/109。
@@ -297,13 +300,21 @@ alloca（`%v_A/%v_B/%v_C`）类型是 `**[i32;1024]`（**指针**），被排除
   h_functional 40/40、perf/01_mm1 PASS、RISC-V 109/109、双 target
   byte-identical。新增单测 `emits_sign_extension`。
 
-#### M55：收尾与回归门禁
+#### M55：收尾与回归门禁 ✅
 
 - 双 target × -O0/1/2 全量编译 + 5 次 byte-identical；
   functional/h_functional/perf 全量 QEMU 差分；on/off 差分无行为差异。
 - `scripts/perf_compare.sh 01_mm1` 记录静态指令数。
 - 新增单测：指针 alloca 提升、count-up 旋转、zero-store、`subs` 融合、PSR
-  触发。
+  触发、exit 区域读取循环值时拒绝旋转。
+- 修复 -O2 门禁暴露的旋转回归：`rotate_count_up` 的 guard 使 pre-header 直接
+  流入 exit，exit 可达区域内（含 exit 之后的块）若直接使用 header 参数或循环内
+  定义值，会失去支配定义（VCode SSA 校验失败）。修复为：exit 区域
+  （`exit_region`，沿 successor 展开、遇循环块停止）内任何非 exit 块使用循环值
+  即拒绝旋转；exit 自身仍可参数化；exit 读取非参数循环值亦拒绝。`29_break`
+  （exit 有 break/continue 等额外前驱时拒绝参数化）与
+  `58_sort_test4`/`16_k_smallest`/`20_sort`（swap 块读取 `min`/`j` 循环值）均修复。
+  全量 -O0/1/2 × 双 target 通过；`01_mm1` 内层仍为 `subs;b.ne` + `madd`。
 
 ### 2.5 与 §3 SIMD 的交接
 

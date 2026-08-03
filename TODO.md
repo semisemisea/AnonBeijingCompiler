@@ -464,15 +464,76 @@ riscv functional+h_functional 全量通过，非对齐 131→0 处；**FPGA 实�
 
 ### 系统性 codegen 问题（所有用例热循环均受影响）
 
-- A1 无条件跳转 `la t6,label; jr t6`（3 条）而非 `j`（1 条）。
-- A2 不用立即数槽：`li 1; addw` → `addiw`；`li 0; slt` → `slt a,zero,b`。
-- A3 循环条件 `slt+beqz`（2 条）→ `blt`（1 条）。
-- A4 地址强度削减不完整且不对称：a. 内层元素地址每轮从 IV 重算而非指针递增；
-  b. 循环不变行基址在 k 循环内重算；c. 全局基址每轮 `la` 重载；
-  d. SR pass 存在但匹配面有限，漏了 slli+add 形状与全局基址。
-- A5 `mulw+addw` 未融合 `maddw`（M 扩展）：many_mat_cal 矩阵乘、transpose2。
-- A6 累加器 phi 拷贝往返：many_mat_cal 平方和、01_mm2，每轮 2 条 mv。
-- A7 基址溢出到栈每轮重载：transpose2、fft1（寄存器压力导致 spill）。
+- A1 无条件跳转 `la t6,label; jr t6`（auipc+addi+jr=3 条）而非 `j`
+  （jal x0=1 条）。每循环回边、每分支目标都付。数量：huffman 281、
+  crypto 216、conv2d-1 111、many_mat_cal 80、03_sort1 78。BOOM 分支
+  代价高，收益被放大。
+- A2 不用立即数槽：`li 1; addw` → `addiw`；`li 1; subw` → `addiw -1`；
+  `li 0x40; slt` → `slti`；`li 0; slt a,b` → `slt a,zero,b`。li 数量：
+  huffman 337、crypto 240、conv2d 130、crc 122、many_mat_cal 83。
+- A3 循环条件 `slt+beqz`（2 条）→ `blt`（1 条）。配合 A1 循环头实际
+  8 条、理想 2 条。
+- A4 地址强度削减不完整且不对称：
+  - a. 内层元素地址每轮从 IV 重算（addw+slli+add）而非指针递增：sl2
+    每轮 7 次邻域重算（42 行循环体 21 行地址运算）、many_mat_cal
+    C[i][k]、01_mm2、h-10-03、shuffle1 value/nextvalue、transpose2
+    j*colsize mul、matmul2。
+  - b. 循环不变行基址在 k 循环内重算：matmul2 每轮 `mul i×4000`（i 在
+    k 循环不变）、01_mm2/h-10-03 行基址。
+  - c. 全局基址每轮 `la` 重载：matmul2 gv_c、01_mm2 gv_B、shuffle1
+    gv_value+gv_nextvalue、h-10-03 gv_B。
+  - d. SR 部分生效（many_mat_cal A[k][j] 已指针 +0x1000、transpose2
+    i*rowsize 已提出 j 循环）→ pass 存在但匹配面有限，漏了 slli+add
+    形状与全局基址。
+- A5 `mulw+addw` 未融合 `maddw`（M 扩展）：many_mat_cal 矩阵乘内循环、
+  transpose2 ans 循环。
+- A6 累加器 phi 拷贝往返：many_mat_cal 平方和 `mv s2,s5; addw; mv s5,s2`、
+  01_mm2 同。每轮 2 条 mv。
+  - **根因（2026-08-04 已定位，regalloc 层，非 phi 拷贝问题）**：
+    - IR 是规范 blockparam（%vid_9），Add lowering 干净 3 操作数（AluRRR 无
+      constraint），MIR 的 addw 是 in-place（rd==rs1，merge 保证）。
+    - 真正的机制：sum 的 blockparam merge 把全函数生命周期并成一个 bundle
+      （dense v292），**但 sum 最后被 `putint(%vid_9)` 当调用参数**——lower_call
+      （uika_riscv/src/lower.rs:986）把 arg 的 vreg 直接 pin 到 a0
+      （reg_fixed_use，无独立 arg-copy vreg）。
+    - compute_requirement（requirement.rs:149）把 bundle 内任意 fixed use 折叠成
+      整条 bundle 的 FixedReg(a0) → sum 全程被钉死 a0 → 与同 range 内其他 call
+      参数（getarray 地址 pp247 等）冲突 → 被迫 split 级联（bundle 292→301→
+      304/307，split 于 pp246/253/278，见 RUST_LOG trace）→ 循环携带段 s5、
+      循环体段 s2 分裂 → 每轮 2 条桥接 mv。
+    - 对照：IV (a6) 短 range、无 call-arg use → 单寄存器零拷贝，证明机制本身
+      没问题，是 fixed-use 毒化长 bundle。
+  - **候选方案**：
+    - A1（推荐，已细化 2026-08-04）：
+      - **改动点**：uika_riscv/src/lower.rs `lower_call`（arg 循环约
+        975-999 行，`put_value_in_reg` 之后、ArgSlot::Reg 分支）——判定为
+        "长生命周期"的参数先 `ctx.emit(MInst::Mov { src: arg_reg, dst: fresh })`
+        （fresh = `ctx.alloc_tmp(arg_ty)`），CallArgPair.vreg 用 fresh；
+        fixed-a0 只落在 fresh 的微小 range 上。`lower_tail_call` 同步。
+      - **判定规则（初版，数据驱动，实现后按 corpus 结果收敛）**：
+        `arena.inst_data(arg).used_by().len() > 1 || arg 是 blockparam`
+        （blockparam 集 = 所有非 entry block 的 params，LowerContext 初始化时
+        建一次 HashSet）。依据：poison 源 v210/v235 均为多层 use（blockparam
+        传参 + call 参数，used_by≥2）→ 规则命中 → 两条 fixed-a0 同时摘除 →
+        合并 bundle 无 fixed use → 自由分配 → 循环内 0 拷贝。短生命周期参数
+        （常量 remat、刚算的地址，used_by=1）不 copy → 保持现状（fixed
+        机制直接落 a0，零/一 move）。
+      - **预期收益/风险**：mmc1/mmc2/01_mm2 累加循环 2 mv/iter→0；crc 类
+        （loop-carried 状态传内层 call）copy 恰好等于现在的 ABI move，无回归；
+        huffman（常量参数）不命中，无变化。风险点：内层 call 的 blockparam
+        参数若当前已直接落 a0（无 move），copy 会 +1 mv/iter——用 crc/
+        huffman/fft1 的 .s diff 验证，若有回归则收紧规则（只 blockparam 或
+        只多 use）。
+      - **验证**：①mmc1/mmc2/01_mm2 循环 mv 计数（2→0）；②crc1-3/
+        huffman-01-03/fft1 的 .s 指令数 diff（预期无回归）；③全 corpus .s
+        指令数统计；④make test-riscv functional QEMU 差分；⑤RUST_LOG
+        trace 复查 sum bundle requirement 变 Register、split 级联消失。
+    - A2（allocator 侧）：compute_requirement/split 隔离 fixed use，不折叠整条
+      bundle。动分配器核心，风险高，需 regalloc2 对照。
+  - **验证计划**：mmc1/mmc2/01_mm2 内层循环 mv 计数（2→0）；make test-riscv
+    functional 差分；全 corpus .s 指令数统计。
+- A7 基址溢出到栈每轮重载：transpose2 matrix 基址 `ld 0(sp)` 每轮 2 次、
+  fft1 数组基址每轮 1 次（寄存器压力导致 spill）。
 
 ### 用例特定
 

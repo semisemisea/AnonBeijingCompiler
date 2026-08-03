@@ -349,6 +349,17 @@ impl ToRaanaIR for items::ConstDef {
             if !matches!(self.const_init_val, items::ConstInitVal::Array(_)) {
                 panic!("Invalid assign: integer to an array")
             };
+            if self.const_init_val.is_empty_init() {
+                let arr_ty = array_shape
+                    .iter()
+                    .map(|x| *x as usize)
+                    .rfold(ty.clone(), Type::get_array);
+                let init = ctx.new_global_value().zero_init(arr_ty);
+                let alloc_var = ctx.new_global_value().global_alloc(init);
+                ctx.set_value_name(alloc_var, self.ident.clone());
+                ctx.insert_const(self.ident.clone(), alloc_var);
+                return;
+            }
             let exps = self.const_init_val.init_val_shape(&array_shape);
             let zero = ctx.zero_global(&ty);
             let elems = exps
@@ -554,26 +565,30 @@ impl ToRaanaIR for items::VarDef {
                 if !matches!(init_val, items::InitVal::Array(_)) {
                     panic!("Invalid assign: integer to an array")
                 }
-                let exps = init_val.init_val_shape(&array_shape);
-                let zero = ctx.zero_global(&ty);
-                let elems = exps
-                    .iter()
-                    .map(|exp| match exp {
-                        Some(exp) => {
-                            exp.global_convert(ctx);
-                            let val = ctx.pop_val().unwrap();
-                            ctx.coerce_global(val, &ty)
-                        }
-                        None => zero,
-                    })
-                    .collect::<Vec<_>>();
-                let agg = array_shape.iter().rev().fold(elems, |elems, &dim_l| {
-                    elems
-                        .chunks(dim_l as _)
-                        .map(|chunk| ctx.new_global_value().aggregate(chunk.to_owned()))
-                        .collect::<Vec<_>>()
-                });
-                agg[0]
+                if init_val.is_empty_init() {
+                    ctx.new_global_value().zero_init(arr_ty.clone())
+                } else {
+                    let exps = init_val.init_val_shape(&array_shape);
+                    let zero = ctx.zero_global(&ty);
+                    let elems = exps
+                        .iter()
+                        .map(|exp| match exp {
+                            Some(exp) => {
+                                exp.global_convert(ctx);
+                                let val = ctx.pop_val().unwrap();
+                                ctx.coerce_global(val, &ty)
+                            }
+                            None => zero,
+                        })
+                        .collect::<Vec<_>>();
+                    let agg = array_shape.iter().rev().fold(elems, |elems, &dim_l| {
+                        elems
+                            .chunks(dim_l as _)
+                            .map(|chunk| ctx.new_global_value().aggregate(chunk.to_owned()))
+                            .collect::<Vec<_>>()
+                    });
+                    agg[0]
+                }
             } else {
                 ctx.new_global_value().zero_init(arr_ty)
             };

@@ -404,6 +404,35 @@ M44 v2（select 掩码）。
 - 遗留：R=0 无 epilogue 时 latch f_target 保持原 exit；常量不进 layout（DCE
   is_critical 对 laid-out Integer unreachable，项目约定）。
 
+##### M44 v2 方向扫描（2026-08-05，perf corpus 拒绝原因分布，M44_TRACE=1）
+
+- 工具：loop_vectorize.rs 内 `M44_TRACE=1` env 门控 trace（analyze_loop 每个拒绝
+  点打点，含 M42 ForbidReason 明细），后续 v2 验证沿用。
+- 关键结论：**payload 级拒绝几乎为零**（全 perf corpus 仅 Rem×2 循环、
+  load_unmodeled×1、load_classify×1）——v1 的 op 白名单/stride/对齐检查不是
+  真实瓶颈（shl 等担心不成立：前端 *2 的 shl 循环根本没走到 payload）。
+- 真实拦截分布（去重，perf 全量）：
+  - not_innermost 969（外层循环，正常）
+  - shape_body_not_2_blocks 363（体内含分支/多块）
+  - shape_header_multi_inst 315（rotate 未处理的 test-at-top 头部：compare+
+    branch 在 header——rotate 因 exit 读 IV 等拒绝）
+  - m42_forbidden:CallInBody 186（输入读取循环 getint/getarray、计时调用——
+    真不可向量化）
+  - m42_forbidden:IntraIterationConflict 174（就地同地址 R/W 与内存累加
+    C[i][j]+= 内核，含 mm）
+  - params_not_2 162（寄存器归约 3 参数 [iv, acc, t]，radixSort/ludcmp 内核）
+  - NoInductionVariable 90、latch_exit_inside_or_args 27、
+    LoopCarriedConflict 18、NonAffineIndex 12、DynamicMemZero 12、
+    entry_trip_not_const 12（运行时 trip → M43）、UnknownBase/RuntimeCoefficient 各 6
+- v2 方向排序（按性价比 + 协调成本）：
+  1. **B1 寄存器归约向量化**（params_not_2 + M42 Reducible 判定已就绪，不碰
+     dependence.rs/switch 线）：sum/count 类内核 → 向量 acc + 出口 addv。
+  2. **test-at-top 形态**（shape_header_multi_inst，无 M42 依赖）：rotate 拒绝的
+     循环直接按 count-up 处理（header 测试保留，counter 方案不变）。
+  3. **in-place/内存累加**（IntraIterationConflict，需放宽 dependence.rs
+     test_access_pair：同地址 R/W 且写依赖读 → 元素级安全）——dependence.rs 与
+     switch 线共享，须先协调。
+
 #### M45：SLP 基本块向量化 + 循环展开
 
 - SLP（`raana_ir/src/opt/passes/slp.rs`）：把同一基本块内相邻、类型一致的独立

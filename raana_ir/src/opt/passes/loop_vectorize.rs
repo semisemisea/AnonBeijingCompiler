@@ -174,6 +174,65 @@ struct VecPlan {
 // Read-only analysis
 // ---------------------------------------------------------------------------
 
+/// Debug tracing for rejection reasons (M44_TRACE=1). Temporary diagnostic
+/// tool for the v2 planning scan; not part of the pass contract.
+fn trace(data: &FunctionData, looop: &Loop, reason: &str) {
+    if std::env::var("M44_TRACE").is_ok() {
+        let name = data.name();
+        eprintln!("[M44] func={name} header={:?} reject={reason}", looop.header());
+    }
+}
+
+fn inst_kind_name(kind: &InstKind) -> &'static str {
+    match kind {
+        InstKind::Binary(b) => match b.op() {
+            BinaryOp::Shl => "Shl",
+            BinaryOp::Shr => "Shr",
+            BinaryOp::Sar => "Sar",
+            BinaryOp::And => "And",
+            BinaryOp::Or => "Or",
+            BinaryOp::Xor => "Xor",
+            BinaryOp::Div => "Div",
+            BinaryOp::Rem => "Rem",
+            BinaryOp::Eq => "Eq",
+            BinaryOp::NotEq => "NotEq",
+            BinaryOp::Gt => "Gt",
+            BinaryOp::Lt => "Lt",
+            BinaryOp::Ge => "Ge",
+            BinaryOp::Le => "Le",
+            BinaryOp::Min => "Min",
+            BinaryOp::Max => "Max",
+            BinaryOp::Add => "Add",
+            BinaryOp::Sub => "Sub",
+            BinaryOp::Mul => "Mul",
+        },
+        InstKind::Select(_) => "Select",
+        InstKind::Call(_) => "Call",
+        InstKind::TailCall(_) => "TailCall",
+        InstKind::Cast(_) => "Cast",
+        InstKind::MemZero(_) => "MemZero",
+        InstKind::Fma(_) => "Fma",
+        InstKind::VectorSplat(_) => "VectorSplat",
+        InstKind::VectorExtractElement(_) => "VectorExtractElement",
+        InstKind::VectorInsertElement(_) => "VectorInsertElement",
+        InstKind::VectorReduce(_) => "VectorReduce",
+        InstKind::Load(_) => "Load",
+        InstKind::Store(_) => "Store",
+        InstKind::GetElemPtr(_) => "GetElemPtr",
+        InstKind::Jump(_) => "Jump",
+        InstKind::Branch(_) => "Branch",
+        InstKind::Return(_) => "Return",
+        InstKind::Undef => "Undef",
+        InstKind::Aggregate(_) => "Aggregate",
+        InstKind::Alloc => "Alloc",
+        InstKind::GlobalAlloc(_) => "GlobalAlloc",
+        InstKind::BlockArgRef(_) => "BlockArgRef",
+        InstKind::Integer(_) => "Integer",
+        InstKind::Float(_) => "Float",
+        InstKind::ZeroInit => "ZeroInit",
+    }
+}
+
 fn find_vectorizable(
     program: &Program,
     func: Function,
@@ -210,27 +269,32 @@ fn analyze_loop(
         .iter()
         .any(|other| other.header() != looop.header() && looop.contains(other.header()))
     {
+        trace(data, looop, "not_innermost");
         return None;
     }
 
     // 2. M42 verdict: not Forbidden. (Reducible is accepted; the trip
     //    counter is always labeled a reduction, see the module docs.)
     let dep = dependence.for_loop(looop)?;
-    if matches!(dep.verdict, Verdict::Forbidden { .. }) {
+    if let Verdict::Forbidden { reason } = &dep.verdict {
+        trace(data, looop, &format!("m42_forbidden:{reason:?}"));
         return None;
     }
     if dep.accesses.iter().any(|a| a.kind == AccessKind::ZeroFill) {
+        trace(data, looop, "memzero_in_body");
         return None;
     }
 
     // 3. Shape: body == {header, latch}, header is a straight jump, single
     //    latch whose terminator branches back to the header.
     if looop.body().len() != 2 || looop.latches().len() != 1 {
+        trace(data, looop, "shape_body_not_2_blocks");
         return None;
     }
     let header = looop.header();
     let latch = looop.latches()[0];
     if !looop.contains(latch) || latch == header {
+        trace(data, looop, "shape_latch_is_header");
         return None;
     }
     {
@@ -240,24 +304,28 @@ fn analyze_loop(
             return None;
         };
         if iter.next().is_some() {
-            return None;
+        trace(data, looop, "shape_header_multi_inst");
+        return None;
         }
         let InstKind::Jump(jump) = arena.inst_data(only).kind() else {
             return None;
         };
         if jump.target() != latch || !jump.args().is_empty() {
-            return None;
+        trace(data, looop, "shape_header_jump_not_plain");
+        return None;
         }
     }
 
     // 4. Header parameters: exactly [iv, t], both i32.
     let params = data.bb_data(header).params();
     if params.len() != 2 {
+        trace(data, looop, "params_not_2");
         return None;
     }
     let iv = params[0];
     let counter = params[1];
     if !arena.inst_data(iv).ty().is_i32() || !arena.inst_data(counter).ty().is_i32() {
+        trace(data, looop, "params_not_i32");
         return None;
     }
 
@@ -269,25 +337,31 @@ fn analyze_loop(
         return None;
     };
     if branch.t_target() != header || !looop.contains(branch.t_target()) {
+        trace(data, looop, "latch_target_not_header");
         return None;
     }
     let exit = branch.f_target();
     if looop.contains(exit) || !branch.f_args().is_empty() {
+        trace(data, looop, "latch_exit_inside_or_args");
         return None;
     }
     if !data.bb_data(exit).params().is_empty() {
+        trace(data, looop, "exit_has_params");
         return None;
     }
     let back_args = branch.t_args();
     if back_args.len() != 2 {
+        trace(data, looop, "back_args_not_2");
         return None;
     }
     let t_next = branch.cond();
     if back_args[1] != t_next {
+        trace(data, looop, "counter_not_cond");
         return None;
     }
     let iv_next = back_args[0];
     if !is_add_one(arena, iv_next, iv) || !is_sub_one(arena, t_next, counter) {
+        trace(data, looop, "non_unit_step");
         return None;
     }
 
@@ -295,6 +369,7 @@ fn analyze_loop(
     //    plain jump into the header with [i0, t0].
     let preds: Vec<BasicBlock> = cfg.predecessors_of(header).to_vec();
     if preds.len() != 2 {
+        trace(data, looop, "entry_preds_not_2");
         return None;
     }
     let preheader = preds.iter().copied().find(|&b| b != latch)?;
@@ -302,18 +377,29 @@ fn analyze_loop(
     let entry_args: Vec<Inst> = match arena.inst_data(entry_edge).kind() {
         InstKind::Branch(b) if b.t_target() == header => b.t_args().to_vec(),
         InstKind::Jump(j) if j.target() == header => j.args().to_vec(),
-        _ => return None,
+        _ => {
+            trace(data, looop, "entry_edge_shape");
+            return None;
+        }
     };
     if entry_args.len() != 2 {
+        trace(data, looop, "entry_args_not_2");
         return None;
     }
 
     // 7. Exact trip: both the initial index and the trip counter must be
     //    compile-time constants, and the trip must fit at least one vector
     //    iteration.
-    let entry_i0 = constant_i64(arena, data, entry_args[0])?;
-    let trip = constant_i64(arena, data, entry_args[1])?;
+    let Some(entry_i0) = constant_i64(arena, data, entry_args[0]) else {
+        trace(data, looop, "entry_i0_not_const");
+        return None;
+    };
+    let Some(trip) = constant_i64(arena, data, entry_args[1]) else {
+        trace(data, looop, "entry_trip_not_const");
+        return None;
+    };
     if trip < VF {
+        trace(data, looop, "trip_below_vf");
         return None;
     }
 
@@ -353,11 +439,13 @@ fn analyze_loop(
                 // invariants; the base must be loop-invariant (a global,
                 // stack alloc, or a dominating value).
                 if !is_loop_invariant(arena, gep.base(), header, latch) {
-                    return None;
+        trace(data, looop, "gep_base_loop_variant");
+        return None;
                 }
                 for &offset in gep.offsets() {
                     if offset != iv && !is_loop_invariant(arena, offset, header, latch) {
-                        return None;
+        trace(data, looop, "gep_offset_loop_variant");
+        return None;
                     }
                 }
                 classes.insert(inst, Class::Keep);
@@ -367,7 +455,9 @@ fn analyze_loop(
                 let Some((class, elem)) =
                     classify_load(arena, load.src(), access, &payload, header, latch)
                 else {
-                    return None;
+                                        trace(data, looop, "load_unmodeled");
+        trace(data, looop, "load_classify");
+        return None;
                 };
                 merge_elem(&mut elem_ty, elem)?;
                 if class == Class::VecLoad {
@@ -378,18 +468,22 @@ fn analyze_loop(
             InstKind::Store(store) => {
                 let access = dep.accesses.iter().find(|a| a.inst == inst)?;
                 if access.kind != AccessKind::Write || access.byte_coefficient != VF {
-                    return None; // invariant / strided stores are not vectorized
+        trace(data, looop, "store_not_contig_write");
+        return None; // invariant / strided stores are not vectorized
                 }
                 if !base_is_16b_aligned(arena, access.base) {
-                    return None;
+        trace(data, looop, "base_not_aligned");
+        return None;
                 }
                 let elem = arena.inst_data(store.src()).ty().clone();
                 if !elem.is_i32() && !elem.is_f32() {
-                    return None;
+        trace(data, looop, "elem_not_i32_f32");
+        return None;
                 }
                 merge_elem(&mut elem_ty, elem)?;
                 if !is_address_operand(arena, store.dest(), &payload, header, latch) {
-                    return None;
+        trace(data, looop, "store_dest_not_gep");
+        return None;
                 }
                 vectorized_any = true;
                 classes.insert(inst, Class::VecStore);
@@ -401,7 +495,14 @@ fn analyze_loop(
             InstKind::Integer(_) | InstKind::Float(_) | InstKind::ZeroInit => {
                 classes.insert(inst, Class::Keep);
             }
-            _ => return None, // Select/Call/Cast/MemZero/Vector ops/...
+            other => {
+                trace(
+                    data,
+                    looop,
+                    &format!("payload_inst_rejected:{}", inst_kind_name(other)),
+                );
+                return None; // Select/Call/Cast/MemZero/Vector ops/...
+            }
         }
     }
 
@@ -416,9 +517,11 @@ fn analyze_loop(
         };
         let ty = arena.inst_data(binary.lhs()).ty().clone();
         if !ty.is_i32() && !ty.is_f32() {
-            return None;
+        trace(data, looop, "binary_elem_not_scalar");
+        return None;
         }
         if arena.inst_data(binary.rhs()).ty() != &ty {
+            trace(data, looop, "binary_operand_type_mismatch");
             return None;
         }
         for operand in [binary.lhs(), binary.rhs()] {
@@ -430,7 +533,8 @@ fn analyze_loop(
                 Some(Class::VecLoad) | Some(Class::VecBinary) => {}
                 _ => {
                     if !is_loop_invariant(arena, operand, header, latch) {
-                        return None;
+        trace(data, looop, "binary_operand_loop_variant");
+        return None;
                     }
                 }
             }
@@ -453,7 +557,9 @@ fn analyze_loop(
             Some(Class::VecLoad) | Some(Class::VecBinary) => {}
             _ => {
                 if !is_loop_invariant(arena, store.src(), header, latch) {
-                    return None;
+                                        trace(data, looop, "mixed_elem_types");
+        trace(data, looop, "store_src_loop_variant");
+        return None;
                 }
             }
         }
@@ -464,11 +570,13 @@ fn analyze_loop(
     for &inst in &payload {
         for &user in arena.inst_data(inst).used_by() {
             if data.layout().parent_bb(user) != Some(latch) {
-                return None;
+        trace(data, looop, "value_escapes_loop");
+        return None;
             }
         }
     }
     if !vectorized_any {
+        trace(data, looop, "no_vector_ops");
         return None;
     }
     let elem_ty = elem_ty?;

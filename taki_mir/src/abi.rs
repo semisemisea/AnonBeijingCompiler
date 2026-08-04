@@ -6,6 +6,7 @@ use smallvec::{SmallVec, smallvec};
 use tomori_utils::{PrimaryMap, SecondaryMap, entity_impl};
 
 use crate::prelude::*;
+use raana_ir::ir::TypeKind as HirTypeKind;
 use crate::reg_alloc::reg::{MachineEnv, PReg, RegClass, SpillSlot};
 use crate::register::{Reg, Writable};
 use crate::types::LoweredType;
@@ -133,6 +134,26 @@ pub trait ABIMachineSpec {
     }
 
     fn stack_align() -> u32;
+
+    /// Required alignment (in bytes) of stack-allocated array objects.
+    ///
+    /// SIMD backends (e.g. AArch64 NEON) need array locals 16-byte aligned so
+    /// vector loads/stores never see a misaligned base address; the shared
+    /// `allocate_stackslot` rounds the array slot's absolute address (outgoing
+    /// argument area + slot offset) up to this alignment. Non-SIMD backends
+    /// inherit the default 8, which is a no-op because every stack slot size
+    /// and the outgoing argument area are already 8-byte multiples.
+    fn array_slot_align() -> u32 {
+        8
+    }
+
+    /// Optional alignment pseudo-op emitted before a global object of at least
+    /// 16 bytes. SIMD backends return e.g. `".p2align 4"` so vectorized global
+    /// access stays 16-byte aligned; other backends return `None` and emit no
+    /// directive.
+    fn global_align_directive() -> Option<&'static str> {
+        None
+    }
 
     /// Number of logical allocator spill units needed by a value in `regclass`.
     ///
@@ -474,10 +495,23 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
         // Calls are discovered during lowering, so folding the then-current
         // outgoing size here would make early objects overlap a later maximum
         // outgoing-call area.
-        let ret = self.total_stackslots_size;
+        let mut ret = self.total_stackslots_size;
+        // Array objects are addressed at sp + outgoing_args_size + offset on
+        // every backend. Pad the relative offset so the absolute address of an
+        // array object is `array_slot_align()`-aligned (NEON `ldr/str q`
+        // requires 16-byte alignment on AArch64). The outgoing area and every
+        // slot size are 8-byte multiples, so this inserts at most 8 bytes of
+        // padding and never overlaps a neighbouring slot. Non-SIMD backends
+        // keep the default 8, making the rounding a no-op.
+        if matches!(ty.kind(), HirTypeKind::Array(..)) {
+            let slot_align = M::array_slot_align();
+            let absolute = self.outgoing_arg_size.wrapping_add(ret);
+            let pad = (slot_align.wrapping_sub(absolute % slot_align)) % slot_align;
+            ret = ret.wrapping_add(pad);
+        }
         let size = ty.size() as u32;
         let actual_size = size.next_multiple_of(align);
-        self.total_stackslots_size += actual_size;
+        self.total_stackslots_size = ret + actual_size;
         ret
     }
 

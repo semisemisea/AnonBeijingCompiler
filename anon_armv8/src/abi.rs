@@ -28,6 +28,18 @@ impl ABIMachineSpec for AArch64Abi {
     fn stack_align() -> u32 {
         16
     }
+
+    /// NEON `ldr/str q` requires 16-byte alignment for vector memory access,
+    /// so array locals must land on 16-byte boundaries.
+    fn array_slot_align() -> u32 {
+        16
+    }
+
+    /// Align globals of at least 16 bytes to 16 so vectorized global access
+    /// stays aligned.
+    fn global_align_directive() -> Option<&'static str> {
+        Some(".p2align 4")
+    }
     fn spillslot_size(regclass: RegClass) -> u32 {
         match regclass {
             RegClass::Int | RegClass::Float => 1,

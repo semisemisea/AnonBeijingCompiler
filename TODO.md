@@ -370,6 +370,40 @@ M44 v2（select 掩码）。
 - 验收：many_mat_cal / matmul 内层出现 `fmla` 与 `ld1/st1`；全 corpus QEMU 差分 +
   on/off 差分；-O0/1/2 × 双 target 5 次 byte-identical。
 
+##### M44 v1 已实现（2026-08-05，hermes 线 feat/loop-vectorize-hermes，验收数据）
+
+- 实现：`loop_vectorize.rs`（+注册 pass.rs aarch64 块 chain_to_switch 后 LICM 前）。
+  旋转后 count-up 循环（header=[iv,t] 直通 latch，latch 底部 `br t' header/exit`），
+  trip=4Q+R 精确常量 ≥4 → 主循环 Q 次向量迭代（counter 入口改 4Q、iv/t 步进 ±4、
+  测试不变），R 次标量迭代以常量下标 peel 成直链 epilogue（无运行时 guard）。
+  连续 load→`<4 x T>` Load（同地址原位重写）、Add/Sub/Mul→lane-wise 向量 op
+  （不变操作数 VectorSplat）、连续 store→向量 store。
+- M42 判定修正：旋转循环的 counter（`t'=t-1`，体内无其他使用）恒被标为
+  Reducible{IntSub}，故验收判定 = "非 Forbidden"；真归约由操作数规则拒绝
+  （accumulator 块参数不可作向量操作数，Select 不在白名单）——Reducible 验收
+  语义与 goal 原文"Reducible 跳过"的偏差已记录在文件头注释。
+- 单测 9 个全绿（trip=16 i32、trip=18 peel 2 块、stride=8 拒绝、select 拒绝、
+  真归约拒绝、非 exact 拒绝、Param base 拒绝、f32、幂等）；raana_ir 315 全过；
+  workspace 全过。
+- 端到端（qemu harness 差分，临时用例 tests/perf/elem_vect_check.sy 已删）：
+  `b[i]=a[i]+1` 全局数组 trip=16，-O2 汇编出 `ldr q → dup v.4s（splat 常量）→
+  add v.4s → str q`，IV 步进 +4；输出 1..16 与标量一致。-O0/-O1/-O2 三级 PASS。
+- **perf 五例（01_mm1/fft1/sl1/conv2d-1/matmul1）v1 均不出向量指令（静态事实，
+  不声称收益），原因分类**：
+  1. 内层为归约（M42 Reducible，v1 拒绝）：01_mm1/conv2d-1 的 C[i][j]+= 内核、
+     matmul1（且含 select）；
+  2. 体内含非白名单 op：fft1（rem/div/sar/shr/and）、sl1（div/sar）、01_mm1
+     （shl）、conv2d-1（rem/sar/shr/and，多为边界/下标运算）；
+  3. 就地同地址读写（M42 IntraIterationConflict）与 Param base 在真实用例中
+     也常见。
+- **关键发现（v2 候选）**：前端把 `*2` 等常量乘 strength-reduce 成 `shl`，
+  v1 白名单（Add/Sub/Mul）直接拒绝——`b[i]=a[i]*2+1` 这类最普通的循环也过
+  不了。v2 加 Shl（lane-wise 移位，NEON sshl 直出）即可解锁大量真实循环。
+  另：lowering 对向量 load/store 目前出 `ldr/str q`（VecLd1/VecSt1 MInst 已
+  定义但未接 lower 路径），验收口径按实际汇编记录。
+- 遗留：R=0 无 epilogue 时 latch f_target 保持原 exit；常量不进 layout（DCE
+  is_critical 对 laid-out Integer unreachable，项目约定）。
+
 #### M45：SLP 基本块向量化 + 循环展开
 
 - SLP（`raana_ir/src/opt/passes/slp.rs`）：把同一基本块内相邻、类型一致的独立

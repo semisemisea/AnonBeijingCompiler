@@ -195,22 +195,19 @@ impl ZeroStoreLoop {
         let byte_len = data
             .new_local_value()
             .binary(BinaryOp::Mul, entry_args[t_pos], size);
-        // When the store GEP's first offset is the loop induction variable
-        // (e.g. `buf[i] = 0`), the row prefix is empty: the row starts at
-        // `base` itself. Reuse `base` directly — materializing a no-offset
-        // GEP would insert a block-arg/constant reference into the layout,
-        // which later passes (e.g. DCE's critical-inst scan) assert never
-        // happens.
-        let clear = if row_offsets.is_empty() {
-            data.new_local_value().mem_zero_dynamic(base, byte_len)
+        let (row_start, row_start_is_new) = if row_offsets.is_empty() {
+            (base, false)
         } else {
-            let row_start = data.new_local_value().get_elem_ptr(base, row_offsets);
-            data.layout_mut()
-                .insert_before_terminator(entry_block, row_start);
-            data.new_local_value().mem_zero_dynamic(row_start, byte_len)
+            let gep = data.new_local_value().get_elem_ptr(base, row_offsets);
+            (gep, true)
         };
+        let clear = data.new_local_value().mem_zero_dynamic(row_start, byte_len);
         data.layout_mut()
             .insert_before_terminator(entry_block, byte_len);
+        if row_start_is_new {
+            data.layout_mut()
+                .insert_before_terminator(entry_block, row_start);
+        }
         data.layout_mut()
             .insert_before_terminator(entry_block, clear);
         data.replace_inst_with(entry_edge_inst).jump(exit, vec![]);
@@ -354,6 +351,85 @@ mod tests {
                 .used_by()
                 .iter()
                 .any(|&pred| data.layout().parent_bb(pred) == Some(entry))
+        );
+    }
+
+    /// A flat array loop `arr[i] = 0` where `arr` is already an element
+    /// pointer: the store GEP has a single (IV) offset, so `row_offsets` is
+    /// empty and the MemZero must address `arr` itself, not a GEP of `arr`.
+    #[test]
+    fn uses_base_pointer_when_the_row_has_no_leading_offsets() {
+        let mut program = Program::new();
+        let func = program.new_function(
+            Type::get_unit(),
+            "clear_flat".into(),
+            vec![Type::get_pointer(Type::get_i32()), Type::get_i32()],
+        );
+        {
+            let data = program.func_data_mut(func);
+            let entry = data.add_entry_block();
+            let arr = data.params()[0];
+            let trip = data.params()[1];
+            let header = data
+                .new_basic_block()
+                .basic_block("header".into(), vec![Type::get_i32(), Type::get_i32()]);
+            let body = data.new_basic_block().basic_block("body".into(), vec![]);
+            let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+            for block in [header, body, exit] {
+                data.layout_mut().push_bb_back(block);
+            }
+            let zero = data.new_local_inst().integer(0);
+            let entry_jump = data.new_local_inst().jump(header, vec![zero, trip]);
+            data.layout_mut().insert_inst(entry, entry_jump);
+
+            let j = data.bb_data(header).params()[0];
+            let t = data.bb_data(header).params()[1];
+            let header_jump = data.new_local_inst().jump(body, vec![]);
+            data.layout_mut().insert_inst(header, header_jump);
+
+            let gep = data.new_local_inst().get_elem_ptr(arr, vec![j]);
+            let store = data.new_local_inst().store(zero, gep);
+            let one = data.new_local_inst().integer(1);
+            let next_j = data.new_local_inst().binary(BinaryOp::Add, j, one);
+            let next_t = data.new_local_inst().binary(BinaryOp::Sub, t, one);
+            let latch = data
+                .new_local_inst()
+                .branch(next_t, header, vec![next_j, next_t], exit, vec![]);
+            for inst in [gep, store, next_j, next_t, latch] {
+                data.layout_mut().insert_inst(body, inst);
+            }
+            let ret = data.new_local_inst().ret(None);
+            data.layout_mut().insert_inst(exit, ret);
+        }
+
+        let mut context = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(func),
+        };
+        assert!(run(&mut context));
+        let data = context.curr_func_data();
+        let mem_zero = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|layout| layout.insts().iter().copied())
+            .find(|&inst| matches!(data.inst_data(inst).kind(), InstKind::MemZero(..)))
+            .expect("a MemZero must be created");
+        let InstKind::MemZero(mem_zero) = data.inst_data(mem_zero).kind() else {
+            unreachable!()
+        };
+        // The MemZero targets the flat array pointer directly; its dest must
+        // not be a fresh GEP (and the block's instruction list must not
+        // contain a block-arg reference).
+        assert_eq!(mem_zero.dest(), data.params()[0]);
+        assert!(
+            data.layout()
+                .basicblocks()
+                .iter()
+                .all(|layout| layout
+                    .insts()
+                    .iter()
+                    .all(|&inst| !matches!(data.inst_data(inst).kind(), InstKind::BlockArgRef(..))))
         );
     }
 

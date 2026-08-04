@@ -215,13 +215,27 @@ impl RotateLoops {
             if args.len() != params.len() {
                 return false;
             }
-            let carries_update = matches!(
-                data.inst_data(args[iv_pos]).kind(),
+            let carries_update = match data.inst_data(args[iv_pos]).kind() {
                 InstKind::Binary(b)
                     if b.op() == BinaryOp::Add
-                        && b.lhs() == iv
-                        && matches!(data.inst_data(b.rhs()).kind(), InstKind::Integer(one) if one.value() == 1)
-            );
+                        && matches!(
+                            data.inst_data(b.rhs()).kind(),
+                            InstKind::Integer(one) if one.value() == 1
+                        ) =>
+                {
+                    // Direct `iv + 1`, or `p + 1` where `p` provably flows
+                    // from `iv` through a chain of block parameters (the
+                    // exit block of an inner loop carries the outer IV
+                    // through its own parameters; the back edge updates it
+                    // after the inner loop exits).
+                    if b.lhs() == iv {
+                        true
+                    } else {
+                        Self::value_flows_from(data, b.lhs(), iv, &mut FxHashSet::default())
+                    }
+                }
+                _ => false,
+            };
             if carries_update {
                 if back_edge.replace((pred, args)).is_some() {
                     return false;
@@ -392,6 +406,75 @@ impl RotateLoops {
             exit_back_args,
         );
 
+        true
+    }
+
+    /// Whether `value` provably equals `target` at the point of use: either
+    /// it *is* `target`, or it is a block parameter whose every incoming
+    /// edge carries a value that provably equals `target`. This follows the
+    /// value through single-value chains of block parameters (nested-loop
+    /// exit blocks pass the outer IV through their own parameters). A cyclic
+    /// self-carrying edge is neutral (the parameter keeps its value), so a
+    /// visited parameter is accepted.
+    fn value_flows_from(
+        data: &FunctionData,
+        value: Inst,
+        target: Inst,
+        visited: &mut FxHashSet<Inst>,
+    ) -> bool {
+        if value == target {
+            return true;
+        }
+        if !visited.insert(value) {
+            return true; // Self-carrying edge: value unchanged.
+        }
+        let InstKind::BlockArgRef(_) = data.inst_data(value).kind() else {
+            return false;
+        };
+        // Locate the owning block by scanning for the parameter (BlockArgRef
+        // stores no back-reference to its block).
+        let Some(param_block) = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .find(|l| data.bb_data(l.bb()).params().contains(&value))
+            .map(|l| l.bb())
+        else {
+            return false;
+        };
+        let param_pos = data
+            .bb_data(param_block)
+            .params()
+            .iter()
+            .position(|&p| p == value)
+            .unwrap();
+        let preds: Vec<Inst> = data
+            .bb_data(param_block)
+            .used_by()
+            .iter()
+            .copied()
+            .collect();
+        if preds.is_empty() {
+            return false;
+        }
+        for pred_inst in preds {
+            let args: Vec<Inst> = match data.inst_data(pred_inst).kind() {
+                InstKind::Jump(jump) => jump.args().to_vec(),
+                InstKind::Branch(branch) if branch.t_target() == param_block => {
+                    branch.t_args().to_vec()
+                }
+                InstKind::Branch(branch) if branch.f_target() == param_block => {
+                    branch.f_args().to_vec()
+                }
+                _ => return false,
+            };
+            let Some(&arg) = args.get(param_pos) else {
+                return false;
+            };
+            if !Self::value_flows_from(data, arg, target, visited) {
+                return false;
+            }
+        }
         true
     }
 
@@ -707,6 +790,94 @@ mod tests {
         };
         assert_eq!(step.op(), BinaryOp::Sub);
         assert_eq!(step.lhs(), t);
+    }
+
+    #[test]
+    fn rotates_count_up_when_the_update_flows_through_block_params() {
+        // matmul1 shape: the outer (j) loop's back edge updates the IV via a
+        // chain of inner-loop exit block parameters — `t = add(p2, 1)` where
+        // `p2` flows from the header IV through `body -> mid -> latch`. The
+        // rotation must recognize the phi-chain update as the back edge.
+        let mut program = Program::new();
+        let func = program.new_function(
+            Type::get_i32(),
+            "rot_up_phi_chain".to_owned(),
+            vec![Type::get_i32()],
+        );
+        let (entry, header, body, exit, latch) = {
+            let data = program.func_data_mut(func);
+            let entry = data.add_entry_block();
+            let header = data
+                .new_basic_block()
+                .basic_block("header".to_owned(), vec![Type::get_i32()]);
+            let body = data
+                .new_basic_block()
+                .basic_block("body".to_owned(), vec![]);
+            let mid = data
+                .new_basic_block()
+                .basic_block("mid".to_owned(), vec![Type::get_i32()]);
+            let latch = data
+                .new_basic_block()
+                .basic_block("latch".to_owned(), vec![Type::get_i32()]);
+            let exit = data
+                .new_basic_block()
+                .basic_block("exit".to_owned(), vec![]);
+            for block in [header, body, mid, latch, exit] {
+                data.layout_mut().push_bb_back(block);
+            }
+
+            let init_inst = data.new_local_inst().integer(0);
+            let entry_jump = data.new_local_inst().jump(header, vec![init_inst]);
+            data.layout_mut().insert_inst(entry, entry_jump);
+
+            let iv = data.bb_data(header).params()[0];
+            let bound = data.params()[0];
+            let lt = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+            let header_branch =
+                data.new_local_inst().branch(lt, body, vec![], exit, vec![]);
+            data.layout_mut().insert_inst(header, lt);
+            data.layout_mut().insert_inst(header, header_branch);
+
+            // body -> mid(iv); mid(p) -> latch(p); latch(p2) -> header(add(p2, 1)).
+            let body_jump = data.new_local_inst().jump(mid, vec![iv]);
+            data.layout_mut().insert_inst(body, body_jump);
+            let mid_param = data.bb_data(mid).params()[0];
+            let mid_jump = data.new_local_inst().jump(latch, vec![mid_param]);
+            data.layout_mut().insert_inst(mid, mid_jump);
+            let latch_param = data.bb_data(latch).params()[0];
+            let one = data.new_local_inst().integer(1);
+            let next_iv = data.new_local_inst().binary(BinaryOp::Add, latch_param, one);
+            let backedge = data.new_local_inst().jump(header, vec![next_iv]);
+            data.layout_mut().insert_inst(latch, next_iv);
+            data.layout_mut().insert_inst(latch, backedge);
+
+            let ret = data.new_local_inst().ret(None);
+            data.layout_mut().insert_inst(exit, ret);
+
+            (entry, header, body, exit, latch)
+        };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(func),
+        };
+
+        assert!(run(&mut data));
+        // The header passes through and carries the trip counter.
+        let header_terminator = data.layout().basicblock(header).terminator();
+        assert!(
+            matches!(data.inst_data(header_terminator).kind(), InstKind::Jump(j) if j.target() == body)
+        );
+        assert_eq!(data.bb_data(header).params().len(), 2);
+        // The pre-header guard branches to header/exit.
+        let guard = data.layout().basicblock(entry).terminator();
+        assert!(
+            matches!(data.inst_data(guard).kind(), InstKind::Branch(b) if b.t_target() == header && b.f_target() == exit)
+        );
+        // The latch tests the decremented trip counter at the bottom.
+        let latch_term = data.layout().basicblock(latch).terminator();
+        assert!(
+            matches!(data.inst_data(latch_term).kind(), InstKind::Branch(b) if b.t_target() == header && b.f_target() == exit)
+        );
     }
 
     #[test]

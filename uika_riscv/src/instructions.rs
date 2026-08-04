@@ -2,13 +2,14 @@ use smallvec::SmallVec;
 
 use taki_mir::{
     abi::{ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
+    emit_buffer::LabelKind,
     reg_alloc::reg::{OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
     types::{F32, I32, I64, LoweredType},
     vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
 };
 
-use crate::{abi::Riscv64ABI, labels::Label};
+use crate::{abi::Riscv64ABI, labels::Label, regs::preg_name};
 
 pub type WritableReg = Writable<Reg>;
 
@@ -102,8 +103,9 @@ impl MachInst for MInst {
             MInst::JumpReg { rs } => {
                 collector.reg_use(rs);
             }
-            MInst::CondBr { cond, .. } => {
-                collector.reg_use(cond);
+            MInst::CondBr { rs1, rs2, .. } => {
+                collector.reg_use(rs1);
+                collector.reg_use(rs2);
             }
             MInst::Mov { src, dst } => {
                 collector.reg_use(src);
@@ -258,38 +260,41 @@ impl MachInstEmit for MInst {
                 label.emit(ctx)
             }
             MInst::TailCall { label, .. } => {
-                write!(ctx, "la t6, ")?;
-                label.emit(ctx)?;
-                write!(ctx, "\n    jr t6")
+                // `tail` is the auipc+jalr pseudoinstruction (2 instructions,
+                // one fewer than the previous `la t6, fn; jr t6` form).
+                write!(ctx, "tail ")?;
+                label.emit(ctx)
             }
             MInst::Ret => write!(ctx, "ret"),
             MInst::RetVal { .. } => Ok(()),
             MInst::Args { .. } => Ok(()),
             MInst::Jump { label } => {
-                write!(ctx, "la t6, ")?;
-                label.emit(ctx)?;
-                write!(ctx, "\n    jr t6")
+                let Label::Block(target) = label else {
+                    unreachable!("Jump target must be an intra-function block");
+                };
+                ctx.put_uncond_branch("j ", *target, LabelKind::RV_JAL)
             }
             MInst::JumpReg { rs } => {
                 write!(ctx, "jr ")?;
                 ctx.write_reg(rs)
             }
             MInst::CondBr {
-                cond,
+                op,
+                rs1,
+                rs2,
                 true_label,
                 false_label,
             } => {
-                write!(ctx, "beqz ")?;
-                ctx.write_reg(cond)?;
-                writeln!(ctx, ", 1f")?;
-                write!(ctx, "    la t6, ")?;
-                true_label.emit(ctx)?;
-                writeln!(ctx, "")?;
-                writeln!(ctx, "    jr t6")?;
-                writeln!(ctx, "1:")?;
-                write!(ctx, "    la t6, ")?;
-                false_label.emit(ctx)?;
-                write!(ctx, "\n    jr t6")
+                let Label::Block(true_target) = true_label else {
+                    unreachable!("CondBr true target must be an intra-function block");
+                };
+                let Label::Block(false_target) = false_label else {
+                    unreachable!("CondBr false target must be an intra-function block");
+                };
+                let prefix = condbr_prefix(*op, rs1, rs2);
+                let inv_prefix = condbr_prefix(op.inverted(), rs1, rs2);
+                ctx.put_branch(&prefix, Some(&inv_prefix), *true_target, LabelKind::RV_B)?;
+                ctx.put_uncond_branch("j ", *false_target, LabelKind::RV_JAL)
             }
             MInst::Mov { src, dst } => {
                 let src_real = src.to_real_reg();
@@ -336,6 +341,48 @@ impl MachInstEmit for MInst {
             }
         }
     }
+}
+
+/// A two-register RISC-V B-type branch condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CondBrOp {
+    Beq,
+    Bne,
+    Blt,
+    Bge,
+}
+
+impl CondBrOp {
+    pub fn inverted(self) -> Self {
+        match self {
+            CondBrOp::Beq => CondBrOp::Bne,
+            CondBrOp::Bne => CondBrOp::Beq,
+            CondBrOp::Blt => CondBrOp::Bge,
+            CondBrOp::Bge => CondBrOp::Blt,
+        }
+    }
+
+    /// Assembly mnemonic of the branch.
+    pub fn mnemonic(self) -> &'static str {
+        match self {
+            CondBrOp::Beq => "beq",
+            CondBrOp::Bne => "bne",
+            CondBrOp::Blt => "blt",
+            CondBrOp::Bge => "bge",
+        }
+    }
+}
+
+/// Text prefix of a B-type branch (`"beq a4, a0, "`); the emit buffer appends
+/// the target label. Operands must be physical after register allocation.
+fn condbr_prefix(op: CondBrOp, rs1: &Reg, rs2: &Reg) -> String {
+    let name = |reg: &Reg| {
+        preg_name(
+            reg.to_real_reg()
+                .expect("CondBr operands must be physical after register allocation"),
+        )
+    };
+    format!("{} {}, {}, ", op.mnemonic(), name(rs1), name(rs2))
 }
 
 #[derive(Debug, Clone)]
@@ -434,7 +481,9 @@ pub enum MInst {
         rs: Reg,
     },
     CondBr {
-        cond: Reg,
+        op: CondBrOp,
+        rs1: Reg,
+        rs2: Reg,
         true_label: Label,
         false_label: Label,
     },

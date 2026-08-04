@@ -9,8 +9,8 @@ use smallvec::{SmallVec, smallvec};
 use crate::{
     abi::{DEFAULT_CLOBBERS, Riscv64ABI},
     instructions::{
-        AMode, AluRRImm12OP, AluRRImmShiftOP, AluRRROP, FcvtMode, FpuRRROP, Imm12, LoadOP, MInst,
-        ShiftImm, ShiftImm64, StoreOP,
+        AMode, AluRRImm12OP, AluRRImmShiftOP, AluRRROP, CondBrOp, FcvtMode, FpuRRROP, Imm12,
+        LoadOP, MInst, ShiftImm, ShiftImm64, StoreOP,
     },
     labels::Label,
     regs::{a0, a1, a2, fa0, fp_reg, preg_name, stack_reg, zero_reg},
@@ -1195,8 +1195,6 @@ impl LowerBackend for Riscv64Backend {
                 });
             }
             raana_ir::ir::InstKind::Branch(branch) => {
-                let cond = branch.cond();
-                let cond = ctx.put_value_in_reg(cond);
                 let t_args = branch.t_args();
                 let f_args = branch.f_args();
                 for &arg in t_args.iter().chain(f_args) {
@@ -1205,8 +1203,14 @@ impl LowerBackend for Riscv64Backend {
                 let &[t_target, f_target] = target else {
                     unreachable!()
                 };
+                // Fold an IR comparison into a two-register B-type branch,
+                // skipping the slt/subw+seqz materialization (see
+                // `select_branch_condition`).
+                let BranchCondition { op, rs1, rs2 } = select_branch_condition(ctx, branch.cond());
                 ctx.emit(MInst::CondBr {
-                    cond,
+                    op,
+                    rs1,
+                    rs2,
                     true_label: Label::Block(t_target),
                     false_label: Label::Block(f_target),
                 });
@@ -1269,6 +1273,73 @@ impl LowerBackend for Riscv64Backend {
         ctx.emit(MInst::Jump {
             label: Label::Block(target),
         });
+    }
+
+    fn branch_opt_enabled(_config: &Self::CodegenConfig) -> bool {
+        true
+    }
+
+    fn veneer_lines(kind: taki_mir::emit_buffer::LabelKind, target: &str) -> Vec<String> {
+        use taki_mir::emit_buffer::LabelKind;
+        match kind {
+            // A B-type branch fell out of ±4KiB: a `j` veneer covers the
+            // whole ±1MiB jal range (functions here are far smaller).
+            LabelKind::RV_B | LabelKind::RV_JAL => vec![format!("j {target}")],
+            other => unreachable!("RISC-V does not emit {other:?} branches"),
+        }
+    }
+}
+
+/// Fold an IR comparison into a two-register RISC-V B-type branch condition.
+/// Returns `None` when the condition is not a direct integer comparison; the
+/// caller then falls back to a truthiness test (`bne reg, x0`).
+/// A two-register B-type comparison selected for an IR branch condition.
+struct BranchCondition {
+    op: CondBrOp,
+    rs1: Reg,
+    rs2: Reg,
+}
+
+/// Lower an IR branch condition to a two-register B-type comparison.
+///
+/// Integer comparisons fold directly (`Lt` -> `blt`, `Eq` -> `beq`, ...),
+/// skipping the `slt`/`subw;seqz` materialization. Float comparisons lower
+/// to `flt.s`/`fle.s`/`feq.s`, whose raw bit patterns must not be compared
+/// as integers, and any other condition (e.g. an inlined block param) tests
+/// a register against x0 instead.
+fn select_branch_condition(ctx: &mut LowerContext<'_, MInst>, cond: HirInst) -> BranchCondition {
+    let InstKind::Binary(binary) = ctx.arena.inst_data(cond).kind() else {
+        return branch_truthiness(ctx, cond);
+    };
+    let operand_float =
+        |inst: HirInst| matches!(ctx.arena.inst_data(inst).ty().kind(), HirTypeKind::Float32);
+    if operand_float(binary.lhs()) || operand_float(binary.rhs()) {
+        return branch_truthiness(ctx, cond);
+    }
+    // Mirror `lower_binary`'s operand placement: Gt/Le emit `slt` with the
+    // operands swapped, and the branch folds to the same B-type form.
+    let (op, lhs, rhs) = match binary.op() {
+        BinaryOp::Lt => (CondBrOp::Blt, binary.lhs(), binary.rhs()),
+        BinaryOp::Gt => (CondBrOp::Blt, binary.rhs(), binary.lhs()),
+        BinaryOp::Ge => (CondBrOp::Bge, binary.lhs(), binary.rhs()),
+        BinaryOp::Le => (CondBrOp::Bge, binary.rhs(), binary.lhs()),
+        BinaryOp::Eq => (CondBrOp::Beq, binary.lhs(), binary.rhs()),
+        BinaryOp::NotEq => (CondBrOp::Bne, binary.lhs(), binary.rhs()),
+        _ => return branch_truthiness(ctx, cond),
+    };
+    BranchCondition {
+        op,
+        rs1: ctx.put_value_in_reg(lhs),
+        rs2: ctx.put_value_in_reg(rhs),
+    }
+}
+
+/// Fallback: branch on the truthiness of a materialized condition register.
+fn branch_truthiness(ctx: &mut LowerContext<'_, MInst>, cond: HirInst) -> BranchCondition {
+    BranchCondition {
+        op: CondBrOp::Bne,
+        rs1: ctx.put_value_in_reg(cond),
+        rs2: zero_reg(),
     }
 }
 

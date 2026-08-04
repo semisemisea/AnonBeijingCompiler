@@ -514,9 +514,32 @@ fn find_interchange(program: &Program, func: Function) -> Option<Plan> {
     let data = program.func_data(func);
     let (cfg, _dom, loops) = LoopAnalysis::new(data);
     let induction = BasicInductionVariableAnalysis::new(data, &cfg, &loops);
-    let ranges = RangeAnalysis::new(&arena, &cfg, &loops, &induction);
+
+    // Cheap candidate pre-filter before building the heavy analyses: at
+    // least one innermost loop with a parent is required, otherwise no
+    // interchange is possible and Range/Dependence never need to run.
+    let mut any_candidate = false;
+    for (k_idx, l_k) in loops.loops().iter().enumerate() {
+        let innermost = !loops
+            .loops()
+            .iter()
+            .any(|l| l.header() != l_k.header() && l_k.contains(l.header()));
+        if innermost && loops.parent_loop_index(k_idx).is_some() {
+            any_candidate = true;
+            break;
+        }
+    }
+    if !any_candidate {
+        return None;
+    }
+
     let effects = EffectAnalysis::new(program);
-    let deps = DependenceAnalysis::new(program, func, &effects, 4);
+    // Dependence analysis is only needed for the M42 reducibility check;
+    // build it lazily on the first candidate that reaches that check.
+    let mut deps: Option<DependenceAnalysis> = None;
+    // Range analysis is only needed for the direction check (dual_coeffs);
+    // build it lazily on the first candidate that reaches that check.
+    let mut ranges: Option<RangeAnalysis> = None;
 
     for k_idx in 0..loops.loops().len() {
         let l_k = &loops.loops()[k_idx];
@@ -769,6 +792,8 @@ fn find_interchange(program: &Program, func: Function) -> Option<Plan> {
 
         // (e) The k-loop must be a reduction (M42) — no calls, no other
         // carried dependencies.
+        let deps = deps
+            .get_or_insert_with(|| DependenceAnalysis::new(program, func, &effects, 4));
         let Some(dep) = deps.for_loop(l_k) else {
             continue;
         };
@@ -787,7 +812,10 @@ fn find_interchange(program: &Program, func: Function) -> Option<Plan> {
         let mut has_row_stride = false;
         for access in &dep.accesses {
             let addr = access_inst_addr(&arena, access.inst);
-            let Some((cj, ck)) = dual_coeffs(&arena, l_j, l_k, j_iv, k_iv, &ranges, addr) else {
+            let ranges = ranges.get_or_insert_with(|| {
+                RangeAnalysis::new(&arena, &cfg, &loops, &induction)
+            });
+            let Some((cj, ck)) = dual_coeffs(&arena, l_j, l_k, j_iv, k_iv, ranges, addr) else {
                 all_same_sign = false;
                 break;
             };

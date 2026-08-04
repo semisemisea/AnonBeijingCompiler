@@ -1069,4 +1069,93 @@ P3：D（位反转无分支）——先量化 fft1 热循环占比。
 
 **验证**：inline.rs 8 单测（4 新+4 旧）、raana_ir 264 全量、`cargo test --offline --locked --workspace` 全绿、make test perf/huffman-01.sy + perf/fft1.sy（ARGS="-O 1 -j 1"）QEMU 均 PASS。
 
-**遗留**：many_mat_cal DPE 越界（既有，独立修）；fft1 multiply 若要消除需递归→循环迭代化变换（非 Inline 范畴，clang 也未做）；fft_specialized_0 顶层调用点保持拒绝（收益≈0 判断正确）。
+**遗留**：~~many_mat_cal DPE 越界（既有，独立修）~~ **已修复（见 §8.8）**；fft1 multiply 若要消除需递归→循环迭代化变换（非 Inline 范畴，clang 也未做）；fft_specialized_0 顶层调用点保持拒绝（收益≈0 判断正确）。
+
+### 8.8 many_mat_cal DeadPhiElimination panic 根因与修复（2026-08-04）
+
+**现象**：many_mat_cal-1/2/3 在 -O2 编译期 panic `swap_remove index (is 12) should be < len (is 12)`，栈顶为 DeadPhiElimination::run_on。基线 HEAD（a36776c）同样 panic——既有 bug，但并非"未知遗留"：是 IRH 与 DPE 的不变量耦合问题。
+
+**根因链**（用临时诊断定位：pass manager 每个 pass 后插 args/params 对齐检查，锁定 iter=0 pass=8 首次失配）：
+1. InvariantReductionHoisting（IRH，many_mat_cal 热点的退化优化，pass.rs 注释明示）改造外层循环：给 header（while_entry_49）`add_param(carrier)` 追加 D_total 载体参数（12→13）。
+2. IRH 只同步了**新边**的 args（compute_done、degraded_latch 各 push 1 个）；**原 latch（while_end_54）的 `jump header` 边没动**——header 的 branch 已改指 degraded_latch，原 latch 成死代码，但其 terminator 仍指向 header，`used_by` 反向链接保留（DCE 只删指令不删块，且 jump 的 target 可达所以 jump 本身也保留）。
+3. 死边 args 12 vs header params 13 → IR 不变量（所有 incoming args 长度 == params 长度）被破坏。DPE 遍历 `header.used_by()`（不区分可达性）按 13 个 params 的 index 删 args → swap_remove(12) 越界。
+4. 为什么之前没炸：DPE 是 fixed point 里唯一按 used_by 遍历所有边（含死边）并按位置删 args 的 pass；之前的用例没有"改造后遗留死边"的形态。
+
+**修复**（两层）：
+1. **IRH 根因**（invariant_reduction_hoisting.rs apply()）：加 carrier 后遍历 `header.used_by()`，所有仍指向 header 的 terminator（jump/branch 对应 arm）把 args 补齐到 params 长度——死边 push dummy i32（不可执行，值无意义）。used_by 反向链接不区分可达性，所有消费方都会看到死边。
+2. **DPE 加固**（dce.rs）：`swap_remove` → `remove`。unused index 序列是逆序，positional `remove` 保序（swap_remove 会把末尾元素换到删位导致 params/args 相对顺序乱掉；虽与 args 同步乱序，但多轮 fixed point 下任何一方被其他 pass 单独触碰就错位）。
+3. **回归断言**（IRH 测试 `degrades_an_invariant_outer_reduction_nest`）：改造后所有指向 header 的边 args == params 长度（含死边），直接覆盖本次 bug 场景。
+
+**验证**：many_mat_cal-1/2/3 编译通过（239 指令，之前 PANIC）；QEMU -O1 PASS（3.26s——IRH 退化首次实际运行验证，设计目标 1.5×10¹⁰ → 10⁶ 元素操作）；全量 perf 汇编扫描 0 panic、0 失配、其余用例指令数与修复前完全一致（huffman 460 / fft1 562 / 01_mm 235 / 03_sort 527 等不变）；raana_ir 264 + workspace 11 suite 全绿；huffman/fft1 QEMU 回归 PASS。临时诊断代码已全部移除（pass.rs 无残留 diff）。
+
+## 9. 全量 perf 效率审查：vs clang -O2 汇编对比（2026-08-04）
+
+方法：clang 17（--target=aarch64-none-elf -O2 -S，`const int N = k;` sed 成 `#define N k`，加 -Wno-implicit-function-declaration），与本编译器 -O2 同口径数指令（函数级 + 循环体级）。**指令数≠动态效率**：huffman 静态 +9 但 decode 循环全内联（动态优于 clang 的 bl read_bits）；01_mm 静态 -68 但 clang 主循环用 NEON（35 条 SIMD，动态我们落后——NEON 按用户指示最后考虑）。
+
+### 9.1 指令数全景（clang vs ours，按落后幅度排序）
+
+| 用例 | clang | ours | Δ | 落后主因（函数级） |
+|---|---|---|---|---|
+| fft0/1/2 | 297 | 562 | +265 | multiply 64v43 / power 36v22 / fft 151v109 + fft_specialized_0 139（clang 无此克隆）/ main 172v90 |
+| 03_sort | 374 | 527 | +153 | radixSort_specialized_0 239（specialize 递归克隆双份）+ radixSort 230v215 |
+| matmul | 132 | 200 | +68 | main 内 k 循环地址 madd 重算 |
+| h-5 | 242 | 328 | +86 | kernel_ludcmp 276v203（stride 常量循环内重载 + 地址 madd） |
+| h-8 | 134 | 165 | +31 | kernel_nussinov 127v106 |
+| knapsack | 61 | 99 | +38 | knapsack_naive 53v32 |
+| h-1 | 68 | 98 | +30 | fun 27v21 / main 71v47 |
+| sl1 | 158 | 206 | +48 | 二维地址 madd 重算 + 常量循环内重载（movz 14%） |
+| huffman | 451 | 460 | +9 | 持平（动态我们更优，见上） |
+| crypto | 445 | 430 | -15 | pseudo_md5 299v135 但 pseudo_sha1 被 DFE 删（clang 保留死函数） |
+| 领先：h-10 -52%、crc -47%、h-4 -45%、conv2d -29%、01_mm -22%、shuffle -22%、h-9 -21%、many_mat_cal -8%、transpose -8% |
+
+### 9.2 效率差距分类（按通用性与动态收益排序）
+
+**A. 循环内大常量物化重载（头号通用差距，影响 fft1/sl1/matmul/h-5/h-1/crypto/huffman/crc）**
+- 现象：IR 的 const 是值（不在 layout），后端在**每个使用点**物化 movz/movk。循环内使用的 magic 取模常量（998244353）、stride（5600/15900）、边界（1000）每轮重载 2-6 条。
+- 实测：fft1 蝶形循环体每轮 movz/movk ×4-6（clang 循环外 w22/w23 加载一次，循环内 0 条）；movz/movk 静态占比 ours 9% vs clang 2%（fft1）、sl1 14% vs 3%、h-1 14% vs 2%、crypto 10% vs 4%、huffman 8% vs 3%。
+- 根因：LICM 把 const 当 invariant（licm.rs:157-162）但不提升（const 无 layout 位置）；taki_mir 无机器层 LICM（搜索无）；ion RA 无循环概念，remat 决策每使用点独立。
+- 候选方案（IR 层，需先讨论定方案）：
+  1. 新增 `InstKind::Materialize(Integer)`（或复用现有指令的恒等形态如 `Binary(Add, C, 0)`——需防 GVN/常量折叠回 C）：在 preheader 物化一次，循环内引用。
+  2. GVN/专门 pass：循环内使用 ≥2 次的 const 操作数 → preheader 物化。
+  3. 后端 remat 成本模型：大常量（>12-bit imm）remat 成本算 2，倾向寄存器分配——但无循环信息，治标不治本。
+- 验证：fft1 蝶形循环体指令数 30→20 左右；sl1/matmul/h-5 循环体 movz 清零。
+
+**B. GEP 二维地址未指针化（sl1/matmul/h-5，A 的伴生）**
+- 现象：`a[i][j]`（i 循环不变、j 循环变）每轮 `mov x, xzr; add x, x, w, sxtw; movz/movk stride; madd addr, idx, stride, base` 重算（sl1 两处、matmul 内层、ludcmp 多处），clang 全部双指针步进（`ldr [xN]; add xN, xN, #4`）。
+- 根因：PSR（pointer_strength_reduction）未覆盖"不变行 + 变列"的 2D GEP 形态（最近 commit 1261113 只支持 runtime-bound 循环的一种形态）；A 的常量重载使 madd 序列更贵。
+- 候选：PSR 扩展——循环内 `getelemptr base, (i, j)`，i 不变 j 是 IV → preheader 算 `base + i*stride`，循环内 `p += 4` 指针步进。注意 32 位索引符号扩展（sxtw）与 64 位地址。
+- 验证：sl1/matmul/h-5 内层循环体指令数对比 clang。
+
+**C. specialize 对递归函数的过度克隆（03_sort +153 主因）**
+- 现象：radixSort 递归（bitround 递减），main 以常数调用 → specialize 克隆 radixSort_specialized_0（239 条）；克隆体内部递归仍调通用 radixSort（bitround 递归时非常数）→ 双份代码共存，specialized 版只执行顶层 1 次，收益 = bitround 常数折叠。
+- 候选：specialize 对递归 callee 的克隆策略——内部递归调用重定向到 specialized 版（保持折叠链，但体积仍 ×2 且位宽递减需要多版？）或递归函数直接不克隆（省 239 条体积）。需量化 specialized 版顶层执行的动态收益。
+- 验证：03_sort 指令数 527→~290（去 specialized 双份）；radixSort 性能不退化。
+
+**D. 函数序言/尾声 folded spill（fft1 multiply 64v43、power 36v22 等）——已实施（2026-08-04）**
+- 现象：我们的序言 `stp x29,x30 + sub sp + add x29 + str x19 + str x20`（5-6 条）vs clang `stp x29,x30 + stp x20,x19 + mov`（3-4 条，folded spill 用 stp 一次存两个 callee-saved）。
+- 实施：abi.rs `gen_clobber_save/gen_clobber_restore` 把 callee_saved 中相邻 8 字节整数对合并成 `StorePair/LoadPair`（SignedOffset，stp/ldp），寄存器顺序与槽位地址对应关系按 stp 语义（src1 存低地址）调整。非 lowering 改动（frame orchestration 钩子，RA 后寄存器/偏移全已知），零依赖检查需求。
+- 结果：**全量 60 用例指令数全减，总计 -438**：fft1 562→521（-41，multiply 序言 `str x19;str x20`→`stp x20,x19`）、03_sort -19、h-5 -12、knapsack -12、h-8 -8、sl1 -8、conv2d -6、huffman -6，无一增加。workspace 全绿，fft1/huffman/many_mat_cal QEMU -O1 回归 PASS。
+- 遗留：**crypto-1 大帧（pseudo_md5 帧 688B）**——10 个 callee-saved（x19-x28）偏移 608-680 超 stp SignedOffset 编码范围（±512）未合并（clang 同函数只用 1 个 callee-saved + 576B 局部 spill，RA 策略差异）。候选：FrameLayout 槽位布局把 callee-saved 放帧低偏移区（可编码 stp）或分块 stp。
+- 连续 store 扫描结论：**通用 merge pass（方案 2）当前无候选**——局部数组初始化已是 MemZero（`bl .Lsoyo_memzero`，03_sort head[16] 等），全局数组走 BSS `.zero`，无展开的连续 store 序列；唯一相邻 store 对是 crypto-1 大帧 callee-saved（超编码范围，属布局问题）。暂缓方案 2。
+
+**E. huffman 范围检查折叠（已记录于 §7.4，P2）**：`(c+64)>=65 && (c+64)<=144` → `sub; cmp; b.ls` 单无符号比较。decode 循环每符号 1 次。
+
+**F. crypto pseudo_md5 299v135（低优先）**：clang 主循环更紧凑（可能是循环展开/常量折叠差异），总量我们已领先（-15）。
+
+### 9.3 动态效率注意点（指令数之外的判断）
+
+- huffman 静态 +9 但动态更优（decode 循环零调用 vs clang bl read_bits）；h-10 我们 trsm 内联 vs clang 保留函数（动态我们优）；01_mm 我们静态 -68 但 clang NEON 动态快——**静态对比只用于找差距，最终以 QEMU/真机时间为准**。
+- 蝶形循环/radix 主循环/matmul k 循环的每轮指令数是动态热点代理指标：fft1 我们 ~30 条/轮 vs clang ~20 条/轮（差 33%，其中 movz/movk 4-6 条）。
+
+### 9.4 优先级建议
+
+1. **A+B（循环内常量物化 + GEP 指针化）**：P1，通用、跨 ~8 用例，fft1（最大静态差距）与 sl1/matmul/h-5（热循环）直接受益。先定 A 的方案（Materialize 指令 vs 恒等 Binary）再动工。
+2. **D（folded spill）**：✅ 已实施（§9.2 D，全量 -438）。遗留 crypto-1 大帧布局（P3）。
+3. **C（specialize 递归克隆）**：搁置——纯效率无害（specialized 版仅执行顶层 1 次，527 条 < L1I 32KB），收益仅静态体积/编译时间（比赛按运行时间计分），filter 递归克隆易错。需要时再做。
+4. **E（范围检查折叠）**：P2，独立小变换（§7.4 已列）。
+5. NEON 最后考虑（01_mm 等）。
+
+### 9.5 验证基线（本清单）
+
+- 全部用 clang -O2 同用例对比 + 循环体每轮指令数 + cargo test + make test 定向；全量由用户跑。
+- 合规：全部按 IR 结构/循环结构触发，无名字/输入指纹（常量物化按"循环内使用的不可编码常量"触发，GEP 按索引结构触发，与用例无关）。

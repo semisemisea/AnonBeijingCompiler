@@ -202,18 +202,51 @@ impl ABIMachineSpec for AArch64Abi {
     fn gen_clobber_save(frame: &FrameLayout) -> SmallVec<[MInst; 16]> {
         let mut insts = smallvec![];
         let base = i64::from(frame.total_size - frame.setup_area_size);
+        // Precompute each callee-saved slot, then merge adjacent 8-byte
+        // integer pairs into a single store-pair (mirroring the FP/LR
+        // prologue) instead of two independent stores.
         let mut offset = 0i64;
-        for preg in &frame.callee_saved {
-            let size = i64::from(clobber_slot_size(*preg));
+        let mut slots = Vec::with_capacity(frame.callee_saved.len());
+        for &preg in &frame.callee_saved {
+            let size = i64::from(clobber_slot_size(preg));
             if size > 8 {
                 offset = (offset + size - 1) & !(size - 1);
             }
             offset += size;
+            slots.push((preg, base - offset));
+        }
+        let mut i = 0;
+        while i < slots.len() {
+            let (preg, addr) = slots[i];
+            let pair = i + 1 < slots.len()
+                && clobber_memory_type(preg) == MemoryType::I64
+                && clobber_memory_type(slots[i + 1].0) == MemoryType::I64
+                && addr - slots[i + 1].1 == 8;
+            if pair {
+                if let Some(offset) = SImm7Scaled::new(slots[i + 1].1, 8) {
+                    // `stp src1, src2, [sp, #off]` stores src1 at the lower
+                    // address [sp,#off] and src2 at [sp,#off+8]; our slot
+                    // order assigns the earlier preg the higher address, so
+                    // the pair is swapped.
+                    insts.push(MInst::StorePair {
+                        ty: MemoryType::I64,
+                        src1: Reg::from_physical_reg(slots[i + 1].0),
+                        src2: Reg::from_physical_reg(preg),
+                        addr: PairAMode::SignedOffset {
+                            base: regs::stack_reg(),
+                            offset,
+                        },
+                    });
+                    i += 2;
+                    continue;
+                }
+            }
             insts.push(MInst::Store {
-                ty: clobber_memory_type(*preg),
-                src: Reg::from_physical_reg(*preg),
-                addr: AMode::SpOffset(base - offset),
+                ty: clobber_memory_type(preg),
+                src: Reg::from_physical_reg(preg),
+                addr: AMode::SpOffset(addr),
             });
+            i += 1;
         }
         insts
     }
@@ -222,17 +255,43 @@ impl ABIMachineSpec for AArch64Abi {
         let mut insts = smallvec![];
         let base = i64::from(frame.total_size - frame.setup_area_size);
         let mut offset = 0i64;
-        for preg in &frame.callee_saved {
-            let size = i64::from(clobber_slot_size(*preg));
+        let mut slots = Vec::with_capacity(frame.callee_saved.len());
+        for &preg in &frame.callee_saved {
+            let size = i64::from(clobber_slot_size(preg));
             if size > 8 {
                 offset = (offset + size - 1) & !(size - 1);
             }
             offset += size;
+            slots.push((preg, base - offset));
+        }
+        let mut i = 0;
+        while i < slots.len() {
+            let (preg, addr) = slots[i];
+            let pair = i + 1 < slots.len()
+                && clobber_memory_type(preg) == MemoryType::I64
+                && clobber_memory_type(slots[i + 1].0) == MemoryType::I64
+                && addr - slots[i + 1].1 == 8;
+            if pair {
+                if let Some(offset) = SImm7Scaled::new(slots[i + 1].1, 8) {
+                    insts.push(MInst::LoadPair {
+                        ty: MemoryType::I64,
+                        dst1: Writable::from_reg(Reg::from_physical_reg(slots[i + 1].0)),
+                        dst2: Writable::from_reg(Reg::from_physical_reg(preg)),
+                        addr: PairAMode::SignedOffset {
+                            base: regs::stack_reg(),
+                            offset,
+                        },
+                    });
+                    i += 2;
+                    continue;
+                }
+            }
             insts.push(MInst::Load {
-                ty: clobber_memory_type(*preg),
-                dst: Writable::from_reg(Reg::from_physical_reg(*preg)),
-                addr: AMode::SpOffset(base - offset),
+                ty: clobber_memory_type(preg),
+                dst: Writable::from_reg(Reg::from_physical_reg(preg)),
+                addr: AMode::SpOffset(addr),
             });
+            i += 1;
         }
         insts
     }

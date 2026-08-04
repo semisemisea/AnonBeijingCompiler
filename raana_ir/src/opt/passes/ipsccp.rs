@@ -79,6 +79,25 @@ impl LatticeMap {
             }
         }
     }
+
+    /// Overwrite the lattice unconditionally, returning whether it changed.
+    /// Loads use this: their value is a snapshot of the simulated memory at
+    /// the time of (re)scheduling, and merging an outdated snapshot with the
+    /// current one (e.g. 0 read before a store, 6 after) would collapse to
+    /// Bottom instead of refining to the latest value.
+    fn insert_or_replace(&mut self, node: Node, status: Lattice) -> bool {
+        match self.0.entry(node) {
+            std::collections::hash_map::Entry::Occupied(mut e) if *e.get() != status => {
+                e.insert(status);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(status);
+                status != Lattice::Top
+            }
+        }
+    }
 }
 type EdgeSet = FxHashSet<Edge>;
 type NodeSet = FxHashSet<Node>;
@@ -206,34 +225,20 @@ impl MemState {
         changed
     }
 
-    /// A `MemZero` of `len` bytes at `off` of `root`: cells in the range
-    /// are dropped (the zero range now answers them), and the zero interval
-    /// is merged.
+    /// A `MemZero` of `len` bytes at `off` of `root` zeroes the range.
+    ///
+    /// Cells already written by stores are NOT dropped: the worklist does
+    /// not process a block's instructions in layout order, so a MemZero may
+    /// be visited after the stores of the same initialization sequence. The
+    /// frontend always emits MemZero before the stores, so a cell that
+    /// exists must reflect a store that is semantically later; the zero
+    /// range only answers loads when no store has written the cell.
     fn mem_zero(&mut self, root: RootKey, off: i64, len: i64) -> bool {
-        let mut changed = false;
-        if let Some(keys) = self.root_cells.get(&root) {
-            let to_remove = keys
-                .iter()
-                .copied()
-                .filter(|&k| {
-                    let o = k.offset();
-                    o >= off && o < off + len
-                })
-                .collect::<Vec<_>>();
-            for key in to_remove {
-                self.cells.remove(&key);
-                if let Some(keys) = self.root_cells.get_mut(&root) {
-                    keys.retain(|&k| k != key);
-                }
-                changed = true;
-            }
-        }
         self.all_roots.insert(root);
         let ranges = self.zero.entry(root).or_default();
         let before_len = ranges.len();
         merge_zero_interval(ranges, off, off + len);
-        changed |= ranges.len() != before_len;
-        changed
+        ranges.len() != before_len
     }
 
     /// The value a store through an unresolvable address may target: the
@@ -505,7 +510,12 @@ impl Pass for IPSCCP {
                         match resolve_cell(env, &ctx, func, load.src()) {
                             Some((key, root)) => {
                                 let value = state.read(key);
-                                merge_and_extend(node, value, &mut lattice_map);
+                                // Overwrite: the load mirrors the current
+                                // memory snapshot, not a meet of historical
+                                // snapshots.
+                                if lattice_map.insert_or_replace(node, value) {
+                                    extend_affected_node_used_by(node);
+                                }
                                 state.root_loaders.entry(root).or_default().push(node);
                             }
                             None => {
@@ -1329,6 +1339,58 @@ mod tests {
     fn call_to_writer_invalidates_global_cell() {
         let mut program = Program::new();
         let global = new_global(&mut program);
+        // The writer stores its (unknown) argument into the global.
+        let writer = program.new_function(Type::get_unit(), "writer".into(), vec![Type::get_i32()]);
+        {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(writer),
+            };
+            let entry = data.add_entry_block();
+            let param = data.params()[0];
+            let store = data.new_local_value().store(param, global);
+            data.layout_mut().insert_inst(entry, store);
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+        }
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        // An unknown value flows into the writer's parameter.
+        let getint = program.new_function(Type::get_i32(), "getint".into(), vec![]);
+        let (load, _ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(main),
+            };
+            let entry = data.add_entry_block();
+            let zero = data.new_local_value().integer(0);
+            let gep = data.new_local_value().get_elem_ptr(global, vec![zero]);
+            data.layout_mut().insert_inst(entry, gep);
+            let five = data.new_local_value().integer(5);
+            let store = data.new_local_value().store(five, gep);
+            data.layout_mut().insert_inst(entry, store);
+            let input = data.new_local_value().call(getint, vec![]);
+            data.layout_mut().insert_inst(entry, input);
+            let call = data.new_local_value().call(writer, vec![input]);
+            data.layout_mut().insert_inst(entry, call);
+            let load = data.new_local_value().load(gep);
+            data.layout_mut().insert_inst(entry, load);
+            let ret = data.new_local_value().ret(Some(load));
+            data.layout_mut().insert_inst(entry, ret);
+            (load, ret)
+        };
+
+        let _ = IPSCCP.run(&mut program);
+        let data = program.func_data(main);
+        // The writer may have overwritten the cell with an unknown value:
+        // the load stays a load.
+        assert!(matches!(data.inst_data(load).kind(), InstKind::Load(..)));
+    }
+
+    #[test]
+    fn call_to_deterministic_writer_folds_load() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        // The writer stores a compile-time constant into the global.
         let writer = program.new_function(Type::get_unit(), "writer".into(), vec![]);
         {
             let mut data = ArenaContextMut {
@@ -1352,9 +1414,6 @@ mod tests {
             let zero = data.new_local_value().integer(0);
             let gep = data.new_local_value().get_elem_ptr(global, vec![zero]);
             data.layout_mut().insert_inst(entry, gep);
-            let five = data.new_local_value().integer(5);
-            let store = data.new_local_value().store(five, gep);
-            data.layout_mut().insert_inst(entry, store);
             let call = data.new_local_value().call(writer, vec![]);
             data.layout_mut().insert_inst(entry, call);
             let load = data.new_local_value().load(gep);
@@ -1364,10 +1423,13 @@ mod tests {
             (load, ret)
         };
 
-        let _ = IPSCCP.run(&mut program);
+        assert!(IPSCCP.run(&mut program));
         let data = program.func_data(main);
-        // The writer may have overwritten the cell: the load stays a load.
-        assert!(matches!(data.inst_data(load).kind(), InstKind::Load(..)));
+        // The callee's constant store is modeled: the load folds to 1.
+        assert!(matches!(
+            data.inst_data(load).kind(),
+            InstKind::Integer(integer) if integer.value() == 1
+        ));
     }
 
     #[test]

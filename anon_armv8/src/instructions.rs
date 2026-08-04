@@ -285,6 +285,13 @@ pub enum AMode {
         extend: ExtendOp,
         shift: u8,
     },
+    /// Post-increment addressing for single loads/stores: the base register
+    /// is both *read* (as the address) and *written back* (advanced by the
+    /// signed 9-bit immediate), so it is a def+use operand.
+    PostIndex {
+        base: Reg,
+        offset: SImm9,
+    },
     FrameSlot(i64),
     /// A fixed offset from the post-prologue stack pointer.
     SpOffset(i64),
@@ -1323,6 +1330,14 @@ fn visit_amode(collector: &mut impl OperandVisitor, addr: &mut AMode) {
         | AMode::ExtendedRegOffset { base, index, .. } => {
             use_sp_aware_reg(collector, base);
             collector.reg_use(index);
+        }
+        AMode::PostIndex { base, .. } => {
+            // Post-index addressing reads the base as the address and writes
+            // it back advanced by the immediate: a def+use on the same
+            // register (mirrors PairAMode::PostIndex in the scheduler).
+            use_sp_aware_reg(collector, base);
+            let mut writable = Writable::from_reg(*base);
+            def_sp_aware_reg(collector, &mut writable);
         }
         AMode::FrameSlot(_)
         | AMode::SpOffset(_)
@@ -2409,6 +2424,11 @@ fn emit_amode(ctx: &mut dyn EmitContext, addr: &AMode) -> core::fmt::Result {
             }
             write!(ctx, "]")
         }
+        AMode::PostIndex { base, offset } => {
+            write!(ctx, "[")?;
+            emit_reg(ctx, *base, OperandSize::Size64)?;
+            write!(ctx, "], #{}", offset.value())
+        }
         AMode::FrameSlot(offset) | AMode::SpOffset(offset) | AMode::OutgoingArg(offset) => {
             write!(ctx, "[sp, #{offset}]")
         }
@@ -3022,6 +3042,72 @@ mod tests {
             },
         });
         assert_eq!(store, "str q4, [x0, #16]");
+    }
+
+    #[test]
+    fn emits_post_index_load_and_store() {
+        let load = emit(MInst::Load {
+            ty: super::MemoryType::I32,
+            dst: Writable::from_reg(int_reg(3)),
+            addr: super::AMode::PostIndex {
+                base: int_reg(0),
+                offset: super::SImm9::new(-8).unwrap(),
+            },
+        });
+        assert_eq!(load, "ldr w3, [x0], #-8");
+
+        let store = emit(MInst::Store {
+            ty: super::MemoryType::I32,
+            src: int_reg(4),
+            addr: super::AMode::PostIndex {
+                base: int_reg(1),
+                offset: super::SImm9::new(16).unwrap(),
+            },
+        });
+        assert_eq!(store, "str w4, [x1], #16");
+    }
+
+    #[test]
+    fn post_index_base_is_collected_as_use_and_def() {
+        let base = virtual_reg(0, RegClass::Int);
+        let dst = virtual_reg(1, RegClass::Int);
+        let mut load = MInst::Load {
+            ty: super::MemoryType::I32,
+            dst: Writable::from_reg(dst),
+            addr: super::AMode::PostIndex {
+                base,
+                offset: super::SImm9::new(8).unwrap(),
+            },
+        };
+        let mut visitor = TestOperandVisitor(Vec::new());
+        load.get_operands(&mut visitor);
+        let base_ops: Vec<_> = visitor
+            .0
+            .iter()
+            .filter(|(vreg, ..)| *vreg == base.to_virtual_reg().unwrap())
+            .collect();
+        assert_eq!(
+            base_ops.len(),
+            2,
+            "post-index base must be collected as both a use and a def"
+        );
+        let base_kinds: Vec<_> = base_ops.iter().map(|(_, _, kind)| *kind).collect();
+        assert!(
+            base_kinds.contains(&OperandKind::Use),
+            "base must be a use: {base_kinds:?}"
+        );
+        assert!(
+            base_kinds.contains(&OperandKind::Def),
+            "base must be a def: {base_kinds:?}"
+        );
+
+        let dst_kinds: Vec<_> = visitor
+            .0
+            .iter()
+            .filter(|(vreg, ..)| *vreg == dst.to_virtual_reg().unwrap())
+            .map(|(_, _, kind)| *kind)
+            .collect();
+        assert_eq!(dst_kinds, vec![OperandKind::Def]);
     }
 
     #[test]

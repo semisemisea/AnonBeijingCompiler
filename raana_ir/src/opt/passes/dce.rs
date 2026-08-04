@@ -567,8 +567,16 @@ impl Pass for DeadPhiElimination {
 
 #[cfg(test)]
 mod dead_phi_tests {
+<<<<<<< HEAD
     use super::{DeadPhiElimination, Pass};
     use crate::ir::{BinaryOp, InstKind, Program, Type, arena::Arena, builder_trait::*};
+=======
+    use super::{DeadFunctionElimination, DeadPhiElimination, Pass};
+    use crate::{
+        ir::{InstKind, Program, Type, arena::Arena, builder_trait::*},
+        opt::pass::ArenaContextMut,
+    };
+>>>>>>> a36776c ([Opt(DCE)]: Eliminate dead functions unreachable from main)
 
     #[test]
     fn removes_dead_param_from_both_same_target_branch_arms() {
@@ -603,6 +611,7 @@ mod dead_phi_tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn jump_args_stay_aligned_when_trailing_params_are_dead() {
         // A block whose *trailing* parameters are dead: the jump arguments
         // must drop the same positions, keeping earlier args aligned.
@@ -662,6 +671,157 @@ mod dead_phi_tests {
             }
         }
         assert!(found);
+=======
+    fn removes_an_unreferenced_function() {
+        let mut program = Program::new();
+        let main = program.new_function(Type::get_unit(), "main".into(), vec![]);
+        let a = program.new_function(Type::get_unit(), "a".into(), vec![]);
+        let b = program.new_function(Type::get_unit(), "b".into(), vec![]);
+        let dead = program.new_function(Type::get_unit(), "dead".into(), vec![]);
+
+        for (func, calls) in [
+            (main, vec![a]),
+            (a, vec![b]),
+            (b, vec![]),
+            (dead, vec![]),
+        ] {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(func),
+            };
+            let entry = data.add_entry_block();
+            for &callee in &calls {
+                let call = data.new_local_value().call(callee, vec![]);
+                data.layout_mut().insert_inst(entry, call);
+            }
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+        }
+
+        assert!(DeadFunctionElimination.run(&mut program));
+        let layout = program.function_layout();
+        assert!(layout.contains(&main));
+        assert!(layout.contains(&a));
+        assert!(layout.contains(&b));
+        assert!(!layout.contains(&dead));
+    }
+
+    #[test]
+    fn removes_transitively_dead_functions() {
+        let mut program = Program::new();
+        let main = program.new_function(Type::get_unit(), "main".into(), vec![]);
+        let d = program.new_function(Type::get_unit(), "d".into(), vec![]);
+        let e = program.new_function(Type::get_unit(), "e".into(), vec![]);
+
+        for (func, calls) in [(main, vec![]), (d, vec![e]), (e, vec![])] {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(func),
+            };
+            let entry = data.add_entry_block();
+            for &callee in &calls {
+                let call = data.new_local_value().call(callee, vec![]);
+                data.layout_mut().insert_inst(entry, call);
+            }
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+        }
+
+        assert!(DeadFunctionElimination.run(&mut program));
+        let layout = program.function_layout();
+        assert!(layout.contains(&main));
+        assert!(!layout.contains(&d));
+        assert!(!layout.contains(&e));
+    }
+
+    #[test]
+    fn removes_a_self_recursive_function() {
+        let mut program = Program::new();
+        let main = program.new_function(Type::get_unit(), "main".into(), vec![]);
+        let f = program.new_function(Type::get_unit(), "f".into(), vec![]);
+
+        for (func, calls) in [(main, vec![]), (f, vec![f])] {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(func),
+            };
+            let entry = data.add_entry_block();
+            for &callee in &calls {
+                let call = data.new_local_value().call(callee, vec![]);
+                data.layout_mut().insert_inst(entry, call);
+            }
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+        }
+
+        assert!(DeadFunctionElimination.run(&mut program));
+        assert!(!program.function_layout().contains(&f));
+    }
+
+    #[test]
+    fn preserves_decl_and_main() {
+        let mut program = Program::new();
+        let main = program.new_function(Type::get_unit(), "main".into(), vec![]);
+        let unused_decl = program.new_function(Type::get_unit(), "unused_decl".into(), vec![]);
+
+        // `unused_decl` is a declaration stub (no basic blocks) and is never
+        // called: it must be preserved, as must `main`.
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(main),
+        };
+        let entry = data.add_entry_block();
+        let ret = data.new_local_value().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        assert!(!DeadFunctionElimination.run(&mut program));
+        let layout = program.function_layout();
+        assert!(layout.contains(&main));
+        assert!(layout.contains(&unused_decl));
+    }
+}
+
+/// Remove functions that are unreachable from `main` through the call graph
+/// (dead functions). Instruction-level DCE keeps whole unused functions,
+/// which then drag their internal call sites into the emitted assembly
+/// (e.g. an unused crypto helper retaining its rotl/and calls). Reachability
+/// is the transitive closure from `main`, so a self-recursive function with
+/// no external caller is removed as well, which a plain callsite-count
+/// check would misclassify. Declaration stubs (runtime library interfaces)
+/// are preserved; `main` is always reachable as the closure root. Removing
+/// a function only drops it from the program's function layout: the
+/// `FunctionData` stays in the arena because function handles are
+/// index-based and arena removal would invalidate every later handle.
+pub struct DeadFunctionElimination;
+
+impl Pass for DeadFunctionElimination {
+    fn run(&mut self, program: &mut Program) -> bool {
+        let call_graph = call_graph::CallGraph::new(program);
+        let main = program.get_main_function();
+        let mut reachable = HashSet::default();
+        let mut queue = vec![main];
+        let mut head = 0;
+        while head < queue.len() {
+            let func = queue[head];
+            head += 1;
+            if reachable.insert(func) {
+                queue.extend(call_graph.callees_in(func));
+            }
+        }
+        let dead = program
+            .function_layout()
+            .iter()
+            .copied()
+            .filter(|&func| !reachable.contains(&func) && !program.func_data(func).layout().is_decl())
+            .collect::<Vec<_>>();
+        if dead.is_empty() {
+            return false;
+        }
+        for func in dead {
+            program.remove_function(func);
+        }
+        true
+>>>>>>> a36776c ([Opt(DCE)]: Eliminate dead functions unreachable from main)
     }
 }
 

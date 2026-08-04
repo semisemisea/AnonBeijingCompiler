@@ -82,6 +82,18 @@ const MATRIX: &[MatrixCase] = &[
 ];
 
 fn compile_sy(source: &str, target: Target, opt_level: u8) -> String {
+    compile_sy_with(source, target, opt_level, true)
+}
+
+/// Like `compile_sy`, but with a pipeline that keeps dead functions (no
+/// dead-function elimination). ABI observation tests assert on the parameter
+/// binding of optimized-but-unreachable helpers, which the real pipeline
+/// correctly removes.
+fn compile_sy_without_dfe(source: &str, target: Target, opt_level: u8) -> String {
+    compile_sy_with(source, target, opt_level, false)
+}
+
+fn compile_sy_with(source: &str, target: Target, opt_level: u8, use_dfe: bool) -> String {
     let ast = crate::sysy::CompUnitsParser::new()
         .parse(source)
         .expect("SysY test case must parse");
@@ -161,9 +173,21 @@ mod tests {
     use super::*;
 
     fn compile_deterministically(case: &MatrixCase, target: Target, opt_level: u8) -> String {
-        let first = compile_sy(case.source, target, opt_level);
+        compile_deterministically_with(case, target, opt_level, true)
+    }
+
+    fn compile_deterministically_with(
+        case: &MatrixCase,
+        target: Target,
+        opt_level: u8,
+        use_dfe: bool,
+    ) -> String {
+        let compile = |case: &MatrixCase, target: Target, opt_level: u8| {
+            compile_sy_with(case.source, target, opt_level, use_dfe)
+        };
+        let first = compile(case, target, opt_level);
         for _ in 0..4 {
-            let again = compile_sy(case.source, target, opt_level);
+            let again = compile(case, target, opt_level);
             assert_eq!(
                 first, again,
                 "compilation of `{}` ({target:?}, -O{opt_level}) is not deterministic",
@@ -190,7 +214,7 @@ mod tests {
         let case = MATRIX.iter().find(|c| c.name == "leaf_add").unwrap();
         for opt_level in [1u8, 2] {
             for target in [Target::Aarch64, Target::Riscv64] {
-                let asm = compile_deterministically(case, target, opt_level);
+                let asm = compile_deterministically_with(case, target, opt_level, false);
                 let add = function_section(&asm, "add");
                 for banned in [
                     "str ", "ldr ", "sw ", "lw ", "stp", "ldp", "sub sp", "addi sp",
@@ -214,7 +238,7 @@ mod tests {
     #[test]
     fn unused_register_parameter_produces_no_argument_slots() {
         let case = MATRIX.iter().find(|c| c.name == "unused_params").unwrap();
-        let asm = compile_deterministically(case, Target::Aarch64, 2);
+        let asm = compile_deterministically_with(case, Target::Aarch64, 2, false);
         let use_first = function_section(&asm, "use_first");
         // The second parameter is dead; it must not be materialized onto the
         // stack or read back.
@@ -265,10 +289,13 @@ mod tests {
         ast.convert(&mut ctx);
         let mut program = ctx.program;
         let mut pass_manager = raana_ir::opt::pass::PassesManager::from_config(
-            raana_ir::opt::config::PassesConfig::new(
-                raana_ir::opt::config::OptimizationLevel::O2,
-                raana_ir::opt::config::TargetPolicy::aarch64(),
-            ),
+            raana_ir::opt::config::PassesConfig {
+                dead_function_elimination: false,
+                ..raana_ir::opt::config::PassesConfig::new(
+                    raana_ir::opt::config::OptimizationLevel::O2,
+                    raana_ir::opt::config::TargetPolicy::aarch64(),
+                )
+            },
         );
         pass_manager.run_passes(&mut program);
         let config = AArch64CodegenConfig {
@@ -310,10 +337,13 @@ mod tests {
         ast.convert(&mut ctx);
         let mut program = ctx.program;
         let mut pass_manager = raana_ir::opt::pass::PassesManager::from_config(
-            raana_ir::opt::config::PassesConfig::new(
-                raana_ir::opt::config::OptimizationLevel::O2,
-                raana_ir::opt::config::TargetPolicy::aarch64(),
-            ),
+            raana_ir::opt::config::PassesConfig {
+                dead_function_elimination: false,
+                ..raana_ir::opt::config::PassesConfig::new(
+                    raana_ir::opt::config::OptimizationLevel::O2,
+                    raana_ir::opt::config::TargetPolicy::aarch64(),
+                )
+            },
         );
         pass_manager.run_passes(&mut program);
         let config = AArch64CodegenConfig {
@@ -349,10 +379,13 @@ mod tests {
         ast.convert(&mut ctx);
         let mut program = ctx.program;
         let mut pass_manager = raana_ir::opt::pass::PassesManager::from_config(
-            raana_ir::opt::config::PassesConfig::new(
-                raana_ir::opt::config::OptimizationLevel::O2,
-                raana_ir::opt::config::TargetPolicy::aarch64(),
-            ),
+            raana_ir::opt::config::PassesConfig {
+                dead_function_elimination: false,
+                ..raana_ir::opt::config::PassesConfig::new(
+                    raana_ir::opt::config::OptimizationLevel::O2,
+                    raana_ir::opt::config::TargetPolicy::aarch64(),
+                )
+            },
         );
         pass_manager.run_passes(&mut program);
         let config = AArch64CodegenConfig {
@@ -392,7 +425,7 @@ mod tests {
                           if (ga > 3 || gb < 2) { r = h(ga); }\n\
                           return r;\n\
                       }\n\
-                      int main() { ga = 2; gb = 3; return f(1) + g(); }\n";
+                      int main() { ga = 2; gb = 3; return f(getint()) + g(); }\n";
         let output = compile_with_branch_opt(source, true);
         let f = function_stats(&output, "f");
         assert!(f.branch_opt.ran);

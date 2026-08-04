@@ -59,6 +59,7 @@ pub struct PassesConfig {
     pub target: TargetPolicy,
     pub loop_unroll: LoopUnrollMode,
     pub collect_stats: bool,
+    pub dead_function_elimination: bool,
 }
 
 impl PassesConfig {
@@ -71,6 +72,7 @@ impl PassesConfig {
                 OptimizationLevel::O1 | OptimizationLevel::O2 => LoopUnrollMode::Enabled,
             },
             collect_stats: false,
+            dead_function_elimination: true,
         }
     }
 }

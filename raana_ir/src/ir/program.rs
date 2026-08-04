@@ -104,4 +104,13 @@ impl Program {
     pub fn function_layout(&self) -> &[Function] {
         &self.function_layout
     }
+
+    /// Remove `func` from the program's function layout. The `FunctionData`
+    /// stays in the arena (function handles are index-based and removing
+    /// from the arena would invalidate every later handle), so a removed
+    /// function is unreachable to layout-walking passes but its handle
+    /// remains queryable.
+    pub fn remove_function(&mut self, func: Function) {
+        self.function_layout.retain(|&f| f != func);
+    }
 }

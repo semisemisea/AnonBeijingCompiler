@@ -208,6 +208,13 @@ pub struct LowerContext<'prog, I: VCodeInst> {
     /// we have to store it in a small buffer and reverse when pushing to vcode.
     ir_inst: Vec<I>,
 
+    /// BB-scoped constant sharing: constant value -> shared vreg, built during
+    /// the current block's lowering. The materialization is deferred to the
+    /// end of the block (see `emit_block_const_shared`), so the def lands at
+    /// the block start after the stream reversal; same-value constants in one
+    /// block then share a single movz/movk chain instead of one per use.
+    block_const_shared: FxHashMap<i64, Reg>,
+
     // ----------------- Side effect and color----------------- //
     // INFO: We give each instruction a color. The colors are same between two instruction if:
     // - There is no instruction have side effect between them.
@@ -428,6 +435,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             bb_end_color,
             value_lowered_use,
             ir_inst: Vec::new(),
+            block_const_shared: FxHashMap::default(),
         }
     }
 
@@ -468,6 +476,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
 
             if let Some(bb) = lb.orig_block() {
                 self.cur_block = Some(bb);
+                self.block_const_shared.clear();
                 if let Some(branch_inst) =
                     self.collect_branch_and_targets(block_index, &mut targets_buffer)
                 {
@@ -496,6 +505,10 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 self.gen_arg_setup();
                 self.finish_ir_inst();
             }
+
+            // Emit the block's shared constant materializations at the buffer
+            // tail so the stream reversal places them at the block start.
+            self.emit_block_const_shared();
 
             self.finish_bb();
             self.cur_block = None;
@@ -827,11 +840,52 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     pub fn put_value_in_reg(&mut self, inst: HirInst) -> Reg {
         *self.value_lowered_use.entry(inst).or_insert(0) += 1;
         assert!(!self.inst_sunk.contains(&inst));
+        // BB-scoped constant sharing: an integer constant is only materialized
+        // once per block, at the block start (see `emit_block_const_shared`).
+        // Same-value uses share the vreg, so `movz`/`movk` chains are not
+        // repeated per use. Only constants that actually reach this path are
+        // shared; immediates folded into instructions never arrive here.
+        if let InstKind::Integer(integer) = self.arena.inst_data(inst).kind() {
+            return self.const_to_reg(i64::from(integer.value()));
+        }
         let reg = *self.reg_map.entry(inst).or_insert_with(|| {
             self.vregs_alloc
                 .alloc(self.arena.inst_data(inst).ty().into())
         });
         self.rematerialize_if_needed(inst, reg)
+    }
+
+    /// BB-scoped constant sharing: return a vreg for `value` that is shared
+    /// by every use in the current block. The materialization is deferred to
+    /// the end of the block (see `emit_block_const_shared`), so the def lands
+    /// at the block start after the stream reversal and same-value constants
+    /// materialize once per block instead of once per use. Inline
+    /// materialization sites that bypass `put_value_in_reg` (e.g. division
+    /// magic multipliers) route through this helper too.
+    pub fn const_to_reg(&mut self, value: i64) -> Reg {
+        if let Some(&shared) = self.block_const_shared.get(&value) {
+            return shared;
+        }
+        let shared = self.alloc_tmp(HirType::get_i32());
+        self.block_const_shared.insert(value, shared);
+        shared
+    }
+
+    /// Emit the deferred constant materializations recorded for the current
+    /// block. Called at the end of the block's lowering so the shared vregs'
+    /// defs land at the block start after the stream reversal.
+    fn emit_block_const_shared(&mut self) {
+        let entries: Vec<(i64, Reg)> = self.block_const_shared.drain().collect();
+        for (value, reg) in entries {
+            self.emit(<I::ABISpec as ABIMachineSpec>::gen_load_imm(
+                Writable::from_reg(reg),
+                value as u32 as u64,
+                I32,
+            ));
+        }
+        // Flush immediately: the emitted chain is the last code pushed for
+        // this block, so the stream reversal places it at the block start.
+        self.finish_ir_inst();
     }
 
     /// Return the virtual register preallocated for an HIR instruction result.

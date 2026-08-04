@@ -106,7 +106,10 @@ fn compile_sy_with(source: &str, target: Target, opt_level: u8, use_dfe: bool) -
         Target::Riscv64 => raana_ir::opt::config::TargetPolicy::riscv64(),
     };
     let mut pass_manager = raana_ir::opt::pass::PassesManager::from_config(
-        raana_ir::opt::config::PassesConfig::new(ir_opt_level, target_policy),
+        raana_ir::opt::config::PassesConfig {
+            dead_function_elimination: use_dfe,
+            ..raana_ir::opt::config::PassesConfig::new(ir_opt_level, target_policy)
+        },
     );
     pass_manager.run_passes(&mut program);
     let aarch64_config = match opt_level {

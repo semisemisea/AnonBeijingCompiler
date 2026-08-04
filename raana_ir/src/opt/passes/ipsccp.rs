@@ -2,7 +2,11 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::opt::{
-    analysis_passes::icfg::{Edge, EdgeType},
+    analysis_passes::{
+        effects::{EffectAnalysis, WriteRoot},
+        icfg::{Edge, EdgeType},
+        memory::{BaseEnv, MemObject},
+    },
     prelude::*,
     utils::visit_and_replace,
 };
@@ -75,9 +79,300 @@ impl LatticeMap {
             }
         }
     }
+
+    /// Overwrite the lattice unconditionally, returning whether it changed.
+    /// Loads use this: their value is a snapshot of the simulated memory at
+    /// the time of (re)scheduling, and merging an outdated snapshot with the
+    /// current one (e.g. 0 read before a store, 6 after) would collapse to
+    /// Bottom instead of refining to the latest value.
+    fn insert_or_replace(&mut self, node: Node, status: Lattice) -> bool {
+        match self.0.entry(node) {
+            std::collections::hash_map::Entry::Occupied(mut e) if *e.get() != status => {
+                e.insert(status);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(status);
+                status != Lattice::Top
+            }
+        }
+    }
 }
 type EdgeSet = FxHashSet<Edge>;
 type NodeSet = FxHashSet<Node>;
+
+/// A constant-offset memory cell: a local stack object or a global object
+/// at a byte offset. Only i32-sized accesses are modeled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CellKey {
+    Local(Function, Inst, i64),
+    Global(Inst, i64),
+}
+
+/// A memory root: an entire local stack object or global object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RootKey {
+    Local(Function, Inst),
+    Global(Inst),
+}
+
+impl CellKey {
+    fn offset(self) -> i64 {
+        match self {
+            CellKey::Local(_, _, off) | CellKey::Global(_, off) => off,
+        }
+    }
+
+    fn root(self) -> RootKey {
+        match self {
+            CellKey::Local(func, inst, _) => RootKey::Local(func, inst),
+            CellKey::Global(inst, _) => RootKey::Global(inst),
+        }
+    }
+}
+
+/// Simulation of the "main memory" for constant-offset accesses (see
+/// `docs/memory_alias_analysis.md` §5.3). Per cell we keep the per-writer
+/// contributions so a store whose source refines Top -> Constant over the
+/// worklist can recover; the folded value is the lattice meet of the
+/// writers. Zero ranges model `MemZero` and zero-initialized globals.
+#[derive(Default)]
+struct MemState {
+    /// cell -> writer store instruction -> contribution lattice.
+    cells: FxHashMap<CellKey, FxHashMap<Inst, Lattice>>,
+    /// root -> merged zero byte intervals [from, to).
+    zero: FxHashMap<RootKey, Vec<(i64, i64)>>,
+    /// root -> cells currently tracked (for MemZero range removal).
+    root_cells: FxHashMap<RootKey, Vec<CellKey>>,
+    /// root -> loads that read it (re-scheduled on any root change).
+    root_loaders: FxHashMap<RootKey, Vec<Node>>,
+    /// every root ever modeled (for "may write anything" invalidation).
+    all_roots: FxHashSet<RootKey>,
+    /// roots invalidated by an unknown write (unresolvable store
+    /// destination, may-write call). A root in this set never folds loads
+    /// again: the unknown write may have happened at any program point,
+    /// so a later store to the same cell (even a constant one) cannot be
+    /// trusted to be visible to earlier loads re-scheduled after it.
+    cleared_roots: FxHashSet<RootKey>,
+}
+
+impl MemState {
+    /// Folded value of a cell: meet of the writer contributions.
+    fn cell_fold(&self, key: CellKey) -> Lattice {
+        match self.cells.get(&key) {
+            None => Lattice::Top,
+            Some(writers) => writers
+                .values()
+                .fold(Lattice::Top, |acc, &v| acc.merge(v)),
+        }
+    }
+
+    /// The value a load of `key` reads: the cell if any store wrote it,
+    /// else a zero-range value if covered, else Bottom (unknown).
+    fn read(&self, key: CellKey) -> Lattice {
+        // A root invalidated by an unknown write (dynamic-index store,
+        // may-write call) never folds again: the write may sit between
+        // any store and any load of the root, and re-scheduled loads
+        // would otherwise read a cell state that belongs to a different
+        // program point.
+        if self.cleared_roots.contains(&key.root()) {
+            return Lattice::Bottom;
+        }
+        let cell = self.cell_fold(key);
+        if cell != Lattice::Top {
+            return cell;
+        }
+        let root = key.root();
+        let covered = self
+            .zero
+            .get(&root)
+            .is_some_and(|ranges| {
+                ranges
+                    .iter()
+                    .any(|&(from, to)| key.offset() >= from && key.offset() < to)
+            });
+        if covered {
+            Lattice::Constant(0)
+        } else {
+            Lattice::Bottom
+        }
+    }
+
+    /// Record a store `writer` of `value` into `key`. A Top source writes
+    /// an unknown value (Bottom contribution) but may recover when the
+    /// source refines and the writer is re-visited. Returns whether the
+    /// folded cell value changed.
+    fn write(&mut self, key: CellKey, writer: Inst, value: Lattice) -> bool {
+        let contribution = if value == Lattice::Top {
+            Lattice::Bottom
+        } else {
+            value
+        };
+        let root = key.root();
+        self.all_roots.insert(root);
+        let writers = self.cells.entry(key).or_default();
+        let before = writers
+            .values()
+            .fold(Lattice::Top, |acc, &v| acc.merge(v));
+        if writers.is_empty() {
+            self.root_cells.entry(root).or_default().push(key);
+        }
+        writers.insert(writer, contribution);
+        let after = writers
+            .values()
+            .fold(Lattice::Top, |acc, &v| acc.merge(v));
+        before != after
+    }
+
+    /// Drop every cell and zero range of `root` (a call or an unknown
+    /// destination may have overwritten anything).
+    ///
+    /// `unknown_write` marks a *value-unknown* invalidation (dynamic-index
+    /// store, may-write-anything call): the write may sit between any
+    /// store and any load of the root, so the root must never fold loads
+    /// again (a re-scheduled load would read a cell state belonging to a
+    /// different program point). A `false` invalidation (call to a callee
+    /// with known write roots) only drops the current cells; the callee's
+    /// stores are modeled separately and may repopulate them.
+    fn clear(&mut self, root: RootKey, unknown_write: bool) -> bool {
+        let mut changed = false;
+        if let Some(keys) = self.root_cells.remove(&root) {
+            for key in keys {
+                self.cells.remove(&key);
+            }
+            changed = true;
+        }
+        changed |= self.zero.remove(&root).is_some();
+        if unknown_write {
+            self.cleared_roots.insert(root);
+        }
+        changed
+    }
+
+    /// A `MemZero` of `len` bytes at `off` of `root` zeroes the range.
+    ///
+    /// Cells already written by stores are NOT dropped: the worklist does
+    /// not process a block's instructions in layout order, so a MemZero may
+    /// be visited after the stores of the same initialization sequence. The
+    /// frontend always emits MemZero before the stores, so a cell that
+    /// exists must reflect a store that is semantically later; the zero
+    /// range only answers loads when no store has written the cell.
+    fn mem_zero(&mut self, root: RootKey, off: i64, len: i64) -> bool {
+        self.all_roots.insert(root);
+        let ranges = self.zero.entry(root).or_default();
+        let before_len = ranges.len();
+        merge_zero_interval(ranges, off, off + len);
+        ranges.len() != before_len
+    }
+
+    /// The value a store through an unresolvable address may target: the
+    /// concrete roots from the points-to analysis, or `None` for "any".
+    fn possible_targets(
+        &self,
+        analysis: &EffectAnalysis,
+        func: Function,
+        addr: Inst,
+        ctx: &ArenaContext<'_>,
+    ) -> Option<Vec<RootKey>> {
+        match analysis.targets_of(ctx, func, addr) {
+            Some(objects) => {
+                let mut roots = Vec::new();
+                for o in objects {
+                    match o {
+                        crate::opt::analysis_passes::effects::AbstractObject::Global(g) => {
+                            roots.push(RootKey::Global(g));
+                        }
+                        crate::opt::analysis_passes::effects::AbstractObject::Alloc(cf, a)
+                            if cf == func =>
+                        {
+                            roots.push(RootKey::Local(func, a));
+                        }
+                        _ => {}
+                    }
+                }
+                Some(roots)
+            }
+            None => None,
+        }
+        .or_else(|| {
+            // Unresolvable address: conservatively everything modeled.
+            Some(self.all_roots.iter().copied().collect())
+        })
+    }
+}
+
+/// Merge `[from, to)` into a sorted, disjoint interval list.
+fn merge_zero_interval(ranges: &mut Vec<(i64, i64)>, from: i64, to: i64) {
+    let mut from = from;
+    let mut to = to;
+    let mut i = 0;
+    while i < ranges.len() {
+        let (l, r) = ranges[i];
+        if r < from {
+            i += 1;
+            continue;
+        }
+        if l > to {
+            break;
+        }
+        from = from.min(l);
+        to = to.max(r);
+        ranges.remove(i);
+    }
+    ranges.insert(i, (from, to));
+}
+
+/// Clear every cell the callee may write (in the caller's terms) and
+/// re-schedule the affected loads. Unknown writers clear everything.
+fn invalidate_call(
+    analysis: &EffectAnalysis,
+    state: &mut MemState,
+    callee: Function,
+    func: Function,
+    mem_reschedule: &mut Vec<Node>,
+) {
+    let roots: Vec<RootKey> = match analysis.call_write_roots(callee, func) {
+        Some(roots) => roots
+            .into_iter()
+            .map(|r| match r {
+                WriteRoot::Global(g) => RootKey::Global(g),
+                WriteRoot::Local(f, a) => RootKey::Local(f, a),
+            })
+            .collect(),
+        None => state.all_roots.iter().copied().collect(),
+    };
+    let unknown = matches!(analysis.call_write_roots(callee, func), None);
+    for root in roots {
+        if state.clear(root, unknown) {
+            if let Some(loaders) = state.root_loaders.get(&root) {
+                mem_reschedule.extend(loaders.iter().copied());
+            }
+        }
+    }
+}
+
+/// Resolve `addr` in `func` to a constant-offset cell on a modeled root,
+/// using the base-object environment.
+fn resolve_cell(
+    env: &BaseEnv,
+    ctx: &ArenaContext<'_>,
+    func: Function,
+    addr: Inst,
+) -> Option<(CellKey, RootKey)> {
+    let off = env.constant_offset(ctx, addr)?;
+    match env.base_of(ctx, addr) {
+        MemObject::Alloc(a) => {
+            let key = CellKey::Local(func, a, off);
+            Some((key, key.root()))
+        }
+        MemObject::Global(g) => {
+            let key = CellKey::Global(g, off);
+            Some((key, key.root()))
+        }
+        _ => None,
+    }
+}
 
 impl Pass for IPSCCP {
     fn run(&mut self, program: &mut Program) -> bool {
@@ -87,6 +382,34 @@ impl Pass for IPSCCP {
         let mut edge_worklist: VecDeque<Edge> = VecDeque::default();
         let mut node_worklist: VecDeque<Node> = VecDeque::default();
         let mut lattice_map = LatticeMap::default();
+
+        // Whole-program purity / alias analysis feeding the main-memory
+        // simulation below (constant-offset cells on local and global
+        // roots, zero ranges, per-call invalidation).
+        let analysis = EffectAnalysis::new(program);
+        let mut state = MemState::default();
+        {
+            // Zero-initialized globals answer constant-offset loads with 0
+            // until a store overwrites them.
+            let ctx = ArenaContext {
+                program,
+                curr_func: Some(program.get_main_function()),
+            };
+            for &g in program.global_inst_layout() {
+                let InstKind::GlobalAlloc(global_alloc) = ctx.inst_data(g).kind() else {
+                    continue;
+                };
+                if matches!(
+                    ctx.inst_data(global_alloc.init()).kind(),
+                    InstKind::ZeroInit
+                ) {
+                    let size = ctx.inst_data(g).ty().derefernce().size() as i64;
+                    let root = RootKey::Global(g);
+                    state.all_roots.insert(root);
+                    merge_zero_interval(state.zero.entry(root).or_default(), 0, size);
+                }
+            }
+        }
 
         // Stage 0.1
         // Default: Set every integer to const, float to bottom, else remain top.
@@ -148,6 +471,9 @@ impl Pass for IPSCCP {
             // (`merge_and_extend` et al.) hold a mutable borrow of it; collect
             // them here and drain after those closures are dropped.
             let mut relay_targets: Vec<Node> = Vec::new();
+            // Loads whose memory cells changed (stores, MemZero, calls) are
+            // re-scheduled the same way.
+            let mut mem_reschedule: Vec<Node> = Vec::new();
 
             if let Some(node) = node_worklist.pop_front() {
                 let push_edge = |edge: Edge| {
@@ -193,10 +519,42 @@ impl Pass for IPSCCP {
                         inst,
                         data.inst_data(inst)
                     ),
-                    // For now, we lack simulation of main memory. So all memory related stuff is
-                    // considerd as variable.
-                    InstKind::GetElemPtr(..) | InstKind::Alloc | InstKind::Load(..) => {
+                    // Addresses are not i32 constants; keep them variable.
+                    InstKind::GetElemPtr(..) | InstKind::Alloc => {
                         merge_and_extend(node, Lattice::Bottom, &mut lattice_map);
+                    }
+                    // Loads read the simulated memory: a constant-offset
+                    // cell on a local/global root folds to the stored value
+                    // (or 0 under a zero range); everything else is
+                    // conservatively Bottom.
+                    InstKind::Load(load) => {
+                        let env = analysis.env_of(func);
+                        let ctx = ArenaContext {
+                            program,
+                            curr_func: Some(func),
+                        };
+                        match resolve_cell(env, &ctx, func, load.src()) {
+                            Some((key, root)) => {
+                                let value = state.read(key);
+                                // Overwrite: the load mirrors the current
+                                // memory snapshot, not a meet of historical
+                                // snapshots.
+                                if lattice_map.insert_or_replace(node, value) {
+                                    extend_affected_node_used_by(node);
+                                }
+                                // Register the load for re-scheduling when
+                                // its root changes. Deduplicate: a load that
+                                // is (re)processed many times must not grow
+                                // the loader list unboundedly.
+                                let loaders = state.root_loaders.entry(root).or_default();
+                                if !loaders.contains(&node) {
+                                    loaders.push(node);
+                                }
+                            }
+                            None => {
+                                merge_and_extend(node, Lattice::Bottom, &mut lattice_map);
+                            }
+                        }
                     }
                     InstKind::Binary(binary) => {
                         let status = match (
@@ -287,7 +645,66 @@ impl Pass for IPSCCP {
                         };
                         merge_and_extend(node, status, &mut lattice_map);
                     }
-                    InstKind::Store(..) | InstKind::MemZero(..) => {}
+                    // Stores write into the simulated memory: a resolvable
+                    // constant-offset cell records the source lattice; an
+                    // unresolvable destination clears everything it may
+                    // target (via the points-to analysis).
+                    InstKind::Store(store) => {
+                        let env = analysis.env_of(func);
+                        let ctx = ArenaContext {
+                            program,
+                            curr_func: Some(func),
+                        };
+                        let value = lattice_map.get(Node::new(func, store.src()));
+                        match resolve_cell(env, &ctx, func, store.dest()) {
+                            Some((key, root)) => {
+                                if state.write(key, inst, value) {
+                                    if let Some(loaders) = state.root_loaders.get(&root) {
+                                        mem_reschedule.extend(loaders.iter().copied());
+                                    }
+                                }
+                            }
+                            None => {
+                                let roots = state
+                                    .possible_targets(&analysis, func, store.dest(), &ctx);
+                                for root in roots.unwrap_or_default() {
+                                    if state.clear(root, true) {
+                                        if let Some(loaders) = state.root_loaders.get(&root) {
+                                            mem_reschedule.extend(loaders.iter().copied());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    InstKind::MemZero(mem_zero) => {
+                        let env = analysis.env_of(func);
+                        let ctx = ArenaContext {
+                            program,
+                            curr_func: Some(func),
+                        };
+                        let len = mem_zero.byte_len() as i64;
+                        match resolve_cell(env, &ctx, func, mem_zero.dest()) {
+                            Some((key, root)) => {
+                                if state.mem_zero(root, key.offset(), len) {
+                                    if let Some(loaders) = state.root_loaders.get(&root) {
+                                        mem_reschedule.extend(loaders.iter().copied());
+                                    }
+                                }
+                            }
+                            None => {
+                                let roots = state
+                                    .possible_targets(&analysis, func, mem_zero.dest(), &ctx);
+                                for root in roots.unwrap_or_default() {
+                                    if state.clear(root, true) {
+                                        if let Some(loaders) = state.root_loaders.get(&root) {
+                                            mem_reschedule.extend(loaders.iter().copied());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     InstKind::TailCall(tail_call) => {
                         // A tail call transfers control to the callee just like a
                         // regular call, so its actual arguments must flow into the
@@ -327,6 +744,15 @@ impl Pass for IPSCCP {
                                 );
                             }
                         }
+                        // The tail callee may write memory; invalidate the
+                        // cells it can reach.
+                        invalidate_call(
+                            &analysis,
+                            &mut state,
+                            callee,
+                            func,
+                            &mut mem_reschedule,
+                        );
                     }
                     InstKind::Call(call) => {
                         let callee = call.callee();
@@ -343,6 +769,15 @@ impl Pass for IPSCCP {
                                 );
                             }
                         }
+                        // The callee may write memory; invalidate the cells
+                        // it can reach (unknown writers clear everything).
+                        invalidate_call(
+                            &analysis,
+                            &mut state,
+                            callee,
+                            func,
+                            &mut mem_reschedule,
+                        );
                     }
                     InstKind::Return(ret) => {
                         if let Some(ret_val) = ret.value() {
@@ -427,6 +862,7 @@ impl Pass for IPSCCP {
             }
             // Closures borrowing `node_worklist` are now dropped; safe to extend.
             node_worklist.extend(relay_targets.drain(..));
+            node_worklist.extend(mem_reschedule.drain(..));
         }
 
         let mut changed = false;
@@ -583,9 +1019,12 @@ mod tests {
     use crate::{
         ir::{
             BinaryOp,
-            builder::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
+            builder::{
+                BasicBlockBuilder, GlobalInstBuilder, LocalInstBuilder, ScalarInstBuilder,
+            },
         },
         llvm::LlvmWriter,
+        opt::pass::ArenaContextMut,
     };
 
     fn build_float_cast(value: f32) -> (Program, Function, Inst, Inst) {
@@ -821,5 +1260,294 @@ mod tests {
         let llvm = writer.finish();
         assert!(llvm.contains("define i32 @callee(i32 %"), "{llvm}");
         assert!(!llvm.contains("define i32 @callee(i32 7)"), "{llvm}");
+    }
+
+    // --- main-memory simulation (constant-offset cells) ---
+
+    fn new_global(program: &mut Program) -> Inst {
+        let init = program.new_value().zero_init(Type::get_i32());
+        program.new_value().global_alloc(init)
+    }
+
+    #[test]
+    fn folds_store_load_roundtrip_on_global_cell() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let (load, ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(main),
+            };
+            let entry = data.add_entry_block();
+            let zero = data.new_local_value().integer(0);
+            let gep = data.new_local_value().get_elem_ptr(global, vec![zero]);
+            data.layout_mut().insert_inst(entry, gep);
+            let five = data.new_local_value().integer(5);
+            let store = data.new_local_value().store(five, gep);
+            data.layout_mut().insert_inst(entry, store);
+            let load = data.new_local_value().load(gep);
+            data.layout_mut().insert_inst(entry, load);
+            let ret = data.new_local_value().ret(Some(load));
+            data.layout_mut().insert_inst(entry, ret);
+            (load, ret)
+        };
+
+        assert!(IPSCCP.run(&mut program));
+        let data = program.func_data(main);
+        assert!(matches!(
+            data.inst_data(load).kind(),
+            InstKind::Integer(integer) if integer.value() == 5
+        ));
+        let InstKind::Return(ret_data) = data.inst_data(ret).kind() else {
+            panic!("expected return instruction")
+        };
+        assert_eq!(ret_data.value(), Some(load));
+    }
+
+    #[test]
+    fn zero_initialized_global_load_folds_to_zero() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let (load, _ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(main),
+            };
+            let entry = data.add_entry_block();
+            let zero = data.new_local_value().integer(0);
+            let gep = data.new_local_value().get_elem_ptr(global, vec![zero]);
+            data.layout_mut().insert_inst(entry, gep);
+            let load = data.new_local_value().load(gep);
+            data.layout_mut().insert_inst(entry, load);
+            let ret = data.new_local_value().ret(Some(load));
+            data.layout_mut().insert_inst(entry, ret);
+            (load, ret)
+        };
+
+        assert!(IPSCCP.run(&mut program));
+        let data = program.func_data(main);
+        assert!(matches!(
+            data.inst_data(load).kind(),
+            InstKind::Integer(integer) if integer.value() == 0
+        ));
+    }
+
+    #[test]
+    fn mem_zero_makes_local_array_loads_zero() {
+        let mut program = Program::new();
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let (load, _ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(main),
+            };
+            let entry = data.add_entry_block();
+            let alloc = data
+                .new_local_value()
+                .alloc(Type::get_array(Type::get_i32(), 4));
+            data.layout_mut().insert_inst(entry, alloc);
+            let clear = data.new_local_value().mem_zero(alloc, 16);
+            data.layout_mut().insert_inst(entry, clear);
+            let zero = data.new_local_value().integer(0);
+            let gep = data.new_local_value().get_elem_ptr(alloc, vec![zero]);
+            data.layout_mut().insert_inst(entry, gep);
+            let load = data.new_local_value().load(gep);
+            data.layout_mut().insert_inst(entry, load);
+            let ret = data.new_local_value().ret(Some(load));
+            data.layout_mut().insert_inst(entry, ret);
+            (load, ret)
+        };
+
+        assert!(IPSCCP.run(&mut program));
+        let data = program.func_data(main);
+        assert!(matches!(
+            data.inst_data(load).kind(),
+            InstKind::Integer(integer) if integer.value() == 0
+        ));
+    }
+
+    #[test]
+    fn call_to_writer_invalidates_global_cell() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        // The writer stores its (unknown) argument into the global.
+        let writer = program.new_function(Type::get_unit(), "writer".into(), vec![Type::get_i32()]);
+        {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(writer),
+            };
+            let entry = data.add_entry_block();
+            let param = data.params()[0];
+            let store = data.new_local_value().store(param, global);
+            data.layout_mut().insert_inst(entry, store);
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+        }
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        // An unknown value flows into the writer's parameter.
+        let getint = program.new_function(Type::get_i32(), "getint".into(), vec![]);
+        let (load, _ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(main),
+            };
+            let entry = data.add_entry_block();
+            let zero = data.new_local_value().integer(0);
+            let gep = data.new_local_value().get_elem_ptr(global, vec![zero]);
+            data.layout_mut().insert_inst(entry, gep);
+            let five = data.new_local_value().integer(5);
+            let store = data.new_local_value().store(five, gep);
+            data.layout_mut().insert_inst(entry, store);
+            let input = data.new_local_value().call(getint, vec![]);
+            data.layout_mut().insert_inst(entry, input);
+            let call = data.new_local_value().call(writer, vec![input]);
+            data.layout_mut().insert_inst(entry, call);
+            let load = data.new_local_value().load(gep);
+            data.layout_mut().insert_inst(entry, load);
+            let ret = data.new_local_value().ret(Some(load));
+            data.layout_mut().insert_inst(entry, ret);
+            (load, ret)
+        };
+
+        let _ = IPSCCP.run(&mut program);
+        let data = program.func_data(main);
+        // The writer may have overwritten the cell with an unknown value:
+        // the load stays a load.
+        assert!(matches!(data.inst_data(load).kind(), InstKind::Load(..)));
+    }
+
+    #[test]
+    fn call_to_deterministic_writer_folds_load() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        // The writer stores a compile-time constant into the global.
+        let writer = program.new_function(Type::get_unit(), "writer".into(), vec![]);
+        {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(writer),
+            };
+            let entry = data.add_entry_block();
+            let one = data.new_local_value().integer(1);
+            let store = data.new_local_value().store(one, global);
+            data.layout_mut().insert_inst(entry, store);
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+        }
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let (load, _ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(main),
+            };
+            let entry = data.add_entry_block();
+            let zero = data.new_local_value().integer(0);
+            let gep = data.new_local_value().get_elem_ptr(global, vec![zero]);
+            data.layout_mut().insert_inst(entry, gep);
+            let call = data.new_local_value().call(writer, vec![]);
+            data.layout_mut().insert_inst(entry, call);
+            let load = data.new_local_value().load(gep);
+            data.layout_mut().insert_inst(entry, load);
+            let ret = data.new_local_value().ret(Some(load));
+            data.layout_mut().insert_inst(entry, ret);
+            (load, ret)
+        };
+
+        assert!(IPSCCP.run(&mut program));
+        let data = program.func_data(main);
+        // The callee's constant store is modeled: the load folds to 1.
+        assert!(matches!(
+            data.inst_data(load).kind(),
+            InstKind::Integer(integer) if integer.value() == 1
+        ));
+    }
+
+    #[test]
+    fn distinct_offsets_do_not_share_cells() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let (load, _ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(main),
+            };
+            let entry = data.add_entry_block();
+            let zero = data.new_local_value().integer(0);
+            let one = data.new_local_value().integer(1);
+            let gep0 = data.new_local_value().get_elem_ptr(global, vec![zero]);
+            let gep1 = data.new_local_value().get_elem_ptr(global, vec![one]);
+            data.layout_mut().insert_inst(entry, gep0);
+            data.layout_mut().insert_inst(entry, gep1);
+            let five = data.new_local_value().integer(5);
+            let store = data.new_local_value().store(five, gep0);
+            data.layout_mut().insert_inst(entry, store);
+            let load = data.new_local_value().load(gep1);
+            data.layout_mut().insert_inst(entry, load);
+            let ret = data.new_local_value().ret(Some(load));
+            data.layout_mut().insert_inst(entry, ret);
+            (load, ret)
+        };
+
+        let _ = IPSCCP.run(&mut program);
+        let data = program.func_data(main);
+        // g[1] was never written: still a load.
+        assert!(matches!(data.inst_data(load).kind(), InstKind::Load(..)));
+    }
+
+    #[test]
+    fn divergent_stores_merge_to_bottom() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let (load, _ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(main),
+            };
+            let entry = data.add_entry_block();
+            let then_block = data.new_basic_block().basic_block("then".into(), vec![]);
+            let else_block = data.new_basic_block().basic_block("else".into(), vec![]);
+            let merge = data.new_basic_block().basic_block("merge".into(), vec![]);
+            for block in [then_block, else_block, merge] {
+                data.layout_mut().push_bb_back(block);
+            }
+
+            let zero = data.new_local_value().integer(0);
+            let gep = data.new_local_value().get_elem_ptr(global, vec![zero]);
+            data.layout_mut().insert_inst(entry, gep);
+            let one = data.new_local_value().integer(1);
+            let store_one = data.new_local_value().store(one, gep);
+            data.layout_mut().insert_inst(entry, store_one);
+            let cond = data.new_local_value().load(gep);
+            data.layout_mut().insert_inst(entry, cond);
+            let branch = data
+                .new_local_value()
+                .branch(cond, then_block, vec![], else_block, vec![]);
+            data.layout_mut().insert_inst(entry, branch);
+
+            let two = data.new_local_value().integer(2);
+            let store_two = data.new_local_value().store(two, gep);
+            data.layout_mut().insert_inst(else_block, store_two);
+            let jump_t = data.new_local_value().jump(merge, vec![]);
+            data.layout_mut().insert_inst(then_block, jump_t);
+            let jump_e = data.new_local_value().jump(merge, vec![]);
+            data.layout_mut().insert_inst(else_block, jump_e);
+
+            let load = data.new_local_value().load(gep);
+            data.layout_mut().insert_inst(merge, load);
+            let ret = data.new_local_value().ret(Some(load));
+            data.layout_mut().insert_inst(merge, ret);
+            (load, ret)
+        };
+
+        let _ = IPSCCP.run(&mut program);
+        let data = program.func_data(main);
+        // Two different constant writers on different paths: Bottom, so the
+        // load is not folded to either.
+        assert!(matches!(data.inst_data(load).kind(), InstKind::Load(..)));
     }
 }

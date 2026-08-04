@@ -345,6 +345,54 @@ impl InvariantReductionHoisting {
         let done_jump = data.new_local_value().jump(cand.header, done_args);
         data.layout_mut().insert_inst(compute_done, done_jump);
 
+        // The original latch (and any other terminator still targeting the
+        // header) is now unreachable — the header branches to `degraded_latch`
+        // instead — but its `used_by` reverse link to the header survives until
+        // DCE removes the block. Every consumer that walks `used_by` (e.g.
+        // DeadPhiElimination) sees that edge, so its argument list must still
+        // match the header's (now carrier-extended) parameter list. Top up the
+        // stale edge with a dummy value; it is never executed.
+        let header_params_len = data.bb_data(cand.header).params().len();
+        let stale_edges = data
+            .bb_data(cand.header)
+            .used_by()
+            .iter()
+            .copied()
+            .filter(|&inst| data.layout().parent_bb(inst).is_some())
+            .collect::<Vec<_>>();
+        for inst in stale_edges {
+            let dummy = data.new_local_value().integer(0);
+            match data.inst_data(inst).kind() {
+                InstKind::Jump(jump) if jump.target() == cand.header => {
+                    let t = jump.target();
+                    let mut args = jump.args().to_vec();
+                    while args.len() < header_params_len {
+                        args.push(dummy);
+                    }
+                    data.replace_inst_with(inst).jump(t, args);
+                }
+                InstKind::Branch(branch) => {
+                    let c = branch.cond();
+                    let tt = branch.t_target();
+                    let ft = branch.f_target();
+                    let mut ta = branch.t_args().to_vec();
+                    let mut fa = branch.f_args().to_vec();
+                    if tt == cand.header {
+                        while ta.len() < header_params_len {
+                            ta.push(dummy);
+                        }
+                    }
+                    if ft == cand.header {
+                        while fa.len() < header_params_len {
+                            fa.push(dummy);
+                        }
+                    }
+                    data.replace_inst_with(inst).branch(c, tt, ta, ft, fa);
+                }
+                _ => {}
+            }
+        }
+
         // The original latch references values inside the (now unreachable)
         // nest, so it cannot serve as the degraded loop's latch. Build a fresh
         // latch that touches only reachable values: the header's own parameters
@@ -877,6 +925,34 @@ mod tests {
             program.func_data(function).layout().basicblocks().len(),
             new_blocks
         );
+
+        // Every terminator that still targets the degraded header must supply
+        // the carrier argument, including the original (now unreachable)
+        // latch edge: `used_by` reverse links survive until DCE, and
+        // DeadPhiElimination walks them to trim arguments, so a stale edge
+        // with a short argument list would panic it (many_mat_cal regression).
+        let data = program.func_data(function);
+        let stale_edges = data.bb_data(outer).used_by().iter().copied().collect::<Vec<_>>();
+        assert!(
+            stale_edges.len() >= 3,
+            "compute_done + degraded latch + original latch must target the header"
+        );
+        for &inst in &stale_edges {
+            match data.inst_data(inst).kind() {
+                InstKind::Jump(jump) => {
+                    assert_eq!(jump.args().len(), 3, "stale jump edge must carry the carrier");
+                }
+                InstKind::Branch(branch) => {
+                    if branch.t_target() == outer {
+                        assert_eq!(branch.t_args().len(), 3);
+                    }
+                    if branch.f_target() == outer {
+                        assert_eq!(branch.f_args().len(), 3);
+                    }
+                }
+                _ => panic!("a terminator targeting the header must be a jump or branch"),
+            }
+        }
     }
 
     #[test]

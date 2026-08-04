@@ -3,6 +3,7 @@ pub mod chain_to_switch;
 pub mod column_major;
 pub mod const_prop;
 pub mod dce;
+pub mod dse;
 pub mod gvn;
 pub mod gvn_pre;
 pub mod if_conversion;

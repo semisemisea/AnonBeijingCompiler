@@ -735,9 +735,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     }
 
     // 3. Latch machinery: step both IVs by the vector width. The loop now
-    //    runs `q` iterations because the counter enters at `4Q`.
+    //    runs `q` iterations because the counter enters at `4Q`. The step
+    //    constant stays out of layout (constants are never placed in blocks;
+    //    DCE's `is_critical` treats a laid-out Integer as unreachable).
     let four = data.new_local_inst().integer(VF as i32);
-    data.layout_mut().insert_inst_before(iv_next, four);
     data.replace_inst_with(iv_next)
         .raw(Binary::new_data(iv, four, BinaryOp::Add, i32.clone()));
     data.replace_inst_with(t_next)
@@ -746,7 +747,6 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     // 4. Entry edge: the counter enters at `4Q` (trip % 4 handled by the
     //    epilogue); the index keeps its original initial value.
     let four_q = data.new_local_inst().integer((VF * q) as i32);
-    data.layout_mut().insert_inst_before(entry_edge, four_q);
     let entry_rewrite = match data.inst_data(entry_edge).kind() {
         InstKind::Branch(b) => {
             let mut t_args = b.t_args().to_vec();

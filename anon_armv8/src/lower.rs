@@ -1471,13 +1471,9 @@ impl LowerBackend for AArch64Backend {
                 }
 
                 let cond = ctx.put_value_in_reg(branch.cond());
-                ctx.emit(MInst::CmpImm {
+                ctx.emit(MInst::Cbnz {
                     size: OperandSize::Size32,
-                    lhs: cond,
-                    imm: Imm12::new(0, false).unwrap(),
-                });
-                ctx.emit(MInst::CondBr {
-                    cond: Cond::Ne,
+                    reg: cond,
                     true_label: Label::from_block(true_target),
                     false_label: Label::from_block(false_target),
                 });

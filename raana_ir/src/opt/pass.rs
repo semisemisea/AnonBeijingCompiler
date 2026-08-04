@@ -290,6 +290,16 @@ impl PassesManager {
         let dce = dce::DeadCodeElimination;
         p.register(Box::new(dce));
 
+        // Drop whole functions unreachable from `main` (dead functions):
+        // instruction-level DCE keeps them, dragging their internal calls
+        // into the emitted assembly. ABI observation tests compile through a
+        // without-dead-function-elimination pipeline, since they assert on
+        // the parameter binding of optimized-but-unreachable helpers.
+        if config.dead_function_elimination {
+            let dfe = dce::DeadFunctionElimination;
+            p.register(Box::new(dfe));
+        }
+
         p
     }
 }

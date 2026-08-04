@@ -9,6 +9,9 @@
 //! 3. Store-to-load forwarding: a load of a cell whose most recent
 //!    operation is a store (no write or possible read in between) is
 //!    replaced by the stored value.
+//! 4. Covered MemZero removal: a MemZero whose whole byte range is
+//!    overwritten by later stores (same base, constant offsets, known
+//!    store widths, no intervening read/call) is dead and removed.
 //!
 //! Address resolution reuses the M49 base environment (`BaseEnv`:
 //! `base_of` + `constant_offset`, including pointer-slot resolution and
@@ -190,10 +193,14 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
     let mut covered_removals: Vec<Inst> = Vec::new();
     // (load inst, replacement value)
     let mut forwardings: Vec<(Inst, Inst)> = Vec::new();
+    // MemZeros whose whole range is overwritten by later stores.
+    let mut memzero_removals: Vec<Inst> = Vec::new();
     for bb in data.layout().basicblocks() {
         // cell -> (pending store, stored value); the store has not been
         // read from memory yet.
         let mut pending: FxHashMap<Cell, (Inst, Inst)> = FxHashMap::default();
+        // MemZeros in this block that later stores may still cover fully.
+        let mut live_memzeros: Vec<LiveMemZero> = Vec::new();
         for &inst in bb.insts() {
             match data.inst_data(inst).kind() {
                 InstKind::Store(store) => match resolve(store.dest()) {
@@ -203,10 +210,45 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                         {
                             covered_removals.push(prev);
                         }
+                        // Each byte of the stored value overwrites any live
+                        // MemZero range it lands in. The store width is the
+                        // byte size of the stored value's type (i32 -> 4).
+                        let width = data.inst_data(store.src()).ty().size() as i64;
+                        if width > 0 {
+                            let (root_s, off_s) = cell;
+                            let mut i = 0;
+                            while i < live_memzeros.len() {
+                                let covered = {
+                                    let m = &mut live_memzeros[i];
+                                    if m.root != root_s {
+                                        i += 1;
+                                        continue;
+                                    }
+                                    let s = off_s.max(m.off);
+                                    let e = (off_s + width).min(m.off + m.len);
+                                    if s >= e {
+                                        i += 1;
+                                        continue;
+                                    }
+                                    record_coverage(m, s, e)
+                                };
+                                if covered {
+                                    // Fully covered: the MemZero is dead.
+                                    memzero_removals.push(live_memzeros[i].inst);
+                                    live_memzeros.swap_remove(i);
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        }
                     }
                     // Unknown destination: may alias anything, so every
-                    // pending store is conservatively treated as observed.
-                    None => pending.clear(),
+                    // pending store is conservatively treated as observed,
+                    // and no MemZero coverage can be proven.
+                    None => {
+                        pending.clear();
+                        live_memzeros.clear();
+                    }
                 },
                 InstKind::Load(load) => match resolve(load.src()) {
                     Some(cell) => {
@@ -218,10 +260,20 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                         } else {
                             pending.remove(&cell);
                         }
+                        // A load of any byte in a live MemZero's range
+                        // observes the zeroing: the MemZero must stay.
+                        live_memzeros
+                            .retain(|m| !cell_in_range(&cell, m.root, m.off, m.len));
                     }
-                    None => pending.clear(),
+                    None => {
+                        pending.clear();
+                        live_memzeros.clear();
+                    }
                 },
                 InstKind::Call(call) => {
+                    // A call may read any memory (and may write it), so no
+                    // MemZero coverage can be proven past it.
+                    live_memzeros.clear();
                     let callee = call.callee();
                     match analysis.call_write_roots(callee, func) {
                         None => pending.clear(),
@@ -266,8 +318,25 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                         pending.retain(|cell, _| {
                             !cell_in_range(cell, root, off, len)
                         });
+                        // A following MemZero zeroes overlapping bytes again:
+                        // no coverage can be proven for those live candidates.
+                        live_memzeros
+                            .retain(|m| m.root != root || m.off >= off + len || off >= m.off + m.len);
+                        // Register as a removal candidate. A runtime-length
+                        // MemZero (unbounded range) can never be proven fully
+                        // covered by stores, so it is not tracked.
+                        if len != i64::MAX {
+                            live_memzeros.push(LiveMemZero {
+                                inst,
+                                root,
+                                off,
+                                len,
+                                covered: Vec::new(),
+                            });
+                        }
                     } else {
                         pending.clear();
+                        live_memzeros.clear();
                     }
                 }
                 _ => {}
@@ -280,7 +349,11 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
         utils::visit_and_replace(data, load, value);
         changed = true;
     }
-    for inst in writeback_removals.into_iter().chain(covered_removals) {
+    for inst in writeback_removals
+        .into_iter()
+        .chain(covered_removals)
+        .chain(memzero_removals)
+    {
         if let Some(bb) = data.layout().parent_bb(inst) {
             data.remove_layout_inst(bb, inst);
             changed = true;
@@ -327,6 +400,60 @@ fn cell_in_range(cell: &Cell, root: MemObject, off: i64, len: i64) -> bool {
         return false;
     }
     cell.1 >= off && cell.1 < off + len
+}
+
+/// A MemZero candidate for coverage-based removal while scanning a block.
+///
+/// `covered` is the sorted, disjoint union of byte ranges of
+/// `[off, off+len)` already overwritten by later stores. Once the union
+/// covers the whole range the MemZero is dead.
+struct LiveMemZero {
+    inst: Inst,
+    root: MemObject,
+    off: i64,
+    len: i64,
+    covered: Vec<(i64, i64)>,
+}
+
+/// Record that byte range `[s, e)` of `m`'s range was overwritten by a
+/// later store, merging into the sorted disjoint `covered` intervals.
+/// Returns `true` iff `[off, off+len)` is now fully covered.
+fn record_coverage(m: &mut LiveMemZero, s: i64, e: i64) -> bool {
+    if s >= e {
+        return false;
+    }
+    // Insert `[s, e)` into the sorted disjoint interval list, merging
+    // overlaps and adjacencies.
+    let mut new_s = s;
+    let mut new_e = e;
+    let mut i = 0;
+    while i < m.covered.len() {
+        let (a, b) = m.covered[i];
+        if b < new_s {
+            i += 1;
+            continue;
+        }
+        if a > new_e {
+            break;
+        }
+        new_s = new_s.min(a);
+        new_e = new_e.max(b);
+        m.covered.remove(i);
+    }
+    m.covered.insert(i, (new_s, new_e));
+    // Check whether the merged union now spans `[off, off+len)` without holes.
+    let end = m.off + m.len;
+    let mut cur = m.off;
+    for &(a, b) in m.covered.iter() {
+        if a > cur {
+            return false;
+        }
+        cur = cur.max(b);
+        if cur >= end {
+            return true;
+        }
+    }
+    cur >= end
 }
 
 #[cfg(test)]
@@ -603,5 +730,184 @@ mod tests {
             }
         }
         assert_eq!(stores.len(), 2, "memzero barrier must keep both stores");
+    }
+
+    /// `memzero a[4], 16` followed by stores of all 4 i32 elements: every
+    /// byte of the range is overwritten before any read — the MemZero is
+    /// dead and must be removed.
+    #[test]
+    fn removes_memzero_fully_covered_by_stores() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "f".into(), vec![]);
+        let (memzero, ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = data.add_entry_block();
+            let alloc = data
+                .new_local_value()
+                .alloc(Type::get_array(Type::get_i32(), 4));
+            data.layout_mut().insert_inst(entry, alloc);
+            let zero = data.new_local_value().integer(0);
+            data.layout_mut().insert_inst(entry, zero);
+            let memzero = data.new_local_value().mem_zero(alloc, 16);
+            data.layout_mut().insert_inst(entry, memzero);
+            for i in 0..4 {
+                let idx = data.new_local_value().integer(i);
+                data.layout_mut().insert_inst(entry, idx);
+                let ptr = data.new_local_value().get_elem_ptr(alloc, vec![zero, idx]);
+                data.layout_mut().insert_inst(entry, ptr);
+                let val = data.new_local_value().integer(i + 1);
+                data.layout_mut().insert_inst(entry, val);
+                let store = data.new_local_value().store(val, ptr);
+                data.layout_mut().insert_inst(entry, store);
+            }
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+            (memzero, ret)
+        };
+        let _ = ret;
+
+        assert!(DSE.run(&mut program));
+        let data = program.func_data(function);
+        let mut memzeros = Vec::new();
+        let mut stores = 0;
+        for block in data.layout().basicblocks() {
+            for &inst in block.insts() {
+                match data.inst_data(inst).kind() {
+                    InstKind::MemZero(..) => memzeros.push(inst),
+                    InstKind::Store(..) => stores += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            memzeros.is_empty(),
+            "fully covered memzero must be removed"
+        );
+        assert_eq!(stores, 4, "covering stores must survive");
+        let _ = memzero;
+    }
+
+    /// `memzero a[4], 16` with only the first two elements stored: bytes
+    /// [8, 16) are never overwritten — the MemZero must survive.
+    #[test]
+    fn keeps_memzero_partially_covered() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "f".into(), vec![]);
+        let (memzero, ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = data.add_entry_block();
+            let alloc = data
+                .new_local_value()
+                .alloc(Type::get_array(Type::get_i32(), 4));
+            data.layout_mut().insert_inst(entry, alloc);
+            let zero = data.new_local_value().integer(0);
+            data.layout_mut().insert_inst(entry, zero);
+            let memzero = data.new_local_value().mem_zero(alloc, 16);
+            data.layout_mut().insert_inst(entry, memzero);
+            for i in 0..2 {
+                let idx = data.new_local_value().integer(i);
+                data.layout_mut().insert_inst(entry, idx);
+                let ptr = data.new_local_value().get_elem_ptr(alloc, vec![zero, idx]);
+                data.layout_mut().insert_inst(entry, ptr);
+                let val = data.new_local_value().integer(i + 1);
+                data.layout_mut().insert_inst(entry, val);
+                let store = data.new_local_value().store(val, ptr);
+                data.layout_mut().insert_inst(entry, store);
+            }
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+            (memzero, ret)
+        };
+        let _ = ret;
+
+        assert!(!DSE.run(&mut program), "nothing may change");
+        let data = program.func_data(function);
+        let mut memzeros = Vec::new();
+        for block in data.layout().basicblocks() {
+            for &inst in block.insts() {
+                if matches!(data.inst_data(inst).kind(), InstKind::MemZero(..)) {
+                    memzeros.push(inst);
+                }
+            }
+        }
+        assert_eq!(
+            memzeros.len(),
+            1,
+            "partially covered memzero must survive"
+        );
+        let _ = memzero;
+    }
+
+    /// A load of any byte in the MemZero's range observes the zeroing:
+    /// the MemZero must survive even if later stores cover it fully.
+    #[test]
+    fn keeps_memzero_read_in_between() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "f".into(), vec![]);
+        let (memzero, ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = data.add_entry_block();
+            let alloc = data
+                .new_local_value()
+                .alloc(Type::get_array(Type::get_i32(), 4));
+            data.layout_mut().insert_inst(entry, alloc);
+            let zero = data.new_local_value().integer(0);
+            data.layout_mut().insert_inst(entry, zero);
+            let memzero = data.new_local_value().mem_zero(alloc, 16);
+            data.layout_mut().insert_inst(entry, memzero);
+            for i in 0..3 {
+                let idx = data.new_local_value().integer(i);
+                data.layout_mut().insert_inst(entry, idx);
+                let ptr = data.new_local_value().get_elem_ptr(alloc, vec![zero, idx]);
+                data.layout_mut().insert_inst(entry, ptr);
+                let val = data.new_local_value().integer(i + 1);
+                data.layout_mut().insert_inst(entry, val);
+                let store = data.new_local_value().store(val, ptr);
+                data.layout_mut().insert_inst(entry, store);
+            }
+            // Read a byte of the zeroed range before the final store.
+            let first_ptr = data.new_local_value().get_elem_ptr(alloc, vec![zero, zero]);
+            data.layout_mut().insert_inst(entry, first_ptr);
+            let load = data.new_local_value().load(first_ptr);
+            data.layout_mut().insert_inst(entry, load);
+            let idx3 = data.new_local_value().integer(3);
+            data.layout_mut().insert_inst(entry, idx3);
+            let last_ptr = data.new_local_value().get_elem_ptr(alloc, vec![zero, idx3]);
+            data.layout_mut().insert_inst(entry, last_ptr);
+            let val = data.new_local_value().integer(9);
+            data.layout_mut().insert_inst(entry, val);
+            let store = data.new_local_value().store(val, last_ptr);
+            data.layout_mut().insert_inst(entry, store);
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+            (memzero, ret)
+        };
+        let _ = ret;
+
+        DSE.run(&mut program);
+        let data = program.func_data(function);
+        let mut memzeros = Vec::new();
+        for block in data.layout().basicblocks() {
+            for &inst in block.insts() {
+                if matches!(data.inst_data(inst).kind(), InstKind::MemZero(..)) {
+                    memzeros.push(inst);
+                }
+            }
+        }
+        assert_eq!(
+            memzeros.len(),
+            1,
+            "memzero observed by an intervening load must survive"
+        );
+        let _ = memzero;
     }
 }

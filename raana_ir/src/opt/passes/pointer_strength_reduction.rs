@@ -161,9 +161,7 @@ impl PointerStrengthReduction {
             let Some(exit) = normalize_strict_exit(data, looop, iv) else {
                 continue;
             };
-            let Some(iv_range) = constant_induction_range(data, iv, exit) else {
-                continue;
-            };
+            let iv_range = constant_induction_range(data, iv, exit);
             let signed_step = exit.signed_step();
             let Some(header_iv_position) = data
                 .bb_data(looop.header())
@@ -299,6 +297,15 @@ impl PointerStrengthReduction {
                     else {
                         continue;
                     };
+                    // Runtime-bound loops (unknown iv_range) skip the i32
+                    // intermediate-range proof: the incremental scheme only
+                    // performs 64-bit pointer adds, so the protected 32-bit
+                    // computation no longer exists. Guard the per-iteration
+                    // byte step instead so a pathological stride cannot
+                    // blow up the address span or the immediate encoding.
+                    if iv_range.is_none() && signed_byte_delta.unsigned_abs() > (1 << 20) {
+                        continue;
+                    }
                     let removable_derived_insts = removable_chain
                         .iter()
                         .all(|derived| {
@@ -388,7 +395,7 @@ impl PointerStrengthReduction {
         ranges: &RangeAnalysis,
         looop: &Loop,
         iv: Inst,
-        iv_range: ConstantInductionRange,
+        iv_range: Option<ConstantInductionRange>,
         gep: Inst,
         value: Inst,
     ) -> Option<IndexEvolution> {
@@ -410,7 +417,7 @@ impl PointerStrengthReduction {
             ranges: &RangeAnalysis,
             looop: &Loop,
             iv: Inst,
-            iv_range: ConstantInductionRange,
+            iv_range: Option<ConstantInductionRange>,
             gep: Inst,
             value: Inst,
         ) -> Option<AffineI32Expr> {
@@ -493,17 +500,26 @@ impl PointerStrengthReduction {
                 _ => return None,
             };
             let depends_on_iv = lhs.coefficient != 0 || rhs.coefficient != 0;
+            // With a constant induction range, both the intermediate wrap
+            // proof and the i32 range fit keep the 32-bit offset arithmetic
+            // sound. With a runtime bound (iv_range unknown) both checks are
+            // skipped: the incremental scheme replaces that arithmetic with
+            // 64-bit pointer adds, and the valid-input domain excludes i32
+            // wraparound, so the incremental address sequence matches the
+            // original linear one.
             if depends_on_iv
-                && (!ranges.proves_binary_no_signed_wrap(
-                    binary.op(),
-                    binary.lhs(),
-                    binary.rhs(),
-                    RangeContext::Before(gep),
-                ) || !PointerStrengthReduction::affine_range_fits_i32(
-                    coefficient,
-                    offset_range,
-                    iv_range,
-                ))
+                && iv_range.is_some_and(|range| {
+                    !ranges.proves_binary_no_signed_wrap(
+                        binary.op(),
+                        binary.lhs(),
+                        binary.rhs(),
+                        RangeContext::Before(gep),
+                    ) || !PointerStrengthReduction::affine_range_fits_i32(
+                        coefficient,
+                        offset_range,
+                        range,
+                    )
+                })
             {
                 return None;
             }
@@ -1341,21 +1357,112 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_affine_index_without_a_constant_range_proof() {
-        let (mut dynamic_bound_program, dynamic_bound) = build_loop(BinaryOp::Lt, true);
-        replace_gep_index_with_affine(&mut dynamic_bound_program, &dynamic_bound, 2, 1, false);
-        assert!(!run(&mut dynamic_bound_program, dynamic_bound.function));
+    fn carries_an_affine_index_with_a_runtime_bound() {
+        // An affine index with a runtime (non-constant) bound: the i32
+        // intermediate-range proof is skipped because the incremental
+        // scheme replaces the 32-bit offset arithmetic with 64-bit pointer
+        // adds.
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        replace_gep_index_with_affine(&mut program, &fixture, 2, 1, false);
+        assert!(run(&mut program, fixture.function));
 
-        let (mut wrapping_program, wrapping) = build_loop(BinaryOp::Lt, true);
-        replace_bound_with_constant(&mut wrapping_program, &wrapping, 10);
-        replace_gep_index_with_affine(&mut wrapping_program, &wrapping, 1 << 30, 0, false);
-        assert!(!run(&mut wrapping_program, wrapping.function));
+        let data = program.func_data(fixture.function);
+        let InstKind::Jump(backedge) = data.inst_data(fixture.backedge).kind() else {
+            panic!("backedge must remain a jump");
+        };
+        let InstKind::GetElemPtr(next) = data.inst_data(backedge.args()[1]).kind() else {
+            panic!("latch must compute the next pointer");
+        };
+        let pointer = data.bb_data(fixture.header).params()[1];
+        assert_eq!(next.base(), pointer);
+        assert_eq!(integer_constant(data, next.offsets()[0]), Some(2));
     }
 
     #[test]
-    fn rejects_a_direct_induction_index_without_a_constant_range_proof() {
+    fn rejects_an_affine_index_whose_32_bit_intermediate_can_wrap() {
+        // A constant bound keeps the range proof active: a coefficient that
+        // overflows i32 would corrupt the intermediate offset arithmetic.
         let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        replace_bound_with_constant(&mut program, &fixture, 10);
+        replace_gep_index_with_affine(&mut program, &fixture, 1 << 30, 0, false);
         assert!(!run(&mut program, fixture.function));
+    }
+
+    #[test]
+    fn carries_a_pointer_for_a_direct_induction_index_with_a_runtime_bound() {
+        // The primary runtime-bound case: a direct induction index with a
+        // runtime bound becomes an incremental pointer. The header gains a
+        // pointer parameter, the latch steps it, and the original GEP reads
+        // through it with a zero offset.
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        assert!(run(&mut program, fixture.function));
+
+        let data = program.func_data(fixture.function);
+        assert_eq!(data.bb_data(fixture.header).params().len(), 2);
+        let pointer = data.bb_data(fixture.header).params()[1];
+        let InstKind::Jump(backedge) = data.inst_data(fixture.backedge).kind() else {
+            panic!("backedge must remain a jump");
+        };
+        let InstKind::GetElemPtr(next) = data.inst_data(backedge.args()[1]).kind() else {
+            panic!("latch must compute the next pointer");
+        };
+        assert_eq!(next.base(), pointer);
+        assert_eq!(integer_constant(data, next.offsets()[0]), Some(1));
+        let InstKind::Jump(entry_jump) = data.inst_data(fixture.entry_jump).kind() else {
+            panic!("entry terminator must remain a jump");
+        };
+        let InstKind::GetElemPtr(initial) = data.inst_data(entry_jump.args()[1]).kind() else {
+            panic!("entry must compute the initial pointer");
+        };
+        // Direct index at position 1 (iv_last): the initial offset is the
+        // constant 3 from the entry jump; the invariant position 0 keeps
+        // the original offset.
+        assert_eq!(integer_constant(data, initial.offsets()[1]), Some(3));
+        let InstKind::GetElemPtr(gep) = data.inst_data(fixture.gep).kind() else {
+            unreachable!()
+        };
+        assert_eq!(gep.base(), pointer);
+        assert_eq!(integer_constant(data, gep.offsets()[0]), Some(0));
+    }
+
+    #[test]
+    fn carries_a_pointer_with_a_non_constant_initial_value() {
+        // The initial value only needs to be available in the preheader: a
+        // non-constant (function parameter) initial offset is carried into
+        // the initial pointer as-is, with no constant-fold requirement.
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        {
+            let data = program.func_data_mut(fixture.function);
+            let bound = data.params()[1];
+            data.replace_inst_with(fixture.entry_jump)
+                .jump(fixture.header, vec![bound]);
+        }
+        assert!(run(&mut program, fixture.function));
+
+        let data = program.func_data(fixture.function);
+        let InstKind::Jump(entry_jump) = data.inst_data(fixture.entry_jump).kind() else {
+            panic!("entry terminator must remain a jump");
+        };
+        let InstKind::GetElemPtr(initial) = data.inst_data(entry_jump.args()[1]).kind() else {
+            panic!("entry must compute the initial pointer");
+        };
+        assert_eq!(initial.offsets()[1], data.params()[1]);
+    }
+
+    #[test]
+    fn rejects_a_non_unit_step_with_a_runtime_bound() {
+        // normalize_strict_exit requires a constant bound for non-unit
+        // steps: a runtime bound with step 2 stays untransformed.
+        let (mut program, fixture) = build_loop_with_update(BinaryOp::Add, 2, BinaryOp::Lt, true);
+        assert!(!run(&mut program, fixture.function));
+        assert_eq!(
+            program
+                .func_data(fixture.function)
+                .bb_data(fixture.header)
+                .params()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -2133,11 +2240,19 @@ mod tests {
 
     #[test]
     fn rejects_a_loop_variant_suffix_after_the_induction_index() {
+        // A suffix that is variant but cannot be classified as affine (here:
+        // a load inside the loop) must reject the whole GEP. (An affine
+        // suffix such as iv + 1 is legal and folds into the pointer step;
+        // this test pins the unclassifiable case.)
         let (mut program, fixture) = build_loop(BinaryOp::Lt, false);
         let data = program.func_data_mut(fixture.function);
         let base = data.params()[0];
+        let slot = data.new_local_value().alloc(Type::get_i32());
+        let suffix = data.new_local_value().load(slot);
+        data.layout_mut().insert_inst_before(fixture.gep, slot);
+        data.layout_mut().insert_inst_before(fixture.gep, suffix);
         data.replace_inst_with(fixture.gep)
-            .get_elem_ptr(base, vec![fixture.iv, fixture.next_iv]);
+            .get_elem_ptr(base, vec![fixture.iv, suffix]);
 
         assert!(!run(&mut program, fixture.function));
         assert_eq!(

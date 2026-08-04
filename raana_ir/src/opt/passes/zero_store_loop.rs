@@ -195,12 +195,22 @@ impl ZeroStoreLoop {
         let byte_len = data
             .new_local_value()
             .binary(BinaryOp::Mul, entry_args[t_pos], size);
-        let row_start = data.new_local_value().get_elem_ptr(base, row_offsets);
-        let clear = data.new_local_value().mem_zero_dynamic(row_start, byte_len);
+        // When the store GEP's first offset is the loop induction variable
+        // (e.g. `buf[i] = 0`), the row prefix is empty: the row starts at
+        // `base` itself. Reuse `base` directly — materializing a no-offset
+        // GEP would insert a block-arg/constant reference into the layout,
+        // which later passes (e.g. DCE's critical-inst scan) assert never
+        // happens.
+        let clear = if row_offsets.is_empty() {
+            data.new_local_value().mem_zero_dynamic(base, byte_len)
+        } else {
+            let row_start = data.new_local_value().get_elem_ptr(base, row_offsets);
+            data.layout_mut()
+                .insert_before_terminator(entry_block, row_start);
+            data.new_local_value().mem_zero_dynamic(row_start, byte_len)
+        };
         data.layout_mut()
             .insert_before_terminator(entry_block, byte_len);
-        data.layout_mut()
-            .insert_before_terminator(entry_block, row_start);
         data.layout_mut()
             .insert_before_terminator(entry_block, clear);
         data.replace_inst_with(entry_edge_inst).jump(exit, vec![]);

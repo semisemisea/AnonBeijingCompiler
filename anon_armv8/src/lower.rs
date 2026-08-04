@@ -3,8 +3,8 @@
 use std::collections::HashSet;
 
 use raana_ir::ir::{
-    Binary, BinaryOp, Call, Cast, Fma, GetElemPtr, InstKind, Load, Return, Select, Store, TailCall,
-    Type as HirType, TypeKind, VectorExtractElement, VectorInsertElement, VectorReduce,
+    Binary, BinaryOp, Call, Cast, Fma, GetElemPtr, InstKind, Integer, Load, Return, Select, Store,
+    TailCall, Type as HirType, TypeKind, VectorExtractElement, VectorInsertElement, VectorReduce,
     VectorReduceOp, VectorSplat,
     arena::Arena,
     inst_kind::{MemZero, MemZeroLen},
@@ -28,7 +28,7 @@ use crate::{
     instructions::{
         AMode, AluOp, CCmpStep, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift, MInst,
         MemoryType, SelectCmp, SelectValue, ShiftOp, VecArithOp, VecBitOp, VecCmpOp, VecCvtOp,
-        VecMinMaxOp, VecShape,
+        VecMinMaxOp, VecShape, VecShiftOp,
     },
     labels::Label,
     regs::{self, OperandSize, RegOrZr},
@@ -449,6 +449,83 @@ fn lower_vector_binary(
                 rhs,
             });
         }
+        BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Sar => {
+            if is_float {
+                ctx.lowering_panic(
+                    "AArch64 instruction selection",
+                    "vector shifts have no float form (the loop vectorizer rejects float shifts)",
+                    Some(arena.inst_data(binary.lhs()).ty()),
+                    Some(arena.inst_data(inst).ty()),
+                );
+            }
+            let shift_op = match binary.op() {
+                BinaryOp::Shl => VecShiftOp::Shl,
+                BinaryOp::Shr => VecShiftOp::Shr,
+                _ => VecShiftOp::Sar,
+            };
+            // A constant amount (a splatted integer literal) uses the
+            // immediate forms shl/ushr/sshr; anything else uses the
+            // register forms sshl/ushl.
+            match constant_shift_amount(arena, binary.rhs(), shape) {
+                Some(imm) => ctx.emit(MInst::VecShift {
+                    op: shift_op,
+                    shape,
+                    dst,
+                    lhs,
+                    rhs,
+                    imm: Some(imm),
+                }),
+                None => {
+                    // Variable right shifts have no direct NEON register
+                    // form: sshl/ushl with a negative amount shift right, so
+                    // negate the amount vector first.
+                    if binary.op() == BinaryOp::Shl {
+                        ctx.emit(MInst::VecShift {
+                            op: shift_op,
+                            shape,
+                            dst,
+                            lhs,
+                            rhs,
+                            imm: None,
+                        });
+                    } else {
+                        let neg = ctx.alloc_tmp(arena.inst_data(binary.lhs()).ty().clone());
+                        ctx.emit(MInst::VecNeg {
+                            shape,
+                            dst: Writable::from_reg(neg),
+                            src: rhs,
+                        });
+                        ctx.emit(MInst::VecShift {
+                            op: shift_op,
+                            shape,
+                            dst,
+                            lhs,
+                            rhs: neg,
+                            imm: None,
+                        });
+                    }
+                }
+            }
+        }
+        BinaryOp::Div => {
+            // NEON has no integer vector divide (`sdiv` is scalar-only); the
+            // loop vectorizer rejects i32 Div (constant divisors are rewritten
+            // to shift chains by StrengthReduction). Only f32 reaches here.
+            if !is_float {
+                ctx.lowering_panic(
+                    "AArch64 instruction selection",
+                    "NEON has no integer vector divide; i32 Div must stay scalar",
+                    Some(arena.inst_data(binary.lhs()).ty()),
+                    Some(arena.inst_data(inst).ty()),
+                );
+            }
+            ctx.emit(MInst::VecDiv {
+                shape,
+                dst,
+                lhs,
+                rhs,
+            });
+        }
         op => {
             ctx.lowering_panic(
                 "AArch64 instruction selection",
@@ -459,6 +536,21 @@ fn lower_vector_binary(
         }
     }
     LoweredOutput::Value(result)
+}
+
+/// A constant vector shift amount: the shift's rhs is a `VectorSplat` of an
+/// integer literal whose value fits the lane width (immediate shifts encode
+/// amounts 0..lane_bits). Anything else is a variable amount and falls back
+/// to the register-form `sshl`/`ushl`.
+fn constant_shift_amount(arena: ArenaContext<'_>, rhs: HirInst, shape: VecShape) -> Option<u8> {
+    let InstKind::VectorSplat(splat) = arena.inst_data(rhs).kind() else {
+        return None;
+    };
+    let InstKind::Integer(value) = arena.inst_data(splat.src()).kind() else {
+        return None;
+    };
+    let lane_bits = u8::from(shape.element_bytes()) * 8;
+    u8::try_from(value.value()).ok().filter(|imm| *imm < lane_bits)
 }
 
 /// Map a HIR vector type onto a NEON arrangement. Only the machine-supported
@@ -3810,10 +3902,11 @@ mod tests {
         data.layout_mut().insert_inst(entry, ret);
 
         let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
-        // dup from a float scalar is `dup v.4s, s0`; scvtf converts the lanes;
-        // fmla fuses the multiply-add.
+        // dup from a float scalar reads the aliased vector register
+        // (`dup v.4s, v.s[0]` — LLVM MC rejects `dup v.4s, sn`); scvtf
+        // converts the lanes; fmla fuses the multiply-add.
         assert!(assembly.contains("dup v"), "{assembly}");
-        assert!(assembly.contains(".4s, s"), "{assembly}");
+        assert!(assembly.contains(".s[0]"), "{assembly}");
         assert!(assembly.contains("scvtf"), "{assembly}");
         assert!(assembly.contains("fmla"), "{assembly}");
     }

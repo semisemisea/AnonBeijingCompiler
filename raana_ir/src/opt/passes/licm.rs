@@ -186,6 +186,119 @@ impl LICM {
             None
         };
 
+        // A block parameter whose block has a single logical incoming edge is
+        // that edge's argument. Resolving such parameters (transitively, and
+        // through the passthrough header-parameter substitution below)
+        // exposes invariant computations that reference values forwarded
+        // through single-predecessor chains — e.g. conv2d's inlined `idx`
+        // address arithmetic, where the row index reaches the inner loop
+        // through a chain of forwarding blocks.
+        //
+        // The seed contains only *passthrough* header parameters (whose
+        // backedge passes the parameter itself): their entry-edge argument is
+        // the parameter's value in every iteration and is available in the
+        // preheader. Loop-carried header parameters (entry X, backedge Y)
+        // must NOT resolve to their entry argument — that is how the c/r/kr/kc
+        // induction variables of conv2d were once folded to their entry value
+        // 0. They stay terminal values and are judged by `resolved_invariant`
+        // (their defining block is inside the loop, so they remain variant).
+        let mut param_resolutions: FxHashMap<Inst, Inst> = FxHashMap::default();
+        if let Some(substitution) = &substitution {
+            for &parameter in &invariant_header_params {
+                if let Some(&arg) = substitution.get(&parameter) {
+                    param_resolutions.insert(parameter, arg);
+                }
+            }
+        }
+        let mut deferred: Vec<(Inst, Inst)> = Vec::new();
+        for &block in cfg.blocks() {
+            let params = data.bb_data(block).params().to_vec();
+            if params.is_empty() {
+                continue;
+            }
+            let edges = incoming_edges(data, cfg, block);
+            if edges.len() != 1 {
+                continue; // real phis and function parameters stay terminal
+            }
+            let args = edges[0].args(data);
+            for (position, &parameter) in params.iter().enumerate() {
+                if param_resolutions.contains_key(&parameter) {
+                    continue;
+                }
+                let Some(&arg) = args.get(position) else {
+                    continue;
+                };
+                if arg == parameter {
+                    continue; // self-passthrough: no information
+                }
+                if parameter_blocks.contains_key(&arg) {
+                    // The argument is another block's parameter: chain
+                    // through its resolution when available. Parameters of
+                    // single-edge blocks resolve in a later fixpoint pass;
+                    // terminal parameters (multi-edge blocks — e.g. the
+                    // loop-carried IVs of enclosing loops) are kept as the
+                    // final value and judged by `resolved_invariant`.
+                    match param_resolutions.get(&arg) {
+                        Some(&value) => {
+                            param_resolutions.insert(parameter, value);
+                        }
+                        None => {
+                            let arg_block = parameter_blocks[&arg];
+                            if incoming_edges(data, cfg, arg_block).len() == 1 {
+                                deferred.push((parameter, arg));
+                            } else {
+                                param_resolutions.insert(parameter, arg);
+                            }
+                        }
+                    }
+                } else {
+                    param_resolutions.insert(parameter, arg);
+                }
+            }
+        }
+        while !deferred.is_empty() {
+            let mut progress = false;
+            let mut still_deferred = Vec::with_capacity(deferred.len());
+            for (parameter, arg) in deferred.drain(..) {
+                if let Some(&value) = param_resolutions.get(&arg) {
+                    param_resolutions.insert(parameter, value);
+                    progress = true;
+                } else {
+                    // The argument never resolved (cyclic chain): keep it as
+                    // a terminal value; `resolved_invariant` judges it.
+                    param_resolutions.insert(parameter, arg);
+                    progress = true;
+                }
+            }
+            deferred = still_deferred;
+            if !progress {
+                break; // defensive: should not happen with terminal handling
+            }
+        }
+
+        // A resolved parameter value is invariant when it is a passthrough
+        // header parameter or its defining block dominates the loop header.
+        // Any value dominating the header lies outside the loop and is
+        // available at the preheader insertion point, so hoisting with the
+        // substituted operand is dominance-safe (the 8-04 operand-substitution
+        // crash cannot recur).
+        let resolved_invariant = |value: Inst| -> bool {
+            if value.is_global() || data.inst_data(value).kind().is_const() {
+                return true;
+            }
+            if invariant_header_params.contains(&value) {
+                return true;
+            }
+            match data.layout().parent_bb(value) {
+                Some(block) => {
+                    !looop.contains(block) && dom_tree.dominates(block, looop.header())
+                }
+                None => parameter_blocks.get(&value).is_some_and(|&block| {
+                    !looop.contains(block) && dom_tree.dominates(block, looop.header())
+                }),
+            }
+        };
+
         let loop_insts = insts(looop, data).collect::<Vec<_>>();
         let mut map = loop_insts
             .iter()
@@ -251,7 +364,17 @@ impl LICM {
                 return true;
             }
             if loop_params.contains(&operand) {
-                return invariant_header_params.contains(&operand);
+                // Header parameters are invariant only through the
+                // backedge-passthrough rule above: the substitution map
+                // seeds header-param rewrites, but a loop-carried header
+                // parameter (entry value X, backedge value Y) is variant
+                // even though the map rewrites it. Body parameters resolve
+                // through the single-predecessor chain.
+                return invariant_header_params.contains(&operand)
+                    || (!header_params.contains(&operand)
+                        && param_resolutions
+                            .get(&operand)
+                            .is_some_and(|&value| resolved_invariant(value)));
             }
             match data.layout().parent_bb(operand) {
                 Some(block) if looop.contains(block) => {
@@ -419,8 +542,8 @@ impl LICM {
                 continue;
             }
             changed = true;
-            if let Some(substitution) = &substitution {
-                substitute_header_params(data, inst, substitution);
+            if !param_resolutions.is_empty() {
+                substitute_header_params(data, inst, &param_resolutions);
             }
             let bb = data
                 .layout()
@@ -431,12 +554,8 @@ impl LICM {
         }
 
         for (inst, base, prefix_offsets, remaining_offsets, original_ty) in partial_geps {
-            let substitute = |value: Inst| -> Inst {
-                substitution
-                    .as_ref()
-                    .and_then(|map| map.get(&value).copied())
-                    .unwrap_or(value)
-            };
+            let substitute =
+                |value: Inst| -> Inst { param_resolutions.get(&value).copied().unwrap_or(value) };
             let prefix = data.new_local_value().get_elem_ptr(
                 substitute(base),
                 prefix_offsets
@@ -1690,5 +1809,253 @@ mod tests {
         assert_eq!(binary.lhs(), outer);
         assert_eq!(binary.rhs(), two);
         assert!(!run(&mut program, function));
+    }
+
+    /// conv2d shape: a single-predecessor forwarding block (the inlined `idx`
+    /// chain) passes the passthrough header parameter on; an invariant
+    /// computation on the forwarded value is hoisted, its operand replaced by
+    /// the header's entry argument.
+    #[test]
+    fn hoists_through_single_predecessor_body_forwarding() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "licm_forward".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let forward = data
+            .new_basic_block()
+            .basic_block("forward".into(), vec![Type::get_i32()]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, forward, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let five = data.new_local_inst().integer(5);
+        let entry_jump = data.new_local_inst().jump(header, vec![five]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let header_param = data.bb_data(header).params()[0];
+        let condition = data.new_local_inst().integer(1);
+        let branch = data
+            .new_local_inst()
+            .branch(condition, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, branch);
+
+        let forward_jump = data.new_local_inst().jump(forward, vec![header_param]);
+        data.layout_mut().insert_inst(body, forward_jump);
+
+        let forwarded = data.bb_data(forward).params()[0];
+        let two = data.new_local_inst().integer(2);
+        let doubled = data
+            .new_local_inst()
+            .binary(BinaryOp::Mul, forwarded, two);
+        let backedge = data.new_local_inst().jump(header, vec![header_param]);
+        for inst in [two, doubled, backedge] {
+            data.layout_mut().insert_inst(forward, inst);
+        }
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(data.layout().parent_bb(doubled), Some(entry));
+        let InstKind::Binary(binary) = data.inst_data(doubled).kind() else {
+            unreachable!()
+        };
+        assert_eq!(binary.lhs(), five);
+        assert_eq!(binary.rhs(), two);
+        assert!(!run(&mut program, function));
+    }
+
+    /// The resolution chain may pass through the preheader's own parameter:
+    /// the hoisted instruction lands in the preheader with that parameter as
+    /// its operand, which is available at the insertion point by
+    /// construction.
+    #[test]
+    fn resolves_chain_through_preheader_parameter() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "licm_chain".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let side = data.new_basic_block().basic_block("side".into(), vec![]);
+        let preheader = data
+            .new_basic_block()
+            .basic_block("preheader".into(), vec![Type::get_i32()]);
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let forward = data
+            .new_basic_block()
+            .basic_block("forward".into(), vec![Type::get_i32()]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [side, preheader, header, body, forward, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let seven = data.new_local_inst().integer(7);
+        let condition = data.new_local_inst().integer(1);
+        let entry_branch = data
+            .new_local_inst()
+            .branch(condition, preheader, vec![seven], side, vec![]);
+        data.layout_mut().insert_inst(entry, entry_branch);
+        let side_jump = data.new_local_inst().jump(exit, vec![]);
+        data.layout_mut().insert_inst(side, side_jump);
+
+        let pre_param = data.bb_data(preheader).params()[0];
+        let pre_jump = data.new_local_inst().jump(header, vec![pre_param]);
+        data.layout_mut().insert_inst(preheader, pre_jump);
+
+        let header_param = data.bb_data(header).params()[0];
+        let header_branch = data
+            .new_local_inst()
+            .branch(condition, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, header_branch);
+
+        let forward_jump = data.new_local_inst().jump(forward, vec![header_param]);
+        data.layout_mut().insert_inst(body, forward_jump);
+
+        let forwarded = data.bb_data(forward).params()[0];
+        let two = data.new_local_inst().integer(2);
+        let doubled = data
+            .new_local_inst()
+            .binary(BinaryOp::Mul, forwarded, two);
+        let backedge = data.new_local_inst().jump(header, vec![header_param]);
+        for inst in [two, doubled, backedge] {
+            data.layout_mut().insert_inst(forward, inst);
+        }
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(data.layout().parent_bb(doubled), Some(preheader));
+        let InstKind::Binary(binary) = data.inst_data(doubled).kind() else {
+            unreachable!()
+        };
+        // forwarded -> header_param -> pre_param: the preheader's own
+        // parameter substitutes for the forwarded value.
+        assert_eq!(binary.lhs(), pre_param);
+        assert_eq!(binary.rhs(), two);
+    }
+
+    /// A body parameter whose block has two logical incoming edges (here a
+    /// same-target branch) is a real phi and stays variant.
+    #[test]
+    fn keeps_body_param_with_two_logical_edges_variant() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "licm_two_edges".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let forward = data
+            .new_basic_block()
+            .basic_block("forward".into(), vec![Type::get_i32()]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, forward, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let header_param = data.bb_data(header).params()[0];
+        let condition = data.new_local_inst().integer(1);
+        let branch = data
+            .new_local_inst()
+            .branch(condition, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, branch);
+
+        // Same-target branch: two logical edges into `forward`.
+        let forward_jump = data.new_local_inst().branch(
+            condition,
+            forward,
+            vec![header_param],
+            forward,
+            vec![header_param],
+        );
+        data.layout_mut().insert_inst(body, forward_jump);
+
+        let forwarded = data.bb_data(forward).params()[0];
+        let two = data.new_local_inst().integer(2);
+        let doubled = data
+            .new_local_inst()
+            .binary(BinaryOp::Mul, forwarded, two);
+        let backedge = data.new_local_inst().jump(header, vec![header_param]);
+        for inst in [two, doubled, backedge] {
+            data.layout_mut().insert_inst(forward, inst);
+        }
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(!run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(data.layout().parent_bb(doubled), Some(forward));
+    }
+
+    /// A resolution chain ending at a loop-internal variant value keeps the
+    /// parameter variant.
+    #[test]
+    fn keeps_body_param_resolving_to_loop_variant_variant() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "licm_variant_chain".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let forward = data
+            .new_basic_block()
+            .basic_block("forward".into(), vec![Type::get_i32()]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, forward, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let header_param = data.bb_data(header).params()[0];
+        let condition = data.new_local_inst().integer(1);
+        let branch = data
+            .new_local_inst()
+            .branch(condition, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, branch);
+
+        // The forwarded value is `header_param + 1`, computed in the loop:
+        // variant, so the chain cannot make `doubled` invariant.
+        let one = data.new_local_inst().integer(1);
+        let step = data
+            .new_local_inst()
+            .binary(BinaryOp::Add, header_param, one);
+        let forward_jump = data.new_local_inst().jump(forward, vec![step]);
+        for inst in [one, step, forward_jump] {
+            data.layout_mut().insert_inst(body, inst);
+        }
+
+        let forwarded = data.bb_data(forward).params()[0];
+        let two = data.new_local_inst().integer(2);
+        let doubled = data
+            .new_local_inst()
+            .binary(BinaryOp::Mul, forwarded, two);
+        let backedge = data.new_local_inst().jump(header, vec![step]);
+        for inst in [two, doubled, backedge] {
+            data.layout_mut().insert_inst(forward, inst);
+        }
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(!run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(data.layout().parent_bb(doubled), Some(forward));
     }
 }

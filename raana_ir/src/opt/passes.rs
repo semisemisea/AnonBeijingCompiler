@@ -11,6 +11,7 @@ pub mod inline;
 pub mod invariant_reduction_hoisting;
 pub mod ipsccp;
 pub mod licm;
+pub mod mulmod_recognize;
 pub mod loop_unroll;
 pub mod pointer_strength_reduction;
 pub mod reduction_unroll;

@@ -15,7 +15,7 @@ use taki_mir::{
         LowerBackend, LowerContext, LoweredOutput, analyze_gep, fold_gep_constant_offset,
         sink_gep_into_address,
     },
-    prelude::{ArenaContext, HirFunctionData, HirInst},
+    prelude::{ArenaContext, HirFunction, HirFunctionData, HirInst},
     reg_alloc::reg::PReg,
     register::Writable,
     vcode::MachInst,
@@ -1143,12 +1143,91 @@ fn lower_const_mem_zero(
     LoweredOutput::None
 }
 
+/// The compiler-provided modular-multiplication builtin recognized by the
+/// `mulmod_recognize` IR pass (AArch64 only). It has no body and is never
+/// defined in the assembly: every call is expanded here.
+const MULMOD_BUILTIN: &str = "soyo_mulmod";
+
+fn is_mulmod_builtin(arena: ArenaContext<'_>, callee: HirFunction) -> bool {
+    arena.func_data(callee).name() == MULMOD_BUILTIN
+}
+
+/// Lower a call to the `soyo_mulmod(a, b, p)` builtin to the four-instruction
+/// sequence
+///
+/// ```text
+/// smull x2, w0, w1   // product = (i64)a*b  (exact: two 32-bit operands)
+/// sxtw  x3, w2       // p64 = (i64)p
+/// sdiv  x4, x2, x3   // quotient = product / p64 (truncating)
+/// msub  x0, x4, x3, x2 // result = product - quotient*p64  (the remainder)
+/// ```
+///
+/// The remainder of `(i64)a*b % p` is always in `(-p, p)`, so its low 32 bits
+/// are the correct `i32` return value. No actual call is emitted.
+///
+/// A multiply-high magic-number sequence (`smulh` + shifts) was implemented
+/// and measured: it regressed both the static count and the QEMU runtime,
+/// because every inline-expanded site re-materializes the 64-bit magic
+/// constant (4 `movz`/`movk`) plus the divisor inside the hot butterfly loop,
+/// and QEMU executes `sdiv` natively. The generic `sdiv` stays until a
+/// loop-invariant constant hoist exists (see TODO.md M62).
+fn lower_mulmod_builtin(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    call: &Call,
+) -> LoweredOutput {
+    let args = call.args();
+    assert_eq!(args.len(), 3, "soyo_mulmod takes exactly three arguments");
+    let a = ctx.put_value_in_reg(args[0]);
+    let b = ctx.put_value_in_reg(args[1]);
+    let p = ctx.put_value_in_reg(args[2]);
+
+    // 64-bit temporaries: the product and the intermediate quotient.
+    let tmp_ty = HirType::get_pointer(HirType::get_i32());
+    let product = ctx.alloc_tmp(tmp_ty.clone());
+    ctx.emit(MInst::SMulL {
+        dst: Writable::from_reg(product),
+        lhs: a,
+        rhs: b,
+    });
+
+    let p64 = ctx.alloc_tmp(tmp_ty.clone());
+    ctx.emit(MInst::Sxtw {
+        size: OperandSize::Size32,
+        dst: Writable::from_reg(p64),
+        src: p,
+    });
+
+    let quotient = ctx.alloc_tmp(tmp_ty);
+    ctx.emit(MInst::SDiv {
+        size: OperandSize::Size64,
+        dst: Writable::from_reg(quotient),
+        lhs: product,
+        rhs: p64,
+    });
+
+    let result = ctx.result_reg(inst);
+    ctx.emit(MInst::MSub {
+        size: OperandSize::Size64,
+        dst: Writable::from_reg(result),
+        lhs: quotient,
+        rhs: p64,
+        subtrahend: product,
+    });
+    let _ = arena;
+    LoweredOutput::Value(result)
+}
+
 fn lower_call(
     ctx: &mut LowerContext<'_, MInst>,
     arena: ArenaContext<'_>,
     inst: HirInst,
     call: &Call,
 ) -> LoweredOutput {
+    if is_mulmod_builtin(arena, call.callee()) {
+        return lower_mulmod_builtin(ctx, arena, inst, call);
+    }
     let mut args = Vec::new();
     let types: Vec<_> = call
         .args()

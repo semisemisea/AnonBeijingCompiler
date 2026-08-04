@@ -797,19 +797,66 @@ impl PointerStrengthReduction {
         )
     }
 
+    /// Upper bound on how many nested `getelemptr` levels (an outer GEP used
+    /// as the base of an inner GEP) `has_only_loop_memory_users` will follow
+    /// before giving up conservatively. Realistic 2D/3D array access chains
+    /// are 2-3 levels deep; anything deeper is rejected to bound compile time.
+    const MAX_TRANSITIVE_GEP_DEPTH: usize = 8;
+
+    /// Returns whether every use of `gep` inside `looop` is a memory
+    /// operation (`Load`/`Store`/`MemZero`) that uses `gep` as its address,
+    /// possibly through nested `getelemptr` levels: a GEP that uses `gep` as
+    /// its base is accepted iff its own users satisfy the same property. Any
+    /// use in a non-address role (stored as data, passed to a call, returned,
+    /// ...) anywhere along the chain rejects. This admits the 2D array shape
+    /// `b[k][i]` where the outer GEP carries the induction-variable index and
+    /// its only user is the inner GEP.
     fn has_only_loop_memory_users(data: &ArenaContextMut<'_>, looop: &Loop, gep: Inst) -> bool {
-        let users = data.inst_data(gep).used_by();
-        !users.is_empty()
-            && users.iter().all(|&user| {
-                data.layout()
-                    .parent_bb(user)
-                    .is_some_and(|block| looop.contains(block))
-                    && match data.inst_data(user).kind() {
-                        InstKind::Load(load) => load.src() == gep,
-                        InstKind::Store(store) => store.dest() == gep,
-                        _ => false,
-                    }
-            })
+        fn chain_has_only_loop_memory_users(
+            data: &ArenaContextMut<'_>,
+            looop: &Loop,
+            gep: Inst,
+            visited: &mut FxHashSet<Inst>,
+            depth: usize,
+        ) -> bool {
+            // Cycle protection: each GEP is visited at most once. In a
+            // well-formed SSA use graph a GEP has a single base, so a revisit
+            // can only happen through a base-edge cycle that never reaches a
+            // memory operation; reject it conservatively (this also bounds
+            // the walk, alongside the depth cap).
+            if depth >= PointerStrengthReduction::MAX_TRANSITIVE_GEP_DEPTH
+                || !visited.insert(gep)
+            {
+                return false;
+            }
+            let users = data.inst_data(gep).used_by();
+            !users.is_empty()
+                && users.iter().all(|&user| {
+                    data.layout()
+                        .parent_bb(user)
+                        .is_some_and(|block| looop.contains(block))
+                        && match data.inst_data(user).kind() {
+                            InstKind::Load(load) => load.src() == gep,
+                            InstKind::Store(store) => store.dest() == gep,
+                            InstKind::MemZero(mem_zero) => mem_zero.dest() == gep,
+                            // Follow the chain only through the pointer
+                            // (base) operand; a GEP used anywhere else is not
+                            // an address-only use.
+                            InstKind::GetElemPtr(inner) => {
+                                inner.base() == gep
+                                    && chain_has_only_loop_memory_users(
+                                        data,
+                                        looop,
+                                        user,
+                                        visited,
+                                        depth + 1,
+                                    )
+                            }
+                            _ => false,
+                        }
+                })
+        }
+        chain_has_only_loop_memory_users(data, looop, gep, &mut FxHashSet::default(), 0)
     }
 
     fn only_reaches_candidate(
@@ -3027,5 +3074,163 @@ mod tests {
         assert_eq!(next.base(), pointer);
         assert_eq!(integer_constant(data, next.offsets()[0]), Some(1));
         assert!(!run(&mut program, function));
+    }
+
+    /// Builds a loop whose header contains a chain of `chain_len` nested GEPs
+    /// `g0 -> g1 -> ... -> g_{chain_len-1}`, each following GEP using the
+    /// previous one as its base, ending in a `Load` from the innermost GEP.
+    /// Returns the program, the function, the loop analysis, and the outer GEP
+    /// `g0`.
+    fn build_nested_gep_chain(chain_len: usize) -> (Program, Function, LoopAnalysis, Inst) {
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        let data = program.func_data_mut(fixture.function);
+        let base = data.params()[0];
+        let iv = fixture.iv;
+        let mut current = base;
+        let mut outer = None;
+        for index in 0..chain_len {
+            let zero = data.new_local_inst().integer(0);
+            let gep = if index == 0 {
+                data.new_local_inst().get_elem_ptr(current, vec![iv])
+            } else {
+                data.new_local_inst().get_elem_ptr(current, vec![zero])
+            };
+            data.layout_mut().insert_before_terminator(fixture.header, gep);
+            outer.get_or_insert(gep);
+            current = gep;
+        }
+        let load = data.new_local_inst().load(current);
+        data.layout_mut().insert_before_terminator(fixture.header, load);
+        let (_cfg, _dom_tree, loops) = LoopAnalysis::new(data);
+        (
+            program,
+            fixture.function,
+            loops,
+            outer.expect("chain must be non-empty"),
+        )
+    }
+
+    fn memory_users_ok(
+        program: &mut Program,
+        function: Function,
+        loops: &LoopAnalysis,
+        gep: Inst,
+    ) -> bool {
+        let looop = loops
+            .loops()
+            .iter()
+            .next()
+            .expect("fixture must contain exactly one loop");
+        let context = ArenaContextMut {
+            program,
+            curr_func: Some(function),
+        };
+        PointerStrengthReduction::has_only_loop_memory_users(&context, looop, gep)
+    }
+
+    #[test]
+    fn accepts_a_nested_gep_chain_ending_in_a_load() {
+        for chain_len in [2, 3] {
+            let (mut program, function, loops, outer) = build_nested_gep_chain(chain_len);
+            assert!(
+                memory_users_ok(&mut program, function, &loops, outer),
+                "a chain of {chain_len} nested GEPs ending in a load must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_a_gep_consumed_by_a_mem_zero() {
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        let outer = {
+            let data = program.func_data_mut(fixture.function);
+            let base = data.params()[0];
+            let zero = data.new_local_inst().integer(0);
+            let outer = data.new_local_inst().get_elem_ptr(base, vec![zero]);
+            let mem_zero = data.new_local_inst().mem_zero(outer, 4);
+            for inst in [outer, mem_zero] {
+                data.layout_mut().insert_before_terminator(fixture.header, inst);
+            }
+            outer
+        };
+        let (_cfg, _dom_tree, loops) = LoopAnalysis::new(program.func_data(fixture.function));
+        assert!(memory_users_ok(&mut program, fixture.function, &loops, outer));
+    }
+
+    #[test]
+    fn rejects_a_user_chain_containing_a_non_memory_use() {
+        // outer -> inner -> load, but the innermost GEP is also stored as data
+        // (`Store` uses it as `src`, not `dest`): both GEPs must be rejected.
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        let (outer, inner) = {
+            let data = program.func_data_mut(fixture.function);
+            let base = data.params()[0];
+            let iv = fixture.iv;
+            let zero = data.new_local_inst().integer(0);
+            let outer = data.new_local_inst().get_elem_ptr(base, vec![iv]);
+            let inner = data.new_local_inst().get_elem_ptr(outer, vec![zero]);
+            let load = data.new_local_inst().load(inner);
+            let store_as_data = data.new_local_inst().store(inner, base);
+            for inst in [outer, inner, load, store_as_data] {
+                data.layout_mut().insert_before_terminator(fixture.header, inst);
+            }
+            (outer, inner)
+        };
+        let (_cfg, _dom_tree, loops) = LoopAnalysis::new(program.func_data(fixture.function));
+        assert!(!memory_users_ok(&mut program, fixture.function, &loops, outer));
+        assert!(!memory_users_ok(&mut program, fixture.function, &loops, inner));
+
+        // The outer GEP itself stored as data is also rejected.
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        let outer = {
+            let data = program.func_data_mut(fixture.function);
+            let base = data.params()[0];
+            let iv = fixture.iv;
+            let zero = data.new_local_inst().integer(0);
+            let outer = data.new_local_inst().get_elem_ptr(base, vec![iv]);
+            let inner = data.new_local_inst().get_elem_ptr(outer, vec![zero]);
+            let load = data.new_local_inst().load(inner);
+            let store_as_data = data.new_local_inst().store(outer, base);
+            for inst in [outer, inner, load, store_as_data] {
+                data.layout_mut().insert_before_terminator(fixture.header, inst);
+            }
+            outer
+        };
+        let (_cfg, _dom_tree, loops) = LoopAnalysis::new(program.func_data(fixture.function));
+        assert!(!memory_users_ok(&mut program, fixture.function, &loops, outer));
+    }
+
+    #[test]
+    fn rejects_deeply_nested_gep_chains_conservatively() {
+        // Chains at or below the depth cap are accepted...
+        let (mut program, function, loops, outer) =
+            build_nested_gep_chain(PointerStrengthReduction::MAX_TRANSITIVE_GEP_DEPTH);
+        assert!(memory_users_ok(&mut program, function, &loops, outer));
+
+        // ...while chains beyond it are rejected to bound compile time.
+        let (mut program, function, loops, outer) =
+            build_nested_gep_chain(PointerStrengthReduction::MAX_TRANSITIVE_GEP_DEPTH + 1);
+        assert!(!memory_users_ok(&mut program, function, &loops, outer));
+    }
+
+    #[test]
+    fn rejects_a_cyclic_gep_user_chain_without_looping() {
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        let (a, b) = {
+            let data = program.func_data_mut(fixture.function);
+            let base = data.params()[0];
+            let iv = fixture.iv;
+            let zero = data.new_local_inst().integer(0);
+            let a = data.new_local_inst().get_elem_ptr(base, vec![iv]);
+            let b = data.new_local_inst().get_elem_ptr(a, vec![zero]);
+            data.layout_mut().insert_before_terminator(fixture.header, a);
+            data.layout_mut().insert_before_terminator(fixture.header, b);
+            // Rewire `a`'s base to `b`, forming the use cycle a -> b -> a.
+            data.replace_inst_with(a).get_elem_ptr(b, vec![iv]);
+            (a, b)
+        };
+        let (_cfg, _dom_tree, loops) = LoopAnalysis::new(program.func_data(fixture.function));
+        assert!(!memory_users_ok(&mut program, fixture.function, &loops, a));
+        assert!(!memory_users_ok(&mut program, fixture.function, &loops, b));
     }
 }

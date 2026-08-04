@@ -13,6 +13,7 @@ pub mod inline;
 pub mod invariant_reduction_hoisting;
 pub mod ipsccp;
 pub mod licm;
+pub mod loop_interchange;
 pub mod loop_unroll;
 pub mod matmul_interchange;
 pub mod mod_fold;

@@ -247,6 +247,15 @@ impl PassesManager {
         let rotate_loops = Box::new(rotate_loops::RotateLoops);
         p.register(rotate_loops);
 
+        // Swap the two innermost loops of perfect i-j-k nests so the new
+        // inner loop accesses contiguous memory (matmul1). AArch64-only: it
+        // exists to unlock loop vectorization and must run after rotation
+        // (the pass consumes the test-at-bottom form).
+        if config.target.enable_chain_to_switch {
+            let loop_interchange = Box::new(loop_interchange::LoopInterchange);
+            p.register(loop_interchange);
+        }
+
         // Collapse zero-initialization loops into a single runtime-length
         // `MemZero` (`bl memset` on AArch64). AArch64-only for now; it runs
         // after rotation so it sees the countdown form.

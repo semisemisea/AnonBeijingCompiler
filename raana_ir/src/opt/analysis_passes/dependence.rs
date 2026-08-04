@@ -169,14 +169,14 @@ impl DependenceAnalysis {
 // ---------------------------------------------------------------------------
 
 /// Element-level affine classification of one GEP index.
-struct IndexInfo {
+pub(crate) struct IndexInfo {
     /// Coefficient of the loop's BIV (0 = invariant).
-    coefficient: i64,
+    pub(crate) coefficient: i64,
     /// Invariant part element range `[min, max]`.
-    offset_range: (i64, i64),
+    pub(crate) offset_range: (i64, i64),
 }
 
-fn classify_index(
+pub(crate) fn classify_index(
     arena: &ArenaContext<'_>,
     looop: &Loop,
     iv: Inst,
@@ -421,7 +421,7 @@ struct ExitInfo {
     bound: Inst,
 }
 
-fn normalize_exit_ro(
+pub(crate) fn normalize_exit_ro(
     data: &FunctionData,
     arena: &impl Arena,
     looop: &Loop,
@@ -496,7 +496,7 @@ fn normalize_exit_ro(
 
 /// Conservative trip-count upper bound from a normalized exit. `None` means
 /// "unknown": the caller then uses the full i32 domain.
-fn trip_count_upper_bound(
+pub(crate) fn trip_count_upper_bound(
     arena: &impl Arena,
     data: &FunctionData,
     looop: &Loop,

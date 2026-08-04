@@ -2265,4 +2265,119 @@ mod tests {
         // ABI args are not guaranteed sign-extended: extension must stay.
         assert!(asm.contains("addw"), "{asm}");
     }
+
+    /// Compiles `x <op> constant` and returns the assembly.
+    fn compile_constant_comparison(op: BinaryOp, constant: i32) -> String {
+        let mut program = Program::new();
+        let function = program.new_function(
+            HirType::get_i32(),
+            "cmp_const".to_string(),
+            vec![HirType::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let x = data.params()[0];
+        let c = data.new_local_inst().integer(constant);
+        let cmp = data.new_local_inst().binary(op, x, c);
+        data.layout_mut().insert_inst(entry, cmp);
+        let ret = data.new_local_inst().ret(Some(cmp));
+        data.layout_mut().insert_inst(entry, ret);
+        taki_mir::compile::<Riscv64Backend>(&program)
+    }
+
+    #[test]
+    fn constant_comparison_folds_to_slti() {
+        // x < 5: one slti, no materialized constant.
+        let asm = compile_constant_comparison(BinaryOp::Lt, 5);
+        assert!(asm.contains("slti"), "{asm}");
+        assert!(!asm.contains("\n    li "), "{asm}");
+        // x <= 5 == x < 6: slti with the shifted constant, no xori, no li.
+        let asm = compile_constant_comparison(BinaryOp::Le, 5);
+        assert!(asm.contains("slti"), "{asm}");
+        assert!(!asm.contains("xori"), "{asm}");
+        assert!(!asm.contains("\n    li "), "{asm}");
+        // x >= 5 == !(x < 5): slti + xori, no li.
+        let asm = compile_constant_comparison(BinaryOp::Ge, 5);
+        assert!(asm.contains("slti"), "{asm}");
+        assert!(asm.contains("xori"), "{asm}");
+        assert!(!asm.contains("\n    li "), "{asm}");
+        // x > 5 == !(x < 6): slti(c+1) + xori, no li.
+        let asm = compile_constant_comparison(BinaryOp::Gt, 5);
+        assert!(asm.contains("slti"), "{asm}");
+        assert!(asm.contains("xori"), "{asm}");
+        assert!(!asm.contains("\n    li "), "{asm}");
+    }
+
+    #[test]
+    fn large_constant_comparison_falls_back() {
+        // 4096 is not a 12-bit immediate: keep li + slt.
+        let asm = compile_constant_comparison(BinaryOp::Lt, 4096);
+        assert!(!asm.contains("slti"), "{asm}");
+        assert!(asm.contains("slt "), "{asm}");
+        assert!(asm.contains("\n    li "), "{asm}");
+    }
+
+    /// Compiles `x <op> constant` and returns the assembly.
+    fn compile_constant_binary_imm(op: BinaryOp, constant: i32) -> String {
+        let mut program = Program::new();
+        let function = program.new_function(
+            HirType::get_i32(),
+            "bin_const".to_string(),
+            vec![HirType::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let x = data.params()[0];
+        let c = data.new_local_inst().integer(constant);
+        let bin = data.new_local_inst().binary(op, x, c);
+        data.layout_mut().insert_inst(entry, bin);
+        let ret = data.new_local_inst().ret(Some(bin));
+        data.layout_mut().insert_inst(entry, ret);
+        taki_mir::compile::<Riscv64Backend>(&program)
+    }
+
+    #[test]
+    fn large_constant_binary_falls_back() {
+        // 4096 is not a 12-bit immediate: keep li + addw.
+        let asm = compile_constant_binary_imm(BinaryOp::Add, 4096);
+        assert!(!asm.contains("addi a"), "{asm}");
+        assert!(asm.contains("li a1, 0x1000"), "{asm}");
+        assert!(asm.contains("addw"), "{asm}");
+        // sub(x, -2048) would need addi #2048, which is not encodable.
+        let asm = compile_constant_binary_imm(BinaryOp::Sub, -2048);
+        assert!(!asm.contains("addi a"), "{asm}");
+        assert!(asm.contains("\n    li "), "{asm}");
+        // shift amounts beyond 31 are not folded.
+        let asm = compile_constant_binary_imm(BinaryOp::Shl, 32);
+        assert!(!asm.contains("slli"), "{asm}");
+    }
+
+    #[test]
+    fn constant_mul_folds_to_shift_sequence() {
+        // x * 8 = slli #3: no li, no mulw.
+        let asm = compile_constant_binary_imm(BinaryOp::Mul, 8);
+        assert!(asm.contains("slli"), "{asm}");
+        assert!(!asm.contains("\n    li "), "{asm}");
+        assert!(!asm.contains("mulw"), "{asm}");
+        // x * 3 = (x << 1) + x: slli + addw.
+        let asm = compile_constant_binary_imm(BinaryOp::Mul, 3);
+        assert!(asm.contains("slli"), "{asm}");
+        assert!(asm.contains("addw"), "{asm}");
+        assert!(!asm.contains("\n    li "), "{asm}");
+        assert!(!asm.contains("mulw"), "{asm}");
+        // x * 7 = (x << 3) - x: slli + subw.
+        let asm = compile_constant_binary_imm(BinaryOp::Mul, 7);
+        assert!(asm.contains("slli"), "{asm}");
+        assert!(asm.contains("subw"), "{asm}");
+        assert!(!asm.contains("\n    li "), "{asm}");
+        assert!(!asm.contains("mulw"), "{asm}");
+        // x * 1: the operand itself.
+        let asm = compile_constant_binary_imm(BinaryOp::Mul, 1);
+        assert!(!asm.contains("\n    li "), "{asm}");
+        assert!(!asm.contains("mulw"), "{asm}");
+        // x * 6 is not 2^n or 2^n +/- 1: fall back to li + mulw.
+        let asm = compile_constant_binary_imm(BinaryOp::Mul, 6);
+        assert!(asm.contains("mulw"), "{asm}");
+        assert!(asm.contains("\n    li "), "{asm}");
+    }
 }

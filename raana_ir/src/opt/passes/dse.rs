@@ -16,9 +16,13 @@
 //! address never triggers a deletion or rewrite.
 
 use crate::opt::{
-    analysis_passes::{effects::EffectAnalysis, memory::{BaseEnv, MemObject}},
+    analysis_passes::{
+        effects::EffectAnalysis,
+        memory::{BaseEnv, MemObject},
+    },
     prelude::*,
 };
+use rustc_hash::FxHashMap;
 
 /// Dead store elimination.
 pub struct DSE;
@@ -42,11 +46,14 @@ impl Pass for DSE {
 type Cell = (MemObject, i64);
 
 /// Resolve an address to a concrete cell when its base and offset are both
-/// compile-time known.
+/// compile-time known. Only stack allocs and globals have cell semantics;
+/// parameters (ABI pointers) and unknown bases resolve to `None`.
 fn resolve_cell(env: &BaseEnv, ctx: &ArenaContext<'_>, addr: Inst) -> Option<Cell> {
     let off = env.constant_offset(ctx, addr)?;
     match env.base_of(ctx, addr) {
-        MemObject::Alloc(_) | MemObject::Global(_) => Some((env.base_of(ctx, addr), off)),
+        MemObject::Alloc(_) | MemObject::Global(_) => {
+            Some((env.base_of(ctx, addr), off))
+        }
         _ => None,
     }
 }
@@ -55,24 +62,218 @@ fn resolve_cell(env: &BaseEnv, ctx: &ArenaContext<'_>, addr: Inst) -> Option<Cel
 fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> bool {
     let func = data.curr_func.unwrap();
     let env = analysis.env_of(func);
+    let ctx = ArenaContext {
+        program: data.program,
+        curr_func: Some(func),
+    };
+
+    // ---- Pass A (read-only): collect writes, calls, memzeros. ----
+    // cell -> store instructions writing it
+    let mut writes: FxHashMap<Cell, Vec<Inst>> = FxHashMap::default();
+    // (callee, inst) pairs of calls that may write memory at all
+    let mut writing_calls: Vec<Inst> = Vec::new();
+    // memzero ranges: (root, offset, len)
+    let mut memzeros: Vec<(MemObject, i64, i64)> = Vec::new();
+
+    for bb in data.layout().basicblocks() {
+        for &inst in bb.insts() {
+            match data.inst_data(inst).kind() {
+                InstKind::Store(store) => {
+                    if let Some(cell) = resolve_cell(env, &ctx, store.dest()) {
+                        writes.entry(cell).or_default().push(inst);
+                    }
+                }
+                InstKind::Call(call) => {
+                    if analysis.call_write_roots(call.callee(), func).is_some() {
+                        // The callee has a bounded write set; the roots are
+                        // checked per cell below. (None = may write
+                        // anything, treated as a full barrier.)
+                        writing_calls.push(inst);
+                    }
+                }
+                InstKind::MemZero(mem_zero) => {
+                    if let Some((root, off)) = resolve_cell(env, &ctx, mem_zero.dest()) {
+                        memzeros.push((root, off, mem_zero.byte_len() as i64));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ---- Transform 1: GSP redundant write-back removal. ----
+    // A store whose value is the result of loading the very same cell,
+    // when nothing else in the function writes that cell (and no call may
+    // write it, and no MemZero covers it), stores the original value back:
+    // the write-back is a no-op and can go.
+    let mut writeback_removals: Vec<Inst> = Vec::new();
+    for (cell, insts) in writes.iter() {
+        if insts.len() != 1 {
+            continue; // the cell is written elsewhere in the function
+        }
+        let store_inst = insts[0];
+        let InstKind::Store(store) = data.inst_data(store_inst).kind() else {
+            continue;
+        };
+        // v must be a load of the same cell.
+        let InstKind::Load(load) = data.inst_data(store.src()).kind() else {
+            continue;
+        };
+        let Some(src_cell) = resolve_cell(env, &ctx, load.src()) else {
+            continue;
+        };
+        if &src_cell != cell {
+            continue;
+        }
+        // No call may write this cell.
+        let mut may_write = false;
+        for &call_inst in &writing_calls {
+            let InstKind::Call(call) = data.inst_data(call_inst).kind() else {
+                continue;
+            };
+            match analysis.call_write_roots(call.callee(), func) {
+                None => {
+                    may_write = true;
+                    break;
+                }
+                Some(roots) => {
+                    if roots.iter().any(|root| cell_matches_root(cell, root)) {
+                        may_write = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if may_write {
+            continue;
+        }
+        // No MemZero may cover the cell.
+        if memzeros
+            .iter()
+            .any(|(root, off, len)| cell_in_range(cell, *root, *off, *len))
+        {
+            continue;
+        }
+        writeback_removals.push(store_inst);
+    }
+
     let mut changed = false;
-    // (implemented in later commits: write-back removal, covered stores,
-    // store-to-load forwarding)
-    let _ = (func, env, changed, data);
-    false
+    for inst in writeback_removals {
+        if let Some(bb) = data.layout().parent_bb(inst) {
+            data.remove_layout_inst(bb, inst);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Whether a write root (as reported by `call_write_roots`) covers `cell`.
+fn cell_matches_root(cell: &Cell, root: &crate::opt::analysis_passes::effects::WriteRoot) -> bool {
+    match (cell.0, root) {
+        (MemObject::Global(g), crate::opt::analysis_passes::effects::WriteRoot::Global(rg)) => {
+            g == *rg
+        }
+        (MemObject::Alloc(a), crate::opt::analysis_passes::effects::WriteRoot::Local(_, ra)) => {
+            a == *ra
+        }
+        _ => false,
+    }
+}
+
+/// Whether a MemZero range `[off, off+len)` of `root` covers `cell`'s offset.
+fn cell_in_range(cell: &Cell, root: MemObject, off: i64, len: i64) -> bool {
+    if cell.0 != root {
+        return false;
+    }
+    cell.1 >= off && cell.1 < off + len
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{
-        InstKind, Program, Type, arena::Arena, builder_trait::*,
-    };
+    use crate::ir::{InstKind, Program, Type, arena::Arena, builder_trait::*};
+
+    fn new_global(program: &mut Program) -> Inst {
+        let init = program.new_value().zero_init(Type::get_i32());
+        program.new_value().global_alloc(init)
+    }
 
     #[test]
     fn smoke() {
-        // Placeholder so the module compiles with tests wired in; real
-        // tests arrive with the transforms.
         assert!(true);
+    }
+
+    /// `load global; store v, global` with no other write: the store is a
+    /// GSP-style redundant write-back and must be removed.
+    #[test]
+    fn removes_redundant_writeback_of_load_value() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        let function = program.new_function(Type::get_unit(), "f".into(), vec![]);
+        let (load, store, ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = data.add_entry_block();
+            let load = data.new_local_value().load(global);
+            data.layout_mut().insert_inst(entry, load);
+            let store = data.new_local_value().store(load, global);
+            data.layout_mut().insert_inst(entry, store);
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+            (load, store, ret)
+        };
+        let _ = load;
+        let _ = ret;
+
+        assert!(DSE.run(&mut program));
+        let data = program.func_data(function);
+        // The store instruction must be gone from the layout.
+        let mut found_store = false;
+        for block in data.layout().basicblocks() {
+            for &inst in block.insts() {
+                if matches!(data.inst_data(inst).kind(), InstKind::Store(..)) {
+                    found_store = true;
+                }
+            }
+        }
+        assert!(!found_store, "redundant write-back store should be removed");
+    }
+
+    /// The write-back is NOT redundant when the cell is written in between:
+    /// `store 5; load; store load-value` — the final store forwards the
+    /// modified value and must stay.
+    #[test]
+    fn keeps_writeback_when_cell_is_modified() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        let function = program.new_function(Type::get_unit(), "f".into(), vec![]);
+        let (load, store, ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = data.add_entry_block();
+            let five = data.new_local_value().integer(5);
+            let first_store = data.new_local_value().store(five, global);
+            data.layout_mut().insert_inst(entry, first_store);
+            let load = data.new_local_value().load(global);
+            data.layout_mut().insert_inst(entry, load);
+            let store = data.new_local_value().store(load, global);
+            data.layout_mut().insert_inst(entry, store);
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+            (load, store, ret)
+        };
+        let _ = load;
+        let _ = ret;
+
+        assert!(!DSE.run(&mut program));
+        let data = program.func_data(function);
+        assert!(matches!(
+            data.inst_data(store).kind(),
+            InstKind::Store(..)
+        ), "write-back after a real write must survive");
     }
 }

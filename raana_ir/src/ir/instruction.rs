@@ -47,6 +47,13 @@ impl InstData {
         self.name = Some(name);
     }
 
+    /// Retarget the instruction's result type. Only safe when every use is
+    /// rewritten to the new type in the same transformation (loop
+    /// vectorization re-types the reduction accumulator parameter).
+    pub fn set_type(&mut self, ty: Type) {
+        self.ty = ty;
+    }
+
     pub fn used_by(&self) -> &FxHashSet<Inst> {
         &self.used_by
     }

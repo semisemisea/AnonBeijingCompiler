@@ -20,6 +20,9 @@ pub struct LlvmWriter<'a> {
     global_names: HashMap<Inst, String>,
     bb_labels: HashMap<BasicBlock, String>,
     phi_incoming: HashMap<BasicBlock, Vec<(BasicBlock, Vec<Inst>)>>,
+    /// Blocks reachable from the entry (dead blocks are not emitted, and
+    /// their outgoing edges must not feed phis).
+    reachable: FxHashSet<BasicBlock>,
     name_counter: usize,
     bb_counter: usize,
     used_memset: bool,
@@ -165,6 +168,7 @@ impl<'a> LlvmWriter<'a> {
             global_names: HashMap::default(),
             bb_labels: HashMap::default(),
             phi_incoming: HashMap::default(),
+            reachable: FxHashSet::default(),
             name_counter: 0,
             bb_counter: 0,
             used_memset: false,
@@ -305,6 +309,7 @@ impl<'a> LlvmWriter<'a> {
         }
 
         // Phase 2: collect phi incoming values and pre-assign instruction/param names
+        self.compute_reachable(func);
         self.collect_phi_incoming(func);
 
         // Phase 3: pre-assign block labels and inst names, collect all Alloc insts
@@ -418,8 +423,7 @@ impl<'a> LlvmWriter<'a> {
         // Alloca insts are hoisted to the entry block.
         let entry_bb = all_bbs_and_insts.first().map(|(bb, ..)| *bb);
         for (bb, _params, _insts) in &all_bbs_and_insts {
-            let has_preds = self.phi_incoming.contains_key(bb) || Some(*bb) == entry_bb;
-            if has_preds {
+            if self.reachable.contains(bb) {
                 self.visit_block(*bb, Some(*bb) == entry_bb, &alloca_insts)?;
             }
         }
@@ -427,11 +431,43 @@ impl<'a> LlvmWriter<'a> {
         writeln!(self.buffer, "}}")
     }
 
+    /// BFS from the entry block over terminator targets: dead blocks (no
+    /// path from entry) are never emitted, and their edges must not feed
+    /// phis of live blocks.
+    fn compute_reachable(&mut self, func: Function) {
+        let data = self.arena.func_data(func);
+        self.reachable.clear();
+        let Some(entry) = data.layout().entry_bb() else {
+            return;
+        };
+        let mut worklist = vec![entry.bb()];
+        self.reachable.insert(entry.bb());
+        while let Some(bb) = worklist.pop() {
+            let layout = data.layout().basicblock(bb);
+            let Some(&last_inst) = layout.insts().get_last() else {
+                continue;
+            };
+            let targets: Vec<BasicBlock> = match self.arena.inst_data(last_inst).kind() {
+                InstKind::Jump(jump) => vec![jump.target()],
+                InstKind::Branch(branch) => vec![branch.t_target(), branch.f_target()],
+                _ => Vec::new(),
+            };
+            for target in targets {
+                if self.reachable.insert(target) {
+                    worklist.push(target);
+                }
+            }
+        }
+    }
+
     fn collect_phi_incoming(&mut self, func: Function) {
         let data = self.arena.func_data(func);
         self.phi_incoming.clear();
         for layout in data.layout().basicblocks() {
             let bb = layout.bb();
+            if !self.reachable.contains(&bb) {
+                continue;
+            }
             let Some(&last_inst) = layout.insts().get_last() else {
                 continue;
             };

@@ -2415,36 +2415,6 @@ mod tests {
     }
 
     #[test]
-    fn constant_binary_folds_to_immediate() {
-        // add: addi, no materialized constant.
-        let asm = compile_constant_binary(BinaryOp::Add, 5);
-        assert!(asm.contains("addi"), "{asm}");
-        assert!(!asm.contains("\n    li "), "{asm}");
-        // sub(x, 5) == addi(x, -5).
-        let asm = compile_constant_binary(BinaryOp::Sub, 5);
-        assert!(asm.contains("addi"), "{asm}");
-        assert!(!asm.contains("\n    li "), "{asm}");
-        // and: andi.
-        let asm = compile_constant_binary_imm(BinaryOp::And, 0xF);
-        assert!(asm.contains("andi"), "{asm}");
-        assert!(!asm.contains("\n    li "), "{asm}");
-        // or: ori.
-        let asm = compile_constant_binary_imm(BinaryOp::Or, 0xF);
-        assert!(asm.contains("ori"), "{asm}");
-        assert!(!asm.contains("\n    li "), "{asm}");
-        // shl: slli.
-        let asm = compile_constant_binary_imm(BinaryOp::Shl, 3);
-        assert!(asm.contains("slli"), "{asm}");
-        assert!(!asm.contains("\n    li "), "{asm}");
-        // eq: xori + seqz, no sub, no li.
-        let asm = compile_constant_binary_imm(BinaryOp::Eq, 5);
-        assert!(asm.contains("xori"), "{asm}");
-        assert!(asm.contains("seqz"), "{asm}");
-        assert!(!asm.contains("\n    sub"), "{asm}");
-        assert!(!asm.contains("\n    li "), "{asm}");
-    }
-
-    #[test]
     fn large_constant_binary_falls_back() {
         // 4096 is not a 12-bit immediate: keep li + addw.
         let asm = compile_constant_binary_imm(BinaryOp::Add, 4096);

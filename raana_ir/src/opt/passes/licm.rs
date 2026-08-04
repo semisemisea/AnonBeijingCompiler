@@ -97,6 +97,22 @@ fn substitute_header_params(
             let if_false = substitute(select.if_false());
             data.replace_inst_with(inst).select(cond, if_true, if_false);
         }
+        // Hoisted pure calls must have their arguments rewritten too: a call
+        // argument that is a block parameter (header or single-predecessor
+        // body parameter) is only available inside the loop, while the hoisted
+        // call lands in the preheader. Leaving the parameter in place made the
+        // hoisted call use a value whose definition does not dominate it
+        // (fft0/fft1/fft2 VCode SSA verification panic).
+        InstKind::Call(call) => {
+            let callee = call.callee();
+            let args = call.args().iter().map(|&arg| substitute(arg)).collect();
+            data.replace_inst_with(inst).call(callee, args);
+        }
+        InstKind::TailCall(tail) => {
+            let callee = tail.callee();
+            let args = tail.args().iter().map(|&arg| substitute(arg)).collect();
+            data.replace_inst_with(inst).tail_call(callee, args);
+        }
         _ => {}
     }
 }
@@ -1436,6 +1452,93 @@ mod tests {
             data.layout().parent_bb(load.unwrap()),
             Some(data.layout().entry_bb().unwrap().bb())
         );
+    }
+
+    #[test]
+    fn hoisted_pure_call_gets_argument_substituted() {
+        // A pure callee `helper(x) -> x`; the loop calls it with an argument
+        // that arrives through a single-predecessor chain of body block
+        // parameters (F2's parameter <- F1's parameter <- an outside value).
+        // LICM resolves the chain, hoists the call to the preheader, and must
+        // rewrite the call's argument to the resolved outside value — leaving
+        // the loop-local parameter in place makes the hoisted call use a
+        // value that does not dominate the preheader (fft0/fft1/fft2 VCode
+        // SSA verification panic).
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        let helper = program.new_function(Type::get_i32(), "helper".into(), vec![Type::get_i32()]);
+        {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(helper),
+            };
+            let entry = data.add_entry_block();
+            let param = data.params()[0];
+            let ret = data.new_local_value().ret(Some(param));
+            data.layout_mut().insert_inst(entry, ret);
+        }
+        let function = program.new_function(Type::get_unit(), "licm_call_arg".into(), vec![]);
+        let mut call = None;
+        let mut outside = None;
+        {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = data.add_entry_block();
+            let header = data
+                .new_basic_block()
+                .basic_block("header".into(), vec![]);
+            let body = data.new_basic_block().basic_block("body".into(), vec![]);
+            let forward1 = data
+                .new_basic_block()
+                .basic_block("fwd1".into(), vec![Type::get_i32()]);
+            let forward2 = data
+                .new_basic_block()
+                .basic_block("fwd2".into(), vec![Type::get_i32()]);
+            let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+            for block in [header, body, forward1, forward2, exit] {
+                data.layout_mut().push_bb_back(block);
+            }
+            let outside_val = data.new_local_value().integer(7);
+            outside = Some(outside_val);
+            let entry_jump = data.new_local_value().jump(header, vec![]);
+            data.layout_mut().insert_inst(entry, entry_jump);
+
+            let condition = data.new_local_value().integer(1);
+            let branch = data
+                .new_local_value()
+                .branch(condition, body, vec![], exit, vec![]);
+            data.layout_mut().insert_inst(header, branch);
+
+            let body_jump = data.new_local_value().jump(forward1, vec![outside_val]);
+            data.layout_mut().insert_inst(body, body_jump);
+
+            let f1_param = data.bb_data(forward1).params()[0];
+            let f1_jump = data.new_local_value().jump(forward2, vec![f1_param]);
+            data.layout_mut().insert_inst(forward1, f1_jump);
+
+            let f2_param = data.bb_data(forward2).params()[0];
+            let call_inst = data.new_local_value().call(helper, vec![f2_param]);
+            data.layout_mut().insert_inst(forward2, call_inst);
+            call = Some(call_inst);
+            let store = data.new_local_value().store(call_inst, global);
+            data.layout_mut().insert_inst(forward2, store);
+            let backedge = data.new_local_value().jump(header, vec![]);
+            data.layout_mut().insert_inst(forward2, backedge);
+
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(exit, ret);
+        }
+
+        assert!(run_with_analysis(&mut program));
+        let data = program.func_data(function);
+        let entry = data.layout().entry_bb().unwrap().bb();
+        assert_eq!(data.layout().parent_bb(call.unwrap()), Some(entry));
+        let InstKind::Call(call_data) = data.inst_data(call.unwrap()).kind() else {
+            panic!("call instruction expected");
+        };
+        assert_eq!(call_data.args(), &[outside.unwrap()]);
     }
 
     /// A leaf callee whose body is a bare `ret` of its first parameter (or

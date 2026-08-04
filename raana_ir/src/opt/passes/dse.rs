@@ -22,7 +22,7 @@ use crate::opt::{
     },
     prelude::*,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Dead store elimination.
 pub struct DSE;
@@ -32,6 +32,9 @@ impl Pass for DSE {
         let analysis = EffectAnalysis::new(program);
         let mut changed = false;
         for func in program.function_layout().to_vec() {
+            if program.func_data(func).layout().is_decl() {
+                continue; // declarations have no body and no base env
+            }
             let mut arena_context = ArenaContextMut {
                 program,
                 curr_func: Some(func),
@@ -75,11 +78,20 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
     // memzero ranges: (root, offset, len)
     let mut memzeros: Vec<(MemObject, i64, i64)> = Vec::new();
 
+    // Address resolution is the hot path (every store/load/memzero);
+    // memoize per instruction since GEPs are shared across accesses.
+    let mut cell_cache: FxHashMap<Inst, Option<Cell>> = FxHashMap::default();
+    let mut resolve = |addr: Inst| -> Option<Cell> {
+        *cell_cache
+            .entry(addr)
+            .or_insert_with(|| resolve_cell(env, &ctx, addr))
+    };
+
     for bb in data.layout().basicblocks() {
         for &inst in bb.insts() {
             match data.inst_data(inst).kind() {
                 InstKind::Store(store) => {
-                    if let Some(cell) = resolve_cell(env, &ctx, store.dest()) {
+                    if let Some(cell) = resolve(store.dest()) {
                         writes.entry(cell).or_default().push(inst);
                     }
                 }
@@ -92,7 +104,7 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                     }
                 }
                 InstKind::MemZero(mem_zero) => {
-                    if let Some((root, off)) = resolve_cell(env, &ctx, mem_zero.dest()) {
+                    if let Some((root, off)) = resolve(mem_zero.dest()) {
                         memzeros.push((root, off, mem_zero.byte_len() as i64));
                     }
                 }
@@ -106,6 +118,28 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
     // when nothing else in the function writes that cell (and no call may
     // write it, and no MemZero covers it), stores the original value back:
     // the write-back is a no-op and can go.
+    //
+    // Precompute the set of bases that any call may write, so the per-cell
+    // check stays O(1) instead of O(#calls) (large functions with many
+    // stores and calls would otherwise blow up quadratically).
+    let mut call_written_bases: FxHashSet<MemObject> = FxHashSet::default();
+    let mut call_writes_unknown = false;
+    for &call_inst in &writing_calls {
+        let InstKind::Call(call) = data.inst_data(call_inst).kind() else {
+            continue;
+        };
+        match analysis.call_write_roots(call.callee(), func) {
+            None => {
+                call_writes_unknown = true;
+                break;
+            }
+            Some(roots) => {
+                for root in roots {
+                    call_written_bases.insert(root_to_base(&root));
+                }
+            }
+        }
+    }
     let mut writeback_removals: Vec<Inst> = Vec::new();
     for (cell, insts) in writes.iter() {
         if insts.len() != 1 {
@@ -119,32 +153,14 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
         let InstKind::Load(load) = data.inst_data(store.src()).kind() else {
             continue;
         };
-        let Some(src_cell) = resolve_cell(env, &ctx, load.src()) else {
+        let Some(src_cell) = resolve(load.src()) else {
             continue;
         };
         if &src_cell != cell {
             continue;
         }
-        // No call may write this cell.
-        let mut may_write = false;
-        for &call_inst in &writing_calls {
-            let InstKind::Call(call) = data.inst_data(call_inst).kind() else {
-                continue;
-            };
-            match analysis.call_write_roots(call.callee(), func) {
-                None => {
-                    may_write = true;
-                    break;
-                }
-                Some(roots) => {
-                    if roots.iter().any(|root| cell_matches_root(cell, root)) {
-                        may_write = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if may_write {
+        // No call may write this cell (or anything).
+        if call_writes_unknown || call_written_bases.contains(&cell.0) {
             continue;
         }
         // No MemZero may cover the cell.
@@ -172,7 +188,7 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
         let mut pending: FxHashMap<Cell, (Inst, Inst)> = FxHashMap::default();
         for &inst in bb.insts() {
             match data.inst_data(inst).kind() {
-                InstKind::Store(store) => match resolve_cell(env, &ctx, store.dest()) {
+                InstKind::Store(store) => match resolve(store.dest()) {
                     Some(cell) => {
                         if let Some((prev, _)) =
                             pending.insert(cell, (inst, store.src()))
@@ -184,7 +200,7 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                     // pending store is conservatively treated as observed.
                     None => pending.clear(),
                 },
-                InstKind::Load(load) => match resolve_cell(env, &ctx, load.src()) {
+                InstKind::Load(load) => match resolve(load.src()) {
                     Some(cell) => {
                         if let Some(&(_, value)) = pending.get(&cell) {
                             forwardings.push((inst, value));
@@ -234,7 +250,7 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                     }
                 }
                 InstKind::MemZero(mem_zero) => {
-                    if let Some((root, off)) = resolve_cell(env, &ctx, mem_zero.dest()) {
+                    if let Some((root, off)) = resolve(mem_zero.dest()) {
                         let len = mem_zero.byte_len() as i64;
                         pending.retain(|cell, _| {
                             !cell_in_range(cell, root, off, len)
@@ -270,6 +286,14 @@ fn cell_to_object(cell: &Cell, func: Function) -> crate::opt::analysis_passes::e
             crate::opt::analysis_passes::effects::AbstractObject::Alloc(func, a)
         }
         _ => crate::opt::analysis_passes::effects::AbstractObject::Unknown,
+    }
+}
+
+/// Convert a write root to its base object.
+fn root_to_base(root: &crate::opt::analysis_passes::effects::WriteRoot) -> MemObject {
+    match root {
+        crate::opt::analysis_passes::effects::WriteRoot::Global(g) => MemObject::Global(*g),
+        crate::opt::analysis_passes::effects::WriteRoot::Local(_, a) => MemObject::Alloc(*a),
     }
 }
 

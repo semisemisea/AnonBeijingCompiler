@@ -1356,7 +1356,9 @@ fn apply_interchange(data: &mut ArenaContextMut<'_>, plan: Plan) -> bool {
         let v = if Some(p) == j_trip_idx {
             b_i_old_args[p]
         } else if p == j_pos_hj {
-            j_pos_hk.map(|hp| last_old_args[hp]).unwrap_or(j0)
+            j_pos_hk_adj
+                .and_then(|hp| last_old_args.get(hp).copied())
+                .unwrap_or(j0)
         } else {
             last_old_args[p]
         };

@@ -86,7 +86,7 @@ fn is_critical(value: Inst, data: &FunctionData, removable_calls: &HashSet<Inst>
         | InstKind::VectorInsertElement(..)
         | InstKind::VectorReduce(..) => false,
         // rdf is not ready
-        InstKind::Call(call) => !removable_calls.contains(&value),
+        InstKind::Call(..) => !removable_calls.contains(&value),
     }
 }
 

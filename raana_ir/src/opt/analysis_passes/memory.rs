@@ -88,7 +88,9 @@ impl BaseEnv {
         }
 
         // Store-once pointer slots. A slot written more than once, or
-        // touched by MemZero, is not resolvable.
+        // touched by MemZero, is not resolvable. Global destinations are
+        // skipped: only function-local Allocs can be pointer slots, and
+        // `FunctionData` cannot inspect global instructions.
         let mut stored: FxHashMap<Inst, Inst> = FxHashMap::default();
         let mut ambiguous: FxHashSet<Inst> = FxHashSet::default();
         for bb_layout in data.layout().basicblocks() {
@@ -96,7 +98,7 @@ impl BaseEnv {
                 match data.inst_data(inst).kind() {
                     InstKind::Store(store) => {
                         let dest = store.dest();
-                        if matches!(data.inst_data(dest).kind(), InstKind::Alloc) {
+                        if !dest.is_global() && matches!(data.inst_data(dest).kind(), InstKind::Alloc) {
                             if ambiguous.contains(&dest) {
                                 continue;
                             }
@@ -108,7 +110,7 @@ impl BaseEnv {
                     }
                     InstKind::MemZero(mem_zero) => {
                         let dest = mem_zero.dest();
-                        if matches!(data.inst_data(dest).kind(), InstKind::Alloc) {
+                        if !dest.is_global() && matches!(data.inst_data(dest).kind(), InstKind::Alloc) {
                             stored.remove(&dest);
                             ambiguous.insert(dest);
                         }

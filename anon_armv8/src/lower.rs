@@ -2555,6 +2555,14 @@ fn fold_mul_add_sub(
             mul.rhs(),
             size,
         )
+        // Only fuse within one block. A multiplication hoisted by LICM to a
+        // preheader (or any other dominator) executes less often than the
+        // consuming add; fusing it back into a madd re-materializes the
+        // product at the consumer's frequency and silently defeats the hoist
+        // (conv2d inner loop regression). Checked before the sinking call:
+        // `sink_pure_single_use_producer` has the side effect of claiming the
+        // producer, which must not happen when the fusion is rejected.
+        || arena.f().layout().parent_bb(mul_inst) != arena.f().layout().parent_bb(consumer)
         || !ctx.sink_pure_single_use_producer(mul_inst, consumer)
     {
         return None;

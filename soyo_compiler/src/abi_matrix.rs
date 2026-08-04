@@ -454,4 +454,13 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn integer_truthiness_branch_uses_cbnz() {
+        let source = "int main() { int value = getint(); if (value) { return 1; } return 0; }\n";
+        let assembly = compile_sy(source, Target::Aarch64, 2);
+        let main = function_section(&assembly, "main");
+        assert!(main.contains("cbnz "), "{main}");
+        assert!(!main.contains("cmp "), "{main}");
+    }
 }

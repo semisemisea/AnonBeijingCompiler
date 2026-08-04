@@ -5,6 +5,11 @@ mod passes;
 pub mod stats;
 pub mod utils;
 
+// Re-exported so out-of-tree emitters (e.g. the LLVM writer) can recognize the
+// compiler-provided `soyo_mulmod` modmul builtin without depending on the
+// (private) pass module layout.
+pub use passes::mulmod_recognize::MULMOD_HELPER;
+
 /// Opt crate prelude
 pub mod prelude {
     // IR object.

@@ -7,11 +7,12 @@ use crate::ir::arena::Arena;
 use crate::ir::{
     Function, InstKind, Program, Type, TypeKind,
     inst_kind::{
-        Binary, BinaryOp, Call, Cast, Fma, GetElemPtr, VectorExtractElement, VectorInsertElement,
+        Binary, BinaryOp, Cast, Call, Fma, GetElemPtr, VectorExtractElement, VectorInsertElement,
         VectorReduce, VectorSplat,
     },
     instruction::Inst,
 };
+use crate::opt::MULMOD_HELPER;
 
 pub struct LlvmWriter<'a> {
     buffer: String,
@@ -197,7 +198,16 @@ impl<'a> LlvmWriter<'a> {
         let funcs: Vec<Function> = self.arena.function_layout().to_vec();
         for &func in &funcs {
             self.arena.curr_func = Some(func);
-            let is_decl = self.arena.func_data(func).layout().is_decl();
+            let (is_decl, name) = {
+                let data = self.arena.func_data(func);
+                (data.layout().is_decl(), data.name().to_string())
+            };
+            if is_decl && name == MULMOD_HELPER {
+                // The `soyo_mulmod` builtin has no body and is never a real
+                // symbol: every call is expanded inline by `visit_mulmod_call`,
+                // so no declaration is emitted for it.
+                continue;
+            }
             if is_decl {
                 self.visit_declare(func)?;
             } else {
@@ -568,12 +578,16 @@ impl<'a> LlvmWriter<'a> {
             InstKind::Binary(b) if b.op().is_compare()
         );
         let is_select = matches!(&kind, InstKind::Select(..));
+        // `soyo_mulmod` calls are expanded inline (see `visit_mulmod_call`),
+        // which emits its own intermediate SSA names, so no shared `%r = ...`
+        // prefix is written for them.
+        let is_mulmod = matches!(&kind, InstKind::Call(call) if self.is_mulmod_callee(call));
 
-        if !ty.is_unit() && !is_cmp && !is_select {
+        if !is_mulmod && !ty.is_unit() && !is_cmp && !is_select {
             write!(self.buffer, "  {} = ", get_name!(self, inst))?;
-        } else if !ty.is_unit() {
+        } else if !is_mulmod && !ty.is_unit() {
             write!(self.buffer, "  ")?;
-        } else {
+        } else if !is_mulmod {
             write!(self.buffer, "  ")?;
         }
 
@@ -611,7 +625,7 @@ impl<'a> LlvmWriter<'a> {
                 return Ok(());
             }
             InstKind::Cast(cast) => self.visit_cast(cast, &ty),
-            InstKind::Call(call) => self.visit_call(call, &ty),
+            InstKind::Call(call) => self.visit_call(inst, call, &ty),
             InstKind::TailCall(tail_call) => {
                 let callee_data = self.arena.func_data(tail_call.callee());
                 let args_str: Vec<String> = tail_call
@@ -1152,8 +1166,56 @@ impl<'a> LlvmWriter<'a> {
         )
     }
 
-    fn visit_call(&mut self, call: &Call, ret_ty: &Type) -> std::fmt::Result {
+    fn is_mulmod_callee(&self, call: &Call) -> bool {
+        let callee = call.callee();
+        self.arena.func_data(callee).name() == MULMOD_HELPER
+    }
+
+    /// Expand a call to the compiler-provided `soyo_mulmod(a, b, p)` builtin
+    /// (see the M60 `mulmod_recognize` pass) into the LLVM IR equivalent of the
+    /// AArch64 backend's `smull; sxtw; sdiv; msub` sequence: the exact 64-bit
+    /// product of the two 32-bit operands, sign-extended modulus, truncating
+    /// division, and remainder. The builtin has no body and is never emitted as
+    /// a real symbol, so every call must be expanded here.
+    fn visit_mulmod_call(&mut self, inst: Inst, call: &Call) -> std::fmt::Result {
+        let args = call.args();
+        assert_eq!(args.len(), 3, "soyo_mulmod takes exactly three arguments");
+        let a = get_name!(self, args[0]);
+        let b = get_name!(self, args[1]);
+        let p = get_name!(self, args[2]);
+
+        let a64 = format!("%mulmod_a{}", self.name_counter);
+        self.name_counter += 1;
+        writeln!(self.buffer, "  {} = sext i32 {} to i64", a64, a)?;
+        let b64 = format!("%mulmod_b{}", self.name_counter);
+        self.name_counter += 1;
+        writeln!(self.buffer, "  {} = sext i32 {} to i64", b64, b)?;
+        let prod = format!("%mulmod_p{}", self.name_counter);
+        self.name_counter += 1;
+        writeln!(self.buffer, "  {} = mul i64 {}, {}", prod, a64, b64)?;
+        let p64 = format!("%mulmod_m{}", self.name_counter);
+        self.name_counter += 1;
+        writeln!(self.buffer, "  {} = sext i32 {} to i64", p64, p)?;
+        let quot = format!("%mulmod_q{}", self.name_counter);
+        self.name_counter += 1;
+        writeln!(self.buffer, "  {} = sdiv i64 {}, {}", quot, prod, p64)?;
+        let rem = format!("%mulmod_r{}", self.name_counter);
+        self.name_counter += 1;
+        writeln!(self.buffer, "  {} = srem i64 {}, {}", rem, prod, p64)?;
+        writeln!(
+            self.buffer,
+            "  {} = trunc i64 {} to i32",
+            get_name!(self, inst),
+            rem
+        )
+    }
+
+    fn visit_call(&mut self, inst: Inst, call: &Call, ret_ty: &Type) -> std::fmt::Result {
         let callee_data = self.arena.func_data(call.callee());
+        let callee_name = callee_data.name().to_string();
+        if callee_name == MULMOD_HELPER {
+            return self.visit_mulmod_call(inst, call);
+        }
         let args_str: Vec<String> = call
             .args()
             .iter()
@@ -1169,7 +1231,7 @@ impl<'a> LlvmWriter<'a> {
             self.buffer,
             "call {} @{}({})",
             self.type_to_llvm(ret_ty),
-            callee_data.name(),
+            callee_name,
             args_str.join(", ")
         )
     }
@@ -1410,5 +1472,39 @@ mod tests {
         let llvm = writer.finish();
         assert!(llvm.contains("getelementptr [4 x i32]"), "{llvm}");
         assert!(!llvm.contains("getelementptr inbounds"), "{llvm}");
+    }
+
+    #[test]
+    fn expands_soyo_mulmod_inline_and_omits_declaration() {
+        let mut program = Program::new();
+        let helper = program.new_function(
+            Type::get_i32(),
+            super::MULMOD_HELPER.into(),
+            vec![Type::get_i32(), Type::get_i32(), Type::get_i32()],
+        );
+        let function = program.new_function(Type::get_i32(), "caller".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let a = data.new_local_inst().integer(5);
+        let b = data.new_local_inst().integer(7);
+        let p = data.new_local_inst().integer(11);
+        let call = data
+            .new_local_inst()
+            .call_with_type(helper, vec![a, b, p], Type::get_i32());
+        data.layout_mut().insert_inst(entry, call);
+        let ret = data.new_local_inst().ret(Some(call));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let mut writer = LlvmWriter::new(&program);
+        writer.write().unwrap();
+        let llvm = writer.finish();
+        assert!(llvm.contains("sext i32 5 to i64"), "{llvm}");
+        assert!(llvm.contains("sext i32 7 to i64"), "{llvm}");
+        assert!(llvm.contains("sext i32 11 to i64"), "{llvm}");
+        assert!(llvm.contains("mul i64"), "{llvm}");
+        assert!(llvm.contains("sdiv i64"), "{llvm}");
+        assert!(llvm.contains("srem i64"), "{llvm}");
+        assert!(llvm.contains("trunc i64"), "{llvm}");
+        assert!(!llvm.contains("@soyo_mulmod"), "{llvm}");
     }
 }

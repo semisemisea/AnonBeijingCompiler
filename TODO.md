@@ -317,6 +317,30 @@ matmul1 无效**（即使放宽也不会导致问题——等价性证明不变�
 依赖链：T1/T2 并行 → T3 → T4 → T5 → T6。matmul1 全链路 = interchange →
 M44 v2（select 掩码）。
 
+**v2 实现状态（2026-08-06）**：T1-T5 已完成并提交，真实 matmul1 触发：
+- T1（4e0e985）：M42 phi 汇合归约识别。T2（09330b4）：rotate_count_up
+  phi 链（value_flows_from 值流解析）——j 循环旋转成功。
+- T3/T4/T5（9e5aab1）：判定放宽（壳链 = jump 路径 + preheader 允许 +
+  exit 带参 + j IV 值流解析——BIV 误报 trip counter/不变量已排除）+ 变换
+  （c_gep 重写移 update 块、H_k 删 temp、E_k/E_j 参数表重写、壳链重连
+  H_j → 原 k 循环体、删除 terminator 清理 target used_by）+ 归约迁移
+  （if 分支 phi 形态 → 内存累加，c_gep 必须插 update 前避免块内
+  use-before-def）。
+- 验证：matmul1 -O2 IR 断言 i-k-j 交换（b[k][j]/a[k][j]/c[i][j] 内层 j
+  连续 +4B、a[i][k] 标量广播）；QEMU 差分 PASS；perf 60 例全 PASS；
+  functional -O1 抽样 PASS；raana_ir 313 全绿。
+- 已知形态差异（v2 变换期间修掉的坑，留档）：① last_shell 的 jump args
+  在 drop_header_param 后少一个槽位——trip 初值须用调整后位置
+  （k_trip_idx 减 temp 偏移）；② h_j 必须连到原 k 循环体首块（k_first），
+  连到 b_k（k latch）会得空体 j 循环；③ update 选择须排除 Branch（br 的
+  args 也消费 acc）；④ layout remove_inst 不清理 terminator 的 target
+  used_by——已补。
+
+**剩余（v3）**：真实形态单测（matmul1 结构固化，防回归）；性能验证
+（交换后标量执行比原 ijk 略慢属预期——收益在 M44 向量化；matmul1 运行
+时间变化记录）；与 M44 交互（内层 j 的 if 分支 → select 掩码，归 M44 v2）；
+全量功能回归（用户自行）。
+
 #### M43：loop versioning / 运行时 guard
 
 - SysY 的 trip count 与数组对齐编译期未知 → 向量化循环必须版本化：

@@ -675,8 +675,19 @@ impl<'a> LlvmWriter<'a> {
                         byte_len.to_string()
                     }
                     crate::ir::inst_kind::mem_zero::MemZeroLen::Value(byte_len) => {
-                        let name = get_name!(self, *byte_len);
-                        format!("zext i32 {name} to i64")
+                        let data = self.arena.inst_data(*byte_len);
+                        if let InstKind::Integer(value) = data.kind() {
+                            // i32 constant: use it directly as an i64
+                            // literal. Modern llc rejects `zext i32 40 to
+                            // i64` constexprs inside call arguments.
+                            value.value().to_string()
+                        } else {
+                            let name = get_name!(self, *byte_len);
+                            let zext = format!("%len_ext_{}", self.name_counter);
+                            self.name_counter += 1;
+                            writeln!(self.buffer, "{} = zext i32 {} to i64", zext, name)?;
+                            zext
+                        }
                     }
                 };
                 writeln!(

@@ -917,7 +917,11 @@ impl Pass for PointerStrengthReduction {
                 program: &*data.program,
                 curr_func: data.curr_func,
             };
-            let ranges = RangeAnalysis::new(&range_arena, &cfg, &loops, &ivs);
+            let nonneg = crate::opt::analysis_passes::return_summary::nonneg_preserving_functions(
+                &data.program,
+            );
+            let no_params = FxHashSet::default();
+            let ranges = RangeAnalysis::new(&range_arena, &cfg, &loops, &ivs, &nonneg, &no_params);
             let mut transformed = false;
             for looop in loops.loops() {
                 let Some(candidate) = Self::find_candidate(

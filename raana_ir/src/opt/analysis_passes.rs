@@ -8,3 +8,4 @@ pub mod loop_analysis;
 pub mod memory;
 pub mod pure_function;
 pub mod range;
+pub mod return_summary;

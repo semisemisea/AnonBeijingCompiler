@@ -267,6 +267,11 @@ impl PassesManager {
         let pointer_sr = Box::new(pointer_strength_reduction::PointerStrengthReduction);
         p.register(pointer_sr);
 
+        // Fold `br (x < 0), A, B` when range analysis (with the M61 pure
+        // non-negativity summaries) proves the modmul guard is never taken.
+        let guard_elimination = Box::new(guard_elimination::GuardElimination);
+        p.register(guard_elimination);
+
         let sr = Box::new(sr::StrengthReduction);
         p.register(sr);
 

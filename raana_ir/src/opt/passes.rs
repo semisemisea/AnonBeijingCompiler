@@ -6,6 +6,7 @@ pub mod dce;
 pub mod dse;
 pub mod gvn;
 pub mod gvn_pre;
+pub mod guard_elimination;
 pub mod if_conversion;
 pub mod inline;
 pub mod invariant_reduction_hoisting;

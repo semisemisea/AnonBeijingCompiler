@@ -15,6 +15,7 @@ use crate::{
                 InductionStep,
             },
             loop_analysis::{Loop, LoopAnalysis},
+            return_summary,
         },
         pass::ArenaContext,
         utils::{
@@ -291,6 +292,10 @@ enum ValueDef {
         src: Inst,
         source_float: Option<f32>,
     },
+    Call {
+        callee: crate::ir::Function,
+        args: Vec<Inst>,
+    },
     BlockParameter,
     Unknown,
 }
@@ -303,6 +308,14 @@ pub struct RangeAnalysis {
     before: FxHashMap<Inst, State>,
     loop_caps: FxHashMap<Inst, IntRange>,
     loop_headers: FxHashSet<BasicBlock>,
+    /// Pure functions whose result is `>= 0` whenever every argument is
+    /// `>= 0` (see `return_summary::nonneg_preserving_functions`).
+    nonneg_preserving: FxHashSet<crate::ir::Function>,
+    /// The `soyo_mulmod` builtin declaration, if present.
+    modmul_builtin: Option<crate::ir::Function>,
+    /// Entry-block parameters known `>= 0` at every call site (see
+    /// `return_summary::always_nonneg_params`).
+    nonneg_params: FxHashSet<Inst>,
 }
 
 impl RangeAnalysis {
@@ -311,6 +324,8 @@ impl RangeAnalysis {
         cfg: &CFG,
         loops: &LoopAnalysis,
         induction: &BasicInductionVariableAnalysis,
+        nonneg_preserving: &FxHashSet<crate::ir::Function>,
+        nonneg_params: &FxHashSet<Inst>,
     ) -> Self {
         let data = arena.curr_func_data();
         let mut definitions = FxHashMap::default();
@@ -321,7 +336,11 @@ impl RangeAnalysis {
                 match inst_data.kind() {
                     InstKind::Integer(value) => ValueDef::Integer(value.value()),
                     InstKind::ZeroInit => ValueDef::ZeroInit,
-                    InstKind::Undef | InstKind::Load(_) | InstKind::Call(_) => ValueDef::Undef,
+                    InstKind::Undef | InstKind::Load(_) => ValueDef::Undef,
+                    InstKind::Call(call) => ValueDef::Call {
+                        callee: call.callee(),
+                        args: call.args().to_vec(),
+                    },
                     InstKind::Binary(binary) => {
                         ValueDef::Binary(binary.op(), binary.lhs(), binary.rhs())
                     }
@@ -342,6 +361,9 @@ impl RangeAnalysis {
             definitions.insert(inst, definition);
         }
 
+        let modmul_builtin = arena.program.function_layout().iter().copied().find(|&f| {
+            arena.program.func_data(f).name() == return_summary::MODMUL_BUILTIN
+        });
         let loop_headers = loops.loops().iter().map(Loop::header).collect();
         let mut analysis = Self {
             definitions,
@@ -351,6 +373,9 @@ impl RangeAnalysis {
             before: FxHashMap::default(),
             loop_caps: FxHashMap::default(),
             loop_headers,
+            nonneg_preserving: nonneg_preserving.clone(),
+            modmul_builtin,
+            nonneg_params: nonneg_params.clone(),
         };
         analysis.solve(data, cfg);
         analysis.add_induction_caps(arena, loops, induction);
@@ -426,7 +451,11 @@ impl RangeAnalysis {
         let mut initial = State::default();
         for &parameter in data.bb_data(entry).params() {
             if data.inst_data(parameter).ty().is_i32() {
-                initial.insert(parameter, IntRange::full());
+                if self.nonneg_params.contains(&parameter) {
+                    initial.insert(parameter, IntRange::bounded(0, i32::MAX));
+                } else {
+                    initial.insert(parameter, IntRange::full());
+                }
             }
         }
         self.block_entries.insert(entry, initial);
@@ -762,6 +791,18 @@ impl RangeAnalysis {
         self.evaluate_contextual(value, state, &mut FxHashSet::default(), 0)
     }
 
+    /// Re-derive `value`'s range from its definition against the settled
+    /// `self.ranges`, ignoring the range `solve` recorded for `value` itself.
+    ///
+    /// `solve` records a value's range when its block is first processed, which
+    /// happens before entry-parameter ranges have propagated through
+    /// `self.ranges` (they are joined in only at the end). A call of two entry
+    /// parameters therefore records `full` and stays stale. Callers that need
+    /// the settled answer (return summaries, guard folding) use this.
+    pub fn range_of_fresh(&self, value: Inst) -> IntRange {
+        self.evaluate_def(value, &self.ranges, &mut FxHashSet::default(), 0)
+    }
+
     fn evaluate_contextual(
         &self,
         value: Inst,
@@ -775,7 +816,19 @@ impl RangeAnalysis {
         if depth >= CONTEXT_DEPTH_LIMIT || !visiting.insert(value) {
             return self.base_range(value);
         }
-        let range = match self.definitions.get(&value) {
+        let range = self.evaluate_def(value, facts, visiting, depth);
+        visiting.remove(&value);
+        range
+    }
+
+    fn evaluate_def(
+        &self,
+        value: Inst,
+        facts: &State,
+        visiting: &mut FxHashSet<Inst>,
+        depth: usize,
+    ) -> IntRange {
+        match self.definitions.get(&value) {
             Some(ValueDef::Integer(value)) => IntRange::constant(*value),
             Some(ValueDef::ZeroInit) => IntRange::constant(0),
             Some(ValueDef::Binary(op, lhs, rhs)) => transfer_binary(
@@ -806,10 +859,49 @@ impl RangeAnalysis {
             Some(ValueDef::BlockParameter) => {
                 self.ranges.get(&value).copied().unwrap_or(IntRange::full())
             }
+            Some(ValueDef::Call { callee, args }) => self.call_range(*callee, args, facts, visiting, depth),
             Some(ValueDef::Undef) | Some(ValueDef::Unknown) | None => IntRange::full(),
-        };
-        visiting.remove(&value);
-        range
+        }
+    }
+
+    /// Range of a call result. The `soyo_mulmod(a, b, p)` builtin returns
+    /// `[0, p)` when both multiplicands are provably non-negative (a remainder
+    /// of a non-negative product never turns negative); a non-negativity
+    /// preserving pure function returns `[0, i32::MAX]` when every argument is
+    /// provably non-negative. Everything else is full range.
+    fn call_range(
+        &self,
+        callee: crate::ir::Function,
+        args: &[Inst],
+        facts: &State,
+        visiting: &mut FxHashSet<Inst>,
+        depth: usize,
+    ) -> IntRange {
+        if self.modmul_builtin == Some(callee) && args.len() == 3 {
+            let a = self.evaluate_contextual(args[0], facts, visiting, depth + 1);
+            let b = self.evaluate_contextual(args[1], facts, visiting, depth + 1);
+            if a.min().is_some_and(|min| min >= 0) && b.min().is_some_and(|min| min >= 0) {
+                let p = match self.definitions.get(&args[2]) {
+                    Some(ValueDef::Integer(value)) => *value,
+                    _ => 0,
+                };
+                if p > 0 {
+                    return IntRange::bounded(0, p - 1);
+                }
+                return IntRange::bounded(0, i32::MAX);
+            }
+            return IntRange::full();
+        }
+        if self.nonneg_preserving.contains(&callee)
+            && args.iter().all(|&arg| {
+                self.evaluate_contextual(arg, facts, visiting, depth + 1)
+                    .min()
+                    .is_some_and(|min| min >= 0)
+            })
+        {
+            return IntRange::bounded(0, i32::MAX);
+        }
+        IntRange::full()
     }
 }
 
@@ -1027,7 +1119,14 @@ mod tests {
             program,
             curr_func: Some(function),
         };
-        RangeAnalysis::new(&arena, &cfg, &loops, &ivs)
+        RangeAnalysis::new(
+            &arena,
+            &cfg,
+            &loops,
+            &ivs,
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+        )
     }
 
     #[test]

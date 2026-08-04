@@ -1478,4 +1478,112 @@ mod tests {
             });
         assert!(has_f32_vector, "the vector load must be <4 x f32>");
     }
+
+    #[test]
+    fn rejects_non_innermost_loop() {
+        // A two-level nest: the outer loop contains the elementwise inner
+        // loop. Only the inner one may be vectorized; the outer loop's latch
+        // must keep its unit-step counter and index updates.
+        let mut program = Program::new();
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr.clone());
+            program.new_value().global_alloc(init)
+        };
+        let b = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_unit(), "nested".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        // Outer loop: [iv_o, t_o] -> b1 -> inner loop -> b2 (latch) -> h_o.
+        let h_o = data
+            .new_basic_block()
+            .basic_block("h_o".into(), vec![i32.clone(), i32.clone()]);
+        let b1 = data.new_basic_block().basic_block("b1".into(), vec![]);
+        let b2 = data.new_basic_block().basic_block("b2".into(), vec![]);
+        let exit_o = data.new_basic_block().basic_block("exit_o".into(), vec![]);
+        // Inner loop: [iv, t] -> latch; latch does the elementwise work.
+        let h_i = data
+            .new_basic_block()
+            .basic_block("h_i".into(), vec![i32.clone(), i32.clone()]);
+        let latch_i = data.new_basic_block().basic_block("latch_i".into(), vec![]);
+        let exit_i = data.new_basic_block().basic_block("exit_i".into(), vec![]);
+        for bb in [h_o, b1, b2, exit_o, h_i, latch_i, exit_i] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let trip_o = data.new_local_inst().integer(32);
+        let entry_jump = data.new_local_inst().jump(h_o, vec![zero, trip_o]);
+        data.layout_mut().insert_inst(entry, zero);
+        data.layout_mut().insert_inst(entry, trip_o);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let iv_o = data.bb_data(h_o).params()[0];
+        let t_o = data.bb_data(h_o).params()[1];
+        let h_o_jump = data.new_local_inst().jump(b1, vec![]);
+        data.layout_mut().insert_inst(h_o, h_o_jump);
+        let one = data.new_local_inst().integer(1);
+        let trip_i = data.new_local_inst().integer(16);
+        let iv = data.bb_data(h_i).params()[0];
+        let t = data.bb_data(h_i).params()[1];
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        // b1: enter the inner loop.
+        let inner_entry = lb.jump(h_i, vec![zero, trip_i]);
+        // Inner header jump.
+        let h_i_jump = lb.jump(latch_i, vec![]);
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let gep_b = lb.get_elem_ptr(b, vec![zero, iv]);
+        let store = lb.store(load_a, gep_b);
+        let iv_next = lb.binary(BinaryOp::Add, iv, one);
+        let t_next = lb.binary(BinaryOp::Sub, t, one);
+        let inner_back = lb.branch(t_next, h_i, vec![iv_next, t_next], exit_i, vec![]);
+        // b2 (outer latch): iv_o+1, t_o-1, test back.
+        let iv_o_next = lb.binary(BinaryOp::Add, iv_o, one);
+        let t_o_next = lb.binary(BinaryOp::Sub, t_o, one);
+        let outer_back = lb.branch(t_o_next, h_o, vec![iv_o_next, t_o_next], exit_o, vec![]);
+        drop(lb);
+        data.layout_mut().insert_inst(b1, inner_entry);
+        data.layout_mut().insert_inst(h_i, h_i_jump);
+        for inst in [gep_a, load_a, gep_b, store, iv_next, t_next, inner_back] {
+            data.layout_mut().insert_inst(latch_i, inst);
+        }
+        for inst in [iv_o_next, t_o_next, outer_back] {
+            data.layout_mut().insert_inst(b2, inst);
+        }
+        let exit_o_ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit_o, exit_o_ret);
+        let exit_i_jump = data.new_local_inst().jump(b2, vec![]);
+        data.layout_mut().insert_inst(exit_i, exit_i_jump);
+
+        assert!(run(&mut program, function), "the innermost loop is vectorized");
+        let data = program.func_data(function);
+        // The outer latch (b2) still steps by 1: it was not vectorized.
+        let outer_steps_unit = data
+            .layout()
+            .basicblock(b2)
+            .insts()
+            .iter()
+            .any(|&inst| {
+                matches!(
+                    data.inst_data(inst).kind(),
+                    InstKind::Binary(b)
+                        if b.op() == BinaryOp::Add
+                            && b.lhs() == iv_o
+                            && matches!(
+                                data.inst_data(b.rhs()).kind(),
+                                InstKind::Integer(v) if v.value() == 1
+                            )
+                )
+            });
+        assert!(outer_steps_unit, "outer loop must stay scalar (non-innermost)");
+        assert_eq!(vector_load_count(&program, function), 1, "only the inner loop vectorizes");
+    }
 }

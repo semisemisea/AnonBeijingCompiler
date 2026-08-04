@@ -2239,6 +2239,86 @@ mod tests {
     }
 
     #[test]
+    fn vectorizes_inplace_accumulation() {
+        // B3: `b[i] = b[i] + a[i]` — a same-address read-modify-write whose
+        // stored value depends on the loaded value is lane-independent
+        // (M42 elementwise-inplace relaxation), so the loop vectorizes with
+        // two vector loads, one lane-wise add, one vector store.
+        let mut program = Program::new();
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr.clone());
+            program.new_value().global_alloc(init)
+        };
+        let b = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_unit(), "inplace".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for bb in [header, latch, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let trip_inst = data.new_local_inst().integer(16);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero, trip_inst]);
+        data.layout_mut().insert_inst(entry, zero);
+        data.layout_mut().insert_inst(entry, trip_inst);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let iv = data.bb_data(header).params()[0];
+        let counter = data.bb_data(header).params()[1];
+        let header_jump = data.new_local_inst().jump(latch, vec![]);
+        data.layout_mut().insert_inst(header, header_jump);
+        let one = data.new_local_inst().integer(1);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_b = lb.get_elem_ptr(b, vec![zero, iv]);
+        let load_b = lb.load(gep_b);
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let sum = lb.binary(BinaryOp::Add, load_b, load_a);
+        let store = lb.store(sum, gep_b);
+        let iv_next = lb.binary(BinaryOp::Add, iv, one);
+        let t_next = lb.binary(BinaryOp::Sub, counter, one);
+        let back = lb.branch(t_next, header, vec![iv_next, t_next], exit, vec![]);
+        drop(lb);
+        for inst in [
+            one, gep_b, load_b, gep_a, load_a, sum, store, iv_next, t_next, back,
+        ] {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(
+            run(&mut program, function),
+            "in-place accumulation must vectorize (B3)"
+        );
+        assert_eq!(
+            vector_load_count(&program, function),
+            2,
+            "both b[i] and a[i] become vector loads"
+        );
+        assert_eq!(scalar_load_count(&program, function), 0);
+        assert_eq!(
+            vector_binaries(&program, function),
+            vec![BinaryOp::Add],
+            "the update becomes a lane-wise add"
+        );
+    }
+
+    #[test]
     fn rejects_non_innermost_loop() {
         // A two-level nest: the outer loop contains the elementwise inner
         // loop. Only the inner one may be vectorized; the outer loop's latch

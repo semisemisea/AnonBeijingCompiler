@@ -15,6 +15,7 @@ pub mod ipsccp;
 pub mod licm;
 pub mod loop_interchange;
 pub mod loop_unroll;
+pub mod loop_vectorize;
 pub mod matmul_interchange;
 pub mod mod_fold;
 pub mod mulmod_recognize;

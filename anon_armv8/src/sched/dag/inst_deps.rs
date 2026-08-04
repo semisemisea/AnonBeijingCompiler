@@ -384,7 +384,8 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
 
         MInst::VecDup { dst, src, .. }
         | MInst::VecCvt { dst, src, .. }
-        | MInst::VecAddv { dst, src } => InstDeps {
+        | MInst::VecAddv { dst, src }
+        | MInst::VecNeg { dst, src, .. } => InstDeps {
             defs: preg(dst.reg),
             uses: preg(*src),
             flags_def: false,
@@ -397,7 +398,9 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
         MInst::VecArithRRR { dst, lhs, rhs, .. }
         | MInst::VecBitwise { dst, lhs, rhs, .. }
         | MInst::VecCmp { dst, lhs, rhs, .. }
-        | MInst::VecMinMax { dst, lhs, rhs, .. } => InstDeps {
+        | MInst::VecMinMax { dst, lhs, rhs, .. }
+        | MInst::VecShift { dst, lhs, rhs, .. }
+        | MInst::VecDiv { dst, lhs, rhs, .. } => InstDeps {
             defs: preg(dst.reg),
             uses: [preg(*lhs), preg(*rhs)].into_iter().flatten().collect(),
             flags_def: false,

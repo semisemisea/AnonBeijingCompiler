@@ -434,7 +434,9 @@ fn emits_dup_from_gpr_and_float_scalars() {
         dst: Writable::from_reg(vec_reg(0)),
         src: float_reg(5),
     });
-    assert_eq!(dup_f32, "dup v0.4s, s5");
+    // LLVM MC rejects `dup vd.4s, sn`; the float scalar is read through
+    // the aliased vector register (`s5` is the low 32 bits of `v5`).
+    assert_eq!(dup_f32, "dup v0.4s, v5.s[0]");
 }
 
 #[test]
@@ -591,6 +593,63 @@ fn emits_vector_mov_imm_lane_and_minmax_forms() {
         });
         assert_eq!(text, format!("{mnemonic} v0.4s, v1.4s, v2.4s"));
     }
+}
+
+#[test]
+fn emits_vector_shift_div_neg_forms() {
+    // Immediate shifts: shl / ushr / sshr with a #imm amount.
+    for (op, mnemonic) in [
+        (super::VecShiftOp::Shl, "shl"),
+        (super::VecShiftOp::Shr, "ushr"),
+        (super::VecShiftOp::Sar, "sshr"),
+    ] {
+        let text = emit(MInst::VecShift {
+            op,
+            shape: super::VecShape::FourS,
+            dst: Writable::from_reg(vec_reg(0)),
+            lhs: vec_reg(1),
+            rhs: vec_reg(2),
+            imm: Some(3),
+        });
+        assert_eq!(text, format!("{mnemonic} v0.4s, v1.4s, #3"));
+    }
+    // Register (variable-amount) forms: sshl / ushl / sshl v,v,v.
+    for (op, mnemonic) in [
+        (super::VecShiftOp::Shl, "sshl"),
+        (super::VecShiftOp::Shr, "ushl"),
+        (super::VecShiftOp::Sar, "sshl"),
+    ] {
+        let text = emit(MInst::VecShift {
+            op,
+            shape: super::VecShape::FourS,
+            dst: Writable::from_reg(vec_reg(0)),
+            lhs: vec_reg(1),
+            rhs: vec_reg(2),
+            imm: None,
+        });
+        assert_eq!(text, format!("{mnemonic} v0.4s, v1.4s, v2.4s"));
+    }
+    let neg = emit(MInst::VecNeg {
+        shape: super::VecShape::FourS,
+        dst: Writable::from_reg(vec_reg(0)),
+        src: vec_reg(2),
+    });
+    assert_eq!(neg, "neg v0.4s, v2.4s");
+    let fdiv = emit(MInst::VecDiv {
+        shape: super::VecShape::FourS,
+        dst: Writable::from_reg(vec_reg(0)),
+        lhs: vec_reg(1),
+        rhs: vec_reg(2),
+    });
+    assert_eq!(fdiv, "fdiv v0.4s, v1.4s, v2.4s");
+    // Float-scalar dup prints through the aliased vector register
+    // (`s0` is the low 32 bits of `v0`); LLVM MC rejects `dup vd.4s, sn`.
+    let dup_float = emit(MInst::VecDup {
+        shape: super::VecShape::FourS,
+        dst: Writable::from_reg(vec_reg(0)),
+        src: float_reg(3),
+    });
+    assert_eq!(dup_float, "dup v0.4s, v3.s[0]");
 }
 
 #[test]

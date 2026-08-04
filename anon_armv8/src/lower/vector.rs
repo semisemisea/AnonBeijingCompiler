@@ -98,6 +98,83 @@ pub(super) fn lower_vector_binary(
                 rhs,
             });
         }
+        BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Sar => {
+            if is_float {
+                ctx.lowering_panic(
+                    "AArch64 instruction selection",
+                    "vector shifts have no float form (the loop vectorizer rejects float shifts)",
+                    Some(arena.inst_data(binary.lhs()).ty()),
+                    Some(arena.inst_data(inst).ty()),
+                );
+            }
+            let shift_op = match binary.op() {
+                BinaryOp::Shl => VecShiftOp::Shl,
+                BinaryOp::Shr => VecShiftOp::Shr,
+                _ => VecShiftOp::Sar,
+            };
+            // A constant amount (a splatted integer literal) uses the
+            // immediate forms shl/ushr/sshr; anything else uses the
+            // register forms sshl/ushl.
+            match constant_shift_amount(arena, binary.rhs(), shape) {
+                Some(imm) => ctx.emit(MInst::VecShift {
+                    op: shift_op,
+                    shape,
+                    dst,
+                    lhs,
+                    rhs,
+                    imm: Some(imm),
+                }),
+                None => {
+                    // Variable right shifts have no direct NEON register
+                    // form: sshl/ushl with a negative amount shift right, so
+                    // negate the amount vector first.
+                    if binary.op() == BinaryOp::Shl {
+                        ctx.emit(MInst::VecShift {
+                            op: shift_op,
+                            shape,
+                            dst,
+                            lhs,
+                            rhs,
+                            imm: None,
+                        });
+                    } else {
+                        let neg = ctx.alloc_tmp(arena.inst_data(binary.lhs()).ty().clone());
+                        ctx.emit(MInst::VecNeg {
+                            shape,
+                            dst: Writable::from_reg(neg),
+                            src: rhs,
+                        });
+                        ctx.emit(MInst::VecShift {
+                            op: shift_op,
+                            shape,
+                            dst,
+                            lhs,
+                            rhs: neg,
+                            imm: None,
+                        });
+                    }
+                }
+            }
+        }
+        BinaryOp::Div => {
+            // NEON has no integer vector divide (`sdiv` is scalar-only); the
+            // loop vectorizer rejects i32 Div (constant divisors are rewritten
+            // to shift chains by StrengthReduction). Only f32 reaches here.
+            if !is_float {
+                ctx.lowering_panic(
+                    "AArch64 instruction selection",
+                    "NEON has no integer vector divide; i32 Div must stay scalar",
+                    Some(arena.inst_data(binary.lhs()).ty()),
+                    Some(arena.inst_data(inst).ty()),
+                );
+            }
+            ctx.emit(MInst::VecDiv {
+                shape,
+                dst,
+                lhs,
+                rhs,
+            });
+        }
         op => {
             ctx.lowering_panic(
                 "AArch64 instruction selection",
@@ -123,6 +200,17 @@ pub(super) fn vector_shape(ty: &TypeKind) -> VecShape {
         (2, 8) => VecShape::TwoD,
         _ => panic!("unsupported AArch64 vector shape: <{lanes} x {elem}> (only 128-bit .4s/.2d)"),
     }
+}
+
+fn constant_shift_amount(arena: ArenaContext<'_>, rhs: HirInst, shape: VecShape) -> Option<u8> {
+    let InstKind::VectorSplat(splat) = arena.inst_data(rhs).kind() else {
+        return None;
+    };
+    let InstKind::Integer(value) = arena.inst_data(splat.src()).kind() else {
+        return None;
+    };
+    let lane_bits = u8::from(shape.element_bytes()) * 8;
+    u8::try_from(value.value()).ok().filter(|imm| *imm < lane_bits)
 }
 
 /// `fma(acc, lhs, rhs)`: `acc` is a read-write accumulator, so copy it into

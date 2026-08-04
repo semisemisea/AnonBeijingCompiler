@@ -534,6 +534,7 @@ fn find_interchange(program: &Program, func: Function) -> Option<Plan> {
     }
 
     let effects = EffectAnalysis::new(program);
+    let nonneg = crate::opt::analysis_passes::return_summary::nonneg_preserving_functions(program);
     // Dependence analysis is only needed for the M42 reducibility check;
     // build it lazily on the first candidate that reaches that check.
     let mut deps: Option<DependenceAnalysis> = None;
@@ -813,7 +814,8 @@ fn find_interchange(program: &Program, func: Function) -> Option<Plan> {
         for access in &dep.accesses {
             let addr = access_inst_addr(&arena, access.inst);
             let ranges = ranges.get_or_insert_with(|| {
-                RangeAnalysis::new(&arena, &cfg, &loops, &induction)
+                let no_params = rustc_hash::FxHashSet::default();
+                RangeAnalysis::new(&arena, &cfg, &loops, &induction, &nonneg, &no_params)
             });
             let Some((cj, ck)) = dual_coeffs(&arena, l_j, l_k, j_iv, k_iv, ranges, addr) else {
                 all_same_sign = false;

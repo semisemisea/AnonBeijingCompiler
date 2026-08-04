@@ -148,7 +148,12 @@ impl DependenceAnalysis {
         let data = program.func_data(func);
         let (cfg, _dom, loops) = LoopAnalysis::new(data);
         let induction = BasicInductionVariableAnalysis::new(data, &cfg, &loops);
-        let ranges = RangeAnalysis::new(&arena, &cfg, &loops, &induction);
+        let nonneg = crate::opt::analysis_passes::return_summary::nonneg_preserving_functions(
+            program,
+        );
+        let no_params = rustc_hash::FxHashSet::default();
+        let ranges =
+            RangeAnalysis::new(&arena, &cfg, &loops, &induction, &nonneg, &no_params);
         let env = effects.env_of(func);
 
         let mut by_header = FxHashMap::default();

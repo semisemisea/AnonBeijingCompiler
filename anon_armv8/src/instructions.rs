@@ -379,6 +379,20 @@ pub enum VecArithOp {
     Mul,
 }
 
+/// Vector shift operations. Immediate forms use `shl`/`ushr`/`sshr`;
+/// register (variable-amount) forms use `sshl`/`ushl`, with the amount
+/// vector pre-negated for right shifts (NEON has no register-form right
+/// shift; `sshl`/`ushl` with a negative amount shift right).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecShiftOp {
+    /// Logical left shift.
+    Shl,
+    /// Logical right shift (`ushr`/`ushl`).
+    Shr,
+    /// Arithmetic right shift (`sshr`/`sshl`).
+    Sar,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VecBitOp {
     And,
@@ -814,6 +828,31 @@ pub enum MInst {
         lhs: Reg,
         rhs: Reg,
     },
+    /// Vector shift: immediate form `shl/ushr/sshr v{d}.<shape>, v{lhs}.<shape>, #imm`;
+    /// register form `sshl/ushl v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>` with the
+    /// amount vector pre-negated for right shifts (`neg` emitted separately).
+    VecShift {
+        op: VecShiftOp,
+        shape: VecShape,
+        dst: WritableReg,
+        lhs: Reg,
+        rhs: Reg,
+        imm: Option<u8>,
+    },
+    /// Vector float divide: `fdiv v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>`.
+    /// (NEON has no integer vector divide; i32 Div stays scalar.)
+    VecDiv {
+        shape: VecShape,
+        dst: WritableReg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    /// Vector negation: `neg v{d}.<shape>, v{src}.<shape>`.
+    VecNeg {
+        shape: VecShape,
+        dst: WritableReg,
+        src: Reg,
+    },
     FMovFromZero {
         dst: WritableReg,
     },
@@ -1019,6 +1058,7 @@ impl MachInst for MInst {
             | Self::VecDup { dst, src, .. }
             | Self::VecCvt { dst, src, .. }
             | Self::VecAddv { dst, src }
+            | Self::VecNeg { dst, src, .. }
             | Self::Scvtf { dst, src }
             | Self::Fcvtzs { dst, src } => {
                 collector.reg_use(src);
@@ -1035,7 +1075,9 @@ impl MachInst for MInst {
             Self::VecArithRRR { dst, lhs, rhs, .. }
             | Self::VecBitwise { dst, lhs, rhs, .. }
             | Self::VecCmp { dst, lhs, rhs, .. }
-            | Self::VecMinMax { dst, lhs, rhs, .. } => {
+            | Self::VecMinMax { dst, lhs, rhs, .. }
+            | Self::VecShift { dst, lhs, rhs, .. }
+            | Self::VecDiv { dst, lhs, rhs, .. } => {
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
                 collector.reg_def(dst);
@@ -1409,6 +1451,9 @@ impl MachInstEmit for MInst {
             | Self::VecExtractLane { .. }
             | Self::VecInsertLane { .. }
             | Self::VecMinMax { .. }
+            | Self::VecShift { .. }
+            | Self::VecDiv { .. }
+            | Self::VecNeg { .. }
             | Self::FMovFromZero { .. }
             | Self::FAlu { .. }
             | Self::FCmp { .. }
@@ -1792,6 +1837,20 @@ fn vec_minmax_name(op: VecMinMaxOp) -> &'static str {
         VecMinMaxOp::Umax => "umax",
         VecMinMaxOp::Fmin => "fmin",
         VecMinMaxOp::Fmax => "fmax",
+    }
+}
+fn vec_shift_name(op: VecShiftOp, is_reg: bool) -> &'static str {
+    match (op, is_reg) {
+        // Immediate forms: `shl` / `ushr` / `sshr v.4s, v.4s, #imm`.
+        (VecShiftOp::Shl, false) => "shl",
+        (VecShiftOp::Shr, false) => "ushr",
+        (VecShiftOp::Sar, false) => "sshr",
+        // Register forms: `sshl` / `ushl v.4s, v.4s, v.4s`. Right shifts use
+        // a pre-negated amount vector (`neg` emitted before this), because
+        // NEON has no register-form right-shift instruction.
+        (VecShiftOp::Shl, true) => "sshl",
+        (VecShiftOp::Shr, true) => "ushl",
+        (VecShiftOp::Sar, true) => "sshl",
     }
 }
 fn emit_gpr(ctx: &mut dyn EmitContext, reg: &Gpr, size: OperandSize) -> core::fmt::Result {

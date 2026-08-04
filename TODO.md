@@ -458,6 +458,52 @@ M44 v2（select 掩码）。
 - 遗留：临时用例 tests/perf/red16.* 已删；addv 命中扫描脚本在
   /tmp/m44_corpus。
 
+##### M44 v2 目标 1（payload 白名单扩展）执行记录（2026-08-05）
+
+- 实现：loop_vectorize.rs 白名单扩至 Shl/Shr/Sar/And/Or/Xor/Div/Min/Max。
+  - 类型约束：Shl/Shr/Sar/And/Or/Xor 仅 i32（f32 拒绝，新 trace
+    binary_shift_bitwise_not_i32）；**Div 仅 f32**（i32 拒绝，trace
+    binary_int_div_no_neon——goal 原文"Div 向量化（sdiv/fdiv v.4s）"前提
+    错误：NEON 无整数向量除法，`sdiv` 仅标量形态，LLVM MC 拒收 `sdiv
+    v.4s`，ACLE 无 vdivq_s32；常量除数 i32 div 由 sr 移位链覆盖，见下）；
+    Min/Max i32+f32 均可；Rem 保持拒绝。
+  - **配套 anon_armv8 最小 lowering（goal 原文假设 lowering 已支持向量
+    Shl/Shr/Div，实为 lowering_panic 缺口；只扩白名单会让 -O2 panic，
+    开工前经用户确认 A 方案）**：instructions.rs 新增 VecShiftOp/VecShift
+    （立即数 shl/ushr/sshr + 寄存器 sshl/ushl，变量右移先 VecNeg 再
+    sshl/ushl——NEON 无寄存器形态右移）、VecDiv（仅 fdiv v.4s）、VecNeg；
+    emit + RegUseCollector + passes/dce.rs 纯函数表 + sched/dag.rs InstDeps
+    同步；lower.rs lower_vector_binary 接 Shl/Shr/Sar/Div（常量移位量经
+    VectorSplat-of-Integer 识别 → 立即数形态，i32 Div 防御性 panic）。
+  - **存量 f32 splat 语法修正**：VectorSplat f32 路径原 emit `dup vd.4s,
+    sn`，LLVM MC 拒收（此前 f32 向量化从未过真实汇编器，存量隐患）→
+    经寄存器别名输出 `dup vd.4s, vn.s[0]`（sN = vN 低 32 位；clang
+    vdupq_n_f32 同款）。两个断言旧语法既有测试同步更新。
+  - Sar 入白名单的原因：sr.rs 对常量除数除法产出 sar 链（a[i]/2 →
+    sar/shr/add/sar），Sar 与 Shl/Shr 同一 NEON 指令族，漏掉则 sr 链循环
+    全拒。原始 goal 只列 Shl/Shr，此为执行期补充（仍在 loop_vectorize.rs
+    内，不碰其他 pass）。
+- 验证：
+  - 单测 +5（shift_xor 循环、f32 div、f32 shl 拒绝、i32 div 拒绝、新 op
+    幂等），raana_ir 333 全过（基线 328）；anon_armv8 126 全过（含新
+    emit 单测 + dup-f32 断言更新）。
+  - 端到端（tests/perf/v2_whitelist_tmp.sy 临时用例，跑完删除）：-O2
+    汇编通过 host clang 语法验证 + make test 差分 -O0/-O1/-O2 三级 PASS：
+    a[i]*2 → shl v.4s,#1（sr 改写 mul→shl 后向量化）；a[i]/2 →
+    ushr#31+add+sshr#1（sr 移位链向量化）；a[i]%4 → sshr+ushr+add+and
+    v.16b（sr 链）；fa[i]/2.0 → dup v.4s,vN.s[0] + fdiv v.4s；
+    a[i]/q[i]（变量除数 i32 div）正确保持标量（标量 sdiv）。
+  - M44_TRACE 复扫（61 例，去重口径 (case,func,header,reason)）：
+    0 编译错误；payload_inst_rejected 仅 Rem×3（conv2d-1/2/3，符合 Rem
+    保持拒绝）；基线 Rem×2/load_unmodeled×1/load_classify×1 → 新白名单 op
+    零拒绝、无新增拒绝类型。corpus 向量化命中仍 0——再次确认 payload
+    白名单不是真实瓶颈（真实拦截：not_innermost/shape_header_multi_inst/
+    shape_body/m42_forbidden/params_not_2，见上方 v2 方向扫描）。
+- 结论：目标 1 是能力储备（白名单 + 向量移位/除法 lowering 就绪，含
+  f32 splat 语法修正），单靠它无 perf 收益；真实优先级不变：B3 in-place
+  内存累加 > B2 test-at-top。后续目标 2/3 完成后，白名单与新增 lowering
+  直接生效。
+
 #### M45：SLP 基本块向量化 + 循环展开
 
 - SLP（`raana_ir/src/opt/passes/slp.rs`）：把同一基本块内相邻、类型一致的独立

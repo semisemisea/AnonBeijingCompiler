@@ -157,14 +157,101 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
         writeback_removals.push(store_inst);
     }
 
+    // ---- Transform 2: covered store removal (within-block). ----
+    // While scanning a block forward, a store is dead as soon as another
+    // store to the same cell appears before any read of that cell.
+    let mut covered_removals: Vec<Inst> = Vec::new();
+    for bb in data.layout().basicblocks() {
+        // cell -> pending store that has not been read yet
+        let mut pending: FxHashMap<Cell, Inst> = FxHashMap::default();
+        for &inst in bb.insts() {
+            match data.inst_data(inst).kind() {
+                InstKind::Store(store) => match resolve_cell(env, &ctx, store.dest()) {
+                    Some(cell) => {
+                        if let Some(prev) = pending.insert(cell, inst) {
+                            covered_removals.push(prev);
+                        }
+                    }
+                    // Unknown destination: may alias anything, so every
+                    // pending store is conservatively treated as observed.
+                    None => pending.clear(),
+                },
+                InstKind::Load(load) => match resolve_cell(env, &ctx, load.src()) {
+                    Some(cell) => {
+                        pending.remove(&cell);
+                    }
+                    None => pending.clear(),
+                },
+                InstKind::Call(call) => {
+                    let callee = call.callee();
+                    match analysis.call_write_roots(callee, func) {
+                        None => pending.clear(),
+                        Some(write_roots) => {
+                            let read_roots = analysis.call_read_roots(callee, func);
+                            pending.retain(|cell, _| {
+                                let written = write_roots
+                                    .iter()
+                                    .any(|root| cell_matches_root(cell, root));
+                                if written {
+                                    return false;
+                                }
+                                match &read_roots {
+                                    None => false, // may read anything
+                                    Some(roots) => {
+                                        if roots
+                                            .iter()
+                                            .any(|root| cell_matches_root(cell, root))
+                                        {
+                                            return false;
+                                        }
+                                        // The call may also read through a
+                                        // target set we cannot express as
+                                        // roots; be conservative.
+                                        let mut targets =
+                                            rustc_hash::FxHashSet::default();
+                                        let obj = cell_to_object(cell, func);
+                                        targets.insert(obj);
+                                        !analysis.call_may_read(callee, Some(&targets))
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+                InstKind::MemZero(mem_zero) => {
+                    if let Some((root, off)) = resolve_cell(env, &ctx, mem_zero.dest()) {
+                        let len = mem_zero.byte_len() as i64;
+                        pending.retain(|cell, _| {
+                            !cell_in_range(cell, root, off, len)
+                        });
+                    } else {
+                        pending.clear();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     let mut changed = false;
-    for inst in writeback_removals {
+    for inst in writeback_removals.into_iter().chain(covered_removals) {
         if let Some(bb) = data.layout().parent_bb(inst) {
             data.remove_layout_inst(bb, inst);
             changed = true;
         }
     }
     changed
+}
+
+/// Convert a cell to the abstract object used by the effects analysis.
+fn cell_to_object(cell: &Cell, func: Function) -> crate::opt::analysis_passes::effects::AbstractObject {
+    match cell.0 {
+        MemObject::Global(g) => crate::opt::analysis_passes::effects::AbstractObject::Global(g),
+        MemObject::Alloc(a) => {
+            crate::opt::analysis_passes::effects::AbstractObject::Alloc(func, a)
+        }
+        _ => crate::opt::analysis_passes::effects::AbstractObject::Unknown,
+    }
 }
 
 /// Whether a write root (as reported by `call_write_roots`) covers `cell`.
@@ -275,5 +362,126 @@ mod tests {
             data.inst_data(store).kind(),
             InstKind::Store(..)
         ), "write-back after a real write must survive");
+    }
+
+    /// `store 1; store 2` to the same cell with no read in between: the
+    /// first store is dead.
+    #[test]
+    fn removes_covered_store() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        let function = program.new_function(Type::get_unit(), "f".into(), vec![]);
+        let (first, second, ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = data.add_entry_block();
+            let one = data.new_local_value().integer(1);
+            let two = data.new_local_value().integer(2);
+            let first = data.new_local_value().store(one, global);
+            data.layout_mut().insert_inst(entry, first);
+            let second = data.new_local_value().store(two, global);
+            data.layout_mut().insert_inst(entry, second);
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+            (first, second, ret)
+        };
+        let _ = ret;
+
+        assert!(DSE.run(&mut program));
+        let data = program.func_data(function);
+        let mut stores = Vec::new();
+        for block in data.layout().basicblocks() {
+            for &inst in block.insts() {
+                if matches!(data.inst_data(inst).kind(), InstKind::Store(..)) {
+                    stores.push(inst);
+                }
+            }
+        }
+        assert_eq!(stores, vec![second], "first covered store must go");
+    }
+
+    /// `store 1; load; store 2`: the load reads the first store, so it is
+    /// live and must survive.
+    #[test]
+    fn keeps_store_read_in_between() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        let function = program.new_function(Type::get_unit(), "f".into(), vec![]);
+        let (first, second, ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = data.add_entry_block();
+            let one = data.new_local_value().integer(1);
+            let two = data.new_local_value().integer(2);
+            let first = data.new_local_value().store(one, global);
+            data.layout_mut().insert_inst(entry, first);
+            let load = data.new_local_value().load(global);
+            data.layout_mut().insert_inst(entry, load);
+            let _ = load;
+            let second = data.new_local_value().store(two, global);
+            data.layout_mut().insert_inst(entry, second);
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+            (first, second, ret)
+        };
+        let _ = ret;
+
+        assert!(!DSE.run(&mut program));
+        let data = program.func_data(function);
+        let mut stores = Vec::new();
+        for block in data.layout().basicblocks() {
+            for &inst in block.insts() {
+                if matches!(data.inst_data(inst).kind(), InstKind::Store(..)) {
+                    stores.push(inst);
+                }
+            }
+        }
+        assert_eq!(stores.len(), 2, "both stores must survive a read");
+    }
+
+    /// A store through an unknown address may alias any cell: pending
+    /// stores must not be dropped across it.
+    #[test]
+    fn keeps_store_across_unknown_address_store() {
+        let mut program = Program::new();
+        let global = new_global(&mut program);
+        let function = program.new_function(Type::get_unit(), "f".into(), vec![Type::get_i32()]);
+        let (first, second, ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = data.add_entry_block();
+            let one = data.new_local_value().integer(1);
+            let two = data.new_local_value().integer(2);
+            let first = data.new_local_value().store(one, global);
+            data.layout_mut().insert_inst(entry, first);
+            // A store through the (unknown) parameter address.
+            let param = data.params()[0];
+            let unknown_store = data.new_local_value().store(two, param);
+            data.layout_mut().insert_inst(entry, unknown_store);
+            let second = data.new_local_value().store(two, global);
+            data.layout_mut().insert_inst(entry, second);
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+            (first, second, ret)
+        };
+        let _ = ret;
+
+        assert!(!DSE.run(&mut program));
+        let data = program.func_data(function);
+        let mut stores = Vec::new();
+        for block in data.layout().basicblocks() {
+            for &inst in block.insts() {
+                if matches!(data.inst_data(inst).kind(), InstKind::Store(..)) {
+                    stores.push(inst);
+                }
+            }
+        }
+        assert_eq!(stores.len(), 3, "no store may be dropped across an unknown write");
     }
 }

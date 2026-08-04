@@ -611,6 +611,58 @@ fn cross_iteration_may_overlap(
     a_lo < b_hi && b_lo < a_hi
 }
 
+/// Whether `from`'s value reaches `to` through a def-use chain of any length.
+/// Used to prove that the stored value of an in-place update depends on the
+/// loaded value.
+fn value_flows_to(arena: &ArenaContext<'_>, from: Inst, to: Inst) -> bool {
+    if from == to {
+        return true;
+    }
+    let mut work: Vec<Inst> = vec![from];
+    let mut seen: Vec<Inst> = Vec::new();
+    while let Some(node) = work.pop() {
+        for &user in arena.inst_data(node).used_by() {
+            if user == to {
+                return true;
+            }
+            if !seen.contains(&user) {
+                seen.push(user);
+                work.push(user);
+            }
+        }
+    }
+    false
+}
+
+/// B3: element-safe in-place update. A same-base read-write pair whose
+/// addresses coincide within every iteration (`byte_coefficient` and
+/// `constant_part` equal, coefficient nonzero) is lane-independent when the
+/// stored value depends on the loaded value through a pure def-use chain:
+/// iteration `i` reads `c[i]`, computes, writes `c[i]` back, and no other
+/// iteration touches that address. Such pairs skip the conflict test.
+///
+/// Coefficient-0 pairs (the same address every iteration, e.g. a scalar
+/// global `g = g + a[i]`) are genuine loop-carried dependencies and stay
+/// forbidden. Pairs whose store does not depend on the load (a same-address
+/// write of an unrelated value) are not elementwise updates and stay
+/// forbidden. Any *second* write to the same address is still caught by the
+/// remaining pairwise tests, so the relaxation cannot hide a true conflict.
+fn is_elementwise_inplace(arena: &ArenaContext<'_>, read: &AccessFunction, write: &AccessFunction) -> bool {
+    if read.kind != AccessKind::Read || write.kind != AccessKind::Write {
+        return false;
+    }
+    if read.byte_coefficient == 0 || read.byte_coefficient != write.byte_coefficient {
+        return false;
+    }
+    if read.constant_part != write.constant_part {
+        return false;
+    }
+    let InstKind::Store(store) = arena.inst_data(write.inst).kind() else {
+        return false;
+    };
+    value_flows_to(arena, read.inst, store.src())
+}
+
 /// Test one pair of accesses. Read-read pairs are always harmless (loads may
 /// alias without observable effect). Anything involving a write must be
 /// proven disjoint or the loop is forbidden.
@@ -951,11 +1003,17 @@ fn analyze_loop(
     // instruction is skipped: its own iterations access either distinct
     // addresses (coefficient != 0) or the same address without ordering
     // hazards (coefficient == 0, a store writing its own address repeatedly).
+    // B3: element-safe in-place read-modify-write pairs (same address, store
+    // depends on load, coefficient != 0) are lane-independent and skip the
+    // test; every other pair is still tested.
     for i in 0..accesses.len() {
         for j in (i + 1)..accesses.len() {
             let a = &accesses[i];
             let b = &accesses[j];
             if a.base != b.base || a.inst == b.inst {
+                continue;
+            }
+            if is_elementwise_inplace(arena, a, b) || is_elementwise_inplace(arena, b, a) {
                 continue;
             }
             if let Err(reason) = test_access_pair(a, b, trip) {
@@ -1331,9 +1389,12 @@ mod tests {
     }
 
     #[test]
-    fn same_base_read_write_is_forbidden() {
-        // `g[j] = g[j] + 1` over an array param: load and store share the same
-        // base and offset within one iteration -> IntraIterationConflict.
+    fn same_base_inplace_update_is_vectorizable() {
+        // `g[j] = g[j] + 1` over an array param: B3 treats a same-address
+        // read-modify-write whose stored value depends on the loaded value as
+        // element-safe (each iteration touches only its own element), so the
+        // pair no longer conflicts. (The vectorizer still gates param bases
+        // on alignment; this only relaxes the M42 verdict.)
         let mut program = Program::new();
         let function = program.new_function(
             Type::get_unit(),
@@ -1379,13 +1440,206 @@ mod tests {
 
         let dep = analyze(&program, function);
         assert!(
+            !matches!(dep.verdict, Verdict::Forbidden { .. }),
+            "in-place read-modify-write must no longer be forbidden, got {:?}",
+            dep.verdict
+        );
+    }
+
+    #[test]
+    fn same_address_write_not_depending_on_load_stays_forbidden() {
+        // `h[j] = g[j]; g[j] = 2`: the same-address store writes an unrelated
+        // value (a constant), so the pair is not an elementwise update and
+        // stays an IntraIterationConflict.
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "f".into(),
+            vec![
+                Type::get_pointer(Type::get_array(Type::get_i32(), 16)),
+                Type::get_pointer(Type::get_array(Type::get_i32(), 16)),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let (g, h) = (data.params()[0], data.params()[1]);
+        let n = data.new_local_inst().integer(16);
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let j = data.bb_data(header).params()[0];
+        let one = data.new_local_inst().integer(1);
+        let two = data.new_local_inst().integer(2);
+        let gep_g = data.new_local_inst().get_elem_ptr(g, vec![zero, j]);
+        let load_g = data.new_local_inst().load(gep_g);
+        let gep_h = data.new_local_inst().get_elem_ptr(h, vec![zero, j]);
+        let store_h = data.new_local_inst().store(load_g, gep_h);
+        let store_g = data.new_local_inst().store(two, gep_g);
+        let j_update = data.new_local_inst().binary(BinaryOp::Add, j, one);
+        for inst in [gep_g, load_g, gep_h, store_h, store_g, j_update] {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        let back = data.new_local_inst().jump(header, vec![j_update]);
+        data.layout_mut().insert_inst(body, back);
+        let compare = data.new_local_inst().binary(BinaryOp::Lt, j, n);
+        let branch = data
+            .new_local_inst()
+            .branch(compare, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, compare);
+        data.layout_mut().insert_inst(header, branch);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        let dep = analyze(&program, function);
+        assert!(
             matches!(
                 dep.verdict,
                 Verdict::Forbidden {
                     reason: ForbidReason::IntraIterationConflict { .. }
                 }
             ),
-            "expected Forbidden(IntraIterationConflict), got {:?}",
+            "same-address write of an unrelated value must stay forbidden, got {:?}",
+            dep.verdict
+        );
+    }
+
+    #[test]
+    fn inplace_scalar_same_address_every_iteration_stays_forbidden() {
+        // `g[0] = g[0] + a[j]` with an invariant index: byte_coefficient == 0
+        // means the same address every iteration — a genuine loop-carried
+        // dependency, not an elementwise update.
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "f".into(),
+            vec![
+                Type::get_pointer(Type::get_array(Type::get_i32(), 16)),
+                Type::get_pointer(Type::get_array(Type::get_i32(), 16)),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let (a, g) = (data.params()[0], data.params()[1]);
+        let n = data.new_local_inst().integer(16);
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let j = data.bb_data(header).params()[0];
+        let one = data.new_local_inst().integer(1);
+        let gep_g = data.new_local_inst().get_elem_ptr(g, vec![zero, zero]);
+        let load_g = data.new_local_inst().load(gep_g);
+        let gep_a = data.new_local_inst().get_elem_ptr(a, vec![zero, j]);
+        let load_a = data.new_local_inst().load(gep_a);
+        let sum = data.new_local_inst().binary(BinaryOp::Add, load_g, load_a);
+        let store_g = data.new_local_inst().store(sum, gep_g);
+        let j_update = data.new_local_inst().binary(BinaryOp::Add, j, one);
+        for inst in [gep_g, load_g, gep_a, load_a, sum, store_g, j_update] {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        let back = data.new_local_inst().jump(header, vec![j_update]);
+        data.layout_mut().insert_inst(body, back);
+        let compare = data.new_local_inst().binary(BinaryOp::Lt, j, n);
+        let branch = data
+            .new_local_inst()
+            .branch(compare, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, compare);
+        data.layout_mut().insert_inst(header, branch);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        let dep = analyze(&program, function);
+        assert!(
+            matches!(
+                dep.verdict,
+                Verdict::Forbidden {
+                    reason: ForbidReason::LoopCarriedConflict { .. }
+                        | ForbidReason::IntraIterationConflict { .. }
+                }
+            ),
+            "coefficient-0 in-place update must stay forbidden, got {:?}",
+            dep.verdict
+        );
+    }
+
+    #[test]
+    fn cross_iteration_inplace_stays_forbidden() {
+        // `g[j] = g[j-1] + 1`: the load and store addresses differ within one
+        // iteration (constant parts -4 vs 0), so the pair is not elementwise;
+        // the cross-iteration overlap makes it a LoopCarriedConflict.
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "f".into(),
+            vec![Type::get_pointer(Type::get_array(Type::get_i32(), 16))],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let n = data.new_local_inst().integer(16);
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let j = data.bb_data(header).params()[0];
+        let one = data.new_local_inst().integer(1);
+        let minus_one = data.new_local_inst().integer(-1);
+        // j-1 via a temporary index `t = j + (-1)`.
+        let prev = data.new_local_inst().binary(BinaryOp::Add, j, minus_one);
+        let gep_prev = data.new_local_inst().get_elem_ptr(base, vec![zero, prev]);
+        let load_prev = data.new_local_inst().load(gep_prev);
+        let add = data.new_local_inst().binary(BinaryOp::Add, load_prev, one);
+        let gep_j = data.new_local_inst().get_elem_ptr(base, vec![zero, j]);
+        let store = data.new_local_inst().store(add, gep_j);
+        let j_update = data.new_local_inst().binary(BinaryOp::Add, j, one);
+        for inst in [prev, gep_prev, load_prev, add, gep_j, store, j_update] {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        let back = data.new_local_inst().jump(header, vec![j_update]);
+        data.layout_mut().insert_inst(body, back);
+        let compare = data.new_local_inst().binary(BinaryOp::Lt, j, n);
+        let branch = data
+            .new_local_inst()
+            .branch(compare, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, compare);
+        data.layout_mut().insert_inst(header, branch);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        let dep = analyze(&program, function);
+        assert!(
+            matches!(
+                dep.verdict,
+                Verdict::Forbidden {
+                    reason: ForbidReason::LoopCarriedConflict { .. }
+                }
+            ),
+            "cross-iteration in-place access must stay forbidden, got {:?}",
             dep.verdict
         );
     }

@@ -38,7 +38,7 @@ jobs:
       github.event_name == 'push' ||
       (github.event_name == 'workflow_dispatch' && inputs.suite != 'perf')
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -63,8 +63,8 @@ jobs:
           shared-key: compiler-ci
           cache-targets: true
 
-      - name: Run ${{ matrix.name }} quick suite
-        run: make ${{ matrix.target }} TESTS="functional h_functional" ARGS="-j 2"
+      - name: Run ${{ matrix.name }} full suite (-O2, incl. perf)
+        run: make ${{ matrix.target }} TESTS="functional h_functional perf" ARGS="-O 2 -j 2"
 
       - name: Upload failure results
         if: failure()
@@ -120,7 +120,7 @@ jobs:
           cache-targets: true
 
       - name: Run ${{ matrix.name }} performance suite
-        run: make ${{ matrix.target }} TESTS=perf ARGS="-j 2"
+        run: make ${{ matrix.target }} TESTS=perf ARGS="-O 2 -j 2"
 
       - name: Upload failure results
         if: failure()

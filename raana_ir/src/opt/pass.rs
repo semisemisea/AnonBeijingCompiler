@@ -271,6 +271,15 @@ impl PassesManager {
             p.register(chain_to_switch);
         }
 
+        // Vectorize innermost exact-trip loops with contiguous 4-byte
+        // accesses (NEON, VF=4, i32/f32). AArch64-only; RISC-V keeps scalar
+        // loops. Runs after chain_to_switch (shaping sees scalar bodies) and
+        // before LICM.
+        if config.target.enable_chain_to_switch {
+            let loop_vectorize = Box::new(loop_vectorize::LoopVectorize::new());
+            p.register(loop_vectorize);
+        }
+
         // Hoist loop-invariant pure expressions to the preheader.
         let licm = Box::new(licm::LICM::with_computed_load_limit(
             config.target.enable_chain_to_switch,

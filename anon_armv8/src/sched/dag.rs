@@ -571,8 +571,7 @@ fn amode_location(addr: &AMode, provenance: &HashMap<PReg, Provenance>) -> Optio
         ),
         AMode::RegOffset { .. }
         | AMode::ScaledRegOffset { .. }
-        | AMode::ExtendedRegOffset { .. }
-        | AMode::PostIndex { .. } => return None,
+        | AMode::ExtendedRegOffset { .. } => return None,
     };
     value.offset = value.offset.checked_add(displacement)?;
     Some(value)
@@ -898,7 +897,7 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
         }
 
         MInst::Load { ty, dst, addr } => InstDeps {
-            defs: [preg(dst.reg), amode_defs(addr)].concat(),
+            defs: preg(dst.reg),
             uses: amode_regs(addr),
             flags_def: false,
             flags_use: false,
@@ -912,7 +911,7 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
         },
 
         MInst::Store { ty, src, addr } => InstDeps {
-            defs: amode_defs(addr),
+            defs: vec![],
             uses: [preg(*src), amode_regs(addr)].concat(),
             flags_def: false,
             flags_use: false,
@@ -1280,16 +1279,6 @@ fn amode_regs(addr: &crate::instructions::AMode) -> Vec<PReg> {
         AMode::ExtendedRegOffset { base, index, .. } => {
             [preg(*base), preg(*index)].into_iter().flatten().collect()
         }
-        AMode::PostIndex { base, .. } => preg(*base),
-        _ => vec![],
-    }
-}
-
-fn amode_defs(addr: &crate::instructions::AMode) -> Vec<PReg> {
-    use crate::instructions::AMode;
-    match addr {
-        // Post-index addressing writes the advanced value back to base.
-        AMode::PostIndex { base, .. } => preg(*base),
         _ => vec![],
     }
 }

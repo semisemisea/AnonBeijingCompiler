@@ -278,6 +278,12 @@ impl PassesManager {
         let tco = Box::new(tco::TailCallElim);
         p.register(tco);
 
+        // Turn `call F(args)` on a pure self-tail-recursive loop into an
+        // inlined loop (clang-style): the callee's self `tail_call` becomes a
+        // back-edge in the caller. Runs after TCO so the loop form is visible.
+        let tail_recursive_inline = Box::new(tail_recursive_inline::TailRecursiveInline);
+        p.register(tail_recursive_inline);
+
         let boolean_simplification = Box::new(boolean_simplify::BooleanSimplification);
         p.register(boolean_simplification);
 

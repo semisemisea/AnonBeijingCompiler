@@ -25,6 +25,14 @@ impl Specialize {
             {
                 continue;
             }
+            // A self-recursive candidate is never usefully specialized: the
+            // clone keeps its recursion pointing at the original, so it is a
+            // byte-for-byte duplicate that only adds a call indirection. The
+            // self-tail-recursive loop case is handled by the
+            // `tail_recursive_inline` pass instead.
+            if call_graph.reaches(candidate, candidate) {
+                continue;
+            }
             let callsites = call_graph.incoming_callsites_of(candidate);
             let mut specialize_count = 0;
             for Node { func, inst } in callsites {

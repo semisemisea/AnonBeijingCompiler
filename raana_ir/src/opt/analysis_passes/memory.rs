@@ -23,7 +23,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    ir::{BasicBlock, FunctionData, Inst, InstKind, arena::Arena},
+    ir::{BasicBlock, Function, FunctionData, Inst, InstKind, arena::Arena},
     opt::utils::gep::gep_index_stride,
 };
 /// The base object a pointer value ultimately derives from.
@@ -65,7 +65,12 @@ impl AliasResult {
 
 /// Per-function environment for base-object tracing.
 ///
-/// Built once per function; all queries are read-only afterwards.
+/// Built once per function; all queries are read-only afterwards. The
+/// base/offset tables are precomputed by [`BaseEnv::build_tables`] with a
+/// fixed-point pass over the function's instructions and block parameters
+/// (call it once after construction, with an arena that can reach global
+/// instructions). Queries are then O(1) table lookups — no per-query
+/// recursion.
 pub struct BaseEnv {
     /// Position of each block parameter within its owning block, used to
     /// resolve pointer-valued block parameters through incoming edges.
@@ -75,6 +80,11 @@ pub struct BaseEnv {
     slots: FxHashMap<Inst, Inst>,
     /// The function's entry parameters (`FunctionData::params()`).
     entry_params: Vec<Inst>,
+    /// Precomputed base object of every address-shaped instruction.
+    base_table: FxHashMap<Inst, MemObject>,
+    /// Precomputed byte offset of every address-shaped instruction
+    /// (`None` entry = offset not statically known).
+    offset_table: FxHashMap<Inst, Option<i64>>,
 }
 
 impl BaseEnv {
@@ -124,127 +134,127 @@ impl BaseEnv {
             param_position,
             slots: stored,
             entry_params: data.params().to_vec(),
+            base_table: FxHashMap::default(),
+            offset_table: FxHashMap::default(),
         }
     }
 
     /// The base object `ptr` ultimately derives from.
     ///
-    /// `arena` must be a context with access to both the function's local
-    /// arena and the program's global arena (e.g. `ArenaContext`); global
-    /// instructions cannot be inspected through `FunctionData` alone.
+    /// O(1) lookup into the table precomputed by [`Self::build_tables`];
+    /// instructions missing from the table (or global objects, which are
+    /// resolved directly) conservatively yield `Unknown`.
     pub fn base_of<A: Arena + ?Sized>(&self, arena: &A, ptr: Inst) -> MemObject {
-        let mut seen = FxHashSet::default();
-        self.base_of_inner(arena, ptr, &mut seen)
+        if matches!(arena.inst_data(ptr).kind(), InstKind::GlobalAlloc(..)) {
+            return MemObject::Global(ptr);
+        }
+        self.base_table
+            .get(&ptr)
+            .copied()
+            .unwrap_or(MemObject::Unknown)
     }
 
-    fn base_of_inner<A: Arena + ?Sized>(
+    /// Precompute the base and offset tables with a fixed-point pass.
+    ///
+    /// Must be called once after construction (with an arena that can reach
+    /// global instructions, e.g. `ArenaContext`); afterwards all queries
+    /// are O(1) lookups. The work table distinguishes "not yet resolved"
+    /// (`None`) from "resolved to unknown" (`Some(Unknown)`), so cyclic
+    /// phi chains (loop backedges) converge conservatively to `Unknown`
+    /// instead of oscillating.
+    pub fn build_tables<A: Arena + ?Sized>(&mut self, arena: &A, func: Function) {
+        let data = arena.func_data(func);
+        let mut insts: Vec<Inst> = Vec::new();
+        for bb_layout in data.layout().basicblocks() {
+            insts.extend(bb_layout.insts().iter().copied());
+            insts.extend(arena.bb_data(bb_layout.bb()).params().iter().copied());
+        }
+
+        // ---- Base fixed point. ----
+        let mut base_work: FxHashMap<Inst, Option<MemObject>> =
+            insts.iter().map(|&i| (i, None)).collect();
+        loop {
+            let mut changed = false;
+            for &ptr in &insts {
+                let next = self.compute_base(arena, ptr, &base_work);
+                let cur = base_work.get_mut(&ptr).unwrap();
+                if *cur != next {
+                    *cur = next;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.base_table = base_work
+            .into_iter()
+            .map(|(k, v)| (k, v.unwrap_or(MemObject::Unknown)))
+            .collect();
+
+        // ---- Offset fixed point. ----
+        let mut off_work: FxHashMap<Inst, Option<Option<i64>>> =
+            insts.iter().map(|&i| (i, None)).collect();
+        loop {
+            let mut changed = false;
+            for &ptr in &insts {
+                let next = self.compute_offset(arena, ptr, &off_work);
+                let cur = off_work.get_mut(&ptr).unwrap();
+                if *cur != next {
+                    *cur = next;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.offset_table = off_work
+            .into_iter()
+            .map(|(k, v)| (k, v.flatten()))
+            .collect();
+    }
+
+    /// Fixed-point step for the base of `ptr`.
+    ///
+    /// `work` maps every address-shaped instruction to its current base
+    /// (`None` = not resolved yet). Dependencies that are not yet resolved
+    /// keep the current entry pending; `Some(Unknown)` is a settled
+    /// unknown (no further refinement).
+    fn compute_base<A: Arena + ?Sized>(
         &self,
         arena: &A,
         ptr: Inst,
-        seen: &mut FxHashSet<Inst>,
-    ) -> MemObject {
-        if !seen.insert(ptr) {
-            // Cyclic phi resolution (loop backedge passing the parameter
-            // itself): cannot decide, be conservative.
-            return MemObject::Unknown;
-        }
+        work: &FxHashMap<Inst, Option<MemObject>>,
+    ) -> Option<MemObject> {
         match arena.inst_data(ptr).kind() {
-            InstKind::Alloc => MemObject::Alloc(ptr),
-            InstKind::GlobalAlloc(..) => MemObject::Global(ptr),
-            InstKind::GetElemPtr(gep) => self.base_of_inner(arena, gep.base(), seen),
+            InstKind::Alloc => Some(MemObject::Alloc(ptr)),
+            InstKind::GlobalAlloc(..) => Some(MemObject::Global(ptr)),
+            InstKind::GetElemPtr(gep) => {
+                if matches!(arena.inst_data(gep.base()).kind(), InstKind::GlobalAlloc(..)) {
+                    return Some(MemObject::Global(gep.base()));
+                }
+                work.get(&gep.base()).copied().flatten()
+            }
             InstKind::Load(load) => match self.slots.get(&load.src()) {
-                Some(&stored) => self.base_of_inner(arena, stored, seen),
-                None => MemObject::Unknown,
+                Some(&stored) => {
+                    if matches!(arena.inst_data(stored).kind(), InstKind::GlobalAlloc(..)) {
+                        Some(MemObject::Global(stored))
+                    } else {
+                        work.get(&stored).copied().flatten()
+                    }
+                }
+                None => Some(MemObject::Unknown),
             },
             InstKind::BlockArgRef(..) => {
                 if let Some(index) = self.entry_params.iter().position(|&p| p == ptr) {
-                    return MemObject::Param(index);
+                    return Some(MemObject::Param(index));
                 }
-                self.resolve_block_param(arena, ptr, seen)
-            }
-            _ => MemObject::Unknown,
-        }
-    }
-
-    /// Resolve a pointer-valued block parameter through the argument vectors
-    /// of its incoming edges. If every incoming argument resolves to the same
-    /// base object, that object is returned; otherwise `Unknown`.
-    fn resolve_block_param<A: Arena + ?Sized>(
-        &self,
-        arena: &A,
-        param: Inst,
-        seen: &mut FxHashSet<Inst>,
-    ) -> MemObject {
-        let Some(&(block, index)) = self.param_position.get(&param) else {
-            return MemObject::Unknown;
-        };
-        let mut result: Option<MemObject> = None;
-        for &user in arena.bb_data(block).used_by() {
-            let arg = match arena.inst_data(user).kind() {
-                InstKind::Jump(jump) if jump.target() == block => jump.args().get(index).copied(),
-                InstKind::Branch(branch) => {
-                    if branch.t_target() == block {
-                        branch.t_args().get(index).copied()
-                    } else if branch.f_target() == block {
-                        branch.f_args().get(index).copied()
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            let Some(arg) = arg else {
-                return MemObject::Unknown;
-            };
-            let base = self.base_of_inner(arena, arg, seen);
-            if base.is_unknown() {
-                return MemObject::Unknown;
-            }
-            match result {
-                Some(prev) if prev != base => return MemObject::Unknown,
-                _ => result = Some(base),
-            }
-        }
-        result.unwrap_or(MemObject::Unknown)
-    }
-
-    /// Byte offset of `ptr` relative to its base object, or `None` when any
-    /// index along the GEP chain is not a compile-time constant.
-    ///
-    /// The base object itself (a bare Alloc/GlobalAlloc/parameter) has
-    /// offset zero. Block parameters (phi) resolve to their incoming
-    /// jump/branch argument offsets, mirroring `base_of`: without this, a
-    /// parameter that aliases a GEP of a base (e.g. an array row passed to
-    /// a callee) would resolve to offset 0 instead of the row offset.
-    pub fn constant_offset<A: Arena + ?Sized>(&self, arena: &A, ptr: Inst) -> Option<i64> {
-        let mut seen = FxHashSet::default();
-        self.constant_offset_inner(arena, ptr, &mut seen)
-    }
-
-    fn constant_offset_inner<A: Arena + ?Sized>(
-        &self,
-        arena: &A,
-        ptr: Inst,
-        seen: &mut FxHashSet<Inst>,
-    ) -> Option<i64> {
-        if !seen.insert(ptr) {
-            // Cyclic phi resolution (loop backedge): conservative.
-            return None;
-        }
-        match arena.inst_data(ptr).kind() {
-            InstKind::Alloc | InstKind::GlobalAlloc(..) => Some(0),
-            InstKind::BlockArgRef(..) => {
-                // ABI parameters (the function's entry block) are bare
-                // pointers: offset zero.
-                if self.entry_params.iter().any(|&p| p == ptr) {
-                    return Some(0);
-                }
-                // Block parameters: every incoming edge must carry the
-                // same constant offset, or the offset is unknown.
                 let Some(&(block, index)) = self.param_position.get(&ptr) else {
-                    return None;
+                    return Some(MemObject::Unknown);
                 };
-                let mut result: Option<i64> = None;
+                let mut result: Option<MemObject> = None;
+                let mut all_set = true;
                 for &user in arena.bb_data(block).used_by() {
                     let arg = match arena.inst_data(user).kind() {
                         InstKind::Jump(jump) if jump.target() == block => {
@@ -262,32 +272,142 @@ impl BaseEnv {
                         _ => None,
                     };
                     let Some(arg) = arg else {
-                        continue;
+                        return Some(MemObject::Unknown);
                     };
-                    let off = self.constant_offset_inner(arena, arg, seen)?;
-                    if result.is_none() {
-                        result = Some(off);
-                    } else if result != Some(off) {
-                        return None;
+                    match work.get(&arg) {
+                        None => all_set = false,
+                        Some(Some(MemObject::Unknown)) => return Some(MemObject::Unknown),
+                        Some(Some(m)) => match result {
+                            Some(prev) if prev != *m => return Some(MemObject::Unknown),
+                            _ => result = Some(*m),
+                        },
+                        Some(None) => all_set = false,
                     }
                 }
-                result
+                if all_set {
+                    result.or(Some(MemObject::Unknown))
+                } else {
+                    None
+                }
+            }
+            _ => Some(MemObject::Unknown),
+        }
+    }
+
+    /// Fixed-point step for the byte offset of `ptr`.
+    ///
+    /// The work value is `Option<Option<i64>>`: outer `None` = pending,
+    /// `Some(None)` = settled non-constant, `Some(Some(off))` = constant.
+    fn compute_offset<A: Arena + ?Sized>(
+        &self,
+        arena: &A,
+        ptr: Inst,
+        work: &FxHashMap<Inst, Option<Option<i64>>>,
+    ) -> Option<Option<i64>> {
+        match arena.inst_data(ptr).kind() {
+            InstKind::Alloc | InstKind::GlobalAlloc(..) => Some(Some(0)),
+            InstKind::BlockArgRef(..) => {
+                // ABI parameters (the function's entry block) are bare
+                // pointers: offset zero.
+                if self.entry_params.iter().any(|&p| p == ptr) {
+                    return Some(Some(0));
+                }
+                let Some(&(block, index)) = self.param_position.get(&ptr) else {
+                    return Some(None);
+                };
+                let mut result: Option<i64> = None;
+                let mut all_set = true;
+                for &user in arena.bb_data(block).used_by() {
+                    let arg = match arena.inst_data(user).kind() {
+                        InstKind::Jump(jump) if jump.target() == block => {
+                            jump.args().get(index).copied()
+                        }
+                        InstKind::Branch(branch) => {
+                            if branch.t_target() == block {
+                                branch.t_args().get(index).copied()
+                            } else if branch.f_target() == block {
+                                branch.f_args().get(index).copied()
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    let Some(arg) = arg else {
+                        return Some(None);
+                    };
+                    match work.get(&arg) {
+                        None => all_set = false,
+                        Some(Some(None)) => return Some(None),
+                        Some(Some(Some(off))) => {
+                            if result.is_none() {
+                                result = Some(*off);
+                            } else if result != Some(*off) {
+                                return Some(None);
+                            }
+                        }
+                        Some(None) => all_set = false,
+                    }
+                }
+                if all_set {
+                    Some(result)
+                } else {
+                    None
+                }
             }
             InstKind::GetElemPtr(gep) => {
-                let mut off = self.constant_offset_inner(arena, gep.base(), seen)?;
+                let base_off = if matches!(
+                    arena.inst_data(gep.base()).kind(),
+                    InstKind::GlobalAlloc(..)
+                ) {
+                    Some(Some(0))
+                } else {
+                    work.get(&gep.base()).copied().flatten()
+                };
+                let mut off = match base_off {
+                    None => return None,          // base pending
+                    Some(None) => return Some(None),
+                    Some(Some(o)) => o,
+                };
                 for (pos, &idx) in gep.offsets().iter().enumerate() {
-                    let idx_value = integer_constant(arena, idx)?;
-                    let stride = gep_index_stride(arena, ptr, pos)?.byte_stride;
-                    off = off.checked_add(idx_value as i64 * stride)?;
+                    let Some(idx_value) = integer_constant(arena, idx) else {
+                        return Some(None);
+                    };
+                    let Some(stride) = gep_index_stride(arena, ptr, pos) else {
+                        return Some(None);
+                    };
+                    let Some(sum) = off.checked_add(idx_value as i64 * stride.byte_stride) else {
+                        return Some(None);
+                    };
+                    off = sum;
                 }
-                Some(off)
+                Some(Some(off))
             }
             InstKind::Load(load) => match self.slots.get(&load.src()) {
-                Some(&stored) => self.constant_offset_inner(arena, stored, seen),
-                None => None,
+                Some(&stored) => {
+                    if matches!(arena.inst_data(stored).kind(), InstKind::GlobalAlloc(..)) {
+                        Some(Some(0))
+                    } else {
+                        work.get(&stored).copied().flatten()
+                    }
+                }
+                None => Some(None),
             },
-            _ => None,
+            _ => Some(None),
         }
+    }
+
+    /// Byte offset of `ptr` relative to its base object, or `None` when any
+    /// index along the GEP chain is not a compile-time constant.
+    ///
+    /// The base object itself (a bare Alloc/GlobalAlloc/parameter) has
+    /// offset zero; block parameters resolve through their incoming edge
+    /// arguments (precomputed by [`Self::build_tables`]).
+    pub fn constant_offset<A: Arena + ?Sized>(&self, arena: &A, ptr: Inst) -> Option<i64> {
+        if matches!(arena.inst_data(ptr).kind(), InstKind::GlobalAlloc(..)) {
+            return Some(0);
+        }
+        self.offset_table.get(&ptr).copied().flatten()
     }
 
     /// Intra-procedural alias result between two addresses, refined by
@@ -375,11 +495,12 @@ mod tests {
 
     fn env_of(program: &Program, func: crate::ir::Function) -> (BaseEnv, ArenaContext<'_>) {
         let data = program.func_data(func);
-        let env = BaseEnv::new(data);
+        let mut env = BaseEnv::new(data);
         let ctx = ArenaContext {
             program,
             curr_func: Some(func),
         };
+        env.build_tables(&ctx, func);
         (env, ctx)
     }
 

@@ -180,7 +180,13 @@ impl EffectAnalysis {
                 effects.insert(func, fx);
                 continue;
             }
-            envs.insert(func, BaseEnv::new(data));
+            let mut env = BaseEnv::new(data);
+            let env_ctx = ArenaContext {
+                program,
+                curr_func: Some(func),
+            };
+            env.build_tables(&env_ctx, func);
+            envs.insert(func, env);
             effects.insert(func, direct_effects(program, func));
 
             for bb_layout in data.layout().basicblocks() {
@@ -599,11 +605,12 @@ impl std::ops::BitOrAssign for FunctionEffects {
 fn direct_effects(program: &Program, func: Function) -> FunctionEffects {
     let mut fx = FunctionEffects::default();
     let data = program.func_data(func);
-    let env = BaseEnv::new(data);
+    let mut env = BaseEnv::new(data);
     let ctx = ArenaContext {
         program,
         curr_func: Some(func),
     };
+    env.build_tables(&ctx, func);
     for bb_layout in data.layout().basicblocks() {
         for &inst in bb_layout.insts() {
             match data.inst_data(inst).kind() {

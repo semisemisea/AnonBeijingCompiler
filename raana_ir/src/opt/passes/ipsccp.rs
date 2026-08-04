@@ -516,7 +516,14 @@ impl Pass for IPSCCP {
                                 if lattice_map.insert_or_replace(node, value) {
                                     extend_affected_node_used_by(node);
                                 }
-                                state.root_loaders.entry(root).or_default().push(node);
+                                // Register the load for re-scheduling when
+                                // its root changes. Deduplicate: a load that
+                                // is (re)processed many times must not grow
+                                // the loader list unboundedly.
+                                let loaders = state.root_loaders.entry(root).or_default();
+                                if !loaders.contains(&node) {
+                                    loaders.push(node);
+                                }
                             }
                             None => {
                                 merge_and_extend(node, Lattice::Bottom, &mut lattice_map);

@@ -185,6 +185,18 @@ impl PassesManager {
         let specialize = Box::new(specialize::Specialize::default());
         p.register_initial(specialize);
 
+        // Recognize the "multiply by doubling" modular-multiplication
+        // recursion (fft0/fft1) and rewrite it to a `b < 0` guard plus a call
+        // to the `soyo_mulmod` builtin, which the AArch64 backend expands
+        // inline (`smull; sxtw; sdiv; msub`). Runs before `inline` so the
+        // now-tiny callee is inlined into its callers, and after `specialize`
+        // (which skips self-recursive candidates like `multiply`). AArch64-only;
+        // RISC-V keeps the recursion.
+        if config.target.enable_chain_to_switch {
+            let mulmod = Box::new(mulmod_recognize::MulmodRecognize);
+            p.register_initial(mulmod);
+        }
+
         let inline = Box::new(inline::Inline);
         p.register_initial(inline);
 

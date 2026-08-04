@@ -105,6 +105,12 @@ impl FunctionEffects {
     pub fn may_write_memory(&self) -> bool {
         !self.writes.is_empty() || self.writes_unknown
     }
+
+    /// The function may read program memory (through known or unknown
+    /// addresses).
+    pub fn may_read_memory(&self) -> bool {
+        !self.reads.is_empty() || self.reads_unknown
+    }
 }
 
 /// A call site: caller, callee, and the actual arguments (positionally
@@ -297,6 +303,71 @@ impl EffectAnalysis {
         let mut roots = Vec::new();
         for w in &fx.writes {
             match w {
+                EffectObject::Global(g) => roots.push(WriteRoot::Global(*g)),
+                EffectObject::Alloc(cf, a) if *cf == func => {
+                    roots.push(WriteRoot::Local(func, *a));
+                }
+                EffectObject::Alloc(..) => {}
+                EffectObject::Param(j) => {
+                    for o in self.points_to.get(&(callee, *j)).into_iter().flatten() {
+                        match o {
+                            AbstractObject::Global(g) => roots.push(WriteRoot::Global(*g)),
+                            AbstractObject::Alloc(cf, a) if *cf == func => {
+                                roots.push(WriteRoot::Local(func, *a));
+                            }
+                            AbstractObject::Alloc(..) => {}
+                            AbstractObject::Unknown => return None,
+                        }
+                    }
+                }
+            }
+        }
+        Some(roots)
+    }
+
+    /// Whether a call to `callee` may read any object in `targets`.
+    /// `targets == None` means the queried address may be anything.
+    pub fn call_may_read(
+        &self,
+        callee: Function,
+        targets: Option<&HashSet<AbstractObject>>,
+    ) -> bool {
+        let fx = self.effects_of(callee);
+        if fx.reads_unknown {
+            return true;
+        }
+        let Some(targets) = targets else {
+            return fx.may_read_memory();
+        };
+        fx.reads.iter().any(|r| match r {
+            EffectObject::Global(g) => targets.contains(&AbstractObject::Global(*g)),
+            EffectObject::Alloc(cf, a) => targets.contains(&AbstractObject::Alloc(*cf, *a)),
+            EffectObject::Param(j) => self
+                .points_to
+                .get(&(callee, *j))
+                .into_iter()
+                .flatten()
+                .any(|o| match o {
+                    AbstractObject::Global(g) => targets.contains(&AbstractObject::Global(*g)),
+                    AbstractObject::Alloc(cf, a) => {
+                        targets.contains(&AbstractObject::Alloc(*cf, *a))
+                    }
+                    AbstractObject::Unknown => true,
+                }),
+        })
+    }
+
+    /// The roots (in `func`'s own terms) a call to `callee` may read.
+    /// `None` means the callee may read anything. Callee-frame allocs are
+    /// invisible to `func` and omitted.
+    pub fn call_read_roots(&self, callee: Function, func: Function) -> Option<Vec<WriteRoot>> {
+        let fx = self.effects_of(callee);
+        if fx.reads_unknown {
+            return None;
+        }
+        let mut roots = Vec::new();
+        for r in &fx.reads {
+            match r {
                 EffectObject::Global(g) => roots.push(WriteRoot::Global(*g)),
                 EffectObject::Alloc(cf, a) if *cf == func => {
                     roots.push(WriteRoot::Local(func, *a));

@@ -3,10 +3,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::opt::{
     analysis_passes::{
         dom_tree::v2::DominanceTree,
-        effects::EffectAnalysis,
-        function_side_effects::{
-            FunctionSideEffects, MemoryBase, analyze, resolve_base, write_base_may_hit,
-        },
+        effects::{AbstractObject, EffectAnalysis, WriteRoot},
         loop_analysis::Loop,
     },
     prelude::*,
@@ -58,7 +55,6 @@ impl LICM {
         cfg: &CFG,
         dom_tree: &DominanceTree,
         parameter_blocks: &FxHashMap<Inst, BasicBlock>,
-        effects: &FxHashMap<Function, FunctionSideEffects>,
     ) -> LoopResult {
         fn insts(looop: &Loop, data: &ArenaContextMut<'_>) -> impl Iterator<Item = Inst> {
             looop
@@ -85,11 +81,6 @@ impl LICM {
             ) || (matches!(kind, InstKind::Call(..)) && hoistable_calls.contains(&inst))
         }
 
-        /// May a write through `base` hit something `reader` reads?
-        fn write_may_hit(base: MemoryBase, reader: &FunctionSideEffects) -> bool {
-            write_base_may_hit(base, reader)
-        }
-
         fn is_integer_zero(data: &ArenaContextMut<'_>, inst: Inst) -> bool {
             matches!(data.inst_data(inst).kind(), InstKind::Integer(value) if value.value() == 0)
         }
@@ -106,8 +97,8 @@ impl LICM {
             .map(|inst| (inst, Lattice::Variant))
             .collect::<FxHashMap<_, _>>();
 
-        // Calls that may be hoisted: the callee must be read-only (no I/O, no
-        // timer, no external write), and nothing in the loop may write
+        // Calls that may be hoisted: the callee must be read-only (no I/O,
+        // no timer, no external write), and nothing in the loop may write
         // anything the callee reads (stores, memzeroes, or other calls).
         let hoistable_calls =
             loop_insts
@@ -117,25 +108,43 @@ impl LICM {
                     let InstKind::Call(call) = data.inst_data(inst).kind() else {
                         return false;
                     };
-                    let Some(callee_effects) = effects.get(&call.callee()) else {
+                    let Some(analysis) = analysis else {
                         return false;
                     };
-                    if !callee_effects.is_read_only() {
+                    if !analysis.is_removable(call.callee()) {
                         return false;
                     }
+                    let func = data.curr_func.unwrap();
                     let conflicts = loop_insts.iter().copied().any(|other| {
                         match data.inst_data(other).kind() {
                             InstKind::Store(store) => {
-                                let base = resolve_base(data, data.global(), store.dest());
-                                write_may_hit(base, callee_effects)
+                                let targets = analysis.targets_of(data, func, store.dest());
+                                analysis.call_may_read(call.callee(), targets.as_ref())
                             }
                             InstKind::MemZero(mem_zero) => {
-                                let base = resolve_base(data, data.global(), mem_zero.dest());
-                                write_may_hit(base, callee_effects)
+                                let targets = analysis.targets_of(data, func, mem_zero.dest());
+                                analysis.call_may_read(call.callee(), targets.as_ref())
                             }
-                            InstKind::Call(other_call) => effects
-                                .get(&other_call.callee())
-                                .is_some_and(|e| e.may_conflict_with_reads_of(callee_effects)),
+                            InstKind::Call(other_call) => {
+                                let sibling = other_call.callee();
+                                match analysis.call_read_roots(call.callee(), func) {
+                                    Some(reads) => {
+                                        let reads = reads
+                                            .iter()
+                                            .map(|r| match r {
+                                                WriteRoot::Global(g) => {
+                                                    AbstractObject::Global(*g)
+                                                }
+                                                WriteRoot::Local(f, a) => {
+                                                    AbstractObject::Alloc(*f, *a)
+                                                }
+                                            })
+                                            .collect::<FxHashSet<_>>();
+                                        analysis.call_may_write(sibling, Some(&reads))
+                                    }
+                                    None => analysis.effects_of(sibling).may_write_memory(),
+                                }
+                            }
                             _ => false,
                         }
                     });
@@ -365,9 +374,13 @@ impl Pass for LICM {
         if data.layout().is_decl() {
             return false;
         }
-        // Function-level side effects do not change while this pass runs
-        // (LICM only relocates instructions), so analyze once per invocation.
-        let effects = analyze(data.program);
+        // Direct invocations (unit tests, pre-run_on callers) have no
+        // analysis yet; build one locally. Function-level side effects do
+        // not change while this pass runs (LICM only relocates
+        // instructions), so analyzing once per invocation is enough.
+        if self.analysis.is_none() {
+            self.analysis = Some(EffectAnalysis::new(data.program));
+        }
         let mut changed = false;
         loop {
             let Some(cfg) = CFG::new(data) else {
@@ -400,7 +413,6 @@ impl Pass for LICM {
                     &cfg,
                     &dom_tree,
                     &parameter_blocks,
-                    &effects,
                 ) {
                     LoopResult::Unchanged => {}
                     LoopResult::Changed => changed = true,

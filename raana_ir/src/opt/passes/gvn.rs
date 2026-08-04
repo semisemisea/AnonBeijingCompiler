@@ -1,9 +1,7 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::opt::{
-    analysis_passes::function_side_effects::{
-        FunctionSideEffects, analyze, resolve_base, write_base_may_hit,
-    },
+    analysis_passes::effects::{AbstractObject, EffectAnalysis, WriteRoot},
     prelude::*,
 };
 
@@ -63,20 +61,20 @@ struct NumberedValue {
     eliminable: bool,
 }
 
-struct ValueNumbering {
+struct ValueNumbering<'a> {
     next: u32,
     by_inst: FxHashMap<Inst, NumberedValue>,
     by_key: FxHashMap<ValueKey, ValueNumber>,
-    effects: FxHashMap<Function, FunctionSideEffects>,
+    analysis: &'a EffectAnalysis,
 }
 
-impl ValueNumbering {
-    fn new(effects: FxHashMap<Function, FunctionSideEffects>) -> Self {
+impl<'a> ValueNumbering<'a> {
+    fn new(analysis: &'a EffectAnalysis) -> Self {
         Self {
             next: 0,
             by_inst: FxHashMap::default(),
             by_key: FxHashMap::default(),
-            effects,
+            analysis,
         }
     }
 
@@ -162,10 +160,7 @@ impl ValueNumbering {
                 // run_on handles. Other calls still get a (shared) number so
                 // their arguments are numbered consistently, but are never
                 // eliminated.
-                let eliminable = self
-                    .effects
-                    .get(&call.callee())
-                    .is_some_and(FunctionSideEffects::is_read_only);
+                let eliminable = self.analysis.is_removable(call.callee());
                 (
                     ValueKey::Call {
                         callee: call.callee(),
@@ -297,7 +292,7 @@ impl ScopedLoadLeaders {
 /// that base, and a sibling call only kills leaders whose callee's read set
 /// intersects the sibling's write set.
 struct ScopedCallLeaders {
-    leaders: FxHashMap<ValueNumber, (Inst, FunctionSideEffects)>,
+    leaders: FxHashMap<ValueNumber, (Inst, Function)>,
     scopes: Vec<Vec<ValueNumber>>,
 }
 
@@ -317,18 +312,17 @@ impl ScopedCallLeaders {
         self.leaders.get(&number).map(|(leader, _)| *leader)
     }
 
-    fn insert(&mut self, number: ValueNumber, leader: Inst, effects: FunctionSideEffects) {
-        self.leaders.insert(number, (leader, effects));
+    fn insert(&mut self, number: ValueNumber, leader: Inst, callee: Function) {
+        self.leaders.insert(number, (leader, callee));
         self.scopes.last_mut().unwrap().push(number);
     }
 
-    /// Drop every leader whose callee's read set may be hit by a write
-    /// described by `predicate`.
-    fn invalidate_matching(&mut self, predicate: impl Fn(&FunctionSideEffects) -> bool) {
+    /// Drop every leader whose callee satisfies `predicate`.
+    fn invalidate_matching(&mut self, predicate: impl Fn(Function) -> bool) {
         let stale = self
             .leaders
             .iter()
-            .filter(|(_, (_, effects))| predicate(effects))
+            .filter(|(_, (_, callee))| predicate(*callee))
             .map(|(&number, _)| number)
             .collect::<Vec<_>>();
         for number in stale {
@@ -359,8 +353,8 @@ impl Pass for GlobalInstNumbering {
         let dominance_tree = dom_tree::build_dominance_tree(&idom, rpo.len());
         // Function-level effects do not change while this pass runs (GVN
         // only replaces values), so analyze once per invocation.
-        let effects = analyze(data.program);
-        let mut numbers = ValueNumbering::new(effects.clone());
+        let analysis = EffectAnalysis::new(data.program);
+        let mut numbers = ValueNumbering::new(&analysis);
         let mut leaders = ScopedLeaders::new();
 
         enum Visit {
@@ -414,36 +408,68 @@ impl Pass for GlobalInstNumbering {
                         load_leaders.record_store();
                         // Precisely invalidate call leaders whose callee may
                         // read the stored location.
-                        let base = resolve_base(data, data.global(), store.dest());
-                        call_leaders.invalidate_matching(|e| write_base_may_hit(base, e));
+                        let func = data.curr_func.unwrap();
+                        let targets = analysis.targets_of(data, func, store.dest());
+                        call_leaders.invalidate_matching(|c| {
+                            analysis.call_may_read(c, targets.as_ref())
+                        });
                     }
                     InstKind::MemZero(mem_zero) => {
                         load_leaders.record_store();
-                        let base = resolve_base(data, data.global(), mem_zero.dest());
-                        call_leaders.invalidate_matching(|e| write_base_may_hit(base, e));
+                        let func = data.curr_func.unwrap();
+                        let targets = analysis.targets_of(data, func, mem_zero.dest());
+                        call_leaders.invalidate_matching(|c| {
+                            analysis.call_may_read(c, targets.as_ref())
+                        });
                     }
                     InstKind::Call(call) => {
                         // A call that writes no external memory (a read-only
                         // or pure-I/O callee) cannot clobber a loaded value,
                         // so load leaders stay valid across it.
-                        let may_write = match effects.get(&call.callee()) {
-                            Some(e) => e.has_external_writes(),
-                            None => true,
-                        };
-                        if may_write {
+                        if analysis.effects_of(call.callee()).may_write_memory() {
                             load_leaders.record_store();
                         }
                         // A sibling call may write what a call leader reads.
-                        match effects.get(&call.callee()) {
-                            Some(e) => {
-                                let e = e.clone();
-                                call_leaders.invalidate_matching(move |leader| {
-                                    e.may_conflict_with_reads_of(leader)
-                                });
+                        let func = data.curr_func.unwrap();
+                        let sibling = call.callee();
+                        let has_conflict = match analysis.call_read_roots(sibling, func) {
+                            Some(leader_reads) => {
+                                let reads = leader_reads
+                                    .iter()
+                                    .map(|r| match r {
+                                        WriteRoot::Global(g) => AbstractObject::Global(*g),
+                                        WriteRoot::Local(f, a) => {
+                                            AbstractObject::Alloc(*f, *a)
+                                        }
+                                    })
+                                    .collect::<FxHashSet<_>>();
+                                analysis.call_may_write(sibling, Some(&reads))
                             }
-                            // Library calls are not in the analysis map;
-                            // conservatively assume they may write anything.
-                            None => call_leaders.invalidate_matching(|_| true),
+                            // The sibling may read anything: any leader may
+                            // be clobbered if the sibling writes anything at
+                            // all.
+                            None => analysis.effects_of(sibling).may_write_memory(),
+                        };
+                        if has_conflict {
+                            // Conservatively: only the leaders the sibling
+                            // may actually write get dropped; recompute the
+                            // per-leader check below.
+                            call_leaders.invalidate_matching(|c| {
+                                let reads = match analysis.call_read_roots(c, func) {
+                                    Some(reads) => reads,
+                                    None => return analysis.effects_of(sibling).may_write_memory(),
+                                };
+                                let reads = reads
+                                    .iter()
+                                    .map(|r| match r {
+                                        WriteRoot::Global(g) => AbstractObject::Global(*g),
+                                        WriteRoot::Local(f, a) => {
+                                            AbstractObject::Alloc(*f, *a)
+                                        }
+                                    })
+                                    .collect::<FxHashSet<_>>();
+                                analysis.call_may_write(sibling, Some(&reads))
+                            });
                         }
                     }
                     _ => {}
@@ -476,9 +502,7 @@ impl Pass for GlobalInstNumbering {
                     // call_leaders; everything else goes through the generic
                     // leaders map.
                     if let InstKind::Call(call) = data.inst_data(value).kind() {
-                        if let Some(e) = effects.get(&call.callee()) {
-                            call_leaders.insert(numbered.number, value, e.clone());
-                        }
+                        call_leaders.insert(numbered.number, value, call.callee());
                     } else {
                         leaders.insert(numbered.number, value);
                     }

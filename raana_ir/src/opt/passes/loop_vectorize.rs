@@ -175,6 +175,11 @@ struct VecPlan {
     vector_ty: Type,
     /// B1: register-reduction plan, or None for plain elementwise loops.
     reduction: Option<ReductionPlan>,
+    /// Loop-invariant passthrough parameters: outer induction values the
+    /// back edge forwards unchanged (e.g. the inner loop of a nested kernel
+    /// reads the outer IVs). Their entry arguments stay live across the
+    /// vectorized loop and are forwarded to the exit / epilogue chain.
+    passthrough_args: Vec<Inst>,
 }
 
 /// B1: a register accumulator recognized by M42 (`Reducible`) on a 3-param
@@ -354,53 +359,19 @@ fn analyze_loop(
         }
     }
 
-    // 4. Header parameters: [iv, t] (elementwise) or [iv, acc, t] (B1
-    //    reduction). All parameters must be i32 scalars (the vector
+    // 4. Header parameters: [iv, t] (elementwise), [iv, acc, t] (B1
+    //    reduction), optionally extended with loop-invariant *passthrough*
+    //    parameters — outer induction values the back edge forwards
+    //    unchanged (the common nested-kernel shape: an inner loop reads the
+    //    outer IVs). All parameters must be i32 scalars (the vector
     //    re-typing below happens in the mutation phase, and re-running this
     //    analysis on an already-vectorized loop is rejected here).
+    //
+    //    The latch terminator is inspected here to distinguish passthrough
+    //    params (back-edge argument == the parameter itself) from the loop's
+    //    own [iv, t] / [iv, acc, t] parameter set.
     let params = data.bb_data(header).params();
     let n_params = params.len();
-    let acc_info: Option<(Inst, usize, BinaryOp)> = if n_params == 2 {
-        None
-    } else if n_params == 3 {
-        let Verdict::Reducible { accumulator, op } = &dep.verdict else {
-            trace(data, looop, "b1_not_reducible");
-            return None;
-        };
-        let acc_slot = match params.iter().position(|&p| p == *accumulator) {
-            Some(slot) => slot,
-            None => {
-                trace(data, looop, "b1_acc_not_param");
-                return None;
-            }
-        };
-        let bop = match op {
-            ReductionOp::IntAdd => BinaryOp::Add,
-            ReductionOp::IntSub => BinaryOp::Sub,
-            _ => {
-                // IntMul/IntMin/IntMax accumulate differently; B1 keeps them
-                // scalar.
-                trace(data, looop, "b1_op_not_add_sub");
-                return None;
-            }
-        };
-        Some((*accumulator, acc_slot, bop))
-    } else {
-        trace(data, looop, "params_not_2");
-        return None;
-    };
-    for &p in params.iter() {
-        if !arena.inst_data(p).ty().is_i32() {
-            trace(data, looop, "params_not_i32");
-            return None;
-        }
-    }
-
-    // 5. Latch terminator: `br t', header([...']), exit`. The last header
-    //    parameter is the trip counter (`t' = sub(t, 1)` doubles as the
-    //    condition); the remaining non-accumulator parameter is the index IV
-    //    (`iv' = add(iv, 1)`). The exit takes either no parameters or
-    //    exactly the final accumulator value (B1).
     let latch_branch = data.layout().basicblock(latch).terminator();
     let InstKind::Branch(branch) = arena.inst_data(latch_branch).kind() else {
         return None;
@@ -414,18 +385,76 @@ fn analyze_loop(
         trace(data, looop, "latch_exit_inside_or_args");
         return None;
     }
-    let exit_params = data.bb_data(exit).params();
-    if branch.f_args().len() != exit_params.len() || exit_params.len() > 1 {
-        trace(data, looop, "exit_has_params");
-        return None;
-    }
     let back_args = branch.t_args();
     if back_args.len() != n_params {
         trace(data, looop, "back_args_not_2");
         return None;
     }
-    let t_next = branch.cond();
+    // Passthrough slots: the back-edge argument is the parameter itself.
+    // The trip counter is the last parameter (its back-edge arg is the
+    // `t' = sub(t, 1)` condition, never the parameter itself).
+    let passthrough: Vec<usize> = (0..n_params)
+        .filter(|&i| back_args[i] == params[i])
+        .collect();
     let counter_slot = n_params - 1;
+    let effective: Vec<usize> = (0..n_params)
+        .filter(|&i| i != counter_slot && !passthrough.contains(&i))
+        .collect();
+    let acc_info: Option<(Inst, usize, BinaryOp)> = match effective.len() {
+        1 => None,
+        2 => {
+            let Verdict::Reducible { accumulator, op } = &dep.verdict else {
+                trace(data, looop, "b1_not_reducible");
+                return None;
+            };
+            let acc_slot = match params.iter().position(|&p| p == *accumulator) {
+                Some(slot) => slot,
+                None => {
+                    trace(data, looop, "b1_acc_not_param");
+                    return None;
+                }
+            };
+            if passthrough.contains(&acc_slot) || acc_slot == counter_slot {
+                trace(data, looop, "b1_acc_is_passthrough_or_counter");
+                return None;
+            }
+            let bop = match op {
+                ReductionOp::IntAdd => BinaryOp::Add,
+                ReductionOp::IntSub => BinaryOp::Sub,
+                _ => {
+                    // IntMul/IntMin/IntMax accumulate differently; B1 keeps
+                    // them scalar.
+                    trace(data, looop, "b1_op_not_add_sub");
+                    return None;
+                }
+            };
+            Some((*accumulator, acc_slot, bop))
+        }
+        _ => {
+            trace(data, looop, "params_not_2");
+            return None;
+        }
+    };
+    for &p in params.iter() {
+        if !arena.inst_data(p).ty().is_i32() {
+            trace(data, looop, "params_not_i32");
+            return None;
+        }
+    }
+
+    // 5. Latch terminator details: `br t', header([...']), exit`. The last
+    //    header parameter is the trip counter (`t' = sub(t, 1)` doubles as
+    //    the condition); the remaining non-accumulator, non-passthrough
+    //    parameter is the index IV (`iv' = add(iv, 1)`). The exit takes the
+    //    passthrough values (and, for B1, the final accumulator as its first
+    //    parameter).
+    let exit_params = data.bb_data(exit).params();
+    let expected_exit = passthrough.len() + usize::from(acc_info.is_some());
+    if branch.f_args().len() != exit_params.len() || exit_params.len() != expected_exit {
+        trace(data, looop, "exit_has_params");
+        return None;
+    }
+    let t_next = branch.cond();
     if back_args[counter_slot] != t_next {
         trace(data, looop, "counter_not_cond");
         return None;
@@ -434,20 +463,24 @@ fn analyze_loop(
     let (iv, iv_next, iv_slot) = match acc_info {
         Some((acc, acc_slot, _)) => {
             let slots: Vec<usize> = (0..n_params)
-                .filter(|&i| i != acc_slot && i != counter_slot)
+                .filter(|&i| i != acc_slot && i != counter_slot && !passthrough.contains(&i))
                 .collect();
             debug_assert_eq!(slots.len(), 1);
             (params[slots[0]], back_args[slots[0]], slots[0])
         }
-        None => (params[0], back_args[0], 0),
+        None => {
+            debug_assert_eq!(effective.len(), 1);
+            let slot = effective[0];
+            (params[slot], back_args[slot], slot)
+        }
     };
     if !is_add_one(arena, iv_next, iv) || !is_sub_one(arena, t_next, counter) {
         trace(data, looop, "non_unit_step");
         return None;
     }
     // For a reduction, the accumulator's back-edge arg must be its update
-    // `acc' = binary(op, acc, delta)`; the exit arg (if any) carries the same
-    // final value.
+    // `acc' = binary(op, acc, delta)`; the exit's first arg carries the same
+    // final value (the remaining exit args are the passthrough values).
     let acc_update: Option<(Inst, Inst)> = match acc_info {
         Some((acc, acc_slot, bop)) => {
             let update = back_args[acc_slot];
@@ -499,6 +532,12 @@ fn analyze_loop(
         trace(data, looop, "entry_args_not_2");
         return None;
     }
+    // Passthrough entry arguments: loop-invariant values forwarded to the
+    // exit / epilogue chain after vectorization (their params stay i32).
+    let passthrough_args: Vec<Inst> = passthrough
+        .iter()
+        .map(|&slot| entry_args[slot])
+        .collect();
 
     // 7. Exact trip: the initial index and the trip counter must be
     //    compile-time constants, and the trip must fit at least one vector
@@ -776,6 +815,7 @@ fn analyze_loop(
         classes,
         vector_ty: Type::get_vector(elem_ty, VF as usize),
         reduction,
+        passthrough_args,
     })
 }
 
@@ -871,8 +911,10 @@ fn is_vectorizable_binary_op(op: BinaryOp) -> bool {
 }
 
 /// Loop-invariant value: a compile-time constant, a global, a dominating
-/// (outside-the-loop) definition, or an outer block parameter. Header/latch
-/// block parameters and in-loop definitions are loop-variant.
+/// (outside-the-loop) definition, an outer block parameter, or a header
+/// *passthrough* parameter (an outer induction value the back edge forwards
+/// unchanged — its value does not vary across iterations). Header/latch
+/// block parameters with a real back-edge update are loop-variant.
 fn is_loop_invariant(arena: &ArenaContext<'_>, inst: Inst, header: BasicBlock, latch: BasicBlock) -> bool {
     if matches!(
         arena.inst_data(inst).kind(),
@@ -880,7 +922,16 @@ fn is_loop_invariant(arena: &ArenaContext<'_>, inst: Inst, header: BasicBlock, l
     ) {
         return true;
     }
-    if arena.bb_data(header).params().contains(&inst) || arena.bb_data(latch).params().contains(&inst) {
+    if let Some(slot) = arena.bb_data(header).params().iter().position(|&p| p == inst) {
+        // A passthrough parameter: the back-edge argument is the parameter
+        // itself.
+        let term = arena.curr_func_data().layout().basicblock(latch).terminator();
+        let InstKind::Branch(branch) = arena.inst_data(term).kind() else {
+            return false;
+        };
+        return branch.t_args().get(slot) == Some(&inst);
+    }
+    if arena.bb_data(latch).params().contains(&inst) {
         return false;
     }
     match arena.curr_func_data().layout().parent_bb(inst) {
@@ -949,39 +1000,45 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         classes,
         vector_ty,
         reduction,
+        passthrough_args,
     } = plan;
     let q = trip / VF;
     let r = trip % VF;
     let i32 = Type::get_i32();
-    // The trip counter is the last header parameter ([iv, t] or [iv, acc, t]).
-    let entry_arg_count = 2 + usize::from(reduction.is_some());
+    let n_passthrough = passthrough_args.len();
+    // The trip counter is the last header parameter; passthrough params
+    // precede it ([.. passthroughs .., iv (, acc), t]).
+    let entry_arg_count = 2 + usize::from(reduction.is_some()) + n_passthrough;
 
     // 1. Scalar epilogue: peel `r` (0..=3) straight-line copies of the
     //    original body with the index IV substituted by constants. Reduction
     //    epilogues carry the scalar accumulator as a block parameter and
-    //    keep accumulating.
+    //    keep accumulating; passthrough values ride along as parameters so
+    //    the chain can forward them to the exit.
     let mut epi_blocks: Vec<BasicBlock> = Vec::new();
     if r > 0 {
         for k in 0..r {
-            let block = data.new_basic_block().basic_block(
-                format!("vec_epi_{k}"),
-                if reduction.is_some() {
-                    vec![i32.clone()]
-                } else {
-                    vec![]
-                },
-            );
+            let mut param_tys = vec![i32.clone(); n_passthrough];
+            if reduction.is_some() {
+                param_tys.insert(0, i32.clone());
+            }
+            let block = data
+                .new_basic_block()
+                .basic_block(format!("vec_epi_{k}"), param_tys);
             epi_blocks.push(block);
         }
     }
 
     // 1b. Reduction exit block: `acc_final = VectorReduce(Add, acc_vec)`,
     //     then jump into the epilogue chain (or straight to the exit when
-    //     r == 0). Placed right after the latch.
+    //     r == 0). Placed right after the latch. Passthrough values are
+    //     forwarded alongside the reduced accumulator.
     let reduce_block: Option<BasicBlock> = if let Some(red) = &reduction {
+        let mut param_tys = vec![i32.clone(); n_passthrough];
+        param_tys.insert(0, vector_ty.clone());
         let rb = data
             .new_basic_block()
-            .basic_block("vec_reduce".into(), vec![vector_ty.clone()]);
+            .basic_block("vec_reduce".into(), param_tys);
         data.layout_mut().insert_bb_after(latch, rb);
         let acc_vec_param = data.bb_data(rb).params()[0];
         let acc_final = alloc_inst(
@@ -989,9 +1046,11 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             VectorReduce::new_data(VectorReduceOp::Add, acc_vec_param, i32.clone()),
         );
         data.layout_mut().insert_inst(rb, acc_final);
+        let mut fwd = vec![acc_final];
+        fwd.extend(data.bb_data(rb).params()[1..].iter().copied());
         let (target, args) = match (epi_blocks.first().copied(), red.exit_acc_param) {
-            (Some(first), _) => (first, vec![acc_final]),
-            (None, Some(_)) => (exit, vec![acc_final]),
+            (Some(first), _) => (first, fwd),
+            (None, Some(_)) => (exit, fwd),
             (None, None) => (exit, vec![]),
         };
         let jump = data.new_local_inst().jump(target, args);
@@ -1024,6 +1083,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 insts.push(acc_k);
                 jump_args.push(acc_k);
             }
+            // Forward the invariant passthrough values through the chain.
+            let epi_params = data.bb_data(block).params();
+            let passthrough_start = usize::from(reduction.is_some());
+            jump_args.extend(epi_params[passthrough_start..].iter().copied());
             let target = epi_blocks.get(idx + 1).copied().unwrap_or(exit);
             insts.push(data.new_local_inst().jump(target, jump_args));
             let after = if idx == 0 {
@@ -1103,17 +1166,22 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     //     the epilogue chain (r > 0); untouched when neither applies. Runs
     //     after the accumulator update is re-typed (2b) so the branch's
     //     f_args type-check against the reduce block's vector parameter.
+    //     Passthrough values (loop-invariant) feed the chain / exit as-is.
     if reduction.is_some() || r > 0 {
         let (cond, t_target, t_args) = match data.inst_data(latch_branch).kind() {
             InstKind::Branch(b) => (b.cond(), b.t_target(), b.t_args().to_vec()),
             _ => unreachable!(),
         };
         let (f_target, f_args) = match &reduction {
-            Some(red) => (
-                reduce_block.expect("reduce block built when reduction is set"),
-                vec![red.acc_update],
-            ),
-            None => (epi_blocks[0], vec![]),
+            Some(red) => {
+                let mut args = vec![red.acc_update];
+                args.extend(passthrough_args.iter().copied());
+                (
+                    reduce_block.expect("reduce block built when reduction is set"),
+                    args,
+                )
+            }
+            None => (epi_blocks[0], passthrough_args.clone()),
         };
         data.replace_inst_with(latch_branch)
             .branch(cond, t_target, t_args, f_target, f_args);

@@ -522,6 +522,15 @@ impl RangeAnalysis {
         }
     }
 
+    /// Compute the incoming range state for `target`'s block parameters.
+    ///
+    /// Only the parameters are returned.  Non-parameter values reachable from
+    /// an edge are recovered lazily by `evaluate_contextual` along the def-use
+    /// chain (falling back to the global `self.ranges` join), and each block's
+    /// own definitions are re-derived when the block is processed.  Copying
+    /// every incoming edge's full state here is O(incoming × state) and
+    /// dominates the cost of range analysis on deeply nested loops; the join
+    /// loop in `solve` keeps `block_entries[target]` monotonic without it.
     fn join_incoming(
         &self,
         data: &crate::ir::FunctionData,
@@ -541,12 +550,6 @@ impl RangeAnalysis {
                 let range = self.evaluate_contextual(argument, state, &mut FxHashSet::default(), 0);
                 result
                     .entry(parameter)
-                    .and_modify(|old| *old = old.join(range))
-                    .or_insert(range);
-            }
-            for (&value, &range) in state {
-                result
-                    .entry(value)
                     .and_modify(|old| *old = old.join(range))
                     .or_insert(range);
             }

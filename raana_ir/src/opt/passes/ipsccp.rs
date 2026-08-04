@@ -149,6 +149,12 @@ struct MemState {
     root_loaders: FxHashMap<RootKey, Vec<Node>>,
     /// every root ever modeled (for "may write anything" invalidation).
     all_roots: FxHashSet<RootKey>,
+    /// roots invalidated by an unknown write (unresolvable store
+    /// destination, may-write call). A root in this set never folds loads
+    /// again: the unknown write may have happened at any program point,
+    /// so a later store to the same cell (even a constant one) cannot be
+    /// trusted to be visible to earlier loads re-scheduled after it.
+    cleared_roots: FxHashSet<RootKey>,
 }
 
 impl MemState {
@@ -165,6 +171,14 @@ impl MemState {
     /// The value a load of `key` reads: the cell if any store wrote it,
     /// else a zero-range value if covered, else Bottom (unknown).
     fn read(&self, key: CellKey) -> Lattice {
+        // A root invalidated by an unknown write (dynamic-index store,
+        // may-write call) never folds again: the write may sit between
+        // any store and any load of the root, and re-scheduled loads
+        // would otherwise read a cell state that belongs to a different
+        // program point.
+        if self.cleared_roots.contains(&key.root()) {
+            return Lattice::Bottom;
+        }
         let cell = self.cell_fold(key);
         if cell != Lattice::Top {
             return cell;
@@ -213,7 +227,15 @@ impl MemState {
 
     /// Drop every cell and zero range of `root` (a call or an unknown
     /// destination may have overwritten anything).
-    fn clear(&mut self, root: RootKey) -> bool {
+    ///
+    /// `unknown_write` marks a *value-unknown* invalidation (dynamic-index
+    /// store, may-write-anything call): the write may sit between any
+    /// store and any load of the root, so the root must never fold loads
+    /// again (a re-scheduled load would read a cell state belonging to a
+    /// different program point). A `false` invalidation (call to a callee
+    /// with known write roots) only drops the current cells; the callee's
+    /// stores are modeled separately and may repopulate them.
+    fn clear(&mut self, root: RootKey, unknown_write: bool) -> bool {
         let mut changed = false;
         if let Some(keys) = self.root_cells.remove(&root) {
             for key in keys {
@@ -222,6 +244,9 @@ impl MemState {
             changed = true;
         }
         changed |= self.zero.remove(&root).is_some();
+        if unknown_write {
+            self.cleared_roots.insert(root);
+        }
         changed
     }
 
@@ -317,8 +342,9 @@ fn invalidate_call(
             .collect(),
         None => state.all_roots.iter().copied().collect(),
     };
+    let unknown = matches!(analysis.call_write_roots(callee, func), None);
     for root in roots {
-        if state.clear(root) {
+        if state.clear(root, unknown) {
             if let Some(loaders) = state.root_loaders.get(&root) {
                 mem_reschedule.extend(loaders.iter().copied());
             }
@@ -642,7 +668,7 @@ impl Pass for IPSCCP {
                                 let roots = state
                                     .possible_targets(&analysis, func, store.dest(), &ctx);
                                 for root in roots.unwrap_or_default() {
-                                    if state.clear(root) {
+                                    if state.clear(root, true) {
                                         if let Some(loaders) = state.root_loaders.get(&root) {
                                             mem_reschedule.extend(loaders.iter().copied());
                                         }
@@ -670,7 +696,7 @@ impl Pass for IPSCCP {
                                 let roots = state
                                     .possible_targets(&analysis, func, mem_zero.dest(), &ctx);
                                 for root in roots.unwrap_or_default() {
-                                    if state.clear(root) {
+                                    if state.clear(root, true) {
                                         if let Some(loaders) = state.root_loaders.get(&root) {
                                             mem_reschedule.extend(loaders.iter().copied());
                                         }

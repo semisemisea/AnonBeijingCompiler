@@ -176,12 +176,39 @@ fn aarch64_dynamic_term_cost(stride: u64) -> usize {
 fn aarch64_add_offset_cost(offset: i64) -> usize {
     let magnitude = offset.unsigned_abs();
     if magnitude <= 0xfff || (magnitude & 0xfff == 0 && magnitude >> 12 <= 0xfff) {
+        // A 12-bit (or 12-bit scaled by 12) immediate fits the add directly.
         1
     } else {
-        // A 64-bit constant can require four move-wide instructions before the
-        // final add, so use the worst-case Cortex-A53 instruction count.
-        5
+        // The backend materializes the constant with a move-wide sequence
+        // (`movz`/`movn` seed plus `movk` patches) followed by one add.
+        move_wide_cost(magnitude) + 1
     }
+}
+
+/// Number of instructions to materialize `value` into a 64-bit register using
+/// the backend's `plan_integer_constant` move-wide scheme: one seed
+/// (`movz`/`movn`) plus a `movk` per remaining chunk that differs from the
+/// seed. Mirrors `anon_armv8::constants::plan_integer_constant`'s cost.
+fn move_wide_cost(value: u64) -> usize {
+    if value == 0 {
+        return 1;
+    }
+    let chunks = [
+        value as u16,
+        (value >> 16) as u16,
+        (value >> 32) as u16,
+        (value >> 48) as u16,
+    ];
+    let zero_cost = chunks.iter().filter(|&&chunk| chunk != 0).count();
+    let ones_cost = chunks.iter().filter(|&&chunk| chunk != u16::MAX).count();
+    let use_movn = ones_cost < zero_cost;
+    let seed = if use_movn { u16::MAX } else { 0 };
+    // Seed + one `movk` per chunk that still differs from the seed.
+    1 + chunks
+        .iter()
+        .filter(|&&chunk| chunk != seed)
+        .count()
+        .saturating_sub(1)
 }
 
 #[cfg(test)]
@@ -255,6 +282,9 @@ mod tests {
         assert_eq!(aarch64_add_offset_cost(4096), 1);
         assert_eq!(aarch64_add_offset_cost(64), 1);
         assert_eq!(aarch64_add_offset_cost(-64), 1);
-        assert_eq!(aarch64_add_offset_cost(4097), 5);
+        // 4097 = 0x1001: a single movz seed (one nonzero chunk) plus one add.
+        assert_eq!(aarch64_add_offset_cost(4097), 2);
+        // 0x1234_5678 needs a movz seed plus one movk patch plus one add.
+        assert_eq!(aarch64_add_offset_cost(0x12345678), 3);
     }
 }

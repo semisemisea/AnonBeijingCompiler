@@ -643,6 +643,10 @@ fn test_access_pair(
 
 /// Match `acc ± E` / `acc * E` / `min(acc, E)` etc., or
 /// `select(c, acc op E, acc)`. `E` must not be `acc`.
+/// The reduction operation when `update` combines `acc` with an expression:
+/// `acc op E`, `E op acc` (binary), `select(cond, acc op E, acc)`, or a
+/// phi-join block parameter whose incoming arms are `acc` (passthrough) or
+/// `acc op E`. Returns `None` when the shape is not a reduction.
 fn match_acc_update_op(
     arena: &ArenaContext<'_>,
     acc: Inst,
@@ -679,6 +683,69 @@ fn match_acc_update_op(
                 return None;
             };
             is_delta(binary)
+        }
+        InstKind::BlockArgRef(_) => {
+            // Phi-join reduction (if-branch + join block): the back-edge
+            // value is a block parameter whose incoming arms are `acc`
+            // (passthrough) or `acc op E`. At least one arm must update.
+            let Some(param_block) = data
+                .layout()
+                .basicblocks()
+                .iter()
+                .find(|l| data.bb_data(l.bb()).params().contains(&update))
+                .map(|l| l.bb())
+            else {
+                return None;
+            };
+            let param_pos = data
+                .bb_data(param_block)
+                .params()
+                .iter()
+                .position(|&p| p == update)
+                .unwrap();
+            let preds: Vec<Inst> = data
+                .bb_data(param_block)
+                .used_by()
+                .iter()
+                .copied()
+                .collect();
+            if preds.is_empty() {
+                return None;
+            }
+            let mut op: Option<ReductionOp> = None;
+            let mut saw_update = false;
+            for pred_inst in preds {
+                let args: Vec<Inst> = match data.inst_data(pred_inst).kind() {
+                    InstKind::Jump(jump) => jump.args().to_vec(),
+                    InstKind::Branch(branch) if branch.t_target() == param_block => {
+                        branch.t_args().to_vec()
+                    }
+                    InstKind::Branch(branch) if branch.f_target() == param_block => {
+                        branch.f_args().to_vec()
+                    }
+                    _ => return None,
+                };
+                let &arg = args.get(param_pos)?;
+                if arg == acc {
+                    continue; // Passthrough arm.
+                }
+                let InstKind::Binary(binary) = data.inst_data(arg).kind() else {
+                    return None;
+                };
+                let arm_op = is_delta(binary)?;
+                if let Some(prev) = op {
+                    if prev != arm_op {
+                        return None;
+                    }
+                }
+                op = Some(arm_op);
+                saw_update = true;
+            }
+            if saw_update {
+                op
+            } else {
+                None // All arms passthrough: invariant parameter, not a reduction.
+            }
         }
         _ => None,
     }
@@ -718,20 +785,72 @@ fn identify_reduction(
             continue;
         };
         // The accumulator must not be used by any body instruction outside
-        // the update chain (the update + its select wrapper).
+        // the update chain (the update + its select wrapper, or the phi-join
+        // arms for a block-parameter update).
         let mut chain: SmallVec<[Inst; 4]> = SmallVec::new();
         chain.push(update);
         if let InstKind::Select(select) = data.inst_data(update).kind() {
             chain.push(select.if_true());
         }
+        if let InstKind::BlockArgRef(_) = data.inst_data(update).kind() {
+            // Phi-join: the update block's incoming arms that consume `acc`
+            // (the `acc op E` computations) are part of the chain.
+            if let Some(param_block) = data
+                .layout()
+                .basicblocks()
+                .iter()
+                .find(|l| data.bb_data(l.bb()).params().contains(&update))
+                .map(|l| l.bb())
+            {
+                for pred_inst in data.bb_data(param_block).used_by().iter().copied().collect::<Vec<_>>() {
+                    let args: Vec<Inst> = match data.inst_data(pred_inst).kind() {
+                        InstKind::Jump(jump) => jump.args().to_vec(),
+                        InstKind::Branch(branch) if branch.t_target() == param_block => {
+                            branch.t_args().to_vec()
+                        }
+                        InstKind::Branch(branch) if branch.f_target() == param_block => {
+                            branch.f_args().to_vec()
+                        }
+                        _ => continue,
+                    };
+                    for arg in args {
+                        if arg != update && data.inst_data(arg).inst_usage().any(|u| u == acc) {
+                            chain.push(arg);
+                        }
+                    }
+                }
+            }
+        }
         let mut used_elsewhere = false;
+        // For a phi-join update, the edges passing `acc` into the join block
+        // are part of the reduction (the passthrough arm); only the phi
+        // block itself needs to be known to skip them.
+        let phi_block: Option<BasicBlock> = if let InstKind::BlockArgRef(_) =
+            data.inst_data(update).kind()
+        {
+            data.layout()
+                .basicblocks()
+                .iter()
+                .find(|l| data.bb_data(l.bb()).params().contains(&update))
+                .map(|l| l.bb())
+        } else {
+            None
+        };
         for &bb in looop.body() {
             for &inst in data.layout().basicblock(bb).insts() {
                 if chain.contains(&inst) {
                     continue;
                 }
+                let is_phi_edge = matches!(
+                    (data.inst_data(inst).kind(), phi_block),
+                    (InstKind::Jump(jump), Some(block)) if jump.target() == block,
+                ) || matches!(
+                    (data.inst_data(inst).kind(), phi_block),
+                    (InstKind::Branch(branch), Some(block))
+                        if branch.t_target() == block || branch.f_target() == block,
+                );
                 for used in data.inst_data(inst).inst_usage() {
-                    if used == acc {
+                    if used == acc && !is_phi_edge {
                         used_elsewhere = true;
                     }
                 }
@@ -956,6 +1075,98 @@ mod tests {
         let (_cfg, _dom, loops) = LoopAnalysis::new(data);
         let looop = loops.loops().first().expect("one loop");
         analysis.for_loop(looop).expect("analyzed").clone()
+    }
+
+    /// matmul1 shape: the reduction flows through an if-branch + join block —
+    /// the back-edge value is the join block's parameter, whose arms are
+    /// `acc` (passthrough) and `acc + load` (update).
+    fn build_phi_reduction(program: &mut Program, passthrough_only: bool) -> Function {
+        let function = program.new_function(
+            Type::get_i32(),
+            "phi_reduction".into(),
+            vec![Type::get_pointer(Type::get_array(Type::get_i32(), 16))],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let base = data.params()[0];
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32(), Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let then = data.new_basic_block().basic_block("then".into(), vec![]);
+        let join = data.new_basic_block().basic_block("join".into(), vec![Type::get_i32()]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, then, join, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let acc = data.bb_data(header).params()[0];
+        let j = data.bb_data(header).params()[1];
+        let one = data.new_local_inst().integer(1);
+        let n16 = data.new_local_inst().integer(16);
+
+        let gep = data.new_local_inst().get_elem_ptr(base, vec![zero, j]);
+        let load = data.new_local_inst().load(gep);
+        let cond = data.new_local_inst().binary(BinaryOp::Gt, load, zero);
+        let branch = data
+            .new_local_inst()
+            .branch(cond, then, vec![], join, vec![acc]);
+        for inst in [gep, load, cond, branch] {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        let add = data.new_local_inst().binary(BinaryOp::Add, acc, load);
+        let then_jump = if passthrough_only {
+            // Degenerate arm: join receives `load` (not acc-derived).
+            data.new_local_inst().jump(join, vec![load])
+        } else {
+            data.new_local_inst().jump(join, vec![add])
+        };
+        for inst in [add, then_jump] {
+            data.layout_mut().insert_inst(then, inst);
+        }
+        let join_param = data.bb_data(join).params()[0];
+        let j_update = data.new_local_inst().binary(BinaryOp::Add, j, one);
+        let back = data.new_local_inst().jump(header, vec![join_param, j_update]);
+        data.layout_mut().insert_inst(join, j_update);
+        data.layout_mut().insert_inst(join, back);
+
+        let compare = data.new_local_inst().binary(BinaryOp::Lt, j, n16);
+        let header_branch = data
+            .new_local_inst()
+            .branch(compare, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, compare);
+        data.layout_mut().insert_inst(header, header_branch);
+
+        let ret = data.new_local_inst().ret(Some(acc));
+        data.layout_mut().insert_inst(exit, ret);
+        function
+    }
+
+    #[test]
+    fn phi_join_reduction_is_reducible() {
+        let mut program = Program::new();
+        let function = build_phi_reduction(&mut program, false);
+        let dep = analyze(&program, function);
+        let Verdict::Reducible { accumulator, op } = dep.verdict else {
+            panic!("expected Reducible, got {:?}", dep.verdict);
+        };
+        assert_eq!(op, ReductionOp::IntAdd);
+        assert!(program.func_data(function).inst_data(accumulator).ty().is_i32());
+    }
+
+    #[test]
+    fn phi_join_with_non_acc_arm_is_not_a_reduction() {
+        let mut program = Program::new();
+        let function = build_phi_reduction(&mut program, true);
+        let dep = analyze(&program, function);
+        assert!(
+            !matches!(dep.verdict, Verdict::Reducible { .. }),
+            "a phi arm carrying a non-acc value must not be a reduction"
+        );
     }
 
     #[test]

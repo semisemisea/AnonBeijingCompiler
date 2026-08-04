@@ -58,6 +58,12 @@ fn locally_pure(program: &Program, func: Function) -> bool {
     if is_library_function(data.name()) {
         return false;
     }
+    // The M60 `soyo_mulmod` modmul builtin is a compiler-provided declaration
+    // with no body, but it is pure: the AArch64 backend expands every call to
+    // `smull; sxtw; sdiv; msub` arithmetic with no side effects.
+    if data.name() == super::return_summary::MODMUL_BUILTIN {
+        return true;
+    }
     // Declarations (library-style entries with no body) have unknown
     // behaviour; never treat them as pure.
     if data.layout().entry_bb().is_none() {

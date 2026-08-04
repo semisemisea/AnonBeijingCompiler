@@ -52,7 +52,8 @@ use crate::ir::{
     arena::Arena,
     builder_trait::*,
     inst_kind::{
-        Binary, Float, GetElemPtr, InstKind, Integer, Load, Store, VectorSplat,
+        Binary, Float, GetElemPtr, InstKind, Integer, Load, Store, VectorReduce,
+        VectorReduceOp, VectorSplat,
     },
     types::{Type, TypeKind},
     BasicBlock, BinaryOp, Function, Inst, Program,
@@ -60,7 +61,7 @@ use crate::ir::{
 use crate::ir::function::FunctionData;
 use crate::opt::{
     analysis_passes::{
-        dependence::{AccessKind, DependenceAnalysis, Verdict},
+        dependence::{AccessKind, DependenceAnalysis, ReductionOp, Verdict},
         effects::EffectAnalysis,
         loop_analysis::{Loop, LoopAnalysis},
         memory::MemObject,
@@ -168,6 +169,32 @@ struct VecPlan {
     classes: FxHashMap<Inst, Class>,
     /// `<4 x T>` result type (T = the loop's element type).
     vector_ty: Type,
+    /// B1: register-reduction plan, or None for plain elementwise loops.
+    reduction: Option<ReductionPlan>,
+}
+
+/// B1: a register accumulator recognized by M42 (`Reducible`) on a 3-param
+/// loop `[iv, acc, t]`. The accumulator is carried as a vector and reduced
+/// horizontally at the loop exit (`VectorReduce` / `addv`).
+#[derive(Debug, Clone)]
+struct ReductionPlan {
+    /// The accumulator header parameter, re-typed to `<4 x T>` in place.
+    acc: Inst,
+    /// Position of `acc` in the header parameter list.
+    acc_slot: usize,
+    /// Lane-wise accumulation op (IntAdd -> Add, IntSub -> Sub).
+    op: BinaryOp,
+    /// The latch instruction producing the next accumulator value
+    /// (`acc' = binary(op, acc, delta)`; re-typed in place, id preserved).
+    acc_update: Inst,
+    /// Per-iteration delta: a payload value (vectorized) or a loop-invariant
+    /// scalar (splatted).
+    delta: Inst,
+    /// Entry-edge argument for the accumulator slot (initial value).
+    acc_init: Inst,
+    /// The exit block's accumulator parameter (receives the reduced value),
+    /// or None when the exit takes no parameters.
+    exit_acc_param: Option<Inst>,
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +303,13 @@ fn analyze_loop(
     // 2. M42 verdict: not Forbidden. (Reducible is accepted; the trip
     //    counter is always labeled a reduction, see the module docs.)
     let dep = dependence.for_loop(looop)?;
+    if let Verdict::Reducible { accumulator, op } = &dep.verdict {
+        trace(
+            data,
+            looop,
+            &format!("verdict=Reducible{{acc={accumulator:?},op={op:?}}}"),
+        );
+    }
     if let Verdict::Forbidden { reason } = &dep.verdict {
         trace(data, looop, &format!("m42_forbidden:{reason:?}"));
         return None;
@@ -316,22 +350,53 @@ fn analyze_loop(
         }
     }
 
-    // 4. Header parameters: exactly [iv, t], both i32.
+    // 4. Header parameters: [iv, t] (elementwise) or [iv, acc, t] (B1
+    //    reduction). All parameters must be i32 scalars (the vector
+    //    re-typing below happens in the mutation phase, and re-running this
+    //    analysis on an already-vectorized loop is rejected here).
     let params = data.bb_data(header).params();
-    if params.len() != 2 {
+    let n_params = params.len();
+    let acc_info: Option<(Inst, usize, BinaryOp)> = if n_params == 2 {
+        None
+    } else if n_params == 3 {
+        let Verdict::Reducible { accumulator, op } = &dep.verdict else {
+            trace(data, looop, "b1_not_reducible");
+            return None;
+        };
+        let acc_slot = match params.iter().position(|&p| p == *accumulator) {
+            Some(slot) => slot,
+            None => {
+                trace(data, looop, "b1_acc_not_param");
+                return None;
+            }
+        };
+        let bop = match op {
+            ReductionOp::IntAdd => BinaryOp::Add,
+            ReductionOp::IntSub => BinaryOp::Sub,
+            _ => {
+                // IntMul/IntMin/IntMax accumulate differently; B1 keeps them
+                // scalar.
+                trace(data, looop, "b1_op_not_add_sub");
+                return None;
+            }
+        };
+        Some((*accumulator, acc_slot, bop))
+    } else {
         trace(data, looop, "params_not_2");
         return None;
-    }
-    let iv = params[0];
-    let counter = params[1];
-    if !arena.inst_data(iv).ty().is_i32() || !arena.inst_data(counter).ty().is_i32() {
-        trace(data, looop, "params_not_i32");
-        return None;
+    };
+    for &p in params.iter() {
+        if !arena.inst_data(p).ty().is_i32() {
+            trace(data, looop, "params_not_i32");
+            return None;
+        }
     }
 
-    // 5. Latch terminator: `br t', header([iv', t']), exit` with unit steps
-    //    `iv' = add(iv, 1)` and `t' = sub(t, 1)`; single exit, no exit
-    //    parameters (the epilogue chain passes no args).
+    // 5. Latch terminator: `br t', header([...']), exit`. The last header
+    //    parameter is the trip counter (`t' = sub(t, 1)` doubles as the
+    //    condition); the remaining non-accumulator parameter is the index IV
+    //    (`iv' = add(iv, 1)`). The exit takes either no parameters or
+    //    exactly the final accumulator value (B1).
     let latch_branch = data.layout().basicblock(latch).terminator();
     let InstKind::Branch(branch) = arena.inst_data(latch_branch).kind() else {
         return None;
@@ -341,29 +406,73 @@ fn analyze_loop(
         return None;
     }
     let exit = branch.f_target();
-    if looop.contains(exit) || !branch.f_args().is_empty() {
+    if looop.contains(exit) {
         trace(data, looop, "latch_exit_inside_or_args");
         return None;
     }
-    if !data.bb_data(exit).params().is_empty() {
+    let exit_params = data.bb_data(exit).params();
+    if branch.f_args().len() != exit_params.len() || exit_params.len() > 1 {
         trace(data, looop, "exit_has_params");
         return None;
     }
     let back_args = branch.t_args();
-    if back_args.len() != 2 {
+    if back_args.len() != n_params {
         trace(data, looop, "back_args_not_2");
         return None;
     }
     let t_next = branch.cond();
-    if back_args[1] != t_next {
+    let counter_slot = n_params - 1;
+    if back_args[counter_slot] != t_next {
         trace(data, looop, "counter_not_cond");
         return None;
     }
-    let iv_next = back_args[0];
+    let counter = params[counter_slot];
+    let (iv, iv_next, iv_slot) = match acc_info {
+        Some((acc, acc_slot, _)) => {
+            let slots: Vec<usize> = (0..n_params)
+                .filter(|&i| i != acc_slot && i != counter_slot)
+                .collect();
+            debug_assert_eq!(slots.len(), 1);
+            (params[slots[0]], back_args[slots[0]], slots[0])
+        }
+        None => (params[0], back_args[0], 0),
+    };
     if !is_add_one(arena, iv_next, iv) || !is_sub_one(arena, t_next, counter) {
         trace(data, looop, "non_unit_step");
         return None;
     }
+    // For a reduction, the accumulator's back-edge arg must be its update
+    // `acc' = binary(op, acc, delta)`; the exit arg (if any) carries the same
+    // final value.
+    let acc_update: Option<(Inst, Inst)> = match acc_info {
+        Some((acc, acc_slot, bop)) => {
+            let update = back_args[acc_slot];
+            let InstKind::Binary(binary) = arena.inst_data(update).kind() else {
+                trace(data, looop, "b1_acc_update_not_binary");
+                return None;
+            };
+            if binary.op() != bop || binary.lhs() != acc {
+                trace(data, looop, "b1_acc_update_shape");
+                return None;
+            }
+            if !exit_params.is_empty() && branch.f_args()[0] != update {
+                trace(data, looop, "exit_arg_not_acc");
+                return None;
+            }
+            let delta = binary.rhs();
+            // The accumulator must be consumed only by its update chain
+            // (and the exit argument). An exit that reads the header
+            // parameter directly is not the rotated form and stays scalar.
+            for &user in arena.inst_data(acc).used_by() {
+                if user != update && data.layout().parent_bb(user) != Some(latch) {
+                    trace(data, looop, "b1_acc_used_outside_latch");
+                    return None;
+                }
+            }
+            Some((update, delta))
+        }
+        None => None,
+    };
 
     // 6. Entry edge: exactly one outside predecessor, a guard branch or a
     //    plain jump into the header with [i0, t0].
@@ -382,19 +491,19 @@ fn analyze_loop(
             return None;
         }
     };
-    if entry_args.len() != 2 {
+    if entry_args.len() != n_params {
         trace(data, looop, "entry_args_not_2");
         return None;
     }
 
-    // 7. Exact trip: both the initial index and the trip counter must be
+    // 7. Exact trip: the initial index and the trip counter must be
     //    compile-time constants, and the trip must fit at least one vector
     //    iteration.
-    let Some(entry_i0) = constant_i64(arena, data, entry_args[0]) else {
+    let Some(entry_i0) = constant_i64(arena, data, entry_args[iv_slot]) else {
         trace(data, looop, "entry_i0_not_const");
         return None;
     };
-    let Some(trip) = constant_i64(arena, data, entry_args[1]) else {
+    let Some(trip) = constant_i64(arena, data, entry_args[counter_slot]) else {
         trace(data, looop, "entry_trip_not_const");
         return None;
     };
@@ -418,6 +527,9 @@ fn analyze_loop(
         set.insert(latch_branch, ());
         set.insert(t_next, ());
         set.insert(iv_next, ());
+        if let Some((update, _)) = acc_update {
+            set.insert(update, ());
+        }
         set
     };
     let payload: Vec<Inst> = latch_insts
@@ -581,6 +693,45 @@ fn analyze_loop(
     }
     let elem_ty = elem_ty?;
 
+    // B1: the accumulator delta must be a payload value (vectorized) or a
+    // loop-invariant scalar (splatted); then build the reduction plan.
+    let reduction = match acc_info {
+        None => None,
+        Some((acc, acc_slot, bop)) => {
+            let (update, delta) = acc_update.expect("acc_update set alongside acc_info");
+            let delta_class = payload
+                .iter()
+                .position(|&p| p == delta)
+                .and_then(|idx| classes.get(&payload[idx]).copied());
+            match delta_class {
+                Some(Class::VecLoad) | Some(Class::VecBinary) | Some(Class::Keep) => {}
+                Some(_) => {
+                    trace(data, looop, "b1_delta_not_vectorizable");
+                    return None;
+                }
+                None => {
+                    if !is_loop_invariant(arena, delta, header, latch) {
+                        trace(data, looop, "b1_delta_loop_variant");
+                        return None;
+                    }
+                }
+            }
+            Some(ReductionPlan {
+                acc,
+                acc_slot,
+                op: bop,
+                acc_update: update,
+                delta,
+                acc_init: entry_args[acc_slot],
+                exit_acc_param: if exit_params.is_empty() {
+                    None
+                } else {
+                    Some(exit_params[0])
+                },
+            })
+        }
+    };
+
     Some(VecPlan {
         header,
         latch,
@@ -596,6 +747,7 @@ fn analyze_loop(
         payload,
         classes,
         vector_ty: Type::get_vector(elem_ty, VF as usize),
+        reduction,
     })
 }
 
@@ -754,50 +906,94 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         payload,
         classes,
         vector_ty,
+        reduction,
     } = plan;
     let q = trip / VF;
     let r = trip % VF;
     let i32 = Type::get_i32();
+    // The trip counter is the last header parameter ([iv, t] or [iv, acc, t]).
+    let entry_arg_count = 2 + usize::from(reduction.is_some());
 
     // 1. Scalar epilogue: peel `r` (0..=3) straight-line copies of the
-    //    original body with the index IV substituted by constants.
+    //    original body with the index IV substituted by constants. Reduction
+    //    epilogues carry the scalar accumulator as a block parameter and
+    //    keep accumulating.
     let mut epi_blocks: Vec<BasicBlock> = Vec::new();
     if r > 0 {
         for k in 0..r {
-            let block = data
-                .new_basic_block()
-                .basic_block(format!("vec_epi_{k}"), vec![]);
+            let block = data.new_basic_block().basic_block(
+                format!("vec_epi_{k}"),
+                if reduction.is_some() {
+                    vec![i32.clone()]
+                } else {
+                    vec![]
+                },
+            );
             epi_blocks.push(block);
         }
+    }
+
+    // 1b. Reduction exit block: `acc_final = VectorReduce(Add, acc_vec)`,
+    //     then jump into the epilogue chain (or straight to the exit when
+    //     r == 0). Placed right after the latch.
+    let reduce_block: Option<BasicBlock> = if let Some(red) = &reduction {
+        let rb = data
+            .new_basic_block()
+            .basic_block("vec_reduce".into(), vec![vector_ty.clone()]);
+        data.layout_mut().insert_bb_after(latch, rb);
+        let acc_vec_param = data.bb_data(rb).params()[0];
+        let acc_final = alloc_inst(
+            data,
+            VectorReduce::new_data(VectorReduceOp::Add, acc_vec_param, i32.clone()),
+        );
+        data.layout_mut().insert_inst(rb, acc_final);
+        let (target, args) = match (epi_blocks.first().copied(), red.exit_acc_param) {
+            (Some(first), _) => (first, vec![acc_final]),
+            (None, Some(_)) => (exit, vec![acc_final]),
+            (None, None) => (exit, vec![]),
+        };
+        let jump = data.new_local_inst().jump(target, args);
+        data.layout_mut().insert_inst(rb, jump);
+        Some(rb)
+    } else {
+        None
+    };
+
+    if r > 0 {
         for (idx, &block) in epi_blocks.iter().enumerate() {
             let subst_iv = data
                 .new_local_inst()
                 .integer((entry_i0 + VF * q + idx as i64) as i32);
             let mut map = FxHashMap::<Inst, Inst>::default();
-            let mut insts: Vec<Inst> = Vec::with_capacity(payload.len() + 1);
+            let mut insts: Vec<Inst> = Vec::with_capacity(payload.len() + 2);
             for &orig in &payload {
                 insts.push(clone_payload_inst(data, orig, &mut map, iv, subst_iv));
             }
+            let mut jump_args: Vec<Inst> = Vec::new();
+            if let Some(red) = &reduction {
+                // acc_k' = op(acc_param, delta_k). The delta clone exists when
+                // the delta is a payload inst; invariant deltas are reused.
+                let delta_k = map.get(&red.delta).copied().unwrap_or(red.delta);
+                let acc_param = data.bb_data(block).params()[0];
+                let acc_k = alloc_inst(
+                    data,
+                    Binary::new_data(acc_param, delta_k, red.op, i32.clone()),
+                );
+                insts.push(acc_k);
+                jump_args.push(acc_k);
+            }
             let target = epi_blocks.get(idx + 1).copied().unwrap_or(exit);
-            insts.push(data.new_local_inst().jump(target, vec![]));
-            let after = if idx == 0 { latch } else { epi_blocks[idx - 1] };
+            insts.push(data.new_local_inst().jump(target, jump_args));
+            let after = if idx == 0 {
+                reduce_block.unwrap_or(latch)
+            } else {
+                epi_blocks[idx - 1]
+            };
             data.layout_mut().insert_bb_after(after, block);
             for inst in insts {
                 data.layout_mut().insert_inst(block, inst);
             }
         }
-        // Retarget the latch's exit edge into the epilogue chain.
-        let (cond, t_target, t_args) = match data.inst_data(latch_branch).kind() {
-            InstKind::Branch(b) => (b.cond(), b.t_target(), b.t_args().to_vec()),
-            _ => unreachable!(),
-        };
-        data.replace_inst_with(latch_branch).branch(
-            cond,
-            t_target,
-            t_args,
-            epi_blocks[0],
-            vec![],
-        );
     }
 
     // 2. In-place vectorization of the latch payload (instruction ids are
@@ -842,6 +1038,45 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         }
     }
 
+    // 2b. B1: re-type the accumulator parameter to `<4 x T>` and rewrite its
+    //     update chain into a lane-wise accumulation. The delta resolves
+    //     through the same machinery as any payload value (vector load /
+    //     vector binary) or is splatted when loop-invariant.
+    if let Some(red) = &reduction {
+        data.inst_data_mut(red.acc).set_type(vector_ty.clone());
+        let delta_vec = vector_operand(
+            data,
+            &mut splats,
+            red.delta,
+            &payload,
+            &classes,
+            &vector_ty,
+            red.acc_update,
+        );
+        data.replace_inst_with(red.acc_update)
+            .raw(Binary::new_data(red.acc, delta_vec, red.op, vector_ty.clone()));
+    }
+
+    // 2c. Retarget the latch's exit edge: the reduce block (reduction) or
+    //     the epilogue chain (r > 0); untouched when neither applies. Runs
+    //     after the accumulator update is re-typed (2b) so the branch's
+    //     f_args type-check against the reduce block's vector parameter.
+    if reduction.is_some() || r > 0 {
+        let (cond, t_target, t_args) = match data.inst_data(latch_branch).kind() {
+            InstKind::Branch(b) => (b.cond(), b.t_target(), b.t_args().to_vec()),
+            _ => unreachable!(),
+        };
+        let (f_target, f_args) = match &reduction {
+            Some(red) => (
+                reduce_block.expect("reduce block built when reduction is set"),
+                vec![red.acc_update],
+            ),
+            None => (epi_blocks[0], vec![]),
+        };
+        data.replace_inst_with(latch_branch)
+            .branch(cond, t_target, t_args, f_target, f_args);
+    }
+
     // 3. Latch machinery: step both IVs by the vector width. The loop now
     //    runs `q` iterations because the counter enters at `4Q`. The step
     //    constant stays out of layout (constants are never placed in blocks;
@@ -853,12 +1088,21 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         .raw(Binary::new_data(counter, four, BinaryOp::Sub, i32.clone()));
 
     // 4. Entry edge: the counter enters at `4Q` (trip % 4 handled by the
-    //    epilogue); the index keeps its original initial value.
+    //    epilogue); the index keeps its original initial value; a reduction
+    //    accumulator enters splatted across the vector.
     let four_q = data.new_local_inst().integer((VF * q) as i32);
+    let acc_splat: Option<Inst> = reduction.as_ref().map(|red| {
+        let s = alloc_inst(data, VectorSplat::new_data(red.acc_init, vector_ty.clone()));
+        data.layout_mut().insert_inst_before(entry_edge, s);
+        s
+    });
     let entry_rewrite = match data.inst_data(entry_edge).kind() {
         InstKind::Branch(b) => {
             let mut t_args = b.t_args().to_vec();
-            t_args[1] = four_q;
+            t_args[entry_arg_count - 1] = four_q;
+            if let (Some(red), Some(splat)) = (&reduction, &acc_splat) {
+                t_args[red.acc_slot] = *splat;
+            }
             EntryRewrite::Branch {
                 cond: b.cond(),
                 f_target: b.f_target(),
@@ -868,7 +1112,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         }
         InstKind::Jump(j) => {
             let mut args = j.args().to_vec();
-            args[1] = four_q;
+            args[entry_arg_count - 1] = four_q;
+            if let (Some(red), Some(splat)) = (&reduction, &acc_splat) {
+                args[red.acc_slot] = *splat;
+            }
             EntryRewrite::Jump {
                 target: j.target(),
                 args,
@@ -1108,6 +1355,70 @@ mod tests {
         let ret = data.new_local_inst().ret(None);
         data.layout_mut().insert_inst(exit, ret);
         (function, header, latch, exit)
+    }
+
+    /// Global array `a` plus a rotated count-up reduction loop
+    /// `for (i = 0; i < trip; i++) acc += a[i]` (or `-=` for `Sub`), with the
+    /// rotated exit carrying the final accumulator:
+    /// `header([acc, iv, t]) -> latch { acc' = op(acc, load(a[iv])); iv+1;
+    /// t-1; br t' -> header / exit([acc']) }`, `exit([acc_final])`.
+    #[allow(clippy::type_complexity)]
+    fn build_reduction(
+        program: &mut Program,
+        op: BinaryOp,
+        trip: i32,
+    ) -> (Function, BasicBlock, BasicBlock, BasicBlock, Inst, Inst, Inst) {
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_i32(), "reduce".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut *program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone(), i32.clone()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data
+            .new_basic_block()
+            .basic_block("exit".into(), vec![i32.clone()]);
+        for bb in [header, latch, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let trip_inst = data.new_local_inst().integer(trip);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero, trip_inst]);
+        data.layout_mut().insert_inst(entry, zero);
+        data.layout_mut().insert_inst(entry, trip_inst);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let acc = data.bb_data(header).params()[0];
+        let iv = data.bb_data(header).params()[1];
+        let counter = data.bb_data(header).params()[2];
+        let header_jump = data.new_local_inst().jump(latch, vec![]);
+        data.layout_mut().insert_inst(header, header_jump);
+        let one = data.new_local_inst().integer(1);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let sum = lb.binary(op, acc, load_a);
+        let iv_next = lb.binary(BinaryOp::Add, iv, one);
+        let t_next = lb.binary(BinaryOp::Sub, counter, one);
+        let back = lb.branch(t_next, header, vec![sum, iv_next, t_next], exit, vec![sum]);
+        drop(lb);
+        for inst in [one, gep_a, load_a, sum, iv_next, t_next, back] {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        let exit_acc = data.bb_data(exit).params()[0];
+        let exit_ret = data.new_local_inst().ret(Some(exit_acc));
+        data.layout_mut().insert_inst(exit, exit_ret);
+        (function, header, latch, exit, acc, iv, counter)
     }
 
     fn run(program: &mut Program, function: Function) -> bool {
@@ -1354,8 +1665,8 @@ mod tests {
         data.layout_mut().insert_inst(entry, entry_jump);
         let iv = data.bb_data(header).params()[0];
         let counter = data.bb_data(header).params()[1];
-        let _tmp_inst3 = data.new_local_inst().jump(latch, vec![]);
-        data.layout_mut().insert_inst(header, _tmp_inst3);
+        let header_jump = data.new_local_inst().jump(latch, vec![]);
+        data.layout_mut().insert_inst(header, header_jump);
         let one = data.new_local_inst().integer(1);
         let mut lb = LocalBuilder {
             arena: &mut data as &mut dyn Arena,
@@ -1373,15 +1684,193 @@ mod tests {
         for inst in [one, gep_a, load_a, cond, value, gep_b, store, iv_next, t_next, back] {
             data.layout_mut().insert_inst(latch, inst);
         }
-        let _tmp_inst4 = data.new_local_inst().ret(None);
-        data.layout_mut().insert_inst(exit, _tmp_inst4);
+        let exit_ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, exit_ret);
         assert!(!run(&mut program, function), "select must be rejected in v1");
     }
 
     #[test]
-    fn rejects_real_reduction() {
-        // sum += a[i] over a 3-parameter header [acc, iv, t]: the accumulator
-        // cannot be a vector operand.
+    fn vectorizes_reduction() {
+        // B1: `sum += a[i]` — a 3-param loop [acc, iv, t] whose accumulator
+        // update is `acc' = add(acc, load(a[iv]))`. The accumulator must
+        // become a `<4 x i32>` block parameter and the exit must reduce it
+        // horizontally (VectorReduce / addv) before the exit parameter.
+        let mut program = Program::new();
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_i32(), "reduce".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone(), i32.clone()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        // Rotated form: the exit carries the final accumulator value.
+        let exit = data
+            .new_basic_block()
+            .basic_block("exit".into(), vec![i32.clone()]);
+        for bb in [header, latch, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let trip_inst = data.new_local_inst().integer(16);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero, trip_inst]);
+        data.layout_mut().insert_inst(entry, zero);
+        data.layout_mut().insert_inst(entry, trip_inst);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let acc = data.bb_data(header).params()[0];
+        let iv = data.bb_data(header).params()[1];
+        let counter = data.bb_data(header).params()[2];
+        let header_jump = data.new_local_inst().jump(latch, vec![]);
+        data.layout_mut().insert_inst(header, header_jump);
+        let one = data.new_local_inst().integer(1);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let sum = lb.binary(BinaryOp::Add, acc, load_a);
+        let iv_next = lb.binary(BinaryOp::Add, iv, one);
+        let t_next = lb.binary(BinaryOp::Sub, counter, one);
+        let back = lb.branch(t_next, header, vec![sum, iv_next, t_next], exit, vec![sum]);
+        drop(lb);
+        for inst in [one, gep_a, load_a, sum, iv_next, t_next, back] {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        let exit_acc = data.bb_data(exit).params()[0];
+        let exit_ret = data.new_local_inst().ret(Some(exit_acc));
+        data.layout_mut().insert_inst(exit, exit_ret);
+
+        assert!(
+            run(&mut program, function),
+            "register reductions are vectorized in B1"
+        );
+        let data = program.func_data(function);
+        // The accumulator parameter is now a vector.
+        assert!(
+            data.inst_data(acc).ty().is_vector(),
+            "accumulator must be re-typed to <4 x i32>"
+        );
+        // A horizontal reduction exists (the exit of the vector loop).
+        let has_reduce = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|l| l.insts().iter().copied())
+            .any(|inst| matches!(data.inst_data(inst).kind(), InstKind::VectorReduce(_)));
+        assert!(has_reduce, "the vector loop must exit through VectorReduce");
+        // The exit still receives a scalar accumulator (i32).
+        assert!(
+            data.inst_data(exit_acc).ty().is_i32(),
+            "exit accumulator parameter stays scalar"
+        );
+    }
+
+    #[test]
+    fn vectorizes_reduction_int_sub() {
+        // acc -= a[i]: IntSub reductions accumulate the same way.
+        let mut program = Program::new();
+        let (function, _header, _latch, _exit, acc, _iv, _counter) =
+            build_reduction(&mut program, BinaryOp::Sub, 16);
+        assert!(run(&mut program, function), "IntSub reductions vectorize");
+        let data = program.func_data(function);
+        assert!(data.inst_data(acc).ty().is_vector(), "acc must be re-typed");
+        let has_reduce = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|l| l.insts().iter().copied())
+            .any(|inst| matches!(data.inst_data(inst).kind(), InstKind::VectorReduce(_)));
+        assert!(has_reduce, "exit must reduce the accumulator");
+    }
+
+    #[test]
+    fn reduction_epilogue_carries_acc() {
+        // trip = 18 -> Q = 4 vector iterations + R = 2 scalar iterations. The
+        // peeled epilogue must keep accumulating: each epi block takes the
+        // scalar accumulator as a parameter and forwards its updated value.
+        let mut program = Program::new();
+        let (function, _header, latch, exit, acc, _iv, _counter) =
+            build_reduction(&mut program, BinaryOp::Add, 18);
+        assert!(run(&mut program, function), "pass must fire");
+        let data = program.func_data(function);
+        assert!(
+            data.inst_data(acc).ty().is_vector(),
+            "vector accumulator in the main loop"
+        );
+        // The epilogue chain: two blocks after the reduce block (which has a
+        // vector parameter), both carrying one i32 accumulator parameter.
+        let mut current = latch;
+        let mut epi_found = 0;
+        loop {
+            let term = data.layout().basicblock(current).terminator();
+            let next = match data.inst_data(term).kind() {
+                InstKind::Branch(branch) => branch.f_target(),
+                InstKind::Jump(jump) => jump.target(),
+                _ => break,
+            };
+            if next == exit {
+                break;
+            }
+            let next_params = data.bb_data(next).params();
+            if next_params.is_empty() || data.inst_data(next_params[0]).ty().is_vector() {
+                // The reduce block (vector accumulator) sits between the
+                // latch and the epilogue chain.
+                current = next;
+                continue;
+            }
+            assert_eq!(
+                next_params.len(),
+                1,
+                "epi block must carry the scalar accumulator"
+            );
+            assert!(
+                data.inst_data(next_params[0]).ty().is_i32(),
+                "epi accumulator stays scalar"
+            );
+            epi_found += 1;
+            current = next;
+        }
+        assert_eq!(epi_found, 2, "R = 2 peeled iterations");
+    }
+
+    #[test]
+    fn reduction_is_idempotent() {
+        let mut program = Program::new();
+        let (function, _header, _latch, _exit, _acc, _iv, _counter) =
+            build_reduction(&mut program, BinaryOp::Add, 16);
+        assert!(run(&mut program, function), "first run vectorizes");
+        assert!(
+            !run(&mut program, function),
+            "second run must not rewrite the vector loop"
+        );
+    }
+
+    #[test]
+    fn rejects_int_mul_reduction() {
+        // acc *= a[i] is Reducible{IntMul}; B1 only accumulates IntAdd/IntSub
+        // (IntMul needs a different exit reduction).
+        let mut program = Program::new();
+        let (function, _header, _latch, _exit, _acc, _iv, _counter) =
+            build_reduction(&mut program, BinaryOp::Mul, 16);
+        assert!(
+            !run(&mut program, function),
+            "IntMul reductions stay scalar in B1"
+        );
+    }
+
+    #[test]
+    fn rejects_exit_reads_header_acc() {
+        // An exit block that reads the accumulator header parameter directly
+        // (not via the rotated exit parameter) is not the rotated form and
+        // must stay scalar.
         let mut program = Program::new();
         let i32 = Type::get_i32();
         let arr = Type::get_array(i32.clone(), 64);

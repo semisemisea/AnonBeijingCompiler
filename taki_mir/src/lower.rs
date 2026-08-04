@@ -215,6 +215,12 @@ pub struct LowerContext<'prog, I: VCodeInst> {
     /// block then share a single movz/movk chain instead of one per use.
     block_const_shared: FxHashMap<i64, Reg>,
 
+    /// Constant values used by two or more operands in the current block.
+    /// Only these participate in `block_const_shared`; single-use constants
+    /// keep their per-use materialization so their live range is not
+    /// extended to the block start (register-pressure guard).
+    block_const_multi: FxHashSet<i64>,
+
     // ----------------- Side effect and color----------------- //
     // INFO: We give each instruction a color. The colors are same between two instruction if:
     // - There is no instruction have side effect between them.
@@ -436,6 +442,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             value_lowered_use,
             ir_inst: Vec::new(),
             block_const_shared: FxHashMap::default(),
+            block_const_multi: FxHashSet::default(),
         }
     }
 
@@ -477,6 +484,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             if let Some(bb) = lb.orig_block() {
                 self.cur_block = Some(bb);
                 self.block_const_shared.clear();
+                self.block_const_multi = self.scan_block_const_uses(bb);
                 if let Some(branch_inst) =
                     self.collect_branch_and_targets(block_index, &mut targets_buffer)
                 {
@@ -846,7 +854,10 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         // repeated per use. Only constants that actually reach this path are
         // shared; immediates folded into instructions never arrive here.
         if let InstKind::Integer(integer) = self.arena.inst_data(inst).kind() {
-            return self.const_to_reg(i64::from(integer.value()));
+            let value = i64::from(integer.value());
+            if let Some(shared) = self.const_to_reg(value, value) {
+                return shared;
+            }
         }
         let reg = *self.reg_map.entry(inst).or_insert_with(|| {
             self.vregs_alloc
@@ -855,20 +866,49 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         self.rematerialize_if_needed(inst, reg)
     }
 
-    /// BB-scoped constant sharing: return a vreg for `value` that is shared
-    /// by every use in the current block. The materialization is deferred to
+    /// BB-scoped constant sharing: return a shared vreg for `value` when
+    /// `gate_on` is used by two or more operands in the current block (for
+    /// ordinary constants `gate_on == value`; the division-magic path gates
+    /// the magic multiplier on the divisor's operand count, because the magic
+    /// value itself is not an IR operand). The materialization is deferred to
     /// the end of the block (see `emit_block_const_shared`), so the def lands
-    /// at the block start after the stream reversal and same-value constants
-    /// materialize once per block instead of once per use. Inline
-    /// materialization sites that bypass `put_value_in_reg` (e.g. division
-    /// magic multipliers) route through this helper too.
-    pub fn const_to_reg(&mut self, value: i64) -> Reg {
+    /// at the block start after the stream reversal and the constant
+    /// materializes once per block instead of once per use. `None` means the
+    /// caller should keep its per-use materialization (single-use constants
+    /// keep short live ranges, guarding register pressure).
+    pub fn const_to_reg(&mut self, value: i64, gate_on: i64) -> Option<Reg> {
+        if !self.block_const_multi.contains(&gate_on) {
+            return None;
+        }
         if let Some(&shared) = self.block_const_shared.get(&value) {
-            return shared;
+            return Some(shared);
         }
         let shared = self.alloc_tmp(HirType::get_i32());
         self.block_const_shared.insert(value, shared);
-        shared
+        Some(shared)
+    }
+
+    /// Count Integer-constant operands per value in `block`; values used by
+    /// two or more operands are the sharing candidates for this block.
+    fn scan_block_const_uses(&mut self, block: HirBasicBlock) -> FxHashSet<i64> {
+        let mut counts: FxHashMap<i64, usize> = FxHashMap::default();
+        let func = self
+            .arena
+            .program
+            .func_data(self.arena.curr_func.expect("function is set during lowering"));
+        let insts = func.layout().basicblock(block).insts().to_vec();
+        for inst in insts {
+            for operand in self.arena.inst_data(*inst).inst_usage() {
+                if let InstKind::Integer(integer) = self.arena.inst_data(operand).kind() {
+                    *counts.entry(i64::from(integer.value())).or_default() += 1;
+                }
+            }
+        }
+        counts
+            .into_iter()
+            .filter(|&(_, count)| count >= 2)
+            .map(|(value, _)| value)
+            .collect()
     }
 
     /// Emit the deferred constant materializations recorded for the current

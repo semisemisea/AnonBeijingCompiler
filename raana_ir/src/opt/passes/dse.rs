@@ -15,6 +15,7 @@
 //! block-parameter phi offsets). Everything conservative: an unresolvable
 //! address never triggers a deletion or rewrite.
 
+use crate::ir::inst_kind::mem_zero::MemZeroLen;
 use crate::opt::{
     analysis_passes::{
         effects::EffectAnalysis,
@@ -105,7 +106,14 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                 }
                 InstKind::MemZero(mem_zero) => {
                     if let Some((root, off)) = resolve(mem_zero.dest()) {
-                        memzeros.push((root, off, mem_zero.byte_len() as i64));
+                        // A runtime-length MemZero (M53 zero-store loops)
+                        // may cover anything after `off`: treat it as an
+                        // unbounded range.
+                        let len = match mem_zero.byte_len_len() {
+                            MemZeroLen::Const(n) => *n as i64,
+                            MemZeroLen::Value(_) => i64::MAX,
+                        };
+                        memzeros.push((root, off, len));
                     }
                 }
                 _ => {}
@@ -251,7 +259,10 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                 }
                 InstKind::MemZero(mem_zero) => {
                     if let Some((root, off)) = resolve(mem_zero.dest()) {
-                        let len = mem_zero.byte_len() as i64;
+                        let len = match mem_zero.byte_len_len() {
+                            MemZeroLen::Const(n) => *n as i64,
+                            MemZeroLen::Value(_) => i64::MAX,
+                        };
                         pending.retain(|cell, _| {
                             !cell_in_range(cell, root, off, len)
                         });

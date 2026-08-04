@@ -433,6 +433,31 @@ M44 v2（select 掩码）。
      test_access_pair：同地址 R/W 且写依赖读 → 元素级安全）——dependence.rs 与
      switch 线共享，须先协调。
 
+##### M44 v2 B1（寄存器归约向量化）执行记录（2026-08-05）
+
+- 实现（57e882f，547 行）：3 参数 [iv, acc, t] + M42 Reducible{IntAdd/IntSub} →
+  acc 参数原位 set_type(<4 x T>)、latch acc 更新重写为 lane-wise 向量累加、
+  出口 vec_reduce 块 VectorReduce(Add) → 标量 acc_final、epilogue 标量 acc 参数
+  链（R 次）、entry 边 splat(acc_init)。新增 InstData::set_type（instruction.rs
+  +7 行）。防护：acc 用户逃逸 exit 拒绝、IntMul/Min/Max 后置、幂等靠参数类型
+  检查。单测 +5（IntAdd/IntSub/epilogue 链/幂等/IntMul 拒绝），raana_ir 321
+  全过；合成用例 qemu 差分 -O0/-O1/-O2 三级 PASS；汇编出 dup → ldr q →
+  add v.4s → **addv s** → fmov。
+- **真实 corpus 命中 = 0（诚实数据）**，原因：
+  1. radixSort 的 14×2 个 b1_target 是 M42 误标：getNumPos 类循环 3 参数中
+     M42 把实际 IV（add-one 参数）识别为 accumulator，真 carried value 是
+     数据相关 sar 链（%vid_0）→ 我的 iv 单位步进检查正确拒绝
+     （non_unit_step）。
+  2. kernel_ludcmp 的归约是内存累加（C[i][j]+= → IntraIterationConflict），
+     属 B3（in-place）范围，非 B1。
+  3. perf corpus 中"真寄存器归约 + 2 块 + exact trip"形态 ≈ 不存在；fft 的
+     IntSub 归约被体内 rem/sar 等非白名单 op 拦截。
+- 结论：B1 是能力储备（正确性已验证的寄存器归约向量化），当前无 perf 收益；
+  且与 interchange 场景（归约迁移成内存累加后走 v1 主路径）不重叠。后续要吃
+  真实用例，正确优先级是 B3（in-place/内存累加，需 M42 协调）。
+- 遗留：临时用例 tests/perf/red16.* 已删；addv 命中扫描脚本在
+  /tmp/m44_corpus。
+
 #### M45：SLP 基本块向量化 + 循环展开
 
 - SLP（`raana_ir/src/opt/passes/slp.rs`）：把同一基本块内相邻、类型一致的独立

@@ -207,6 +207,65 @@ M39-M41b。参考澄清：Cranelift 的 SIMD 是**显式降层**（wasm `v128` �
   （Add/Sub 步进）、`dom_tree`、`cfg`。
 - 验收：对 many_mat_cal / conv2d-1 / matmul 内层循环能正确判定；宁漏勿错，无法
   证明一律保守拒绝（误报 = 0）。
+- 状态：已实现（2026-08-05，`analysis_passes/dependence.rs`，6 单测全绿，
+  raana_ir 306 测试通过）。当前依赖分析的访问函数只按"当前循环 BIV"分类，
+  interchange 判定需要双 IV（j/k）系数时另行提取。
+
+#### loop interchange（M44 前置，独立 pass，2026-08-05 设计定稿）
+
+目标：matmul1 乘法段 i-j-k 三层（rotate_loops 后 countdown 形态），交换 j/k →
+i-k-j，使新内层 j 的 c[i][j]/b[k][j]/a[k][j] 全部连续（4B stride）。matmul1
+当前内层 k：a[i][k] 连续但 a[k][j] 跨行 4000B，无法直接向量化。绝大多数 perf
+用例（01_mm/fft/sl1/conv2d/transpose 等）内层已连续，不需要 interchange。
+
+**核心洞察：块结构完全复用。** rotate 后块拓扑：
+`H_i → B_i → H_j → B_j → H_k → B_k → H_k(回边)/E_k → H_j(回边)/E_j → H_i(回边)/E_i`
+- H_k=inner_header（参数 [k,temp]）、B_k=inner_body（if/归约 + k 更新 + k 测试
+  br）、E_k=inner_exit（c[i][j]=temp + j 更新 + j 测试 br）、H_j/B_j/E_j=mid、
+  H_i/B_i/E_i=outer（B_j 只含 jump H_k）。
+
+交换 j/k 后仅三处改动（其余块原样）：
+1. H_k 参数 [k,temp] → [k]（删 temp），回边 args 同步删一项。
+2. B_k 尾部：删 k 更新+k 测试；追加 E_k 的 j 更新+j 测试（layout 移动，保持
+   use-def/layout 一致）；terminator 换 j 测试 br（target 保持 H_j/E_k）。
+3. E_k 尾部：删 c[i][j]=temp 与 j 更新+j 测试；追加 B_k 的 k 更新+k 测试；
+   terminator 换 k 测试 br（**target 从 E_k 改为 E_j**——k 出口直接到 i 更新）。
+
+**归约迁移（难点）**：原 temp 寄存器归约（k 内累加、k 后 c[i][j]=temp）→
+c[i][j] 内存跨 k 累加：B_k 里 `temp' = select(cond, temp+delta, temp)` 改为
+`store(select(cond, load(c[i][j])+delta, load(c[i][j])), c[i][j])`（load 复用）；
+E_k 的 c[i][j]=temp 赋值删除。合法性要求：c[i][j] 在 k 首次迭代时为零——判定：
+c 的 base 是 Global（未初始化全局零初始）且 k 循环内无其他 c 写；否则拒绝交换
+（宁漏勿错）。float 归约不迁移（IEEE 累加顺序 k→j 改变，不可交换；matmul1 是
+int）。交换后内层 j 的 c[i][j] 是普通内存写 → M42 判定自动 Vectorizable（无
+寄存器归约、写写跨 j 无冲突）——比 Reducible 更干净，M44 直接 ld1/add/st1。
+
+**保守判定（v1）**：
+1. 嵌套链 H_i ⊃ H_j ⊃ H_k（j 循环 body 只含 k 循环 + E_k 的 c[i][j]=temp 旁
+   语句——该语句是归约迁移吸收对象，唯一允许的旁语句）。
+2. L_j、L_k 均可计数（induction_trip_count）+ 单位步进。
+3. M42 对 L_k 判定 Reducible/Vectorizable，且方向同向：L_k 内所有内存访问的
+   (j 系数, k 系数) 均 ≥ 0（matmul1：c[i][j]=(+,0)、a[i][k]=(0,+)、
+   b[k][j]=(+,+)、b[i][k]=(0,+)、a[k][j]=(+,+) 全非负）。M42 现只分类当前
+   BIV——需按指定 IV 分类的提取参数或独立双系数分类器。
+4. 归约目标 c[i][j]：Global base + 零初始 + k 循环内无其他写。
+5. 无 call、无 MemZero、单 latch、单出口。
+
+**幂等性（关键陷阱）**：方向同向判定对称，交换后仍同向 → 无限交换。解法：
+不对称条件——仅当内层循环存在 IV 系数 ∉ {0, 元素大小} 的访问（跨行访问）才
+交换。交换前 L_k 的 a[k][j] k 系数 4000 → 交换；交换后 L_j 所有 j 系数 ∈
+{0,4} → 停止。单测必须锁死二次判定不交换。
+
+**实现**：`raana_ir/src/opt/passes/loop_interchange.rs`（~350-400 行含测试）；
+注册 pass.rs aarch64 分支，rotate_loops 后、M44 前；CFG 变更后重建全部快照
+（AGENTS.md 硬规则）；指令移动用 layout 移动（禁止手动改 used_by）。
+
+**验收**：单测 4 个（matmul 形态成功交换：temp 参数消失 + c[i][j] 累加出现 +
+k 测试 target=E_j；幂等；方向反拒绝；非零初始拒绝）；matmul1.sy -O2 aarch64
+汇编内层连续访存；on/off 差分；RISC-V 零影响（不注册）；make test 回归。
+
+**与 M44 衔接**：交换后内层 j 含 if(cond)（cond 含 j → 逐 lane 不同）→ 需
+select 掩码 → 归 M44 v2（v1 无 select 跳过 matmul1，先覆盖内层已连续用例）。
 
 #### M43：loop versioning / 运行时 guard
 

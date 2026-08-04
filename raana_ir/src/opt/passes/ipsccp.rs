@@ -1,6 +1,7 @@
 //! Implementation of *Interprocedural Sparse Condition Constant Propagation*
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::ir::inst_kind::mem_zero::MemZeroLen;
 use crate::opt::{
     analysis_passes::{
         effects::{EffectAnalysis, WriteRoot},
@@ -683,16 +684,29 @@ impl Pass for IPSCCP {
                             program,
                             curr_func: Some(func),
                         };
-                        let len = mem_zero.byte_len() as i64;
-                        match resolve_cell(env, &ctx, func, mem_zero.dest()) {
-                            Some((key, root)) => {
+                        // A runtime-length MemZero (M53 zero-store loops)
+                        // covers an unknown range: conservatively invalidate
+                        // the whole root instead of folding a zero interval.
+                        let len = match mem_zero.byte_len_len() {
+                            MemZeroLen::Const(n) => Some(*n as i64),
+                            MemZeroLen::Value(_) => None,
+                        };
+                        match (resolve_cell(env, &ctx, func, mem_zero.dest()), len) {
+                            (Some((key, root)), Some(len)) => {
                                 if state.mem_zero(root, key.offset(), len) {
                                     if let Some(loaders) = state.root_loaders.get(&root) {
                                         mem_reschedule.extend(loaders.iter().copied());
                                     }
                                 }
                             }
-                            None => {
+                            (Some((_, root)), None) => {
+                                if state.clear(root, true) {
+                                    if let Some(loaders) = state.root_loaders.get(&root) {
+                                        mem_reschedule.extend(loaders.iter().copied());
+                                    }
+                                }
+                            }
+                            (None, _) => {
                                 let roots = state
                                     .possible_targets(&analysis, func, mem_zero.dest(), &ctx);
                                 for root in roots.unwrap_or_default() {

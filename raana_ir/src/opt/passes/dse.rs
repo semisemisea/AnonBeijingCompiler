@@ -157,18 +157,26 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
         writeback_removals.push(store_inst);
     }
 
-    // ---- Transform 2: covered store removal (within-block). ----
+    // ---- Transform 2 + 3: covered store removal & store-to-load
+    // forwarding (within-block). ----
     // While scanning a block forward, a store is dead as soon as another
-    // store to the same cell appears before any read of that cell.
+    // store to the same cell appears before any read of that cell. A load
+    // of a cell whose latest operation is a pending store is replaced by
+    // the stored value (forwarding).
     let mut covered_removals: Vec<Inst> = Vec::new();
+    // (load inst, replacement value)
+    let mut forwardings: Vec<(Inst, Inst)> = Vec::new();
     for bb in data.layout().basicblocks() {
-        // cell -> pending store that has not been read yet
-        let mut pending: FxHashMap<Cell, Inst> = FxHashMap::default();
+        // cell -> (pending store, stored value); the store has not been
+        // read from memory yet.
+        let mut pending: FxHashMap<Cell, (Inst, Inst)> = FxHashMap::default();
         for &inst in bb.insts() {
             match data.inst_data(inst).kind() {
                 InstKind::Store(store) => match resolve_cell(env, &ctx, store.dest()) {
                     Some(cell) => {
-                        if let Some(prev) = pending.insert(cell, inst) {
+                        if let Some((prev, _)) =
+                            pending.insert(cell, (inst, store.src()))
+                        {
                             covered_removals.push(prev);
                         }
                     }
@@ -178,7 +186,14 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                 },
                 InstKind::Load(load) => match resolve_cell(env, &ctx, load.src()) {
                     Some(cell) => {
-                        pending.remove(&cell);
+                        if let Some(&(_, value)) = pending.get(&cell) {
+                            forwardings.push((inst, value));
+                            // The store's memory value is still unread; it
+                            // stays pending so a later covering store can
+                            // still remove it.
+                        } else {
+                            pending.remove(&cell);
+                        }
                     }
                     None => pending.clear(),
                 },
@@ -234,6 +249,10 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
     }
 
     let mut changed = false;
+    for (load, value) in forwardings {
+        utils::visit_and_replace(data, load, value);
+        changed = true;
+    }
     for inst in writeback_removals.into_iter().chain(covered_removals) {
         if let Some(bb) = data.layout().parent_bb(inst) {
             data.remove_layout_inst(bb, inst);
@@ -330,7 +349,8 @@ mod tests {
 
     /// The write-back is NOT redundant when the cell is written in between:
     /// `store 5; load; store load-value` — the final store forwards the
-    /// modified value and must stay.
+    /// modified value and must stay. The intermediate load is forwarded and
+    /// the first store is covered, so only the write-back store survives.
     #[test]
     fn keeps_writeback_when_cell_is_modified() {
         let mut program = Program::new();
@@ -353,15 +373,29 @@ mod tests {
             data.layout_mut().insert_inst(entry, ret);
             (load, store, ret)
         };
-        let _ = load;
         let _ = ret;
 
-        assert!(!DSE.run(&mut program));
+        assert!(DSE.run(&mut program));
         let data = program.func_data(function);
+        // The load is forwarded: it no longer has any user.
+        assert!(
+            data.inst_data(load).used_by().is_empty(),
+            "load must be forwarded (no remaining users)"
+        );
+        // The write-back store (of the modified value) must survive.
         assert!(matches!(
             data.inst_data(store).kind(),
             InstKind::Store(..)
         ), "write-back after a real write must survive");
+        let mut stores = Vec::new();
+        for block in data.layout().basicblocks() {
+            for &inst in block.insts() {
+                if matches!(data.inst_data(inst).kind(), InstKind::Store(..)) {
+                    stores.push(inst);
+                }
+            }
+        }
+        assert_eq!(stores, vec![store], "only the write-back store remains");
     }
 
     /// `store 1; store 2` to the same cell with no read in between: the
@@ -402,14 +436,15 @@ mod tests {
         assert_eq!(stores, vec![second], "first covered store must go");
     }
 
-    /// `store 1; load; store 2`: the load reads the first store, so it is
-    /// live and must survive.
+    /// `store 1; load; store 2`: the load is forwarded to 1 and the first
+    /// store is covered; only `store 2` remains. (Forwarding makes the
+    /// intermediate load a non-reader of memory.)
     #[test]
     fn keeps_store_read_in_between() {
         let mut program = Program::new();
         let global = new_global(&mut program);
         let function = program.new_function(Type::get_unit(), "f".into(), vec![]);
-        let (first, second, ret) = {
+        let (first, second, load, ret) = {
             let mut data = ArenaContextMut {
                 program: &mut program,
                 curr_func: Some(function),
@@ -421,17 +456,21 @@ mod tests {
             data.layout_mut().insert_inst(entry, first);
             let load = data.new_local_value().load(global);
             data.layout_mut().insert_inst(entry, load);
-            let _ = load;
             let second = data.new_local_value().store(two, global);
             data.layout_mut().insert_inst(entry, second);
             let ret = data.new_local_value().ret(None);
             data.layout_mut().insert_inst(entry, ret);
-            (first, second, ret)
+            (first, second, load, ret)
         };
         let _ = ret;
 
-        assert!(!DSE.run(&mut program));
+        assert!(DSE.run(&mut program));
         let data = program.func_data(function);
+        // The load was forwarded to the value of the first store: no users.
+        assert!(
+            data.inst_data(load).used_by().is_empty(),
+            "load must be forwarded (no remaining users)"
+        );
         let mut stores = Vec::new();
         for block in data.layout().basicblocks() {
             for &inst in block.insts() {
@@ -440,7 +479,8 @@ mod tests {
                 }
             }
         }
-        assert_eq!(stores.len(), 2, "both stores must survive a read");
+        assert_eq!(stores, vec![second], "only the covering store remains");
+        let _ = first;
     }
 
     /// A store through an unknown address may alias any cell: pending
@@ -483,5 +523,50 @@ mod tests {
             }
         }
         assert_eq!(stores.len(), 3, "no store may be dropped across an unknown write");
+    }
+
+    /// A MemZero covering the cell is a read/write barrier: the pending
+    /// store before it cannot be forwarded across or dropped.
+    #[test]
+    fn memzero_barrier_stops_forwarding_and_removal() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "f".into(), vec![]);
+        let (first, second, load, ret) = {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(function),
+            };
+            let entry = data.add_entry_block();
+            let alloc = data.new_local_value().alloc(Type::get_i32());
+            data.layout_mut().insert_inst(entry, alloc);
+            let five = data.new_local_value().integer(5);
+            let first = data.new_local_value().store(five, alloc);
+            data.layout_mut().insert_inst(entry, first);
+            let zero = data.new_local_value().mem_zero(alloc, 4);
+            data.layout_mut().insert_inst(entry, zero);
+            let load = data.new_local_value().load(alloc);
+            data.layout_mut().insert_inst(entry, load);
+            let second = data.new_local_value().store(load, alloc);
+            data.layout_mut().insert_inst(entry, second);
+            let ret = data.new_local_value().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+            (first, second, load, ret)
+        };
+        let _ = ret;
+
+        assert!(!DSE.run(&mut program));
+        let data = program.func_data(function);
+        // The load was NOT forwarded (memzero cleared the pending store).
+        assert!(matches!(data.inst_data(load).kind(), InstKind::Load(..)));
+        // Both stores survive.
+        let mut stores = Vec::new();
+        for block in data.layout().basicblocks() {
+            for &inst in block.insts() {
+                if matches!(data.inst_data(inst).kind(), InstKind::Store(..)) {
+                    stores.push(inst);
+                }
+            }
+        }
+        assert_eq!(stores.len(), 2, "memzero barrier must keep both stores");
     }
 }

@@ -2,8 +2,8 @@ use crate::opt::{
     analysis_passes::{
         dom_tree::v2::DominanceTree,
         induction_variable::{
-            BasicInductionVariableAnalysis, ConstantInductionRange, constant_induction_range,
-            normalize_strict_exit,
+            BasicInductionVariableAnalysis, ConstantInductionRange, InductionStep,
+            constant_induction_range, normalize_strict_exit,
         },
         loop_analysis::{Loop, LoopAnalysis},
         range::{IntRange, RangeAnalysis, RangeContext},
@@ -158,11 +158,46 @@ impl PointerStrengthReduction {
             })
             .collect::<FxHashSet<_>>();
         for iv in ivs.for_loop(looop) {
-            let Some(exit) = normalize_strict_exit(data, looop, iv) else {
-                continue;
+            // The pointer step only needs the IV's constant update value. The
+            // strict-exit normalization additionally provides a constant
+            // induction range used to prove that affine (non-direct) index
+            // expressions cannot wrap `i32`. Rotated countdown loops whose
+            // header no longer compares the IV (the test moved to the latch
+            // comparing the countdown counter) still qualify for direct and
+            // invariant indices.
+            let signed_step = match iv.step() {
+                InductionStep::Add(step) => Self::integer_constant(data, step)?,
+                InductionStep::Sub(step) => Self::integer_constant(data, step)?.checked_neg()?,
             };
-            let iv_range = constant_induction_range(data, iv, exit);
-            let signed_step = exit.signed_step();
+            // Non-unit steps must keep the no-wrap proof from a normalized
+            // strict exit with a constant bound: the pointer follows `iv`
+            // directly and could otherwise skip past the bound. Unit steps
+            // only need a strict exit; the constant range is optional there
+            // because a direct or invariant index is carried exactly by the
+            // pointer (the affine wrap check still requires it). A loop whose
+            // header branch `normalize_strict_exit` rejected (non-strict
+            // compare such as `Le`) is refused: the IV can wrap past the
+            // bound. Rotated countdown loops move the test to the latch and
+            // leave the header as a jump-through block, which is the shape
+            // h-5's inner loop has.
+            let iv_range = if signed_step.unsigned_abs() != 1 {
+                Some(constant_induction_range(data, iv, normalize_strict_exit(data, looop, iv)?)?)
+            } else {
+                match normalize_strict_exit(data, looop, iv) {
+                    Some(exit) => constant_induction_range(data, iv, exit),
+                    None => {
+                        let header_terminator = data.layout().basicblock(looop.header()).terminator();
+                        if matches!(
+                            data.inst_data(header_terminator).kind(),
+                            InstKind::Jump(..)
+                        ) {
+                            None
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+            };
             let Some(header_iv_position) = data
                 .bb_data(looop.header())
                 .params()
@@ -1386,6 +1421,23 @@ mod tests {
         replace_bound_with_constant(&mut program, &fixture, 10);
         replace_gep_index_with_affine(&mut program, &fixture, 1 << 30, 0, false);
         assert!(!run(&mut program, fixture.function));
+    }
+
+    #[test]
+    fn carries_a_direct_induction_index_without_a_constant_range_proof() {
+        // A strict-exit unit-step loop with a runtime bound: the pointer is
+        // carried exactly by the IV (base + iv*stride), so no constant
+        // induction range is required for a direct index. This is the shape of
+        // h-5's inner k loop after count-up rotation.
+        let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
+        assert!(run(&mut program, fixture.function));
+        let data = program.func_data(fixture.function);
+        let pointer = data.bb_data(fixture.header).params()[1];
+        let InstKind::GetElemPtr(rewritten) = data.inst_data(fixture.gep).kind() else {
+            unreachable!()
+        };
+        assert_eq!(rewritten.base(), pointer);
+        assert_eq!(integer_constant(data, rewritten.offsets()[0]), Some(0));
     }
 
     #[test]

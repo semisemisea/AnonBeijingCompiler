@@ -2317,12 +2317,7 @@ fn lower_signed_div_rem_magic(
     };
     let size = OperandSize::Size32;
 
-    let multiplier = ctx.alloc_tmp(HirType::get_i32());
-    ctx.emit(MInst::LoadImm {
-        size,
-        dst: Writable::from_reg(multiplier),
-        value: u64::from(magic.multiplier as u32),
-    });
+    let multiplier = ctx.const_to_reg(i64::from(magic.multiplier as u32));
     let product = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
     ctx.emit(MInst::SMulL {
         dst: Writable::from_reg(product),
@@ -2396,12 +2391,7 @@ fn lower_signed_div_rem_magic(
     });
 
     if op == BinaryOp::Rem {
-        let divisor_reg = ctx.alloc_tmp(HirType::get_i32());
-        ctx.emit(MInst::LoadImm {
-            size,
-            dst: Writable::from_reg(divisor_reg),
-            value: u64::from(divisor as u32),
-        });
+        let divisor_reg = ctx.const_to_reg(i64::from(divisor as u32));
         ctx.emit(MInst::MSub {
             size,
             dst,
@@ -3924,5 +3914,92 @@ mod tests {
             assert!(assembly.contains("bsl"), "{assembly}");
             assert!(assembly.contains("addv s"), "{assembly}");
         }
+    }
+
+    /// Builds `r = ((a + C) + (b + C))` with two same-value constant uses in
+    /// one block, and returns the assembly.
+    fn compile_two_same_constant_adds(c: i32) -> String {
+        use raana_ir::ir::arena::Arena;
+        use raana_ir::ir::builder_trait::*;
+
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "two_const".to_owned(),
+            vec![Type::get_i32(), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let a = data.params()[0];
+        let b = data.params()[1];
+        let c1 = data.new_local_inst().integer(c);
+        let add1 = data.new_local_inst().binary(BinaryOp::Add, a, c1);
+        let c2 = data.new_local_inst().integer(c);
+        let add2 = data.new_local_inst().binary(BinaryOp::Add, b, c2);
+        let add3 = data.new_local_inst().binary(BinaryOp::Add, add1, add2);
+        let ret = data.new_local_inst().ret(Some(add3));
+        for inst in [add1, add2, add3, ret] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        taki_mir::compile::<crate::lower::AArch64Backend>(&program)
+    }
+
+    #[test]
+    fn shares_one_materialization_for_same_value_constants_in_a_block() {
+        let assembly = compile_two_same_constant_adds(0xc811);
+        assert_eq!(
+            assembly.matches("0xc811").count(),
+            1,
+            "two uses of 0xc811 in one block must materialize once:\n{assembly}"
+        );
+    }
+
+    #[test]
+    fn does_not_materialize_an_embeddable_constant() {
+        let assembly = compile_two_same_constant_adds(7);
+        assert!(
+            !assembly.contains("movz"),
+            "an add-immediate constant must stay embedded:\n{assembly}"
+        );
+    }
+
+    #[test]
+    fn keeps_per_block_materialization_for_cross_block_uses() {
+        use raana_ir::ir::arena::Arena;
+        use raana_ir::ir::builder_trait::*;
+
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "cross_block".to_owned(),
+            vec![Type::get_i32(), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let tail = data.new_basic_block().basic_block("tail".to_owned(), vec![]);
+        data.layout_mut().push_bb_back(tail);
+        let a = data.params()[0];
+        let b = data.params()[1];
+        let c1 = data.new_local_inst().integer(0xc811);
+        let add1 = data.new_local_inst().binary(BinaryOp::Add, a, c1);
+        data.layout_mut().insert_inst(entry, add1);
+        let one = data.new_local_inst().integer(1);
+        let branch = data
+            .new_local_inst()
+            .branch(one, tail, vec![], tail, vec![]);
+        data.layout_mut().insert_inst(entry, branch);
+        let c2 = data.new_local_inst().integer(0xc811);
+        let add2 = data.new_local_inst().binary(BinaryOp::Add, b, c2);
+        let add3 = data.new_local_inst().binary(BinaryOp::Add, add1, add2);
+        let ret = data.new_local_inst().ret(Some(add3));
+        for inst in [add2, add3, ret] {
+            data.layout_mut().insert_inst(tail, inst);
+        }
+        let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+        assert_eq!(
+            assembly.matches("0xc811").count(),
+            2,
+            "each block materializes its own 0xc811:\n{assembly}"
+        );
     }
 }

@@ -367,6 +367,10 @@ impl Pass for GlobalInstNumbering {
         let rpo = cfg::rpo_path(&graph);
         let idom = dom_tree::idom(&predecessors, &rpo);
         let dominance_tree = dom_tree::build_dominance_tree(&idom, rpo.len());
+        // RPO position per block: a predecessor that comes *later* in RPO
+        // is a backedge, i.e. this block is a loop header.
+        let rpo_pos: FxHashMap<usize, usize> =
+            rpo.iter().enumerate().map(|(i, &b)| (b, i)).collect();
         // Function-level effects do not change while this pass runs (GVN
         // only replaces values), so analyze once per invocation.
         let analysis = EffectAnalysis::new(data.program);
@@ -396,6 +400,18 @@ impl Pass for GlobalInstNumbering {
             load_leaders.enter_scope();
             call_leaders.enter_scope();
             let bb = bb_alloc.search_id(bb_id);
+            // Loop headers (any predecessor is later in RPO = backedge):
+            // the loop body may write any address, so a load CSE'd from a
+            // pre-header or an earlier iteration would read a stale value
+            // on the backedge. Invalidate every load leader on entry.
+            let is_loop_header = predecessors.get(&bb_id).is_some_and(|preds| {
+                preds
+                    .iter()
+                    .any(|&p| rpo_pos.get(&p).is_some_and(|&pi| pi > rpo_pos[&bb_id]))
+            });
+            if is_loop_header {
+                load_leaders.record_store();
+            }
             let values = data
                 .bb_data(bb)
                 .params()

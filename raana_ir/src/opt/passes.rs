@@ -20,5 +20,6 @@ pub mod simplify_cfg;
 pub mod specialize;
 pub mod sr;
 pub mod ssa;
+pub mod tail_recursive_inline;
 pub mod tco;
 pub mod zero_store_loop;

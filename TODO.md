@@ -267,6 +267,56 @@ k 测试 target=E_j；幂等；方向反拒绝；非零初始拒绝）；matmul1
 **与 M44 衔接**：交换后内层 j 含 if(cond)（cond 含 j → 逐 lane 不同）→ 需
 select 掩码 → 归 M44 v2（v1 无 select 跳过 matmul1，先覆盖内层已连续用例）。
 
+**状态**：v1 已实现（2026-08-05，commit f884241，loop_interchange.rs ~700 行
+含 4 单测，raana_ir 310 全绿）。注册于 pass.rs aarch64 分支（rotate_loops
+后）。matmul1.sy -O2 编译通过但**不触发**（保守拒绝，无行为变化）。
+
+**v1 与真实 matmul1 的 4 处差距**（真实 IR 核对 /tmp/ic_matmul1.raana）：
+1. j 循环是 test-at-top（while_entry_16 的 br %49 = lt %vid_2, 1000），只有
+   k 循环被 rotate 成 countdown。
+2. j 循环体含 preheader_19（LICM 提升的 %56/%57 行 GEP，循环不变量）——
+   shells 判定（纯 jump 壳）拒绝。
+3. if 归约是真实分支 + phi 汇合（br %70 → then_23 / end_24 参数），不是
+   select 形态——M42 identify_reduction 只认 select/binary。
+4. k 出口块 while_end_22 带 4 个 block 参数（[i, j, k, temp]）——
+   exit_of_one 的"出口无参数"检查拒绝。
+
+**j 不旋转的真实原因（查证 rotate_loops.rs，2026-08-05）**：rotate 有两条
+路径——rotate_countdown（cond 是 header 参数直接、entry 值非零）与
+rotate_count_up（lt iv, bound → trip counter）。j 循环是 count-up，走
+rotate_count_up；其 `carries_update` 检查 `b.lhs() == iv` 过严——j 的更新是
+while_end_22 的 jump args `%78 = add(%73, 1)`，%73 是 while_end_22 的**块参数**
+（phi 链，从 header 的 iv 经 k 循环 exit 的 br 臂传来）——匹配失败 → j 被当
+entry 边 → 双 entry → 拒绝旋转。"非零"是 rotate_countdown 的条件，对 j 循环
+（count-up 形态）根本不在判定路径上——**原"放宽非零"路径 A 的前提错误，对
+matmul1 无效**（即使放宽也不会导致问题——等价性证明不变——但零收益）。
+
+**v2 两条路径**：
+- 路径 A'：放宽 rotate_count_up 的 carries_update 支持单层 phi 链（中间块
+  参数从 header iv 直接传来 → b.lhs() 可解析为 iv+1）——~50 行 + 单测。
+  让 j 循环旋转成 test-at-bottom → v1 变换骨架直接适用。代价：rotate 是双
+  target 通用 pass，影响所有嵌套循环（等价变换，需 make test-riscv 回归）。
+- 路径 B：interchange 自支持 test-at-top 外层（H_j br 重连 + preheader 移动
+  + 骨架重排）——~200 行。影响面限 interchange（AArch64-only），但变换
+  复杂度最高。
+
+**v2 任务划分（路径 A' 优先）**：
+- T1 M42 phi 汇合归约识别（dependence.rs identify_reduction 支持 backedge
+  值 = 出口块参数 phi，两臂匹配 acc / acc±E）——~100 行 + 2 单测，独立。
+- T2 rotate_count_up phi 链识别（rotate_loops.rs carries_update 放宽）——
+  ~50 行 + 单测，独立，与 T1 可并行。
+- T3 interchange 判定放宽（shells 允许 preheader 块=内容全 invariant；exit
+  允许带参数）——~60 行 + 2 单测，依赖 T2。
+- T4 interchange 变换：preheader 移动（k 循环 entry）+ E_k 参数表重写——
+  ~150 行 + 真实形态单测（test-at-bottom j + preheader + 带参出口，用真实
+  IR 结构固化），依赖 T3。难点：layout/use-def 一致性。
+- T5 归约迁移 phi 形态（分支保留式：then 臂 load c[i][j]+delta+store，phi
+  参数删 temp）——~100 行 + 测试，依赖 T1/T4。
+- T6 端到端：matmul1.sy -O2 触发（IR 断言 j/k 交换 + 汇编内层连续）+ QEMU
+  差分 + make test 回归。
+依赖链：T1/T2 并行 → T3 → T4 → T5 → T6。matmul1 全链路 = interchange →
+M44 v2（select 掩码）。
+
 #### M43：loop versioning / 运行时 guard
 
 - SysY 的 trip count 与数组对齐编译期未知 → 向量化循环必须版本化：

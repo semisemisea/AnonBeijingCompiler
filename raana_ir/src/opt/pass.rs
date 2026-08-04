@@ -208,6 +208,11 @@ impl PassesManager {
         let gvn = Box::new(gvn::GlobalInstNumbering);
         p.register(gvn);
 
+        // Dead store elimination: drops GSP redundant write-backs and
+        // covered stores so later passes see a cleaner memory image.
+        let dse = Box::new(dse::DSE);
+        p.register(dse);
+
         let pointer_sr = Box::new(pointer_strength_reduction::PointerStrengthReduction);
         p.register(pointer_sr);
 

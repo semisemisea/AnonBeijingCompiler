@@ -32,7 +32,9 @@ impl MachInst for MInst {
                 collector.reg_use(rs);
                 collector.reg_def(rd);
             }
-            MInst::Slli { rd, rs, .. } | MInst::Srai { rd, rs, .. } => {
+            MInst::Slli { rd, rs, .. }
+            | MInst::Srai { rd, rs, .. }
+            | MInst::Srli { rd, rs, .. } => {
                 collector.reg_use(rs);
                 collector.reg_def(rd);
             }
@@ -206,6 +208,13 @@ impl MachInstEmit for MInst {
             }
             MInst::Srai { rd, rs, shamt } => {
                 write!(ctx, "srai ")?;
+                ctx.write_reg(&rd.reg)?;
+                write!(ctx, ", ")?;
+                ctx.write_reg(rs)?;
+                write!(ctx, ", {}", shamt.value())
+            }
+            MInst::Srli { rd, rs, shamt } => {
+                write!(ctx, "srli ")?;
                 ctx.write_reg(&rd.reg)?;
                 write!(ctx, ", ")?;
                 ctx.write_reg(rs)?;
@@ -418,6 +427,12 @@ pub enum MInst {
         rs: Reg,
         shamt: ShiftImm64,
     },
+    /// The 64-bit logical shift right; the 64-bit counterpart of `SrliW`.
+    Srli {
+        rd: WritableReg,
+        rs: Reg,
+        shamt: ShiftImm64,
+    },
     LoadImm {
         rd: WritableReg,
         value: u64,
@@ -560,6 +575,12 @@ impl Imm12 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AluRRImm12OP {
     Addi,
+    /// The word (`w`) variant: sign-extends the 32-bit result, preserving the
+    /// backend's i32-in-64-bit-register invariant.
+    Addiw,
+    Andi,
+    Ori,
+    Slti,
     Xori,
 }
 
@@ -711,6 +732,10 @@ impl core::fmt::Display for AluRRImm12OP {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
             AluRRImm12OP::Addi => write!(f, "addi"),
+            AluRRImm12OP::Addiw => write!(f, "addiw"),
+            AluRRImm12OP::Andi => write!(f, "andi"),
+            AluRRImm12OP::Ori => write!(f, "ori"),
+            AluRRImm12OP::Slti => write!(f, "slti"),
             AluRRImm12OP::Xori => write!(f, "xori"),
         }
     }

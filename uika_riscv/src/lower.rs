@@ -397,6 +397,90 @@ fn lower_signed_div_rem_magic(
     true
 }
 
+/// `xori rd, rs, 1`: the boolean flip behind `>=`/`<=`/`!=`.
+fn emit_xori_one(ctx: &mut LowerContext<'_, MInst>, rd: Writable<Reg>, rs: Reg) {
+    ctx.emit(MInst::AluRRImm12 {
+        op: AluRRImm12OP::Xori,
+        rd,
+        rs,
+        imm: Imm12::ONE,
+    });
+}
+
+/// Emit a comparison through `emit_less`, writing `rd` directly, or into a
+/// temporary flipped with `xori rd, less, 1` when `invert`.
+fn lower_invertible_cmp(
+    ctx: &mut LowerContext<'_, MInst>,
+    rd: Writable<Reg>,
+    invert: bool,
+    emit_less: impl FnOnce(&mut LowerContext<'_, MInst>, Writable<Reg>),
+) -> LoweredOutput {
+    if !invert {
+        emit_less(ctx, rd);
+        return LoweredOutput::Value(rd.to_reg());
+    }
+    let less = ctx.alloc_tmp(HirType::get_i32());
+    emit_less(ctx, Writable::from_reg(less));
+    emit_xori_one(ctx, rd, less);
+    LoweredOutput::Value(rd.to_reg())
+}
+
+/// `slt rd, rs1, rs2`, flipping the result with `xori 1` when `invert`.
+fn lower_slt(
+    ctx: &mut LowerContext<'_, MInst>,
+    rd: Writable<Reg>,
+    rs1: Reg,
+    rs2: Reg,
+    invert: bool,
+) -> LoweredOutput {
+    lower_invertible_cmp(ctx, rd, invert, |ctx, less| {
+        ctx.emit(MInst::AluRRR {
+            op: AluRRROP::Slt,
+            rd: less,
+            rs1,
+            rs2,
+        });
+    })
+}
+
+/// `slti rd, rs, imm`, flipping the result with `xori 1` when `invert`.
+fn lower_slti(
+    ctx: &mut LowerContext<'_, MInst>,
+    rd: Writable<Reg>,
+    rs: Reg,
+    imm: Imm12,
+    invert: bool,
+) -> LoweredOutput {
+    lower_invertible_cmp(ctx, rd, invert, |ctx, less| {
+        ctx.emit(MInst::AluRRImm12 {
+            op: AluRRImm12OP::Slti,
+            rd: less,
+            rs,
+            imm,
+        });
+    })
+}
+
+/// `seqz`/`snez rd, rs`: an equality test against zero.
+fn lower_eq_zero(
+    ctx: &mut LowerContext<'_, MInst>,
+    rd: Writable<Reg>,
+    equal: bool,
+    rs: Reg,
+) -> LoweredOutput {
+    ctx.emit(MInst::AluRRR {
+        op: if equal {
+            AluRRROP::Seqz
+        } else {
+            AluRRROP::Snez
+        },
+        rd,
+        rs1: rs,
+        rs2: zero_reg(),
+    });
+    LoweredOutput::Value(rd.to_reg())
+}
+
 fn lower_binary(
     ctx: &mut LowerContext<'_, MInst>,
     arena: ArenaContext<'_>,
@@ -404,15 +488,67 @@ fn lower_binary(
     binary: &Binary,
 ) -> LoweredOutput {
     let bop = binary.op();
-    let lhs = ctx.put_value_in_reg(binary.lhs());
     let def = ctx.result_reg(inst);
     let rd = Writable::from_reg(def);
     let inst_ty = arena.inst_data(inst).ty();
+    let is_i32 = matches!(inst_ty.kind(), HirTypeKind::Int32);
     let is_float = matches!(inst_ty.kind(), HirTypeKind::Float32)
         || matches!(
             arena.inst_data(binary.lhs()).ty().kind(),
             HirTypeKind::Float32
         );
+
+    // `0 op x` identities fold before either operand is materialized: the
+    // backend has no DCE pass, so a rematerialized `li 0` would stay in the
+    // output. Float constants never reach here (`integer_constant` only
+    // matches `Integer`). The `Value` aliases below rely on every i32
+    // producer keeping values sign-extended in 64-bit registers (loads,
+    // W-class ops, constants, ABI args); `slti`/`slli`/GEP indexing depend
+    // on the same invariant.
+    if integer_constant(arena, binary.lhs()) == Some(0) {
+        match bop {
+            BinaryOp::Add | BinaryOp::Or | BinaryOp::Xor => {
+                let rhs = ctx.put_value_in_reg(binary.rhs());
+                return LoweredOutput::Value(rhs);
+            }
+            BinaryOp::And => {
+                ctx.emit(MInst::LoadImm { rd, value: 0 });
+                return LoweredOutput::Value(def);
+            }
+            BinaryOp::Sub => {
+                // 0 - x = neg(x), emitted as `subw rd, zero, x` (or `sub`).
+                let rhs = ctx.put_value_in_reg(binary.rhs());
+                ctx.emit(MInst::AluRRR {
+                    op: if is_i32 {
+                        AluRRROP::SubW
+                    } else {
+                        AluRRROP::Sub
+                    },
+                    rd,
+                    rs1: zero_reg(),
+                    rs2: rhs,
+                });
+                return LoweredOutput::Value(def);
+            }
+            BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Ge | BinaryOp::Le => {
+                let rhs = ctx.put_value_in_reg(binary.rhs());
+                let (rs1, rs2, invert) = match bop {
+                    BinaryOp::Lt => (zero_reg(), rhs, false),
+                    BinaryOp::Gt => (rhs, zero_reg(), false),
+                    BinaryOp::Ge => (zero_reg(), rhs, true),
+                    _ => (rhs, zero_reg(), true), // Le
+                };
+                return lower_slt(ctx, rd, rs1, rs2, invert);
+            }
+            BinaryOp::Eq | BinaryOp::NotEq => {
+                let rhs = ctx.put_value_in_reg(binary.rhs());
+                return lower_eq_zero(ctx, rd, bop == BinaryOp::Eq, rhs);
+            }
+            _ => {}
+        }
+    }
+
+    let lhs = ctx.put_value_in_reg(binary.lhs());
 
     if is_float {
         let rhs = ctx.put_value_in_reg(binary.rhs());
@@ -439,12 +575,7 @@ fn lower_binary(
                 rs1,
                 rs2,
             });
-            ctx.emit(MInst::AluRRImm12 {
-                op: AluRRImm12OP::Xori,
-                rd,
-                rs: equal,
-                imm: Imm12::ONE,
-            });
+            emit_xori_one(ctx, rd, equal);
         } else {
             ctx.emit(MInst::FpuRRR { op, rd, rs1, rs2 });
         }
@@ -461,12 +592,148 @@ fn lower_binary(
         {
             return LoweredOutput::Value(def);
         }
+        // Constant-operand folding: each arm returns when an immediate form
+        // is selected; otherwise it falls through to the register form, which
+        // is the only one allowed to materialize the constant (no DCE pass).
+        let rhs_imm = integer_constant(arena, binary.rhs());
+        let is_i32 = matches!(inst_ty.kind(), HirTypeKind::Int32);
+        match bop {
+            BinaryOp::Add | BinaryOp::Sub => {
+                if rhs_imm == Some(0) {
+                    return LoweredOutput::Value(lhs);
+                }
+                // add/sub x, x, k → addiw/addi x, x, ±k.
+                let imm = rhs_imm
+                    .map(|k| {
+                        if bop == BinaryOp::Sub {
+                            k.wrapping_neg()
+                        } else {
+                            k
+                        }
+                    })
+                    .and_then(Imm12::from_i32);
+                if let Some(imm) = imm {
+                    ctx.emit(MInst::AluRRImm12 {
+                        op: if is_i32 {
+                            AluRRImm12OP::Addiw
+                        } else {
+                            AluRRImm12OP::Addi
+                        },
+                        rd,
+                        rs: lhs,
+                        imm,
+                    });
+                    return LoweredOutput::Value(def);
+                }
+            }
+            BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
+                if rhs_imm == Some(0) {
+                    if bop == BinaryOp::And {
+                        ctx.emit(MInst::LoadImm { rd, value: 0 });
+                        return LoweredOutput::Value(def);
+                    }
+                    return LoweredOutput::Value(lhs);
+                }
+                if let Some(imm) = rhs_imm.and_then(Imm12::from_i32) {
+                    let op = match bop {
+                        BinaryOp::And => AluRRImm12OP::Andi,
+                        BinaryOp::Or => AluRRImm12OP::Ori,
+                        BinaryOp::Xor => AluRRImm12OP::Xori,
+                        _ => unreachable!(),
+                    };
+                    ctx.emit(MInst::AluRRImm12 {
+                        op,
+                        rd,
+                        rs: lhs,
+                        imm,
+                    });
+                    return LoweredOutput::Value(def);
+                }
+            }
+            BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Sar => {
+                if rhs_imm == Some(0) {
+                    // Zero shift = identity; aliasing keeps a negative i32
+                    // sign-extended, unlike `srliw rd, rs, 0`.
+                    return LoweredOutput::Value(lhs);
+                }
+                let shamt = rhs_imm.and_then(|v| u8::try_from(v).ok());
+                if is_i32 {
+                    if let Some(shamt) = shamt.and_then(ShiftImm::new) {
+                        let op = match bop {
+                            BinaryOp::Shl => AluRRImmShiftOP::SlliW,
+                            BinaryOp::Shr => AluRRImmShiftOP::SrliW,
+                            BinaryOp::Sar => AluRRImmShiftOP::SraiW,
+                            _ => unreachable!(),
+                        };
+                        ctx.emit(MInst::AluRRImmShift {
+                            op,
+                            rd,
+                            rs: lhs,
+                            shamt,
+                        });
+                        return LoweredOutput::Value(def);
+                    }
+                } else if let Some(shamt) = shamt.and_then(ShiftImm64::new) {
+                    let m = match bop {
+                        BinaryOp::Shl => MInst::Slli { rd, rs: lhs, shamt },
+                        BinaryOp::Shr => MInst::Srli { rd, rs: lhs, shamt },
+                        BinaryOp::Sar => MInst::Srai { rd, rs: lhs, shamt },
+                        _ => unreachable!(),
+                    };
+                    ctx.emit(m);
+                    return LoweredOutput::Value(def);
+                }
+            }
+            BinaryOp::Lt | BinaryOp::Ge => {
+                // x < k → slti x, k; x >= k → slti x, k; xori 1.
+                if let Some(imm) = rhs_imm.and_then(Imm12::from_i32) {
+                    return lower_slti(ctx, rd, lhs, imm, bop == BinaryOp::Ge);
+                }
+            }
+            BinaryOp::Gt | BinaryOp::Le => {
+                if rhs_imm == Some(0) {
+                    if bop == BinaryOp::Gt {
+                        // x > 0 ⟺ 0 < x, folded to slt rd, zero, x.
+                        return lower_slt(ctx, rd, zero_reg(), lhs, false);
+                    }
+                    // x <= 0 ⟺ x < 1.
+                    return lower_slti(ctx, rd, lhs, Imm12::ONE, false);
+                }
+                // x > k ⟺ !(x < k+1); x <= k ⟺ x < k+1.
+                if let Some(imm) = rhs_imm.and_then(|k| Imm12::from_i32(k.wrapping_add(1))) {
+                    return lower_slti(ctx, rd, lhs, imm, bop == BinaryOp::Gt);
+                }
+            }
+            BinaryOp::Eq | BinaryOp::NotEq => {
+                // x == 0 → seqz x; x != 0 → snez x.
+                if rhs_imm == Some(0) {
+                    return lower_eq_zero(ctx, rd, bop == BinaryOp::Eq, lhs);
+                }
+                // x == k → addiw x, -k; seqz/snez. Only the truncating 32-bit
+                // form is sound (comparison on the wrapping ring); wider
+                // operands keep the exact 64-bit register form.
+                if is_i32 {
+                    if let Some(imm) = rhs_imm.and_then(|k| Imm12::from_i32(k.wrapping_neg())) {
+                        let difference = ctx.alloc_tmp(HirType::get_i32());
+                        ctx.emit(MInst::AluRRImm12 {
+                            op: AluRRImm12OP::Addiw,
+                            rd: Writable::from_reg(difference),
+                            rs: lhs,
+                            imm,
+                        });
+                        return lower_eq_zero(ctx, rd, bop == BinaryOp::Eq, difference);
+                    }
+                }
+            }
+            BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Min | BinaryOp::Max => {}
+        }
+
         let rhs = ctx.put_value_in_reg(binary.rhs());
         let op = (!matches!(bop, BinaryOp::Eq | BinaryOp::NotEq))
             .then(|| alu_op_for_hir_binary(bop, inst_ty));
         let sub_op = alu_op_for_hir_binary(BinaryOp::Sub, inst_ty);
         match bop {
-            BinaryOp::NotEq => {
+            BinaryOp::Eq | BinaryOp::NotEq => {
                 let difference = ctx.alloc_tmp(HirType::get_i32());
                 ctx.emit(MInst::AluRRR {
                     op: sub_op,
@@ -474,27 +741,7 @@ fn lower_binary(
                     rs1: lhs,
                     rs2: rhs,
                 });
-                ctx.emit(MInst::AluRRR {
-                    op: AluRRROP::Snez,
-                    rd,
-                    rs1: difference,
-                    rs2: zero_reg(),
-                });
-            }
-            BinaryOp::Eq => {
-                let difference = ctx.alloc_tmp(HirType::get_i32());
-                ctx.emit(MInst::AluRRR {
-                    op: sub_op,
-                    rd: Writable::from_reg(difference),
-                    rs1: lhs,
-                    rs2: rhs,
-                });
-                ctx.emit(MInst::AluRRR {
-                    op: AluRRROP::Seqz,
-                    rd,
-                    rs1: difference,
-                    rs2: zero_reg(),
-                });
+                return lower_eq_zero(ctx, rd, bop == BinaryOp::Eq, difference);
             }
             BinaryOp::Lt
             | BinaryOp::Add
@@ -1477,6 +1724,279 @@ mod tests {
 
         let asm = taki_mir::compile::<Riscv64Backend>(&program);
         assert!(asm.contains("divw "), "{asm}");
+    }
+
+    /// Emits `constant <op> parameter` as a whole function and returns its
+    /// RISC-V assembly (mirror of `compile_constant_binary`).
+    fn compile_constant_on_lhs(op: BinaryOp, value: i32) -> String {
+        let mut program = Program::new();
+        let function = program.new_function(
+            HirType::get_i32(),
+            "constant_lhs".to_string(),
+            vec![HirType::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let parameter = data.params()[0];
+        let constant = data.new_local_inst().integer(value);
+        let binary = data.new_local_inst().binary(op, constant, parameter);
+        let ret = data.new_local_inst().ret(Some(binary));
+        data.layout_mut().insert_inst(entry, binary);
+        data.layout_mut().insert_inst(entry, ret);
+        taki_mir::compile::<Riscv64Backend>(&program)
+    }
+
+    #[test]
+    fn logic_within_imm12_uses_immediate_forms() {
+        let asm = compile_constant_binary(BinaryOp::And, 0xff);
+        assert!(asm.contains("andi "), "{asm}");
+        assert!(!asm.contains("and "), "{asm}");
+        assert!(!asm.contains("li "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Or, 3);
+        assert!(asm.contains("ori "), "{asm}");
+        assert!(!asm.contains("or "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Xor, 1);
+        assert!(asm.contains("xori "), "{asm}");
+        assert!(!asm.contains("xor "), "{asm}");
+        assert!(!asm.contains("li "), "{asm}");
+
+        // Negative masks encode through the sign-extended 12-bit immediate.
+        let asm = compile_constant_binary(BinaryOp::And, -2);
+        assert!(asm.contains("andi "), "{asm}");
+        assert!(!asm.contains("and "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Or, -1);
+        assert!(asm.contains("ori "), "{asm}");
+        assert!(!asm.contains("or "), "{asm}");
+    }
+
+    #[test]
+    fn subtraction_from_zero_is_a_negation() {
+        let asm = compile_constant_on_lhs(BinaryOp::Sub, 0);
+        assert!(asm.contains("subw "), "{asm}");
+        assert!(!asm.contains("li "), "{asm}");
+    }
+
+    #[test]
+    fn zero_identity_operands_fold_before_materialization() {
+        // Both the left intercept (`0 op x`) and the right fold (`x op 0`)
+        // must avoid materializing `li 0` (no DCE). `0 - x` is covered by
+        // `subtraction_from_zero_is_a_negation`; `x - 0` aliases below.
+        for on_lhs in [false, true] {
+            let add = if on_lhs {
+                compile_constant_on_lhs(BinaryOp::Add, 0)
+            } else {
+                compile_constant_binary(BinaryOp::Add, 0)
+            };
+            assert!(!add.contains("li "), "{on_lhs}:\n{add}");
+            assert!(!add.contains("addw "), "{on_lhs}:\n{add}");
+
+            let or = if on_lhs {
+                compile_constant_on_lhs(BinaryOp::Or, 0)
+            } else {
+                compile_constant_binary(BinaryOp::Or, 0)
+            };
+            assert!(!or.contains("li "), "{on_lhs}:\n{or}");
+            assert!(!or.contains("or "), "{on_lhs}:\n{or}");
+
+            let xor = if on_lhs {
+                compile_constant_on_lhs(BinaryOp::Xor, 0)
+            } else {
+                compile_constant_binary(BinaryOp::Xor, 0)
+            };
+            assert!(!xor.contains("li "), "{on_lhs}:\n{xor}");
+            assert!(!xor.contains("xor "), "{on_lhs}:\n{xor}");
+
+            let and = if on_lhs {
+                compile_constant_on_lhs(BinaryOp::And, 0)
+            } else {
+                compile_constant_binary(BinaryOp::And, 0)
+            };
+            assert!(and.contains("li "), "{on_lhs}:\n{and}");
+        }
+
+        let sub = compile_constant_binary(BinaryOp::Sub, 0);
+        assert!(!sub.contains("li "), "{sub}");
+        assert!(!sub.contains("subw "), "{sub}");
+    }
+
+    #[test]
+    fn equality_with_zero_is_a_single_seqz_or_snez() {
+        let asm = compile_constant_binary(BinaryOp::Eq, 0);
+        assert!(asm.contains("seqz "), "{asm}");
+        assert!(!asm.contains("subw "), "{asm}");
+        assert!(!asm.contains("li "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::NotEq, 0);
+        assert!(asm.contains("snez "), "{asm}");
+        assert!(!asm.contains("subw "), "{asm}");
+
+        let asm = compile_constant_on_lhs(BinaryOp::Eq, 0);
+        assert!(asm.contains("seqz "), "{asm}");
+        assert!(!asm.contains("li "), "{asm}");
+    }
+
+    #[test]
+    fn zero_comparisons_use_the_zero_register() {
+        // `x > 0` (right fold) and `0 < x`/`0 > x` (left intercept) all
+        // lower to `slt` against x0.
+        let asm = compile_constant_binary(BinaryOp::Gt, 0);
+        assert!(asm.contains("slt "), "{asm}");
+        assert!(!asm.contains("li "), "{asm}");
+        assert!(!asm.contains("xori "), "{asm}");
+
+        let asm = compile_constant_on_lhs(BinaryOp::Lt, 0);
+        assert!(asm.contains("slt "), "{asm}");
+        assert!(!asm.contains("li "), "{asm}");
+
+        let asm = compile_constant_on_lhs(BinaryOp::Gt, 0);
+        assert!(asm.contains("slt "), "{asm}");
+        assert!(!asm.contains("li "), "{asm}");
+    }
+
+    #[test]
+    fn imm12_boundaries_fold_or_fall_back() {
+        // Upper and lower encodable bounds, plus small constants.
+        let asm = compile_constant_binary(BinaryOp::Add, 1);
+        assert!(asm.contains("addiw "), "{asm}");
+        assert!(!asm.contains("li "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Add, 2047);
+        assert!(asm.contains("addiw "), "{asm}");
+        assert!(asm.contains("2047"), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Add, -2048);
+        assert!(asm.contains("addiw "), "{asm}");
+        assert!(asm.contains("-2048"), "{asm}");
+
+        // Negative constants; sub folds through addiw of the negated value.
+        let asm = compile_constant_binary(BinaryOp::Add, -1);
+        assert!(asm.contains("addiw "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Sub, 1);
+        assert!(asm.contains("addiw "), "{asm}");
+        assert!(asm.contains(", -1"), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Sub, 2048);
+        assert!(asm.contains("addiw "), "{asm}");
+        assert!(asm.contains("-2048"), "{asm}");
+        assert!(!asm.contains("subw "), "{asm}");
+
+        // Outside the 12-bit signed range: register form.
+        let asm = compile_constant_binary(BinaryOp::Add, 2048);
+        assert!(asm.contains("addw "), "{asm}");
+        assert!(!asm.contains("addiw "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Sub, -2049);
+        assert!(asm.contains("subw "), "{asm}");
+        assert!(!asm.contains("addiw "), "{asm}");
+    }
+
+    #[test]
+    fn comparison_boundaries_fold_or_fall_back() {
+        // x > k ⟺ !(x < k+1); x <= k ⟺ x < k+1. k+1 = 2048 is not
+        // encodable, so k = 2047 falls back to the register form.
+        let asm = compile_constant_binary(BinaryOp::Gt, 2047);
+        assert!(!asm.contains("slti "), "{asm}");
+        assert!(asm.contains("slt "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Le, 2047);
+        assert!(!asm.contains("slti "), "{asm}");
+        assert!(asm.contains("slt "), "{asm}");
+
+        // k+1 = 2047 / -2048 remain encodable.
+        let asm = compile_constant_binary(BinaryOp::Gt, 2046);
+        assert!(asm.contains("slti "), "{asm}");
+        assert!(asm.contains("2047"), "{asm}");
+        assert!(asm.contains("xori "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Le, -2049);
+        assert!(asm.contains("slti "), "{asm}");
+        assert!(asm.contains("-2048"), "{asm}");
+        assert!(!asm.contains("xori "), "{asm}");
+
+        // x < 0 / x >= 0 / x <= 0 fold through the slti forms.
+        let asm = compile_constant_binary(BinaryOp::Lt, 0);
+        assert!(asm.contains("slti "), "{asm}");
+        assert!(asm.contains(", 0"), "{asm}");
+        assert!(!asm.contains("li "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Ge, 0);
+        assert!(asm.contains("slti "), "{asm}");
+        assert!(asm.contains("xori "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Le, 0);
+        assert!(asm.contains("slti "), "{asm}");
+        assert!(asm.contains(", 1"), "{asm}");
+        assert!(!asm.contains("xori "), "{asm}");
+    }
+
+    #[test]
+    fn equality_boundaries_fold_or_fall_back() {
+        // k = 2048 encodes as addiw x, -2048; k = -2048 needs +2048 (not
+        // encodable) and wrapping_neg(i32::MIN) = i32::MIN is rejected, so
+        // both fall back to the register form.
+        let asm = compile_constant_binary(BinaryOp::Eq, 2048);
+        assert!(asm.contains("addiw "), "{asm}");
+        assert!(asm.contains("-2048"), "{asm}");
+        assert!(asm.contains("seqz "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Eq, -2048);
+        assert!(!asm.contains("addiw "), "{asm}");
+        assert!(asm.contains("subw "), "{asm}");
+        assert!(asm.contains("seqz "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Eq, i32::MIN);
+        assert!(!asm.contains("addiw "), "{asm}");
+        assert!(asm.contains("subw "), "{asm}");
+        assert!(asm.contains("seqz "), "{asm}");
+    }
+
+    #[test]
+    fn shift_amount_boundaries_fold_or_fall_back() {
+        // Small amounts fold to the W-class immediate forms.
+        let asm = compile_constant_binary(BinaryOp::Shl, 2);
+        assert!(asm.contains("slliw "), "{asm}");
+        assert!(!asm.contains("sllw "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Shr, 2);
+        assert!(asm.contains("srliw "), "{asm}");
+        assert!(!asm.contains("srlw "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Sar, 2);
+        assert!(asm.contains("sraiw "), "{asm}");
+        assert!(!asm.contains("sraw "), "{asm}");
+        assert!(!asm.contains("li "), "{asm}");
+
+        // Encodable upper bound: 31 (W class). 32 and negative amounts keep
+        // the register form, which preserves the hardware's low-bit masking.
+        let asm = compile_constant_binary(BinaryOp::Sar, 31);
+        assert!(asm.contains("sraiw "), "{asm}");
+        assert!(!asm.contains("sraw "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Sar, 32);
+        assert!(asm.contains("sraw "), "{asm}");
+        assert!(!asm.contains("sraiw "), "{asm}");
+
+        let asm = compile_constant_binary(BinaryOp::Shl, -1);
+        assert!(asm.contains("sllw "), "{asm}");
+        assert!(!asm.contains("slliw "), "{asm}");
+    }
+
+    #[test]
+    fn zero_shift_is_an_identity_alias() {
+        // `srliw rd, rs, 0` would zero-extend a negative i32; aliasing keeps
+        // it sign-extended.
+        for op in [BinaryOp::Shl, BinaryOp::Shr, BinaryOp::Sar] {
+            let asm = compile_constant_binary(op, 0);
+            assert!(!asm.contains("slliw "), "{op:?}:\n{asm}");
+            assert!(!asm.contains("sllw "), "{op:?}:\n{asm}");
+            assert!(!asm.contains("srliw "), "{op:?}:\n{asm}");
+            assert!(!asm.contains("sraw "), "{op:?}:\n{asm}");
+            assert!(!asm.contains("li "), "{op:?}:\n{asm}");
+        }
     }
 
     #[test]

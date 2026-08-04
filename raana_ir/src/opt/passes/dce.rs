@@ -500,8 +500,14 @@ impl Pass for DeadPhiElimination {
             changed = true;
             let bb = bb_allocator.search_id(i);
 
+            // `unused_params_index` is descending, so positional `remove`
+            // keeps the remaining parameters in their original relative
+            // order. `swap_remove` would also work positionally, but it
+            // reorders the tail and every predecessor's argument vector
+            // must be permuted identically for the block's phi values to
+            // stay aligned across repeated runs.
             for &index in unused_params_index.iter() {
-                let _val = data.bb_data_mut(bb).params_mut().swap_remove(index);
+                let _val = data.bb_data_mut(bb).params_mut().remove(index);
             }
 
             let jump_inst = data
@@ -519,7 +525,7 @@ impl Pass for DeadPhiElimination {
                         let t = jump.target();
                         let mut a = jump.args().to_vec();
                         for &index in unused_params_index.iter() {
-                            a.swap_remove(index);
+                            a.remove(index);
                         }
                         data.replace_inst_with(inst).jump(t, a);
                     }
@@ -534,12 +540,12 @@ impl Pass for DeadPhiElimination {
                         // the rebuilt branch keeps args aligned with params.
                         if bb == branch.t_target() {
                             for &index in unused_params_index.iter() {
-                                ta.swap_remove(index);
+                                ta.remove(index);
                             }
                         }
                         if bb == branch.f_target() {
                             for &index in unused_params_index.iter() {
-                                fa.swap_remove(index);
+                                fa.remove(index);
                             }
                         }
                         data.replace_inst_with(inst).branch(c, tt, ta, ft, fa);

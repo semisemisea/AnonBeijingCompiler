@@ -40,8 +40,12 @@ impl StrengthReduction {
             }
             let candidate = self
                 .remainder_comparison(data, compare.lhs(), compare.rhs())
-                .or_else(|| self.remainder_comparison(data, compare.rhs(), compare.lhs()));
-            let Some((value, compared, mask)) = candidate else {
+                .map(|c| (compare.lhs(), c))
+                .or_else(|| {
+                    self.remainder_comparison(data, compare.rhs(), compare.lhs())
+                        .map(|c| (compare.rhs(), c))
+                });
+            let Some((remainder, (value, compared, mask))) = candidate else {
                 continue;
             };
 
@@ -49,7 +53,19 @@ impl StrengthReduction {
             let masked = data
                 .new_local_inst()
                 .binary(BinaryOp::And, value, mask_value);
-            data.layout_mut().insert_inst_before(inst, masked);
+            // Place the mask right where the remainder was computed.  The
+            // backend then sees the bit test before any division that
+            // recomputes the same loop-carried value, avoiding the copy that
+            // preserving the pre-division value would otherwise force.
+            // Anchoring at the remainder (rather than the comparison) is safe
+            // even across blocks: SSA dominance guarantees the remainder
+            // dominates the comparison it feeds, so the mask inserted before
+            // the remainder still dominates that comparison.
+            let anchor = match data.layout().parent_bb(remainder) {
+                Some(_) => remainder,
+                _ => inst,
+            };
+            data.layout_mut().insert_inst_before(anchor, masked);
             let expected = data.new_local_inst().integer(compared);
             data.replace_inst_with(inst)
                 .binary(compare.op(), masked, expected);
@@ -576,6 +592,56 @@ mod tests {
             .insts()
             .iter()
             .all(|&inst| !matches!(data.inst_data(inst).kind(), InstKind::Binary(b) if b.op() == BinaryOp::Rem)));
+    }
+
+    /// The mask feeding `x % 2 == 1` must be placed where the remainder was
+    /// computed, before any `x / 2` that overwrites the loop-carried `x`.  If
+    /// the mask were left next to the comparison (after the division), the
+    /// backend would need a copy of `x` to run the bit test after the
+    /// division clobbered it.
+    #[test]
+    fn places_bit_test_mask_before_division_of_same_value() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "bit_then_div".into(),
+            vec![Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let x = data.params()[0];
+        let two = data.new_local_inst().integer(2);
+        let one = data.new_local_inst().integer(1);
+        let rem = data.new_local_inst().binary(BinaryOp::Rem, x, two);
+        let compare = data.new_local_inst().binary(BinaryOp::Eq, rem, one);
+        // `x / 2` uses the same `x` the bit test reads; SR rewrites it to
+        // `(x + (x>>31)) >> 1`, a chain that overwrites `x`'s register.
+        let div = data.new_local_inst().binary(BinaryOp::Div, x, two);
+        let sum = data.new_local_inst().binary(BinaryOp::Add, compare, div);
+        let ret = data.new_local_inst().ret(Some(sum));
+        for inst in [rem, div, compare, sum, ret] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        assert!(run(&mut program));
+        let data = program.func_data(function);
+        let insts: Vec<Inst> = data
+            .layout()
+            .entry_bb()
+            .unwrap()
+            .insts()
+            .iter()
+            .copied()
+            .collect();
+        let and_pos = insts
+            .iter()
+            .position(|&inst| matches!(data.inst_data(inst).kind(), InstKind::Binary(b) if b.op() == BinaryOp::And));
+        let sar_pos = insts
+            .iter()
+            .position(|&inst| matches!(data.inst_data(inst).kind(), InstKind::Binary(b) if b.op() == BinaryOp::Sar));
+        assert!(
+            and_pos.is_some() && sar_pos.is_some() && and_pos.unwrap() < sar_pos.unwrap(),
+            "bit-test mask must precede the division: insts={insts:?}"
+        );
     }
 
     #[test]

@@ -228,7 +228,7 @@ impl PassesManager {
         // Collapse zero-initialization loops into a single runtime-length
         // `MemZero` (`bl memset` on AArch64). AArch64-only for now; it runs
         // after rotation so it sees the countdown form.
-        if with_chain_to_switch {
+        if config.target.enable_chain_to_switch {
             let zero_store_loop = Box::new(zero_store_loop::ZeroStoreLoop);
             p.register(zero_store_loop);
         }

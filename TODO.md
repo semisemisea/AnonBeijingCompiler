@@ -922,3 +922,151 @@ riscv functional+h_functional 全量通过，非对齐 131→0 处；**FPGA 实�
 
 ```
 # Goal: 实现 M52 DSE（死 Store 消除 + 冗余回写删除 + store→load forwarding）
+
+## 7. 性能差距分析：vs clang -O2（2026-08-04）
+
+方法：clang 17（--target=aarch64-none-elf -O2，sed 把 SysY `const int N` 预处理成 `#define N`）与本编译器 -O2 同用例对比汇编指令数。clang 是强基线（含 NEON/内联/循环优化），差距按可实现性分级。DSE（M52）归隔壁会话，本清单避开。
+
+### 7.1 指令数对比（文件级，grep 指令行数）
+
+| 用例 | clang -O2 | 本编译器 -O2 | 差距 |
+|---|---|---|---|
+| conv2d-1 | 586 | 542 | -8%（持平） |
+| 03_sort1 | 404 | 454 | +12% |
+| sl1 | 169 | 212 | +25% |
+| crypto-1 | 468 | 836 | +79% |
+| huffman-01 | 514 | 890 | +73% |
+| fft1 | 321 | 684 | +113% |
+
+conv2d-1 已优于 clang（行指针提前 + LDR 融合 + madd 的功劳）。差距集中在 call 密集/位运算类用例。
+
+### 7.2 差距 A（修正版）：真实差距 = 死函数不删除 + 循环内调用点内联（P1/P2）
+
+初版结论"Inline 是 once 单候选导致 40 call 未内联"——**错误**。调试（call_graph 边打印 + incoming_callsites_of 数据 + 最终 IR call 归属）证明：
+
+1. **Inline 的 run 已是内部自循环**（inline.rs:19-25 `while Self::once(program)`），会一直内联到无候选，不是 once 单候选。
+2. **crypto-1 的 pseudo_md5 14 个调用点全部内联**（最终 IR 中 pseudo_md5 0 个 call）。get_random、_and/_or/_not/_xor 等也被内联。Inline 机制正常。
+3. **crypto-1 汇编 40 个 bl 的真相**：18 个在死函数 pseudo_sha1 里（main 从不调用它，源码 158 行定义后无调用者），6 个在 main（getint×2/starttime/stoptime/putarray/_xor×1）。**死函数 pseudo_sha1 没被 DCE 删除**（570 行汇编死代码），其内部 rotl1/rotl5/rotl30/_and/_xor 调用全保留 → 指令数统计虚高。
+4. 活代码里真实的 call 开销：main 的 _xor（循环外 1 次，size×callsites 超限不内联，影响极小）。
+
+真实差距（修正后）：
+- A1（P1）：**死函数删除**——DCE 只删死指令不删无调用者的函数。pseudo_sha1 类（crypto-1 570 行、fft1 可能也有）在最终汇编保留。实现：DCE 里用 call_graph（main 可达）或调用点计数删除无调用者且非 main 的函数。注意与隔壁 DSE（store 消除）不冲突。收益：代码体积 + 编译时间（汇编/链接/缓存），运行性能无直接影响（死代码不执行）。
+- A2（P2）：**循环内调用点内联**——huffman 的 read_bits_specialized_2（每符号调用、含循环、size > CALL_SIZE_LIMIT=40）不内联，是活代码里真实的每符号 call 开销（+序言，它内部还调 rotlN）。read_bits 是循环函数，size 超限被拒。候选：find_candidate 判断调用点所在块是否在自然循环内，循环内调用点放宽 CALL_SIZE_LIMIT（动态收益 ×迭代次数）。fft1 的 multiply/memmove 同属此类。
+- fft1 递归调用（bl fft×2）无法内联（recursion 检查），结构性保留。
+
+验证记录：调试手段 = call_graph.rs 边打印 + inline.rs main callees/布局 call 数打印 + incoming_callsites_of entry 打印 + 最终 IR call 行号归属（pseudo_md5 154-599 / pseudo_sha1 599-815 / main 815+）。调试代码已全部移除（git diff 干净）。
+
+### 7.3 差距 B（已撤销）：叶子寄存器保存——实测不成立
+
+初判 read_bits_specialized_2 是"叶子函数却保存 x19-x22"——错误。复查汇编它内部有 1 个 call（bl rotlN_specialized_0），是非叶子，保存 ra/x19-x22 正确。crypto-1 的 rotl1（真叶子，5 条指令无 call）零序言、用 caller-saved w2/w4/w6/w8——分配器对叶子函数已正确处理。ra 保存也已有（taki_mir/abi.rs:429 has_calls，lowering 扫描 call 指令设置，控制 RISC-V ra / AArch64 x30 保存与 outgoing area）。结论：后端"是否需要保存寄存器"的机制已完备，无需新工作。read_bits 的开销（每符号 bl + 序言/尾声 ~14 条）本质是内联不足（差距 A），不是寄存器分配。
+
+### 7.4 差距 C：范围检查未折叠（huffman，P2，IR 层）
+
+现象：clang 把 decode_fixed_huffman 的 `(c+64)>=65 && (c+64)<=144` 折叠成 `sub w8, w0, #1; cmp w8, #79; b.ls`（单无符号比较，利用 i32 回绕）。本编译器生成 land_merge + ccmp + b.le + 双分支块。
+
+候选方案：IR 层变换 `x >= L && x <= U`（有符号）→ 无符号单比较 `sub; cmp; ls`（等价变换：x-L 无符号 ≤ U-L，L/U 为常量时）。放 boolean_simplify 或 StrengthReduction。需证明 i32 回绕下等价（x < L 时 x-L 无符号回绕为巨大值 → 自然排除，合法）。验证：huffman decode 循环单分支；构造边界用例单测。
+
+### 7.5 差距 D：位反转循环用分支（fft1，P2）
+
+现象：fft 位反转循环（L_fft_while_body_5）用 tbnz w0,#0 + then/else 双块；clang 用 ubfx/csel 无分支（LBB3_4）。if-conversion 未覆盖该形态（位反转表达式 `(i&1) ? i>>1 : n/2 + i>>1` 之类）。
+
+候选方案：if-conversion 扩展或位运算规范化（`(i&1)!=0` 条件 → csel）。先确认 fft1 热循环占比再定优先级（fft 是递归，位反转循环可能占比小）。
+
+### 7.6 差距 E：清零循环未识别为 MemZero/NEON（01_mm2 类，P2）
+
+现象：clang 把 `C[i][j]=0` 双层清零循环识别为 memset（NEON 优化 libc）。本编译器保留 store 循环（IR 是 gep+store 循环，不是 MemZero 指令）。01_mm2/01_mm3 等含初始化清零段。
+
+候选方案：循环模式识别（内层 store 常量 0、全行连续）→ 生成 MemZero 或直接 NEON stp 序列。注意与隔壁 DSE 的接口（DSE 也动 store）。验证：清零段汇编变 stp 批量；01_mm2 定向。
+
+### 7.7 结构性差距（不可追/搁置）
+
+- NEON 向量化：clang 对 01_mm1/01_mm2 主循环用 NEON + 运行时别名 versioning + memset。M42-M46 搁置中，需 SIMD 通路。
+- clang 的循环展开/多版本化（LBB 结构复杂化）——通用 unroll 分支（feat/loop-unroll）有未完成工作（rebase 编译失败），本线不重复。
+
+### 7.8 优先级建议
+
+P1：A1（死函数删除）已落地（commit a36776c，crypto-1 836→453 指令）。**A2（循环内调用点内联）是当前主线**——详见 §8（huffman read_bits/fft1 multiply 实测数据、候选方案、验证计划）。B 已撤销（见 7.3）。
+P2：C（范围检查折叠）、E（清零识别）——独立小变换。
+P3：D（位反转无分支）——先量化 fft1 热循环占比。
+验证基线：本清单全部用 clang -O2 同用例对比 + cargo test + make test 定向；全量由用户跑。合规：全部按 IR 结构触发，无名字/输入指纹。
+
+## 8. A2：循环内调用点内联（P2，2026-08-04 侦察）
+
+### 8.1 现状（A1 DFE commit a36776c 之后）
+
+- Inline 机制已确认完备：run() 内部自循环（inline.rs:19-25 `while Self::once`）；find_candidate 每次重建 call_graph（正确）；recursion 检查用 `call_graph.reaches(callee, callee)` 拒递归环（fft 的 bl fft×2 因此保留，结构性正确）；BodyClonePlan::capture 预检（含循环的函数体克隆合法——循环嵌套克隆已验证）。
+- cost model（inline.rs:132-135）：`size > CALL_SIZE_LIMIT(40) || size × callsites > TOTAL_SIZE_LIMIT(100)` → 拒。
+- estimate_size（inline.rs:30-36）：纯布局 inst 计数（不含序言/参数路由成本）。
+- LoopAnalysis 现成可用：`LoopAnalysis::min_loop_contain(block) -> Option<&Loop>`（loop_analysis.rs:65），`LoopAnalysis::new(&FunctionData) -> (CFG, DominanceTree, LoopAnalysis)`（71 行）。
+
+### 8.2 实测数据（-O2，inline-dbg 打印 + IR 定位）
+
+| callee | size | callsites | 拒绝原因 | 调用点位置 |
+|---|---|---|---|---|
+| read_bits_specialized_0/1/2（huffman） | 141 | 1-2 | CALL_SIZE_LIMIT（远超 40） | main 的 decode 循环体 `while_body_6_decode_fixed_huffman_inline_7`，每符号 1 次（IR 118 行） |
+| rotlN_specialized_0（huffman） | 34 | 3 | TOTAL_SIZE_LIMIT（34×3=102 > 100，差 2） | read_bits 内部（IR 317/534/748 行） |
+| fft_specialized_0（fft1） | 97 | 3 | CALL_SIZE_LIMIT | 蝶形循环所在函数（其内部 169/177 行调 multiply） |
+| multiply（fft1） | ~20（未实测） | 6 | **非 cost 拒绝（cost 检查未打印，拒绝点待定位：callsite 选择/类型检查/BodyClonePlan？）** | power 内 2（47/71/76 tail）、fft 递归前 1（128）、fft_specialized 蝶形循环 2（169/177） |
+| memmove（fft1） | - | - | 已内联（fft 里块名 while_entry_2_memmove_inline_7） | **不是差距项**（此前 TODO 7.4 误记） |
+
+关键事实：
+- read_bits 是**非叶子**（内部调 rotlN_specialized_0，IR 748 行）——内联 read_bits 会把 rotlN 调用带进 main，后续轮次链式内联 rotlN（rotlN 34×3=102 也只差 TOTAL 边界 2）。
+- decode_fixed_huffman 已内联进 main（块名后缀 _inline_4），read_bits 调用点因此直接位于 main 的循环里。
+- fft1 的热点结构：fft 递归（保留）→ 每层递归前 multiply(θ,θ)（128 行，非循环内）+ fft_specialized 蝶形循环内 multiply（169/177 行，循环内）。memmove 复制循环已内联。
+- clang 对照：read_bits 被 clang 内联（decode 循环无 call），huffman 差距 +73% 的 call 开销部分在此；fft1 +113% 含 multiply 调用 + 位反转分支（7.6 的 P3-D，独立项）。
+
+### 8.3 根因链
+
+1. cost model 纯静态（size × callsites），无"调用点在自然循环内 → 动态收益 × 迭代次数"信号。
+2. read_bits 类循环函数（size 141）单调用点也被 CALL_SIZE_LIMIT=40 一刀切拒——恰是动态收益最大的场景（decode 循环迭代 N 次 × call 开销 + 非叶子序言 ~14 条）。
+3. rotlN 类（34×3=102）卡 TOTAL_SIZE_LIMIT 边界 2 个点——其调用点在 read_bits 内，read_bits 内联后随迁入 main，链式内联被同一静态限制挡住。
+4. multiply 拒绝点未定位（非 cost）——实施第一步先精确定位（候选：136-140 行 callsite 查找、152-166 类型/unit 检查、168-173 BodyClonePlan/contains_tail_call）。
+
+### 8.4 候选方案（建议先做 1，数据校准后定倍数）
+
+1. **循环内调用点信号放宽**（核心）：
+   - 对候选调用点构建 LoopAnalysis（`LoopAnalysis::new(caller_data)`，只对过 cost 门槛前的候选者构建，find_candidate 每轮的开销可接受），`min_loop_contain(call_block).is_some()` = 循环内。
+   - 任一 callsite 在循环内 → 放宽：建议初值 CALL_SIZE_LIMIT_LOOP=120、TOTAL_SIZE_LIMIT_LOOP=200（read_bits 141 仍差 21——**141 单调用点 + 循环内可特殊放行**（单调用点膨胀一次性，动态收益大），或 CALL_SIZE_LIMIT_LOOP=150）。**实施时用真实数据校准，先保守后放宽**。
+   - 放宽仅作用于 cost 检查（132-135 行）；recursion/BodyClonePlan/类型检查不动。
+2. **链式内联自然达成**：read_bits 内联 → rotlN 调用点进 main 的 decode 循环 → 下一轮 find_candidate 对 rotlN 用循环内放宽 → 内联。无需额外机制。
+3. **内联后 DFE 联动已就绪**：read_bits/rotlN 内联后变死 → fixed point 的 DFE 删除（a36776c）。
+4. multiply 拒绝点定位后单独处理（若 BodyClonePlan 拒绝则先解决克隆前置）。
+
+### 8.5 风险与边界
+
+- 代码膨胀：read_bits 141 inst 一次性进 main（1 个调用点）；fft_specialized 97 inst 进调用者（3 个调用点，需看是否值得——若 3 个调用点都在递归路径上，动态收益存疑，可能只放宽单调用点+循环内）。**几何均值风险**：逐 perf 用例检查汇编膨胀（01_mm2 的 memset 类清零循环、其他用例的循环内大函数）。
+- 寄存器压力：内联后调用者活跃值增加——A53 31 寄存器，风险低但需看 hot loop spill（make mca 复查）。
+- 迭代次数未知：循环内布尔信号是近似（无法静态估计 N）——放宽倍数保守起步，避免全程序膨胀。
+- 递归边界不变：fft 保留；fft_specialized 若内部含 fft 调用（recursion 检查已覆盖）安全。
+- 合规：循环内调用点信号是通用 IR 结构触发，无函数名/用例指纹。
+
+### 8.6 验证计划
+
+1. 单测（inline.rs tests）：main 循环内调用大 callee → 断言内联；同 callee 循环外调用 → 不内联（保守保持）；rotlN 式（多调用点+循环内）→ 放宽后内联。
+2. huffman 定向：read_bits_specialized_2 内联（decode 循环无 bl read_bits）、rotlN 链式内联（无 bl rotlN）、bl 数 33 → 对比 clang、make test huffman QEMU 正确性。
+3. fft1 定向：multiply 内联（蝶形循环无 bl multiply）、bl fft×2 保留、make test fft1 QEMU。
+4. 全量 perf 用例汇编 bl 数/指令数扫描（膨胀风险）+ workspace 测试。
+5. 性能：QEMU 时间对比 huffman/fft1 前后；几何均值风险自查（其他用例无膨胀）。
+6. 全量 make test / make test-riscv 由用户跑。
+
+### 8.7 实施结果（2026-08-04 完成，commit 见 git log）
+
+**multiply 拒绝点定位（§8.2 遗留问题，结论）**：`recursion-cycle` 守卫（inline.rs:120，cost 检查之前）。multiply 是真递归（fft1.sy:7 `multiply(a, b/2)`）——自递归 callee 克隆后其自调用点移入调用者，reaches 守卫不再排除，会无限链式内联，守卫必要（cranelift `does_not_inline_across_a_recursive_call_cycle`）。**"fft1 multiply 消失"在 Inline 层不可达**（clang 同样无法内联递归函数）；这不是 cost 缺口，不改守卫。另：fft_specialized_0 的 3 个调用点全部在 main 顶层（不在循环内，蝶形循环在其函数体内），循环内信号对它不适用，且 3 次程序级调用内联收益≈0，当前 cost 拒绝是对的。fft1 代码生成零变化（562 = HEAD 562，见下）。
+
+**实现**：`CALL_SIZE_LIMIT_LOOP=200` / `TOTAL_SIZE_LIMIT_LOOP=300`；`any_callsite_in_loop()`（inline.rs，按 caller 去重建 `LoopAnalysis`，任一 callsite 的 call_block 满足 `min_loop_contain().is_some()` → 放宽）。仅放宽 cost 检查；recursion/BodyClonePlan/类型检查不动。单测 4 新增（循环内大 callee 内联 / 循环外不内联 / 多调用点+循环内放宽 / 循环外多调用点保守）。
+
+**数据校准（初值 150/200 → 实测 200/300，偏差说明）**：rotlN_specialized_0 的调用点在 read_bits **内部循环**里（不是 TODO §8.4 预测的"read_bits 进 main 后再链式"路径），先于 read_bits 被放宽内联进 read_bits 本体 → read_bits_specialized_1/2 从 141 长到 **175**（141+34）→ 175 > 150 被拒，链式增长卡在 CALL 上限。CALL_SIZE_LIMIT_LOOP 提到 200 后全链打通。TOTAL_SIZE_LIMIT_LOOP=300 覆盖 read_bits_specialized_0 的 141×2=282。
+
+**huffman 结果（-O2 aarch64）**：最终 IR 只剩 `main`——read_bits_specialized_0/1/2、rotlN_specialized_0、decode_fixed_huffman、output_data 全部内联，随后 DFE 清掉死函数。汇编 460 指令（HEAD 550，clang 514）——§7.1 的 +73% 差距反超为 **-10%**。decode 循环无 bl。QEMU -O1 PASS。
+
+**fft1 结果**：562 = HEAD 562，零变化（无循环内调用点 + multiply 递归结构），bl fft×5/bl multiply×19 保留（递归正确性）。
+
+**全量 perf 汇编扫描（HEAD a36776c vs NEW，指令数）**：
+- 收窄：huffman 550→460、crc 137→125（crc32_specialized_0 70×1 循环内）、shuffle 193→173（insert 75×1）、h-10 170→164（trsm_optimized 51×1）。
+- 膨胀（均为热循环内核，静态成本远小于 A53 L1I，无几何均值风险）：01_mm 191→235（mm 56×2 内联，`while(i<5){mm×2}` 共 10 次调用省 call 开销）；03_sort 411→527（getNumPos 8-inst×14 调用点全内联，基数排序热循环数百万次调用，明确大赢）。
+- 其余 30+ 用例零变化。
+- **many_mat_cal-1/2/3 编译 panic**（DeadPhiElimination swap_remove 越界）：基线 HEAD worktree 实测同样 panic——既有 bug，非本改动引入（另见记忆：heavy_read 类 dce swap_remove 越界）。
+
+**验证**：inline.rs 8 单测（4 新+4 旧）、raana_ir 264 全量、`cargo test --offline --locked --workspace` 全绿、make test perf/huffman-01.sy + perf/fft1.sy（ARGS="-O 1 -j 1"）QEMU 均 PASS。
+
+**遗留**：many_mat_cal DPE 越界（既有，独立修）；fft1 multiply 若要消除需递归→循环迭代化变换（非 Inline 范畴，clang 也未做）；fft_specialized_0 顶层调用点保持拒绝（收益≈0 判断正确）。

@@ -19,11 +19,37 @@ pub fn is_library_function(name: &str) -> bool {
     )
 }
 
+/// A pointer is *caller-visible* when its target may be reachable by the
+/// caller: it is a global, a function parameter, or is derived from either via
+/// GEP/casts. Reading or writing through such a pointer is observable by the
+/// rest of the program, so it makes a function impure. Pointers that trace back
+/// to a local `Alloc` (through GEP/cast only) are invisible to the caller.
+fn caller_visible_ptr(data: &FunctionData, params: &[Inst], ptr: Inst) -> bool {
+    let mut worklist = vec![ptr];
+    let mut seen = HashSet::default();
+    while let Some(inst) = worklist.pop() {
+        if !seen.insert(inst) {
+            continue;
+        }
+        if inst.is_global() || params.contains(&inst) {
+            return true;
+        }
+        match data.inst_data(inst).kind() {
+            InstKind::GetElemPtr(gep) => worklist.push(gep.base()),
+            InstKind::Cast(cast) => worklist.push(cast.src()),
+            // Anything not provably derived from a local Alloc (a load, a
+            // block-arg pointer, a select, ...) is treated as caller-visible.
+            _ => return true,
+        }
+    }
+    false
+}
+
 /// A function is *locally pure* when its body performs no observable memory
-/// operation: it may not load or store through a global address, write memory
-/// with `MemZero`, or take the address of a global. Scalar reads/writes through
-/// pointers that the callee cannot reach are invisible to the rest of the
-/// program, so they do not make a function impure.
+/// operation: it may not load or store through a caller-visible address
+/// (global or pointer parameter), write memory with `MemZero`, or take the
+/// address of a global. Scalar reads/writes through local `Alloc` pointers are
+/// invisible to the rest of the program, so they do not make a function impure.
 ///
 /// Callers must still check that every callee is pure (see
 /// [`pure_functions`]); this only inspects the function's own body.
@@ -37,20 +63,27 @@ fn locally_pure(program: &Program, func: Function) -> bool {
     if data.layout().entry_bb().is_none() {
         return false;
     }
+    let params = data.params();
     for bb in data.layout().basicblocks() {
         for &inst in bb.insts() {
             match data.inst_data(inst).kind() {
                 InstKind::Load(load) => {
-                    if load.src().is_global() {
+                    if caller_visible_ptr(data, params, load.src()) {
                         return false;
                     }
                 }
                 InstKind::Store(store) => {
-                    if store.src().is_global() || store.dest().is_global() {
+                    if caller_visible_ptr(data, params, store.src())
+                        || caller_visible_ptr(data, params, store.dest())
+                    {
                         return false;
                     }
                 }
-                InstKind::MemZero(..) => return false,
+                InstKind::MemZero(mem_zero) => {
+                    if caller_visible_ptr(data, params, mem_zero.dest()) {
+                        return false;
+                    }
+                }
                 InstKind::GetElemPtr(gep) => {
                     if gep.base().is_global() {
                         return false;

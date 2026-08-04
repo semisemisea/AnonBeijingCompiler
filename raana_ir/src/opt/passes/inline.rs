@@ -1,6 +1,10 @@
 use crate::{
     ir::arena::Arena,
-    opt::{prelude::*, utils::body_clone::BodyClonePlan},
+    opt::{
+        analysis_passes::loop_analysis::LoopAnalysis,
+        prelude::*,
+        utils::body_clone::BodyClonePlan,
+    },
 };
 
 /// Inline functions with a bounded total cloning cost. A callee is inlined
@@ -14,6 +18,16 @@ pub struct Inline;
 const CALL_SIZE_LIMIT: usize = 40;
 /// Total budget for one callee across all of its callsites.
 const TOTAL_SIZE_LIMIT: usize = 100;
+/// Per-callsite clone budget when at least one callsite sits inside a
+/// natural loop of its caller: the removed call overhead is paid once per
+/// loop iteration, so a larger one-time clone is dynamically worthwhile
+/// there (e.g. `read_bits_specialized_*` in huffman-01's decode loop).
+/// Calibrated on real data: a loop-resident callee may itself grow through
+/// chained in-loop inlining of its own helpers (`read_bits` 141 + `rotlN` 34
+/// = 175), so the budget must cover the post-chain size, not the bare body.
+const CALL_SIZE_LIMIT_LOOP: usize = 200;
+/// Total budget across the callsites of an in-loop callee.
+const TOTAL_SIZE_LIMIT_LOOP: usize = 300;
 
 impl Pass for Inline {
     fn run(&mut self, program: &mut Program) -> bool {
@@ -128,10 +142,17 @@ impl Inline {
             // Cost model: the estimated clone size times the number of
             // callsites must stay within budget. A single-callsite helper of
             // any reasonable size is always inlined; a many-callsite leaf is
-            // only inlined when the total stays small.
+            // only inlined when the total stays small. A callee whose callsite
+            // sits inside a natural loop removes its call overhead once per
+            // iteration, so the strict budget is relaxed for it (see
+            // `any_callsite_in_loop`).
             let size = estimate_size(callee_data);
-            if size > CALL_SIZE_LIMIT || size.saturating_mul(callsites.len()) > TOTAL_SIZE_LIMIT {
-                continue;
+            let total = size.saturating_mul(callsites.len());
+            if size > CALL_SIZE_LIMIT || total > TOTAL_SIZE_LIMIT {
+                let in_loop = Self::any_callsite_in_loop(program, &callsites);
+                if !in_loop || size > CALL_SIZE_LIMIT_LOOP || total > TOTAL_SIZE_LIMIT_LOOP {
+                    continue;
+                }
             }
             let Some(&callsite) = callsites.iter().find(|callsite| {
                 callsite.func != callee && !call_graph.reaches(callee, callsite.func)
@@ -182,13 +203,35 @@ impl Inline {
         }
         None
     }
+
+    /// True when any of the callsites' enclosing blocks sits inside a natural
+    /// loop of its caller. Builds one `LoopAnalysis` per distinct caller; the
+    /// analysis is a snapshot of the current CFG, which is valid because
+    /// `find_candidate` runs before any mutation in `once`.
+    fn any_callsite_in_loop(program: &Program, callsites: &[Node]) -> bool {
+        let mut loops_by_caller: HashMap<Function, LoopAnalysis> = HashMap::default();
+        callsites.iter().any(|callsite| {
+            let analysis = loops_by_caller.entry(callsite.func).or_insert_with(|| {
+                let (_, _, loops) = LoopAnalysis::new(program.func_data(callsite.func));
+                loops
+            });
+            let Some(call_block) = program
+                .func_data(callsite.func)
+                .layout()
+                .parent_bb(callsite.inst)
+            else {
+                return false;
+            };
+            analysis.min_loop_contain(call_block).is_some()
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::Inline;
     use crate::{
-        ir::{BinaryOp, Inst, InstKind, Program, Type, arena::Arena, builder_trait::*},
+        ir::{BasicBlock, BinaryOp, Function, Inst, InstKind, Program, Type, arena::Arena, builder_trait::*},
         opt::pass::Pass,
     };
 
@@ -476,6 +519,182 @@ mod tests {
             let ret = data.new_local_inst().ret(Some(call));
             data.layout_mut().insert_inst(entry, call);
             data.layout_mut().insert_inst(entry, ret);
+        }
+
+        assert!(!Inline.run(&mut program));
+    }
+
+    /// Build a leaf callee whose layout holds exactly `insts` instructions
+    /// (`insts - 1` chained adds plus one return), so `estimate_size`
+    /// reports `insts`.
+    fn build_leaf(program: &mut Program, name: &str, insts: usize) -> Function {
+        let callee = program.new_function(Type::get_i32(), name.into(), vec![]);
+        let data = program.func_data_mut(callee);
+        let entry = data.add_entry_block();
+        let mut acc: Inst = data.new_local_inst().integer(0);
+        for i in 1..insts {
+            let int = data.new_local_inst().integer(i as i32);
+            let add = data.new_local_inst().binary(BinaryOp::Add, acc, int);
+            data.layout_mut().insert_inst(entry, add);
+            acc = add;
+        }
+        let ret = data.new_local_inst().ret(Some(acc));
+        data.layout_mut().insert_inst(entry, ret);
+        callee
+    }
+
+    /// Build a `main` with a natural loop
+    /// `entry -> header(i) -> body -> header` (branch on `i < 10`, `exit`
+    /// returns 0). `body` is left empty for the caller to fill and must end
+    /// with a jump back to `header`. Returns `(main, header, body)`.
+    fn build_loop_main(program: &mut Program) -> (Function, BasicBlock, BasicBlock) {
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let data = program.func_data_mut(main);
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        data.layout_mut().push_bb_back(header);
+        data.layout_mut().push_bb_back(body);
+        data.layout_mut().push_bb_back(exit);
+
+        let one = data.new_local_inst().integer(1);
+        let ten = data.new_local_inst().integer(10);
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![one]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let i = data.bb_data(header).params()[0];
+        let cond = data.new_local_inst().binary(BinaryOp::Lt, i, ten);
+        let branch = data.new_local_inst().branch(cond, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, cond);
+        data.layout_mut().insert_inst(header, branch);
+
+        let ret = data.new_local_inst().ret(Some(zero));
+        data.layout_mut().insert_inst(exit, ret);
+        (main, header, body)
+    }
+
+    /// Finish a `body` produced by `build_loop_main`: append the given
+    /// instructions, then increment the header induction variable and jump
+    /// back to the header.
+    fn finish_loop_body(
+        program: &mut Program,
+        main: Function,
+        header: BasicBlock,
+        body: BasicBlock,
+        insts: &[Inst],
+    ) {
+        let data = program.func_data_mut(main);
+        let i = data.bb_data(header).params()[0];
+        let one = data.new_local_inst().integer(1);
+        let increment = data.new_local_inst().binary(BinaryOp::Add, i, one);
+        let backedge = data.new_local_inst().jump(header, vec![increment]);
+        for &inst in insts {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        data.layout_mut().insert_inst(body, increment);
+        data.layout_mut().insert_inst(body, backedge);
+    }
+
+    fn assert_main_has_no_calls(program: &Program, main: Function) {
+        let data = program.func_data(main);
+        assert!(data.layout().basicblocks().iter().all(|block| {
+            block
+                .insts()
+                .iter()
+                .all(|&inst| !matches!(data.inst_data(inst).kind(), InstKind::Call(..)))
+        }));
+    }
+
+    #[test]
+    fn inlines_an_oversized_callee_when_the_call_sits_in_a_natural_loop() {
+        // A callee above CALL_SIZE_LIMIT is still inlined when its callsite
+        // runs inside a natural loop: the removed call overhead is paid once
+        // per iteration.
+        let mut program = Program::new();
+        let callee = build_leaf(&mut program, "big_leaf", super::CALL_SIZE_LIMIT + 1);
+        let (main, header, body) = build_loop_main(&mut program);
+        let call = program
+            .func_data_mut(main)
+            .new_local_inst()
+            .call_with_type(callee, vec![], Type::get_i32());
+        finish_loop_body(&mut program, main, header, body, &[call]);
+
+        assert!(Inline.run(&mut program));
+        assert!(!Inline.run(&mut program));
+        assert_main_has_no_calls(&program, main);
+    }
+
+    #[test]
+    fn does_not_inline_an_oversized_callee_outside_a_loop() {
+        // The same oversized callee stays a call when its callsite is not
+        // loop-resident: the relaxed budget must only apply to in-loop calls.
+        let mut program = Program::new();
+        let callee = build_leaf(&mut program, "big_leaf", super::CALL_SIZE_LIMIT + 1);
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        {
+            let data = program.func_data_mut(main);
+            let entry = data.add_entry_block();
+            let call = data
+                .new_local_inst()
+                .call_with_type(callee, vec![], Type::get_i32());
+            let ret = data.new_local_inst().ret(Some(call));
+            data.layout_mut().insert_inst(entry, call);
+            data.layout_mut().insert_inst(entry, ret);
+        }
+
+        assert!(!Inline.run(&mut program));
+    }
+
+    #[test]
+    fn inlines_a_multi_callsite_callee_when_its_callsites_sit_in_a_loop() {
+        // 34 insts x 3 callsites = 102 exceeds TOTAL_SIZE_LIMIT (100), so
+        // the strict model rejects it; the in-loop total budget covers it.
+        let mut program = Program::new();
+        let callee = build_leaf(&mut program, "leaf", 34);
+        let (main, header, body) = build_loop_main(&mut program);
+        let data = program.func_data_mut(main);
+        let calls: Vec<_> = (0..3)
+            .map(|_| {
+                data.new_local_inst()
+                    .call_with_type(callee, vec![], Type::get_i32())
+            })
+            .collect();
+        finish_loop_body(&mut program, main, header, body, &calls);
+
+        assert!(Inline.run(&mut program));
+        assert!(!Inline.run(&mut program));
+        assert_main_has_no_calls(&program, main);
+    }
+
+    #[test]
+    fn does_not_inline_a_multi_callsite_callee_outside_a_loop() {
+        // The same 34-inst x 3-callsite shape outside any loop stays a call
+        // because 102 > TOTAL_SIZE_LIMIT and no loop relaxes the budget.
+        let mut program = Program::new();
+        let callee = build_leaf(&mut program, "leaf", 34);
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        {
+            let data = program.func_data_mut(main);
+            let entry = data.add_entry_block();
+            let first = data
+                .new_local_inst()
+                .call_with_type(callee, vec![], Type::get_i32());
+            let second = data
+                .new_local_inst()
+                .call_with_type(callee, vec![], Type::get_i32());
+            let third = data
+                .new_local_inst()
+                .call_with_type(callee, vec![], Type::get_i32());
+            let add = data.new_local_inst().binary(BinaryOp::Add, first, second);
+            let add2 = data.new_local_inst().binary(BinaryOp::Add, add, third);
+            let ret = data.new_local_inst().ret(Some(add2));
+            for inst in [first, second, third, add, add2, ret] {
+                data.layout_mut().insert_inst(entry, inst);
+            }
         }
 
         assert!(!Inline.run(&mut program));

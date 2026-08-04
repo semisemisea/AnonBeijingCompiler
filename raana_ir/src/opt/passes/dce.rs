@@ -567,16 +567,11 @@ impl Pass for DeadPhiElimination {
 
 #[cfg(test)]
 mod dead_phi_tests {
-<<<<<<< HEAD
-    use super::{DeadPhiElimination, Pass};
-    use crate::ir::{BinaryOp, InstKind, Program, Type, arena::Arena, builder_trait::*};
-=======
     use super::{DeadFunctionElimination, DeadPhiElimination, Pass};
     use crate::{
-        ir::{InstKind, Program, Type, arena::Arena, builder_trait::*},
+        ir::{BinaryOp, InstKind, Program, Type, arena::Arena, builder_trait::*},
         opt::pass::ArenaContextMut,
     };
->>>>>>> a36776c ([Opt(DCE)]: Eliminate dead functions unreachable from main)
 
     #[test]
     fn removes_dead_param_from_both_same_target_branch_arms() {
@@ -611,7 +606,6 @@ mod dead_phi_tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn jump_args_stay_aligned_when_trailing_params_are_dead() {
         // A block whose *trailing* parameters are dead: the jump arguments
         // must drop the same positions, keeping earlier args aligned.
@@ -671,7 +665,8 @@ mod dead_phi_tests {
             }
         }
         assert!(found);
-=======
+    }
+
     fn removes_an_unreferenced_function() {
         let mut program = Program::new();
         let main = program.new_function(Type::get_unit(), "main".into(), vec![]);
@@ -779,6 +774,7 @@ mod dead_phi_tests {
         assert!(layout.contains(&main));
         assert!(layout.contains(&unused_decl));
     }
+
 }
 
 /// Remove functions that are unreachable from `main` through the call graph
@@ -821,7 +817,6 @@ impl Pass for DeadFunctionElimination {
             program.remove_function(func);
         }
         true
->>>>>>> a36776c ([Opt(DCE)]: Eliminate dead functions unreachable from main)
     }
 }
 

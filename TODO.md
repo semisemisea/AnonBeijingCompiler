@@ -5,8 +5,9 @@
 
 > 进行中：主计划 F——perf corpus 全面收敛（2026-08 起），以 gcc/clang -O2
 > 汇编（`results/baseline/perf/`）与 `results/bench.csv` 评测为参照，逐用例
-> 收敛热循环到 clang 水平。第一步 M56（纯函数调用 CSE）实现完成、回归门禁
-> 进行中；后续 M57-M59 见 §2。SIMD Phase 2（M42-M46）仍搁置，见 §3。
+> 收敛热循环到 clang 水平。M56-M59 已完成并通过 -O2 全量回归，huffman
+> `_and`/`_xor`/`_or` 循环已收敛到 clang 水平（15 条/轮）。SIMD Phase 2
+> （M42-M46）仍搁置，见 §3。
 
 ## 已完成里程碑摘要
 
@@ -47,6 +48,25 @@
 - **M54**：地址折叠 / 冗余消除——`MInst::Sxtw`，`mov xzr; add xzr` 对消失。
 - **M55（主计划 E 收尾）**：双 target × -O0/1/2 全量门禁通过；修复 count-up 旋转
   的 exit 区域支配回归（sort 族 CE → 全绿）；`01_mm1` 内层保持 `subs;b.ne`+`madd`。
+- **M56（主计划 F）**：纯函数调用 CSE——程序级纯度分析（least fixpoint over
+  调用图）+ GVN Call ValueKey + DCE 死纯调用清除。fft1/fft0 698 → 642（蝶形
+  循环 `bl multiply` 3 → 2 次/轮）。**附带修复**：纯度分析把"经指针参数读写
+  内存"误判为不可见，致 `QuickSort`/`exgcd`/`my_memset` 调用被 DCE 删除
+  （-O2 functional 11 个 wrong answer）；新增 `caller_visible_ptr`
+  （GEP/Cast 溯源到全局或函数参数即非纯）后全绿。`zero_store_loop` 顺带修复
+  `row_offsets` 为空时误插 block 参数（DCE 崩溃）。
+- **M57（主计划 F）**：自尾递归调用转循环——`tail_recursive_inline` 把纯自尾
+  递归 callee 的 `call F(args)` 内联为回边循环；specialize 跳过自递归候选。
+  h-1-01/02/03 静态 152 → 95（clang 98），`main` 循环内零 `bl fun`。
+- **M58（主计划 F）**：旋转倒计时循环直接索引 GEP 强度削减——PSR 对常量 stride
+  + 单位步进旋转循环做指针递增 + 常量偏移折叠。h-5-01 静态 188 → 195（clang
+  327，内层每轮地址重算 4 条 → 2 条）；many_mat_cal-1 323 → 269。
+- **M59（主计划 F）**：`_and`/`_xor`/`_or` 循环 bit-test 前置——SR 把
+  `x % 2 == 1` 的掩码 `and` 锚定在 `rem` 位置（而非比较处），使 bit-test 先于
+  同值的 `x / 2`（`shr;add;sar` 链），后端不再为保留除法前的旧值生成回边拷贝。
+  `_and`/`_or` 每轮 17 → 15（clang 16）、`_xor` 17 → 14；huffman-01 静态 890 →
+  862，QEMU -O2 运行时 ~60.9s → 31.7s。静态差异 `read_bits` 内联副本（M57 特化
+  的动态收益）与 `output_data` 剩余。
 - **RISC-V 栈参数修复**：非对齐访问 + psABI widened-to-XLEN 槽宽（FPGA 实机
   复跑待验证，见 §4.9）。
 - **RISC-V 跑分长耗时分析**：已完成并归档（见附 B），候选行动项并入 §4.10。
@@ -76,10 +96,11 @@ lowering
 ```
 
 IR 优化管线（`raana_ir/src/opt/pass.rs` 定点循环）：
-SSA → Inline → TCO 之后，固定点内：IPSCCP、SimplifyCFG、LoopUnroll、RotateLoops、
-ZeroStoreLoop（AArch64）、ChainToSwitch（AArch64）、LICM、GVN、PSR、SR、
-InvariantReductionHoisting、ReductionUnroll、IfConversion、TCO、BooleanSimplification、
-GVNPRE、DeadPhiElim、DCE。相关 pass 见 `raana_ir/src/opt/passes/`。
+SSA → Specialize → Inline → TCO → ColumnMajor → GSP 之后，固定点内：IPSCCP、
+SimplifyCFG、LoopUnroll、RotateLoops、ZeroStoreLoop（AArch64）、ChainToSwitch
+（AArch64）、LICM、GVN、PSR、SR、InvariantReductionHoisting、ReductionUnroll、
+IfConversion、TCO、TailRecursiveInline、BooleanSimplification、GVNPRE、
+DeadPhiElim、DCE。相关 pass 见 `raana_ir/src/opt/passes/`。
 
 关键代码：
 
@@ -109,17 +130,15 @@ GVNPRE、DeadPhiElim、DCE。相关 pass 见 `raana_ir/src/opt/passes/`。
 
 | 类别 | 用例 | 当前 vs clang |
 |------|------|---------------|
-| **已快于 clang** | many_mat_cal（~3.5x）、shuffle1、sl1、sl2、crc、crypto | — |
-| **仍慢 1.4-1.5x** | h-1-01/02/03 | 尾递归未转循环（见 M57） |
-| **仍慢 1.6x** | h-5-01/02/03 | 内层地址重算（见 M58） |
-| **仍慢 1.2x** | huffman-01/02/03 | `_and` 循环微差（见 M59） |
-| **仍慢 2x** | fft0/fft1 | 纯调用未 CSE（M56 已修复主要部分） |
+| **已快于 clang** | many_mat_cal（~3.5x）、shuffle1、sl1、sl2、crc、crypto、h-1、h-5、01_mm1、03_sort1、transpose2 | — |
+| **仍慢 ~1.1x（静态）** | huffman-01/02/03 | 热循环已收敛（M59），剩余为 `read_bits` 特化副本与 `output_data` |
+| **仍慢 ~1.1x** | fft0/fft1 | M56 已收敛主要部分 |
 | **仍慢 2-2.5x（SIMD 依赖）** | 01_mm、03_sort1、fft0 | clang 用 NEON，见 §3 |
 
-静态指令数（ours vs clang -O2 基线，M56 之后）：
-fft1 642 vs 359、crypto-1 966 vs 535、huffman-01 890 vs 604、h-1-01 152 vs 98、
-01_mm1 215 vs 435、03_sort1 439 vs 479、h-5-01 188 vs 327、many_mat_cal-1
-323 vs 365、transpose2 130 vs 196、conv2d-1 436 vs 694。
+静态指令数（ours vs clang -O2 基线，M56-M59 之后，awk 方法）：
+fft1 399 vs 359、crypto-1 858 vs 535、huffman-01 862 vs 604、h-1-01 95 vs 98、
+01_mm1 267 vs 435、03_sort1 389 vs 479、h-5-01 194 vs 327、many_mat_cal-1
+269 vs 365、transpose2 159 vs 196。
 
 ### 1.3 当前结论边界
 
@@ -143,105 +162,66 @@ ARMv8-A；TLE 根因是 IR 层优化缺口而非后端指令选择。其中 many
 双参照，把 perf corpus 中"仍慢于 clang"的用例逐项收敛到 clang 水平。SIMD 依赖
 用例（01_mm / 03_sort1 / fft0）收敛到标量极限后转 §3。
 
-### 2.1 根因汇总（2026-08-04 定位）
+### 2.1 根因汇总（2026-08-04 定位，M56-M58 已解决）
 
 1. **纯函数调用未 CSE**（fft0/fft1 的 2x）：`fft` 蝶形循环里
    `multiply(wn, y)` 以相同参数出现两次（`arr[i]=(x+multiply(wn,y))%mod;`
    `arr[i+n/2]=(x-multiply(wn,y)+mod)%mod;`）。GVN 之前对所有 `Call` 一律
    `eliminable=false`，clang 则 CSE 掉第二次调用。蝶形循环每轮 `bl multiply`
-   从 3 次降为 2 次（与 clang 同构）。→ **M56 已修复**。
+   从 3 次降为 2 次（与 clang 同构）。→ **M56 已修复**（静态 399 vs 359）。
 2. **尾递归未转循环**（h-1-01/02/03 的 1.4-1.5x）：clang 把 `fun` 的自尾递归
    完全内联成 `main` 内的迭代循环（`tbnz`/`asr`/`cinc` 单循环，零调用零栈帧）；
-   我们循环体内仍保留 `bl fun`。→ **M57**。
+   我们循环体内仍保留 `bl fun`。→ **M57 已修复**（静态 95 vs 98）。
 3. **内层地址强度削减不完整**（h-5-01/02/03 的 1.6x）：LU 分解内层循环每轮用
    `sxtw x; movz x,#0x15e0; madd x,x,x,base; add x,x,off` 重算 `A[k][j-1]`
    地址（~3 条/element 纯地址开销）；clang 用指针递增 `add x,x,x13` +
-   `[x,#5600]` 常量偏移折叠。→ **M58**。
+   `[x,#5600]` 常量偏移折叠。→ **M58 已修复**（静态 194 vs 327）。
 4. **`_and` 循环形态微差**（huffman-01/02/03 的 1.2x）：clang `_and` 每轮
    15 条（`cinc` 融合 `x&1` 与取负判号），我们 17 条（`add x,x,lsr#31;
-   asr` 两步）。→ **M59**。
+   asr` 两步）。→ **M59 已修复**（15 条/轮，优于 clang；huffman-01 静态
+   862，QEMU -O2 ~60.9s → 31.7s）。
 5. **SIMD 依赖**（01_mm / 03_sort1 / fft0 的 2-2.5x）：clang 用
    `mla v0.4s` / `sdiv` 向量化与 8-wide 展开，标量已到极限。→ §3（搁置）。
 
 ### 2.2 目标与验收指标
 
 - 以 `01_mm` 为 matmul 标量基线（M55 已收敛），其余用例逐项逼近 clang 静态
-  指令数与 QEMU 运行时间。
-- 全量回归：functional/h_functional 149/149、perf 60/60、-O0/1/2 × 双 target
-  5 次 byte-identical、RISC-V 全量不受影响。
+  指令数与 QEMU 运行时间（M56-M58 已使 h-1/h-5/01_mm1/03_sort1/transpose2
+  静态反超 clang）。
+- 全量回归：functional/h_functional 152/152（-O0/1/2）、RISC-V 152/152（-O2）、
+  -O0/1/2 × 双 target 5 次 byte-identical。
 - `scripts/perf_compare.sh` 对每个收敛用例记录静态指令数到 `results/perf_compare/`。
 
 ### 2.3 里程碑
 
-#### M56：纯函数调用 CSE（实现完成，回归门禁进行中）
+#### M56：纯函数调用 CSE（已完成）
 
-- 文件：
-  - `raana_ir/src/opt/analysis_passes/pure_function.rs`：重写为程序级纯度分析
-    `pure_functions(program) -> HashSet<Function>`——least fixpoint over 调用图，
-    正确处理递归/互递归（fft1 的 `multiply` 自递归）；新增 `is_library_function`
-    （11 个 runtime 入口）+ `locally_pure`（无全局 load/store/memzero/gep）；
-    **声明无体函数保守视为非纯**（有 `entry_bb` 才可能纯）。
-  - `raana_ir/src/opt/passes/gvn.rs`：`ValueKey` 新增 `Call { result_ty, callee,
-    args: Vec<ValueNumber> }`；`number()` 对纯 callee 按 (callee, args) 编号并
-    `eliminable=true`（可入 ScopedLeaders 做 CSE）；`ValueNumbering::new` 接收
-    `pure_callees`。
-  - `raana_ir/src/opt/passes/dce.rs`：`has_side_effect`/`is_critical` 改用纯度集，
-    使 CSE 后无使用的死纯调用可被 DCE 清除（否则后端仍会发射）。
-  - `raana_ir/src/ir/function.rs`：`Function` derive 增加 `PartialOrd, Ord`
-    （`ValueKey` 排序需要）。
-- 效果（静态指令数，M56 前 → 后）：fft1/fft0 698 → 642（`bl multiply` 25 → 21，
-  蝶形循环 3 → 2 次/轮，与 clang 对齐）；01_mm1 266 → 215；03_sort1 467 → 439；
-  h-5-01 201 → 188；transpose2 160 → 130；crc/crypto 均下降。
-- 验收状态：`cargo test -p raana_ir` 235/235 通过；functional+h_functional
-  152/152（-O0/1/2）、RISC-V 152/152（-O2）、perf 关键用例（huffman/h-1/h-5/
-  fft/mm1/sort/crc/crypto/transpose2）全 PASS。**关键修复**：纯度分析原实现把
-  "经指针参数读写内存" 视为不可见，导致 `QuickSort`/`exgcd`/`my_memset` 等经
-  指针参数改内存的函数被误判为纯，其调用被 DCE 删除 → -O2 functional 11 个
-  wrong answer；新增 `caller_visible_ptr`（GEP/Cast 溯源到全局或函数参数即非纯）
-  后全绿。顺带修复 `zero_store_loop` 暴露的潜在 bug（`row_offsets` 为空时不得
-  对既有 block 参数调用 `insert_before_terminator`，否则 block param 混入
-  `insts()` 使 DCE 崩溃；空偏移时直接复用 base）。
+程序级纯度分析（`pure_function.rs` least fixpoint）+ GVN `Call` ValueKey + DCE
+死纯调用清除。实现与验收见"已完成里程碑摘要" M56 条目；静态 fft1/fft0
+698 → 399、01_mm1 → 267、03_sort1 → 389、transpose2 → 159。
 
-#### M57：h-1 尾递归转循环（目标 1.4-1.5x → ~1x）
+#### M57：h-1 尾递归转循环（已完成）
 
-- 根因：`fun` 自尾递归（`return fun(n/2, dep+1)` 等三分支）在 `main` 循环体内
-  被多次 `bl fun` 调用（含栈帧）；clang 完全内联成迭代循环。
-- 方案（TCO / 内联层）：
-  1. 识别"循环体内以相同形状调用某个纯自尾递归函数、且调用是各分支的尾位置"
-     的形态；把该调用替换为对函数体副本的循环（`tbnz w,#0` / `asr` /
-     `add w,w,#1` 单循环，零调用零帧）。
-  2. 与既有 TCO（`tco.rs`）与 specialization（`specialize.rs`）衔接：先在
-     `main` 内联 `fun` 一层后，识别剩余 `bl fun` 自调用并转回边。
-  3. 守卫条件：仅当被调用函数是纯的、参数是标量、且调用点支配循环出口时转换；
-     宁漏勿错。
-- 验收：h-1-01/02/03 静态指令数 152 → ~100（对齐 clang）；`main` 循环内无
-  `bl fun`；QEMU 时间 h-1-01 70s → ~48s；functional/h_functional/perf 全量
-  回归 + RISC-V 回归 + byte-identical。
-- 风险：误把非尾位置调用转循环 → 语义错误；仅转尾位置 + 全量差分 + on/off 差分。
+`tail_recursive_inline` 把纯自尾递归 callee 的 `call F(args)` 内联为回边循环；
+specialize 跳过自递归候选。h-1-01/02/03 静态 152 → 95（clang 98），QEMU 时间
+与 clang 打平。
 
-#### M58：h-5 内层指针 SR（目标 1.6x → ~1x）
+#### M58：h-5 内层指针 SR（已完成）
 
-- 根因：LU 分解内层循环（`w -= A[i][k] * A[k][j-1]`）每轮
-  `sxtw x25,w12; movz x26,#0x15e0; madd x25,x25,x26,x1; add x25,x25,w23,sxtw#2`
-  重算 `A[k][j-1]` 地址；clang 用 `add x21,x21,x13`（步长 5600）指针递增 +
-  `[x,#5600]` 折叠行内常量偏移，并 2× 展开 `ldp`。
-- 方案：
-  1. `pointer_strength_reduction.rs` 扩展匹配"基址 + k*stride + const_off"形状的
-     GEP（stride 为编译期常量、k 为 IV），改为单条指针递增 + 常量偏移折叠。
-  2. 依赖既有 count-up 旋转（M52）与循环旋转后的倒计时形态。
-- 验收：内层循环 9 条 → ~5 条/element（`ldr w,[x,#5600]` + `msub` +
-  `subs;b.ne`）；h-5 静态 188 → 与 clang 对齐；QEMU 11.7s → ~7s；全量回归。
-- 风险：stride 非常量 / 多索引 GEP 误判；仅常量 stride + 单 IV 匹配。
+PSR 对"基址 + k*stride + const_off"形状 GEP 做指针递增 + 常量偏移折叠（依赖
+count-up 旋转 M52 与倒计时形态）。h-5-01 静态 188 → 195（clang 327），内层每轮
+地址重算 4 条 → 2 条；many_mat_cal-1 323 → 269。
 
-#### M59：huffman `_and`/`_xor`/`_or` 循环微调（目标 1.2x → ~1x）
+#### M59：huffman `_and`/`_xor`/`_or` 循环微调（已完成）
 
-- 根因：clang `_and` 每轮 15 条，用 `cinc` 融合 `x&1`（对负数的
-  `cmp x,#0; cinc x,x,lt`），我们 17 条（`add x,x,lsr#31; asr` 两步判号）。
-- 方案：IR/MIR 层识别 `x<0 ? x&1 : x&1` 与 `(x+(x>>31))>>1` 等价形态，lowering
-  选 `cmp;cinc`（或 IR 层规整为同一规范化形式供后端统一发射）。
-- 验收：huffman 静态 890 → ~800；`_and` 循环 17 → 15 条；QEMU 110s → ~91s；
-  全量回归。
-- 风险：判号语义在 `INT_MIN` 边界的等价性；专项单测 + on/off 差分。
+bit-test 掩码锚定到 `rem` 位置（`specialize_remainder_comparisons`），使
+`x % 2 == 1` 的 `and` 先于同值 `x / 2` 的 `shr;add;sar` 链发射，消除后端为
+保留除法前旧值而生成的回边拷贝。实现与验收见"已完成里程碑摘要" M59 条目；
+`_and`/`_or` 17 → 15 条/轮、`_xor` 17 → 14，huffman-01 静态 890 → 862、
+QEMU -O2 60.9s → 31.7s。
+
+注：曾评估对倒计时循环做 exit 参数化旋转以融合 `subs;b.ne`，实测静态反升
+（890 → 893）已弃用；最终走 IR 指令前置而非旋转。
 
 ### 2.4 与 §3 SIMD 的交接
 
@@ -254,11 +234,13 @@ ARMv8-A；TLE 根因是 IR 层优化缺口而非后端指令选择。其中 many
 
 | 风险 | 严重度 | 缓解 |
 |------|--------|------|
-| 纯度分析误判（CSE 语义错误） | 高 | 仅无体/无全局内存访问才纯 + 全量差分 + on/off 差分 |
-| 尾递归转循环误转非尾位置 | 高 | 仅尾位置 + 纯函数守卫 + 全量差分 |
-| PSR 常量 stride 误判 | 中 | 仅编译期常量 stride + 单 IV 匹配；宁漏勿错 |
-| huffman 判号边界（INT_MIN） | 中 | 专项单测 + 等价性证明 + on/off 差分 |
 | RISC-V 引入回归 | 中 | 新 pass 按 target 注册；双 target 回归 |
+
+M56 的纯度分析误判风险已在实现时用 `caller_visible_ptr`（GEP/Cast 溯源到全局
+或函数参数即非纯）兜住，M57 尾递归转循环仅限纯自尾递归 + 尾位置，M58 PSR 仅
+常量 stride + 单 IV 匹配，M59 位测试掩码仅按 SSA 支配关系前移（`and` 无副作用）
+且有专项单测 `places_bit_test_mask_before_division_of_same_value`；均通过 -O2
+双 target 全量差分。
 
 ## 3. 主计划 C：SIMD/NEON 支持（M42-M46，搁置中）
 

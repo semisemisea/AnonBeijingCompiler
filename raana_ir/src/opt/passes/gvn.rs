@@ -157,22 +157,38 @@ impl<'a> ValueNumbering<'a> {
                 // Calls are only mergeable when the callee is read-only (no
                 // I/O, no timer, no external write); the caller must also
                 // prove no intervening write, which the leader tracking in
-                // run_on handles. Other calls still get a (shared) number so
-                // their arguments are numbered consistently, but are never
-                // eliminated.
+                // run_on handles.
+                //
+                // Side-effecting calls (e.g. getint) must NOT share a value
+                // number: two calls to the same callee with the same
+                // arguments read different inputs and produce different
+                // results. Sharing a number would make consumers of the two
+                // results (e.g. `lt a, n` vs `lt b, n`) look equivalent and
+                // get merged. Such calls still number their arguments (for
+                // consistency) but get a per-instruction identity key.
                 let eliminable = self.analysis.is_removable(call.callee());
-                (
-                    ValueKey::Call {
-                        callee: call.callee(),
-                        result_ty: ty,
-                        args: call
-                            .args()
-                            .iter()
-                            .map(|&arg| self.number(data, arg).number)
-                            .collect(),
-                    },
-                    eliminable,
-                )
+                if eliminable {
+                    (
+                        ValueKey::Call {
+                            callee: call.callee(),
+                            result_ty: ty,
+                            args: call
+                                .args()
+                                .iter()
+                                .map(|&arg| self.number(data, arg).number)
+                                .collect(),
+                        },
+                        true,
+                    )
+                } else {
+                    (
+                        ValueKey::Identity {
+                            ty,
+                            value,
+                        },
+                        false,
+                    )
+                }
             }
             InstKind::Load(..)
             | InstKind::Alloc

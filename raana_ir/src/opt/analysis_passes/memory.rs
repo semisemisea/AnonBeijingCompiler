@@ -212,12 +212,69 @@ impl BaseEnv {
     /// index along the GEP chain is not a compile-time constant.
     ///
     /// The base object itself (a bare Alloc/GlobalAlloc/parameter) has
-    /// offset zero.
+    /// offset zero. Block parameters (phi) resolve to their incoming
+    /// jump/branch argument offsets, mirroring `base_of`: without this, a
+    /// parameter that aliases a GEP of a base (e.g. an array row passed to
+    /// a callee) would resolve to offset 0 instead of the row offset.
     pub fn constant_offset<A: Arena + ?Sized>(&self, arena: &A, ptr: Inst) -> Option<i64> {
+        let mut seen = FxHashSet::default();
+        self.constant_offset_inner(arena, ptr, &mut seen)
+    }
+
+    fn constant_offset_inner<A: Arena + ?Sized>(
+        &self,
+        arena: &A,
+        ptr: Inst,
+        seen: &mut FxHashSet<Inst>,
+    ) -> Option<i64> {
+        if !seen.insert(ptr) {
+            // Cyclic phi resolution (loop backedge): conservative.
+            return None;
+        }
         match arena.inst_data(ptr).kind() {
-            InstKind::Alloc | InstKind::GlobalAlloc(..) | InstKind::BlockArgRef(..) => Some(0),
+            InstKind::Alloc | InstKind::GlobalAlloc(..) => Some(0),
+            InstKind::BlockArgRef(..) => {
+                // ABI parameters (the function's entry block) are bare
+                // pointers: offset zero.
+                if self.entry_params.iter().any(|&p| p == ptr) {
+                    return Some(0);
+                }
+                // Block parameters: every incoming edge must carry the
+                // same constant offset, or the offset is unknown.
+                let Some(&(block, index)) = self.param_position.get(&ptr) else {
+                    return None;
+                };
+                let mut result: Option<i64> = None;
+                for &user in arena.bb_data(block).used_by() {
+                    let arg = match arena.inst_data(user).kind() {
+                        InstKind::Jump(jump) if jump.target() == block => {
+                            jump.args().get(index).copied()
+                        }
+                        InstKind::Branch(branch) => {
+                            if branch.t_target() == block {
+                                branch.t_args().get(index).copied()
+                            } else if branch.f_target() == block {
+                                branch.f_args().get(index).copied()
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    let Some(arg) = arg else {
+                        continue;
+                    };
+                    let off = self.constant_offset_inner(arena, arg, seen)?;
+                    if result.is_none() {
+                        result = Some(off);
+                    } else if result != Some(off) {
+                        return None;
+                    }
+                }
+                result
+            }
             InstKind::GetElemPtr(gep) => {
-                let mut off = self.constant_offset(arena, gep.base())?;
+                let mut off = self.constant_offset_inner(arena, gep.base(), seen)?;
                 for (pos, &idx) in gep.offsets().iter().enumerate() {
                     let idx_value = integer_constant(arena, idx)?;
                     let stride = gep_index_stride(arena, ptr, pos)?.byte_stride;
@@ -226,7 +283,7 @@ impl BaseEnv {
                 Some(off)
             }
             InstKind::Load(load) => match self.slots.get(&load.src()) {
-                Some(&stored) => self.constant_offset(arena, stored),
+                Some(&stored) => self.constant_offset_inner(arena, stored, seen),
                 None => None,
             },
             _ => None,

@@ -555,7 +555,7 @@ impl Pass for DeadPhiElimination {
 #[cfg(test)]
 mod dead_phi_tests {
     use super::{DeadPhiElimination, Pass};
-    use crate::ir::{InstKind, Program, Type, arena::Arena, builder_trait::*};
+    use crate::ir::{BinaryOp, InstKind, Program, Type, arena::Arena, builder_trait::*};
 
     #[test]
     fn removes_dead_param_from_both_same_target_branch_arms() {
@@ -587,6 +587,68 @@ mod dead_phi_tests {
         };
         assert!(branch_data.t_args().is_empty());
         assert!(branch_data.f_args().is_empty());
+    }
+
+    #[test]
+    fn jump_args_stay_aligned_when_trailing_params_are_dead() {
+        // A block whose *trailing* parameters are dead: the jump arguments
+        // must drop the same positions, keeping earlier args aligned.
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "dead_tail".into(),
+            vec![Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let merge = data
+            .new_basic_block()
+            .basic_block(
+                "merge".into(),
+                vec![
+                    Type::get_i32(),
+                    Type::get_i32(),
+                    Type::get_i32(),
+                    Type::get_i32(),
+                    Type::get_i32(),
+                    Type::get_i32(),
+                    Type::get_i32(),
+                    Type::get_i32(),
+                    Type::get_i32(),
+                ],
+                );
+        data.layout_mut().push_bb_back(merge);
+        let cond = data.params()[0];
+        let one = data.new_local_inst().integer(1);
+        let jump = data.new_local_inst().jump(merge, vec![one; 9]);
+        data.layout_mut().insert_inst(entry, jump);
+        // Only params 7 and 8 are unused; use the others so only the tail
+        // two get removed.
+        for i in 0..7 {
+            let p = data.bb_data(merge).params()[i];
+            let _use = data.new_local_inst().binary(BinaryOp::Add, p, one);
+            data.layout_mut().insert_inst(entry, _use);
+        }
+        let _ = cond;
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+
+        assert!(DeadPhiElimination.run(&mut program));
+        let data = program.func_data(function);
+        assert_eq!(data.bb_data(merge).params().len(), 7);
+        // The jump into merge must still carry exactly 7 args.
+        let mut found = false;
+        for block in data.layout().basicblocks() {
+            for &inst in block.insts() {
+                if let InstKind::Jump(jump) = data.inst_data(inst).kind() {
+                    if jump.target() == merge {
+                        assert_eq!(jump.args().len(), 7);
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(found);
     }
 }
 

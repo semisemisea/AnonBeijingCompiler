@@ -242,6 +242,112 @@ mod tests {
     }
 
     #[test]
+    fn preserves_argument_order_for_many_params_with_array_parameters() {
+        // Regression for functional/88_many_params2.sy: inlining a callee
+        // with many (incl. array) parameters must keep jump arguments in
+        // positional order.
+        let mut program = Program::new();
+        let arr_ty = Type::get_array(Type::get_i32(), 2);
+        let callee = program.new_function(
+            Type::get_i32(),
+            "func".into(),
+            vec![
+                Type::get_i32(),
+                Type::get_pointer(arr_ty.clone()),
+                Type::get_i32(),
+                Type::get_pointer(Type::get_i32()),
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_pointer(Type::get_i32()),
+                Type::get_i32(),
+                Type::get_i32(),
+            ],
+        );
+        {
+            let data = program.func_data_mut(callee);
+            let entry = data.add_entry_block();
+            let params: Vec<Inst> = data.params().to_vec();
+            let sum = data
+                .new_local_inst()
+                .binary(BinaryOp::Add, params[0], params[2]);
+            let sum = data
+                .new_local_inst()
+                .binary(BinaryOp::Add, sum, params[4]);
+            let sum = data
+                .new_local_inst()
+                .binary(BinaryOp::Add, sum, params[5]);
+            let sum = data
+                .new_local_inst()
+                .binary(BinaryOp::Add, sum, params[7]);
+            let sum = data
+                .new_local_inst()
+                .binary(BinaryOp::Add, sum, params[8]);
+            data.layout_mut().insert_inst(entry, sum);
+            let ret = data.new_local_inst().ret(Some(sum));
+            data.layout_mut().insert_inst(entry, ret);
+        }
+
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+        let (call, args) = {
+            let ret_ty = program.func_data(callee).ret_ty().clone();
+            let data = program.func_data_mut(main);
+            let entry = data.add_entry_block();
+            let args: Vec<_> = (1..=9).map(|v| data.new_local_inst().integer(v)).collect();
+            let mut call_args = args.clone();
+            // Array/pointer parameters receive distinct pointer values so a
+            // positional shuffle is detectable; the scalar constants stay at
+            // their slots.
+            let arr_ptr = data.new_local_inst().alloc(arr_ty.clone());
+            let int_ptr = data.new_local_inst().alloc(Type::get_i32());
+            call_args[1] = arr_ptr;
+            call_args[3] = int_ptr;
+            call_args[6] = int_ptr;
+            let call = data
+                .new_local_inst()
+                .call_with_type(callee, call_args, ret_ty);
+            data.layout_mut().insert_inst(entry, call);
+            let ret = data.new_local_inst().ret(None);
+            data.layout_mut().insert_inst(entry, ret);
+            (call, args)
+        };
+        let _ = call;
+        let _ = args;
+
+        assert!(Inline.run(&mut program));
+        let data = program.func_data(main);
+        // Find the jump into the cloned entry and check positional mapping.
+        let mut found = false;
+        for block in data.layout().basicblocks() {
+            for &inst in block.insts() {
+                if let InstKind::Jump(jump) = data.inst_data(inst).kind() {
+                    let params = data.bb_data(jump.target()).params();
+                    assert_eq!(params.len(), jump.args().len());
+                    for (arg, param) in jump.args().iter().zip(params.iter()) {
+                        assert_eq!(
+                            data.inst_data(*arg).ty(),
+                            data.inst_data(*param).ty(),
+                            "arg/param type mismatch at position"
+                        );
+                    }
+                    // The argument constants must keep their positional
+                    // values (1..=9), i.e. no shuffle by the cloner.
+                    for (i, arg) in jump.args().iter().enumerate() {
+                        if let InstKind::Integer(int) = data.inst_data(*arg).kind() {
+                            assert_eq!(
+                                int.value(),
+                                (i + 1) as i32,
+                                "argument {i} shuffled"
+                            );
+                        }
+                    }
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "expected an inlined entry jump");
+    }
+
+    #[test]
     fn does_not_inline_a_leaf_with_a_large_total_callsite_cost() {
         // A leaf with several callsites is only inlined while the total
         // estimated size (size x callsites) stays within the budget. This

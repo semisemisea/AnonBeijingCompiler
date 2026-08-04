@@ -308,7 +308,7 @@ M39-M41b。参考澄清：Cranelift 的 SIMD 是**显式降层**（wasm `v128` �
   证明无逃逸）→ 用存储值替换全部 load 并删槽；局部 Alloc 全部访问
   经常量 GEP 偏移且未逃逸 → 逐元素提升为 SSA 值（转发由 M52 承接）。
 
-#### M52：Store-to-load forwarding + 死 Store 消除（DSE/DLE，未做）
+#### M52：Store-to-load forwarding + 死 Store 消除（DSE/DLE，执行计划 2026-08-04）
 
 - 现状缺口：DCE 不删任何 Store；GVN 只做 load-CSE、无 forwarding。
 - 注意：M53（IPSCCP 主存模拟）已覆盖常量格内的 store→load 转发。
@@ -318,6 +318,243 @@ M39-M41b。参考澄清：Cranelift 的 SIMD 是**显式降层**（wasm `v128` �
   按整区间 store 统一建模。
 - 附带：GVN ScopedLoadLeaders 的全局失效改为按 M49 may_alias 失效
   （零新增 pass 的 load-CSE 精度提升）。
+
+**详细执行计划（2026-08-04，合并完成后首项）**
+
+一、现象与数据
+- conv2d main 尾部死回写：`store %100, %gv_repeat_factor; store %99,
+  %gv_N_eff`——函数内只读全局，GSP 无条件回写。
+- heavy_read（互评实证）：GSP load-once-write-back 在函数尾留
+  `store %1, %gv_g` → 对方 Purity 正确判为「写全局」→ 拒绝 call 外提。
+  删死回写后 read-only 判定自动修正（LICM call 外提 / DCE 删除纯调用
+  的判定都会变准）。
+- 根因链：GSP 提升全局时无「函数内是否修改该全局」跟踪 → 每个
+  return/tail-call 前无条件回写（scalar_global_promotion.rs write_backs
+  机制）→ 回写污染 read-only 判定 → 保守拒绝优化。
+
+二、设计决策（候选方案）
+- A. 独立 pass `dse.rs`，同 block 前向扫描 + GSP 死回写专项 —— 采纳。
+  收益大头（GSP 死回写 + 相邻覆盖 + 同 block forwarding）局部扫描即可
+  捕获；不引入完整 live-store 数据流（复杂度高、边际收益小）。
+- B. 扩展 DCE —— 否。dce.rs 已因合并（removable_calls 参数 + 对方测试）
+  复杂化，不再塞逻辑；DSE 需 EffectAnalysis + BaseEnv，独立 pass 更清晰。
+- C. 完整反向 live-store 分析 —— 否，本期不做，A 兜不住的模式（跨
+  block 死 store）记录为 M52.5 候选。
+
+三、接口设计
+- 新文件 `raana_ir/src/opt/passes/dse.rs`（约 380 行，含测试）。
+- `pub struct DSE;`——`impl Pass`，`run_on(func)`：
+  - `let analysis = EffectAnalysis::new(program)`（每次 run 重建，定点安全）
+  - `let env = analysis.env_of(func)`（BaseEnv：base_of + constant_offset，
+    已有指针槽解析 + block param phi，9d40dc3 后偏移解析完整）
+  - 地址 key 用简化 `(MemObject, i64)`（base + byte offset），不提取
+    ipsccp 的 CellKey/RootKey（私有 per-writer 结构，合并后刚稳定不动）。
+- 三个变换（同一次 run_on 顺序执行，全部 within-block 前向扫描）：
+  1. **GSP 冗余回写删除**：`store v, p` 且 v 是 `load p` 的结果（或经
+     GEP/整数运算的 load 值）且 p 解析成功 → 检查 p 的 cell 在 store
+     前无其他写、无可能读取（load/call/memzero 命中）→ 删 store。
+  2. **覆盖死 store**：同 cell 连续 store，前一个在下一个之前无可能读
+     取 → 删前一个。
+  3. **store→load forwarding**：load 的 cell 前向最近 store 且中间无写
+     无可能读取 → 替换 load 为 store 值（变量值转发，常量格已由 M53 覆盖）。
+- 保守规则：地址解析失败（unknown base / 非常量偏移）→ 不删不改；
+  遇到可能读该 cell 的 call → 停止该 cell 的前向扫描（effects 的
+  call_read_roots / may_read_memory 判定）；MemZero 视为整区间写 + 读
+  边界（区间命中即保守停止）。
+
+四、伪代码（run_on 核心）
+```
+run_on(func):
+  analysis = EffectAnalysis::new(program); env = analysis.env_of(func)
+  for bb in func 的 blocks（layout 顺序）:
+    cell_state = {}   // cell -> (最近 store inst 或 load 值)
+    for inst in bb.insts():
+      match kind:
+        Store(s):  key = resolve(env, s.dest())       // (MemObject, i64)?
+        | Some(k):
+            // 变换1：冗余回写 —— value 是 load k 的结果且 k 无其他写
+            if is_load_of(s.value(), k) and 无中间写:
+              删除 s; continue
+            // 变换2：覆盖死 store —— cell_state[k] 有未读 store
+            if let Some(prev) = cell_state[k] as 未读 store:
+              删除 prev
+            cell_state[k] = s（未读标记）
+        | None:
+            possible_targets 非空 → 对每个 target cell 标记「已污染」
+            （可能读路径不清除——保守：全部 cell_state 失效）
+        Load(l):   key = resolve(env, l.src())
+        | Some(k) 且 cell_state[k] 是未读 store:
+            变换3：替换 l 为 store 值; 标记已读（可再转发）
+        | 其他:    cell_state[k] 标记已读（不再删前驱 store）
+        Call(c):  若 analysis 判定 c 可能读 cell_state 中某 k → 该 k 已读
+                  若可能写 → cell_state[k] 失效（不清除 store 本身，停止删除）
+        MemZero(z): 区间命中 → 相关 cell 已读/失效
+```
+
+五、文件与行数估计
+- `raana_ir/src/opt/passes/dse.rs`：新建，~230 行实现 + ~150 行测试。
+- `raana_ir/src/opt/pass.rs`：+2 行注册（`p.register(dse::DSE)`）。
+- 注册位置：`gvn` 之后、`pointer_sr` 之前（删死 store 后 pointer_sr/sr
+  看更干净 IR；BaseEnv 静态分析任意位置可用）。
+- 不动 ipsccp.rs / dce.rs / memory.rs（resolve 逻辑用 base_of +
+  constant_offset 组合，约 15 行私有 helper）。
+
+六、验证计划
+- 单测 ~7 个：
+  1. GSP 模式冗余回写删除（load 值存回同址，中间无写）→ store 消失
+  2. 冗余回写保留（中间有写或可能读 call）→ store 保留
+  3. 相邻覆盖死 store 删除（store 1; store 2 同 cell → 删前者）
+  4. 覆盖保留（中间有 load）→ 不删
+  5. store→load forwarding（变量值）→ load 替换
+  6. 未知地址 store（动态下标）→ 保守不删 + 前方 store 不误删
+  7. MemZero 边界（区间命中 → 停止扫描）
+- 端到端（--emit ir 检查）：
+  - conv2d main 尾部 `store %x, %gv_repeat_factor` / `store %x, %gv_N_eff`
+    消失（死回写删除）
+  - heavy_read 类：函数尾 GSP 死回写消失 → effects 判 read-only →
+    LICM call 外提成功（互评建议验证项）
+- 全量门禁：cargo test 254+ 全绿；functional 109 + h_functional 40 ×
+  -O0/1/2 全过（用户跑全量，本线跑单用例 + make test-riscv 单点）。
+- 回归重点：IPSCCP 主存模拟与 DSE 交互（删 store 后格子减少，min2 用例
+  必须仍折叠 6；04/05/88/62 四个修复用例必须仍 PASS）。
+
+七、风险与对策
+- 别名误判删活 store：resolve 失败一律保守；call/memzero 边界用 effects
+  精确判定；最坏情况与 IPSCCP 一样只折叠「确定性」场景。
+- GSP 回写删除误伤跨调用观察者：变换 1 只在「函数内 cell 无其他写 +
+  无可能读」时删（GSP 语义：entry load 值 = 原值，函数内未改则回写
+  恒等）。
+- 定点交互：DSE 自身不引入新迭代轮（单遍 + 依赖 effects 不动点），
+  pass 管理器迭代自然收敛。
+
+**M52 执行记录（2026-08-04 完成）**
+- 4 commit：DSE 骨架 + 注册（gvn 后、pointer_sr 前）→ 变换 1（GSP
+  冗余回写删除）→ 变换 2（覆盖死 store 删除）→ 变换 3（store→load
+  forwarding）+ decl 跳过 + resolve memoize（性能）。单测 7 个，
+  261/261 全绿。
+- 端到端：conv2d main 的 store 是真实初始化（非死回写，正确保留）；
+  heavy_read 类 GSP 死回写删除 → read-only → LICM 外提 ✓；min2 仍折叠
+  6 ✓；04/05/62/88 四个回归 -O2 全 PASS；functional 109 + h_functional
+  40（默认）全过。
+- **门禁（BaseEnv 重写后）**：cargo test 261/261；functional 默认
+  109/109、-O2 109/109；h_functional 默认 40/40、-O2 38/40（唯一失败
+  28_side_effect2，见下方遗留）。musl 编译器需 touch 源码强制重编译
+  （Docker 挂载时间戳问题会让 harness 用旧编译器——23_json 曾因此
+  599s 超时，重编译后秒级）。
+- **性能优化（94d2498）**：BaseEnv 从「查询时现场递归解析」改为
+  「build_tables 不动点预计算 base/offset 表 + 查询 O(1) 查表」
+  （memory.rs；EffectAnalysis::new 里构建）。IPSCCP root_loaders push
+  去重。23_json -O2 编译 9 分钟 → 0.078s（7000x）；28_side_effect2
+  79s 超时 → 1.5s。
+- **遗留（28_side_effect2 -O1/-O2 wrong answer：529 vs 701）**：
+  禁用 IPSCCP 后输出 701 正确 → IPSCCP 引入。BaseEnv 重写前 28 编译
+  >130s 从未跑完，529 大概率是 IPSCCP 既有折叠 bug（被加速暴露）：
+  疑似主存模拟乱序（动态下标 store 的 clear 与 load 折叠乱序，与
+  e15e676 修的 memzero 乱序同类）。简单内联+sum 用例（side_min=3、
+  side2=20）均正确，仅 28 的 20 链 + 数组返回触发。**已修复
+  （`[Fix(IPSCCP)] Never fold loads of roots invalidated by unknown
+  writes`）**：根因 = flow-insensitive cell 被跨时点写覆盖——动态下标
+  store（或 may-write-anything call）clear 后，root 的 cell 状态属于
+  别的程序点，重调度的 load 会读到错误值。修复：MemState 加
+  `cleared_roots`，unknown-write 的 clear（动态 store/memzero 动态
+  dest/write_roots=None 的 call）永久禁止该 root 折叠 load（read 返回
+  Bottom）；确定性 call 失效的 clear 不标记（callee 写入被跨函数模拟，
+  可折叠）。28 -O2 输出 701 ✓，门禁 h_functional -O2 40/40。
+- **遗留（heavy_read.sy 循环版 -O2 panic，已修复）**：DeadPhiElimination
+  swap_remove 越界（jump args 与 block params 数量不一致，BB(2)
+  params 3 / args 2）——无 DSE 注册也 panic，既有 bug 与 DSE 无关。
+  **已修复**：cherry-pick 隔壁 `93fbb18 [Fix(DPE)] Keep dead-edge args
+  aligned after IRH carrier insertion`（c0cedbb）——根因 = IRH
+  （InvariantReductionHoisting）加 carrier 参数后只更新新边 args，原
+  latch 死边 args 未补齐（args 12 vs params 13）→ DPE 按 used_by
+  （含死边）删 args 越界。修复：IRH 补齐所有指向 header 的边 args
+  （死边 push dummy）+ DPE swap_remove → positional remove（保序）。
+- **遗留（23_json -O2 死循环，已修复 `[Fix(GVN)] Invalidate load
+  leaders at loop headers`）**：qemu 跑 23_json.elf 死循环（编译 1s 但
+  运行卡死；-O0 正确）。根因 = GVN 的 ScopedLoadLeaders 把循环入口的
+  load（如 pos）CSE 成 preheader 值——循环体写该地址（store pos），
+  回跳后仍用旧值（反汇编实锤：cmp w20 用循环前寄存器，str 递增写
+  内存但条件不变）→ 死循环。IPSCCP 折叠后 IR 变化触发（禁用 IPSCCP
+  时循环体重新 load，正确）。修复：GVN Enter 循环头块（RPO 中前驱
+  位置更晚 = backedge）时 `load_leaders.record_store()` 使所有 load
+  leader 失效（循环头/体内 load 重新读取）。23_json -O2 输出与 -O0
+  一致 ✓，门禁 functional/h_functional × -O0/2 全过（109+40）。
+
+**执行 goal 提示词（2026-08-04，给 future agent/compaction 的自包含任务）**
+
+```
+# Goal: 实现 M52 DSE（死 Store 消除 + 冗余回写删除 + store→load forwarding）
+
+## 背景
+SysY 编译器项目（Rust），工作目录
+/Users/azureskye/Documents/Programs/rust/AnonBeijingCompiler-hermes，
+分支 feat/riscv_match（当前 ahead 18，origin/main behind 7）。
+详细设计见本文件 §4 的 M52 节（现象/候选方案/接口/伪代码/验证/风险），
+严格按它执行，不自行更改设计。
+
+## 必须遵守的规则（用户明令）
+- 只在 hermes worktree 操作；不 push、不 rebase（遇冲突立即停并汇报）；
+  不碰其他 worktree；不读/不提交 .env 等凭据文件。
+- 无 hacky workaround（rm、手动 sed、flat pool 一律禁止），只做 root
+  cause 修复。
+- 勤 commit、勤单测：每个原子部分完成即 commit（消息格式
+  `[Opt(DSE)]: <做什么>`），工作树尽量保持干净。
+- 代码纪律：不改既有 pass 的基本结构（dce.rs/ipsccp.rs 刚合并稳定，
+  除 pass.rs 注册外尽量不动）；新增代码匹配现有风格。
+
+## 原子拆分（每步完成后 commit，再做下一步）
+1. **骨架**：新建 raana_ir/src/opt/passes/dse.rs（`pub struct DSE;`
+   impl Pass，run_on 空实现或最小扫描），私有 resolve helper（用
+   memory.rs BaseEnv 的 base_of + constant_offset 组合成
+   (MemObject, i64) key）；pass.rs 在 gvn 之后、pointer_sr 之前注册
+   `p.register(dse::DSE)`；cargo build 通过。
+2. **变换 1：GSP 冗余回写删除**（计划 §三.1）+ 单测（§六 的 1/2 两个
+   用例）；load 值存回同址且中间无写 → 删 store。
+3. **变换 2：覆盖死 store 删除**（§三.2）+ 单测（§六 的 3/4/6 三个
+   用例）；同 cell 连续 store 前一个无读 → 删。
+4. **变换 3：store→load forwarding**（§三.3）+ 单测（§六 的 5 用例）；
+  变量值转发（常量格 M53 已覆盖，不重复做）。
+5. **端到端验证**：--emit ir 检查 conv2d main 尾部
+   `store %x, %gv_repeat_factor` / `store %x, %gv_N_eff` 死回写消失；
+   构造 heavy_read 类用例验证 GSP 死回写删除后 LICM call 外提生效；
+   4 个回归用例（04_arr_defn3 / 05_arr_defn4 / 62_percolation /
+   88_many_params2）-O2 仍 PASS；min2 用例（/tmp/min2.sy 若还在，否则
+   按 summary 重建）仍折叠 ret 6。有问题 root cause 修复后单独 commit。
+6. **全量门禁**：cargo test -p raana_ir 全绿（现有 254 个 + 新增 DSE
+   测试）；make test functional（109）、make test ARGS="-O 2"
+   functional、make test h_functional（40）全过；h_functional 同样
+   ARGS="-O 2" 跑一遍。**perf 测试用户自己跑，不要跑 perf**。
+
+## 验证命令
+- 单测：cargo test -p raana_ir dse:: 2>&1 | grep -E "test result"
+- 全量单测：cargo test -p raana_ir 2>&1 | grep -E "test result"
+- ARM 用例（Docker 内，慢）：
+  make test functional
+  make test ARGS="-O 2" functional
+  make test h_functional
+  make test ARGS="-O 2" h_functional
+- IR 检查：./target/release/compiler --emit ir -o /tmp/x.raana -O2 <sy>
+
+## 关键代码位置
+- raana_ir/src/opt/passes/scalar_global_promotion.rs：write_backs 机制
+  （每个 return/tail-call 前无条件回写，M52 目标）
+- raana_ir/src/opt/analysis_passes/memory.rs：BaseEnv::base_of /
+  constant_offset（含指针槽解析 + block param phi，9d40dc3 后完整）
+- raana_ir/src/opt/analysis_passes/effects.rs：EffectAnalysis
+  （call_read_roots / may_read_memory / is_removable 等判定）
+- raana_ir/src/opt/passes/ipsccp.rs:331 resolve_cell：参考实现（不提取，
+  DSE 用私有简化 key）
+- raana_ir/src/opt/pass.rs:209 gvn 注册处：DSE 插在 gvn 与 pointer_sr 之间
+
+## 验收清单（全部满足才算完成）
+- [ ] dse.rs 单测 ≥7 个全绿，cargo test 全绿
+- [ ] conv2d 死回写消失（--emit ir 验证）
+- [ ] functional 109 + h_functional 40 × -O0/1/2 全过（用户跑 perf）
+- [ ] 4 个回归用例 -O2 PASS（04/05/62/88）
+- [ ] min2 折叠 ret 6
+- [ ] 每个原子部分有独立 commit，最终 git status 只剩非本任务文件
+      （TODO.md 如有外部会话改动保持不动）
+```
 
 #### M53：IPSCCP 主存模拟（已完成）
 
@@ -593,3 +830,95 @@ riscv functional+h_functional 全量通过，非对齐 131→0 处；**FPGA 实�
 - crc(4.5s)：B8
 
 候选行动项（P0-P3）已并入 §5.10。
+
+## 6. 工作区未提交改动记录（2026-08-04，stash 存档）
+
+### 6.1 ipsccp.rs 未提交改动（已 stash，归属：内存分析线遗留/待确认）
+
+`git stash push -m "ipsccp: load snapshot overwrite + mem_zero store-order fix" -- raana_ir/src/opt/passes/ipsccp.rs`
+恢复：`git stash apply stash@{0}`（确认归属后再决定合并/丢弃）。
+
+改动内容（120 行，+91/-29，基于 191cd71）：
+
+1. **load 传播改覆盖**（新增 LatticeMap::insert_or_replace，~20 行）：原 merge_and_extend
+   把历史快照与当前快照做 meet——同一 load 先被调度读到 0（store 前）、重调度后读到 6
+   （store 后）会塌缩成 Bottom，常量传播失效。改为无条件覆盖为当前内存快照值：load 的
+   语义是"某次调度时刻的内存快照"，不是所有快照的交。调用点（~510 行）改
+   insert_or_replace 成功时照常 extend_affected_node_used_by。
+2. **mem_zero 不再 drop 已写 cell**（~15 行）：原实现清除 zero 区间内所有已写 cell；
+   但 worklist 不按 layout 顺序处理块内指令，MemZero 可能在初始化序列的 stores 之后才
+   被访问，清除会误杀语义上更晚的 store。约定：frontend 总是先发 MemZero 再发 stores，
+   所以"已存在"的 cell 必对应语义更晚的 store；zero range 只应答未被 store 写过的 cell。
+3. 测试修正：call_to_writer_invalidates_global_cell 的 writer 增加 i32 参数（注入未知值）。
+
+性质：IPSCCP 主存模拟（M53）正确性补丁。与本线执行计划（LICM 缺口 A + pointer_sr 缺口 B）
+无关，执行 goal 时**不碰、不恢复**，除非用户另行指示。
+
+### 6.2 执行计划分支
+
+- 新分支：`feat/addr-incr-runtime-bound`（自 191cd71 开出）。
+- 计划全文见主 worktree TODO.md commit e2bfba1（§"执行计划：运行时边界循环的地址增量优化"）
+  及本会话修正：修复 A 判定须要求"所有 incoming ∈ {单一外部值 V, param 自身} 且至少一个
+  非自身"（计划主表述"全部非循环内定义"不充分：entry/backedge 传不同外部值会在第 2 轮
+  变值）；修复 B 现有测试翻转面仅 2 个（1271 行 dynamic 半段、1282 行整体，均改写为正测试）。
+- TODO.md 本节改动未提交，goal 开工时可先 commit 为 docs commit。
+
+---
+
+**M52 执行记录（2026-08-04 完成）**
+- 4 commit：DSE 骨架 + 注册（gvn 后、pointer_sr 前）→ 变换 1（GSP
+  冗余回写删除）→ 变换 2（覆盖死 store 删除）→ 变换 3（store→load
+  forwarding）+ decl 跳过 + resolve memoize（性能）。单测 7 个，
+  261/261 全绿。
+- 端到端：conv2d main 的 store 是真实初始化（非死回写，正确保留）；
+  heavy_read 类 GSP 死回写删除 → read-only → LICM 外提 ✓；min2 仍折叠
+  6 ✓；04/05/62/88 四个回归 -O2 全 PASS；functional 109 + h_functional
+  40（默认）全过。
+- **门禁（BaseEnv 重写后）**：cargo test 261/261；functional 默认
+  109/109、-O2 109/109；h_functional 默认 40/40、-O2 38/40（唯一失败
+  28_side_effect2，见下方遗留）。musl 编译器需 touch 源码强制重编译
+  （Docker 挂载时间戳问题会让 harness 用旧编译器——23_json 曾因此
+  599s 超时，重编译后秒级）。
+- **性能优化（94d2498）**：BaseEnv 从「查询时现场递归解析」改为
+  「build_tables 不动点预计算 base/offset 表 + 查询 O(1) 查表」
+  （memory.rs；EffectAnalysis::new 里构建）。IPSCCP root_loaders push
+  去重。23_json -O2 编译 9 分钟 → 0.078s（7000x）；28_side_effect2
+  79s 超时 → 1.5s。
+- **遗留（28_side_effect2 -O1/-O2 wrong answer：529 vs 701）**：
+  禁用 IPSCCP 后输出 701 正确 → IPSCCP 引入。BaseEnv 重写前 28 编译
+  >130s 从未跑完，529 大概率是 IPSCCP 既有折叠 bug（被加速暴露）：
+  疑似主存模拟乱序（动态下标 store 的 clear 与 load 折叠乱序，与
+  e15e676 修的 memzero 乱序同类）。简单内联+sum 用例（side_min=3、
+  side2=20）均正确，仅 28 的 20 链 + 数组返回触发。**已修复
+  （`[Fix(IPSCCP)] Never fold loads of roots invalidated by unknown
+  writes`）**：根因 = flow-insensitive cell 被跨时点写覆盖——动态下标
+  store（或 may-write-anything call）clear 后，root 的 cell 状态属于
+  别的程序点，重调度的 load 会读到错误值。修复：MemState 加
+  `cleared_roots`，unknown-write 的 clear（动态 store/memzero 动态
+  dest/write_roots=None 的 call）永久禁止该 root 折叠 load（read 返回
+  Bottom）；确定性 call 失效的 clear 不标记（callee 写入被跨函数模拟，
+  可折叠）。28 -O2 输出 701 ✓，门禁 h_functional -O2 40/40。
+- **遗留（heavy_read.sy 循环版 -O2 panic，已修复）**：DeadPhiElimination
+  swap_remove 越界（jump args 与 block params 数量不一致，BB(2)
+  params 3 / args 2）——无 DSE 注册也 panic，既有 bug 与 DSE 无关。
+  **已修复**：cherry-pick 隔壁 `93fbb18 [Fix(DPE)] Keep dead-edge args
+  aligned after IRH carrier insertion`（c0cedbb）——根因 = IRH
+  （InvariantReductionHoisting）加 carrier 参数后只更新新边 args，原
+  latch 死边 args 未补齐（args 12 vs params 13）→ DPE 按 used_by
+  （含死边）删 args 越界。修复：IRH 补齐所有指向 header 的边 args
+  （死边 push dummy）+ DPE swap_remove → positional remove（保序）。
+- **遗留（23_json -O2 死循环，已修复 `[Fix(GVN)] Invalidate load
+  leaders at loop headers`）**：qemu 跑 23_json.elf 死循环（编译 1s 但
+  运行卡死；-O0 正确）。根因 = GVN 的 ScopedLoadLeaders 把循环入口的
+  load（如 pos）CSE 成 preheader 值——循环体写该地址（store pos），
+  回跳后仍用旧值（反汇编实锤：cmp w20 用循环前寄存器，str 递增写
+  内存但条件不变）→ 死循环。IPSCCP 折叠后 IR 变化触发（禁用 IPSCCP
+  时循环体重新 load，正确）。修复：GVN Enter 循环头块（RPO 中前驱
+  位置更晚 = backedge）时 `load_leaders.record_store()` 使所有 load
+  leader 失效（循环头/体内 load 重新读取）。23_json -O2 输出与 -O0
+  一致 ✓，门禁 functional/h_functional × -O0/2 全过（109+40）。
+
+**执行 goal 提示词（2026-08-04，给 future agent/compaction 的自包含任务）**
+
+```
+# Goal: 实现 M52 DSE（死 Store 消除 + 冗余回写删除 + store→load forwarding）

@@ -14,6 +14,14 @@ pub enum SchedModel {
     CortexA53,
 }
 
+#[derive(Debug, clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
+#[clap(rename_all = "kebab-case")]
+pub enum LoopUnrollMode {
+    On,
+    Off,
+    DryRun,
+}
+
 #[derive(Debug, clap::Parser)]
 pub(crate) struct Arg {
     #[arg(
@@ -43,6 +51,14 @@ pub(crate) struct Arg {
         default_value_t = Target::Riscv64
     )]
     pub(crate) target: Target,
+    #[arg(
+        long,
+        value_enum,
+        help = "override loop unrolling: on, off, or analysis-only dry-run"
+    )]
+    pub(crate) loop_unroll: Option<LoopUnrollMode>,
+    #[arg(long, help = "print structured IR pass statistics to stderr")]
+    pub(crate) pass_stats: bool,
     #[arg(long, conflicts_with = "disable_mir_dce")]
     pub(crate) enable_mir_dce: bool,
     #[arg(long, conflicts_with = "enable_mir_dce")]
@@ -64,6 +80,29 @@ pub(crate) struct Arg {
 }
 
 impl Arg {
+    pub(crate) fn ir_optimization_config(&self) -> raana_ir::opt::config::PassesConfig {
+        use raana_ir::opt::config::{
+            LoopUnrollMode as IrLoopUnrollMode, OptimizationLevel, PassesConfig, TargetPolicy,
+        };
+
+        let opt_level = OptimizationLevel::try_from(self.opt_level)
+            .expect("clap restricts optimization levels to 0 through 2");
+        let target = match self.target {
+            Target::Aarch64 => TargetPolicy::aarch64(),
+            Target::Riscv64 => TargetPolicy::riscv64(),
+        };
+        let mut config = PassesConfig::new(opt_level, target);
+        if let Some(mode) = self.loop_unroll {
+            config.loop_unroll = match mode {
+                LoopUnrollMode::On => IrLoopUnrollMode::Enabled,
+                LoopUnrollMode::Off => IrLoopUnrollMode::Disabled,
+                LoopUnrollMode::DryRun => IrLoopUnrollMode::DryRun,
+            };
+        }
+        config.collect_stats = self.pass_stats;
+        config
+    }
+
     pub(crate) fn aarch64_codegen_config(&self) -> anon_armv8::AArch64CodegenConfig {
         use anon_armv8::AArch64CodegenConfig;
         let mut config = match self.opt_level {
@@ -123,6 +162,14 @@ impl Arg {
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.opt_level == 0
+            && matches!(
+                self.loop_unroll,
+                Some(LoopUnrollMode::On | LoopUnrollMode::DryRun)
+            )
+        {
+            return Err("--loop-unroll on/dry-run requires -O1 or -O2".to_string());
+        }
         if self.target == Target::Riscv64 {
             let aarch64_only = self.enable_mir_dce
                 || self.disable_mir_dce
@@ -284,6 +331,49 @@ mod tests {
 
         let mut argv = base();
         argv.extend(["--target", "aarch64", "--enable-sched"]);
+        assert!(parse(&argv).validate().is_ok());
+    }
+
+    #[test]
+    fn ir_config_tracks_opt_target_and_loop_unroll_override() {
+        use raana_ir::opt::config::{LoopUnrollMode, OptimizationLevel, TargetIsa};
+
+        let mut argv = base();
+        argv.extend([
+            "-O",
+            "2",
+            "--target",
+            "aarch64",
+            "--loop-unroll",
+            "dry-run",
+            "--pass-stats",
+        ]);
+        let config = parse(&argv).ir_optimization_config();
+        assert_eq!(config.opt_level, OptimizationLevel::O2);
+        assert_eq!(config.target.isa, TargetIsa::Aarch64);
+        assert_eq!(config.loop_unroll, LoopUnrollMode::DryRun);
+        assert!(config.collect_stats);
+
+        let mut argv = base();
+        argv.extend(["-O", "0", "--target", "riscv64"]);
+        let config = parse(&argv).ir_optimization_config();
+        assert_eq!(config.opt_level, OptimizationLevel::O0);
+        assert_eq!(config.target.isa, TargetIsa::Riscv64);
+        assert_eq!(config.loop_unroll, LoopUnrollMode::Disabled);
+    }
+
+    #[test]
+    fn o0_rejects_active_loop_unroll_modes() {
+        let mut argv = base();
+        argv.extend(["-O", "0", "--loop-unroll", "on"]);
+        assert!(parse(&argv).validate().is_err());
+
+        let mut argv = base();
+        argv.extend(["-O", "0", "--loop-unroll", "dry-run"]);
+        assert!(parse(&argv).validate().is_err());
+
+        let mut argv = base();
+        argv.extend(["-O", "0", "--loop-unroll", "off"]);
         assert!(parse(&argv).validate().is_ok());
     }
 }

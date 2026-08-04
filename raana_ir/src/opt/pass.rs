@@ -1,7 +1,12 @@
 use crate::{
     ir::{Function, FunctionData, Program, arena::Arena},
-    opt::passes::*,
+    opt::{
+        config::{LoopUnrollMode, OptimizationLevel, PassesConfig, TargetPolicy},
+        passes::*,
+        stats::PassesRunStats,
+    },
 };
+use std::sync::{Arc, Mutex};
 
 pub struct ArenaContext<'a> {
     pub program: &'a Program,
@@ -110,6 +115,7 @@ pub trait Pass: Send + Sync {
 pub struct PassesManager {
     passes: Vec<Box<dyn Pass>>,
     fixed_point_start: usize,
+    stats: Arc<Mutex<PassesRunStats>>,
 }
 
 impl PassesManager {
@@ -117,6 +123,7 @@ impl PassesManager {
         PassesManager {
             passes: Vec::new(),
             fixed_point_start: 0,
+            stats: Arc::new(Mutex::new(PassesRunStats::default())),
         }
     }
 
@@ -132,7 +139,7 @@ impl PassesManager {
         self.fixed_point_start += 1;
     }
 
-    pub fn run_passes(&mut self, program: &mut Program) {
+    pub fn run_passes(&mut self, program: &mut Program) -> PassesRunStats {
         const MAX_PIPELINE_ITERATIONS: usize = 100;
 
         for pass in &mut self.passes[..self.fixed_point_start] {
@@ -144,7 +151,8 @@ impl PassesManager {
                 .iter_mut()
                 .fold(false, |changed, pass| pass.run(program) || changed);
             if !changed {
-                return;
+                self.stats.lock().unwrap().fixed_point_iterations = iteration + 1;
+                return self.stats.lock().unwrap().clone();
             }
             if iteration + 1 == MAX_PIPELINE_ITERATIONS {
                 panic!(
@@ -152,6 +160,7 @@ impl PassesManager {
                 );
             }
         }
+        unreachable!()
     }
 
     /// The AArch64 pipeline: the common pipeline plus `chain_to_switch`,
@@ -159,11 +168,17 @@ impl PassesManager {
     /// pass. RISC-V keeps the common pipeline (its branches materialize
     /// conditions into registers, so the tree would not amortize).
     pub fn aarch64() -> PassesManager {
-        Self::build_pass_list(true)
+        Self::from_config(PassesConfig::new(
+            OptimizationLevel::O2,
+            TargetPolicy::aarch64(),
+        ))
     }
 
-    fn build_pass_list(with_chain_to_switch: bool) -> PassesManager {
+    pub fn from_config(config: PassesConfig) -> PassesManager {
         let mut p = PassesManager::new();
+        if config.opt_level == OptimizationLevel::O0 {
+            return p;
+        }
         let ssa = Box::new(ssa::SSATransform);
         p.register_initial(ssa);
 
@@ -175,6 +190,11 @@ impl PassesManager {
 
         let tco_initial = Box::new(tco::TailCallElim);
         p.register_initial(tco_initial);
+
+        // Change eligible two-dimensional arrays to the layout favored by
+        // their hottest innermost-loop accesses before GEPs are reshaped.
+        let column_major = Box::new(column_major::ColumnMajor);
+        p.register_initial(column_major);
 
         // Promote unobservable scalar globals to SSA values so the
         // backend keeps them in registers (load once, write back once).
@@ -189,14 +209,33 @@ impl PassesManager {
         let simplify_cfg = Box::new(simplify_cfg::SimplifyCFG);
         p.register(simplify_cfg);
 
+        // Fully unroll small exact-trip loops while they are still in the
+        // test-at-top form recognized by the induction analysis.
+        if config.loop_unroll != LoopUnrollMode::Disabled {
+            let loop_unroll = Box::new(loop_unroll::LoopUnroll::new(
+                config.loop_unroll,
+                Arc::clone(&p.stats),
+                config.collect_stats,
+            ));
+            p.register(loop_unroll);
+        }
+
         // Rotate test-at-top countdown loops to test-at-bottom so the
         // backend can fuse the decrement with the loop test.
         let rotate_loops = Box::new(rotate_loops::RotateLoops);
         p.register(rotate_loops);
 
+        // Collapse zero-initialization loops into a single runtime-length
+        // `MemZero` (`bl memset` on AArch64). AArch64-only for now; it runs
+        // after rotation so it sees the countdown form.
+        if config.target.enable_chain_to_switch {
+            let zero_store_loop = Box::new(zero_store_loop::ZeroStoreLoop);
+            p.register(zero_store_loop);
+        }
+
         // Balanced decision tree for equality chains; the AArch64 backend
         // fuses each (eq, lt) node pair into a single compare.
-        if with_chain_to_switch {
+        if config.target.enable_chain_to_switch {
             let chain_to_switch = Box::new(chain_to_switch::ChainToSwitch);
             p.register(chain_to_switch);
         }
@@ -257,7 +296,10 @@ impl PassesManager {
 
 impl Default for PassesManager {
     fn default() -> Self {
-        Self::build_pass_list(false)
+        Self::from_config(PassesConfig::new(
+            OptimizationLevel::O2,
+            TargetPolicy::riscv64(),
+        ))
     }
 }
 

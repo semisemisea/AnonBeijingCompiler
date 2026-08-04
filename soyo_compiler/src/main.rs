@@ -42,6 +42,7 @@ fn main() {
 fn run(args: cli::Arg) -> Result<(), String> {
     args.validate()?;
     let aarch64_config = args.aarch64_codegen_config();
+    let ir_config = args.ir_optimization_config();
     let source_code = std::fs::read_to_string(&args.input_path).unwrap();
 
     let ast = sysy::CompUnitsParser::new().parse(&source_code).unwrap();
@@ -50,12 +51,10 @@ fn run(args: cli::Arg) -> Result<(), String> {
 
     let mut program = ctx.program;
 
-    if args.opt_level > 0 {
-        let mut pass_manager = match args.target {
-            cli::Target::Aarch64 => raana_ir::opt::pass::PassesManager::aarch64(),
-            cli::Target::Riscv64 => raana_ir::opt::pass::PassesManager::default(),
-        };
-        pass_manager.run_passes(&mut program);
+    let mut pass_manager = raana_ir::opt::pass::PassesManager::from_config(ir_config);
+    let pass_stats = pass_manager.run_passes(&mut program);
+    if args.pass_stats {
+        print_pass_stats(&pass_stats);
     }
 
     let emit = if args.emit.is_empty() {
@@ -109,6 +108,60 @@ fn run(args: cli::Arg) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn print_pass_stats(stats: &raana_ir::opt::stats::PassesRunStats) {
+    use raana_ir::opt::stats::LoopUnrollOutcome;
+
+    for event in &stats.loop_unroll.events {
+        let (outcome, reason) = match event.outcome {
+            LoopUnrollOutcome::Applied => ("applied", "-"),
+            LoopUnrollOutcome::WouldApply => ("would_apply", "-"),
+            LoopUnrollOutcome::Rejected(reason) => ("rejected", reason.as_str()),
+        };
+        eprintln!(
+            "loop_unroll_event\tversion=1\tfunction={}\theader={}\toutcome={}\treason={}\ttrip={}\theader_size={}\tbody_size={}\tprojected={}",
+            event.function,
+            event.header,
+            outcome,
+            reason,
+            event
+                .trip_count
+                .map_or("-".to_owned(), |value| value.to_string()),
+            event.header_size,
+            event.body_size,
+            event
+                .projected_size
+                .map_or("-".to_owned(), |value| value.to_string()),
+        );
+    }
+    let unroll = &stats.loop_unroll;
+    eprintln!(
+        "loop_unroll_summary\tversion=1\tfixed_point_iterations={}\tpass_invocations={}\tobservations={}\tunique_loops={}\tshape_candidates={}\texact_trip_candidates={}\tapplied={}\twould_apply={}",
+        stats.fixed_point_iterations,
+        unroll.pass_invocations,
+        unroll.loop_observations,
+        unroll.unique_loops_seen,
+        unroll.shape_candidates,
+        unroll.exact_trip_candidates,
+        unroll.applied,
+        unroll.would_apply,
+    );
+    for (reason, count) in &unroll.reject_reasons {
+        eprintln!(
+            "loop_unroll_reject\tversion=1\treason={}\tcount={count}",
+            reason.as_str()
+        );
+    }
+    for (trip, count) in &unroll.trip_count_histogram {
+        eprintln!("loop_unroll_trip\tversion=1\ttrip={trip}\tcount={count}");
+    }
+    for (body_size, count) in &unroll.body_size_histogram {
+        eprintln!("loop_unroll_body_size\tversion=1\tbody_size={body_size}\tcount={count}");
+    }
+    for (projected, count) in &unroll.projected_size_histogram {
+        eprintln!("loop_unroll_projected_size\tversion=1\tprojected={projected}\tcount={count}");
+    }
 }
 
 fn dump_ir(program: &raana_ir::ir::Program) -> String {

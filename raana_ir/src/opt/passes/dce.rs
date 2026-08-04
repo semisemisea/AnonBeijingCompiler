@@ -148,7 +148,14 @@ impl DeadCodeElimination {
                     mark_live!(store.src());
                     mark_live!(store.dest());
                 }
-                InstKind::MemZero(mem_zero) => mark_live!(mem_zero.dest()),
+                InstKind::MemZero(mem_zero) => {
+                    mark_live!(mem_zero.dest());
+                    if let crate::ir::inst_kind::mem_zero::MemZeroLen::Value(byte_len) =
+                        mem_zero.byte_len_len()
+                    {
+                        mark_live!(*byte_len);
+                    }
+                }
                 InstKind::Load(load) => {
                     mark_live!(load.src());
                 }

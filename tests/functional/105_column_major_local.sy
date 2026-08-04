@@ -1,0 +1,18 @@
+int main() {
+    int a[8][64];
+    int i = 0;
+    while (i < 8) {
+        a[i][3] = i + 1;
+        i = i + 1;
+    }
+
+    int sum = 0;
+    i = 0;
+    while (i < 8) {
+        sum = sum + a[i][3];
+        i = i + 1;
+    }
+    putint(sum);
+    putch(10);
+    return 0;
+}

@@ -1,6 +1,8 @@
 mod analysis_passes;
+pub mod config;
 pub mod pass;
 mod passes;
+pub mod stats;
 pub mod utils;
 
 /// Opt crate prelude

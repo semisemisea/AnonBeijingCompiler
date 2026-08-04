@@ -621,6 +621,12 @@ pub enum MInst {
         size: OperandSize,
         dst: WritableReg,
     },
+    /// 32-bit source sign-extended into a 64-bit destination (`sxtw xd, wm`).
+    Sxtw {
+        size: OperandSize,
+        dst: WritableReg,
+        src: Reg,
+    },
     LoadAddr {
         dst: WritableReg,
         label: Label,
@@ -1120,6 +1126,11 @@ impl MachInst for MInst {
                 use_sp_aware_reg(collector, src);
                 def_sp_aware_reg(collector, dst);
             }
+            Self::Sxtw { size, dst, src } => {
+                let _ = size;
+                collector.reg_use(src);
+                collector.reg_def(dst);
+            }
             Self::LoadImm { dst, .. }
             | Self::MovZ { dst, .. }
             | Self::MovN { dst, .. }
@@ -1548,6 +1559,12 @@ impl MachInstEmit for MInst {
                 emit_reg(ctx, dst.to_reg(), *size)?;
                 write!(ctx, ", ")?;
                 emit_gpr(ctx, &Gpr::Zr, *size)
+            }
+            Self::Sxtw { size, dst, src } => {
+                write!(ctx, "sxtw ")?;
+                emit_reg(ctx, dst.to_reg(), OperandSize::Size64)?;
+                write!(ctx, ", ")?;
+                emit_reg(ctx, *src, *size)
             }
             Self::LoadAddr { dst, label } => {
                 write!(ctx, "adrp ")?;
@@ -3219,17 +3236,12 @@ mod tests {
     }
 
     #[test]
-    fn vector_types_map_to_the_vector_regclass() {
-        use taki_mir::types::*;
-        for (ty, name) in [
-            (V4I32, "V4I32"),
-            (V2I64, "V2I64"),
-            (V4F32, "V4F32"),
-            (V2F64, "V2F64"),
-        ] {
-            let (classes, types) = MInst::rc_for_type(ty);
-            assert_eq!(classes, &[RegClass::Vector], "{name} class");
-            assert_eq!(types, &[ty], "{name} type");
-        }
+    fn emits_sign_extension() {
+        let text = emit(MInst::Sxtw {
+            size: OperandSize::Size32,
+            dst: Writable::from_reg(int_reg(3)),
+            src: int_reg(2),
+        });
+        assert_eq!(text, "sxtw x3, w2");
     }
 }

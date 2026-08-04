@@ -115,6 +115,7 @@ fn is_dce_removable(inst: &MInst) -> bool {
         | MInst::MovN { .. }
         | MInst::MovK { .. }
         | MInst::MovFromZero { .. }
+        | MInst::Sxtw { .. }
         | MInst::LoadAddr { .. }
         | MInst::StackAddr { .. }
         | MInst::CSet { .. }

@@ -213,6 +213,18 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
         self.insert_inst(MemZero::new_data(dest, byte_len))
     }
 
+    fn mem_zero_dynamic(&mut self, dest: Inst, byte_len: Inst) -> Inst {
+        assert!(
+            self.inst_type(dest).is_pointer(),
+            "memzero destination must be a pointer"
+        );
+        assert!(
+            self.inst_type(byte_len).is_i32(),
+            "dynamic memzero length must be an i32"
+        );
+        self.insert_inst(MemZero::new_dynamic_data(dest, byte_len))
+    }
+
     /// Fused multiply-add over vectors: `result = acc + lhs * rhs`.
     fn fma(&mut self, acc: Inst, lhs: Inst, rhs: Inst) -> Inst {
         let acc_ty = self.inst_type(acc);

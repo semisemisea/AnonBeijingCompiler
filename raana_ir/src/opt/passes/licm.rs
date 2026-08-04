@@ -9,6 +9,7 @@ use crate::opt::{
     prelude::*,
     utils::{
         cfg::CFG,
+        logical_edge::incoming_edges,
         preheader::{EnsurePreheader, ensure_preheader},
     },
 };
@@ -45,6 +46,45 @@ enum LoopResult {
     Unchanged,
     Changed,
     CfgChanged,
+}
+
+/// Rewrites `inst` in place, replacing loop-invariant header parameter operands
+/// with their preheader edge arguments. Only the instruction kinds `LICM` hoists
+/// can carry such operands.
+fn substitute_header_params(
+    data: &mut ArenaContextMut<'_>,
+    inst: Inst,
+    substitution: &FxHashMap<Inst, Inst>,
+) {
+    let substitute = |value: Inst| -> Inst { substitution.get(&value).copied().unwrap_or(value) };
+    match data.inst_data(inst).kind().clone() {
+        InstKind::GetElemPtr(gep) => {
+            let base = substitute(gep.base());
+            let offsets = gep
+                .offsets()
+                .iter()
+                .map(|&offset| substitute(offset))
+                .collect();
+            data.replace_inst_with(inst).get_elem_ptr(base, offsets);
+        }
+        InstKind::Binary(binary) => {
+            let lhs = substitute(binary.lhs());
+            let rhs = substitute(binary.rhs());
+            data.replace_inst_with(inst).binary(binary.op(), lhs, rhs);
+        }
+        InstKind::Cast(cast) => {
+            let src = substitute(cast.src());
+            let ty = data.inst_data(inst).ty().clone();
+            data.replace_inst_with(inst).cast(src, ty);
+        }
+        InstKind::Select(select) => {
+            let cond = substitute(select.cond());
+            let if_true = substitute(select.if_true());
+            let if_false = substitute(select.if_false());
+            data.replace_inst_with(inst).select(cond, if_true, if_false);
+        }
+        _ => {}
+    }
 }
 
 impl LICM {
@@ -90,6 +130,47 @@ impl LICM {
             .iter()
             .flat_map(|&block| data.bb_data(block).params().iter().copied())
             .collect::<FxHashSet<_>>();
+
+        // A header block parameter passed through unchanged on every backedge is
+        // loop-invariant. When the loop has exactly one entry edge, hoisting can
+        // substitute such a parameter with the entry edge's argument (which is
+        // available in the preheader). With multiple entry edges the arguments
+        // differ per edge, so hoisting operands that reference header params is
+        // unsafe and they stay variant.
+        let entry_edges = incoming_edges(data, cfg, looop.header())
+            .into_iter()
+            .filter(|edge| !looop.contains(edge.source()))
+            .collect::<Vec<_>>();
+        let backedges = incoming_edges(data, cfg, looop.header())
+            .into_iter()
+            .filter(|edge| looop.contains(edge.source()))
+            .collect::<Vec<_>>();
+        let header_params = data.bb_data(looop.header()).params().to_vec();
+        let invariant_header_params = header_params
+            .iter()
+            .enumerate()
+            .filter_map(|(position, &parameter)| {
+                (entry_edges.len() == 1
+                    && backedges
+                        .iter()
+                        .all(|edge| edge.args(data).get(position) == Some(&parameter)))
+                .then_some(parameter)
+            })
+            .collect::<FxHashSet<_>>();
+        let substitution = if let [edge] = entry_edges.as_slice() {
+            let edge_args = edge.args(data);
+            Some(
+                header_params
+                    .iter()
+                    .zip(edge_args)
+                    .filter(|(parameter, argument)| parameter != argument)
+                    .map(|(parameter, argument)| (*parameter, *argument))
+                    .collect::<FxHashMap<_, _>>(),
+            )
+        } else {
+            None
+        };
+
         let loop_insts = insts(looop, data).collect::<Vec<_>>();
         let mut map = loop_insts
             .iter()
@@ -157,7 +238,7 @@ impl LICM {
                 return true;
             }
             if loop_params.contains(&operand) {
-                return false;
+                return invariant_header_params.contains(&operand);
             }
             match data.layout().parent_bb(operand) {
                 Some(block) if looop.contains(block) => {
@@ -278,6 +359,9 @@ impl LICM {
                 continue;
             }
             changed = true;
+            if let Some(substitution) = &substitution {
+                substitute_header_params(data, inst, substitution);
+            }
             let bb = data
                 .layout()
                 .parent_bb(inst)
@@ -287,7 +371,19 @@ impl LICM {
         }
 
         for (inst, base, prefix_offsets, remaining_offsets, original_ty) in partial_geps {
-            let prefix = data.new_local_value().get_elem_ptr(base, prefix_offsets);
+            let substitute = |value: Inst| -> Inst {
+                substitution
+                    .as_ref()
+                    .and_then(|map| map.get(&value).copied())
+                    .unwrap_or(value)
+            };
+            let prefix = data.new_local_value().get_elem_ptr(
+                substitute(base),
+                prefix_offsets
+                    .iter()
+                    .map(|&offset| substitute(offset))
+                    .collect(),
+            );
             data.layout_mut()
                 .insert_before_terminator(preheader, prefix);
 
@@ -1404,5 +1500,68 @@ mod tests {
             data.layout().parent_bb(call),
             Some(data.layout().entry_bb().unwrap().bb())
         );
+    }
+
+    #[test]
+    fn hoists_an_invariant_referencing_a_passthrough_header_parameter() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "licm_header_param".into(),
+            vec![Type::get_i32(), Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let outer = data.params()[0];
+        let bound = data.params()[1];
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32(), Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![outer, zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let header_outer = data.bb_data(header).params()[0];
+        let iv = data.bb_data(header).params()[1];
+        let two = data.new_local_inst().integer(2);
+        let doubled = data
+            .new_local_inst()
+            .binary(BinaryOp::Mul, header_outer, two);
+        let condition = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+        let header_branch = data
+            .new_local_inst()
+            .branch(condition, body, vec![], exit, vec![]);
+        for inst in [two, doubled, condition, header_branch] {
+            data.layout_mut().insert_inst(header, inst);
+        }
+
+        let one = data.new_local_inst().integer(1);
+        let next_iv = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        let backedge = data
+            .new_local_inst()
+            .jump(header, vec![header_outer, next_iv]);
+        for inst in [one, next_iv, backedge] {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        // The invariant `mul header_outer, 2` is hoisted to the preheader with
+        // the passthrough header parameter substituted by its entry argument.
+        assert_eq!(data.layout().parent_bb(doubled), Some(entry));
+        let InstKind::Binary(binary) = data.inst_data(doubled).kind() else {
+            unreachable!()
+        };
+        assert_eq!(binary.lhs(), outer);
+        assert_eq!(binary.rhs(), two);
+        assert!(!run(&mut program, function));
     }
 }

@@ -283,6 +283,23 @@ fn dfs(
     }
 }
 
+/// An alloca is promotable only if it holds a single-machine-word value (scalar
+/// or pointer) and its address never escapes: every use is either a `Store` that
+/// writes *to* the slot or a `Load` that reads *from* it. Using the address in
+/// any other way (passing it to a call, storing it into memory, address
+/// arithmetic, returning it) forces the slot to stay in memory.
+fn alloca_does_not_escape(val: Inst, data: &FunctionData) -> bool {
+    data.inst_data(val)
+        .used_by()
+        .iter()
+        .copied()
+        .all(|user| match data.inst_data(user).kind() {
+            InstKind::Store(store) => store.dest() == val,
+            InstKind::Load(_) => true,
+            _ => false,
+        })
+}
+
 pub fn variable_analysis(
     val_id: &mut IDAllocator<Inst, VId>,
     bb_id: &mut IDAllocator<BasicBlock, BId>,
@@ -313,7 +330,9 @@ pub fn variable_analysis(
                     skip_func_para -= 1;
                 } else {
                     let ty = utils::alloc_ty(val, data);
-                    if ty.is_scalar() {
+                    // Single-machine-word slot types (scalar or pointer) are
+                    // promotable when the address does not escape.
+                    if (ty.is_scalar() || ty.is_pointer()) && alloca_does_not_escape(val, data) {
                         val_id.check_or_alloc_id_same(val);
                         val_usage.push(Vec::new());
                     }
@@ -354,3 +373,106 @@ pub fn dominance_analysis(
 
     dominance_frontier
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(data: &mut ArenaContextMut<'_>) -> bool {
+        SSATransform.run_on(data)
+    }
+
+    fn count_kind(data: &FunctionData, pred: impl Fn(&InstKind) -> bool) -> usize {
+        data.layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|layout| layout.insts())
+            .filter(|&&inst| pred(data.inst_data(inst).kind()))
+            .count()
+    }
+
+    /// A pointer-typed alloca whose address is only used by `Store`/`Load` must
+    /// be promoted: after the pass the slot is gone and the loaded pointer is
+    /// replaced by the stored value directly.
+    #[test]
+    fn promotes_pointer_slot_alloca() {
+        let mut program = Program::new();
+        let ptr_ty = Type::get_pointer(Type::get_array(Type::get_i32(), 1024));
+        let func =
+            program.new_function(Type::get_unit(), "promote".to_owned(), vec![ptr_ty.clone()]);
+
+        let _ = (|| {
+            let data = program.func_data_mut(func);
+            let entry = data
+                .new_basic_block()
+                .basic_block("entry".to_owned(), vec![ptr_ty.clone()]);
+            let mid = data.new_basic_block().basic_block("mid".to_owned(), vec![]);
+            data.layout_mut().push_bb_back(entry);
+            data.layout_mut().push_bb_back(mid);
+
+            let slot = data.new_local_inst().alloc(ptr_ty.clone());
+            let param = data.bb_data(entry).params()[0];
+            data.set_params(vec![param]);
+            let store1 = data.new_local_inst().store(param, slot);
+            let jump = data.new_local_inst().jump(mid, vec![]);
+            data.layout_mut().insert_inst(entry, slot);
+            data.layout_mut().insert_inst(entry, store1);
+            data.layout_mut().insert_inst(entry, jump);
+
+            let loaded = data.new_local_inst().load(slot);
+            let zero = data.new_local_inst().integer(0);
+            let elem = data.new_local_inst().get_elem_ptr(loaded, vec![zero]);
+            let store2 = data.new_local_inst().store(zero, elem);
+            let ret = data.new_local_inst().ret(None);
+            data.layout_mut().insert_inst(mid, loaded);
+            data.layout_mut().insert_inst(mid, zero);
+            data.layout_mut().insert_inst(mid, elem);
+            data.layout_mut().insert_inst(mid, store2);
+            data.layout_mut().insert_inst(mid, ret);
+        })();
+
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(func),
+        };
+        assert!(run(&mut data));
+
+        let data = data.curr_func_data();
+        assert_eq!(
+            count_kind(data, |k| matches!(k, InstKind::Alloc)),
+            0,
+            "slot should be promoted"
+        );
+        assert_eq!(
+            count_kind(data, |k| matches!(k, InstKind::Store(..))),
+            1,
+            "only the final element store remains"
+        );
+        assert_eq!(
+            count_kind(data, |k| matches!(k, InstKind::Load(..))),
+            0,
+            "slot load should be replaced"
+        );
+
+        // The GEP base must now be the function parameter, not a load of the slot.
+        let gep = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|layout| layout.insts())
+            .find(|&&inst| matches!(data.inst_data(inst).kind(), InstKind::GetElemPtr(..)))
+            .copied()
+            .unwrap();
+        let InstKind::GetElemPtr(gep_data) = data.inst_data(gep).kind() else {
+            unreachable!()
+        };
+        let param = data.params()[0];
+        assert_eq!(
+            gep_data.base(),
+            param,
+            "GEP base should be the promoted param"
+        );
+    }
+}
+
+// TEMP DEBUG

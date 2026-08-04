@@ -17,7 +17,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-COMPILER="${SOYO_COMPILER:-$ROOT/target/debug/soyo_compiler}"
+COMPILER="${SOYO_COMPILER:-$ROOT/target/debug/compiler}"
 TARGET=aarch64
 OPT=-O2
 RESULTS="$ROOT/results/perf_compare"

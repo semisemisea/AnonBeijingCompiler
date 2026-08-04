@@ -5,6 +5,7 @@ use rustc_hash::FxHashMap as HashMap;
 pub(crate) mod body_clone;
 pub mod call;
 pub mod cfg;
+pub mod column_major_cost;
 pub mod gep;
 pub mod global_handle;
 pub mod logical_edge;
@@ -215,8 +216,16 @@ fn visit_and_replace_single(
             } else {
                 mem_zero.dest()
             };
-            let byte_len = mem_zero.byte_len();
-            data.replace_inst_with(used_by).mem_zero(dest, byte_len);
+            match mem_zero.byte_len_len().clone() {
+                crate::ir::inst_kind::mem_zero::MemZeroLen::Const(byte_len) => {
+                    data.replace_inst_with(used_by).mem_zero(dest, byte_len);
+                }
+                crate::ir::inst_kind::mem_zero::MemZeroLen::Value(byte_len) => {
+                    let byte_len = if byte_len == rep { rep_with } else { byte_len };
+                    data.replace_inst_with(used_by)
+                        .mem_zero_dynamic(dest, byte_len);
+                }
+            }
         }
         InstKind::GetElemPtr(get_elem_ptr) => {
             if get_elem_ptr.base() == rep || get_elem_ptr.offsets().contains(&rep) {

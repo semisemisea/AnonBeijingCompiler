@@ -512,8 +512,10 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
             let inv = branch.inv_prefix.as_ref().unwrap().clone();
             (inv, None, LabelRef::VeneerEnd(veneer_id))
         } else {
-            // `b T` out of range -> `b V; V: b T`.
-            ("b ".to_owned(), None, LabelRef::Veneer(veneer_id))
+            // Unconditional jump out of range -> `j V; V: <veneer lines>`.
+            // Reuse the branch's own prefix so the veneer path works for any
+            // backend's unconditional jump mnemonic (`b` / `j`).
+            (branch.prefix.clone(), None, LabelRef::Veneer(veneer_id))
         };
         let lines = B::veneer_lines(branch.kind, target_name);
         self.veneer_names.push(name.clone());

@@ -1,0 +1,30 @@
+int main() {
+    int zero_trip = 7;
+    int i = 0;
+    while (i < 0) {
+        zero_trip = zero_trip + 100;
+        i = i + 1;
+    }
+
+    int forward = 0;
+    i = 0;
+    while (i < 7) {
+        forward = forward + i;
+        i = i + 2;
+    }
+
+    int backward = 0;
+    i = 7;
+    while (i > 0) {
+        backward = backward + i;
+        i = i - 2;
+    }
+
+    putint(zero_trip);
+    putch(10);
+    putint(forward);
+    putch(10);
+    putint(backward);
+    putch(10);
+    return 0;
+}

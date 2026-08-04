@@ -22,8 +22,12 @@
 //!      unchanged: continue while the counter is nonzero); the index IV
 //!      steps by +4.
 //!   2. Contiguous loads become vector loads (same address), scalar
-//!      Add/Sub/Mul become lane-wise vector ops (invariant operands are
-//!      `VectorSplat`ed), contiguous stores become vector stores.
+//!      Add/Sub/Mul/Shl/Shr/Sar/And/Or/Xor/Div/Min/Max become lane-wise
+//!      vector ops (invariant operands are `VectorSplat`ed), contiguous
+//!      stores become vector stores. Shifts/bitwise ops are integer-only
+//!      (NEON sshl/and/orr/eor); Div is f32-only (fdiv v.4s — NEON has no
+//!      integer vector divide); Min/Max cover i32 and f32
+//!      (smin/smax/fmin/fmax).
 //!   3. The `R` remaining scalar iterations (a compile-time constant in
 //!      `0..=3`) are peeled as straight-line epilogue blocks with the index
 //!      IV substituted by constants — no runtime guards, no remainder loop.
@@ -514,7 +518,8 @@ fn analyze_loop(
 
     // 8. Payload classification. Latch machinery (terminator, condition,
     //    back-edge args) is excluded; everything else must be a GEP, a
-    //    Load/Store, an Add/Sub/Mul, or a constant.
+    //    Load/Store, a whitelisted binary op (see
+    //    `is_vectorizable_binary_op`), or a constant.
     let latch_insts: Vec<Inst> = data
         .layout()
         .basicblock(latch)
@@ -631,6 +636,29 @@ fn analyze_loop(
         if !ty.is_i32() && !ty.is_f32() {
         trace(data, looop, "binary_elem_not_scalar");
         return None;
+        }
+        // Shifts and bitwise ops exist only for integers: NEON has no float
+        // shift/and/or/xor forms and float shift semantics do not exist.
+        // (Div vectorizes only for f32 — NEON has no integer vector divide,
+        // `sdiv` is scalar-only; constant-divisor i32 loops are rewritten to
+        // shift chains by StrengthReduction before the vectorizer's next look.
+        // Min/Max vectorize for both i32 and f32: smin/smax/fmin/fmax.)
+        if matches!(
+            binary.op(),
+            BinaryOp::Shl
+                | BinaryOp::Shr
+                | BinaryOp::Sar
+                | BinaryOp::And
+                | BinaryOp::Or
+                | BinaryOp::Xor
+        ) && !ty.is_i32()
+        {
+            trace(data, looop, "binary_shift_bitwise_not_i32");
+            return None;
+        }
+        if binary.op() == BinaryOp::Div && ty.is_i32() {
+            trace(data, looop, "binary_int_div_no_neon");
+            return None;
         }
         if arena.inst_data(binary.rhs()).ty() != &ty {
             trace(data, looop, "binary_operand_type_mismatch");
@@ -825,7 +853,21 @@ fn is_sub_one(arena: &ArenaContext<'_>, inst: Inst, lhs: Inst) -> bool {
 }
 
 fn is_vectorizable_binary_op(op: BinaryOp) -> bool {
-    matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
+    matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Shl
+            | BinaryOp::Shr
+            | BinaryOp::Sar
+            | BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Xor
+            | BinaryOp::Div
+            | BinaryOp::Min
+            | BinaryOp::Max
+    )
 }
 
 /// Loop-invariant value: a compile-time constant, a global, a dominating
@@ -1285,6 +1327,21 @@ mod tests {
     /// `for (i = 0; i < trip; i++) b[i] = a[i] * 2 + 1` over them.
     /// `trip` must be a compile-time constant (exact-trip requirement).
     fn build_elementwise(program: &mut Program, elem: Type, trip: i32) -> (Function, BasicBlock, BasicBlock, BasicBlock) {
+        build_op_chain(program, elem, trip, &[BinaryOp::Mul, BinaryOp::Add], &[2, 1])
+    }
+
+    /// Like `build_elementwise`, but the payload is `b[i] = chain(a[i])`
+    /// where `chain` applies `ops` in order with per-op constant rhs values
+    /// (`v = a[i]; for (op, c) in ops.zip(consts) { v = v op c }`). The
+    /// constants are element-typed (`Integer` for i32, `Float` for f32).
+    fn build_op_chain(
+        program: &mut Program,
+        elem: Type,
+        trip: i32,
+        ops: &[BinaryOp],
+        consts: &[i32],
+    ) -> (Function, BasicBlock, BasicBlock, BasicBlock) {
+        assert_eq!(ops.len(), consts.len());
         let i32 = Type::get_i32();
         let arr = Type::get_array(elem.clone(), 64);
         let a = {
@@ -1295,7 +1352,7 @@ mod tests {
             let init = program.new_value().zero_init(arr);
             program.new_value().global_alloc(init)
         };
-        let function = program.new_function(Type::get_unit(), "elementwise".into(), vec![]);
+        let function = program.new_function(Type::get_unit(), "op_chain".into(), vec![]);
         let mut data = ArenaContextMut {
             program: &mut *program,
             curr_func: Some(function),
@@ -1326,30 +1383,34 @@ mod tests {
         let mut lb = LocalBuilder {
             arena: &mut data as &mut dyn Arena,
         };
-        let one_elem = if elem.is_f32() {
-            lb.float(1.0)
-        } else {
-            lb.integer(1)
-        };
-        let two_elem = if elem.is_f32() {
-            lb.float(2.0)
-        } else {
-            lb.integer(2)
-        };
+        let mut payload_insts: Vec<Inst> = vec![one_iv];
         let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
         let load_a = lb.load(gep_a);
-        let mul = lb.binary(BinaryOp::Mul, load_a, two_elem);
-        let add = lb.binary(BinaryOp::Add, mul, one_elem);
+        payload_insts.push(gep_a);
+        payload_insts.push(load_a);
+        let mut v = load_a;
+        for (idx, op) in ops.iter().enumerate() {
+            let c = if elem.is_f32() {
+                lb.float(consts[idx] as f32)
+            } else {
+                lb.integer(consts[idx])
+            };
+            v = lb.binary(*op, v, c);
+            payload_insts.push(c);
+            payload_insts.push(v);
+        }
         let gep_b = lb.get_elem_ptr(b, vec![zero, iv]);
-        let store = lb.store(add, gep_b);
+        let store = lb.store(v, gep_b);
         let iv_next = lb.binary(BinaryOp::Add, iv, one_iv);
         let t_next = lb.binary(BinaryOp::Sub, counter, one_iv);
         let back = lb.branch(t_next, header, vec![iv_next, t_next], exit, vec![]);
         drop(lb);
-        for inst in [
-            one_iv, one_elem, two_elem, gep_a, load_a, mul, add, gep_b, store, iv_next, t_next,
-            back,
-        ] {
+        payload_insts.push(gep_b);
+        payload_insts.push(store);
+        payload_insts.push(iv_next);
+        payload_insts.push(t_next);
+        payload_insts.push(back);
+        for inst in payload_insts {
             data.layout_mut().insert_inst(latch, inst);
         }
         let ret = data.new_local_inst().ret(None);
@@ -1449,6 +1510,24 @@ mod tests {
             .filter(|&inst| matches!(data.inst_data(inst).kind(), InstKind::Load(_)))
             .filter(|&inst| !data.inst_data(inst).ty().is_vector())
             .count()
+    }
+
+    /// Payload binary ops that were rewritten to lane-wise vector ops, in
+    /// layout order (the latch machinery stays scalar, so this lists exactly
+    /// the vectorized payload operations).
+    fn vector_binaries(program: &Program, function: Function) -> Vec<BinaryOp> {
+        let data = program.func_data(function);
+        data.layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|l| l.insts().iter().copied())
+            .filter_map(|inst| match data.inst_data(inst).kind() {
+                InstKind::Binary(binary) if data.inst_data(inst).ty().is_vector() => {
+                    Some(binary.op())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn latch_of(program: &Program, function: Function, latch: BasicBlock) -> Vec<Inst> {
@@ -2074,6 +2153,89 @@ mod tests {
                     && matches!(data.inst_data(inst).ty().kind(), TypeKind::Vector(elem, _) if elem.is_f32())
             });
         assert!(has_f32_vector, "the vector load must be <4 x f32>");
+    }
+
+    #[test]
+    fn vectorizes_shift_xor_loop() {
+        // b[i] = (a[i] << 1) ^ 3: shifts and bitwise ops are vectorized
+        // (NEON sshl + eor v.4s); the shift amount is a splatted constant.
+        let mut program = Program::new();
+        let (function, _header, _latch, _exit) = build_op_chain(
+            &mut program,
+            Type::get_i32(),
+            16,
+            &[BinaryOp::Shl, BinaryOp::Xor],
+            &[1, 3],
+        );
+        assert!(run(&mut program, function), "shift/xor loop must vectorize");
+        assert_eq!(vector_load_count(&program, function), 1);
+        assert_eq!(scalar_load_count(&program, function), 0);
+        assert_eq!(
+            vector_binaries(&program, function),
+            vec![BinaryOp::Shl, BinaryOp::Xor],
+            "payload binaries become lane-wise vector ops in order"
+        );
+    }
+
+    #[test]
+    fn rejects_i32_div() {
+        // NEON has no integer vector divide (`sdiv` is scalar-only), so i32
+        // Div stays scalar; constant-divisor loops are rewritten to shift
+        // chains by StrengthReduction before the vectorizer's next look.
+        let mut program = Program::new();
+        let (function, _header, _latch, _exit) =
+            build_op_chain(&mut program, Type::get_i32(), 16, &[BinaryOp::Div], &[2]);
+        assert!(!run(&mut program, function), "i32 div must be rejected");
+    }
+
+    #[test]
+    fn vectorizes_f32_div_loop() {
+        // b[i] = a[i] / 2.0: float vector divide (fdiv v.4s).
+        let mut program = Program::new();
+        let (function, _header, _latch, _exit) =
+            build_op_chain(&mut program, Type::get_f32(), 16, &[BinaryOp::Div], &[2]);
+        assert!(run(&mut program, function), "f32 div loop must vectorize");
+        assert_eq!(vector_binaries(&program, function), vec![BinaryOp::Div]);
+        let data = program.func_data(function);
+        let has_f32_vector = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|l| l.insts().iter().copied())
+            .any(|inst| {
+                data.inst_data(inst).ty().is_vector()
+                    && matches!(data.inst_data(inst).ty().kind(), TypeKind::Vector(elem, _) if elem.is_f32())
+            });
+        assert!(has_f32_vector, "the vector ops must be <4 x f32>");
+    }
+
+    #[test]
+    fn rejects_f32_shift() {
+        // Float shifts have no semantics (and no NEON form): rejected even
+        // though the op is whitelisted for i32.
+        let mut program = Program::new();
+        let (function, _header, _latch, _exit) =
+            build_op_chain(&mut program, Type::get_f32(), 16, &[BinaryOp::Shl], &[1]);
+        assert!(!run(&mut program, function), "f32 shift must be rejected");
+    }
+
+    #[test]
+    fn shift_loop_is_idempotent() {
+        // Same function run twice: the second run must not rewrite the
+        // already-vectorized loop (fixed-point convergence).
+        let mut program = Program::new();
+        let (function, _header, _latch, _exit) = build_op_chain(
+            &mut program,
+            Type::get_i32(),
+            16,
+            &[BinaryOp::Shl, BinaryOp::Xor],
+            &[1, 3],
+        );
+        assert!(run(&mut program, function), "first run vectorizes");
+        assert!(
+            !run(&mut program, function),
+            "second run must not change the vectorized loop"
+        );
     }
 
     #[test]

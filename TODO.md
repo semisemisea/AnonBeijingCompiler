@@ -548,6 +548,25 @@ M44 v2（select 掩码）。
 - B3/B2 后真实优先级：目标 4（select 掩码，matmul 交换内核）> M43
   versioning（数组参数 alignment）> 多参数 test-at-top。
 
+##### M44 v2 目标 4（select 掩码）执行记录（2026-08-05）
+
+- 实现（commit 88e1d18，详见 Vectorize_Progress.md 目标 4 完成记录）：
+  Class::VecSelect——Select(cond,t,f) 条件不变量时接受（逐 lane 拒绝
+  select_lane_cond），变换为 (t & ~m)|(f & m)、m=-(eq(cond,0))，
+  全复用既有向量 binary，零 lowering 改动；二遍检查补 VecSelect
+  操作数校验 + epilogue clone 补 Select。
+- 验证：raana_ir 342 全过（+2 单测：不变量条件向量化/逐 lane 拒绝）。
+- 管线限制（验收 3 诚实记录）：if_conversion 只提升 i32 binary
+  （分支含 load 不转）；全不变量 select 被 LICM hoist（既有 splat
+  路径，合成用例出 dup+str q）；matmul1 真实 select 为 min 归约
+  （IR 137 行），条件逐 lane → v3。
+- **M44 v2 收官**：目标 1-4 全部 [x]。corpus 命中 3/60（matmul 清零）；
+  能力储备：白名单/移位除法 lowering、B3 同地址放宽、passthrough、
+  test-at-top、标量 select。
+- v3 缺口清单：逐 lane select（bsl/csel lowering + if_conversion 增强）；
+  多参数 test-at-top；数组参数 alignment（M43 versioning）；matmul1
+  min 归约 + 奇偶掩码内核。
+
 #### M45：SLP 基本块向量化 + 循环展开
 
 - SLP（`raana_ir/src/opt/passes/slp.rs`）：把同一基本块内相邻、类型一致的独立

@@ -44,22 +44,14 @@ fi
 # Count real instructions in an emitted .s: lines that are not directives,
 # labels, or empty.
 count_insts() {
-    local file="$1"
-    local marker="${2:-}"
-    local active=1
-    if [[ -n "$marker" ]]; then
-        active=0
-    fi
-    awk -v marker="$marker" -v active="$active" '
-        marker != "" && index($0, marker) { active = 1; next }
-        marker != "" && !active { next }
+    awk '
         /^[[:space:]]*$/ { next }
         /^[[:space:]]*\.[a-z]/ { next }
         /^[[:space:]]*\.L[a-z0-9_.]*:/ { next }
         /^[A-Za-z_.][A-Za-z0-9_.]*:/ { next }
         { n++ }
         END { print n+0 }
-    ' "$file"
+    ' "$1"
 }
 
 run_gem5_sim_insts() {
@@ -90,7 +82,7 @@ for case in "${cases[@]}"; do
     fi
     asm="$OUT_DIR/$case.s"
     "$COMPILER" -S "$OPT" --target "$TARGET" -o "$asm" "$src" >/dev/null 2>&1
-    current=$(count_insts "$asm" '# SOYO_PROGRAM_ASM_BEGIN')
+    current=$(count_insts "$asm")
     sim="-"
     if [ "$GEM5" = "yes" ]; then
         sim=$(run_gem5_sim_insts "$case")

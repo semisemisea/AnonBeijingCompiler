@@ -14,6 +14,12 @@ use crate::opt::{
     },
 };
 
+/// Hoisting a large bank of address-computed loads extends all of their live
+/// ranges across the loop and commonly costs more spill traffic than it saves.
+/// Direct scalar loads remain eligible because they do not create the same
+/// address/value register bank.
+const MAX_HOISTED_COMPUTED_LOADS: usize = 8;
+
 /// Loop invariant code motion
 pub struct LICM {
     /// Whole-program purity / alias analysis, rebuilt on every `Pass::run`.
@@ -213,9 +219,7 @@ impl LICM {
                                         let reads = reads
                                             .iter()
                                             .map(|r| match r {
-                                                WriteRoot::Global(g) => {
-                                                    AbstractObject::Global(*g)
-                                                }
+                                                WriteRoot::Global(g) => AbstractObject::Global(*g),
                                                 WriteRoot::Local(f, a) => {
                                                     AbstractObject::Alloc(*f, *a)
                                                 }
@@ -278,13 +282,7 @@ impl LICM {
                 && inst_data
                     .inst_usage()
                     .all(|operand| operand_is_invariant(operand, &map))
-                && load_hoist_safe(
-                    analysis,
-                    inst,
-                    data.curr_func.unwrap(),
-                    data,
-                    &loop_writes,
-                )
+                && load_hoist_safe(analysis, inst, data.curr_func.unwrap(), data, &loop_writes)
             {
                 Lattice::Invariant
             } else {
@@ -302,6 +300,45 @@ impl LICM {
                         .map(|_| user)
                 }));
             }
+        }
+
+        let computed_loads = invariant_order
+            .iter()
+            .copied()
+            .filter(|&inst| {
+                let InstKind::Load(load) = data.inst_data(inst).kind() else {
+                    return false;
+                };
+                matches!(data.inst_data(load.src()).kind(), InstKind::GetElemPtr(..))
+            })
+            .collect::<Vec<_>>();
+        if computed_loads.len() > MAX_HOISTED_COMPUTED_LOADS {
+            for inst in computed_loads {
+                map.insert(inst, Lattice::Variant);
+            }
+            // Any invariant expression depending on a retained load must stay
+            // with it. Iterate to a fixed point because dependency chains may
+            // contain address casts or arithmetic before their final use.
+            loop {
+                let mut downgraded = false;
+                for &inst in &invariant_order {
+                    if map[&inst] != Lattice::Invariant {
+                        continue;
+                    }
+                    if data.inst_data(inst).inst_usage().any(|operand| {
+                        data.layout().parent_bb(operand).is_some_and(|block| {
+                            looop.contains(block) && map.get(&operand) == Some(&Lattice::Variant)
+                        })
+                    }) {
+                        map.insert(inst, Lattice::Variant);
+                        downgraded = true;
+                    }
+                }
+                if !downgraded {
+                    break;
+                }
+            }
+            invariant_order.retain(|inst| map[inst] == Lattice::Invariant);
         }
 
         let partial_geps = loop_insts
@@ -427,14 +464,13 @@ fn load_hoist_safe(
         return false;
     };
     let addr = load.src();
-    loop_writes.iter().all(|&write| {
-        match data.inst_data(write).kind() {
-            InstKind::Store(store) => {
-                !analysis.alias(data, func, addr, store.dest()).may_alias()
-            }
-            InstKind::MemZero(mem_zero) => {
-                !analysis.alias(data, func, addr, mem_zero.dest()).may_alias()
-            }
+    loop_writes
+        .iter()
+        .all(|&write| match data.inst_data(write).kind() {
+            InstKind::Store(store) => !analysis.alias(data, func, addr, store.dest()).may_alias(),
+            InstKind::MemZero(mem_zero) => !analysis
+                .alias(data, func, addr, mem_zero.dest())
+                .may_alias(),
             InstKind::Call(call) => {
                 let targets = analysis.targets_of(data, func, addr);
                 !analysis.call_may_write(call.callee(), targets.as_ref())
@@ -444,8 +480,7 @@ fn load_hoist_safe(
                 !analysis.call_may_write(tail_call.callee(), targets.as_ref())
             }
             _ => true,
-        }
-    })
+        })
 }
 
 impl Pass for LICM {
@@ -1035,9 +1070,7 @@ mod tests {
             curr_func: Some(function),
         };
         let entry = data.add_entry_block();
-        let header = data
-            .new_basic_block()
-            .basic_block("header".into(), vec![]);
+        let header = data.new_basic_block().basic_block("header".into(), vec![]);
         let body = data.new_basic_block().basic_block("body".into(), vec![]);
         let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
         for block in [header, body, exit] {
@@ -1078,6 +1111,37 @@ mod tests {
             data.layout().parent_bb(load),
             Some(data.layout().entry_bb().unwrap().bb())
         );
+    }
+
+    #[test]
+    fn retains_large_banks_of_computed_loads_in_the_loop() {
+        let mut program = Program::new();
+        let globals = (0..=MAX_HOISTED_COMPUTED_LOADS)
+            .map(|_| new_global(&mut program))
+            .collect::<Vec<_>>();
+        let mut loads = Vec::new();
+        let mut loop_header = None;
+        let function = build_loop(
+            &mut program,
+            "licm_computed_load_bank",
+            |data, header, _body, _exit| {
+                loop_header = Some(header);
+                let zero = data.new_local_value().integer(0);
+                for global in globals {
+                    let address = data.new_local_value().get_elem_ptr(global, vec![zero]);
+                    let load = data.new_local_value().load(address);
+                    data.layout_mut().insert_inst(header, address);
+                    data.layout_mut().insert_inst(header, load);
+                    loads.push(load);
+                }
+            },
+        );
+
+        assert!(run_with_analysis(&mut program));
+        let data = program.func_data(function);
+        for load in loads {
+            assert_eq!(data.layout().parent_bb(load), loop_header);
+        }
     }
 
     #[test]
@@ -1176,13 +1240,17 @@ mod tests {
             data.layout_mut().insert_inst(entry, ret);
         }
         let mut load = None;
-        let function = build_loop(&mut program, "licm_load_purecall", |data, header, _b, _e| {
-            let l = data.new_local_value().load(global);
-            data.layout_mut().insert_inst(header, l);
-            load = Some(l);
-            let call = data.new_local_value().call(helper, vec![]);
-            data.layout_mut().insert_inst(header, call);
-        });
+        let function = build_loop(
+            &mut program,
+            "licm_load_purecall",
+            |data, header, _b, _e| {
+                let l = data.new_local_value().load(global);
+                data.layout_mut().insert_inst(header, l);
+                load = Some(l);
+                let call = data.new_local_value().call(helper, vec![]);
+                data.layout_mut().insert_inst(header, call);
+            },
+        );
 
         assert!(run_with_analysis(&mut program));
         let data = program.func_data(function);

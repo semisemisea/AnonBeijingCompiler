@@ -759,17 +759,10 @@ fn analyze_loop(
     //     happens in `apply_vectorize` (2c). Anything else is a shape the
     //     vectorizer does not recognize.
     let mut exit_specs = Vec::with_capacity(exit_params.len());
-    for (pos, &arg) in exit_args.iter().enumerate() {
-        let spec = if acc_info.is_some() && pos == 0 {
-            let (update, _) = acc_update
-                .as_ref()
-                .expect("acc_update is set alongside acc_info");
-            if arg != *update {
-                trace(data, looop, "exit_arg_not_acc");
-                return None;
-            }
-            ExitArgSpec::Acc
-        } else if arg == iv_next {
+    for &arg in exit_args.iter() {
+        // Value-based classification (the accumulator is not assumed to be
+        // exit parameter 0 — e.g. a min-reduction passes [i, min]).
+        let spec = if arg == iv_next {
             ExitArgSpec::IvFinal
         } else if let Some(idx) = passthrough.iter().position(|&slot| {
             arg == params[slot] || arg == entry_args[slot]
@@ -777,6 +770,12 @@ fn analyze_loop(
             // `idx` is the index into `passthrough` / `passthrough_args`
             // (both are ordered identically), not the header slot.
             ExitArgSpec::Passthrough(idx)
+        } else if let Some((update, _)) = acc_update.as_ref() {
+            if arg != *update {
+                trace(data, looop, "exit_arg_not_acc");
+                return None;
+            }
+            ExitArgSpec::Acc
         } else {
             trace(data, looop, "exit_has_params");
             return None;
@@ -1139,11 +1138,10 @@ fn analyze_loop(
                 acc_update: update,
                 delta,
                 acc_init: entry_args[acc_slot],
-                exit_acc_param: if exit_params.is_empty() {
-                    None
-                } else {
-                    Some(exit_params[0])
-                },
+                exit_acc_param: exit_specs
+                    .iter()
+                    .position(|spec| matches!(spec, ExitArgSpec::Acc))
+                    .map(|pos| exit_params[pos]),
             })
         }
     };

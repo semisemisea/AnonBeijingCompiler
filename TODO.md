@@ -716,6 +716,27 @@ A4 exit_has_params（48 次）——**高 ROI，A3+A4+C1 解锁 01_mm**：
   load %119）——需 C1（B3 覆盖多 load 依赖链）才能最终向量化；
   A4 单独做可让 analyze 通过 exit 检查（下游 C1 完成前不向量化）
 
+##### Corpus 复扫（A3+A4+B1+spike 后, 2026-08-05）
+
+60 例 0 编译错误。拒绝分布对比（目标 3 后 → 现在）：
+- exit_has_params: 48 → 0（A4 完成，全部放行）
+- shape_body_not_2_blocks: 111 → 96（B1 -15，其余为双臂/多出口 if）
+- shape_header_multi_inst: 168 → 192（+24）、entry_trip_not_const:
+  18 → 30（+12）、exit_arg_not_acc: 6 → 15（+9）——均为 exit 放行
+  后拒绝点后移（progress，非回归）
+- 不变: not_innermost 276、test_at_top_multi_param 48（2+ 有效
+  参数）、non_unit_step 45、NoInductionVariable 30、bound_not_const
+  18、params_not_2 12、Rem 3
+- 向量化命中: 3/60 不变（matmul 清零 dup+str q）——单测全部能力
+  验证通过，但 corpus 真实组合未通：
+  * matmul1 掩码内核: B1✓ A4✓ → exit_arg_not_acc（B3 归约识别：
+    temp 局部归约 exit 不带 acc——待设计）
+  * 01_mm 内核: A3✓ A4✓ → entry_trip_not_const（bound=运行时 n,
+    M43 versioning）
+  * conv2d: multi_param(2+ 有效) + Rem(ISA) + shape_header
+- 剩余优先级: B3 归约识别（matmul1）> M43 versioning（01_mm/
+  conv2d bound）> 多参数 test-at-top 2+ 有效参数 > A2（低 ROI）
+
 #### M45：SLP 基本块向量化 + 循环展开
 
 - SLP（`raana_ir/src/opt/passes/slp.rs`）：把同一基本块内相邻、类型一致的独立

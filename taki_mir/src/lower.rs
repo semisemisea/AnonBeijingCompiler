@@ -543,14 +543,6 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 self.process_block_param(bb);
             }
 
-            // Entry block: the backend lowers the once-per-call ABI argument
-            // setup here. Entry block parameters are materialized as arg-copy
-            // vregs (see `process_block_param`), never as live-in block params.
-            if block_index.index() == 0 {
-                self.gen_arg_setup();
-                self.finish_ir_inst();
-            }
-
             // Emit loop-shared constant materializations when this block is
             // some loop's preheader (chains land at this block's start after
             // the stream reversal and dominate the whole loop body), then the
@@ -559,6 +551,19 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 self.emit_loop_const_shared(bb);
             }
             self.emit_block_const_shared();
+
+            // Entry block: the backend lowers the once-per-call ABI argument
+            // setup here. Entry block parameters are materialized as arg-copy
+            // vregs (see `process_block_param`), never as live-in block params.
+            // Pushed last so that after the stream reversal the `Args` pseudo
+            // lands before any hoisted constant materialization: those chains
+            // reuse ABI argument registers (e.g. `li a0, 1`) that still hold
+            // live parameters, and the register allocator only sees the
+            // conflict when the parameter's live range starts first.
+            if block_index.index() == 0 {
+                self.gen_arg_setup();
+                self.finish_ir_inst();
+            }
 
             self.finish_bb();
             self.cur_block = None;

@@ -12,7 +12,7 @@ use crate::ir::{
     },
     instruction::Inst,
 };
-use crate::opt::MULMOD_HELPER;
+use crate::opt::{CALLOO_NAME, MULMOD_HELPER};
 
 pub struct LlvmWriter<'a> {
     buffer: String,
@@ -208,7 +208,13 @@ impl<'a> LlvmWriter<'a> {
                 // so no declaration is emitted for it.
                 continue;
             }
-            if is_decl {
+            if is_decl && name == CALLOO_NAME {
+                // The M68 `soyo_calloc` builtin is provided by the AArch64
+                // backend as embedded `.Lsoyo_calloc`, which the LLVM path
+                // lacks. Emit a real definition that forwards to libc calloc
+                // so the LLVM output links.
+                self.visit_calloc_decl()?;
+            } else if is_decl {
                 self.visit_declare(func)?;
             } else {
                 self.visit_define(func)?;
@@ -289,6 +295,31 @@ impl<'a> LlvmWriter<'a> {
     }
 
     // ─── Declare ───
+
+    /// Emit a real definition for the M68 `soyo_calloc` builtin. The AArch64
+    /// backend provides it as embedded `.Lsoyo_calloc`, but the LLVM path has
+    /// no such runtime, so forward to libc `calloc` (available on both target
+    /// triples the LLVM harness links for).
+    fn visit_calloc_decl(&mut self) -> std::fmt::Result {
+        self.reduce_decls
+            .insert("declare ptr @calloc(i64, i64)".into());
+        let c = format!("%calloc_c{}", self.name_counter);
+        self.name_counter += 1;
+        let s = format!("%calloc_s{}", self.name_counter);
+        self.name_counter += 1;
+        let p = format!("%calloc_p{}", self.name_counter);
+        self.name_counter += 1;
+        writeln!(
+            self.buffer,
+            "define ptr @soyo_calloc(i32 %count, i32 %size) {{"
+        )?;
+        writeln!(self.buffer, "entry:")?;
+        writeln!(self.buffer, "  {} = zext i32 %count to i64", c)?;
+        writeln!(self.buffer, "  {} = zext i32 %size to i64", s)?;
+        writeln!(self.buffer, "  {} = call ptr @calloc(i64 {}, i64 {})", p, c, s)?;
+        writeln!(self.buffer, "  ret ptr {}", p)?;
+        writeln!(self.buffer, "}}")
+    }
 
     fn visit_declare(&mut self, func: Function) -> std::fmt::Result {
         let data = self.arena.func_data(func);
@@ -1506,5 +1537,40 @@ mod tests {
         assert!(llvm.contains("srem i64"), "{llvm}");
         assert!(llvm.contains("trunc i64"), "{llvm}");
         assert!(!llvm.contains("@soyo_mulmod"), "{llvm}");
+    }
+
+    #[test]
+    fn defines_soyo_calloc_forwarding_to_libc_calloc() {
+        let mut program = Program::new();
+        let helper = program.new_function(
+            Type::get_pointer(Type::get_i32()),
+            super::CALLOO_NAME.into(),
+            vec![],
+        );
+        let function = program.new_function(
+            Type::get_pointer(Type::get_i32()),
+            "caller".into(),
+            vec![],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let count = data.new_local_inst().integer(4);
+        let size = data.new_local_inst().integer(4);
+        let call = data.new_local_inst().call_with_type(
+            helper,
+            vec![count, size],
+            Type::get_pointer(Type::get_i32()),
+        );
+        data.layout_mut().insert_inst(entry, call);
+        let ret = data.new_local_inst().ret(Some(call));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let mut writer = LlvmWriter::new(&program);
+        writer.write().unwrap();
+        let llvm = writer.finish();
+        assert!(llvm.contains("define ptr @soyo_calloc(i32 %count, i32 %size)"), "{llvm}");
+        assert!(llvm.contains("call ptr @calloc(i64"), "{llvm}");
+        assert!(llvm.contains("declare ptr @calloc(i64, i64)"), "{llvm}");
+        assert!(!llvm.contains("declare ptr @soyo_calloc"), "{llvm}");
     }
 }

@@ -2190,3 +2190,229 @@ test_at_top_bound_not_const → 需 runtime trip count 支持（动态 counter
 计数会下降（验收项 1 满足），但"解锁循环出向量"（验收项 2）在 4 case
 上不成立。若目标是 4 case 出向量，需另行评估 runtime-bound test-at-top
 支持（新特性，超出 A3 范围）。
+
+---
+
+### 10.12 runtime-bound test-at-top 向量化支持（2026-08-06 细化方案，新 session 执行）
+
+**背景**：§10.10 实证证明 6 个候选循环（01_mm1/many_mat/transpose2/conv2d 内层
+归约）形态是 [iv, acc] 单归约（B1 可处理），但 §10.11 证明其 bound 全部是
+runtime 值，当前 `test_at_top_bound_not_const`（936-938 行）继续拒绝。本方案
+解决 runtime bound → 真正解锁这 6 个循环 + 其他 runtime-bound 循环。
+
+**核心思路（用户确认）**：bound 运行时已知 → entry 边运行时计算
+`trip = bound - i0`、`cnt0 = trip & -4`（向量循环 counter，每轮 -4，header 测
+!= 0）、`r = trip & 3` 剩余交给一个**运行时标量 tail 循环**（复用原 bound
+指令作上界，跑 0..3 轮）。`trip < 4` 时 `cnt0 = 0` → 向量循环自然跑 0 轮，
+无需 versioning 守卫分支。不做循环克隆/版本化。
+
+**现状关键代码（行号以 2026-08-06 bea35e2 后为准）**：
+- analyze：passthrough/effective 693-701；test_at_top_multi_param 拒绝
+  711-713（先于 acc_info 匹配）；bound 检查 936-938；trip<VF 948-950；
+  test_at_top_exit_reads_iv 959-961；acc_info 匹配在 effective 之后（约 715+，
+  rotated [iv,acc,t] 走 2 个 effective 分支）；IV 识别 test_at_top 分支取
+  effective[0]（约 774+，B1 时需排除 acc 槽）；b1_acc_used_outside_latch
+  拒绝 exit 直接读 acc（约 877+）。
+- apply：counter 物化 + entry 4Q 追加（约 1532-1546、1976-2011）；epilogue
+  剥 r 个直线块（1561+，常量 IV 代入，1582-1641 建块）；reduce 块
+  （约 1578+，VectorReduce + seed 加回）；exit 边重写（约 1931+，header
+  branch f 边 → epilogue/exit，test_at_top 用 build_exit_args 空参数）；
+  iv 步进 4、counter 步进 4（约 1986-2001）。
+- 单测：build_test_at_top 3155、build_multi_param_test_at_top 3244、
+  vectorizes_multi_param_test_at_top 3402、rejects_test_at_top_nonconstant_bound 3554。
+
+**方案分 3 个原子提交**：
+
+**提交 1：const-bound test-at-top B1 单归约放行（独立正确性，4 case 不出向量）**
+- analyze 711-713：`test_at_top && effective.len() == 2` 时放行进入 acc_info
+  匹配（复用 rotated 的 Reducible 判定），其余仍拒绝；
+- IV 识别：test_at_top 且有 acc_info 时，IV 槽 = effective 中非 acc 的那个
+  （当前取 effective[0]，[acc, iv] 序会错）；
+- b1_acc_used_outside_latch：test_at_top 的 exit 直接读 acc（SSA 支配，无
+  exit 参数）需放行——exit 无参数、直接读 header 参数是 test-at-top 的
+  正常形态（rotated 才是 latch branch f_args 传 acc'）；
+- apply：exit 边重写时 test_at_top + reduction 的 f 边应指向 reduce 块并带
+  [acc 向量参数]（rotated 路径 1931+ 已有，test_at_top 分支需补）；exit 无
+  参数时 reduce 块算出的标量 sum 需经 exit 参数或 header 参数改写送达
+  （构造 4-6 参数 [passthrough…, iv, acc] + const bound 的单测验证）。
+- 验收：单测 ≥2 新增（[iv, acc]+passthrough 向量化成功+幂等；非 Reducible
+  的 effective==2 仍拒）；raana_ir 全绿；matmul1 不回归。
+
+**提交 2：runtime counter 物化（elementwise，不带归约）**
+- analyze 936-938：bound 非 const 时不再直接拒，改记 `runtime_trip=true`
+  并把 bound_inst 存进 VecPlan（新增字段）；
+- 948-950 trip<VF：runtime 时跳过（cnt0=0 自然处理）；
+- 959-961 exit 读 IV：runtime 时若 exit 读 IV，其终值 = bound（运行时值，
+  IvFinal 传 bound_inst 而非 i0+4q）；
+- apply：entry 前插入 `trip = sub(bound, i0)` + `cnt0 = and(trip, -4)`，
+  counter 初始值用 cnt0（替代常量 four_q，约 1976/1990-2011）；latch 步进
+  逻辑不变；
+- **tail 循环构造**：counter 到 0 后进入新建 tail_header（参数 [iv,
+  passthrough…]）+ tail_latch：`lt iv, bound`（复用原 bound_inst）→ br
+  tail_latch / exit；payload 用既有 clone_payload_inst 克隆（IV 代入 tail 的
+  iv 参数）；iv 步进 1；entry iv0 = i0 + cnt0（运行时 add）。exit 参数按
+  exit_specs 重建（IvFinal 传 bound_inst）。
+- **防二次向量化**：tail 是标量循环且 runtime bound → fixed-point 下轮会
+  再向量化它造成无限循环。方案：analyze 拒绝"header 名以 vec_tail_ 前缀"
+  的循环（与 vec_epi_/vec_reduce 命名一致，同属本 pass 产物命名空间，非
+  benchmark 名条件，符合 AGENTS.md 红线精神）；或结构判定（entry 边来自
+  reduce/vec 块）优先，命名兜底。
+- 单测：runtime-bound elementwise 向量化成功（断言向量指令 + tail 存在 +
+  幂等）；trip=0/1/2/3 边界（tail-only，不出向量但语义正确）。
+
+**提交 3：runtime bound + B1 归约组合（真正解锁 4 case 内层）**
+- apply：reduce 块算出的标量 sum 作为 tail 的 acc 初值；tail 内 acc 继续标量
+  累加；tail 出口把最终 acc 传 exit（exit 需加 1 个标量参数 + 改写 exit 直接
+  读 header acc 的引用——提交 1 的 exit 改写机制扩展）；
+- passthrough 参数在 tail 链上继续转发（沿既有 epilogue 转发逻辑）。
+- 单测：runtime-bound [iv, acc] 向量化成功（向量指令 + tail 标量累加 +
+  幂等）。
+
+**验证命令**（沿用 §10.9）：
+- 单测：cargo test -p raana_ir 2>&1 | grep -E "test result"
+- corpus 复扫：M44_TRACE=1 逐个跑 4 case，grep -oE "reject=[A-Za-z0-9_:]+" | sort | uniq -c
+- IR 检查：./target/release/compiler -O2 --target aarch64 --emit ir -o /tmp/x.ir
+- 汇编向量：grep -cE "addv|ldr q|str q|add v[0-9]|mul v[0-9]|dup v[0-9]" /tmp/x.s
+- 定向差分（Docker 内，慢）：make test ARGS="-O 2 -j 1" perf/<case>.sy
+
+**验收清单**：
+- [ ] 提交 1/2/3 各自独立 commit（[Feat(Opt)]: ...），中文消息
+- [ ] 单测 ≥3 新增全绿；raana_ir 全量全绿；workspace 全绿
+- [ ] 4 case 复扫：test_at_top_multi_param 与 test_at_top_bound_not_const
+      计数下降（记录数字），解锁的循环汇编出向量指令（记录 case + 指令）
+- [ ] 01_mm1 内核（BB20）、many_mat k 循环（BB49）、transpose2（BB10）、
+      conv2d checksum（BB14）至少解锁出向量
+- [ ] trip 边界（0/1/2/3）语义正确（差分或单测覆盖）
+- [ ] matmul1 -O2 仍 PASS；RISC-V 零影响；无二次向量化死循环
+- [ ] 最终 git status 只剩非本任务文件
+
+---
+
+### 10.13 自包含 goal 提示词（runtime-bound test-at-top 向量化，可直接粘贴新 session）
+
+```text
+# Goal: runtime-bound test-at-top 向量化支持（loop_vectorize）
+
+## 背景
+SysY 编译器项目（Rust），工作目录
+/Users/azureskye/Documents/Programs/rust/AnonBeijingCompiler-hermes，
+分支 feat/loop-vectorize-hermes。AArch64 NEON 向量化 pass 在
+raana_ir/src/opt/passes/loop_vectorize.rs。60 例 perf corpus 只有
+matmul1/2/3 出向量（bound 是字面常量 while(i<1000)）。最大形态缺口：
+test-at-top 循环的 bound 是运行时值（getint / 运行时全局），被
+test_at_top_bound_not_const 拒绝。背景实证见 TODO.md §10.10-10.12，
+本提示词自包含。
+
+## 必须遵守的规则（用户明令）
+- 只在 hermes worktree 操作；不 push、不 rebase（遇冲突立即停并汇报）；
+  不碰其他 worktree；不读/不提交 .env 等凭据文件。
+- 只改 raana_ir crate；不碰 anon_armv8（lowering）、taki_mir、前端。
+  IR 层问题只改 IR 层。
+- 无 hacky workaround（rm、手动 sed、flat pool 一律禁止），只做 root
+  cause 修复；设计中禁止 Rc<RefCell<T>> / RefCell 共享可变。
+- 不做以 benchmark/函数名/输入为条件的优化（AGENTS.md 红线）；block
+  命名（vec_tail_/vec_epi_/vec_reduce）是本 pass 产物命名空间，允许用于
+  防二次向量化，不得用于任何优化条件。
+- -O0 保留标量；vectorize 只进 aarch64 管线（RISC-V 零影响）。
+- 勤 commit、勤单测：每个原子部分完成即 commit（消息格式
+  [Feat(Opt)]: ... / [Fix(Opt)]: ... / [Docs]: ...），中文消息。
+- 改文件一律 patch；不用 python 脚本改文件；不碰 .docker-image、
+  不 rm -rf、不 cargo clean。
+- 验收粒度 = 单测 + 单 case（make test <case>）；全量测试用户自己跑。
+- 形态实证先行：任何分析改动前先用 M44_TRACE=1 + VECDBG_SHAPE=1 复扫
+  4 个 case 确认当前拒绝分布，结论更新到 TODO.md §10.12。
+
+## 现状与设计
+
+### 现状（loop_vectorize.rs，行号以 bea35e2 后为准）
+- test-at-top 形态：header 结尾 `lt iv, bound; br cond, latch, exit`，
+  latch 是 plain jump 回 header。bound 必须是编译期常量
+  （test_at_top_bound_not_const，约 936-938 行），否则拒绝；trip<VF
+  （948-950）拒绝；exit 读 IV 且 trip%4!=0 拒绝（959-961）。
+- apply：entry 边追加 counter 参数（初值 4Q 常量，约 1976/1990-2011），
+  latch 步进 4，header 测 counter != 0；epilogue 剥 r=trip%4 个直线块
+  （常量 IV 代入，1561-1641）；B1 归约（rotated）有 reduce 块
+  （VectorReduce + seed 加回，约 1578+）。
+- 已有单测：build_test_at_top（3155）、build_multi_param_test_at_top
+  （3244）、vectorizes_multi_param_test_at_top（3402）、
+  rejects_test_at_top_nonconstant_bound（3554）。
+- 既有诊断插桩：M44_TRACE=1 打拒绝原因；VECDBG_SHAPE=1 打
+  [SHAPE-HDR]/[SHAPE-BACK]/[SHAPE-BOUND]/[SHAPE-EXIT]。
+
+### 设计（3 个原子提交，每个独立 commit + 单测）
+
+**提交 1：const-bound test-at-top B1 单归约放行**
+- 711-713 行 `test_at_top && effective.len() != 1`：改为 effective==2 时
+  放行进 acc_info 匹配（复用 rotated 的 Reducible 判定，acc 必须是 header
+  参数且非 passthrough）；其余仍拒绝。不引入多 IV/多归约。
+- IV 识别：test_at_top 且有 acc_info 时，IV 槽取 effective 中非 acc 的槽
+  （当前取 effective[0]，[acc, iv] 参数序会错选 acc 为 IV）。
+- b1_acc_used_outside_latch（约 877+）：test_at_top 的 exit 无参数、经 SSA
+  支配直接读 header 参数，是正常形态；放行 exit 块内读 acc（rotated 才
+  是 latch branch f_args 传 acc'）。
+- apply：test_at_top + reduction 时 header branch f 边 → reduce 块（带
+  [acc 向量]）；exit 无参数时 reduce 块算出的标量 sum 需送达 exit（exit
+  加参数或改写 exit 内对 acc 的引用，与提交 3 共用机制）。
+- 单测：构造 [passthrough…, iv, acc] + const bound（如 bound=16）循环，
+  断言向量指令 + 幂等；非 Reducible 的 effective==2 仍拒绝。
+
+**提交 2：runtime counter 物化 + tail 循环（elementwise，无归约）**
+- analyze：936-938 行 bound 非 const 不再拒，记 runtime_trip=true，
+  bound_inst 存进 VecPlan（新字段）；948-950 跳过 trip<VF；959-961 若
+  exit 读 IV，IvFinal = bound_inst（运行时值）。
+- apply entry：插入 `trip = sub(bound, i0)` + `cnt0 = and(trip, -4)`，
+  counter 初值 = cnt0（替代常量 4Q）。
+- tail 循环：counter 归零边进入新块 tail_header（参数 [iv, passthrough…]）
+  + tail_latch：`lt iv, bound`（复用原 bound_inst）→ br tail_latch/exit；
+  payload 用 clone_payload_inst 克隆（IV 代入 tail 的 iv 参数）；iv 步进 1；
+  entry iv0 = add(i0, cnt0)（运行时）。exit 参数按 exit_specs 重建。
+- 防二次向量化：tail 是标量 runtime-bound 循环，fixed-point 下轮会再
+  向量化 → 死循环。analyze 拒绝 header 名以 vec_tail_ 前缀的循环（结构
+  判定优先：entry 边来自本 pass 产物块；命名兜底）。
+- 单测：runtime-bound elementwise 向量化成功（向量指令 + tail 存在 +
+  幂等）；trip=0/1/2/3 边界语义正确（tail-only）。
+
+**提交 3：runtime bound + B1 归约组合（真正解锁 4 case 内层）**
+- reduce 块标量 sum 作为 tail 的 acc 初值；tail 内 acc 标量累加；tail 出口
+  最终 acc 传 exit（exit 加 1 个标量参数 + 改写 exit 直接读 header acc 的
+  引用，复用提交 1 机制）；passthrough 沿 tail 链转发。
+- 单测：runtime-bound [iv, acc] 向量化成功 + 幂等。
+
+## 验证命令
+- 单测：cargo test -p raana_ir 2>&1 | grep -E "test result"
+- corpus 复扫（拒绝分布）：M44_TRACE=1 逐个跑
+  ./target/release/compiler -O2 --target aarch64 -S tests/perf/<case>.sy
+  2>/tmp/x.log，grep -oE "reject=[A-Za-z0-9_:]+" | sort | uniq -c
+- IR 检查：./target/release/compiler -O2 --target aarch64 --emit ir
+  -o /tmp/x.ir tests/perf/<case>.sy
+- 汇编向量检查：grep -cE "addv|ldr q|str q|add v[0-9]|mul v[0-9]|dup v[0-9]"
+  /tmp/x.s
+- 定向差分（Docker 内，慢）：make test ARGS="-O 2 -j 1" perf/<case>.sy
+
+## 关键代码位置
+- loop_vectorize.rs analyze：693-701（passthrough/effective）、711-713
+  （test_at_top_multi_param 拒绝点）、715+（acc_info 匹配）、774+
+  （test_at_top IV 识别 effective[0]）、877+（b1_acc_used_outside_latch）、
+  936-938（bound 检查）、948-950（trip<VF）、959-961（exit 读 IV）
+- loop_vectorize.rs apply：1532-1546（counter 物化）、1561-1641（epilogue
+  剥块 + clone_payload_inst）、1578+（reduce 块）、1931+（exit 边重写）、
+  1976-2011（entry 4Q + acc splat）
+- 工具函数：constant_i64（1482）、build_exit_args（2062）、
+  vector_operand（2099）、clone_payload_inst（2128）、is_add_one（1373）
+- 既有单测：3155/3244/3402/3554；VECDBG_SHAPE 插桩输出 SHAPE-BOUND
+
+## 验收清单（全部满足才算完成）
+- [ ] 3 个提交各自独立 commit（[Feat(Opt)]: ...），中文消息，每步单测全绿
+- [ ] 形态实证更新 TODO.md §10.12（复扫分布 + 解锁链推进记录）
+- [ ] 单测 ≥3 新增全绿；raana_ir 全量全绿；workspace 全绿
+- [ ] 4 case（conv2d-1 / many_mat_cal-1 / transpose2 / 01_mm1）复扫：
+      test_at_top_multi_param 与 test_at_top_bound_not_const 计数下降
+      （记录数字）
+- [ ] 解锁的循环汇编出向量指令（记录 case + 指令）：01_mm1 内核（BB20）、
+      many_mat k 循环（BB49）、transpose2（BB10）、conv2d checksum（BB14）
+      至少其一
+- [ ] trip 边界（0/1/2/3）语义正确（单测或差分覆盖）
+- [ ] 无二次向量化死循环（tail 被拒，fixed-point 收敛）
+- [ ] matmul1 -O2 仍 PASS（既有能力不回归）；RISC-V 零影响（不注册）
+- [ ] 最终 git status 只剩非本任务文件
+```

@@ -121,6 +121,7 @@ fn compile_sy_with(source: &str, target: Target, opt_level: u8, use_dfe: bool) -
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
             branch_opt: false,
             chain_fusion: false,
+            const_cse: false,
         },
         1 => anon_armv8::AArch64CodegenConfig {
             dce: true,
@@ -130,6 +131,7 @@ fn compile_sy_with(source: &str, target: Target, opt_level: u8, use_dfe: bool) -
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
             branch_opt: true,
             chain_fusion: true,
+            const_cse: true,
         },
         _ => anon_armv8::AArch64CodegenConfig {
             dce: true,
@@ -139,6 +141,7 @@ fn compile_sy_with(source: &str, target: Target, opt_level: u8, use_dfe: bool) -
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
             branch_opt: true,
             chain_fusion: true,
+            const_cse: true,
         },
     };
     match target {

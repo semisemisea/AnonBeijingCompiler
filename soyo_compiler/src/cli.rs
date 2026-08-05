@@ -75,6 +75,10 @@ pub(crate) struct Arg {
     pub(crate) enable_sched: bool,
     #[arg(long, conflicts_with = "enable_sched")]
     pub(crate) disable_sched: bool,
+    #[arg(long, conflicts_with = "disable_const_cse")]
+    pub(crate) enable_const_cse: bool,
+    #[arg(long, conflicts_with = "enable_const_cse")]
+    pub(crate) disable_const_cse: bool,
     #[arg(long, value_enum, default_value_t = SchedModel::CortexA53)]
     pub(crate) sched_model: SchedModel,
 }
@@ -114,6 +118,7 @@ impl Arg {
                 sched_model: self.sched_model.into(),
                 branch_opt: false,
                 chain_fusion: false,
+                const_cse: false,
             },
             1 => AArch64CodegenConfig {
                 dce: true,
@@ -123,6 +128,7 @@ impl Arg {
                 sched_model: self.sched_model.into(),
                 branch_opt: true,
                 chain_fusion: true,
+                const_cse: true,
             },
             _ => AArch64CodegenConfig {
                 dce: true,
@@ -132,6 +138,7 @@ impl Arg {
                 sched_model: self.sched_model.into(),
                 branch_opt: true,
                 chain_fusion: true,
+                const_cse: true,
             },
         };
         if self.enable_mir_dce {
@@ -157,6 +164,12 @@ impl Arg {
         }
         if self.disable_sched {
             config.list_scheduler = false;
+        }
+        if self.enable_const_cse {
+            config.const_cse = true;
+        }
+        if self.disable_const_cse {
+            config.const_cse = false;
         }
         config
     }

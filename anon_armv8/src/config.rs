@@ -20,6 +20,10 @@ pub struct AArch64CodegenConfig {
     /// Pre-RA chain fusion: fold the second compare of a `chain_to_switch`
     /// (check, split) node pair into the check block's compare.
     pub chain_fusion: bool,
+    /// Pre-RA constant CSE + loop-invariant hoist: move `LoadImm`/`MovFromZero`
+    /// materializations inside natural loops to the loop preheader and dedupe
+    /// identical constants (M65).
+    pub const_cse: bool,
 }
 
 impl Default for AArch64CodegenConfig {
@@ -32,6 +36,7 @@ impl Default for AArch64CodegenConfig {
             sched_model: AArch64SchedModel::CortexA53,
             branch_opt: true,
             chain_fusion: true,
+            const_cse: true,
         }
     }
 }

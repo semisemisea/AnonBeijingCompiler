@@ -377,6 +377,12 @@ pub enum VecArithOp {
     Add,
     Sub,
     Mul,
+    /// Floating-point vector arithmetic (`fadd`/`fsub`/`fmul`): `<4 x f32>`
+    /// lanes. The plain forms above are the integer NEON ops and must not be
+    /// used on float vectors.
+    Fadd,
+    Fsub,
+    Fmul,
 }
 
 /// Vector shift operations. Immediate forms use `shl`/`ushr`/`sshr`;
@@ -1309,7 +1315,12 @@ impl MachInst for MInst {
         match ty {
             I32 => (&[RegClass::Int], &[I32]),
             I64 => (&[RegClass::Int], &[I64]),
-            F32 => (&[RegClass::Float], &[F32]),
+            // f32 scalars share the NEON register bank with vectors: `sN` is
+            // the low 32 bits of `vN`, so a single RegClass lets the allocator
+            // prevent s/v aliasing (a Float-class vreg could otherwise be
+            // assigned the same hw_enc as a live Vector-class vreg and be
+            // silently clobbered). Emission renders these as `sN`.
+            F32 => (&[RegClass::Vector], &[F32]),
             V4I32 => (&[RegClass::Vector], &[V4I32]),
             V2I64 => (&[RegClass::Vector], &[V2I64]),
             V4F32 => (&[RegClass::Vector], &[V4F32]),
@@ -1646,12 +1657,14 @@ fn emit_float_rr(ctx: &mut dyn EmitContext, op: &str, dst: Reg, src: &Reg) -> co
     emit_float_reg(ctx, *src, false)
 }
 fn emit_fmov(ctx: &mut dyn EmitContext, dst: Reg, src: &Reg) -> core::fmt::Result {
-    let dst_float = dst
-        .to_real_reg()
-        .is_none_or(|preg| preg.class() == RegClass::Float);
-    let src_float = src
-        .to_real_reg()
-        .is_none_or(|preg| preg.class() == RegClass::Float);
+    // f32 scalars live in Vector-class registers (`sN` ≡ `vN` lane 0), so
+    // both the scalar-FP class and the vector bank render as `sN`/`dN` here.
+    let is_f32_reg = |reg: Reg| {
+        reg.to_real_reg()
+            .is_none_or(|preg| matches!(preg.class(), RegClass::Float | RegClass::Vector))
+    };
+    let dst_float = is_f32_reg(dst);
+    let src_float = is_f32_reg(*src);
     write!(ctx, "fmov ")?;
     if dst_float {
         emit_float_reg(ctx, dst, false)?;
@@ -1752,7 +1765,10 @@ fn emit_data_reg(ctx: &mut dyn EmitContext, reg: Reg, ty: MemoryType) -> core::f
 }
 fn emit_float_reg(ctx: &mut dyn EmitContext, reg: Reg, is_double: bool) -> core::fmt::Result {
     match reg.to_real_reg() {
-        Some(preg) if preg.class() == RegClass::Float => {
+        // f32 scalars are Vector-class vregs; the scalar-FP view of a NEON
+        // register (`sN`/`dN`) is just its low 32/64 bits, so Float and
+        // Vector classes render identically in scalar-FP contexts.
+        Some(preg) if matches!(preg.class(), RegClass::Float | RegClass::Vector) => {
             write!(
                 ctx,
                 "{}{}",
@@ -1777,7 +1793,7 @@ fn emit_vec_scalar_reg(ctx: &mut dyn EmitContext, reg: Reg, shape: VecShape) -> 
         Some(preg) if preg.class() == RegClass::Int => {
             write!(ctx, "{}{}", if wide { "x" } else { "w" }, preg.hw_enc())
         }
-        Some(preg) if preg.class() == RegClass::Float => {
+        Some(preg) if matches!(preg.class(), RegClass::Float | RegClass::Vector) => {
             write!(ctx, "{}{}", if wide { "d" } else { "s" }, preg.hw_enc())
         }
         _ => ctx.write_reg(&reg),
@@ -1808,6 +1824,9 @@ fn vec_arith_name(op: VecArithOp) -> &'static str {
         VecArithOp::Add => "add",
         VecArithOp::Sub => "sub",
         VecArithOp::Mul => "mul",
+        VecArithOp::Fadd => "fadd",
+        VecArithOp::Fsub => "fsub",
+        VecArithOp::Fmul => "fmul",
     }
 }
 fn vec_bit_name(op: VecBitOp) -> &'static str {
@@ -2148,3 +2167,4 @@ fn is_logical_immediate(value: u64, size: OperandSize) -> bool {
 
 #[cfg(test)]
 mod tests;
+

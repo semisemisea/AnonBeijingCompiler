@@ -43,13 +43,18 @@ pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result
             // register (`sN` is the low 32 bits of `vN`): LLVM MC rejects
             // `dup vd.4s, sn`; the accepted form is the element form
             // `dup vd.4s, vn.s[0]` (clang emits the same for vdupq_n_f32).
+            // f32 scalars are Vector-class vregs (sN ≡ vN lane 0), so the
+            // element form covers both the old Float-class pins and the
+            // current Vector-class allocations.
             match src.to_real_reg() {
-                Some(preg) if preg.class() == RegClass::Float => write!(
-                    ctx,
-                    "v{}.{}[0]",
-                    preg.hw_enc(),
-                    if *shape == VecShape::TwoD { "d" } else { "s" }
-                ),
+                Some(preg) if matches!(preg.class(), RegClass::Float | RegClass::Vector) => {
+                    write!(
+                        ctx,
+                        "v{}.{}[0]",
+                        preg.hw_enc(),
+                        if *shape == VecShape::TwoD { "d" } else { "s" }
+                    )
+                }
                 _ => emit_vec_scalar_reg(ctx, *src, *shape),
             }
         }
@@ -157,7 +162,14 @@ pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result
             lane,
         } => {
             write!(ctx, "mov ")?;
-            emit_reg(ctx, dst.to_reg(), *size)?;
+            // The extracted scalar is a GPR (i32/i64) or an f32 in a
+            // Vector-class register (`sN`); render the scalar side by class.
+            match dst.to_reg().to_real_reg() {
+                Some(preg) if matches!(preg.class(), RegClass::Float | RegClass::Vector) => {
+                    emit_float_reg(ctx, dst.to_reg(), *size == OperandSize::Size64)?;
+                }
+                _ => emit_reg(ctx, dst.to_reg(), *size)?,
+            }
             write!(ctx, ", ")?;
             emit_vec_reg(ctx, *src)?;
             write!(
@@ -196,7 +208,14 @@ pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result
                 },
                 lane
             )?;
-            emit_reg(ctx, *src, *size)
+            // The inserted scalar is a GPR (i32/i64) or an f32 in a
+            // Vector-class register (`sN`); render the scalar side by class.
+            match src.to_real_reg() {
+                Some(preg) if matches!(preg.class(), RegClass::Float | RegClass::Vector) => {
+                    emit_float_reg(ctx, *src, *size == OperandSize::Size64)
+                }
+                _ => emit_reg(ctx, *src, *size),
+            }
         }
         MInst::VecMinMax {
             op,

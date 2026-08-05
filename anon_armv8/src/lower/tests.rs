@@ -759,10 +759,11 @@ fn vector_ir_function_emits_neon_float_surface() {
     data.layout_mut().insert_inst(entry, ret);
 
     let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
-    // dup from a float scalar is `dup v.4s, s0`; scvtf converts the lanes;
-    // fmla fuses the multiply-add.
+    // dup from a float scalar reads the aliased vector register
+    // (`dup v.4s, v.s[0]` — LLVM MC rejects `dup v.4s, sn`); scvtf
+    // converts the lanes; fmla fuses the multiply-add.
     assert!(assembly.contains("dup v"), "{assembly}");
-    assert!(assembly.contains(".4s, s"), "{assembly}");
+    assert!(assembly.contains(".s[0]"), "{assembly}");
     assert!(assembly.contains("scvtf"), "{assembly}");
     assert!(assembly.contains("fmla"), "{assembly}");
 }

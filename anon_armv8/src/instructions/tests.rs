@@ -9,8 +9,10 @@ use taki_mir::{
     vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
 };
 
-use super::{CCmpStep, Cond, Imm12, ImmLogic, MInst, SelectCmp, SelectValue, call_clobbers};
-use crate::regs::{OperandSize, float_reg, int_reg};
+use super::{
+    CCmpStep, Cond, FpuOp, Imm12, ImmLogic, MInst, SelectCmp, SelectValue, call_clobbers,
+};
+use crate::regs::{OperandSize, float_reg, int_reg, vector_reg};
 
 #[derive(Default)]
 struct TestEmitContext(String);
@@ -440,11 +442,104 @@ fn emits_dup_from_gpr_and_float_scalars() {
 }
 
 #[test]
+fn rc_for_type_maps_f32_to_the_vector_class() {
+    use taki_mir::types::F32;
+    // f32 scalars must allocate from the same bank as NEON vectors (`sN`
+    // is the low 32 bits of `vN`): a separate Float class would let the
+    // allocator hand an f32 and a live vector the same hw_enc, silently
+    // clobbering one (the h-10 `fmov s0` / `fdiv v0` corruption).
+    let (classes, types) = MInst::rc_for_type(F32);
+    assert_eq!(classes, &[RegClass::Vector]);
+    assert_eq!(types, &[F32]);
+}
+
+#[test]
+fn f32_scalars_in_vector_class_render_as_s_registers() {
+    // The h-10 corruption sequence: an f32 constant materialized with
+    // `fmov s0, w21` (dst is a Vector-class vreg) must render as `sN`,
+    // and every scalar-f32 view of a Vector-class register does.
+    let fmov = emit(MInst::FMov {
+        dst: Writable::from_reg(vec_reg(0)),
+        src: int_reg(21),
+    });
+    assert_eq!(fmov, "fmov s0, w21");
+
+    let fadd = emit(MInst::FAlu {
+        op: FpuOp::Add,
+        dst: Writable::from_reg(vec_reg(0)),
+        lhs: vec_reg(1),
+        rhs: vec_reg(2),
+    });
+    assert_eq!(fadd, "fadd s0, s1, s2");
+
+    let addv = emit(MInst::VecAddv {
+        dst: Writable::from_reg(vec_reg(0)),
+        src: vec_reg(1),
+    });
+    assert_eq!(addv, "addv s0, v1.4s");
+
+    let load = emit(MInst::Load {
+        ty: super::MemoryType::F32,
+        dst: Writable::from_reg(vec_reg(3)),
+        addr: super::AMode::UnsignedOffset {
+            base: int_reg(0),
+            offset: super::UImm12Scaled::new(0, 4).unwrap(),
+        },
+    });
+    assert_eq!(load, "ldr s3, [x0, #0]");
+
+    let store = emit(MInst::Store {
+        ty: super::MemoryType::F32,
+        src: vec_reg(3),
+        addr: super::AMode::UnsignedOffset {
+            base: int_reg(0),
+            offset: super::UImm12Scaled::new(0, 4).unwrap(),
+        },
+    });
+    assert_eq!(store, "str s3, [x0, #0]");
+
+    // Lane extract/insert of an f32 element: the scalar side is `sN`.
+    let extract = emit(MInst::VecExtractLane {
+        size: OperandSize::Size32,
+        dst: Writable::from_reg(vec_reg(0)),
+        src: vec_reg(1),
+        lane: 0,
+    });
+    assert_eq!(extract, "mov s0, v1.s[0]");
+
+    let insert = emit(MInst::VecInsertLane {
+        size: OperandSize::Size32,
+        dst: Writable::from_reg(vec_reg(0)),
+        vector: vec_reg(1),
+        src: vec_reg(2),
+        lane: 1,
+    });
+    assert_eq!(insert, "mov v0.16b, v1.16b\n    mov v0.s[1], s2");
+}
+
+#[test]
+fn dup_from_vector_class_f32_scalar_uses_element_form() {
+    // Post-merge, the splat source of an f32 is a Vector-class register;
+    // `dup vd.4s, sn` is rejected by LLVM MC, so the element form is used.
+    let dup_f32 = emit(MInst::VecDup {
+        shape: super::VecShape::FourS,
+        dst: Writable::from_reg(vec_reg(0)),
+        src: vec_reg(5),
+    });
+    assert_eq!(dup_f32, "dup v0.4s, v5.s[0]");
+}
+
+#[test]
 fn emits_vector_arith_forms() {
     for (op, mnemonic) in [
         (super::VecArithOp::Add, "add"),
         (super::VecArithOp::Sub, "sub"),
         (super::VecArithOp::Mul, "mul"),
+        // Float vectors must use the `f*` NEON forms: the plain integer
+        // ops would add the float bit patterns.
+        (super::VecArithOp::Fadd, "fadd"),
+        (super::VecArithOp::Fsub, "fsub"),
+        (super::VecArithOp::Fmul, "fmul"),
     ] {
         let text = emit(MInst::VecArithRRR {
             op,

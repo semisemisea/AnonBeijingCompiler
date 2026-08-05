@@ -2426,16 +2426,19 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 _ => unreachable!(),
             };
             let cond = if runtime_trip {
-                // The const `t' != 0` test would spin forever on a
-                // negative `cnt0` (negative trip): test
-                // `gt(counter, 0)` instead. The counter steps by 4
-                // (step 3), so a zero/negative `cnt0` exits
-                // immediately. The const path keeps the `t' != 0`
-                // test — existing rotated loops depend on it.
+                // Test the *updated* counter (`t_next = counter - 4`, the
+                // value the back edge carries): the rotated latch is a
+                // do-while — the body runs once before the test — so
+                // testing the entry value would run one extra vector
+                // body (reading past the trip and double-counting the
+                // first `trip & 3` elements in the tail). With
+                // `gt(t_next, 0)` the loop runs exactly `cnt0 / 4`
+                // iterations. The const path keeps the original `t' != 0`
+                // test, which already compares the updated counter.
                 let zero = data.new_local_inst().integer(0);
                 let gt = alloc_inst(
                     data,
-                    Binary::new_data(eff_counter, zero, BinaryOp::Gt, i32.clone()),
+                    Binary::new_data(eff_t_next, zero, BinaryOp::Gt, i32.clone()),
                 );
                 data.layout_mut().insert_inst_before(latch_branch, gt);
                 gt
@@ -2607,9 +2610,38 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             if let (Some(red), Some(splat)) = (&reduction, &acc_splat) {
                 args[red.acc_slot] = *splat;
             }
-            EntryRewrite::Jump {
-                target: j.target(),
-                args,
+            if runtime_trip && !test_at_top {
+                // Rotated runtime entry guard: the vector loop is a
+                // do-while (the latch tests after the body), so an
+                // unconditional entry would execute one vector body even
+                // when `cnt0 <= 0` — a trip of {1,2,3} (or a negative
+                // trip) would read 4 elements past the trip and then
+                // double-count the first `trip & 3` elements in the
+                // tail. Guard the entry with `gt(cnt0, 0)`: the false
+                // edge enters the scalar tail directly at `iv0` with the
+                // seed accumulator (the vector loop never ran).
+                let zero = data.new_local_inst().integer(0);
+                let guard = alloc_inst(
+                    data,
+                    Binary::new_data(cnt0, zero, BinaryOp::Gt, i32.clone()),
+                );
+                data.layout_mut().insert_inst_before(entry_edge, guard);
+                let mut f_args = vec![iv0.expect("runtime iv0 built")];
+                if let Some(red) = &reduction {
+                    f_args.push(red.acc_init);
+                }
+                f_args.extend(passthrough_args.iter().copied());
+                EntryRewrite::Branch {
+                    cond: guard,
+                    f_target: tail_header.expect("tail built when runtime_trip"),
+                    f_args,
+                    t_args: args,
+                }
+            } else {
+                EntryRewrite::Jump {
+                    target: j.target(),
+                    args,
+                }
             }
         }
         _ => unreachable!(),
@@ -3605,15 +3637,28 @@ mod tests {
             branch.t_target(), header,
             "the true edge keeps looping"
         );
-        // The entry counter value was replaced by `cnt0 = and(t0, -4)`.
+        // The entry is a guarded branch: `gt(cnt0, 0)` — the vector loop
+        // is a do-while, so a zero/negative `cnt0` (trip < 4) must skip
+        // it entirely and enter the scalar tail directly. The true edge
+        // carries `cnt0 = and(t0, -4)`.
         let entry_edge = data.layout().basicblock(entry).terminator();
-        let InstKind::Jump(jump) = data.inst_data(entry_edge).kind() else {
-            panic!("entry must be a plain jump");
+        let InstKind::Branch(entry_branch) = data.inst_data(entry_edge).kind() else {
+            panic!("entry must be a guard branch");
         };
-        let InstKind::Binary(and) = data.inst_data(jump.args()[1]).kind() else {
+        let InstKind::Binary(guard_gt) = data.inst_data(entry_branch.cond()).kind() else {
+            panic!("entry guard must be a comparison");
+        };
+        assert_eq!(guard_gt.op(), BinaryOp::Gt);
+        let InstKind::Binary(and) = data.inst_data(entry_branch.t_args()[1]).kind() else {
             panic!("counter entry must be `and(t0, -4)`");
         };
         assert_eq!(and.op(), BinaryOp::And);
+        assert!(
+            data.bb_data(entry_branch.f_target())
+                .name()
+                .starts_with("vec_tail"),
+            "the zero-trip edge enters the scalar tail"
+        );
         // The scalar tail covers the remainder.
         assert!(
             data.layout()
@@ -5156,13 +5201,20 @@ mod tests {
             BinaryOp::Add,
             "rotated tail bound is `i0 + counter_entry`"
         );
-        // The entry counter value was replaced by `cnt0 = and(t0, -4)`.
+        // The entry is a guarded branch: `gt(cnt0, 0)` — the vector loop
+        // is a do-while, so a zero/negative `cnt0` (trip < 4) must skip
+        // it entirely and enter the scalar tail directly. The true edge
+        // carries `cnt0 = and(t0, -4)`.
         let entry_bb = data.layout().entry_bb().expect("entry block").bb();
         let entry_edge = data.layout().basicblock(entry_bb).terminator();
-        let InstKind::Jump(entry_jump) = data.inst_data(entry_edge).kind() else {
-            panic!("entry must be a plain jump");
+        let InstKind::Branch(entry_branch) = data.inst_data(entry_edge).kind() else {
+            panic!("entry must be a guard branch");
         };
-        let InstKind::Binary(and) = data.inst_data(entry_jump.args()[2]).kind() else {
+        let InstKind::Binary(guard_gt) = data.inst_data(entry_branch.cond()).kind() else {
+            panic!("entry guard must be a comparison");
+        };
+        assert_eq!(guard_gt.op(), BinaryOp::Gt);
+        let InstKind::Binary(and) = data.inst_data(entry_branch.t_args()[2]).kind() else {
             panic!("counter entry must be `and(t0, -4)`");
         };
         assert_eq!(and.op(), BinaryOp::And);
@@ -5348,23 +5400,36 @@ mod tests {
             data.bb_data(branch.f_target()).name().starts_with("vec_reduce"),
             "counter-zero edge carries the vector accumulator to the reduce block"
         );
-        // The entry feeds the splatted zero accumulator and `cnt0`.
+        // The entry is a guarded branch: `gt(cnt0, 0)` — the vector loop
+        // is a do-while, so a zero/negative `cnt0` (trip < 4) must skip
+        // it entirely and enter the scalar tail directly. The true edge
+        // feeds the splatted zero accumulator and `cnt0`.
         let entry_bb = data.layout().entry_bb().expect("entry block").bb();
         let entry_edge = data.layout().basicblock(entry_bb).terminator();
-        let InstKind::Jump(entry_jump) = data.inst_data(entry_edge).kind() else {
-            panic!("entry must be a plain jump");
+        let InstKind::Branch(entry_branch) = data.inst_data(entry_edge).kind() else {
+            panic!("entry must be a guard branch");
         };
+        let InstKind::Binary(guard_gt) = data.inst_data(entry_branch.cond()).kind() else {
+            panic!("entry guard must be a comparison");
+        };
+        assert_eq!(guard_gt.op(), BinaryOp::Gt);
         assert!(
             matches!(
-                data.inst_data(entry_jump.args()[0]).kind(),
+                data.inst_data(entry_branch.t_args()[0]).kind(),
                 InstKind::VectorSplat(_)
             ),
             "the accumulator enters splatted"
         );
-        let InstKind::Binary(and) = data.inst_data(entry_jump.args()[2]).kind() else {
+        let InstKind::Binary(and) = data.inst_data(entry_branch.t_args()[2]).kind() else {
             panic!("counter entry must be `and(t0, -4)`");
         };
         assert_eq!(and.op(), BinaryOp::And);
+        assert!(
+            data.bb_data(entry_branch.f_target())
+                .name()
+                .starts_with("vec_tail"),
+            "the zero-trip edge enters the scalar tail"
+        );
         // The exit receives the final accumulator through the tail.
         let tail_term = data.layout().basicblock(tail).terminator();
         let InstKind::Branch(tb) = data.inst_data(tail_term).kind() else {

@@ -2337,6 +2337,35 @@ runtime 值，当前 `test_at_top_bound_not_const`（936-938 行）继续拒绝�
 - many_mat BB49 k 循环：B[k][j] 跨步访问（no_vector_ops）——需 gather
   或转置支持（非本任务）。
 
+**收益评估（2026-08-06 复盘，用户质询"解锁的是否内层循环大头"）**：
+
+**baseline 澄清**：baseline（0108076）并非零 SIMD——matmul1/2/3 已出向量
+（const bound=1000 的 rotated 循环，matmul1 ≈13 条 NEON）。准确表述是
+"除 matmul1/2/3 外 corpus 全零"。
+
+**本次新增解锁的循环（都不是执行大头）**：
+- 01_mm1 checksum（main 的 ans += B[i][j]，runtime bound=getint(n)）：
+  4 条 NEON；工作量 n²≈10^6 次，而 mm() 的 10 次 O(n³) 调用 ≈10^10 次
+  是绝对大头（占执行时间 ~99.99%）——mm 内核 j 循环未解锁；
+- many_mat A/B 填 -1 初始化循环（store -1）：17 条 NEON；工作量
+  T²≈10^6 次，而 k 循环 matmul（sum += C[i][k]*A[k][j]，T³≈10^9）是
+  大头（~99.9%）——k 循环未解锁。
+
+**两个大头的拒绝链（下一缺口的实证）**：
+- 01_mm1 mm 内核 j 循环：rotated（test-at-bottom）+ runtime counter →
+  entry_trip_not_const。本任务 runtime 支持只做 test-at-top；
+  **rotated runtime-bound 是解锁 01_mm1 大头的直接缺口**，且该循环
+  访问形态理想（C[i][j] 连续、A[i][k] 循环不变量、B[k][j] 连续）；
+- many_mat k 循环：A[k][j] 行距 4KB 跨步 → no_vector_ops，需
+  gather/转置（独立特性）。
+
+**结论**：本次价值 = runtime-bound test-at-top 机制全链路验证正确
+（counter 物化 + tail + reduce，差分 6 case 全 PASS + trip 边界语义），
+以及 test_at_top_multi_param 28→4 / bound_not_const 11→0 的形态解锁；
+但解锁循环均非热点，**实际性能收益≈0**。要拿性能，下一项应做
+rotated runtime-bound（test-at-bottom 动态 counter），直接命中 01_mm1
+mm 内核（矩阵乘法类 case 的共同缺口）。
+
 ---
 
 ### 10.13 自包含 goal 提示词（runtime-bound test-at-top 向量化，可直接粘贴新 session）

@@ -1126,13 +1126,13 @@ fn analyze_loop(
             let (update, delta) = acc_update.expect("acc_update set alongside acc_info");
             // The accumulator seed must be splattable at the entry edge. A
             // seed that is another loop's block parameter (e.g. the outer
-            // `sum` of a nested `sum += c[i][j]`) is not materialized
-            // correctly — experiment (2026-08-05) proved that ANY preheader
-            // use of the outer block param lowers to 0 (even a plain
-            // `add(seed, seed)`); the taki_mir block-param -> block-param
-            // value chain is broken across loop levels. Reject for now
-            // (the loop stays scalar); fixing needs a taki_mir lowering /
-            // regalloc change.
+            // `sum` of a nested `sum += c[i][j]`) lowers to a `dup` whose
+            // source register comes out zero — the taki_mir block-param
+            // value chain (block param -> block param across loop levels)
+            // is broken at lowering/regalloc, verified experimentally on
+            // nested_sum/matmul1 (IR stays correct through every pass; the
+            // value is lost during lowering). Reject for now (the loop
+            // stays scalar); fixing needs a taki_mir change.
             if matches!(
                 arena.inst_data(entry_args[acc_slot]).kind(),
                 InstKind::BlockArgRef(_)

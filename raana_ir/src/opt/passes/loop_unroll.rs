@@ -22,7 +22,10 @@ use crate::{
 };
 
 const MAX_FULL_UNROLL_TRIPS: usize = 8;
-const MAX_UNROLLED_NON_TERMINATORS: usize = 64;
+// Small exact loops often expose an outer exact loop after the first unroll.
+// Keep enough room for two-dimensional stencil kernels (for example 5 x 5),
+// while the trip-count cap prevents this budget from applying to long loops.
+const MAX_UNROLLED_NON_TERMINATORS: usize = 1_536;
 
 pub struct LoopUnroll {
     mode: LoopUnrollMode,
@@ -49,8 +52,10 @@ impl LoopUnroll {
 #[derive(Debug, Clone)]
 struct UnrollCandidate {
     header: BasicBlock,
-    body: BasicBlock,
+    blocks: Vec<BasicBlock>,
+    latch: BasicBlock,
     exit: BasicBlock,
+    continue_edge: LogicalEdge,
     backedge: LogicalEdge,
     exit_edge: LogicalEdge,
     trip_count: usize,
@@ -130,7 +135,7 @@ impl Pass for LoopUnroll {
                             outcome,
                             Some(found.trip_count),
                             non_terminators(data, found.header).len(),
-                            non_terminators(data, found.body).len(),
+                            body_size(data, &found),
                             Some(projected_size(data, &found).unwrap()),
                             true,
                             true,
@@ -324,20 +329,15 @@ fn analyze_candidate(
             LoopUnrollRejectReason::HeaderIsEntry,
         ));
     }
-    if looop.body().len() != 2 || looop.latches().len() != 1 {
+    if looop.body().len() < 2 || looop.latches().len() != 1 {
         return Err(CandidateRejection::new(
             LoopUnrollRejectReason::UnsupportedLoopShape,
         ));
     }
-    let body = looop.latches()[0];
-    if body == header || !looop.contains(body) {
+    let latch = looop.latches()[0];
+    if latch == header || !looop.contains(latch) {
         return Err(CandidateRejection::new(
             LoopUnrollRejectReason::UnsupportedLoopShape,
-        ));
-    }
-    if !data.bb_data(body).params().is_empty() {
-        return Err(CandidateRejection::new(
-            LoopUnrollRejectReason::BodyHasParameters,
         ));
     }
     if loops
@@ -374,15 +374,10 @@ fn analyze_candidate(
             LoopUnrollRejectReason::UnsupportedHeaderEdges,
         ));
     };
-    if continue_edge.target(data) != body || !continue_edge.args(data).is_empty() {
-        return Err(CandidateRejection::new(
-            LoopUnrollRejectReason::UnsupportedHeaderEdges,
-        ));
-    }
     let exit = exit_edge.target(data);
 
-    let body_edges = outgoing_edges(data, body);
-    let [backedge] = body_edges.as_slice() else {
+    let latch_edges = outgoing_edges(data, latch);
+    let [backedge] = latch_edges.as_slice() else {
         return Err(CandidateRejection::new(
             LoopUnrollRejectReason::UnsupportedBackedge,
         ));
@@ -456,8 +451,37 @@ fn analyze_candidate(
             shape_candidate: true,
             ..CandidateRejection::new(LoopUnrollRejectReason::NonConstantTripCount)
         })?;
+    let blocks = data
+        .layout()
+        .basicblocks()
+        .iter()
+        .map(|block| block.bb())
+        .filter(|&block| block != header && looop.contains(block))
+        .collect::<Vec<_>>();
+    if blocks.is_empty() || !blocks.contains(&continue_edge.target(data)) {
+        return Err(CandidateRejection::new(
+            LoopUnrollRejectReason::UnsupportedLoopShape,
+        ));
+    }
+    // Full unrolling can clone arbitrary internal control flow, but only when the
+    // header owns the sole loop exit and the latch owns the sole backedge.
+    for &block in &blocks {
+        for edge in outgoing_edges(data, block) {
+            if block == latch && edge == *backedge {
+                continue;
+            }
+            if !looop.contains(edge.target(data)) {
+                return Err(CandidateRejection::new(
+                    LoopUnrollRejectReason::UnsupportedLoopShape,
+                ));
+            }
+        }
+    }
     let header_insts = non_terminators(data, header);
-    let body_insts = non_terminators(data, body);
+    let body_insts = blocks
+        .iter()
+        .flat_map(|&block| non_terminators(data, block))
+        .collect::<Vec<_>>();
     let total = header_insts
         .len()
         .checked_mul(trip_count.saturating_add(1))
@@ -520,12 +544,15 @@ fn analyze_candidate(
         .copied()
         .chain(data.layout().basicblock(header).insts().iter().copied())
         .collect::<FxHashSet<_>>();
-    let body_values = data
-        .bb_data(body)
-        .params()
+    let body_values = blocks
         .iter()
-        .copied()
-        .chain(data.layout().basicblock(body).insts().iter().copied())
+        .flat_map(|&block| {
+            data.bb_data(block)
+                .params()
+                .iter()
+                .copied()
+                .chain(data.layout().basicblock(block).insts().iter().copied())
+        })
         .collect::<FxHashSet<_>>();
     if body_values.iter().any(|&value| {
         data.inst_data(value).used_by().iter().any(|&user| {
@@ -548,8 +575,10 @@ fn analyze_candidate(
 
     Ok(UnrollCandidate {
         header,
-        body,
+        blocks,
+        latch,
         exit,
+        continue_edge: *continue_edge,
         backedge: *backedge,
         exit_edge: *exit_edge,
         trip_count,
@@ -561,19 +590,24 @@ fn projected_size(data: &FunctionData, candidate: &UnrollCandidate) -> Option<us
     non_terminators(data, candidate.header)
         .len()
         .checked_mul(candidate.trip_count.checked_add(1)?)?
-        .checked_add(
-            non_terminators(data, candidate.body)
-                .len()
-                .checked_mul(candidate.trip_count)?,
-        )
+        .checked_add(body_size(data, candidate).checked_mul(candidate.trip_count)?)
+}
+
+fn body_size(data: &FunctionData, candidate: &UnrollCandidate) -> usize {
+    candidate
+        .blocks
+        .iter()
+        .map(|&block| non_terminators(data, block).len())
+        .sum()
 }
 
 fn apply_candidate(data: &mut ArenaContextMut<'_>, candidate: &UnrollCandidate) {
     let header_source = non_terminators(data, candidate.header);
-    let body_source = non_terminators(data, candidate.body);
     let header_params = data.bb_data(candidate.header).params().to_vec();
     let backedge_args = candidate.backedge.args(data).to_vec();
     let exit_args = candidate.exit_edge.args(data).to_vec();
+    let continue_target = candidate.continue_edge.target(data);
+    let continue_args = candidate.continue_edge.args(data).to_vec();
 
     if candidate.trip_count == 0 {
         let values = header_params
@@ -588,7 +622,6 @@ fn apply_candidate(data: &mut ArenaContextMut<'_>, candidate: &UnrollCandidate) 
         return;
     }
 
-    let mut current_body = candidate.body;
     let mut current_values = FxHashMap::default();
     for &param in &header_params {
         current_values.insert(param, param);
@@ -596,19 +629,27 @@ fn apply_candidate(data: &mut ArenaContextMut<'_>, candidate: &UnrollCandidate) 
     for &inst in &header_source {
         current_values.insert(inst, inst);
     }
-    for &inst in &body_source {
-        current_values.insert(inst, inst);
+    for &block in &candidate.blocks {
+        for &param in data.bb_data(block).params() {
+            current_values.insert(param, param);
+        }
+        for &inst in data.layout().basicblock(block).insts() {
+            current_values.insert(inst, inst);
+        }
     }
+    let enter_args = remap_values(&continue_args, &current_values, &candidate.loop_values)
+        .expect("validated continue arguments must be remappable");
     data.replace_inst_with(data.layout().basicblock(candidate.header).terminator())
-        .jump(candidate.body, vec![]);
+        .jump(continue_target, enter_args);
 
-    let mut anchor = candidate.body;
+    let mut anchor = *candidate.blocks.last().unwrap();
+    let mut current_latch = candidate.latch;
     for iteration in 0..candidate.trip_count {
         let next_header = new_header(data, candidate.header, iteration + 1, &mut anchor);
         let next_params = data.bb_data(next_header).params().to_vec();
         let next_args = remap_values(&backedge_args, &current_values, &candidate.loop_values)
             .expect("validated backedge arguments must be remappable");
-        data.replace_inst_with(data.layout().basicblock(current_body).terminator())
+        data.replace_inst_with(data.layout().basicblock(current_latch).terminator())
             .jump(next_header, next_args);
 
         let mut next_values = header_params
@@ -640,21 +681,22 @@ fn apply_candidate(data: &mut ArenaContextMut<'_>, candidate: &UnrollCandidate) 
             break;
         }
 
-        let next_body = new_body(data, candidate.body, iteration + 1, &mut anchor);
-        clone_non_terminators(
+        let block_map = clone_region(
             data,
-            &body_source,
-            next_body,
+            &candidate.blocks,
+            iteration + 1,
+            &mut anchor,
             &mut next_values,
             &candidate.loop_values,
         )
-        .expect("validated body instructions must be remappable");
-        let enter_body = data.new_local_value().jump(next_body, vec![]);
+        .expect("validated loop region must be remappable");
+        let enter_args = remap_values(&continue_args, &next_values, &candidate.loop_values)
+            .expect("validated continue arguments must be remappable");
+        let enter_body = data
+            .new_local_value()
+            .jump(block_map[&continue_target], enter_args);
         data.layout_mut().insert_inst(next_header, enter_body);
-        let placeholder = data.new_local_value().jump(next_header, next_params);
-        data.layout_mut().insert_inst(next_body, placeholder);
-
-        current_body = next_body;
+        current_latch = block_map[&candidate.latch];
         current_values = next_values;
     }
 }
@@ -674,15 +716,16 @@ fn remap_external_header_uses(
                 .iter()
                 .copied()
                 .filter(|&user| {
-                    data.layout()
-                        .parent_bb(user)
-                        .is_some_and(|block| block != candidate.header && block != candidate.body)
+                    data.layout().parent_bb(user).is_some_and(|block| {
+                        block != candidate.header && !candidate.blocks.contains(&block)
+                    })
                 }),
         );
     }
     let mut mapper = IterationMapper {
         values: final_values,
         loop_values: &candidate.loop_values,
+        blocks: None,
     };
     let rewrites = users
         .into_iter()
@@ -718,17 +761,72 @@ fn new_header(
     block
 }
 
-fn new_body(
+fn clone_region(
     data: &mut ArenaContextMut<'_>,
-    source: BasicBlock,
+    sources: &[BasicBlock],
     iteration: usize,
     anchor: &mut BasicBlock,
-) -> BasicBlock {
-    let name = format!("{}_unroll_{iteration}", data.bb_data(source).name());
-    let block = data.new_basic_block().basic_block(name, vec![]);
-    data.layout_mut().insert_bb_after(*anchor, block);
-    *anchor = block;
-    block
+    values: &mut FxHashMap<Inst, Inst>,
+    loop_values: &FxHashSet<Inst>,
+) -> Result<FxHashMap<BasicBlock, BasicBlock>, CloneError> {
+    let mut blocks = FxHashMap::default();
+    for &source in sources {
+        let name = format!("{}_unroll_{iteration}", data.bb_data(source).name());
+        let param_types = data
+            .bb_data(source)
+            .params()
+            .iter()
+            .map(|&param| data.inst_data(param).ty().clone())
+            .collect();
+        let block = data.new_basic_block().basic_block(name, param_types);
+        data.layout_mut().insert_bb_after(*anchor, block);
+        *anchor = block;
+        blocks.insert(source, block);
+        for (&source_param, &cloned_param) in data
+            .bb_data(source)
+            .params()
+            .iter()
+            .zip(data.bb_data(block).params())
+        {
+            values.insert(source_param, cloned_param);
+        }
+    }
+    for &source in sources {
+        let insts = data
+            .layout()
+            .basicblock(source)
+            .insts()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for inst in insts {
+            let ty = data.inst_data(inst).ty().clone();
+            let shell = data.new_local_value().undef(ty);
+            values.insert(inst, shell);
+        }
+    }
+    let mut mapper = IterationMapper {
+        values,
+        loop_values,
+        blocks: Some(&blocks),
+    };
+    for &source in sources {
+        let destination = blocks[&source];
+        let insts = data
+            .layout()
+            .basicblock(source)
+            .insts()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for inst in insts {
+            let mapped = data.inst_data(inst).remap_refs(&mut mapper)?;
+            let cloned = mapper.values[&inst];
+            data.replace_inst_with(cloned).raw(mapped);
+            data.layout_mut().insert_inst(destination, cloned);
+        }
+    }
+    Ok(blocks)
 }
 
 fn clone_non_terminators(
@@ -746,6 +844,7 @@ fn clone_non_terminators(
     let mut mapper = IterationMapper {
         values,
         loop_values,
+        blocks: None,
     };
     for &inst in source {
         let mapped = data.inst_data(inst).remap_refs(&mut mapper)?;
@@ -787,6 +886,7 @@ fn map_value(
 struct IterationMapper<'a> {
     values: &'a FxHashMap<Inst, Inst>,
     loop_values: &'a FxHashSet<Inst>,
+    blocks: Option<&'a FxHashMap<BasicBlock, BasicBlock>>,
 }
 
 impl EntityMapper for IterationMapper<'_> {
@@ -797,7 +897,10 @@ impl EntityMapper for IterationMapper<'_> {
     }
 
     fn map_block(&mut self, block: BasicBlock) -> Result<BasicBlock, Self::Error> {
-        Ok(block)
+        Ok(self
+            .blocks
+            .and_then(|blocks| blocks.get(&block).copied())
+            .unwrap_or(block))
     }
 }
 
@@ -1039,17 +1142,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_large_and_dynamic_trip_counts() {
+    fn rejects_large_trip_counts() {
         let mut large = fixture(0, 9, 1);
         assert!(!run(&mut large));
+    }
 
-        let mut dynamic = fixture(0, 4, 1);
-        let function = dynamic.function;
-        let header = dynamic.header;
-        let body = dynamic.body;
+    #[test]
+    fn clones_body_block_parameters() {
+        let mut parameterized = fixture(0, 4, 1);
+        let function = parameterized.function;
+        let header = parameterized.header;
+        let body = parameterized.body;
         {
-            let data = dynamic.program.func_data_mut(function);
-            let parameter = data.new_basic_block().add_param(body, Type::get_i32());
+            let data = parameterized.program.func_data_mut(function);
+            let _parameter = data.new_basic_block().add_param(body, Type::get_i32());
+            let zero = data.new_local_value().integer(0);
             let terminator = data.layout().basicblock(header).terminator();
             let InstKind::Branch(branch) = data.inst_data(terminator).kind() else {
                 unreachable!();
@@ -1060,11 +1167,15 @@ mod tests {
             data.replace_inst_with(terminator).branch(
                 cond,
                 body,
-                vec![parameter],
+                vec![zero],
                 false_target,
                 false_args,
             );
         }
-        assert!(!run(&mut dynamic));
+        assert!(run(&mut parameterized));
+        let data = parameterized.program.func_data(function);
+        assert_edge_arguments_well_typed(data);
+        let (_cfg, _dom, loops) = LoopAnalysis::new(data);
+        assert!(loops.loops().is_empty());
     }
 }

@@ -2706,3 +2706,137 @@ PASS（vec_trip_0/1/2/3/5/7/neg：0→0、1→1、2→3、3→6、5→15、7→2
 rebuilding_a_frame 失败（fact 在 O2 被 IR 层 Inline，测试期望独立函数段；
 2f4ae40 与 643f614 基座均复现，与向量化任务无关）——workspace 全绿唯一
 缺口，待单独决策（适配测试 vs 查 Inline 策略）。
+
+### 10.16 自包含 goal 提示词（AArch64 s/v 寄存器别名 bug 修复，可直接粘贴新 session）
+
+```text
+# Goal: 修复 AArch64 后端 f32 标量/向量寄存器别名 bug（sN ≡ vN 未建模）
+
+## 背景
+
+loop_vectorize 的 rotated runtime-bound 支持（feat/loop-vectorize-hermes，
+提交 2731143/bd3a45b）解锁了 h-10-01/02/03 的 f32 axpy 循环向量化，但
+这三个 case 在 -O2 差分下 FAIL：期望输出 `0x1.7a47acp+13`，实际输出 `nan`
+（runtime.stdout 为 nan，return 0——静默错算，无崩溃）。同一轮解锁的
+01_mm1（i32）差分 PASS，i32 路径无此问题。
+
+## 根因（已定位，实证链完整）
+
+1. 向量化后的 h-10 循环 IR 正确（`X[j] = X[j]/diag + 1` 形态：
+   `vector_splat %diag`、`div`、`vector_splat 1`、`add`、`store`）。
+2. 但生成汇编（anon_armv8 -O2，while_body_6 内核）错误：
+
+    dup v30.4s, v16.s[0]    ; splat 不变量 diag（v16 = 预头载入的 f32）
+    fmov s0, w21            ; 常量 1.0f 物化进 s0
+    ldr q28, [x26]          ; X[j..j+3]
+    fdiv v0.4s, v28.4s, v30.4s   ; v0 = X/diag —— 覆盖 s0（=v0 lane0）的 1.0f
+    dup v1.4s, v0.s[0]      ; 本应 splat 1.0f，实际读到 fdiv 结果 lane0
+    add v0.4s, v0.4s, v1.4s  ; X/diag + X0/diag0 —— 全 lane 错
+    str q0, [x26]
+
+3. 根因链：
+   - AArch64 物理上 `sN ≡ vN`（s 寄存器是 v 寄存器的低 32 位）。
+   - taki_mir 的 Ion 风格 RA（`src/reg_alloc/ion/`）按 RegClass 独立枚举
+     PReg（`reg_traversal.rs` 的 `preferred_regs_by_class[class_index]`），
+     `RegClass::Float`（s0-s31）与 `RegClass::Vector`（v0-v31）被当成
+     **互不相交的两套物理寄存器**，跨类无任何干扰/冲突。
+   - 于是 fdiv（Vector 类，分到 v0）与常量物化 fmov（Float 类，分到 s0）
+     同 hw_enc 0 共存 → 相互踩踏 → 静默错算。
+   - 这是潜在 bug，首次被触发：此前 corpus 的 SIMD 全为 i32（i32 走 GPR，
+     GPR 不与向量寄存器别名）；f32 标量值跨向量指令存活是第一个触发条件。
+     影响面：任何"f32 标量 live range 与向量 live range 重叠"的函数都可能
+     中招（h-10 的 diag 不变量本次未撞是运气，不是保证）。
+
+## 必须遵守的规则
+
+- 本任务是**后端修复任务**：只改 taki_mir 与 anon_armv8 两个 crate；
+  **不碰 raana_ir**（vectorizer 保持现状，若你认为需要 raana_ir 侧配合，
+  在结论里说明，不要改）。uika_riscv 不得有行为变化（若共享 RA 改动波及，
+  必须验证 RISC-V 零影响）。
+- 无 hacky workaround（只修常量物化路径、手动挡特定指令序列等）——只做
+  root cause 修复；禁止 Rc<RefCell<T>> / RefCell 共享可变。
+- 不做以 benchmark/函数名/输入为条件的优化。
+- 勤 commit、勤单测：每个原子部分完成即 commit，中文消息，消息写文件用
+  `git commit -F`（规避 homoglyph 扫描）。
+- 改文件一律 patch；不用 python 脚本改文件；不碰 .docker-image、不
+  rm -rf、不 cargo clean。
+- 验收粒度 = 单测 + 单 case（make test perf/h-10-01.sy）+ 全量回归；
+  全量测试跑之前先说明在跑什么。
+- 分支：从当前 tip（feat/loop-vectorize-hermes 的 7fc6b63）切
+  `fix/regalloc-s-v-aliasing`；完成后主 agent 会 rebase 到你的分支上。
+- 形态实证先行：先复现（make test perf/h-10-01.sy ARGS="-O 2 -j 1" 确认
+  FAIL nan）再做最小单元复现，然后动手。
+
+## 方案
+
+**推荐（主方案）：f32 标量并入 Vector 类（Cranelift 一致的寄存器模型）**
+
+Cranelift AArch64 没有独立的 Float 类——f32 标量就是 VREG（sN 只是发射
+形式，sN 是 vN 的低 32 位），单一类让 RA 天然防冲突。本仓库把 f32 分成了
+RegClass::Float，与硬件模型不符。改法：
+
+- f32 类型的 VReg 一律分配 Vector 类（v0-v31）；发射时按操作打印 sN（sN
+  ≡ vN lane0，字节级一致）。
+- 逐点清理对 `RegClass::Float` 的分支：taki_mir/src/vcode.rs（约 249、
+  276 行的类型映射）、taki_mir/src/abi.rs（float_regs，约 324）、
+  anon_armv8 的 f32 发射路径（emit_fmov、f32 load/store、VecDup 的
+  `vn.s[0]` 形态——instructions.rs 1807 已处理 Float 源）、emit_buffer.rs
+  （约 786/894）。
+- 删除/合并 RegClass::Float 的独立 PReg 集（若保留空集，RA 不再为其分配）。
+- 用 grep 全量扫 `RegClass::Float` 确认无遗漏。
+
+**备选（若主方案改动面过大，可评估）：RA 层建模 s/v 别名**
+
+给 Ion RA 加"Float(n) 与 Vector(n) 物理别名"：分配 Float 类时排除重叠
+live range 已占用的同 hw_enc Vector PReg（及反向）。注意这是 AArch64 特有
+（RISC-V 的 F/V 真独立），共享 RA 必须后端参数化，且 uika_riscv 必须零
+影响。改动集中在 reg_alloc/ion（liveranges/reg_traversal/spill）。
+
+**明确排除**：只修 lower_vector_splat 的常量物化（f32 常量走 GPR）——
+那只是本案例的触发器，loaded-invariant 跨向量循环的同类碰撞依然存在，
+不是完整修复。
+
+## 验证命令
+
+- 最小复现：`make test perf/h-10-01.sy ARGS="-O 2 -j 1"`——修前 FAIL
+  （nan），修后 PASS（0x1.7a47acp+13）。h-10-02/03 同。
+- 单测：`cargo test --workspace`（taki_mir + anon_armv8 全绿）。
+- 后端单测（必须新增，≥1）：构造 f32 标量值跨向量指令存活的函数
+  （如 h-10 的 diag 形态或 splat 常量 + fdiv 形态），断言生成的 PReg
+  分配无 s/v 同 hw_enc 冲突（或直接断言汇编指令序列正确）。
+- 回归：`make test ARGS="-O 2 -j 1"` 跑 functional + h_functional + perf
+  全量（重点：matmul1/2/3 既有 SIMD 不回归、h-1/h-2 等 f32 标量 case 不
+  回归、h-10-01/02/03 修复）。
+- RISC-V：`make test-riscv ARGS="-O 2"`（或至少单 case + 说明）确认零影响。
+- 汇编检查：修复后 h-10 内核应为 `dup v.4s, sN/wn` + fdiv + add + str q
+  的正确序列。
+
+## 关键代码位置
+
+- anon_armv8/src/lower.rs：1530 `lower_vector_splat`（VecDup 发射入口）；
+  1677 dispatch；3835-3900 既有 splat 单测。
+- anon_armv8/src/instructions.rs：735 VecDup 定义；1807-1824 VecDup 发射
+  （Float 源打 `vn.s[0]`，GPR 源打 `wn`——两条路径都已存在）。
+- taki_mir/src/vcode.rs：249、276（class→类型映射，Float→F32）。
+- taki_mir/src/abi.rs：324（float_regs 用 RegClass::Float）。
+- taki_mir/src/reg_alloc/reg.rs：13-63（PReg = class<<6|hw_enc，Float 与
+  Vector 同 hw_enc 是不同 PReg——别名盲区所在）。
+- taki_mir/src/reg_alloc/ion/：reg_traversal.rs（按类枚举 PReg）、
+  liveranges.rs、spill.rs。
+- taki_mir/src/emit_buffer.rs：786、894（Float 类特殊处理）。
+- uika_riscv/src/regs.rs：152（RISC-V 也用 RegClass::Vector——共享 RA
+  改动的风险面）。
+
+## 验收清单（全部满足才算完成）
+
+- [ ] 根因修复落地（主方案或备选之一），改动不碰 raana_ir
+- [ ] 后端新增单测 ≥1 全绿（s/v 冲突场景，断言 PReg 或汇编正确）
+- [ ] cargo test --workspace 全绿
+- [ ] make test perf/h-10-01.sy ARGS="-O 2 -j 1" PASS（nan → 0x1.7a47acp+13）；
+      h-10-02/03 同 PASS
+- [ ] matmul1/2/3 -O2 仍 PASS（既有 SIMD 不回归）；01_mm1 -O2 仍 PASS
+- [ ] functional + h_functional + perf 全量 -O2 无新增 FAIL
+- [ ] RISC-V 零影响（make test-riscv 抽查或全量，记录结果）
+- [ ] 提交历史干净（每个原子步骤独立 commit，中文消息）
+- [ ] 结论写入 TODO.md §10.16（根因链、改动清单、验证数字）
+```

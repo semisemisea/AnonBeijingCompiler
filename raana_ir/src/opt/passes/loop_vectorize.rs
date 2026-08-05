@@ -56,7 +56,7 @@ use crate::ir::{
     arena::Arena,
     builder_trait::*,
     inst_kind::{
-        Binary, BlockArgRef, Float, GetElemPtr, InstKind, Integer, Load, Store,
+        Binary, BlockArgRef, Float, GetElemPtr, InstKind, Integer, Load, Select, Store,
         VectorReduce, VectorReduceOp, VectorSplat,
     },
     types::{Type, TypeKind},
@@ -142,6 +142,11 @@ enum Class {
     VecBinary,
     /// Contiguous store (byte_coefficient == 4): becomes a vector store.
     VecStore,
+    /// `Select(cond, t, f)` with a loop-invariant condition: rewritten as a
+    /// lane-wise mask selection `(t & ~m) | (f & m)` with `m = -(cond == 0)`
+    /// (all-ones when the condition is false). Lane-wise conditions are
+    /// rejected (v3: needs a vector select / bsl at lowering).
+    VecSelect,
     /// GEPs and constants: left untouched (kept for the epilogue clone).
     Keep,
 }
@@ -789,6 +794,17 @@ fn analyze_loop(
                 // Classified in the second pass (needs the load classes).
                 classes.insert(inst, Class::VecBinary);
             }
+            InstKind::Select(select) => {
+                // Only a loop-invariant condition is supported: the whole
+                // vector picks one side (mask rewrite). A lane-wise
+                // condition (comparison fed by payload values) needs a
+                // vector select / bsl at lowering — deferred to v3.
+                if !is_loop_invariant(arena, select.cond(), header, latch) {
+                    trace(data, looop, "select_lane_cond");
+                    return None;
+                }
+                classes.insert(inst, Class::VecSelect);
+            }
             InstKind::Integer(_) | InstKind::Float(_) | InstKind::ZeroInit => {
                 classes.insert(inst, Class::Keep);
             }
@@ -850,11 +866,48 @@ fn analyze_loop(
                 .position(|&p| p == operand)
                 .and_then(|idx| classes.get(&payload[idx]).copied());
             match operand_class {
-                Some(Class::VecLoad) | Some(Class::VecBinary) => {}
+                Some(Class::VecLoad) | Some(Class::VecBinary) | Some(Class::VecSelect) => {}
                 _ => {
                     if !is_loop_invariant(arena, operand, header, latch) {
         trace(data, looop, "binary_operand_loop_variant");
         return None;
+                    }
+                }
+            }
+        }
+        merge_elem(&mut elem_ty, ty)?;
+        vectorized_any = true;
+    }
+    // Second pass (selects): the selected values must be payload values or
+    // loop-invariant (they resolve through the same machinery as binary
+    // operands at mutation time).
+    for &inst in &payload {
+        if classes.get(&inst) != Some(&Class::VecSelect) {
+            continue;
+        }
+        let InstKind::Select(select) = arena.inst_data(inst).kind() else {
+            unreachable!();
+        };
+        let ty = arena.inst_data(select.if_true()).ty().clone();
+        if !ty.is_i32() && !ty.is_f32() {
+            trace(data, looop, "select_elem_not_scalar");
+            return None;
+        }
+        if arena.inst_data(select.if_false()).ty() != &ty {
+            trace(data, looop, "select_operand_type_mismatch");
+            return None;
+        }
+        for operand in [select.if_true(), select.if_false()] {
+            let operand_class = payload
+                .iter()
+                .position(|&p| p == operand)
+                .and_then(|idx| classes.get(&payload[idx]).copied());
+            match operand_class {
+                Some(Class::VecLoad) | Some(Class::VecBinary) | Some(Class::VecSelect) => {}
+                _ => {
+                    if !is_loop_invariant(arena, operand, header, latch) {
+                        trace(data, looop, "select_operand_loop_variant");
+                        return None;
                     }
                 }
             }
@@ -874,7 +927,7 @@ fn analyze_loop(
             .position(|&p| p == store.src())
             .and_then(|idx| classes.get(&payload[idx]).copied());
         match src_class {
-            Some(Class::VecLoad) | Some(Class::VecBinary) => {}
+            Some(Class::VecLoad) | Some(Class::VecBinary) | Some(Class::VecSelect) => {}
             _ => {
                 if !is_loop_invariant(arena, store.src(), header, latch) {
                                         trace(data, looop, "mixed_elem_types");
@@ -1304,6 +1357,61 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 );
                 data.replace_inst_with(inst).raw(Store::new_data(vsrc, dest));
             }
+            Some(Class::VecSelect) => {
+                // `select(cond, t, f)` with a loop-invariant condition: the
+                // whole vector picks one side. Rewrite as a lane-wise mask
+                // selection `(t & ~m) | (f & m)` with `m = -(eq(cond, 0))`
+                // (all-ones iff the condition is false); every piece is a
+                // whitelisted vector op, so no lowering changes are needed.
+                let (cond, t, f) = match data.inst_data(inst).kind() {
+                    InstKind::Select(select) => {
+                        (select.cond(), select.if_true(), select.if_false())
+                    }
+                    _ => unreachable!(),
+                };
+                let vt =
+                    vector_operand(data, &mut splats, t, &payload, &classes, &vector_ty, inst);
+                let vf =
+                    vector_operand(data, &mut splats, f, &payload, &classes, &vector_ty, inst);
+                let vcond = vector_operand(
+                    data, &mut splats, cond, &payload, &classes, &vector_ty, inst,
+                );
+                let zero = data.new_local_inst().integer(0);
+                let neg_one = data.new_local_inst().integer(-1);
+                let vzero = vector_operand(
+                    data, &mut splats, zero, &payload, &classes, &vector_ty, inst,
+                );
+                let vneg = vector_operand(
+                    data, &mut splats, neg_one, &payload, &classes, &vector_ty, inst,
+                );
+                let eq0 = alloc_inst(
+                    data,
+                    Binary::new_data(vcond, vzero, BinaryOp::Eq, vector_ty.clone()),
+                );
+                data.layout_mut().insert_inst_before(inst, eq0);
+                let m = alloc_inst(
+                    data,
+                    Binary::new_data(vzero, eq0, BinaryOp::Sub, vector_ty.clone()),
+                );
+                data.layout_mut().insert_inst_before(inst, m);
+                let nm = alloc_inst(
+                    data,
+                    Binary::new_data(m, vneg, BinaryOp::Xor, vector_ty.clone()),
+                );
+                data.layout_mut().insert_inst_before(inst, nm);
+                let ta = alloc_inst(
+                    data,
+                    Binary::new_data(vt, nm, BinaryOp::And, vector_ty.clone()),
+                );
+                data.layout_mut().insert_inst_before(inst, ta);
+                let fa = alloc_inst(
+                    data,
+                    Binary::new_data(vf, m, BinaryOp::And, vector_ty.clone()),
+                );
+                data.layout_mut().insert_inst_before(inst, fa);
+                data.replace_inst_with(inst)
+                    .raw(Binary::new_data(ta, fa, BinaryOp::Or, vector_ty.clone()));
+            }
             Some(Class::InvLoad) | Some(Class::Keep) => {}
             None => unreachable!("every payload inst is classified"),
         }
@@ -1542,6 +1650,12 @@ fn clone_payload_inst(
             map_operand(data, binary.lhs(), map, iv, subst_iv),
             map_operand(data, binary.rhs(), map, iv, subst_iv),
             binary.op(),
+            ty,
+        ),
+        InstKind::Select(select) => Select::new_data(
+            map_operand(data, select.cond(), map, iv, subst_iv),
+            map_operand(data, select.if_true(), map, iv, subst_iv),
+            map_operand(data, select.if_false(), map, iv, subst_iv),
             ty,
         ),
         InstKind::Integer(value) => Integer::new_data(value.value()),
@@ -2749,6 +2863,119 @@ mod tests {
         assert!(
             !run(&mut program, function),
             "non-constant bound must stay scalar (no versioning)"
+        );
+    }
+
+    /// Build a rotated elementwise loop with a payload select:
+    /// `b[i] = cond ? a[i] : 0`. `lane_cond` makes the condition the
+    /// lane-wise comparison `a[i] > 0` (rejected: v3); otherwise the
+    /// condition is a loop-invariant flag defined in the entry block.
+    fn build_select_loop(program: &mut Program, lane_cond: bool) -> Function {
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr.clone());
+            program.new_value().global_alloc(init)
+        };
+        let b = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_unit(), "sel_loop".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut *program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for bb in [header, latch, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let trip_inst = data.new_local_inst().integer(16);
+        let flag = data.new_local_inst().integer(1);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero, trip_inst]);
+        for inst in [zero, trip_inst, flag, entry_jump] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let iv = data.bb_data(header).params()[0];
+        let counter = data.bb_data(header).params()[1];
+        let header_jump = data.new_local_inst().jump(latch, vec![]);
+        data.layout_mut().insert_inst(header, header_jump);
+        let one = data.new_local_inst().integer(1);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let cond = if lane_cond {
+            lb.binary(BinaryOp::Gt, load_a, zero)
+        } else {
+            flag
+        };
+        let sel = lb.select(cond, load_a, zero);
+        let gep_b = lb.get_elem_ptr(b, vec![zero, iv]);
+        let store = lb.store(sel, gep_b);
+        drop(lb);
+        let iv_next = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        let t_next = data.new_local_inst().binary(BinaryOp::Sub, counter, one);
+        let back = data.new_local_inst().branch(t_next, header, vec![iv_next, t_next], exit, vec![]);
+        let mut latch_insts = vec![
+            one, gep_a, load_a, sel, gep_b, store, iv_next, t_next, back,
+        ];
+        if lane_cond {
+            // The lane-wise comparison lives in the latch; the invariant
+            // flag is already laid out in the entry block.
+            latch_insts.insert(3, cond);
+        }
+        for inst in latch_insts {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+        function
+    }
+
+    #[test]
+    fn vectorizes_scalar_cond_select() {
+        // `b[i] = flag ? a[i] : 0` with a loop-invariant condition: the
+        // select is rewritten as a mask selection; no scalar Select remains.
+        let mut program = Program::new();
+        let function = build_select_loop(&mut program, false);
+        assert!(
+            run(&mut program, function),
+            "invariant-condition select must vectorize"
+        );
+        let data = program.func_data(function);
+        let select_left = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|l| l.insts().iter().copied())
+            .filter(|&inst| matches!(data.inst_data(inst).kind(), InstKind::Select(_)))
+            .count();
+        assert_eq!(select_left, 0, "no scalar Select may survive vectorization");
+        assert_eq!(
+            vector_load_count(&program, function),
+            1,
+            "a[i] becomes a vector load"
+        );
+    }
+
+    #[test]
+    fn rejects_lane_cond_select() {
+        // `b[i] = (a[i] > 0) ? a[i] : 0` — the condition is a lane-wise
+        // payload value; a vector select / bsl at lowering is a v3 gap, so
+        // the loop stays scalar.
+        let mut program = Program::new();
+        let function = build_select_loop(&mut program, true);
+        assert!(
+            !run(&mut program, function),
+            "lane-wise select condition must stay scalar (v3)"
         );
     }
 

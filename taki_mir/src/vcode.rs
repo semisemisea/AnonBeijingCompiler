@@ -2,7 +2,7 @@ use std::fmt::Debug;
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use tomori_utils::Ranges;
+pub use tomori_utils::Ranges;
 
 use crate::{
     abi::{ABIMachineSpec, CalleeABI},
@@ -532,6 +532,32 @@ impl<I: VCodeInst> VCodeContainer<I> {
     /// must let the pipeline trigger `rebuild_operand_tables` afterwards.
     pub fn insts_mut(&mut self) -> &mut [I] {
         &mut self.insts
+    }
+
+    /// Replace the whole instruction stream and block ranges together. Used by
+    /// MIR passes that move instructions between blocks (e.g. hoisting
+    /// loop-invariant constants to a preheader): the two tables must stay
+    /// consistent, so they are updated atomically. Callers must follow up with
+    /// `rebuild_operand_tables` so the per-instruction operand/clobber tables
+    /// match the new indices.
+    pub fn set_insts_and_block_range(&mut self, insts: Vec<I>, block_range: Ranges) {
+        debug_assert_eq!(insts.len(), block_range.get(block_range.len() - 1).end);
+        self.insts = insts;
+        self.block_range = block_range;
+    }
+
+    /// Rewrite every branch block argument equal to `from` to `to`. Branch
+    /// arguments are vreg uses that live in the CFG side table rather than in
+    /// any instruction's operand list, so passes that redirect a vreg (e.g.
+    /// constant CSE) must update them too.
+    pub fn rewrite_branch_block_args(&mut self, from: Reg, to: Reg) {
+        let from_vreg = VReg::from(from);
+        let to_vreg = VReg::from(to);
+        for arg in self.branch_block_args.iter_mut() {
+            if *arg == from_vreg {
+                *arg = to_vreg;
+            }
+        }
     }
 
     /// All branch block arguments of the function. These are virtual-register

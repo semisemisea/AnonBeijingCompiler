@@ -3797,6 +3797,7 @@ mod tests {
                     sched_model: Default::default(),
                     branch_opt: false,
                     chain_fusion: false,
+                    const_cse: false,
                 },
                 AArch64CodegenConfig {
                     dce: true,
@@ -3806,6 +3807,7 @@ mod tests {
                     sched_model: Default::default(),
                     branch_opt: true,
                     chain_fusion: true,
+                    const_cse: true,
                 },
                 AArch64CodegenConfig {
                     dce: true,
@@ -3815,6 +3817,7 @@ mod tests {
                     sched_model: Default::default(),
                     branch_opt: true,
                     chain_fusion: true,
+                    const_cse: true,
                 },
             ] {
                 let first = taki_mir::compile_with_config::<crate::lower::AArch64Backend>(

@@ -859,7 +859,12 @@ impl PointerStrengthReduction {
                     else {
                         return false;
                     };
-                    if forwarded_params.get(&parameter) != Some(&value)
+                    let parameter_end = forwarded_params
+                        .get(&parameter)
+                        .copied()
+                        .unwrap_or(parameter);
+                    let value_end = forwarded_params.get(&value).copied().unwrap_or(value);
+                    if parameter_end != value_end
                         || !Self::only_reaches_candidate(
                             data,
                             parameter,
@@ -1827,9 +1832,12 @@ mod tests {
         let access = data
             .new_basic_block()
             .basic_block("access".into(), vec![Type::get_i32()]);
+        let forwarding = data
+            .new_basic_block()
+            .basic_block("forwarding".into(), vec![Type::get_i32()]);
         let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
         let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
-        for block in [header, dispatch, access, latch, exit] {
+        for block in [header, dispatch, forwarding, access, latch, exit] {
             data.layout_mut().push_bb_back(block);
         }
 
@@ -1849,8 +1857,14 @@ mod tests {
         for inst in [product, index] {
             data.layout_mut().insert_inst(dispatch, inst);
         }
-        let dispatch_jump = data.new_local_inst().jump(access, vec![index]);
+        let dispatch_jump = data.new_local_inst().jump(forwarding, vec![index]);
         data.layout_mut().insert_inst(dispatch, dispatch_jump);
+
+        let first_forwarded_index = data.bb_data(forwarding).params()[0];
+        let forwarding_jump = data
+            .new_local_inst()
+            .jump(access, vec![first_forwarded_index]);
+        data.layout_mut().insert_inst(forwarding, forwarding_jump);
 
         let forwarded_index = data.bb_data(access).params()[0];
         let gep = data

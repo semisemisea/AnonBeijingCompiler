@@ -1026,13 +1026,6 @@ fn analyze_loop(
             trace(data, looop, "runtime_bound_loop_variant");
             return None;
         }
-        // Runtime-bound reductions (the reduce block feeding the scalar
-        // tail) are wired up in a later commit; reject for now so the
-        // elementwise tail cannot be paired with a dangling reduce block.
-        if acc_info.is_some() {
-            trace(data, looop, "runtime_reduction_not_supported");
-            return None;
-        }
     } else if trip < VF {
         trace(data, looop, "trip_below_vf");
         return None;
@@ -1694,6 +1687,26 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         let t = data.new_local_inst().integer((entry_i0 + VF * q) as i32);
         (t, t)
     };
+    // The tail's entry index: `iv0 = i0 + max(cnt0, 0)` — the vector
+    // loop advanced the index by `cnt0`, and a negative trip clamps back
+    // to `i0` so the tail runs zero iterations. Shared by the reduce
+    // block (reduction) and the exit-edge rewrite (elementwise).
+    let iv0: Option<Inst> = if runtime_trip {
+        let zero = data.new_local_inst().integer(0);
+        let cnt_clamped = alloc_inst(
+            data,
+            Binary::new_data(cnt0, zero, BinaryOp::Max, i32.clone()),
+        );
+        data.layout_mut().insert_inst_before(entry_edge, cnt_clamped);
+        let start = alloc_inst(
+            data,
+            Binary::new_data(i0_inst, cnt_clamped, BinaryOp::Add, i32.clone()),
+        );
+        data.layout_mut().insert_inst_before(entry_edge, start);
+        Some(start)
+    } else {
+        None
+    };
     // Runtime-bound: an exit that reads the header IV parameter directly
     // must see the final scalar value — `bound` when the loop ran, `i0`
     // when the trip was non-positive — not the vector loop's stale
@@ -1772,6 +1785,89 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         }
     }
 
+    // 1b. Runtime-bound scalar tail: a remainder loop
+    //     `while (iv < bound) { payload; acc op= delta; iv++; }` entered
+    //     when the vector counter reaches zero (or is already <= 0 for
+    //     trip < 4). The payload is cloned with the IV substituted by the
+    //     tail's own parameter, so the tail runs `trip & 3` iterations
+    //     (0..3) and handles negative trips by running zero iterations.
+    //     A reduction tail carries the scalar accumulator as its second
+    //     parameter, seeded by the reduce block's sum (1c). Built before
+    //     the reduce block (whose jump target it is) and before the
+    //     in-place vectorization (step 2) so the payload is still scalar
+    //     when cloned.
+    let tail_header: Option<BasicBlock> = if runtime_trip {
+        let one = data.new_local_inst().integer(1);
+        let mut param_tys = vec![i32.clone(); 1 + n_passthrough];
+        if reduction.is_some() {
+            param_tys.insert(1, i32.clone());
+        }
+        let th = data
+            .new_basic_block()
+            .basic_block("vec_tail".into(), param_tys);
+        let tl = data
+            .new_basic_block()
+            .basic_block("vec_tail_latch".into(), vec![]);
+        // Blocks enter the layout before any instruction is inserted.
+        data.layout_mut().insert_bb_after(latch, th);
+        data.layout_mut().insert_bb_after(th, tl);
+        let iv_t = data.bb_data(th).params()[0];
+        let cond_t = alloc_inst(
+            data,
+            Binary::new_data(iv_t, bound_inst, BinaryOp::Lt, i32.clone()),
+        );
+        let iv_final_rt = has_iv_final.then_some(bound_inst);
+        let tail_acc = reduction.as_ref().map(|_| data.bb_data(th).params()[1]);
+        let mut exit_args = build_exit_args(&exit_specs, &passthrough_args, tail_acc, iv_final_rt);
+        if let Some(_) = exit_extra_acc {
+            // The freshly added exit parameter carries the final scalar
+            // accumulator (the tail's own, already seeded with the
+            // reduce-block sum).
+            exit_args.push(tail_acc.expect("reduction tail carries acc"));
+        }
+        let th_br = data
+            .new_local_inst()
+            .branch(cond_t, tl, vec![], exit, exit_args);
+        data.layout_mut().insert_inst(th, cond_t);
+        data.layout_mut().insert_inst(th, th_br);
+        // Tail latch: the cloned payload, the accumulator update
+        // `acc_t' = op(acc_t, delta_k)` (reduction), then
+        // `iv_t' = iv_t + 1`, then the jump back with the passthroughs
+        // forwarded.
+        let mut map = FxHashMap::<Inst, Inst>::default();
+        let mut insts: Vec<Inst> = Vec::with_capacity(payload.len() + 2);
+        for &orig in &payload {
+            insts.push(clone_payload_inst(data, orig, &mut map, iv, iv_t));
+        }
+        let mut jump_args: Vec<Inst> = Vec::new();
+        if let Some(red) = &reduction {
+            // `acc_k = op(acc_t, delta_k)`: the delta clone exists when
+            // the delta is a payload inst; invariant deltas are reused.
+            let delta_k = map.get(&red.delta).copied().unwrap_or(red.delta);
+            let acc_t = data.bb_data(th).params()[1];
+            let acc_k = alloc_inst(
+                data,
+                Binary::new_data(acc_t, delta_k, red.op, i32.clone()),
+            );
+            insts.push(acc_k);
+            jump_args.push(acc_k);
+        }
+        let iv_t_next = alloc_inst(
+            data,
+            Binary::new_data(iv_t, one, BinaryOp::Add, i32.clone()),
+        );
+        insts.push(iv_t_next);
+        jump_args.insert(0, iv_t_next);
+        jump_args.extend(passthrough_args.iter().copied());
+        insts.push(data.new_local_inst().jump(th, jump_args));
+        for inst in insts {
+            data.layout_mut().insert_inst(tl, inst);
+        }
+        Some(th)
+    } else {
+        None
+    };
+
     // 1b. Reduction exit block: `acc_final = VectorReduce(Add, acc_vec)`,
     //     then jump into the epilogue chain (or straight to the exit when
     //     r == 0). Placed right after the latch. Passthrough values are
@@ -1789,43 +1885,55 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             VectorReduce::new_data(VectorReduceOp::Add, acc_vec_param, i32.clone()),
         );
         data.layout_mut().insert_inst(rb, acc_final);
-        let (target, args) = match epi_blocks.first().copied() {
-            Some(first) => {
-                let mut fwd = vec![acc_final];
-                fwd.extend(data.bb_data(rb).params()[1..].iter().copied());
-                (first, fwd)
-            }
-            None => {
-                // r == 0: the exit edge carries the reduced accumulator
-                // (the scalar sum), the passthrough values, and — when
-                // declared — the computed IV final value `i0 + VF*q` (the
-                // loop ran exactly `q` vector iterations, so
-                // `i0 + 4q == i0 + trip`). A param-less test-at-top exit
-                // receives just the sum through its freshly added
-                // parameter (`exit_extra_acc`).
-                let iv_final_const = has_iv_final
-                    .then(|| data.new_local_inst().integer((entry_i0 + VF * q) as i32));
-                let acc_value = if red.exit_acc_param.is_some() || exit_extra_acc.is_some() {
-                    // The vector loop accumulates with a zero seed
-                    // (splat(0)), so the outer seed must be added back:
-                    // sum_final = seed + Σc. (Splatting the seed itself
-                    // would overcount 4x at the addv.)
-                    let sum = alloc_inst(
-                        data,
-                        Binary::new_data(red.acc_init, acc_final, BinaryOp::Add, i32.clone()),
-                    );
-                    data.layout_mut().insert_inst(rb, sum);
-                    Some(sum)
-                } else {
-                    None
-                };
-                let mut args =
-                    build_exit_args(&exit_specs, &passthrough_args, acc_value, iv_final_const);
-                if let Some(_) = exit_extra_acc {
-                    // The freshly added parameter carries the scalar sum.
-                    args.push(acc_value.expect("sum built above"));
+        // The scalar sum (`seed + Σc`) is needed when the exit receives
+        // the accumulator (through a parameter or the freshly added one)
+        // and when the runtime tail continues the reduction from it.
+        let sum: Option<Inst> =
+            (red.exit_acc_param.is_some() || exit_extra_acc.is_some() || runtime_trip).then(|| {
+                // The vector loop accumulates with a zero seed
+                // (splat(0)), so the outer seed must be added back:
+                // sum_final = seed + Σc. (Splatting the seed itself
+                // would overcount 4x at the addv.)
+                let sum = alloc_inst(
+                    data,
+                    Binary::new_data(red.acc_init, acc_final, BinaryOp::Add, i32.clone()),
+                );
+                data.layout_mut().insert_inst(rb, sum);
+                sum
+            });
+        let (target, args) = if runtime_trip {
+            // The scalar tail continues the reduction: its accumulator
+            // parameter is seeded with `sum = seed + Σc` and its index
+            // with `iv0`; passthroughs ride along.
+            let mut fwd = vec![iv0.expect("runtime iv0"), sum.expect("sum built")];
+            fwd.extend(data.bb_data(rb).params()[1..].iter().copied());
+            (tail_header.expect("tail built when runtime_trip"), fwd)
+        } else {
+            match epi_blocks.first().copied() {
+                Some(first) => {
+                    let mut fwd = vec![acc_final];
+                    fwd.extend(data.bb_data(rb).params()[1..].iter().copied());
+                    (first, fwd)
                 }
-                (exit, args)
+                None => {
+                    // r == 0: the exit edge carries the reduced accumulator
+                    // (the scalar sum), the passthrough values, and — when
+                    // declared — the computed IV final value `i0 + VF*q`
+                    // (the loop ran exactly `q` vector iterations, so
+                    // `i0 + 4q == i0 + trip`). A param-less test-at-top
+                    // exit receives just the sum through its freshly added
+                    // parameter (`exit_extra_acc`).
+                    let iv_final_const = has_iv_final
+                        .then(|| data.new_local_inst().integer((entry_i0 + VF * q) as i32));
+                    let mut args =
+                        build_exit_args(&exit_specs, &passthrough_args, sum, iv_final_const);
+                    if let Some(_) = exit_extra_acc {
+                        // The freshly added parameter carries the scalar
+                        // sum.
+                        args.push(sum.expect("sum built above"));
+                    }
+                    (exit, args)
+                }
             }
         };
         let jump = data.new_local_inst().jump(target, args);
@@ -1905,63 +2013,6 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             }
         }
     }
-
-    // 1d. Runtime-bound scalar tail: a remainder loop
-    //     `while (iv < bound) { payload; iv++ }` entered when the vector
-    //     counter reaches zero (or is already <= 0 for trip < 4). The
-    //     payload is cloned with the IV substituted by the tail's own
-    //     parameter, so the tail runs `trip & 3` iterations (0..3) and
-    //     handles negative trips by running zero iterations. Built before
-    //     the in-place vectorization (step 2) so the payload is still
-    //     scalar when cloned. The entry edge's `iv0 = i0 + max(cnt0, 0)`
-    //     is materialized in the exit-edge rewrite (step 2c).
-    let tail_header: Option<BasicBlock> = if runtime_trip {
-        let one = data.new_local_inst().integer(1);
-        let mut param_tys = vec![i32.clone(); 1 + n_passthrough];
-        let th = data
-            .new_basic_block()
-            .basic_block("vec_tail".into(), param_tys);
-        let tl = data
-            .new_basic_block()
-            .basic_block("vec_tail_latch".into(), vec![]);
-        let iv_t = data.bb_data(th).params()[0];
-        // Blocks enter the layout before any instruction is inserted.
-        let after = reduce_block.unwrap_or(latch);
-        data.layout_mut().insert_bb_after(after, th);
-        data.layout_mut().insert_bb_after(th, tl);
-        let cond_t = alloc_inst(
-            data,
-            Binary::new_data(iv_t, bound_inst, BinaryOp::Lt, i32.clone()),
-        );
-        let iv_final_rt = has_iv_final.then_some(bound_inst);
-        let exit_args = build_exit_args(&exit_specs, &passthrough_args, None, iv_final_rt);
-        let th_br = data
-            .new_local_inst()
-            .branch(cond_t, tl, vec![], exit, exit_args);
-        data.layout_mut().insert_inst(th, cond_t);
-        data.layout_mut().insert_inst(th, th_br);
-        // Tail latch: the cloned payload, then `iv_t' = iv_t + 1`, then
-        // the jump back with the passthroughs forwarded.
-        let mut map = FxHashMap::<Inst, Inst>::default();
-        let mut insts: Vec<Inst> = Vec::with_capacity(payload.len() + 2);
-        for &orig in &payload {
-            insts.push(clone_payload_inst(data, orig, &mut map, iv, iv_t));
-        }
-        let iv_t_next = alloc_inst(
-            data,
-            Binary::new_data(iv_t, one, BinaryOp::Add, i32.clone()),
-        );
-        insts.push(iv_t_next);
-        let mut jump_args = vec![iv_t_next];
-        jump_args.extend(passthrough_args.iter().copied());
-        insts.push(data.new_local_inst().jump(th, jump_args));
-        for inst in insts {
-            data.layout_mut().insert_inst(tl, inst);
-        }
-        Some(th)
-    } else {
-        None
-    };
 
     // 2. In-place vectorization of the latch payload (instruction ids are
     //    preserved by ReplaceBuilder, so later operands stay valid).
@@ -2217,18 +2268,7 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                     args,
                 )
             } else if runtime_trip {
-                let zero = data.new_local_inst().integer(0);
-                let cnt_clamped = alloc_inst(
-                    data,
-                    Binary::new_data(cnt0, zero, BinaryOp::Max, i32.clone()),
-                );
-                data.layout_mut().insert_inst_before(entry_edge, cnt_clamped);
-                let iv0 = alloc_inst(
-                    data,
-                    Binary::new_data(i0_inst, cnt_clamped, BinaryOp::Add, i32.clone()),
-                );
-                data.layout_mut().insert_inst_before(entry_edge, iv0);
-                let mut args = vec![iv0];
+                let mut args = vec![iv0.expect("runtime iv0")];
                 args.extend(passthrough_args.iter().copied());
                 (
                     tail_header.expect("tail built when runtime_trip"),
@@ -4503,6 +4543,187 @@ mod tests {
         };
         assert_eq!(gt.op(), BinaryOp::Gt);
         assert!(!run(&mut program, function), "idempotent");
+    }
+
+    /// Build a test-at-top single-reduction loop with a *runtime* bound
+    /// (the shape that unlocks the 4 perf cases): header
+    /// `[passthrough_i, iv, acc]`, `bound = load n` (scalar global),
+    /// payload `b[i] = a[i] + passthrough_i; acc += a[i]`. The exit has
+    /// no parameters and returns the header accumulator directly.
+    fn build_runtime_reduction_test_at_top(
+        program: &mut Program,
+    ) -> (Function, BasicBlock, BasicBlock, BasicBlock, Inst) {
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr.clone());
+            program.new_value().global_alloc(init)
+        };
+        let b = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let n = {
+            let init = program.new_value().zero_init(i32.clone());
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_i32(), "tat_red_rt".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut *program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data.new_basic_block().basic_block(
+            "header".into(),
+            vec![i32.clone(), i32.clone(), i32.clone()],
+        );
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for bb in [header, latch, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let seven = data.new_local_inst().integer(7);
+        let zero = data.new_local_inst().integer(0);
+        let bound = {
+            let mut lb = LocalBuilder {
+                arena: &mut data as &mut dyn Arena,
+            };
+            lb.load(n)
+        };
+        let entry_jump = data.new_local_inst().jump(header, vec![seven, zero, zero]);
+        data.layout_mut().insert_inst(entry, seven);
+        data.layout_mut().insert_inst(entry, zero);
+        data.layout_mut().insert_inst(entry, bound);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let passthrough_i = data.bb_data(header).params()[0];
+        let iv = data.bb_data(header).params()[1];
+        let acc = data.bb_data(header).params()[2];
+        let cond = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+        let header_br = data.new_local_inst().branch(cond, latch, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, cond);
+        data.layout_mut().insert_inst(header, header_br);
+        let one = data.new_local_inst().integer(1);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let sum = lb.binary(BinaryOp::Add, load_a, passthrough_i);
+        let gep_b = lb.get_elem_ptr(b, vec![zero, iv]);
+        let store = lb.store(sum, gep_b);
+        drop(lb);
+        let acc_next = data.new_local_inst().binary(BinaryOp::Add, acc, load_a);
+        let iv_next = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        let latch_jump = data
+            .new_local_inst()
+            .jump(header, vec![passthrough_i, iv_next, acc_next]);
+        for inst in [
+            one, gep_a, load_a, sum, gep_b, store, acc_next, iv_next, latch_jump,
+        ] {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        let ret = data.new_local_inst().ret(Some(acc));
+        data.layout_mut().insert_inst(exit, ret);
+        (function, header, latch, exit, bound)
+    }
+
+    #[test]
+    fn vectorizes_runtime_bound_reduction() {
+        // Runtime-bound [passthrough_i, iv, acc]: the vector loop reduces
+        // into a vector accumulator, the reduce block computes
+        // `sum = seed + Σc`, the scalar tail continues the accumulation
+        // for `trip & 3` iterations, and the exit receives the final
+        // scalar through the freshly added parameter.
+        let mut program = Program::new();
+        let (function, header, _latch, exit, _bound) =
+            build_runtime_reduction_test_at_top(&mut program);
+        assert!(
+            run(&mut program, function),
+            "runtime-bound test-at-top reduction must vectorize"
+        );
+        let data = program.func_data(function);
+        assert_eq!(vector_load_count(&program, function), 1);
+        // The tail carries [iv_t, acc_t, passthrough].
+        let tail = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .map(|l| l.bb())
+            .find(|&bb| data.bb_data(bb).name().starts_with("vec_tail"))
+            .expect("tail loop must exist");
+        let tail_params = data.bb_data(tail).params();
+        assert_eq!(tail_params.len(), 3, "tail header carries [iv_t, acc_t, p]");
+        // The reduce block jumps to the tail with [iv0, sum, p]; `sum` is
+        // `add(seed, VectorReduce)`.
+        let reduce = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .map(|l| l.bb())
+            .find(|&bb| data.bb_data(bb).name().starts_with("vec_reduce"))
+            .expect("reduce block must exist");
+        let reduce_jump = data.layout().basicblock(reduce).terminator();
+        let InstKind::Jump(jump) = data.inst_data(reduce_jump).kind() else {
+            panic!("reduce block must end in a jump");
+        };
+        assert_eq!(jump.target(), tail, "reduce block feeds the tail");
+        let fwd = jump.args().to_vec();
+        assert_eq!(fwd.len(), 3, "tail entry takes [iv0, sum, p]");
+        let InstKind::Binary(iv0) = data.inst_data(fwd[0]).kind() else {
+            panic!("tail entry index must be an add");
+        };
+        assert_eq!(iv0.op(), BinaryOp::Add);
+        let InstKind::Binary(sum) = data.inst_data(fwd[1]).kind() else {
+            panic!("the tail's acc seed must be the scalar sum");
+        };
+        assert_eq!(sum.op(), BinaryOp::Add, "sum = seed + VectorReduce");
+        // The tail latch accumulates scalar: an `add(acc_t, delta)` where
+        // the lhs is the tail's acc parameter.
+        let tail_latch = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .map(|l| l.bb())
+            .find(|&bb| data.bb_data(bb).name().starts_with("vec_tail_latch"))
+            .expect("tail latch must exist");
+        let scalar_accumulates = data
+            .layout()
+            .basicblock(tail_latch)
+            .insts()
+            .iter()
+            .copied()
+            .filter(|&inst| {
+                matches!(
+                    data.inst_data(inst).kind(),
+                    InstKind::Binary(b)
+                        if b.op() == BinaryOp::Add && b.lhs() == tail_params[1]
+                )
+            })
+            .count();
+        assert_eq!(scalar_accumulates, 1, "the tail keeps the scalar acc update");
+        // The header's counter-zero edge enters the reduce block with the
+        // vector accumulator; the reduce block's own edge leaves the tail.
+        let term = data.layout().basicblock(header).terminator();
+        let InstKind::Branch(branch) = data.inst_data(term).kind() else {
+            panic!("header must end in a branch");
+        };
+        assert_eq!(
+            branch.f_target(),
+            reduce,
+            "counter-zero edge enters the reduce block"
+        );
+        // The exit received one added scalar parameter (its direct acc
+        // read was rewritten) and the tail's final acc feeds it.
+        let exit_params = data.bb_data(exit).params();
+        assert_eq!(exit_params.len(), 1, "one scalar param added to the exit");
+        let tail_br = data.layout().basicblock(tail).terminator();
+        let InstKind::Branch(tb) = data.inst_data(tail_br).kind() else {
+            panic!("tail header must end in a branch");
+        };
+        assert_eq!(tb.f_target(), exit);
+        assert_eq!(tb.f_args().to_vec(), vec![tail_params[1]]);
+        // Idempotence: neither the tail nor the vector loop re-fires.
+        assert!(!run(&mut program, function), "vectorized loop must not re-fire");
     }
 
     /// Build a rotated elementwise loop with a payload select:

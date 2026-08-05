@@ -28,7 +28,7 @@ use crate::{
     instructions::{
         AMode, AluOp, CCmpStep, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift, MInst,
         MemoryType, SelectCmp, SelectValue, ShiftOp, VecArithOp, VecBitOp, VecCmpOp, VecCvtOp,
-        VecMinMaxOp, VecShape, VecShiftOp, invert_cond,
+        VecMlaOp, VecMinMaxOp, VecShape, VecShiftOp, invert_cond,
     },
     labels::Label,
     regs::{self, OperandSize, RegOrZr},
@@ -52,7 +52,6 @@ use vector::{
     lower_fma, lower_vector_extract_element, lower_vector_insert_element, lower_vector_reduce,
     lower_vector_splat,
 };
-
 
 impl LowerBackend for AArch64Backend {
     type MInst = MInst;
@@ -171,6 +170,10 @@ impl LowerBackend for AArch64Backend {
         ".zero"
     }
 
+    fn balign_directive() -> &'static str {
+        ".balign 16"
+    }
+
     fn preg_name(preg: PReg) -> &'static str {
         regs::preg_name(preg)
     }
@@ -235,4 +238,3 @@ impl LowerBackend for AArch64Backend {
 
 #[cfg(test)]
 mod tests;
-

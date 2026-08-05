@@ -428,6 +428,13 @@ pub enum VecMinMaxOp {
     Fmax,
 }
 
+/// Integer vector multiply-accumulate/negate-accumulate (`mla`/`mls`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecMlaOp {
+    Mla,
+    Mls,
+}
+
 /// The flag-producing half of an atomic conditional-select pseudo.
 ///
 /// Keeping this in the same [`MInst`] as the flag consumer is intentional:
@@ -846,7 +853,8 @@ pub enum MInst {
         imm: Option<u8>,
     },
     /// Vector float divide: `fdiv v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>`.
-    /// (NEON has no integer vector divide; i32 Div stays scalar.)
+    /// (NEON has no integer vector divide; i32 Div/Rem with a constant splat
+    /// divisor is rewritten to a multiply-high magic sequence instead.)
     VecDiv {
         shape: VecShape,
         dst: WritableReg,
@@ -857,6 +865,41 @@ pub enum MInst {
     VecNeg {
         shape: VecShape,
         dst: WritableReg,
+        src: Reg,
+    },
+    /// Vector bitwise not: `mvn v{d}.16b, v{s}.16b`.
+    VecBitwiseNot {
+        dst: WritableReg,
+        src: Reg,
+    },
+    /// Integer vector multiply-accumulate / negate-accumulate. Read-modify-write
+    /// on `acc`; the accumulator is copied in first:
+    /// `mov v{d}.16b, v{acc}.16b; mla/mls v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>`.
+    VecMla {
+        op: VecMlaOp,
+        shape: VecShape,
+        dst: WritableReg,
+        acc: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    /// Signed widening multiply: `smull v{d}.2d, v{lhs}.2s, v{rhs}.2s` (low
+    /// half) or `smull2 v{d}.2d, v{lhs}.4s, v{rhs}.4s` (high half).
+    VecSMull {
+        high: bool,
+        dst: WritableReg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    /// Narrowing shift right: `xtn v{d}.4s, v{s}.2d` (low half) or
+    /// `xtn2 v{d}.4s, v{s}.2d` (high half). `xtn2` preserves the destination's
+    /// low 64 bits, so `high=true` is a read-modify-write on `dst`; the
+    /// partial result is copied in first: `mov v{d}.16b, v{acc}.16b;
+    /// xtn2 v{d}.4s, v{s}.2d`. For `high=false` `acc` is ignored.
+    VecNarrow {
+        high: bool,
+        dst: WritableReg,
+        acc: Reg,
         src: Reg,
     },
     FMovFromZero {
@@ -1087,6 +1130,39 @@ impl MachInst for MInst {
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
                 collector.reg_def(dst);
+            }
+            Self::VecBitwiseNot { dst, src } => {
+                collector.reg_use(src);
+                collector.reg_def(dst);
+            }
+            Self::VecMla {
+                dst, acc, lhs, rhs, ..
+            } => {
+                // The leading `mov` writes `dst` before the read-modify-write
+                // reads `lhs`/`rhs`, so `dst` is an *early* def: it must not
+                // alias any use (coalescing dst with rhs would clobber rhs).
+                collector.reg_use(acc);
+                collector.reg_use(lhs);
+                collector.reg_use(rhs);
+                collector.reg_early_def(dst);
+            }
+            Self::VecSMull { dst, lhs, rhs, .. } => {
+                collector.reg_use(lhs);
+                collector.reg_use(rhs);
+                collector.reg_def(dst);
+            }
+            Self::VecNarrow { high, dst, acc, src } => {
+                if *high {
+                    // `xtn2` preserves the destination's low half: the leading
+                    // copy writes `dst` before the read-modify-write, so `dst`
+                    // must not alias any use (early def).
+                    collector.reg_use(acc);
+                    collector.reg_use(src);
+                    collector.reg_early_def(dst);
+                } else {
+                    collector.reg_use(src);
+                    collector.reg_def(dst);
+                }
             }
             Self::VecFmla {
                 dst, acc, lhs, rhs, ..
@@ -1465,6 +1541,10 @@ impl MachInstEmit for MInst {
             | Self::VecShift { .. }
             | Self::VecDiv { .. }
             | Self::VecNeg { .. }
+            | Self::VecBitwiseNot { .. }
+            | Self::VecMla { .. }
+            | Self::VecSMull { .. }
+            | Self::VecNarrow { .. }
             | Self::FMovFromZero { .. }
             | Self::FAlu { .. }
             | Self::FCmp { .. }
@@ -1840,6 +1920,12 @@ fn vec_cmp_name(op: VecCmpOp) -> &'static str {
     match op {
         VecCmpOp::Eq => "cmeq",
         VecCmpOp::Gt => "cmgt",
+    }
+}
+fn vec_mla_name(op: VecMlaOp) -> &'static str {
+    match op {
+        VecMlaOp::Mla => "mla",
+        VecMlaOp::Mls => "mls",
     }
 }
 fn vec_cvt_name(op: VecCvtOp) -> &'static str {

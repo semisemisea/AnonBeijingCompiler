@@ -986,6 +986,169 @@ fn vector_kernel_is_deterministic_across_opt_levels() {
     }
 }
 
+/// Vector constant divide/remainder (M69c): the magic sequence widens with
+/// `smull/smull2`, arithmetic-shifts the 64-bit lanes, narrows with
+/// `xtn/xtn2`, and the remainder subtracts the product back with `mls`.
+fn compile_vector_const_div_rem(op: BinaryOp, divisor: i32) -> String {
+    use raana_ir::ir::builder_trait::*;
+
+    let v4i32 = Type::get_vector(Type::get_i32(), 4);
+    let mut program = Program::new();
+    let function = program.new_function(
+        v4i32.clone(),
+        "vec_div_const".into(),
+        vec![v4i32.clone()],
+    );
+    let data = program.func_data_mut(function);
+    let entry = data.add_entry_block();
+    let v = data.params()[0];
+    let constant = data.new_local_inst().integer(divisor);
+    let splat = data.new_local_inst().vector_splat(constant, v4i32.clone());
+    let binary = data.new_local_inst().binary(op, v, splat);
+    for inst in [splat, binary] {
+        data.layout_mut().insert_inst(entry, inst);
+    }
+    let ret = data.new_local_inst().ret(Some(binary));
+    data.layout_mut().insert_inst(entry, ret);
+    taki_mir::compile::<crate::lower::AArch64Backend>(&program)
+}
+
+#[test]
+fn vector_constant_division_uses_the_neon_magic_sequence() {
+    for divisor in [3, 7, 11, 100, -7, 1000000007] {
+        let assembly = compile_vector_const_div_rem(BinaryOp::Div, divisor);
+        assert!(assembly.contains("smull"), "{divisor}:\n{assembly}");
+        assert!(assembly.contains("xtn2"), "{divisor}:\n{assembly}");
+        assert!(!assembly.contains("sdiv"), "{divisor}:\n{assembly}");
+    }
+}
+
+#[test]
+fn vector_constant_remainder_uses_mls() {
+    for divisor in [3, 10, 100, 11] {
+        let assembly = compile_vector_const_div_rem(BinaryOp::Rem, divisor);
+        assert!(assembly.contains("smull"), "{divisor}:\n{assembly}");
+        assert!(assembly.contains("xtn2"), "{divisor}:\n{assembly}");
+        assert!(assembly.contains("mls"), "{divisor}:\n{assembly}");
+        assert!(!assembly.contains("sdiv"), "{divisor}:\n{assembly}");
+    }
+}
+
+/// Vector comparison completion: every missing predicate decomposes onto
+/// `cmgt`/`cmeq` plus `mvn`, and a splat-constant shift folds to the
+/// immediate `shl`/`sshr`/`ushr` forms.
+fn compile_vector_predicates_and_shifts() -> String {
+    use raana_ir::ir::builder_trait::*;
+
+    let v4i32 = Type::get_vector(Type::get_i32(), 4);
+    let mut program = Program::new();
+    let function = program.new_function(
+        Type::get_i32(),
+        "vec_pred".into(),
+        vec![v4i32.clone(), v4i32.clone(), Type::get_i32()],
+    );
+    let data = program.func_data_mut(function);
+    let entry = data.add_entry_block();
+    let v = data.params()[0];
+    let w = data.params()[1];
+    let s = data.params()[2];
+
+    let one = data.new_local_inst().integer(1);
+    let sh_amt = data.new_local_inst().vector_splat(one, v4i32.clone());
+    let two = data.new_local_inst().integer(2);
+    let sh_amt2 = data.new_local_inst().vector_splat(two, v4i32.clone());
+
+    let lt = data.new_local_inst().binary(BinaryOp::Lt, v, w);
+    let le = data.new_local_inst().binary(BinaryOp::Le, v, w);
+    let ge = data.new_local_inst().binary(BinaryOp::Ge, v, w);
+    let ne = data.new_local_inst().binary(BinaryOp::NotEq, v, w);
+
+    let shl = data.new_local_inst().binary(BinaryOp::Shl, v, sh_amt);
+    let shr = data.new_local_inst().binary(BinaryOp::Shr, v, sh_amt2);
+    let sar = data.new_local_inst().binary(BinaryOp::Sar, v, sh_amt2);
+
+    let sum1 = data.new_local_inst().binary(BinaryOp::Add, lt, le);
+    let sum2 = data.new_local_inst().binary(BinaryOp::Add, ge, ne);
+    let sum3 = data.new_local_inst().binary(BinaryOp::Add, shl, shr);
+    let acc1 = data.new_local_inst().binary(BinaryOp::Add, sar, sum3);
+    let acc2 = data.new_local_inst().binary(BinaryOp::Add, acc1, sum2);
+    let acc3 = data.new_local_inst().binary(BinaryOp::Add, acc2, sum1);
+    let reduce = data
+        .new_local_inst()
+        .vector_reduce(raana_ir::ir::VectorReduceOp::Add, acc3);
+    for inst in [
+        sh_amt, sh_amt2, shl, shr, sar, lt, le, ge, ne, sum1, sum2, sum3, acc1, acc2, acc3,
+        reduce,
+    ] {
+        data.layout_mut().insert_inst(entry, inst);
+    }
+    let ret = data.new_local_inst().ret(Some(reduce));
+    data.layout_mut().insert_inst(entry, ret);
+    taki_mir::compile::<crate::lower::AArch64Backend>(&program)
+}
+
+#[test]
+fn vector_comparisons_and_shifts_decompose_onto_neon() {
+    let assembly = compile_vector_predicates_and_shifts();
+    assert!(assembly.contains("cmgt"), "{assembly}");
+    assert!(assembly.contains("cmeq"), "{assembly}");
+    assert!(assembly.contains("mvn v"), "{assembly}");
+    assert!(assembly.contains("shl v"), "{assembly}");
+    assert!(assembly.contains("sshr v"), "{assembly}");
+    assert!(assembly.contains("ushr v"), "{assembly}");
+    assert!(assembly.contains("addv s"), "{assembly}");
+}
+
+/// Pointer-to-pointer cast is a no-op bitcast (`*i32 -> *<4 x i32>`), the
+/// channel that retypes a scalar pointer for a vector load/store.
+#[test]
+fn pointer_cast_is_a_noop_bitcast() {
+    use raana_ir::ir::builder_trait::*;
+
+    let v4i32 = Type::get_vector(Type::get_i32(), 4);
+    let mut program = Program::new();
+    let function = program.new_function(
+        Type::get_i32(),
+        "ptr_cast".into(),
+        vec![Type::get_pointer(Type::get_i32())],
+    );
+    let data = program.func_data_mut(function);
+    let entry = data.add_entry_block();
+    let ptr = data.params()[0];
+    let vec_ptr = data.new_local_inst().cast(ptr, Type::get_pointer(v4i32.clone()));
+    let loaded = data.new_local_inst().load(vec_ptr);
+    let sum = data
+        .new_local_inst()
+        .vector_reduce(raana_ir::ir::VectorReduceOp::Add, loaded);
+    for inst in [vec_ptr, loaded, sum] {
+        data.layout_mut().insert_inst(entry, inst);
+    }
+    let ret = data.new_local_inst().ret(Some(sum));
+    data.layout_mut().insert_inst(entry, ret);
+
+    let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+    assert!(assembly.contains("ldr q"), "{assembly}");
+}
+
+/// Every 16-byte (vector-sized) global is 16-byte aligned so
+/// `ldr/str q` over vector data never faults.
+#[test]
+fn globals_are_16_byte_aligned() {
+    use raana_ir::ir::builder_trait::*;
+
+    let mut program = Program::new();
+    let mut builder = program.new_value();
+    let forty_two = builder.integer(42);
+    builder.global_alloc(forty_two);
+    let v4i32 = Type::get_vector(Type::get_i32(), 4);
+    let zero = builder.zero_init(v4i32);
+    builder.global_alloc(zero);
+
+    let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+    let baligns = assembly.matches(".p2align 4").count();
+    assert_eq!(baligns, 1, "{assembly}");
+}
+
 /// Builds `r = ((a + C) + (b + C))` with two same-value constant uses in
 /// one block, and returns the assembly.
 fn compile_two_same_constant_adds(c: i32) -> String {

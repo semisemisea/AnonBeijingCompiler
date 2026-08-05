@@ -151,12 +151,16 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
 
     fn cast(&mut self, src: Inst, ty: Type) -> Inst {
         let src_ty = self.inst_type(src);
+        // Pointer-to-pointer is a no-op bitcast: the vectorizing pass retypes
+        // a scalar pointer to a vector pointee so `load`/`store` carry a
+        // `<4 x i32>` value while `get_elem_ptr` still addresses scalars.
+        let pointer_to_pointer = src_ty.is_pointer() && ty.is_pointer();
         assert!(
-            src_ty.is_scalar() || src_ty.is_vector(),
+            src_ty.is_scalar() || src_ty.is_vector() || pointer_to_pointer,
             "cast source is neither scalar nor vector: {src_ty}"
         );
         assert!(
-            ty.is_scalar() || ty.is_vector(),
+            ty.is_scalar() || ty.is_vector() || pointer_to_pointer,
             "cast target is neither scalar nor vector: {ty}"
         );
         self.insert_inst(Cast::new_data(src, ty))

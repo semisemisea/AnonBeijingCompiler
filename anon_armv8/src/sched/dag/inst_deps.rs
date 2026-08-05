@@ -400,9 +400,56 @@ pub fn inst_deps(inst: &MInst) -> InstDeps {
         | MInst::VecCmp { dst, lhs, rhs, .. }
         | MInst::VecMinMax { dst, lhs, rhs, .. }
         | MInst::VecShift { dst, lhs, rhs, .. }
-        | MInst::VecDiv { dst, lhs, rhs, .. } => InstDeps {
+        | MInst::VecDiv { dst, lhs, rhs, .. }
+        | MInst::VecSMull { dst, lhs, rhs, .. } => InstDeps {
             defs: preg(dst.reg),
             uses: [preg(*lhs), preg(*rhs)].into_iter().flatten().collect(),
+            flags_def: false,
+            flags_use: false,
+            class: SchedClass::Other,
+            mem: None,
+            is_barrier: false,
+        },
+
+        MInst::VecBitwiseNot { dst, src } => InstDeps {
+            defs: preg(dst.reg),
+            uses: preg(*src),
+            flags_def: false,
+            flags_use: false,
+            class: SchedClass::Other,
+            mem: None,
+            is_barrier: false,
+        },
+
+        MInst::VecNarrow {
+            high,
+            dst,
+            acc,
+            src,
+        } => {
+            let mut uses = preg(*src);
+            if *high {
+                uses.extend(preg(*acc));
+            }
+            InstDeps {
+                defs: preg(dst.reg),
+                uses,
+                flags_def: false,
+                flags_use: false,
+                class: SchedClass::Other,
+                mem: None,
+                is_barrier: false,
+            }
+        }
+
+        MInst::VecMla {
+            dst, acc, lhs, rhs, ..
+        } => InstDeps {
+            defs: preg(dst.reg),
+            uses: [preg(*acc), preg(*lhs), preg(*rhs)]
+                .into_iter()
+                .flatten()
+                .collect(),
             flags_def: false,
             flags_use: false,
             class: SchedClass::Other,

@@ -1,6 +1,6 @@
 //! NEON vector lowering helpers.
 
-use super::arith::operand_size;
+use super::arith::{integer_constant, operand_size, signed_power_of_two};
 use super::*;
 /// Select a vector binary operation onto the NEON instruction set.
 ///
@@ -18,6 +18,30 @@ pub(super) fn lower_vector_binary(
     let ty = arena.inst_data(binary.lhs()).ty().kind();
     let shape = vector_shape(ty);
     let is_float = matches!(ty, TypeKind::Vector(elem, _) if elem.is_f32());
+    // NEON has no integer vector divide (`sdiv` is scalar-only); integer
+    // Div/Rem with a constant splat divisor is rewritten to a multiply-high
+    // magic sequence instead. The constant splat is rematerialized, so it is
+    // read before either operand is materialized.
+    if matches!(binary.op(), BinaryOp::Div | BinaryOp::Rem) && !is_float {
+        let Some(divisor) = splat_constant_i32(arena, binary.rhs()) else {
+            ctx.lowering_panic(
+                "AArch64 instruction selection",
+                "vector integer divide/remainder requires a constant splat divisor",
+                Some(arena.inst_data(binary.lhs()).ty()),
+                Some(arena.inst_data(inst).ty()),
+            );
+        };
+        let lhs = ctx.put_value_in_reg(binary.lhs());
+        if lower_vector_constant_div_rem(ctx, binary.op(), dst, lhs, divisor, shape) {
+            return LoweredOutput::Value(result);
+        }
+        ctx.lowering_panic(
+            "AArch64 instruction selection",
+            "unsupported vector divide/remainder shape",
+            Some(arena.inst_data(binary.lhs()).ty()),
+            Some(arena.inst_data(inst).ty()),
+        );
+    }
     let lhs = ctx.put_value_in_reg(binary.lhs());
     let rhs = ctx.put_value_in_reg(binary.rhs());
     match binary.op() {
@@ -59,7 +83,12 @@ pub(super) fn lower_vector_binary(
                 rhs,
             });
         }
-        BinaryOp::Eq | BinaryOp::Gt => {
+        BinaryOp::Eq
+        | BinaryOp::Gt
+        | BinaryOp::Lt
+        | BinaryOp::Le
+        | BinaryOp::Ge
+        | BinaryOp::NotEq => {
             if is_float {
                 ctx.lowering_panic(
                     "AArch64 instruction selection",
@@ -68,16 +97,40 @@ pub(super) fn lower_vector_binary(
                     Some(arena.inst_data(inst).ty()),
                 );
             }
-            ctx.emit(MInst::VecCmp {
-                op: match binary.op() {
-                    BinaryOp::Eq => VecCmpOp::Eq,
-                    _ => VecCmpOp::Gt,
-                },
-                shape,
-                dst,
-                lhs,
-                rhs,
-            });
+            // NEON predicates missing from the MInst set decompose onto
+            // `cmgt`/`cmeq` plus `mvn`:
+            //   a <  b  ==  b >  a
+            //   a <= b  ==  !(a >  b)
+            //   a >= b  ==  !(a <  b)  ==  !(b >  a)
+            //   a != b  ==  !(a == b)
+            let (base_op, swap, invert) = match binary.op() {
+                BinaryOp::Gt => (VecCmpOp::Gt, false, false),
+                BinaryOp::Lt => (VecCmpOp::Gt, true, false),
+                BinaryOp::Le => (VecCmpOp::Gt, false, true),
+                BinaryOp::Ge => (VecCmpOp::Gt, true, true),
+                BinaryOp::NotEq => (VecCmpOp::Eq, false, true),
+                _ => (VecCmpOp::Eq, false, false),
+            };
+            let (clhs, crhs) = if swap { (rhs, lhs) } else { (lhs, rhs) };
+            if invert {
+                let cmp = ctx.alloc_tmp(arena.inst_data(inst).ty().clone());
+                ctx.emit(MInst::VecCmp {
+                    op: base_op,
+                    shape,
+                    dst: Writable::from_reg(cmp),
+                    lhs: clhs,
+                    rhs: crhs,
+                });
+                ctx.emit(MInst::VecBitwiseNot { dst, src: cmp });
+            } else {
+                ctx.emit(MInst::VecCmp {
+                    op: base_op,
+                    shape,
+                    dst,
+                    lhs: clhs,
+                    rhs: crhs,
+                });
+            }
         }
         BinaryOp::Min | BinaryOp::Max => {
             if shape == VecShape::TwoD {
@@ -162,17 +215,8 @@ pub(super) fn lower_vector_binary(
             }
         }
         BinaryOp::Div => {
-            // NEON has no integer vector divide (`sdiv` is scalar-only); the
-            // loop vectorizer rejects i32 Div (constant divisors are rewritten
-            // to shift chains by StrengthReduction). Only f32 reaches here.
-            if !is_float {
-                ctx.lowering_panic(
-                    "AArch64 instruction selection",
-                    "NEON has no integer vector divide; i32 Div must stay scalar",
-                    Some(arena.inst_data(binary.lhs()).ty()),
-                    Some(arena.inst_data(inst).ty()),
-                );
-            }
+            // Only f32 reaches here (integer Div/Rem is handled above via the
+            // multiply-high magic).
             ctx.emit(MInst::VecDiv {
                 shape,
                 dst,
@@ -216,6 +260,326 @@ fn constant_shift_amount(arena: ArenaContext<'_>, rhs: HirInst, shape: VecShape)
     };
     let lane_bits = u8::from(shape.element_bytes()) * 8;
     u8::try_from(value.value()).ok().filter(|imm| *imm < lane_bits)
+}
+
+/// The `i32` divisor of a `VectorSplat` of a constant integer (vector Div/Rem
+/// needs the whole word; divisors may be negative).
+fn splat_constant_i32(arena: ArenaContext<'_>, inst: HirInst) -> Option<i32> {
+    match arena.inst_data(inst).kind() {
+        InstKind::VectorSplat(splat) => integer_constant(arena, splat.src()),
+        _ => None,
+    }
+}
+
+/// Vector signed division/remainder by a constant `<4 x i32>` divisor.
+///
+/// Only `.4s` lanes are supported (the magic sequence widens each pair of
+/// 32-bit lanes to 64 bits). The multiplier/correction sequence mirrors
+/// [`lower_signed_div_rem_magic`] but per-lane:
+/// `smull/smull2 (32x32->64)` both halves, arithmetic-shift the 64-bit lanes,
+/// narrow back with `xtn/xtn2`, add the sign bit, and (for remainder) `mls`
+/// the divisor back off.
+fn lower_vector_constant_div_rem(
+    ctx: &mut LowerContext<'_, MInst>,
+    op: BinaryOp,
+    dst: Writable<taki_mir::register::Reg>,
+    lhs: taki_mir::register::Reg,
+    divisor: i32,
+    shape: VecShape,
+) -> bool {
+    if shape != VecShape::FourS {
+        return false;
+    }
+    let v4i32 = HirType::get_vector(HirType::get_i32(), 4);
+    // Divisor of magnitude 1: identity / negation.
+    if divisor == 1 {
+        match op {
+            BinaryOp::Div => ctx.emit(MInst::VecMov { dst, src: lhs }),
+            BinaryOp::Rem => emit_zero_vector(ctx, dst, shape),
+            _ => return false,
+        }
+        return true;
+    }
+    if divisor == -1 {
+        match op {
+            BinaryOp::Div => emit_neg_vector(ctx, dst, lhs, shape),
+            BinaryOp::Rem => emit_zero_vector(ctx, dst, shape),
+            _ => return false,
+        }
+        return true;
+    }
+    // Powers of two use the sign-bias shift sequence.
+    if let Some((shift, negate)) = signed_power_of_two(divisor) {
+        return lower_vector_signed_div_rem_power_of_two(ctx, op, dst, lhs, shift, negate, shape);
+    }
+    let Some(magic) = signed_magic_i32(divisor) else {
+        return false;
+    };
+    // The widening multiply and its 64-bit-lane shifts use full 128-bit
+    // vector registers; a `<4 x i32>` temp allocates the same register class
+    // (the lane interpretation is an instruction-level detail).
+    let m = materialize_splat_i32(ctx, magic.multiplier, shape);
+    // product = x * multiplier, both halves widened to 64-bit lanes.
+    let prod_lo = ctx.alloc_tmp(v4i32.clone());
+    let prod_hi = ctx.alloc_tmp(v4i32.clone());
+    ctx.emit(MInst::VecSMull {
+        high: false,
+        dst: Writable::from_reg(prod_lo),
+        lhs,
+        rhs: m,
+    });
+    ctx.emit(MInst::VecSMull {
+        high: true,
+        dst: Writable::from_reg(prod_hi),
+        lhs,
+        rhs: m,
+    });
+
+    // high = product >> 32 (the multiply-high word), narrowed to 4s.
+    let high_lo = ctx.alloc_tmp(v4i32.clone());
+    let high_hi = ctx.alloc_tmp(v4i32.clone());
+    ctx.emit(MInst::VecShift {
+        op: VecShiftOp::Sar,
+        shape: VecShape::TwoD,
+        dst: Writable::from_reg(high_lo),
+        lhs: prod_lo,
+        rhs: prod_lo,
+        imm: Some(32),
+    });
+    ctx.emit(MInst::VecShift {
+        op: VecShiftOp::Sar,
+        shape: VecShape::TwoD,
+        dst: Writable::from_reg(high_hi),
+        lhs: prod_hi,
+        rhs: prod_hi,
+        imm: Some(32),
+    });
+    let high = ctx.alloc_tmp(v4i32.clone());
+    ctx.emit(MInst::VecNarrow {
+        high: false,
+        dst: Writable::from_reg(high),
+        acc: high,
+        src: high_lo,
+    });
+    let high_result = ctx.alloc_tmp(v4i32.clone());
+    ctx.emit(MInst::VecNarrow {
+        high: true,
+        dst: Writable::from_reg(high_result),
+        acc: high,
+        src: high_hi,
+    });
+
+    // corrected = high (+/-) numerator (identity for `MagicCorrection::None`).
+    // `high_result` carries the full narrow (both `xtn` halves); `high` is
+    // only the partial result.
+    let corrected = match magic.correction {
+        MagicCorrection::None => high_result,
+        MagicCorrection::AddNumerator | MagicCorrection::SubNumerator => {
+            let tmp = ctx.alloc_tmp(v4i32.clone());
+            ctx.emit(MInst::VecArithRRR {
+                op: if magic.correction == MagicCorrection::AddNumerator {
+                    VecArithOp::Add
+                } else {
+                    VecArithOp::Sub
+                },
+                shape,
+                dst: Writable::from_reg(tmp),
+                lhs: high_result,
+                rhs: lhs,
+            });
+            tmp
+        }
+    };
+
+    // shifted = corrected >> shift (the multiplier shift, 0..=31).
+    let shifted = if magic.shift == 0 {
+        corrected
+    } else {
+        let tmp = ctx.alloc_tmp(v4i32.clone());
+        ctx.emit(MInst::VecShift {
+            op: VecShiftOp::Sar,
+            shape,
+            dst: Writable::from_reg(tmp),
+            lhs: corrected,
+            rhs: corrected,
+            imm: Some(magic.shift),
+        });
+        tmp
+    };
+
+    // q = shifted + (shifted as u32 >> 31): round the negative quotient
+    // toward zero.
+    let sign = ctx.alloc_tmp(v4i32.clone());
+    ctx.emit(MInst::VecShift {
+        op: VecShiftOp::Shr,
+        shape,
+        dst: Writable::from_reg(sign),
+        lhs: shifted,
+        rhs: shifted,
+        imm: Some(31),
+    });
+    let quotient = if op == BinaryOp::Rem {
+        ctx.alloc_tmp(v4i32.clone())
+    } else {
+        dst.to_reg()
+    };
+    ctx.emit(MInst::VecArithRRR {
+        op: VecArithOp::Add,
+        shape,
+        dst: Writable::from_reg(quotient),
+        lhs: shifted,
+        rhs: sign,
+    });
+
+    if op == BinaryOp::Rem {
+        let d = materialize_splat_i32(ctx, divisor, shape);
+        // rem = x - q * divisor  (`mls vd, vq, vd` computes vd -= vq * vd).
+        ctx.emit(MInst::VecMla {
+            op: VecMlaOp::Mls,
+            shape,
+            dst,
+            acc: lhs,
+            lhs: quotient,
+            rhs: d,
+        });
+    }
+    true
+}
+
+/// Vector signed division/remainder by `(+/-) 2^shift` (`<4 x i32>` lanes).
+fn lower_vector_signed_div_rem_power_of_two(
+    ctx: &mut LowerContext<'_, MInst>,
+    op: BinaryOp,
+    dst: Writable<taki_mir::register::Reg>,
+    lhs: taki_mir::register::Reg,
+    shift: u8,
+    negate_quotient: bool,
+    shape: VecShape,
+) -> bool {
+    if shape != VecShape::FourS {
+        return false;
+    }
+    let v4i32 = HirType::get_vector(HirType::get_i32(), 4);
+    if shift == 0 {
+        // Divisor of magnitude 1 handled by the caller.
+        return false;
+    }
+    let sign = ctx.alloc_tmp(v4i32.clone());
+    ctx.emit(MInst::VecShift {
+        op: VecShiftOp::Sar,
+        shape,
+        dst: Writable::from_reg(sign),
+        lhs,
+        rhs: lhs,
+        imm: Some(31),
+    });
+    let biased = ctx.alloc_tmp(v4i32.clone());
+    ctx.emit(MInst::VecShift {
+        op: VecShiftOp::Shr,
+        shape,
+        dst: Writable::from_reg(biased),
+        lhs: sign,
+        rhs: sign,
+        imm: Some(32 - shift),
+    });
+    let biased = {
+        let tmp = ctx.alloc_tmp(v4i32.clone());
+        ctx.emit(MInst::VecArithRRR {
+            op: VecArithOp::Add,
+            shape,
+            dst: Writable::from_reg(tmp),
+            lhs,
+            rhs: biased,
+        });
+        tmp
+    };
+    let quotient = if op == BinaryOp::Rem || negate_quotient {
+        ctx.alloc_tmp(v4i32.clone())
+    } else {
+        dst.to_reg()
+    };
+    ctx.emit(MInst::VecShift {
+        op: VecShiftOp::Sar,
+        shape,
+        dst: Writable::from_reg(quotient),
+        lhs: biased,
+        rhs: biased,
+        imm: Some(shift),
+    });
+    if negate_quotient && op == BinaryOp::Div {
+        emit_neg_vector(ctx, dst, quotient, shape);
+    }
+    if op == BinaryOp::Rem {
+        let d = materialize_splat_i32(ctx, (1_i32) << shift, shape);
+        // rem = x - q * 2^shift.
+        ctx.emit(MInst::VecMla {
+            op: VecMlaOp::Mls,
+            shape,
+            dst,
+            acc: lhs,
+            lhs: quotient,
+            rhs: d,
+        });
+    }
+    true
+}
+
+/// Materialize an `i32` constant into a scalar GPR and `dup` it across `.4s`.
+fn materialize_splat_i32(
+    ctx: &mut LowerContext<'_, MInst>,
+    value: i32,
+    shape: VecShape,
+) -> taki_mir::register::Reg {
+    let scalar = ctx.alloc_tmp(HirType::get_i32());
+    ctx.emit(MInst::LoadImm {
+        size: OperandSize::Size32,
+        dst: Writable::from_reg(scalar),
+        value: u64::from(value as u32),
+    });
+    let vec = ctx.alloc_tmp(HirType::get_vector(HirType::get_i32(), 4));
+    ctx.emit(MInst::VecDup {
+        shape,
+        dst: Writable::from_reg(vec),
+        src: scalar,
+    });
+    vec
+}
+
+/// `dst = 0 - src` (vector negation).
+fn emit_neg_vector(
+    ctx: &mut LowerContext<'_, MInst>,
+    dst: Writable<taki_mir::register::Reg>,
+    src: taki_mir::register::Reg,
+    shape: VecShape,
+) {
+    let zero = ctx.alloc_tmp(HirType::get_vector(HirType::get_i32(), 4));
+    ctx.emit(MInst::VecMovImm {
+        shape,
+        dst: Writable::from_reg(zero),
+        imm: 0,
+        shift: 0,
+    });
+    ctx.emit(MInst::VecArithRRR {
+        op: VecArithOp::Sub,
+        shape,
+        dst,
+        lhs: zero,
+        rhs: src,
+    });
+}
+
+/// `dst = 0` vector.
+fn emit_zero_vector(
+    ctx: &mut LowerContext<'_, MInst>,
+    dst: Writable<taki_mir::register::Reg>,
+    shape: VecShape,
+) {
+    ctx.emit(MInst::VecMovImm {
+        shape,
+        dst,
+        imm: 0,
+        shift: 0,
+    });
 }
 
 /// `fma(acc, lhs, rhs)`: `acc` is a read-write accumulator, so copy it into

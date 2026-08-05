@@ -373,6 +373,15 @@ pub(super) fn lower_cast(
     match (src_ty, dst_ty) {
         (TypeKind::Int32, TypeKind::Float32) => ctx.emit(MInst::Scvtf { dst, src: src_reg }),
         (TypeKind::Float32, TypeKind::Int32) => ctx.emit(MInst::Fcvtzs { dst, src: src_reg }),
+        // Pointer-to-pointer is a no-op bitcast at the register level. This is
+        // the channel that turns `*i32` into `*<4 x i32>` for vector loads and
+        // stores: `get_elem_ptr` and `load`/`store` still address scalars, and
+        // the vectorizing pass bitcasts the pointer to retype the pointee.
+        (TypeKind::Pointer(..), TypeKind::Pointer(..)) => ctx.emit(MInst::Mov {
+            size: OperandSize::Size64,
+            dst,
+            src: src_reg,
+        }),
         (src_ty, dst_ty) => {
             ctx.lowering_panic(
                 "AArch64 instruction selection",

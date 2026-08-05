@@ -297,6 +297,13 @@ pub trait LowerBackend {
 
     fn zero_directive() -> &'static str;
 
+    /// Alignment directive emitted before every global, or `""` for none.
+    /// AArch64 returns `.balign 16` so vector loads/stores (`ldr/str q`) over
+    /// globals never fault or split; the assembler pads each label to 16 bytes.
+    fn balign_directive() -> &'static str {
+        ""
+    }
+
     fn preg_name(preg: PReg) -> &'static str;
 
     fn format_block_label(lb: &LoweredBlock, func_data: &HirFunctionData) -> String;

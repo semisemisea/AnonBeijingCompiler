@@ -8,7 +8,7 @@ use crate::regs::OperandSize;
 use super::super::{
     MInst, VecShape, emit_float_reg, emit_float_rr, emit_float_rrr, emit_fmov, emit_reg,
     emit_vec_reg, emit_vec_rrr, emit_vec_scalar_reg, fpu_name, vec_arith_name, vec_bit_name,
-    vec_cmp_name, vec_cvt_name, vec_minmax_name, vec_shift_name,
+    vec_cmp_name, vec_cvt_name, vec_minmax_name, vec_mla_name, vec_shift_name,
 };
 
 pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result {
@@ -266,6 +266,66 @@ pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result
             write!(ctx, ".{}, ", shape.arrangement())?;
             emit_vec_reg(ctx, *src)?;
             write!(ctx, ".{}", shape.arrangement())
+        }
+        MInst::VecBitwiseNot { dst, src } => {
+            write!(ctx, "mvn ")?;
+            emit_vec_reg(ctx, dst.to_reg())?;
+            write!(ctx, ".16b, ")?;
+            emit_vec_reg(ctx, *src)?;
+            write!(ctx, ".16b")
+        }
+        MInst::VecMla {
+            op,
+            shape,
+            dst,
+            acc,
+            lhs,
+            rhs,
+        } => {
+            write!(ctx, "mov ")?;
+            emit_vec_reg(ctx, dst.to_reg())?;
+            write!(ctx, ".16b, ")?;
+            emit_vec_reg(ctx, *acc)?;
+            write!(ctx, ".16b")?;
+            ctx.end_inst()?;
+            write!(ctx, "{} ", vec_mla_name(*op))?;
+            emit_vec_reg(ctx, dst.to_reg())?;
+            write!(ctx, ".{}, ", shape.arrangement())?;
+            emit_vec_reg(ctx, *lhs)?;
+            write!(ctx, ".{}, ", shape.arrangement())?;
+            emit_vec_reg(ctx, *rhs)?;
+            write!(ctx, ".{}", shape.arrangement())
+        }
+        MInst::VecSMull {
+            high,
+            dst,
+            lhs,
+            rhs,
+        } => {
+            write!(ctx, "{} ", if *high { "smull2" } else { "smull" })?;
+            emit_vec_reg(ctx, dst.to_reg())?;
+            write!(ctx, ".2d, ")?;
+            emit_vec_reg(ctx, *lhs)?;
+            write!(ctx, ".{}, ", if *high { "4s" } else { "2s" })?;
+            emit_vec_reg(ctx, *rhs)?;
+            write!(ctx, ".{}", if *high { "4s" } else { "2s" })
+        }
+        MInst::VecNarrow { high, dst, acc, src } => {
+            if *high {
+                write!(ctx, "mov ")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".16b, ")?;
+                emit_vec_reg(ctx, *acc)?;
+                write!(ctx, ".16b")?;
+                ctx.end_inst()?;
+            }
+            // `xtn vd.2s, vn.2d` writes the low half (narrowed lane
+            // count); `xtn2 vd.4s, vn.2d` writes the upper half.
+            write!(ctx, "{} ", if *high { "xtn2" } else { "xtn" })?;
+            emit_vec_reg(ctx, dst.to_reg())?;
+            write!(ctx, ".{}, ", if *high { "4s" } else { "2s" })?;
+            emit_vec_reg(ctx, *src)?;
+            write!(ctx, ".2d")
         }
         MInst::FMovFromZero { dst } => {
             write!(ctx, "fmov ")?;

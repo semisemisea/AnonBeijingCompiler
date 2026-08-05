@@ -1149,11 +1149,16 @@ fn analyze_loop(
     // 9. Every payload value must stay inside the loop (no uses in the exit
     //    region), and at least one real vector operation must be produced.
     //    With a B1 single-arm body the uses may sit in any body block
-    //    (body_br / arm / merge), not just the latch.
+    //    (body_br / arm / merge), not just the latch. A user whose owning
+    //    block is None is an orphaned instruction (removed from the layout
+    //    by a transform that failed to detach its operands' used_by lists);
+    //    it is unreachable and observes nothing, so it is not an escape.
     for &inst in &payload {
         for &user in arena.inst_data(inst).used_by() {
-            let user_bb = data.layout().parent_bb(user);
-            if !user_bb.is_some_and(|bb| looop.contains(bb)) {
+            let Some(user_bb) = data.layout().parent_bb(user) else {
+                continue;
+            };
+            if !looop.contains(user_bb) {
         trace(data, looop, "value_escapes_loop");
         return None;
             }
@@ -1679,11 +1684,14 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                             Binary::new_data(vcond, vzero, BinaryOp::Eq, vector_ty.clone()),
                         );
                         data.layout_mut().insert_inst_before(inst, eq0);
-                        let m = alloc_inst(
-                            data,
-                            Binary::new_data(vzero, eq0, BinaryOp::Sub, vector_ty.clone()),
-                        );
-                        data.layout_mut().insert_inst_before(inst, m);
+                        // The mask is the comparison result itself: NEON
+                        // `cmeq` returns all-ones per lane for true (not a
+                        // 0/1 boolean), so `m = eq(cond, 0)` is already the
+                        // all-ones/all-zero mask. The previous
+                        // `m = sub(0, eq(cond, 0))` assumed a 0/1 boolean
+                        // and produced `1` instead of all-ones, corrupting
+                        // the mask (old value's bit 0 was cleared).
+                        let m = eq0;
                         let nm = alloc_inst(
                             data,
                             Binary::new_data(m, vneg, BinaryOp::Xor, vector_ty.clone()),
@@ -1753,11 +1761,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                     Binary::new_data(vcond, vzero, BinaryOp::Eq, vector_ty.clone()),
                 );
                 data.layout_mut().insert_inst_before(inst, eq0);
-                let m = alloc_inst(
-                    data,
-                    Binary::new_data(vzero, eq0, BinaryOp::Sub, vector_ty.clone()),
-                );
-                data.layout_mut().insert_inst_before(inst, m);
+                // `m = eq(cond, 0)` directly: NEON `cmeq` yields all-ones
+                // for true, which is the mask (see the B1 masked-store
+                // comment above for the full rationale).
+                let m = eq0;
                 let nm = alloc_inst(
                     data,
                     Binary::new_data(m, vneg, BinaryOp::Xor, vector_ty.clone()),

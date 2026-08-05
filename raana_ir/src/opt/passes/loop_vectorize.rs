@@ -214,6 +214,10 @@ struct ArmPlan {
     mask_cond: Inst,
     /// The branch instruction rewritten into `jump arm`.
     branch: Inst,
+    /// True when the arm sits on the branch's *true* edge
+    /// (`br cond, arm, merge` — the matmul masked-kernel shape), so the
+    /// mask polarity flips (`m = -(cond != 0)` instead of `-(cond == 0)`).
+    arm_on_true: bool,
 }
 
 /// B1: a register accumulator recognized by M42 (`Reducible`) on a 3-param
@@ -424,8 +428,31 @@ fn analyze_loop(
                         merge,
                         mask_cond: branch.cond(),
                         branch: term,
+                        arm_on_true: false,
                     });
                     break;
+                }
+            }
+            // Masked-kernel shape: `br cond, payload, latch` — the
+            // payload sits on the *true* edge and jumps to the latch
+            // (the branch's false edge). Same masked-store rewrite, but
+            // the mask polarity flips (arm executes when cond != 0).
+            let payload = branch.t_target();
+            let target2 = branch.f_target();
+            if looop.contains(payload) && looop.contains(target2) {
+                let payload_term = data.layout().basicblock(payload).terminator();
+                if let InstKind::Jump(jump2) = arena.inst_data(payload_term).kind() {
+                    if jump2.target() == target2 {
+                        arm_plan = Some(ArmPlan {
+                            body_br: bb,
+                            arm: payload,
+                            merge: target2,
+                            mask_cond: branch.cond(),
+                            branch: term,
+                            arm_on_true: true,
+                        });
+                        break;
+                    }
                 }
             }
         }
@@ -1642,14 +1669,22 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                             Binary::new_data(m, vneg, BinaryOp::Xor, vector_ty.clone()),
                         );
                         data.layout_mut().insert_inst_before(inst, nm);
+                        // Masked-kernel shape (`arm_on_true`): the arm
+                        // executes when cond != 0, so swap the polarity —
+                        // `new` is gated by `nm` (cond != 0), `old` by `m`.
+                        let (m_new, m_old) = if arm_plan.arm_on_true {
+                            (nm, m)
+                        } else {
+                            (m, nm)
+                        };
                         let tn = alloc_inst(
                             data,
-                            Binary::new_data(vnew, m, BinaryOp::And, vector_ty.clone()),
+                            Binary::new_data(vnew, m_new, BinaryOp::And, vector_ty.clone()),
                         );
                         data.layout_mut().insert_inst_before(inst, tn);
                         let fo = alloc_inst(
                             data,
-                            Binary::new_data(vold, nm, BinaryOp::And, vector_ty.clone()),
+                            Binary::new_data(vold, m_old, BinaryOp::And, vector_ty.clone()),
                         );
                         data.layout_mut().insert_inst_before(inst, fo);
                         let sel = alloc_inst(

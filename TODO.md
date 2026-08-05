@@ -2510,16 +2510,20 @@ test_at_top_bound_not_const 拒绝。背景实证见 TODO.md §10.10-10.12，
 entry_trip_not_const 拒绝。本提示词解决 rotated runtime-bound，直接命中
 矩阵乘法类 case 的热点。背景实证见 TODO.md §10.10-10.13，本提示词自包含。
 
-## 实证数据（2026-08-06 扫描，当前 HEAD 03a0862）
-- corpus 60 例中 entry_trip_not_const 共 **108 个循环、15 个 case**：
-  01_mm1/2/3 各 8、fft0/1/2 各 6、h-5-01/02/03 各 12、h-10-01/02/03
-  各 6、h-8-01/02/03 各 4。
+## 实证数据（2026-08-06 扫描，rebase 后 HEAD 52d9f5f，含 main M 系列）
+- corpus 60 例中 entry_trip_not_const 共 **63 个循环、12 个 case**
+  （rebase 前基线 108/15——main 的 M 系列已消化 fft0/1/2（6→0）与
+  h-5 系列（12→4）、h-8（4→3），h-10 不变（6）、01_mm1/2/3 不变（8））：
+  01_mm1/2/3 各 8、h-5-01/02/03 各 4、h-10-01/02/03 各 6、h-8-01/02/03
+  各 3。
 - 01_mm1 mm 内核（目标 1）：rotated，header
   `[outer_i, j, k, counter]`，counter 来自 preheader 的 runtime 计算
   （rotate_loops 产物 `t0 = sub(bound, i0)`，如 01_mm1 `%53 = sub %49, 0`），
   payload `C[i][j] = C[i][j]*A[i][k] + B[k][j]`——C[i][j] 连续、A[i][k]
   循环不变量、B[k][j] 连续，**访问形态理想**，是 elementwise（非归约）。
-- fft/h-* 系列待首扫确认形态（蝶形/归约/多参数），执行第一步先复扫。
+  复扫确认：rebase 后 mm 内核仍被 entry_trip_not_const 拒绝（8 个不变）。
+- h-10/h-8/h-5 剩余循环待首扫确认形态（归约/多参数/跨步），执行第一步
+  先复扫 01_mm1 + h-10-01 的 rotated 循环清单。
 
 ## 必须遵守的规则（用户明令）
 - 只在 hermes worktree 操作；不 push、不 rebase（遇冲突立即停并汇报）；
@@ -2635,7 +2639,9 @@ entry_trip_not_const 拒绝。本提示词解决 rotated runtime-bound，直接�
   1774（exit iv 改写，test-at-top 专用）、1805（counter 物化，
   test_at_top 专用——rotated 只改 entry 值）、1848-1859（tail 构造）、
   1931+（reduce 块）、1971（reduce runtime → tail）、2293+（2c 重写，
-  条件需加 runtime_trip）、2406（counter 步进）、2412（four_q/cnt0 替换）
+  条件需加 runtime_trip）、2412（four_q）、**2429/2431/2459（entry 边
+  counter 替换：2431 是 rotated 的 `t_args[entry_arg_count-1] = four_q`，
+  runtime 时改 cnt0）**
 - 工具：is_add_one（1509）、is_sub_one（1523）、constant_i64（1618）、
   apply_vectorize（1632）、build_exit_args（2513）、clone_payload_inst
   （2579）、subst_operand（remap_refs 统一替换）

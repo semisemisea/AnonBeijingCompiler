@@ -462,6 +462,26 @@ fn analyze_loop(
         }
     }
     let header_insts = data.layout().basicblock(header).insts();
+    if std::env::var("VECDBG_SHAPE").is_ok() {
+        let kinds: Vec<String> = header_insts
+            .iter()
+            .map(|i| {
+                let k = data.inst_data(*i).kind();
+                match k {
+                    InstKind::Binary(b) => format!("binary:{:?}", b.op()),
+                    InstKind::Load(_) => "load".into(),
+                    InstKind::Store(_) => "store".into(),
+                    InstKind::GetElemPtr(_) => "gep".into(),
+                    InstKind::Branch(_) => "br".into(),
+                    InstKind::Jump(_) => "jump".into(),
+                    InstKind::Integer(i) => format!("int({})", i.value()),
+                    InstKind::BlockArgRef(_) => "blockarg".into(),
+                    other => format!("{other:?}"),
+                }
+            })
+            .collect();
+        eprintln!("[SHAPE-HDR] header={header:?} insts={kinds:?}");
+    }
     let mut iter = header_insts.iter().copied();
     let Some(first) = iter.next() else {
         return None;

@@ -31,10 +31,15 @@ pub(super) fn lower_vector_binary(
                 );
             }
             ctx.emit(MInst::VecArithRRR {
-                op: match binary.op() {
-                    BinaryOp::Add => VecArithOp::Add,
-                    BinaryOp::Sub => VecArithOp::Sub,
-                    _ => VecArithOp::Mul,
+                // Float vectors need the `f*` NEON forms (`add v.4s` is an
+                // integer add on the float bit patterns).
+                op: match (binary.op(), is_float) {
+                    (BinaryOp::Add, false) => VecArithOp::Add,
+                    (BinaryOp::Sub, false) => VecArithOp::Sub,
+                    (BinaryOp::Mul, false) => VecArithOp::Mul,
+                    (BinaryOp::Add, true) => VecArithOp::Fadd,
+                    (BinaryOp::Sub, true) => VecArithOp::Fsub,
+                    _ => VecArithOp::Fmul,
                 },
                 shape,
                 dst,

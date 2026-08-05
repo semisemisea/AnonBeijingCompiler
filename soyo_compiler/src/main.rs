@@ -15,15 +15,6 @@ mod abi_matrix;
 
 lalrpop_util::lalrpop_mod!(sysy);
 
-/// Prebuilt SysY runtime assembly (scripts/gen_runtime_templates.sh). Every
-/// emitted .s carries these definitions, so the optimized buffered runtime
-/// wins even when the judging system links the official sysylib archive:
-/// the static-link extraction rule keeps our symbols and drops the
-/// archive's matching objects.
-const RUNTIME_RISCV64: &str = include_str!("../../sysylib/runtime_riscv64.s");
-const RUNTIME_AARCH64: &str = include_str!("../../sysylib/runtime_aarch64.s");
-const PROGRAM_ASM_MARKER: &str = "# SOYO_PROGRAM_ASM_BEGIN";
-
 /// compiler --emit asm -o testcase.s testcase.sy [-O1]
 /// extra support:
 ///     -S is a compatibility alias for `--emit asm`
@@ -189,14 +180,9 @@ fn dump_asm(
     aarch64_config: &anon_armv8::AArch64CodegenConfig,
 ) -> String {
     match target {
-        cli::Target::Riscv64 => {
-            let asm = taki_mir::compile::<Riscv64Backend>(program);
-            format!("{RUNTIME_RISCV64}\n{PROGRAM_ASM_MARKER}\n{asm}")
-        }
+        cli::Target::Riscv64 => taki_mir::compile::<Riscv64Backend>(program),
         cli::Target::Aarch64 => {
-            let asm =
-                taki_mir::compile_with_config::<AArch64Backend>(program, aarch64_config).assembly;
-            format!("{RUNTIME_AARCH64}\n{PROGRAM_ASM_MARKER}\n{asm}")
+            taki_mir::compile_with_config::<AArch64Backend>(program, aarch64_config).assembly
         }
     }
 }

@@ -190,6 +190,27 @@ struct VecPlan {
     /// materializes a trip counter as a new header parameter and replaces
     /// the bound test with the counter test.
     test_at_top: bool,
+    /// B1: single-arm if body (masked store). When Some, the loop body is
+    /// {header, body_br, arm, merge, latch}: body_br ends in
+    /// `br mask_cond, merge, arm` (arm on the false edge, conservative),
+    /// the arm is a single-exit block ending in `jump merge` holding the
+    /// masked stores, and the merge reaches the latch. The arm's stores
+    /// are rewritten with a lane-wise mask so the branch disappears.
+    arm: Option<ArmPlan>,
+}
+
+/// B1 single-arm if body.
+struct ArmPlan {
+    /// The block ending in `br mask_cond, merge, arm`.
+    body_br: BasicBlock,
+    /// The arm block (false edge; terminator `jump merge`).
+    arm: BasicBlock,
+    /// The merge block (the branch's true edge; the arm jumps here).
+    merge: BasicBlock,
+    /// The branch condition selecting the arm (false edge).
+    mask_cond: Inst,
+    /// The branch instruction rewritten into `jump arm`.
+    branch: Inst,
 }
 
 /// B1: a register accumulator recognized by M42 (`Reducible`) on a 3-param
@@ -345,7 +366,7 @@ fn analyze_loop(
     //        latch, exit` (compare + branch, nothing else) and the latch is
     //        a plain jump back to the header. The bound must be a
     //        compile-time constant (no versioning).
-    if looop.body().len() != 2 || looop.latches().len() != 1 {
+    if looop.latches().len() != 1 {
         trace(data, looop, "shape_body_not_2_blocks");
         return None;
     }
@@ -354,6 +375,44 @@ fn analyze_loop(
     if !looop.contains(latch) || latch == header {
         trace(data, looop, "shape_latch_is_header");
         return None;
+    }
+    // B1: accept a single-arm if body — a body block ends in
+    // `br mask_cond, merge, arm` with the arm a single-exit block
+    // (`jump merge`) on the false edge (conservative). The arm's stores
+    // are mask-rewritten so the branch disappears.
+    let mut arm_plan = None;
+    if looop.body().len() != 2 {
+        for &bb in looop.body() {
+            if bb == header || bb == latch {
+                continue;
+            }
+            let term = data.layout().basicblock(bb).terminator();
+            let InstKind::Branch(branch) = arena.inst_data(term).kind() else {
+                continue;
+            };
+            let arm = branch.f_target();
+            let merge = branch.t_target();
+            if !looop.contains(arm) || !looop.contains(merge) {
+                continue;
+            }
+            let arm_term = data.layout().basicblock(arm).terminator();
+            if let InstKind::Jump(jump) = arena.inst_data(arm_term).kind() {
+                if jump.target() == merge {
+                    arm_plan = Some(ArmPlan {
+                        body_br: bb,
+                        arm,
+                        merge,
+                        mask_cond: branch.cond(),
+                        branch: term,
+                    });
+                    break;
+                }
+            }
+        }
+        if arm_plan.is_none() {
+            trace(data, looop, "shape_body_not_2_blocks");
+            return None;
+        }
     }
     let header_insts = data.layout().basicblock(header).insts();
     let mut iter = header_insts.iter().copied();
@@ -393,11 +452,15 @@ fn analyze_loop(
         (true, binary.rhs())
     } else {
         // Rotated: the single header instruction is a plain jump to the
-        // latch.
+        // latch (or to the body_br of a B1 single-arm body).
         let InstKind::Jump(jump) = arena.inst_data(first).kind() else {
             return None;
         };
-        if jump.target() != latch || !jump.args().is_empty() {
+        let header_target_ok = jump.target() == latch
+            || arm_plan
+                .as_ref()
+                .is_some_and(|a| jump.target() == a.body_br);
+        if !header_target_ok || !jump.args().is_empty() {
             trace(data, looop, "shape_header_jump_not_plain");
             return None;
         }
@@ -731,11 +794,29 @@ fn analyze_loop(
         }
         set
     };
-    let payload: Vec<Inst> = latch_insts
-        .iter()
-        .copied()
-        .filter(|inst| !machinery.contains_key(inst))
-        .collect();
+    let payload: Vec<Inst> = if let Some(arm_plan) = &arm_plan {
+        // B1 single-arm body: the payload lives in body_br (before the
+        // branch) and in the arm (before the jump). The latch only holds
+        // machinery.
+        let mut insts = Vec::new();
+        for &inst in data.layout().basicblock(arm_plan.body_br).insts() {
+            if inst != arm_plan.branch {
+                insts.push(inst);
+            }
+        }
+        for &inst in data.layout().basicblock(arm_plan.arm).insts() {
+            if inst != data.layout().basicblock(arm_plan.arm).terminator() {
+                insts.push(inst);
+            }
+        }
+        insts
+    } else {
+        latch_insts
+            .iter()
+            .copied()
+            .filter(|inst| !machinery.contains_key(inst))
+            .collect()
+    };
 
     let mut classes = FxHashMap::<Inst, Class>::default();
     let mut elem_ty: Option<Type> = None;
@@ -953,9 +1034,12 @@ fn analyze_loop(
 
     // 9. Every payload value must stay inside the loop (no uses in the exit
     //    region), and at least one real vector operation must be produced.
+    //    With a B1 single-arm body the uses may sit in any body block
+    //    (body_br / arm / merge), not just the latch.
     for &inst in &payload {
         for &user in arena.inst_data(inst).used_by() {
-            if data.layout().parent_bb(user) != Some(latch) {
+            let user_bb = data.layout().parent_bb(user);
+            if !user_bb.is_some_and(|bb| looop.contains(bb)) {
         trace(data, looop, "value_escapes_loop");
         return None;
             }
@@ -1006,6 +1090,13 @@ fn analyze_loop(
         }
     };
 
+    // B1 single-arm bodies: only exact trips are supported for now (the
+    // epilogue chain for multi-block bodies is not implemented).
+    if arm_plan.is_some() && trip % VF != 0 {
+        trace(data, looop, "arm_remainder_not_supported");
+        return None;
+    }
+
     Some(VecPlan {
         header,
         latch,
@@ -1024,6 +1115,7 @@ fn analyze_loop(
         reduction,
         passthrough_args,
         test_at_top,
+        arm: arm_plan,
     })
 }
 
@@ -1214,6 +1306,7 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         reduction,
         passthrough_args,
         test_at_top,
+        arm,
     } = plan;
     let q = trip / VF;
     let r = trip % VF;
@@ -1372,6 +1465,80 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                     InstKind::Store(store) => (store.src(), store.dest()),
                     _ => unreachable!(),
                 };
+                if let Some(arm_plan) = &arm {
+                    let store_bb = data.layout().parent_bb(inst).unwrap();
+                    if store_bb == arm_plan.arm {
+                        // B1 masked store: `store (new & m) | (old & ~m)`
+                        // with `m = -(eq(mask_cond, 0))` — all-ones exactly
+                        // when the arm executes (it sits on the branch's
+                        // false edge). The old value is the same-address
+                        // load already inside the arm.
+                        let old = payload.iter().copied().find(|&p| {
+                            matches!(
+                                data.inst_data(p).kind(),
+                                InstKind::Load(l) if l.src() == dest
+                            )
+                        });
+                        let Some(old) = old else {
+                            unreachable!("arm store without a same-address load");
+                        };
+                        let vnew = vector_operand(
+                            data, &mut splats, src, &payload, &classes, &vector_ty, inst,
+                        );
+                        let vold = vector_operand(
+                            data, &mut splats, old, &payload, &classes, &vector_ty, inst,
+                        );
+                        let vcond = vector_operand(
+                            data,
+                            &mut splats,
+                            arm_plan.mask_cond,
+                            &payload,
+                            &classes,
+                            &vector_ty,
+                            inst,
+                        );
+                        let zero = data.new_local_inst().integer(0);
+                        let neg_one = data.new_local_inst().integer(-1);
+                        let vzero = vector_operand(
+                            data, &mut splats, zero, &payload, &classes, &vector_ty, inst,
+                        );
+                        let vneg = vector_operand(
+                            data, &mut splats, neg_one, &payload, &classes, &vector_ty, inst,
+                        );
+                        let eq0 = alloc_inst(
+                            data,
+                            Binary::new_data(vcond, vzero, BinaryOp::Eq, vector_ty.clone()),
+                        );
+                        data.layout_mut().insert_inst_before(inst, eq0);
+                        let m = alloc_inst(
+                            data,
+                            Binary::new_data(vzero, eq0, BinaryOp::Sub, vector_ty.clone()),
+                        );
+                        data.layout_mut().insert_inst_before(inst, m);
+                        let nm = alloc_inst(
+                            data,
+                            Binary::new_data(m, vneg, BinaryOp::Xor, vector_ty.clone()),
+                        );
+                        data.layout_mut().insert_inst_before(inst, nm);
+                        let tn = alloc_inst(
+                            data,
+                            Binary::new_data(vnew, m, BinaryOp::And, vector_ty.clone()),
+                        );
+                        data.layout_mut().insert_inst_before(inst, tn);
+                        let fo = alloc_inst(
+                            data,
+                            Binary::new_data(vold, nm, BinaryOp::And, vector_ty.clone()),
+                        );
+                        data.layout_mut().insert_inst_before(inst, fo);
+                        let sel = alloc_inst(
+                            data,
+                            Binary::new_data(tn, fo, BinaryOp::Or, vector_ty.clone()),
+                        );
+                        data.layout_mut().insert_inst_before(inst, sel);
+                        data.replace_inst_with(inst).raw(Store::new_data(sel, dest));
+                        continue;
+                    }
+                }
                 let vsrc = vector_operand(
                     data, &mut splats, src, &payload, &classes, &vector_ty, inst,
                 );
@@ -1580,6 +1747,14 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         EntryRewrite::Jump { target, args } => {
             data.replace_inst_with(entry_edge).jump(target, args);
         }
+    }
+
+    // 5. B1: drop the arm-selecting branch — the arm's stores are already
+    //    mask-rewritten, so the arm can run unconditionally (its
+    //    terminator `jump merge` is preserved and becomes the merge's
+    //    predecessor).
+    if let Some(arm_plan) = &arm {
+        data.replace_inst_with(arm_plan.branch).jump(arm_plan.arm, vec![]);
     }
 
     true
@@ -3084,6 +3259,122 @@ mod tests {
             1,
             "a[i] becomes a vector load"
         );
+    }
+
+    /// Build a rotated loop with a single-arm if body (B1):
+    /// `if ((a[i] & 1) == 0) { b[i] += a[i]; }` — body_br ends in
+    /// `br cond, latch, arm`, the arm holds load b / load a / add /
+    /// store b and jumps back to the latch.
+    fn build_arm_loop(program: &mut Program) -> Function {
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr.clone());
+            program.new_value().global_alloc(init)
+        };
+        let b = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_unit(), "arm_loop".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut *program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone()]);
+        let body_br = data.new_basic_block().basic_block("body_br".into(), vec![]);
+        let arm = data.new_basic_block().basic_block("arm".into(), vec![]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for bb in [header, body_br, arm, latch, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let trip_inst = data.new_local_inst().integer(16);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero, trip_inst]);
+        for inst in [zero, trip_inst, entry_jump] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let iv = data.bb_data(header).params()[0];
+        let counter = data.bb_data(header).params()[1];
+        let header_jump = data.new_local_inst().jump(body_br, vec![]);
+        data.layout_mut().insert_inst(header, header_jump);
+        let one = data.new_local_inst().integer(1);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        // body_br: cond = (a[i] & 1); br cond, latch, arm
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let cond = lb.binary(BinaryOp::And, load_a, one);
+        let br = lb.branch(cond, latch, vec![], arm, vec![]);
+        drop(lb);
+        for inst in [one, gep_a, load_a, cond, br] {
+            data.layout_mut().insert_inst(body_br, inst);
+        }
+        // arm: b[i] += a[i]
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_b = lb.get_elem_ptr(b, vec![zero, iv]);
+        let load_b = lb.load(gep_b);
+        let sum = lb.binary(BinaryOp::Add, load_b, load_a);
+        let store = lb.store(sum, gep_b);
+        let arm_jump = lb.jump(latch, vec![]);
+        drop(lb);
+        for inst in [gep_b, load_b, sum, store, arm_jump] {
+            data.layout_mut().insert_inst(arm, inst);
+        }
+        // latch: iv', t', back branch
+        let iv_next = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        let t_next = data.new_local_inst().binary(BinaryOp::Sub, counter, one);
+        let back = data.new_local_inst().branch(t_next, header, vec![iv_next, t_next], exit, vec![]);
+        for inst in [iv_next, t_next, back] {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+        function
+    }
+
+    #[test]
+    fn vectorizes_single_arm_if_body() {
+        // B1: the arm-selecting branch disappears, the arm's store becomes
+        // a masked store; loads vectorize.
+        let mut program = Program::new();
+        let function = build_arm_loop(&mut program);
+        assert!(
+            run(&mut program, function),
+            "single-arm if body must vectorize via masked store"
+        );
+        let data = program.func_data(function);
+        let select_left = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|l| l.insts().iter().copied())
+            .filter(|&inst| matches!(data.inst_data(inst).kind(), InstKind::Select(_)))
+            .count();
+        assert_eq!(select_left, 0, "no scalar Select may survive");
+        assert_eq!(
+            vector_load_count(&program, function),
+            2,
+            "a[i] and b[i] become vector loads"
+        );
+        // The arm-selecting branch must be gone (now a plain jump).
+        let body_br_insts = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|l| l.insts().iter().copied())
+            .filter(|&inst| {
+                matches!(data.inst_data(inst).kind(), InstKind::Branch(_))
+            })
+            .count();
+        assert_eq!(body_br_insts, 1, "only the latch back-branch remains");
     }
 
     #[test]

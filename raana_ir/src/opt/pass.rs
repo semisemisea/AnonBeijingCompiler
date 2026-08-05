@@ -294,6 +294,16 @@ impl PassesManager {
         let sr = Box::new(sr::StrengthReduction);
         p.register(sr);
 
+        // Interchange the in-place GEMM nest i-j-k → i-k-j with a stack row
+        // buffer so the innermost loop walks A row-contiguously (many_mat_cal
+        // hotspot). Runs after strength reduction (which turns the direct
+        // `A[k][j]` index into a pointer-carrying inner reduction) but before
+        // invariant-reduction hoisting so it sees the pristine i-j-k nest.
+        if config.target.enable_chain_to_switch {
+            let matmul_interchange = Box::new(matmul_interchange::MatmulInterchange);
+            p.register(matmul_interchange);
+        }
+
         // Degrade an outer trip loop whose body is an invariant reduction nest
         // to a single `acc += D_total` per iteration (many_mat_cal hotspot).
         // Runs before reduction_unroll so it sees the pristine nested loops.

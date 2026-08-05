@@ -16,6 +16,7 @@ pub mod licm;
 pub mod mod_fold;
 pub mod mulmod_recognize;
 pub mod loop_unroll;
+pub mod matmul_interchange;
 pub mod pointer_strength_reduction;
 pub mod recursive_memoize;
 pub mod reduction_unroll;

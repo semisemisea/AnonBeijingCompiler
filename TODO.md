@@ -2840,3 +2840,169 @@ live range 已占用的同 hw_enc Vector PReg（及反向）。注意这是 AArc
 - [ ] 提交历史干净（每个原子步骤独立 commit，中文消息）
 - [ ] 结论写入 TODO.md §10.16（根因链、改动清单、验证数字）
 ```
+
+### 10.17 SIMD 之路调研 + 下一步 goal 提示词（函数参数数组基址向量化，h-5/h-8 内核解锁）
+
+**调研数据（2026-08-06，HEAD 2bd63a2，release 编译器 M44_TRACE 复扫）**
+
+h-5-01/02/03（ludcmp）、h-8-01/02/03（nussinov）当前拒绝分布：
+
+| case | load_classify | load_unmodeled | m42_forbidden:UnknownBase | entry_i0_not_const | not_innermost | shape_header_multi_inst |
+|---|---|---|---|---|---|---|
+| h-5-* | 4 | 4 | 15 | 4 | 25 | 4 |
+| h-8-* | 3 | 3 | 3 (+1 IntraIterationConflict) | 0 | 12 | 1 |
+
+（reject=verdict=... 为信息性 trace，非真拒绝，未计）
+
+**根因链（已实证）**
+
+1. h-5（ludcmp）与 h-8（nussinov）的内核都是**函数参数数组**形态：
+   `kernel_ludcmp(int n, int A[][1400], int b[], int x[], int y[])`、
+   `kernel_nussinov(int n, int seq[], int table[][1400])`。
+2. `base_is_16b_aligned`（loop_vectorize.rs:1617）对
+   `MemObject::Param(_) | MemObject::Unknown => false`——参数基址与未知基址
+   直接判不可对齐 → `classify_load`（1504）拒绝 → load_classify/load_unmodeled。
+   这是 h-5/h-8 剩余内核循环的主要拦截点（i32 连续访问、形态本身完全可向量化，
+   与 01_mm1 内核同族，只是基址是函数参数而非全局量）。
+3. h-5 另有 `entry_i0_not_const`（1003）4 个循环：test-at-top 形态但入口 iv 是
+   外层 iv 的运行时值（`j = i; while (j < n)`）——与已支持的 rotated runtime
+   是不同缺口（入口侧 i0 非 const，非 counter 侧）。
+4. `m42_forbidden:UnknownBase`（400）h-5 15 个：dependence 分析基址解析失败
+   （部分循环与 load_classify 可能重复计数，需逐个核对）。
+5. 01_mm2/3 已解锁（0 entry_trip_not_const，IR 各 ~20 个 vec_tail），差分未逐例
+   验证（同族信任 mm1，需补验）。
+6. h-5-01 当前差分 PASS（标量 r≈1572ms）——ludcmp 是执行大头，解锁收益空间大。
+
+**SIMD 路线图（下一步优先级）**
+
+1. **【本提示词】函数参数数组基址向量化**（h-5/h-8 内核，i32，不依赖后端修复）：
+   IPA 参数对齐推断——编译器控制所有调用点，若某参数的所有调用点实参都是
+   16B 对齐基址（Global≥16B / Array Alloc≥16B），则该参数对齐，MemObject::Param
+   可向量化。复用既有 call_graph::CallGraph（inline.rs 用过）。
+2. entry_i0_not_const（h-5 的 `j=i` 循环）：test-at-top 运行时入口 iv，
+   trip=bound-i0 运行时计算（可复用 rotated runtime 的 cnt0/tail 机制）。
+3. 01_mm2/3 差分补验 + 性能落档（qemu r:）。
+4. 后端 s/v 修复落地后：h-10 三例 rebase 重验 + f32 归约路径验证（并行 fix
+   agent 在 fix/regalloc-s-v-aliasing 分支处理，见下）。
+5. UnknownBase 深挖（b[x[i]] 类 gather 形态）——更远期。
+
+**并行修复说明（必须传达给下个 agent）**
+
+- `fix/regalloc-s-v-aliasing` 分支（基于 2bd63a2 切出）正在修 AArch64 后端
+  s/v 寄存器别名 bug：h-10 f32 向量化触发，根因是 taki_mir Ion RA 把
+  RegClass::Float（s0-s31）与 RegClass::Vector（v0-v31）当不相交类分配，
+  而物理上 sN≡vN——fdiv 分 v0、常量物化分 s0 即互相踩踏 → NaN。
+- **已查清是后端原因**（taki_mir/anon_armv8），与本任务（纯 raana_ir）零文件
+  重叠，并行开发无冲突，无需担心 merge conflict。
+- h-10 三例差分验收等后端修复提交后 rebase 验证，**不在本提示词范围**。
+
+**自包含 goal 提示词（可直接粘贴新 session）**
+
+```text
+# Goal: SIMD 之路下一步——函数参数数组基址向量化（h-5 ludcmp / h-8 nussinov 内核解锁）
+
+## 背景
+
+loop_vectorize 已完成：rotated（test-at-bottom）runtime-bound 向量化
+（feat/loop-vectorize-hermes，2731143）、i32/f32 elementwise + B1 归约 +
+tail 链；01_mm1/2/3 内核已出 NEON（01_mm1 qemu -11.8%）；h-10 f32 axpy
+已解锁但三例差分暂 FAIL——已查清是**后端**原因（taki_mir Ion RA 的
+Float/Vector 类别名盲区，sN≡vN 未建模），有并行 fix agent 在
+`fix/regalloc-s-v-aliasing` 分支（基于 2bd63a2）修复中；本任务只改 raana_ir，
+与并行修复零文件重叠，无需担心 conflict。h-10 验收不在本任务范围。
+
+本任务解锁 h-5（ludcmp）与 h-8（nussinov）系列的内核循环（i32 连续访问，
+与 01_mm1 内核同族，基址是函数参数而非全局量）。
+
+## 现状与根因（已实证，2026-08-06 复扫）
+
+- h-5/h-8 当前拒绝分布（M44_TRACE=1，12 个 case 中这 6 个）：
+  h-5-*：load_classify 4、load_unmodeled 4、m42_forbidden:UnknownBase 15、
+  entry_i0_not_const 4；h-8-*：load_classify 3、load_unmodeled 3、
+  m42_forbidden 3+1(IntraIterationConflict)。其余为 not_innermost 等
+  正确拒绝。
+- 根因：`base_is_16b_aligned`（loop_vectorize.rs:1617）对
+  `MemObject::Param(_) | MemObject::Unknown => false`。h-5/h-8 内核函数把
+  数组当参数（`kernel_ludcmp(int n, int A[][1400], int b[], int x[],
+  int y[])`、`kernel_nussinov(int n, int seq[], int table[][1400])`），
+  全部内核循环因参数基址被判不可对齐 → classify_load（1504）拒绝。
+- h-5 另有 entry_i0_not_const（1003）4 个循环：test-at-top 形态、入口 iv
+  是外层 iv 的运行时值（`j = i; while (j < n)`）——可选扩展。
+- h-5-01 当前差分 PASS（标量 r≈1572ms，ludcmp 是执行大头）。
+
+## 必须遵守的规则
+
+- 只改 raana_ir crate（loop_vectorize.rs、dependence.rs、可复用
+  call_graph::CallGraph）；不碰 anon_armv8/taki_mir（并行修复独占）、
+  不碰前端。uika_riscv 零影响。
+- 无 hacky workaround；不做以函数名/benchmark/输入为条件的优化；
+  禁止 Rc<RefCell<T>> / RefCell 共享可变。
+- 形态实证先行：先 M44_TRACE 复扫 h-5-01 确认 load_classify 的具体循环与
+  MemObject 形态，再动手。
+- 勤 commit（中文消息、git commit -F 规避 homoglyph 扫描）；改文件一律
+  patch；不碰 .docker-image、不 rm -rf、不 cargo clean。
+- 验收粒度 = 单测 + 单 case（make test perf/h-5-01.sy ARGS="-O 2 -j 1"）。
+
+## 设计（主方案：IPA 参数对齐推断）
+
+编译器控制所有调用点：对每个函数参数，收集其所有调用点的实参；若全部
+实参解析为 16B 对齐基址（MemObject::Global 且元素类型 ≥16B、或
+MemObject::Alloc 为 Array 且 ≥16B），则该参数声明为 aligned。实现要点：
+
+1. 新增轻量 IPA 分析（复用 call_graph::CallGraph 或类似）：函数参数 →
+   对齐结论（bool）的映射；含递归函数处理（对齐是单调属性，递归保守
+   传递或直接保守 false 亦可，先保守）。
+2. dependence.rs 的 MemObject::Param 需能携带/查询对齐信息（或
+   loop_vectorize 的 base_is_16b_aligned 增加查询参数对齐表的路径）。
+3. 注意 A[i]（外层 iv 索引后的行指针）的 MemObject 解析链：确保依赖分析
+   把 A[i] 的基址解析回 Param A 而非 Unknown（若有解析缺口一并修）。
+4. 未对齐参数（混有未对齐调用点）→ 保持拒绝（标量），不 versioning。
+5. 备选（若 IPA 复杂度过高再评估）：运行时 16B 对齐检查 + 向量/标量双路径
+   versioning（机制可参考既有 runtime trip 的 select/csel 用法，但更重）。
+
+可选扩展（独立原子提交，做不完可留给后续）：
+- entry_i0_not_const（1003）：test-at-top 入口 iv 为运行时值（外层 iv）时
+  trip = bound - i0 运行时计算，复用 rotated runtime 的 cnt0/iv0/tail 机制
+  （入口侧接入，counter 侧已有）。
+
+## 验证命令
+
+- 单测：cargo test -p raana_ir 2>&1 | grep -E "test result"
+- 复扫：M44_TRACE=1 ./target/release/compiler -O2 --target aarch64 --emit ir
+  -o /tmp/x.ir tests/perf/h-5-01.sy 2>&1 | grep -oE "reject=[A-Za-z0-9_:]+" |
+  sort | uniq -c（load_classify/load_unmodeled 计数下降，记录数字）
+- IR 检查：./target/release/compiler -O2 --target aarch64 --emit ir
+- 汇编向量：grep -cE "dup v|ld1|st1|ldr q| v[0-9]+\.4s" /tmp/x.s
+- 定向差分：make test perf/h-5-01.sy ARGS="-O 2 -j 1"（当前标量 PASS，
+  r≈1572ms，解锁后应下降，记录数字）；h-5-02/03、h-8-01/02/03 同
+- 静态计数：scripts/perf_compare.sh h-5-01 h-5-02 h-5-03 h-8-01 h-8-02 h-8-03
+- 回归：make test perf/01_mm1.sy + perf/01_mm2.sy + perf/01_mm3.sy +
+  perf/matmul1.sy ARGS="-O 2 -j 1"（i32 向量化不回归）；RISC-V 抽查
+  （make test-riscv ARGS="-O 2" 或至少一个 i32 向量化 case）
+
+## 关键代码位置
+
+- loop_vectorize.rs：1617 base_is_16b_aligned（Param|Unknown → false 拒点）；
+  1504 classify_load 调用处；1202/1203 load_unmodeled/load_classify；
+  1003 entry_i0_not_const（可选扩展）；400 m42_forbidden。
+- dependence.rs：AccessFunction / MemObject::Param / Unknown 的产生与解析链。
+- call_graph.rs：raana_ir/src/opt/analysis_passes/call_graph.rs（inline.rs
+  已用，可复用做 IPA 调用点收集）。
+- 既有单测参考：rejects_strided_access（3126）、rotated runtime 系列、
+  vectorizes_runtime_trip_counter_entry。
+
+## 验收清单（全部满足才算完成）
+
+- [ ] IPA 参数对齐落地，h-5/h-8 内核循环 load_classify/load_unmodeled 计数
+      下降（记录复扫数字）
+- [ ] 新增单测 ≥3 全绿：参数全对齐解锁、混合对齐拒绝、递归/多调用点保守；
+      raana_ir 全量全绿
+- [ ] h-5-01/02/03 差分 PASS（ludcmp 输出正确，qemu r: 记录前后对比）
+- [ ] h-8-01/02/03 差分 PASS（若全部解锁；部分解锁则记录哪些循环还卡
+      UnknownBase）
+- [ ] 01_mm1/2/3、matmul1 -O2 差分仍 PASS（既有 i32 向量化不回归）
+- [ ] RISC-V 零影响；-O0 标量不变
+- [ ] 无二次向量化死循环（fixed-point 收敛）
+- [ ] 提交历史干净（原子提交，中文消息）；结论写入 TODO.md §10.17
+- [ ] 最终 git status 只剩非本任务文件
+```

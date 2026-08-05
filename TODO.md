@@ -761,6 +761,37 @@ A4 exit_has_params（48 次）——**高 ROI，A3+A4+C1 解锁 01_mm**：
   str q；make test 三级差分；raana_ir 全量；corpus 复扫
   exit_arg_not_acc 下降
 
+##### 最短路计划: sum 循环向量化 (matmul1/2/3 出 addv, 2026-08-05)
+
+目标: `sum += c[i][j]` 嵌套循环 (i 外层 sum 归约, j 内层) 向量化,
+matmul1/2/3 同时出 ldr q + add v.4s + addv 归约。
+
+根因 (已确认):
+1. M42 identify_reduction 返回第一个匹配参数 — `j'=add(j,1)`
+   (IV 步进) 被 match_acc_update_op 误标为 acc (Add 模式匹配),
+   sum (slot 2) 轮不到
+2. acc 种子 = 外层 sum (BlockArgRef) 时 VectorSplat 物化错误
+   (dup w4=0) — lowering 对 BlockArgRef 的 splat 源处理有缺陷
+
+改动 (2 文件):
+1. dependence.rs identify_reduction: 遍历时跳过「IV 参数」—
+   先看 BasicInductionVariableAnalysis (interchange 已用) 能否
+   识别 sum 循环的 iv (j); 能则 M42 直接排除 iv 参数, 不能则用
+   「update == add(param, 常量) 且 param 的 users 含 GEP offset」
+   启发 (保守, sum+=1 会误拒但收益小可接受)
+2. anon_armv8 (或 vectorizer) VectorSplat(BlockArgRef) 修复:
+   诊断 dup 源寄存器取错路径; 物化 seed 值 (preheader 计算 →
+   splat) 或修 lowering 的 BlockArgRef 源
+
+正确性保障 (硬性验收):
+- 单测: vectorizes_nested_sum (i 外层 sum + j 内层向量化,
+  addv 归约) + 断言 make test 差分
+- matmul1/2/3 -O0/-O1/-O2 三级差分全 PASS (错码 = 失败)
+- 防御保留: b1_acc_is_iv / b1_acc_init_block_arg 继续兜底,
+  修复后若仍触发说明识别未生效 (trace 核查)
+- corpus 复扫: matmul 三兄弟出现 addv; 其他用例无回归
+- 不做: 掩码内核结构调试 / M43 versioning (后续)
+
 #### M45：SLP 基本块向量化 + 循环展开
 
 - SLP（`raana_ir/src/opt/passes/slp.rs`）：把同一基本块内相邻、类型一致的独立

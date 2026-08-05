@@ -706,9 +706,12 @@ fn analyze_loop(
             .collect()
     };
     // Test-at-top loops carry exactly one real induction parameter (the
-    // IV); any additional non-passthrough parameter is not a recognized
-    // shape (rotated loops may carry a second one: the B1 accumulator).
-    if test_at_top && effective.len() != 1 {
+    // IV); a second one is accepted as the B1 accumulator ([iv, acc]) and
+    // goes through the acc_info matching below — a non-Reducible
+    // effective==2 shape is rejected there (`b1_not_reducible` etc.).
+    // Rotated loops may also carry the B1 accumulator. More than two
+    // effective parameters stays a rejected shape.
+    if test_at_top && effective.len() > 2 {
         trace(data, looop, "test_at_top_multi_param");
         return None;
     }
@@ -726,7 +729,12 @@ fn analyze_loop(
                     return None;
                 }
             };
-            if passthrough.contains(&acc_slot) || acc_slot == counter_slot {
+            if passthrough.contains(&acc_slot)
+                || (!test_at_top && acc_slot == counter_slot)
+            {
+                // The counter slot only exists for rotated loops; a
+                // test-at-top accumulator may legally be the last header
+                // parameter (e.g. 01_mm1's kernel `[outer, iv, acc]`).
                 trace(data, looop, "b1_acc_is_passthrough_or_counter");
                 return None;
             }
@@ -773,10 +781,23 @@ fn analyze_loop(
     }
     let (iv, iv_next, iv_slot, counter, t_next): (Inst, Inst, usize, Inst, Inst) =
         if test_at_top {
-            // The single effective (non-passthrough) parameter is the IV;
+            // The effective (non-passthrough) parameters are `[iv]` or
+            // `[iv, acc]` (B1). With an accumulator, the IV is the
+            // non-acc effective slot; otherwise it is effective[0].
             // `iv' = add(iv, 1)` is its plain-jump argument in the latch.
             // The remaining parameters are loop-invariant passthroughs.
-            let iv_slot = effective[0];
+            let iv_slot = match acc_info {
+                Some((_, acc_slot, _)) => {
+                    let slots: Vec<usize> = effective
+                        .iter()
+                        .copied()
+                        .filter(|&i| i != acc_slot)
+                        .collect();
+                    debug_assert_eq!(slots.len(), 1);
+                    slots[0]
+                }
+                None => effective[0],
+            };
             let iv = params[iv_slot];
             let iv_next = back_args[iv_slot];
             // Placeholders; unused for test-at-top (no counter yet).
@@ -840,11 +861,18 @@ fn analyze_loop(
                 return None;
             }
             let delta = binary.rhs();
-            // The accumulator must be consumed only by its update chain
-            // (and the exit argument). An exit that reads the header
-            // parameter directly is not the rotated form and stays scalar.
+            // The accumulator must be consumed only by its update chain,
+            // the latch, and — for test-at-top loops — the exit block
+            // (which reads the header parameter directly via SSA
+            // dominance; the apply phase rewrites those reads to the
+            // reduced scalar). Rotated loops carry `acc'` through the
+            // latch branch's f_args, so any other user stays scalar.
             for &user in arena.inst_data(acc).used_by() {
-                if user != update && data.layout().parent_bb(user) != Some(latch) {
+                let user_bb = data.layout().parent_bb(user);
+                if user != update
+                    && user_bb != Some(latch)
+                    && !(test_at_top && user_bb == Some(exit))
+                {
                     trace(data, looop, "b1_acc_used_outside_latch");
                     return None;
                 }
@@ -874,6 +902,20 @@ fn analyze_loop(
     if entry_args.len() != n_params {
         trace(data, looop, "entry_args_not_2");
         return None;
+    }
+    // A test-at-top reduction rewrites the exit block's direct reads of
+    // the header accumulator (and, with a runtime trip, the IV) through a
+    // fresh exit parameter. That is only valid when the exit has no other
+    // predecessors whose argument values we cannot supply: the preheader
+    // guard edge (feeds the seed when the loop never runs) and the
+    // header's own exit edge (rewritten by the mutation phase).
+    if test_at_top && acc_info.is_some() {
+        for &p in cfg.predecessors_of(exit) {
+            if p != preheader && p != header {
+                trace(data, looop, "exit_extra_pred");
+                return None;
+            }
+        }
     }
     // Passthrough entry arguments: loop-invariant values forwarded to the
     // exit / epilogue chain after vectorization (their params stay i32).
@@ -908,8 +950,19 @@ fn analyze_loop(
             // `idx` is the index into `passthrough` / `passthrough_args`
             // (both are ordered identically), not the header slot.
             ExitArgSpec::Passthrough(idx)
-        } else if let Some((update, _)) = acc_update.as_ref() {
-            if arg != *update {
+        } else if let Some((acc, acc_slot, _)) = acc_info.as_ref() {
+            // Rotated: the exit receives the accumulator's update value
+            // (`acc'`, computed in the latch). Test-at-top: the exit may
+            // carry the header parameter itself — the f-edge args are
+            // evaluated at the header, where the parameter's current
+            // value is the final accumulation. Both resolve to
+            // ExitArgSpec::Acc (fed the reduced scalar by the mutation
+            // phase).
+            let ok = acc_update
+                .as_ref()
+                .is_some_and(|(update, _)| arg == *update)
+                || (test_at_top && arg == params[*acc_slot]);
+            if !ok {
                 trace(data, looop, "exit_arg_not_acc");
                 return None;
             }
@@ -1519,6 +1572,38 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     let r = trip % VF;
     let i32 = Type::get_i32();
     let n_passthrough = passthrough_args.len();
+    // B1 test-at-top exits read the header's accumulator parameter
+    // directly (SSA dominance) instead of receiving it through an exit
+    // parameter. The accumulator is re-typed to a vector in step 2b, so
+    // those reads are rewritten to a fresh scalar exit parameter fed the
+    // reduced sum by the reduce block / epilogue chain. The parameter is
+    // appended after any existing exit parameters (the exit edge args are
+    // rebuilt accordingly). The analyze gate (`exit_extra_pred`)
+    // guarantees the exit has no other predecessors, so the parameter can
+    // be added without touching unknown edges.
+    let exit_extra_acc: Option<Inst> = if test_at_top && reduction.is_some() {
+        let acc = reduction.as_ref().expect("reduction set").acc;
+        let exit_users: Vec<Inst> = data
+            .inst_data(acc)
+            .used_by()
+            .iter()
+            .copied()
+            .filter(|&u| data.layout().parent_bb(u) == Some(exit))
+            .collect();
+        if exit_users.is_empty() {
+            None
+        } else {
+            let index = data.bb_data(exit).params().len() + 1;
+            let ep = alloc_inst(data, BlockArgRef::new_data(index, i32.clone()));
+            data.bb_data_mut(exit).params_mut().push(ep);
+            for user in exit_users {
+                subst_operand(data, user, acc, ep);
+            }
+            Some(ep)
+        }
+    } else {
+        None
+    };
     // A4: does any exit parameter carry the IV's final value? Those slots
     // must be fed the computed `i0 + VF*q` (+ the peeled remainder through
     // the epilogue chain) instead of the latch's per-iteration update.
@@ -1596,13 +1681,16 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 (first, fwd)
             }
             None => {
-                // r == 0: the exit edge carries the reduced accumulator,
-                // the passthrough values, and — when declared — the
-                // computed IV final value `i0 + VF*q` (the loop ran exactly
-                // `q` vector iterations, so `i0 + 4q == i0 + trip`).
+                // r == 0: the exit edge carries the reduced accumulator
+                // (the scalar sum), the passthrough values, and — when
+                // declared — the computed IV final value `i0 + VF*q` (the
+                // loop ran exactly `q` vector iterations, so
+                // `i0 + 4q == i0 + trip`). A param-less test-at-top exit
+                // receives just the sum through its freshly added
+                // parameter (`exit_extra_acc`).
                 let iv_final_const = has_iv_final
                     .then(|| data.new_local_inst().integer((entry_i0 + VF * q) as i32));
-                let acc_value = red.exit_acc_param.map(|_| {
+                let acc_value = if red.exit_acc_param.is_some() || exit_extra_acc.is_some() {
                     // The vector loop accumulates with a zero seed
                     // (splat(0)), so the outer seed must be added back:
                     // sum_final = seed + Σc. (Splatting the seed itself
@@ -1612,12 +1700,17 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                         Binary::new_data(red.acc_init, acc_final, BinaryOp::Add, i32.clone()),
                     );
                     data.layout_mut().insert_inst(rb, sum);
-                    sum
-                });
-                (
-                    exit,
-                    build_exit_args(&exit_specs, &passthrough_args, acc_value, iv_final_const),
-                )
+                    Some(sum)
+                } else {
+                    None
+                };
+                let mut args =
+                    build_exit_args(&exit_specs, &passthrough_args, acc_value, iv_final_const);
+                if let Some(_) = exit_extra_acc {
+                    // The freshly added parameter carries the scalar sum.
+                    args.push(acc_value.expect("sum built above"));
+                }
+                (exit, args)
             }
         };
         let jump = data.new_local_inst().jump(target, args);
@@ -1663,16 +1756,26 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 }
                 None => {
                     // The chain's last block jumps to the exit: rebuild the
-                    // exit's arguments from its parameter classes. The IV
-                    // final value is the computed `i0 + VF*q + r`: the
-                    // peeled scalar iterations ran with `iv = i0 + 4q + k`,
-                    // so the scalar exit value `i0 + trip` == `i0 + 4q + r`.
+                    // exit's arguments from its parameter classes (or feed
+                    // the single freshly added parameter for a param-less
+                    // test-at-top exit). The IV final value is the
+                    // computed `i0 + VF*q + r`: the peeled scalar
+                    // iterations ran with `iv = i0 + 4q + k`, so the
+                    // scalar exit value `i0 + trip` == `i0 + 4q + r`.
                     let iv_final_const = has_iv_final
                         .then(|| data.new_local_inst().integer((entry_i0 + VF * q + r) as i32));
-                    (
-                        exit,
-                        build_exit_args(&exit_specs, &passthrough_args, acc_value, iv_final_const),
-                    )
+                    let mut args = build_exit_args(
+                        &exit_specs,
+                        &passthrough_args,
+                        acc_value,
+                        iv_final_const,
+                    );
+                    if let Some(_) = exit_extra_acc {
+                        // The freshly added parameter carries the final
+                        // scalar accumulator from the peeled iterations.
+                        args.push(acc_value.expect("acc_value set with reduction"));
+                    }
+                    (exit, args)
                 }
             };
             insts.push(data.new_local_inst().jump(target, jump_args));
@@ -1910,11 +2013,23 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         let iv_final_const = has_iv_final
             .then(|| data.new_local_inst().integer((entry_i0 + VF * q) as i32));
         let (f_target, f_args) = if test_at_top {
-            // The epilogue chain (r > 0) and the exit both carry the
-            // loop-invariant passthrough values: their header parameters
-            // stay live and unchanged across the vectorized loop, so the
-            // entry-edge values are forwarded as-is.
-            if r > 0 {
+            // B1 reduction: the false edge carries the vector accumulator
+            // (the header parameter, re-typed at step 2b) to the reduce
+            // block, which reduces it and feeds the scalar sum to the
+            // exit (directly, or through the freshly added exit
+            // parameter). Otherwise the epilogue chain (r > 0) and the
+            // exit both carry the loop-invariant passthrough values:
+            // their header parameters stay live and unchanged across the
+            // vectorized loop, so the entry-edge values are forwarded
+            // as-is.
+            if let Some(red) = &reduction {
+                let mut args = vec![red.acc];
+                args.extend(passthrough_args.iter().copied());
+                (
+                    reduce_block.expect("reduce block built when reduction is set"),
+                    args,
+                )
+            } else if r > 0 {
                 (epi_blocks[0], passthrough_args.clone())
             } else {
                 (
@@ -1995,10 +2110,20 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             if let (Some(red), Some(splat)) = (&reduction, &acc_splat) {
                 t_args[red.acc_slot] = *splat;
             }
+            // The preheader's false edge is the trip-zero guard: when it
+            // targets the exit and the exit gained an accumulator
+            // parameter (param-less test-at-top reduction), the loop
+            // never ran, so the exit receives the seed.
+            let mut f_args = b.f_args().to_vec();
+            if let (Some(_), Some(red)) = (exit_extra_acc, &reduction) {
+                if b.f_target() == exit {
+                    f_args.push(red.acc_init);
+                }
+            }
             EntryRewrite::Branch {
                 cond: b.cond(),
                 f_target: b.f_target(),
-                f_args: b.f_args().to_vec(),
+                f_args,
                 t_args,
             }
         }
@@ -2203,6 +2328,33 @@ fn map_operand(
         }
         _ => operand, // global or dominating value: reused as-is
     }
+}
+
+/// Rebuild `inst` with every operand equal to `old` replaced by `new`,
+/// preserving the instruction id (and thus its layout position and
+/// `used_by` links). Used to redirect an exit block's direct reads of a
+/// header parameter (re-typed to a vector during a B1 reduction) to a
+/// fresh scalar exit parameter. The substitution is a full remap, so any
+/// instruction kind is handled uniformly.
+fn subst_operand(data: &mut ArenaContextMut<'_>, inst: Inst, old: Inst, new: Inst) {
+    struct Subst {
+        old: Inst,
+        new: Inst,
+    }
+    impl crate::ir::remap::EntityMapper for Subst {
+        type Error = ();
+        fn map_inst(&mut self, inst: Inst) -> Result<Inst, ()> {
+            Ok(if inst == self.old { self.new } else { inst })
+        }
+        fn map_block(&mut self, block: BasicBlock) -> Result<BasicBlock, ()> {
+            Ok(block)
+        }
+    }
+    let new_data = data
+        .inst_data(inst)
+        .remap_refs(&mut Subst { old, new })
+        .expect("identity mapper cannot fail");
+    data.replace_inst_with(inst).raw(new_data);
 }
 
 // ---------------------------------------------------------------------------
@@ -3610,6 +3762,290 @@ mod tests {
         assert!(
             !run(&mut program, function),
             "non-constant bound must stay scalar (no versioning)"
+        );
+    }
+
+    /// Build a test-at-top single-reduction loop (the B1 shape unlocked by
+    /// commit 1): header `[passthrough_i, iv, acc]`, const bound, payload
+    /// `b[i] = a[i] + passthrough_i; acc += a[i]`. The exit has no
+    /// accumulator parameter and reads the header accumulator directly
+    /// (SSA dominance — the real-case shape; the apply phase appends a
+    /// scalar exit parameter and rewrites the read). When
+    /// `exit_has_passthrough_param` the exit additionally takes the
+    /// loop-invariant passthrough value as its (single) original
+    /// parameter, so the appended accumulator parameter lands after it.
+    #[allow(clippy::type_complexity)]
+    fn build_test_at_top_reduction(
+        program: &mut Program,
+        bound: i32,
+        exit_has_passthrough_param: bool,
+    ) -> (Function, BasicBlock, BasicBlock, BasicBlock, Inst) {
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr.clone());
+            program.new_value().global_alloc(init)
+        };
+        let b = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_i32(), "tat_red".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut *program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data.new_basic_block().basic_block(
+            "header".into(),
+            vec![i32.clone(), i32.clone(), i32.clone()],
+        );
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = if exit_has_passthrough_param {
+            data.new_basic_block()
+                .basic_block("exit".into(), vec![i32.clone()])
+        } else {
+            data.new_basic_block().basic_block("exit".into(), vec![])
+        };
+        for bb in [header, latch, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let seven = data.new_local_inst().integer(7);
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![seven, zero, zero]);
+        data.layout_mut().insert_inst(entry, seven);
+        data.layout_mut().insert_inst(entry, zero);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let passthrough_i = data.bb_data(header).params()[0];
+        let iv = data.bb_data(header).params()[1];
+        let acc = data.bb_data(header).params()[2];
+        let bound_inst = data.new_local_inst().integer(bound);
+        let cond = data.new_local_inst().binary(BinaryOp::Lt, iv, bound_inst);
+        let header_br = if exit_has_passthrough_param {
+            data.new_local_inst()
+                .branch(cond, latch, vec![], exit, vec![seven])
+        } else {
+            data.new_local_inst()
+                .branch(cond, latch, vec![], exit, vec![])
+        };
+        data.layout_mut().insert_inst(header, cond);
+        data.layout_mut().insert_inst(header, header_br);
+        let one = data.new_local_inst().integer(1);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let sum = lb.binary(BinaryOp::Add, load_a, passthrough_i);
+        let gep_b = lb.get_elem_ptr(b, vec![zero, iv]);
+        let store = lb.store(sum, gep_b);
+        drop(lb);
+        let acc_next = data.new_local_inst().binary(BinaryOp::Add, acc, load_a);
+        let iv_next = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        // The passthrough is forwarded unchanged; the IV and accumulator
+        // update.
+        let latch_jump = data
+            .new_local_inst()
+            .jump(header, vec![passthrough_i, iv_next, acc_next]);
+        for inst in [
+            one, gep_a, load_a, sum, gep_b, store, acc_next, iv_next, latch_jump,
+        ] {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        // The exit reads the header accumulator parameter directly (SSA
+        // dominance) — the real-case shape.
+        let ret = data.new_local_inst().ret(Some(acc));
+        data.layout_mut().insert_inst(exit, ret);
+        (function, header, latch, exit, seven)
+    }
+
+    #[test]
+    fn vectorizes_test_at_top_reduction_direct_exit_read() {
+        // Const-bound test-at-top [passthrough_i, iv, acc] with a
+        // param-less exit that reads the header accumulator directly: the
+        // accumulator vectorizes, a reduce block delivers the scalar sum,
+        // the apply phase appends a scalar exit parameter and rewrites the
+        // read.
+        let mut program = Program::new();
+        let (function, header, _latch, exit, _seven) =
+            build_test_at_top_reduction(&mut program, 16, false);
+        assert!(
+            run(&mut program, function),
+            "param-less test-at-top exit reading acc must vectorize"
+        );
+        let data = program.func_data(function);
+        assert_eq!(vector_load_count(&program, function), 1);
+        assert_eq!(scalar_load_count(&program, function), 0);
+        // Exactly one horizontal reduction (the accumulator's addv).
+        let reduce_count = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|l| l.insts().iter().copied())
+            .filter(|&inst| matches!(data.inst_data(inst).kind(), InstKind::VectorReduce(_)))
+            .count();
+        assert_eq!(reduce_count, 1, "one addv for the accumulator");
+        // The exit gained a single scalar parameter; its terminator reads
+        // that parameter instead of the (now vector) header accumulator.
+        let exit_params = data.bb_data(exit).params();
+        assert_eq!(exit_params.len(), 1, "one scalar param added to the exit");
+        let exit_ret = data.layout().basicblock(exit).terminator();
+        let InstKind::Return(ret) = data.inst_data(exit_ret).kind() else {
+            panic!("exit must return");
+        };
+        assert_eq!(
+            ret.value(),
+            Some(exit_params[0]),
+            "the exit's direct acc read is rewritten to the new param"
+        );
+        // The header false edge carries the vector accumulator to the
+        // reduce block; the reduce block feeds the scalar sum to the exit.
+        let term = data.layout().basicblock(header).terminator();
+        let InstKind::Branch(branch) = data.inst_data(term).kind() else {
+            panic!("header must end in a branch");
+        };
+        let f_target = branch.f_target();
+        assert!(
+            data.bb_data(f_target).name().starts_with("vec_reduce"),
+            "exit edge enters the reduce block"
+        );
+        let f_args = branch.f_args().to_vec();
+        assert_eq!(f_args.len(), 2, "reduce block takes [acc_vec, passthrough]");
+        assert!(
+            data.inst_data(f_args[0]).ty().is_vector(),
+            "the reduce block receives the vector accumulator"
+        );
+        let reduce_jump = data.layout().basicblock(f_target).terminator();
+        let InstKind::Jump(jump) = data.inst_data(reduce_jump).kind() else {
+            panic!("reduce block must end in a jump");
+        };
+        assert_eq!(jump.target(), exit);
+        assert_eq!(jump.args().len(), 1, "the sum feeds the added exit param");
+        assert!(
+            data.inst_data(jump.args()[0]).ty().is_i32(),
+            "the added exit param receives the scalar sum"
+        );
+        // Idempotence: a second application changes nothing.
+        assert!(!run(&mut program, function), "vectorized loop must not re-fire");
+    }
+
+    #[test]
+    fn vectorizes_test_at_top_reduction_with_passthrough_exit_param() {
+        // The exit already takes the loop-invariant passthrough value as
+        // its single parameter; the accumulator parameter is appended
+        // after it and fed the reduced sum.
+        let mut program = Program::new();
+        let (function, header, _latch, exit, seven) =
+            build_test_at_top_reduction(&mut program, 16, true);
+        assert!(
+            run(&mut program, function),
+            "test-at-top reduction with a passthrough exit param must vectorize"
+        );
+        let data = program.func_data(function);
+        let exit_params = data.bb_data(exit).params();
+        assert_eq!(
+            exit_params.len(),
+            2,
+            "the accumulator param is appended after the passthrough"
+        );
+        let exit_ret = data.layout().basicblock(exit).terminator();
+        let InstKind::Return(ret) = data.inst_data(exit_ret).kind() else {
+            panic!("exit must return");
+        };
+        assert_eq!(
+            ret.value(),
+            Some(exit_params[1]),
+            "the direct acc read is rewritten to the appended param"
+        );
+        // The reduce block jump feeds [passthrough, sum].
+        let term = data.layout().basicblock(header).terminator();
+        let InstKind::Branch(branch) = data.inst_data(term).kind() else {
+            panic!("header must end in a branch");
+        };
+        let reduce_jump = data.layout().basicblock(branch.f_target()).terminator();
+        let InstKind::Jump(jump) = data.inst_data(reduce_jump).kind() else {
+            panic!("reduce block must end in a jump");
+        };
+        assert_eq!(jump.target(), exit);
+        assert_eq!(jump.args().len(), 2, "exit receives [passthrough, sum]");
+        assert_eq!(jump.args()[0], seven, "passthrough forwarded unchanged");
+        assert!(
+            data.inst_data(jump.args()[1]).ty().is_i32(),
+            "the appended param receives the scalar sum"
+        );
+        assert!(!run(&mut program, function), "vectorized loop must not re-fire");
+    }
+
+    #[test]
+    fn rejects_test_at_top_non_reducible_effective_2() {
+        // A second effective parameter that is not a B1 accumulator must
+        // stay rejected: `[iv, x]` with `x' = rem(x, 5)` (the get_random
+        // shape). Either M42 refuses a Reducible verdict or the
+        // accumulator checks reject it — in both cases the loop stays
+        // scalar.
+        let mut program = Program::new();
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr.clone());
+            program.new_value().global_alloc(init)
+        };
+        let b = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_unit(), "tat_rem".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for bb in [header, latch, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let five = data.new_local_inst().integer(5);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero]);
+        data.layout_mut().insert_inst(entry, zero);
+        data.layout_mut().insert_inst(entry, five);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let iv = data.bb_data(header).params()[0];
+        let x = data.bb_data(header).params()[1];
+        let bound = data.new_local_inst().integer(16);
+        let cond = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+        let header_br = data.new_local_inst().branch(cond, latch, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, cond);
+        data.layout_mut().insert_inst(header, header_br);
+        let one = data.new_local_inst().integer(1);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let sum = lb.binary(BinaryOp::Add, load_a, one);
+        let gep_b = lb.get_elem_ptr(b, vec![zero, iv]);
+        let store = lb.store(sum, gep_b);
+        drop(lb);
+        // x' = rem(x, 5): a second effective parameter that is neither a
+        // passthrough nor a reducible accumulator.
+        let x_next = data.new_local_inst().binary(BinaryOp::Rem, x, five);
+        let iv_next = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        let latch_jump = data.new_local_inst().jump(header, vec![iv_next, x_next]);
+        for inst in [
+            one, gep_a, load_a, sum, gep_b, store, x_next, iv_next, latch_jump,
+        ] {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+        assert!(
+            !run(&mut program, function),
+            "non-reducible effective==2 test-at-top loop must stay scalar"
         );
     }
 

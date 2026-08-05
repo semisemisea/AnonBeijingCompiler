@@ -688,6 +688,34 @@ payload 收集（跨块扩展）：
 
 达成判定：上述验收全过 = B1 达成；matmul1 掩码内核出向量指令。
 
+##### A2/A4 调研结论（2026-08-05, subagent 超时后主 agent 补跑）
+
+A2 shape_header_multi_inst（168 次）——**整体低 ROI，降级**：
+- 形态 1（crypto-1 padding 循环 `while (input_len % 64 != 56)`）：
+  header 7 条指令（sar/shr/add/and/sub 取模链 + lt + br），bound
+  依赖循环内变化的 input_len——不是范围循环 → **正确拒绝，不修**
+- 形态 2（bound 常量表达式，如 `while (i < 5*5)`）：header 含
+  未折叠的 mul + [lt, br] → 首轮 shape_header_multi_inst，但
+  rotate 后续轮次兜底转 rotated → 最终走 rotated 路径——**修法
+  （header 允许不变量指令）ROI 低**，暂不修
+- 结论：168 次中可修子类有限；修 A2 前先确认「rotate 不兜底」
+  的子类是否存在（当前证据：rotate 兜底普遍）
+
+A4 exit_has_params（48 次）——**高 ROI，A3+A4+C1 解锁 01_mm**：
+- 代表形态（01_mm1 计算内核 while_entry_16_mm_inline_34，IR
+  143-155 行）：header [i, j, k, t] 4 参数（A3 后 i/k 为
+  passthrough，effective=[j] ✓）；exit while_end_18 带 3 参数
+  [i, j 终值, k]——**IV 终值**（j 退出时的值，传给外层循环）
+- 根因：exit 参数允许集 = passthrough + acc，IV 终值不在集内
+- 修法：exit 参数分类接受 IV 终值（向量化后 = i0 + step*Q，
+  即 i0+4Q）——apply 时 exit 边重写传计算值；~60 行
+  （analyze step 4/7 的 exit 参数检查 + apply 的 exit 边重写）
+- 预期提升：01_mm1/2/3 计算内核解锁（配合 A3 + C1）；
+  exit_has_params 计数显著下降
+- 注意：该内核同时含 C[i][j] 同地址 R/W（写值依赖链含 B 的
+  load %119）——需 C1（B3 覆盖多 load 依赖链）才能最终向量化；
+  A4 单独做可让 analyze 通过 exit 检查（下游 C1 完成前不向量化）
+
 #### M45：SLP 基本块向量化 + 循环展开
 
 - SLP（`raana_ir/src/opt/passes/slp.rs`）：把同一基本块内相邻、类型一致的独立

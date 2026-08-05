@@ -81,6 +81,32 @@ pub fn outgoing_edges(data: &FunctionData, source: BasicBlock) -> SmallVec<[Logi
     }
 }
 
+/// Return block parameters that are copies rather than real phi values.
+/// A parameter is forwarded only when every logical incoming edge supplies
+/// the exact same SSA value; keeping branch arms distinct is essential when a
+/// branch targets the same block on both sides.
+pub fn forwarded_block_params(data: &FunctionData, cfg: &CFG) -> FxHashMap<Inst, Inst> {
+    cfg.blocks()
+        .iter()
+        .flat_map(|&block| {
+            let edges = incoming_edges(data, cfg, block);
+            data.bb_data(block)
+                .params()
+                .iter()
+                .copied()
+                .enumerate()
+                .filter_map(move |(position, parameter)| {
+                    let first = edges.first()?.args(data).get(position).copied()?;
+                    (first != parameter
+                        && edges
+                            .iter()
+                            .all(|edge| edge.args(data).get(position) == Some(&first)))
+                    .then_some((parameter, first))
+                })
+        })
+        .collect()
+}
+
 pub fn incoming_edges(
     data: &FunctionData,
     cfg: &CFG,

@@ -12,7 +12,10 @@ use crate::opt::{
     utils::{
         cfg::CFG,
         gep::gep_index_stride,
-        logical_edge::{LogicalEdge, LogicalEdgeRewriter, incoming_edges, outgoing_edges},
+        logical_edge::{
+            LogicalEdge, LogicalEdgeRewriter, forwarded_block_params, incoming_edges,
+            outgoing_edges,
+        },
         pointer_strength_reduction_cost::estimate_aarch64_pointer_strength_reduction,
         preheader::{EnsurePreheader, ensure_preheader},
     },
@@ -157,31 +160,7 @@ impl PointerStrengthReduction {
 
         let mut best = None;
         let header_params = data.bb_data(looop.header()).params().to_vec();
-        // Inlining commonly leaves affine address expressions behind chains
-        // of single-predecessor continuation blocks. Their parameters are
-        // copies, not phis. Resolve a parameter only when every logical
-        // incoming edge supplies the exact same value, preserving real merge
-        // parameters and same-target branch-arm distinctions.
-        let forwarded_params = cfg
-            .blocks()
-            .iter()
-            .flat_map(|&block| {
-                let edges = incoming_edges(data, cfg, block);
-                data.bb_data(block)
-                    .params()
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .filter_map(move |(position, parameter)| {
-                        let first = edges.first()?.args(data).get(position).copied()?;
-                        (first != parameter
-                            && edges
-                                .iter()
-                                .all(|edge| edge.args(data).get(position) == Some(&first)))
-                        .then_some((parameter, first))
-                    })
-            })
-            .collect::<FxHashMap<_, _>>();
+        let forwarded_params = forwarded_block_params(data, cfg);
         // A header block parameter that every backedge passes through unchanged
         // is loop-invariant: its value on the first entry equals its value in
         // every iteration, so the preheader edge argument can substitute for it

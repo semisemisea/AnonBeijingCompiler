@@ -3231,3 +3231,83 @@ fadd/fsub/fmul 发射）、标量路径（真标量输出与 .out 一致）。
 - [ ] 提交历史干净（原子 commit，中文消息）；结论写入 TODO.md §10.18
 - [ ] 最终 git status 只剩非本任务文件
 ```
+
+### 10.19 session 启动提示词（f32 调研 subagent + 主 agent 继续 SIMD，可直接粘贴新 session）
+
+```text
+# Goal: 双轨 session——f32 残余 bug 派 subagent 调研 + 主 agent 自己继续 SIMD（参数数组基址向量化）
+
+## 你在这个 session 的角色
+
+你是主 agent：**自己干 SIMD 真活（Track B）**；把 f32 调研（Track A）用
+delegate_task 派给 subagent（leaf，任务文本见下）。两轨并行，**零文件重叠**
+（A=后端 taki_mir/anon_armv8；B=raana_ir）。
+
+## 仓库状态（2026-08-06，分支 feat/loop-vectorize-hermes @ 4d4c8af）
+
+- 已合入：rotated（test-at-bottom）runtime 向量化（2731143）、后端 s/v 别名
+  fix（4039233，5 提交）、sibling 执行记录（4568a43）、docs 至 §10.18。
+- 已完成的 SIMD 能力：test-at-top runtime、rotated runtime、i32/f32
+  elementwise + B1 归约 + tail 链；01_mm1/2/3 内核出 NEON（mm1 qemu -11.8%）。
+- 待办（本 session 两轨）：h-10 三例 FAIL（f32 向量路径 1.45% 数值 bug，
+  Track A）；h-5（ludcmp）/h-8（nussinov）内核循环未向量化（Track B）。
+- 工作树：只剩 ?? Vectorize_Progress.md（非本任务文件，勿提交）。
+- 全量测试用户自己跑；你的验收粒度 = 单测 + 单 case。
+
+## 第一步：读 TODO.md 三个章节（任务全文都在里面）
+
+- **§10.17**：SIMD 下一步 goal（参数数组基址向量化）——**你的 Track B 任务
+  全文**：复扫数据（h-5/h-8 load_classify 4/3、load_unmodeled 4/3、
+  UnknownBase 15/3+1）、根因（base_is_16b_aligned:1617 对 MemObject::Param
+  直接 false）、设计（IPA 参数对齐推断，复用 call_graph）、验证命令、代码
+  位置、验收清单。
+- **§10.18**：f32 残余 bug 调研 goal——**Track A 的 subagent 任务全文**：
+  实证（-O0 标量=0x1.7a47acp+13 正确 / -O2 向量=0x1.74d3aep+13 差 1.45%）、
+  工具链坑、验证命令（直接容器调用）、代码位置、验收清单。
+- **§10.16**：s/v 修复背景（已完成，仅作 Track A 的上下文参考）。
+
+## 执行顺序
+
+1. **先派 Track A subagent**（delegate_task，leaf）：
+   - goal = §10.18 的"自包含 goal 提示词"全文（原样粘贴，含约束/验证/验收）
+   - context = 分支纪律（从 feat/loop-vectorize-hermes 切新分支，完成后
+     报告 commit hash 与验证数字）；输出语言中文；明确"自报不可信——必须
+     附可验证产物：h-10 直接容器 -O2 运行输出、cargo test --workspace 结果、
+     commit hash"
+2. **自己开始 Track B**（§10.17）：先 M44_TRACE=1 复扫 h-5-01 确认
+   load_classify 的具体循环与 MemObject 形态（形态实证先行），再实现 IPA
+   参数对齐推断（复用 call_graph::CallGraph），逐步 commit。
+3. **subagent 结果回来**：验证其可验证产物（直接容器 -O2 输出 = .out、
+   workspace 单测、commit hash），合并其分支，结论落 TODO §10.18 执行记录。
+4. **双轨收尾**：Track B 结论落 §10.17 执行记录；跑回归（01_mm1/2/3、
+   matmul1、h-10 三例、RISC-V 抽查）；最终 git status 只剩非本任务文件后
+   汇报。
+
+## 工具链坑（两轨都涉及，别被误导）
+
+- `make test ARGS="-O 0"` **实际跑 O2 管线**（-O 参数未生效，机制未查明）——
+  **标量对照/权威验证一律用直接容器调用**（§10.18 验证命令里的 docker run
+  --entrypoint 三步曲），不要用 harness 的 -O0。
+- musl 编译器过期（时间戳坑）：`touch raana_ir/src/opt/pass.rs
+  soyo_compiler/src/main.rs && make test-compiler` 重编。
+- harness 每个 case 跑两次（-S + --emit ir），IR dump 崩溃会以 CE 出现。
+
+## 必须遵守的规则
+
+- Track A：只改 taki_mir/anon_armv8；Track B：只改 raana_ir。互不跨界。
+- 无 hacky workaround；root cause only；不做 benchmark/函数名/输入条件优化；
+  禁止 Rc<RefCell<T>> / RefCell 共享可变。
+- 改文件一律 patch；commit 消息中文（[Feat(Opt)]/[Fix(Opt)]/[Docs]），消息写
+  文件用 git commit -F（规避 homoglyph 扫描）；不碰 .docker-image、不
+  rm -rf、不 cargo clean；不 push。
+- 勤 commit、勤单测：每个原子部分完成即 commit。
+
+## 完成条件（全部满足才汇报完成）
+
+- Track A：h-10-01/02/03 直接容器 -O2 运行 = .out（0x1.7a47acp+13）；
+  后端单测 ≥1 覆盖；01_mm1/2/3、matmul1 不回归；RISC-V 零影响。
+- Track B：h-5/h-8 内核循环向量化（load_classify/load_unmodeled 计数下降，
+  记录复扫数字）；h-5-01/02/03、h-8-01/02/03 差分 PASS（记录 qemu r: 前后）；
+  新增单测 ≥3；raana_ir 全量全绿；01_mm1/2/3、matmul1 不回归；RISC-V 零影响。
+- 双轨结论分别落 TODO §10.17/§10.18；git status 只剩非本任务文件。
+```

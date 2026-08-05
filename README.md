@@ -62,23 +62,21 @@ optimizations.
 
 ## Current Progress
 
-- Frontend float support
-- Backend codegen
-- IR text dump.
-- IR optimization
+- Aarch64 SIMD/NEON Support.
 
 ## Usage
 
 Build the CLI with `cargo build -p soyo_compiler`, then run:
 
 ```bash
-soyo_compiler -S --target aarch64 -o testcase.s testcase.sy [-O 1]
+compiler -S --target aarch64 -o testcase.s testcase.sy [-O 1]
 ```
 
-`-S` is an alias for `--emit asm`. The default target is `riscv64`; pass
-`--target aarch64` for GNU AArch64 assembly. `--emit ir`, `--emit llvm`, and
-`--emit asm` select outputs. Multiple comma-separated `--emit` values treat
-`-o` as an output directory and name files from the input stem.
+`-S` is an alias for `--emit asm`. The default target is `Aarch64`; pass
+`--target aarch64` for GNU AArch64 assembly, or you can pass `riscv64` for
+RISC-V assembly. `--emit ir`, `--emit llvm`, and `--emit asm` select outputs.
+Multiple comma-separated `--emit` values treat `-o` as an output directory
+and name files from the input stem.
 
 ### Optimization levels
 
@@ -91,7 +89,7 @@ soyo_compiler -S --target aarch64 -o testcase.s testcase.sy [-O 1]
 Explicit flags override the level defaults:
 
 ```bash
-soyo_compiler -O2 --disable-sched -S --target aarch64 -o out.s test.sy
+compiler -O2 --disable-sched -S --target aarch64 -o out.s test.sy
 ```
 
 Available AArch64 MIR pass controls: `--enable/--disable-mir-dce`,
@@ -145,23 +143,63 @@ We referred to the docs and learn how each pass work, and then chose some of the
 Code of one member of our team attending `pku-minic` course.
 `SoyoCompiler` is migrated and polish directly based on `s2r` repository.
 
+[cranelift](<https://github.com/bytecodealliance/wasmtime>
+The backend design is a simplified copy-paste from `cranelift`.
+Such as `VCodeContainer<I>`, `ABIMachineSpec<I>` and more.
+
 ## Appendix(i): Pass
 
-Each pass will be introduced with a simple description. For more information, please help yourself on wikipedia/internet.
+Each pass will be introduced with a simple description.
+For more information, please help yourself on wikipedia/internet.
 
 ### SSA/mem2reg
 
 Transform the original IR to static single assignment(SSA) form.
 
+### Memoize
+
+A special pass that could *only* (haha) apply for competition compiler.
+It need to satisfy pure, recursive and a bunch of other strict condition,
+then we wrap it in a memoizer like `@cache` in python.
+
+Helpful in fibonacci-like function.
+
 ### ADCE
 
 Aggressive dead code elimination that based on SSA.
-It will assert every instruction, except instruction that have side-effect, is dead at beginning.
 
-### SCCP
+It will assert every instruction, except the one that have side-effect,
+is `dead` at beginning. Then for every living instruction, the instruction
+it uses need to be `alive`. Then we iterate until the fix-point.
+
+### (IP)SCCP
 
 Sparse condition constant propagation that based on SSA.
 Can propagate more constant than regular algorithm due to well property introduced by SSA.
+For now we are using a intra-procedural model.
+It's control-flow sensitive and context-insensitive.
+Most context-sensitive case is solved by `Specialize`
+
+### General Tail Call Optimization
+
+### Specialize
+
+Find the call site `(callee, args)` where there are constant(s) in arguments.
+Then we clone a new function `callee_specialized_1`.
+Reuse the function with same arguments.
+
+Most of the specialized function would be inlined, and the constant would be
+propagate by (IP)SCCP.
+
+Since we are not caring about the size of binary, using a clone of function
+to trade speed is acceptable.
+
+### Inline
+
+Use a heuristic cost model to decide whether a function should inline or not.
+In the whole program, function that is not a declaration, is not recursively
+called, its instruction counts is less than 40, would be inlined.
+For the call-site in the loop, the limit is raised to 200.
 
 ### GVN
 
@@ -173,3 +211,4 @@ Find and replace the value/pattern that has been calculated.
 Strength reduction.
 Replace complex instruction to simple one.
 E.g.: `%1 = mul %0, 2` is equivalent to `%1 = shl %0, 1`
+At lowering stage we have more complex strength reduction.

@@ -108,6 +108,41 @@ pub fn forwarded_block_params(data: &FunctionData, cfg: &CFG) -> FxHashMap<Inst,
         .collect()
 }
 
+/// Resolve copy-parameter chains to their terminal SSA value. Cycles have no
+/// terminal value and are omitted. Results are cached while walking the map so
+/// shared tails are traversed only once.
+pub fn resolve_forwarded_params(forwarded: &FxHashMap<Inst, Inst>) -> FxHashMap<Inst, Inst> {
+    let mut cache = FxHashMap::<Inst, Option<Inst>>::default();
+    for &start in forwarded.keys() {
+        if cache.contains_key(&start) {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut positions = FxHashMap::default();
+        let mut current = start;
+        let resolved = loop {
+            if let Some(&resolved) = cache.get(&current) {
+                break resolved;
+            }
+            if positions.insert(current, path.len()).is_some() {
+                break None;
+            }
+            path.push(current);
+            match forwarded.get(&current).copied() {
+                Some(next) if next != current => current = next,
+                _ => break Some(current),
+            }
+        };
+        for value in path {
+            cache.insert(value, resolved);
+        }
+    }
+    forwarded
+        .keys()
+        .filter_map(|value| cache.get(value).copied().flatten().map(|end| (*value, end)))
+        .collect()
+}
+
 pub fn incoming_edges(
     data: &FunctionData,
     cfg: &CFG,
@@ -182,12 +217,6 @@ impl LogicalEdgeRewriter {
         self.edit(data, edge, |_target, args| args.push(value));
     }
 
-    pub fn remove_arg(&mut self, data: &FunctionData, edge: LogicalEdge, index: usize) {
-        self.edit(data, edge, |_target, args| {
-            args.remove(index);
-        });
-    }
-
     pub fn edit(
         &mut self,
         data: &FunctionData,
@@ -260,6 +289,31 @@ fn snapshot_terminator(data: &FunctionData, terminator: Inst) -> TerminatorRewri
 mod tests {
     use super::*;
     use crate::ir::{Program, Type, builder_trait::*};
+
+    #[test]
+    fn resolves_shared_forwarding_tails_and_rejects_cycles() {
+        let mut program = Program::new();
+        let terminal = program.new_value().integer(7);
+        let first = program.new_value().integer(1);
+        let second = program.new_value().integer(2);
+        let shared = program.new_value().integer(3);
+        let cycle_a = program.new_value().integer(4);
+        let cycle_b = program.new_value().integer(5);
+        let forwarded = FxHashMap::from_iter([
+            (first, shared),
+            (second, shared),
+            (shared, terminal),
+            (cycle_a, cycle_b),
+            (cycle_b, cycle_a),
+        ]);
+
+        let resolved = resolve_forwarded_params(&forwarded);
+        assert_eq!(resolved.get(&first), Some(&terminal));
+        assert_eq!(resolved.get(&second), Some(&terminal));
+        assert_eq!(resolved.get(&shared), Some(&terminal));
+        assert!(!resolved.contains_key(&cycle_a));
+        assert!(!resolved.contains_key(&cycle_b));
+    }
 
     #[test]
     fn enumerates_same_target_branch_arms_independently() {

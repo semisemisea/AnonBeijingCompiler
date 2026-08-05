@@ -274,6 +274,13 @@ impl PassesManager {
         let guard_elimination = Box::new(guard_elimination::GuardElimination);
         p.register(guard_elimination);
 
+        // Fold `x % P` into a conditional subtraction when the dividend is
+        // provably in `[0, 2P)` (one `sub; cmp; csel` instead of a 4-6
+        // instruction magic-number sequence). Runs after guard elimination so
+        // the range facts are stable.
+        let mod_fold = Box::new(mod_fold::ModFold);
+        p.register(mod_fold);
+
         let sr = Box::new(sr::StrengthReduction);
         p.register(sr);
 

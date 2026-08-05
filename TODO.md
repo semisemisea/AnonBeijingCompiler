@@ -636,6 +636,58 @@ C. 依赖层（M42/B3，dependence.rs）
 - conv2d = A3 + A2 + B4(Rem, ISA 限制)
 - matmul1 转置（B5）、min（B2/B3）为 v3 lowering 缺口
 
+##### B1 多块体处理（单臂 if 形态）细化计划（2026-08-05）
+
+前置验证（已完成, commit 1497fb8）：逐 lane select 掩码向量化 spike——
+VecSelect 分类放宽（payload 值条件）+ 白名单加 Eq/Gt，单测全绿
+（vectorizes_lane_cond_select），证明掩码组合 ((t & ~m)|(f & m),
+m=-(eq(cond,0))) 不需要 bsl/csel lowering。真实管线链路仍需 B1
+（if_conversion 不提升含 load 分支 → select 不产生 → 多块体）。
+
+目标：matmul1 奇偶掩码内核（源码 41-50 行）+ corpus 111 次
+shape_body_not_2_blocks 向量化。
+
+形态识别（analyze_loop body 检测扩展）：
+- 接受 body = {header, latch, if_head, arm, merge}（单臂 if）：
+  if_head: br cond → arm / merge（一侧空跳）；arm: 单出口
+  jump merge（含 load/binary/store）；merge: payload 尾 + latch
+- 判定：arm 单出口、merge 单入、if_head 仅此一分支结构
+
+payload 收集（跨块扩展）：
+- arm + merge 内 load/binary/store 统一进 payload（现有收集扩展）
+- load 地址检查复用 load_classify（base=header 参数/不变量）
+
+变换（apply）：
+1. store 条件化：store src → (new_src & ~m) | (old_val & m)，
+   m = -(eq(cond,0))——复用 VecSelect 掩码变换（spike 就绪）
+2. old_val：arm 内若已 load 同一 store 地址则复用，否则在 arm
+   load 链中补插 load
+3. 分支消除：if_head/arm 并入（块删 + 边重定向），循环体回 2 块
+
+归约识别扩展（matmul1 temp 特有, 第三步）：
+- 掩码化后 temp 更新 = select(m, add(temp, d), temp)——B1 归约
+  识别接受 select 更新链（acc' = select(m, add(acc,d), acc)）
+
+依赖检查：
+- 跨块 def-use（arm 内 load → binary → store）检查；cond 必须
+  payload 值或不变量（逐 lane 掩码 ✓）
+
+验收：
+- 单测：构造 if 头多块体循环向量化 + 无标量残留
+- matmul1 -O2 内核出 ldr q + cmgt/and/eor + add v.4s + str q
+  （clang 汇编验证）
+- make test 三级差分 PASS；corpus 复扫 shape_body_not_2_blocks
+  下降（目标 ≥30 次）
+- 改动量估计：~300 行（纯 loop_vectorize.rs）
+
+风险与前置：
+- 实现前先 dump matmul1 IC 交换后的真实内核形态（temp 归约层级、
+  if 位置）——最大不确定点
+- 跨块 payload 的 def-use/escape 检查是新逻辑（测试覆盖重点）
+- 不碰 if_conversion/lowering
+
+达成判定：上述验收全过 = B1 达成；matmul1 掩码内核出向量指令。
+
 #### M45：SLP 基本块向量化 + 循环展开
 
 - SLP（`raana_ir/src/opt/passes/slp.rs`）：把同一基本块内相邻、类型一致的独立

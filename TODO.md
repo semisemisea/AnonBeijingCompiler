@@ -100,9 +100,7 @@
 
 - QEMU 6.5-8.4s 仍未到 ≤4s 参照：命中路径仍是一次完整函数调用（~28 条）；
   若要逼近 C 的 3.74s，需把命中 probe 内联进调用方循环，或做迭代回填省递归。
-- 缓存内存：h-1-01 需 400MB（4 字节/条目）；int16+tag 打包可减半。
-- LLVM 路径注意：`--emit llvm` 会输出未定义的 `soyo_calloc`（test-llvm 不在
-  门禁内，需在 LLVM emitter 里处理或文档声明）。
+ - 缓存内存：h-1-01 需 400MB（4 字节/条目）；int16+tag 打包可减半。
 - `f_memo` 仍是非尾递归自调用（调用后做回填），tail_recursive_inline 不适用。
 
 ## M69：NEON 自动向量化（进行中，重启 M42-M46 SIMD Phase 2）
@@ -167,7 +165,6 @@ clang h-1-03 84。
 | RISC-V 回归 | 中 | 新 pass 按 target 注册；双 target 回归 |
 | M68 合规风险（函数名/输入值匹配） | 高 | 只按结构触发；缓存尺寸来自运行时 bound，不写死 |
 | M68 缓存内存（h-1-01 400MB） | 中 | int16+tag 打包减半（Phase D） |
-| M68 `soyo_calloc` 在 LLVM 路径未定义 | 低 | test-llvm 不在门禁；LLVM emitter 需声明或文档注明 |
 
 ## 交接
 

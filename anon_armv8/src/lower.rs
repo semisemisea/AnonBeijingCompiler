@@ -1221,6 +1221,49 @@ fn lower_mulmod_builtin(
     LoweredOutput::Value(result)
 }
 
+/// The compiler-provided runtime cache allocator declared by the M68
+/// recursive-memoization pass. It has no body: every call is redirected to the
+/// embedded `.Lsoyo_calloc` wrapper, which zero-extends the two 32-bit
+/// arguments and tail-calls glibc `calloc`.
+fn is_calloc_builtin(arena: ArenaContext<'_>, callee: HirFunction) -> bool {
+    arena.func_data(callee).name() == raana_ir::opt::CALLOO_NAME
+}
+
+fn lower_calloc_builtin(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    inst: HirInst,
+    call: &Call,
+) -> LoweredOutput {
+    let args = call.args();
+    assert_eq!(args.len(), 2, "soyo_calloc takes exactly two arguments");
+    let count = ctx.put_value_in_reg(args[0]);
+    let elem_size = ctx.put_value_in_reg(args[1]);
+    let result = ctx.result_reg(inst);
+    ctx.emit(MInst::Call {
+        args: vec![
+            CallArgPair {
+                vreg: count,
+                preg: regs::INT_ARG_REGS[0],
+            },
+            CallArgPair {
+                vreg: elem_size,
+                preg: regs::INT_ARG_REGS[1],
+            },
+        ],
+        ret: Some(CallRetPair {
+            vreg: Writable::from_reg(result),
+            preg: regs::INT_RETURN_REG,
+        }),
+        clobbers: regs::DEFAULT_CLOBBERS,
+        label: Label::Embedded(EmbeddedSymbol::Calloc),
+    });
+    ctx.set_has_calls();
+    ctx.set_outgoing_arg_size(0);
+    let _ = arena;
+    LoweredOutput::Value(result)
+}
+
 fn lower_call(
     ctx: &mut LowerContext<'_, MInst>,
     arena: ArenaContext<'_>,
@@ -1229,6 +1272,9 @@ fn lower_call(
 ) -> LoweredOutput {
     if is_mulmod_builtin(arena, call.callee()) {
         return lower_mulmod_builtin(ctx, arena, inst, call);
+    }
+    if is_calloc_builtin(arena, call.callee()) {
+        return lower_calloc_builtin(ctx, arena, inst, call);
     }
     let mut args = Vec::new();
     let types: Vec<_> = call

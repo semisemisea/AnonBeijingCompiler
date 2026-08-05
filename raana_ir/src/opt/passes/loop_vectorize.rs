@@ -795,12 +795,16 @@ fn analyze_loop(
                 classes.insert(inst, Class::VecBinary);
             }
             InstKind::Select(select) => {
-                // Only a loop-invariant condition is supported: the whole
-                // vector picks one side (mask rewrite). A lane-wise
-                // condition (comparison fed by payload values) needs a
-                // vector select / bsl at lowering — deferred to v3.
-                if !is_loop_invariant(arena, select.cond(), header, latch) {
-                    trace(data, looop, "select_lane_cond");
+                // A select whose condition is a payload value (lane-wise,
+                // e.g. a comparison fed by loads) or a loop-invariant is
+                // rewritten as a lane-wise mask selection
+                // `(t & ~m) | (f & m)` with `m = -(eq(cond, 0))`. The
+                // rewrite uses only whitelisted vector ops, so no vector
+                // select / bsl lowering is needed (v3 gap eliminated).
+                let cond_ok = payload.contains(&select.cond())
+                    || is_loop_invariant(arena, select.cond(), header, latch);
+                if !cond_ok {
+                    trace(data, looop, "select_cond_unknown");
                     return None;
                 }
                 classes.insert(inst, Class::VecSelect);
@@ -1102,6 +1106,8 @@ fn is_vectorizable_binary_op(op: BinaryOp) -> bool {
             | BinaryOp::Div
             | BinaryOp::Min
             | BinaryOp::Max
+            | BinaryOp::Eq
+            | BinaryOp::Gt
     )
 }
 
@@ -2093,66 +2099,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_select_in_body() {
-        // b[i] = select(a[i] > 0, a[i], 0): select is v2 territory.
-        let mut program = Program::new();
-        let i32 = Type::get_i32();
-        let arr = Type::get_array(i32.clone(), 64);
-        let a = {
-            let init = program.new_value().zero_init(arr.clone());
-            program.new_value().global_alloc(init)
-        };
-        let b = {
-            let init = program.new_value().zero_init(arr);
-            program.new_value().global_alloc(init)
-        };
-        let function = program.new_function(Type::get_unit(), "select_body".into(), vec![]);
-        let mut data = ArenaContextMut {
-            program: &mut program,
-            curr_func: Some(function),
-        };
-        let entry = data.add_entry_block();
-        let header = data
-            .new_basic_block()
-            .basic_block("header".into(), vec![i32.clone(), i32.clone()]);
-        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
-        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
-        for bb in [header, latch, exit] {
-            data.layout_mut().push_bb_back(bb);
-        }
-        let zero = data.new_local_inst().integer(0);
-        let trip_inst = data.new_local_inst().integer(16);
-        let entry_jump = data.new_local_inst().jump(header, vec![zero, trip_inst]);
-        data.layout_mut().insert_inst(entry, zero);
-        data.layout_mut().insert_inst(entry, trip_inst);
-        data.layout_mut().insert_inst(entry, entry_jump);
-        let iv = data.bb_data(header).params()[0];
-        let counter = data.bb_data(header).params()[1];
-        let header_jump = data.new_local_inst().jump(latch, vec![]);
-        data.layout_mut().insert_inst(header, header_jump);
-        let one = data.new_local_inst().integer(1);
-        let mut lb = LocalBuilder {
-            arena: &mut data as &mut dyn Arena,
-        };
-        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
-        let load_a = lb.load(gep_a);
-        let cond = lb.binary(BinaryOp::Gt, load_a, zero);
-        let value = lb.select(cond, load_a, zero);
-        let gep_b = lb.get_elem_ptr(b, vec![zero, iv]);
-        let store = lb.store(value, gep_b);
-        let iv_next = lb.binary(BinaryOp::Add, iv, one);
-        let t_next = lb.binary(BinaryOp::Sub, counter, one);
-        let back = lb.branch(t_next, header, vec![iv_next, t_next], exit, vec![]);
-        drop(lb);
-        for inst in [one, gep_a, load_a, cond, value, gep_b, store, iv_next, t_next, back] {
-            data.layout_mut().insert_inst(latch, inst);
-        }
-        let exit_ret = data.new_local_inst().ret(None);
-        data.layout_mut().insert_inst(exit, exit_ret);
-        assert!(!run(&mut program, function), "select must be rejected in v1");
-    }
-
-    #[test]
     fn vectorizes_reduction() {
         // B1: `sum += a[i]` — a 3-param loop [acc, iv, t] whose accumulator
         // update is `acc' = add(acc, load(a[iv]))`. The accumulator must
@@ -2967,15 +2913,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_lane_cond_select() {
+    fn vectorizes_lane_cond_select() {
         // `b[i] = (a[i] > 0) ? a[i] : 0` — the condition is a lane-wise
-        // payload value; a vector select / bsl at lowering is a v3 gap, so
-        // the loop stays scalar.
+        // payload value; the mask rewrite ((t & ~m) | (f & m)) needs only
+        // whitelisted vector ops, so it vectorizes without bsl lowering.
         let mut program = Program::new();
         let function = build_select_loop(&mut program, true);
         assert!(
-            !run(&mut program, function),
-            "lane-wise select condition must stay scalar (v3)"
+            run(&mut program, function),
+            "lane-wise select condition must vectorize via mask rewrite"
         );
     }
 

@@ -66,6 +66,7 @@ use crate::ir::function::FunctionData;
 use crate::opt::{
     analysis_passes::{
         dependence::{AccessKind, DependenceAnalysis, ReductionOp, Verdict},
+        dom_tree::v2::DominanceTree,
         effects::EffectAnalysis,
         loop_analysis::{Loop, LoopAnalysis},
         memory::MemObject,
@@ -344,11 +345,11 @@ fn find_vectorizable(
         curr_func: Some(func),
     };
     let data = program.func_data(func);
-    let (cfg, _dom, loops) = LoopAnalysis::new(data);
+    let (cfg, dom, loops) = LoopAnalysis::new(data);
     let dependence = DependenceAnalysis::new(program, func, effects, VF as u32);
     for looop in loops.loops() {
         if let Some(plan) =
-            analyze_loop(&arena, data, &cfg, &loops, &dependence, looop)
+            analyze_loop(&arena, data, &cfg, &dom, &loops, &dependence, looop)
         {
             return Some(plan);
         }
@@ -360,6 +361,7 @@ fn analyze_loop(
     arena: &ArenaContext<'_>,
     data: &FunctionData,
     cfg: &CFG,
+    dom: &DominanceTree,
     loops: &LoopAnalysis,
     dependence: &DependenceAnalysis,
     looop: &Loop,
@@ -882,16 +884,22 @@ fn analyze_loop(
             }
             let delta = binary.rhs();
             // The accumulator must be consumed only by its update chain,
-            // the latch, and — for test-at-top loops — the exit block
-            // (which reads the header parameter directly via SSA
-            // dominance; the apply phase rewrites those reads to the
-            // reduced scalar). Rotated loops carry `acc'` through the
-            // latch branch's f_args, so any other user stays scalar.
+            // the latch, and — for test-at-top loops — the exit region
+            // (the exit block and the blocks it dominates, which read the
+            // header parameter directly via SSA dominance; the apply
+            // phase rewrites those reads to the reduced scalar). Rotated
+            // loops carry `acc'` through the latch branch's f_args, so
+            // any other user stays scalar. Orphaned instructions
+            // (removed from the layout by a transform that failed to
+            // detach `used_by`) are unreachable and observe nothing, so
+            // they are not an escape.
             for &user in arena.inst_data(acc).used_by() {
-                let user_bb = data.layout().parent_bb(user);
+                let Some(user_bb) = data.layout().parent_bb(user) else {
+                    continue;
+                };
                 if user != update
-                    && user_bb != Some(latch)
-                    && !(test_at_top && user_bb == Some(exit))
+                    && user_bb != latch
+                    && !(test_at_top && dom.dominates(exit, user_bb))
                 {
                     trace(data, looop, "b1_acc_used_outside_latch");
                     return None;
@@ -1030,18 +1038,42 @@ fn analyze_loop(
         trace(data, looop, "trip_below_vf");
         return None;
     }
-    // A test-at-top reduction rewrites the exit block's direct reads of
-    // the header accumulator (and, with a runtime trip, the IV) through a
-    // fresh exit parameter / a rewritten use. That is only valid when the
-    // exit has no other predecessors whose argument values we cannot
-    // supply: the preheader guard edge (feeds the seed when the loop
-    // never runs) and the header's own exit edge (rewritten by the
-    // mutation phase).
+    // A test-at-top reduction rewrites the exit region's direct reads of
+    // the header accumulator (and, with a runtime trip, the IV) to the
+    // reduced scalar. That is only valid when the exit has no other
+    // predecessors whose argument values we cannot supply: the preheader
+    // guard edge (feeds the seed when the loop never runs) and the
+    // header's own exit edge (rewritten by the mutation phase).
     if test_at_top && (acc_info.is_some() || runtime_trip) {
         for &p in cfg.predecessors_of(exit) {
             if p != preheader && p != header {
                 trace(data, looop, "exit_extra_pred");
                 return None;
+            }
+        }
+    }
+    // The exit region's post-exit reads (blocks dominated by the exit)
+    // are rewritten to the reduce block's scalar sum, which only
+    // dominates them when every path goes through the reduce block. A
+    // preheader guard edge (trip == 0) bypasses it: exit-block users
+    // still resolve through the freshly added exit parameter (fed the
+    // seed), but post-exit users would read an undefined sum — reject
+    // that combination.
+    if test_at_top && acc_info.is_some() {
+        let guard_to_exit = matches!(
+            arena.inst_data(entry_edge).kind(),
+            InstKind::Branch(b) if b.f_target() == exit
+        );
+        if guard_to_exit {
+            let (acc, _, _) = acc_info.expect("acc_info set");
+            for &user in arena.inst_data(acc).used_by() {
+                let Some(user_bb) = data.layout().parent_bb(user) else {
+                    continue;
+                };
+                if user_bb != header && user_bb != latch && user_bb != exit {
+                    trace(data, looop, "exit_region_guard");
+                    return None;
+                }
             }
         }
     }
@@ -1631,9 +1663,11 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     // those reads are rewritten to a fresh scalar exit parameter fed the
     // reduced sum by the reduce block / epilogue chain. The parameter is
     // appended after any existing exit parameters (the exit edge args are
-    // rebuilt accordingly). The analyze gate (`exit_extra_pred`)
-    // guarantees the exit has no other predecessors, so the parameter can
-    // be added without touching unknown edges.
+    // rebuilt accordingly). The analyze gates (`exit_extra_pred`,
+    // `exit_region_guard`) guarantee the exit has no other predecessors
+    // and that any read outside the exit block lives in a block the
+    // reduce block dominates, so the parameter can be added and the
+    // post-exit reads rewritten without touching unknown edges.
     let exit_extra_acc: Option<Inst> = if test_at_top && reduction.is_some() {
         let acc = reduction.as_ref().expect("reduction set").acc;
         let exit_users: Vec<Inst> = data
@@ -1656,6 +1690,25 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         }
     } else {
         None
+    };
+    // Post-exit accumulator reads (blocks dominated by the exit — gated
+    // in analyze) are rewritten to the reduce block's scalar sum once it
+    // is built (the sum dominates the whole exit region because every
+    // path to it goes through the reduce block).
+    let post_exit_acc_users: Vec<Inst> = if test_at_top && reduction.is_some() {
+        let acc = reduction.as_ref().expect("reduction set").acc;
+        data.inst_data(acc)
+            .used_by()
+            .iter()
+            .copied()
+            .filter(|&u| {
+                data.layout()
+                    .parent_bb(u)
+                    .is_some_and(|bb| bb != exit && bb != header && bb != latch)
+            })
+            .collect()
+    } else {
+        Vec::new()
     };
     // A4: does any exit parameter carry the IV's final value? Those slots
     // must be fed the computed `i0 + VF*q` (+ the peeled remainder through
@@ -1689,14 +1742,21 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     };
     // The tail's entry index: `iv0 = i0 + max(cnt0, 0)` — the vector
     // loop advanced the index by `cnt0`, and a negative trip clamps back
-    // to `i0` so the tail runs zero iterations. Shared by the reduce
-    // block (reduction) and the exit-edge rewrite (elementwise).
+    // to `i0` so the tail runs zero iterations. The clamp is a scalar
+    // select (the AArch64 backend has no scalar min/max), lowered to
+    // `csel`. Shared by the reduce block (reduction) and the exit-edge
+    // rewrite (elementwise).
     let iv0: Option<Inst> = if runtime_trip {
         let zero = data.new_local_inst().integer(0);
+        let positive = alloc_inst(
+            data,
+            Binary::new_data(cnt0, zero, BinaryOp::Gt, i32.clone()),
+        );
         let cnt_clamped = alloc_inst(
             data,
-            Binary::new_data(cnt0, zero, BinaryOp::Max, i32.clone()),
+            Select::new_data(positive, cnt0, zero, i32.clone()),
         );
+        data.layout_mut().insert_inst_before(entry_edge, positive);
         data.layout_mut().insert_inst_before(entry_edge, cnt_clamped);
         let start = alloc_inst(
             data,
@@ -1868,10 +1928,12 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         None
     };
 
-    // 1b. Reduction exit block: `acc_final = VectorReduce(Add, acc_vec)`,
+    // 1c. Reduction exit block: `acc_final = VectorReduce(Add, acc_vec)`,
     //     then jump into the epilogue chain (or straight to the exit when
-    //     r == 0). Placed right after the latch. Passthrough values are
-    //     forwarded alongside the reduced accumulator.
+    //     r == 0, or into the scalar tail for a runtime trip). Placed
+    //     right after the latch. Passthrough values are forwarded
+    //     alongside the reduced accumulator.
+    let mut reduce_sum: Option<Inst> = None;
     let reduce_block: Option<BasicBlock> = if let Some(red) = &reduction {
         let mut param_tys = vec![i32.clone(); n_passthrough];
         param_tys.insert(0, vector_ty.clone());
@@ -1886,21 +1948,26 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         );
         data.layout_mut().insert_inst(rb, acc_final);
         // The scalar sum (`seed + Σc`) is needed when the exit receives
-        // the accumulator (through a parameter or the freshly added one)
-        // and when the runtime tail continues the reduction from it.
-        let sum: Option<Inst> =
-            (red.exit_acc_param.is_some() || exit_extra_acc.is_some() || runtime_trip).then(|| {
-                // The vector loop accumulates with a zero seed
-                // (splat(0)), so the outer seed must be added back:
-                // sum_final = seed + Σc. (Splatting the seed itself
-                // would overcount 4x at the addv.)
-                let sum = alloc_inst(
-                    data,
-                    Binary::new_data(red.acc_init, acc_final, BinaryOp::Add, i32.clone()),
-                );
-                data.layout_mut().insert_inst(rb, sum);
-                sum
-            });
+        // the accumulator (through a parameter or the freshly added one),
+        // when post-exit reads are rewritten to it, and when the runtime
+        // tail continues the reduction from it.
+        let sum: Option<Inst> = (red.exit_acc_param.is_some()
+            || exit_extra_acc.is_some()
+            || runtime_trip
+            || !post_exit_acc_users.is_empty())
+        .then(|| {
+            // The vector loop accumulates with a zero seed
+            // (splat(0)), so the outer seed must be added back:
+            // sum_final = seed + Σc. (Splatting the seed itself
+            // would overcount 4x at the addv.)
+            let sum = alloc_inst(
+                data,
+                Binary::new_data(red.acc_init, acc_final, BinaryOp::Add, i32.clone()),
+            );
+            data.layout_mut().insert_inst(rb, sum);
+            sum
+        });
+        reduce_sum = sum;
         let (target, args) = if runtime_trip {
             // The scalar tail continues the reduction: its accumulator
             // parameter is seeded with `sum = seed + Σc` and its index
@@ -1942,6 +2009,15 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     } else {
         None
     };
+    // Post-exit accumulator reads (blocks dominated by the exit, gated in
+    // analyze) are rewritten to the reduce block's scalar sum: the sum
+    // dominates the whole exit region because every path to it goes
+    // through the reduce block.
+    if let (Some(red), Some(sum)) = (&reduction, &reduce_sum) {
+        for user in post_exit_acc_users {
+            subst_operand(data, user, red.acc, *sum);
+        }
+    }
 
     if r > 0 {
         for (idx, &block) in epi_blocks.iter().enumerate() {
@@ -4451,16 +4527,21 @@ mod tests {
             panic!("trip must be `sub(bound, i0)`");
         };
         assert_eq!(sub.op(), BinaryOp::Sub);
-        // The tail entry carries `iv0 = i0 + max(cnt0, 0)`.
+        // The tail entry carries `iv0 = i0 + select(gt(cnt0, 0), cnt0, 0)`
+        // (the clamp is a scalar select — the backend has no scalar
+        // min/max).
         let f_args = branch.f_args().to_vec();
         let InstKind::Binary(iv0) = data.inst_data(f_args[0]).kind() else {
             panic!("tail entry index must be an add");
         };
         assert_eq!(iv0.op(), BinaryOp::Add);
-        let InstKind::Binary(clamp) = data.inst_data(iv0.rhs()).kind() else {
-            panic!("tail entry index must clamp cnt0");
+        let InstKind::Select(clamp) = data.inst_data(iv0.rhs()).kind() else {
+            panic!("tail entry index must clamp cnt0 with a select");
         };
-        assert_eq!(clamp.op(), BinaryOp::Max);
+        let InstKind::Binary(gt) = data.inst_data(clamp.cond()).kind() else {
+            panic!("the clamp's condition must be the sign test");
+        };
+        assert_eq!(gt.op(), BinaryOp::Gt);
         // The header's false edge targets the tail.
         assert!(
             data.bb_data(branch.f_target()).name().starts_with("vec_tail"),

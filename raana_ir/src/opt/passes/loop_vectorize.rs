@@ -67,7 +67,7 @@ use crate::opt::{
     analysis_passes::{
         dependence::{AccessKind, DependenceAnalysis, ReductionOp, Verdict},
         dom_tree::v2::DominanceTree,
-        effects::EffectAnalysis,
+        effects::{AbstractObject, EffectAnalysis},
         loop_analysis::{Loop, LoopAnalysis},
         memory::MemObject,
     },
@@ -349,7 +349,7 @@ fn find_vectorizable(
     let dependence = DependenceAnalysis::new(program, func, effects, VF as u32);
     for looop in loops.loops() {
         if let Some(plan) =
-            analyze_loop(&arena, data, &cfg, &dom, &loops, &dependence, looop)
+            analyze_loop(&arena, data, &cfg, &dom, &loops, &dependence, looop, func, effects)
         {
             return Some(plan);
         }
@@ -365,6 +365,8 @@ fn analyze_loop(
     loops: &LoopAnalysis,
     dependence: &DependenceAnalysis,
     looop: &Loop,
+    func: Function,
+    effects: &EffectAnalysis,
 ) -> Option<VecPlan> {
     // 1. Innermost only (a contained loop invalidates the shape below).
     if loops
@@ -1197,7 +1199,7 @@ fn analyze_loop(
             InstKind::Load(load) => {
                 let access = dep.accesses.iter().find(|a| a.inst == inst)?;
                 let Some((class, elem)) =
-                    classify_load(arena, load.src(), access, &payload, header, latch)
+                    classify_load(arena, func, effects, load.src(), access, &payload, header, latch)
                 else {
                                         trace(data, looop, "load_unmodeled");
         trace(data, looop, "load_classify");
@@ -1215,7 +1217,7 @@ fn analyze_loop(
         trace(data, looop, "store_not_contig_write");
         return None; // invariant / strided stores are not vectorized
                 }
-                if !base_is_16b_aligned(arena, access.base) {
+                if !base_is_16b_aligned(arena, effects, func, access.base) {
         trace(data, looop, "base_not_aligned");
         return None;
                 }
@@ -1488,6 +1490,8 @@ fn analyze_loop(
 /// Classify one load against its access function.
 fn classify_load(
     arena: &ArenaContext<'_>,
+    func: Function,
+    effects: &EffectAnalysis,
     addr: Inst,
     access: &crate::opt::analysis_passes::dependence::AccessFunction,
     payload: &[Inst],
@@ -1501,7 +1505,7 @@ fn classify_load(
     if !elem.is_i32() && !elem.is_f32() {
         return None;
     }
-    if access.size != VF || !base_is_16b_aligned(arena, access.base) {
+    if access.size != VF || !base_is_16b_aligned(arena, effects, func, access.base) {
         return None;
     }
     if !is_address_operand(arena, addr, payload, header, latch) {
@@ -1610,19 +1614,55 @@ fn is_loop_invariant(arena: &ArenaContext<'_>, inst: Inst, header: BasicBlock, l
     }
 }
 
-/// v1 alignment gate: the base object must be provably 16B-aligned (globals
+/// v2 alignment gate: the base object must be provably 16B-aligned (globals
 /// with size >= 16 are `.p2align 4`; AArch64 array stack slots round up to
-/// 16). Array parameters have unknown caller alignment and are rejected
-/// (that case needs M43 versioning).
-fn base_is_16b_aligned(arena: &ArenaContext<'_>, base: MemObject) -> bool {
+/// 16). Array parameters are aligned iff every call site passes a 16B-aligned
+/// actual (whole-program points-to from `EffectAnalysis`); unknown-provenance
+/// bases stay rejected (that case needs M43 versioning).
+fn base_is_16b_aligned(
+    arena: &ArenaContext<'_>,
+    effects: &EffectAnalysis,
+    func: Function,
+    base: MemObject,
+) -> bool {
     match base {
         MemObject::Global(global) => arena.inst_data(global).ty().derefernce().size() >= 16,
         MemObject::Alloc(alloc) => {
             let ty = arena.inst_data(alloc).ty().derefernce();
             matches!(ty.kind(), TypeKind::Array(_, _)) && ty.size() >= 16
         }
-        MemObject::Param(_) | MemObject::Unknown => false,
+        MemObject::Param(index) => param_is_16b_aligned(arena, effects, func, index),
+        MemObject::Unknown => false,
     }
+}
+
+/// IPA parameter-alignment inference: a function parameter is 16B-aligned
+/// when every actual at every call site resolves to a 16B-aligned base
+/// object. The `EffectAnalysis` points-to sets are a conservative may-set
+/// over all call sites (unknown-provenance actuals contribute
+/// `AbstractObject::Unknown` and reject the parameter); an absent or empty
+/// set means the function has no resolvable call sites — conservatively
+/// rejected.
+fn param_is_16b_aligned(
+    arena: &ArenaContext<'_>,
+    effects: &EffectAnalysis,
+    func: Function,
+    index: usize,
+) -> bool {
+    let Some(set) = effects.points_to_of(func, index) else {
+        return false;
+    };
+    if set.is_empty() {
+        return false;
+    }
+    set.iter().all(|obj| match obj {
+        AbstractObject::Global(g) => arena.inst_data(*g).ty().derefernce().size() >= 16,
+        AbstractObject::Alloc(_, a) => {
+            let ty = arena.inst_data(*a).ty().derefernce();
+            matches!(ty.kind(), TypeKind::Array(_, _)) && ty.size() >= 16
+        }
+        AbstractObject::Unknown => false,
+    })
 }
 
 fn merge_elem(slot: &mut Option<Type>, elem: Type) -> Option<()> {

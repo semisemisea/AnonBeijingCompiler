@@ -693,6 +693,16 @@ fn analyze_loop(
     let acc_update: Option<(Inst, Inst)> = match acc_info {
         Some((acc, acc_slot, bop)) => {
             let update = back_args[acc_slot];
+            // M42's `match_acc_update_op` cannot distinguish an induction
+            // step (`j' = add(j, 1)`) from a reduction update — the first
+            // matching parameter wins, which is the IV when it precedes the
+            // accumulator in the parameter list (e.g. `sum += c[i][j]`
+            // loops [i, j, sum, t]). A candidate whose update is exactly
+            // the latch's `iv_next` is the IV, not an accumulator.
+            if update == iv_next {
+                trace(data, looop, "b1_acc_is_iv");
+                return None;
+            }
             let InstKind::Binary(binary) = arena.inst_data(update).kind() else {
                 trace(data, looop, "b1_acc_update_not_binary");
                 return None;
@@ -1114,6 +1124,18 @@ fn analyze_loop(
         None => None,
         Some((acc, acc_slot, bop)) => {
             let (update, delta) = acc_update.expect("acc_update set alongside acc_info");
+            // The accumulator seed must be splattable at the entry edge. A
+            // seed that is another loop's block parameter (e.g. the outer
+            // `sum` of a nested `sum += c[i][j]`) is not materialized
+            // correctly by the current splat path — reject for now (the
+            // loop stays scalar).
+            if matches!(
+                arena.inst_data(entry_args[acc_slot]).kind(),
+                InstKind::BlockArgRef(_)
+            ) {
+                trace(data, looop, "b1_acc_init_block_arg");
+                return None;
+            }
             let delta_class = payload
                 .iter()
                 .position(|&p| p == delta)

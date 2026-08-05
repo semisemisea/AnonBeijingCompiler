@@ -1,5 +1,7 @@
 //! AArch64 selection from Raana HIR into generic VCode.
 
+use std::collections::HashSet;
+
 use raana_ir::ir::{
     Binary, BinaryOp, Call, Cast, Fma, GetElemPtr, InstKind, Load, Return, Select, Store, TailCall,
     Type as HirType, TypeKind, VectorExtractElement, VectorInsertElement, VectorReduce,
@@ -1899,20 +1901,24 @@ fn emit_and_comparison_tree(
         user: HirInst,
         comparisons: &mut Vec<HirInst>,
         edges: &mut Vec<(HirInst, HirInst)>,
+        visited: &mut HashSet<HirInst>,
     ) -> bool {
+        if !visited.insert(node) || !has_only_user(ctx, node, user) {
+            return false;
+        }
         let InstKind::Binary(binary) = arena.inst_data(node).kind() else {
             return false;
         };
-        if binary.op() == BinaryOp::And && has_only_user(ctx, node, user) {
-            if !collect(ctx, arena, binary.lhs(), node, comparisons, edges)
-                || !collect(ctx, arena, binary.rhs(), node, comparisons, edges)
+        if binary.op() == BinaryOp::And {
+            if !collect(ctx, arena, binary.lhs(), node, comparisons, edges, visited)
+                || !collect(ctx, arena, binary.rhs(), node, comparisons, edges, visited)
             {
                 return false;
             }
             edges.push((node, user));
             return true;
         }
-        if binary.op() == BinaryOp::NotEq && has_only_user(ctx, node, user) {
+        if binary.op() == BinaryOp::NotEq {
             let inner = if integer_constant(arena, binary.lhs()) == Some(0) {
                 Some(binary.rhs())
             } else if integer_constant(arena, binary.rhs()) == Some(0) {
@@ -1921,7 +1927,7 @@ fn emit_and_comparison_tree(
                 None
             };
             if let Some(inner) = inner {
-                if collect(ctx, arena, inner, node, comparisons, edges) {
+                if collect(ctx, arena, inner, node, comparisons, edges, visited) {
                     edges.push((node, user));
                     return true;
                 }
@@ -1933,15 +1939,22 @@ fn emit_and_comparison_tree(
             return false;
         }
         comparisons.push(node);
-        if has_only_user(ctx, node, user) {
-            edges.push((node, user));
-        }
+        edges.push((node, user));
         true
     }
 
     let mut comparisons = Vec::new();
     let mut edges = Vec::new();
-    if !collect(ctx, arena, root, branch, &mut comparisons, &mut edges)
+    let mut visited = HashSet::new();
+    if !collect(
+        ctx,
+        arena,
+        root,
+        branch,
+        &mut comparisons,
+        &mut edges,
+        &mut visited,
+    )
         || comparisons.len() < 3
         || comparisons.len() > 8
         || !ctx.sink_pure_single_use_tree(&edges, branch)

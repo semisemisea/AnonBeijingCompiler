@@ -27,11 +27,22 @@ pub struct LICM {
     /// address (see `load_hoist_safe`); without the analysis (direct
     /// `run_on` use) loads stay put.
     analysis: Option<EffectAnalysis>,
+    limit_computed_loads: bool,
 }
 
 impl LICM {
     pub fn new() -> LICM {
-        LICM { analysis: None }
+        LICM {
+            analysis: None,
+            limit_computed_loads: true,
+        }
+    }
+
+    pub fn for_target(limit_computed_loads: bool) -> LICM {
+        LICM {
+            analysis: None,
+            limit_computed_loads,
+        }
     }
 }
 
@@ -101,6 +112,7 @@ impl LICM {
         cfg: &CFG,
         dom_tree: &DominanceTree,
         parameter_blocks: &FxHashMap<Inst, BasicBlock>,
+        limit_computed_loads: bool,
     ) -> LoopResult {
         fn insts(looop: &Loop, data: &ArenaContextMut<'_>) -> impl Iterator<Item = Inst> {
             looop
@@ -309,12 +321,26 @@ impl LICM {
                 let InstKind::Load(load) = data.inst_data(inst).kind() else {
                     return false;
                 };
-                matches!(data.inst_data(load.src()).kind(), InstKind::GetElemPtr(..))
+                data.layout()
+                    .parent_bb(load.src())
+                    .is_some_and(|block| looop.contains(block))
             })
             .collect::<Vec<_>>();
-        if computed_loads.len() > MAX_HOISTED_COMPUTED_LOADS {
-            for inst in computed_loads {
-                map.insert(inst, Lattice::Variant);
+        if limit_computed_loads && computed_loads.len() > MAX_HOISTED_COMPUTED_LOADS {
+            let mut retained = VecDeque::from(computed_loads);
+            while let Some(inst) = retained.pop_front() {
+                if map.insert(inst, Lattice::Variant) != Some(Lattice::Invariant) {
+                    continue;
+                }
+                if let InstKind::Load(load) = data.inst_data(inst).kind() {
+                    retained.push_back(load.src());
+                } else {
+                    retained.extend(data.inst_data(inst).inst_usage().filter(|operand| {
+                        data.layout()
+                            .parent_bb(*operand)
+                            .is_some_and(|block| looop.contains(block))
+                    }));
+                }
             }
             // Any invariant expression depending on a retained load must stay
             // with it. Iterate to a fixed point because dependency chains may
@@ -544,6 +570,7 @@ impl Pass for LICM {
                     &cfg,
                     &dom_tree,
                     &parameter_blocks,
+                    self.limit_computed_loads,
                 ) {
                     LoopResult::Unchanged => {}
                     LoopResult::Changed => changed = true,
@@ -1120,6 +1147,7 @@ mod tests {
             .map(|_| new_global(&mut program))
             .collect::<Vec<_>>();
         let mut loads = Vec::new();
+        let mut addresses = Vec::new();
         let mut loop_header = None;
         let function = build_loop(
             &mut program,
@@ -1132,15 +1160,49 @@ mod tests {
                     let load = data.new_local_value().load(address);
                     data.layout_mut().insert_inst(header, address);
                     data.layout_mut().insert_inst(header, load);
+                    addresses.push(address);
                     loads.push(load);
                 }
             },
         );
 
-        assert!(run_with_analysis(&mut program));
+        assert!(!run_with_analysis(&mut program));
         let data = program.func_data(function);
         for load in loads {
             assert_eq!(data.layout().parent_bb(load), loop_header);
+        }
+        for address in addresses {
+            assert_eq!(data.layout().parent_bb(address), loop_header);
+        }
+    }
+
+    #[test]
+    fn target_without_load_bank_limit_hoists_computed_loads() {
+        let mut program = Program::new();
+        let globals = (0..=MAX_HOISTED_COMPUTED_LOADS)
+            .map(|_| new_global(&mut program))
+            .collect::<Vec<_>>();
+        let mut loads = Vec::new();
+        let function = build_loop(
+            &mut program,
+            "licm_unlimited_computed_load_bank",
+            |data, header, _body, _exit| {
+                let zero = data.new_local_value().integer(0);
+                for global in globals {
+                    let address = data.new_local_value().get_elem_ptr(global, vec![zero]);
+                    let load = data.new_local_value().load(address);
+                    data.layout_mut().insert_inst(header, address);
+                    data.layout_mut().insert_inst(header, load);
+                    loads.push(load);
+                }
+            },
+        );
+
+        assert!(LICM::for_target(false).run(&mut program));
+        let data = program.func_data(function);
+        let entry = data.layout().entry_bb().unwrap().bb();
+        for load in loads {
+            assert_eq!(data.layout().parent_bb(load), Some(entry));
         }
     }
 

@@ -2995,6 +2995,76 @@ mod tests {
         (function, header, latch, exit, acc, iv, counter)
     }
 
+    /// A rotated `dst[j] = src[j]` loop (`trip` iterations) over two
+    /// function-parameter array bases — the h-5/h-8 kernel shape.
+    fn param_copy_loop(program: &mut Program, name: &str, trip: i32) -> Function {
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let function = program.new_function(
+            Type::get_unit(),
+            name.into(),
+            vec![Type::get_pointer(arr.clone()), Type::get_pointer(arr)],
+        );
+        let mut data = ArenaContextMut {
+            program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for bb in [header, latch, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let trip_inst = data.new_local_inst().integer(trip);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero, trip_inst]);
+        data.layout_mut().insert_inst(entry, zero);
+        data.layout_mut().insert_inst(entry, trip_inst);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let iv = data.bb_data(header).params()[0];
+        let counter = data.bb_data(header).params()[1];
+        let _tmp = data.new_local_inst().jump(latch, vec![]);
+        data.layout_mut().insert_inst(header, _tmp);
+        let one = data.new_local_inst().integer(1);
+        let (src_ptr, dst_ptr) = (data.params()[0], data.params()[1]);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_src = lb.get_elem_ptr(src_ptr, vec![zero, iv]);
+        let load = lb.load(gep_src);
+        let gep_dst = lb.get_elem_ptr(dst_ptr, vec![zero, iv]);
+        let store = lb.store(load, gep_dst);
+        let iv_next = lb.binary(BinaryOp::Add, iv, one);
+        let t_next = lb.binary(BinaryOp::Sub, counter, one);
+        let back = lb.branch(t_next, header, vec![iv_next, t_next], exit, vec![]);
+        drop(lb);
+        for inst in [one, gep_src, load, gep_dst, store, iv_next, t_next, back] {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+        function
+    }
+
+    /// A `main` that calls `kernel` with the given actuals (its only purpose
+    /// is to feed the whole-program IPA points-to analysis).
+    fn call_kernel(program: &mut Program, kernel: Function, args: Vec<Inst>) -> Function {
+        let main = program.new_function(Type::get_unit(), "main".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program,
+            curr_func: Some(main),
+        };
+        let entry = data.add_entry_block();
+        let call = data.new_local_value().call(kernel, args);
+        data.layout_mut().insert_inst(entry, call);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+        main
+    }
+
     fn run(program: &mut Program, function: Function) -> bool {
         let mut context = ArenaContextMut {
             program,
@@ -3557,8 +3627,9 @@ mod tests {
 
     #[test]
     fn rejects_array_param_base() {
-        // dst[j] = src[j] over array parameters: caller alignment is
-        // unknown, so v1 rejects (versioning is M43).
+        // dst[j] = src[j] over array parameters: with no call site the IPA
+        // alignment inference has no evidence, so the base stays rejected
+        // (versioning is M43).
         let mut program = Program::new();
         let i32 = Type::get_i32();
         let function = program.new_function(
@@ -3613,6 +3684,106 @@ mod tests {
         assert!(
             !run(&mut program, function),
             "array parameter bases must be rejected in v1"
+        );
+    }
+
+    #[test]
+    fn vectorizes_param_base_all_aligned() {
+        // dst[j] = src[j] over parameter arrays whose only call site passes
+        // 16B-aligned globals: the IPA alignment inference must unlock the
+        // loop (both the load and the store pass the v2 alignment gate).
+        let mut program = Program::new();
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let src = {
+            let init = program.new_value().zero_init(arr.clone());
+            program.new_value().global_alloc(init)
+        };
+        let dst = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let kernel = param_copy_loop(&mut program, "kernel", 16);
+        call_kernel(&mut program, kernel, vec![src, dst]);
+        assert!(
+            run(&mut program, kernel),
+            "an all-aligned parameter base must vectorize (IPA)"
+        );
+        assert!(vector_load_count(&program, kernel) >= 1, "vector load emitted");
+    }
+
+    #[test]
+    fn rejects_param_mixed_alignment() {
+        // Two call sites: one passes a 256-byte global, the other an 8-byte
+        // global. The points-to may-set contains a non-aligned base, so the
+        // parameter stays scalar (no versioning).
+        let mut program = Program::new();
+        let i32 = Type::get_i32();
+        let arr64 = Type::get_array(i32.clone(), 64);
+        let arr2 = Type::get_array(i32.clone(), 2);
+        let big = {
+            let init = program.new_value().zero_init(arr64);
+            program.new_value().global_alloc(init)
+        };
+        let small = {
+            let init = program.new_value().zero_init(arr2);
+            program.new_value().global_alloc(init)
+        };
+        let kernel = param_copy_loop(&mut program, "kernel", 16);
+        call_kernel(&mut program, kernel, vec![big, big]);
+        call_kernel(&mut program, kernel, vec![small, small]);
+        assert!(
+            !run(&mut program, kernel),
+            "a parameter with a non-aligned call site must stay scalar"
+        );
+    }
+
+    #[test]
+    fn rejects_param_no_callsite() {
+        // No call site at all: the points-to table has no entry for the
+        // parameter — conservatively rejected (same guarantee as v1).
+        let mut program = Program::new();
+        let kernel = param_copy_loop(&mut program, "kernel", 16);
+        assert!(
+            !run(&mut program, kernel),
+            "unreachable parameter arrays must stay scalar"
+        );
+    }
+
+    #[test]
+    fn aligns_param_through_recursive_callsite() {
+        // The kernel calls itself with its own parameters. The recursive
+        // site's actuals are unresolved (the function's own parameters), so
+        // it contributes nothing to the points-to set; the concrete main
+        // site still carries the aligned globals → the parameter stays
+        // aligned. (Alignment is a monotone property; recursion cannot
+        // downgrade it.)
+        let mut program = Program::new();
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let src = {
+            let init = program.new_value().zero_init(arr.clone());
+            program.new_value().global_alloc(init)
+        };
+        let dst = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let kernel = param_copy_loop(&mut program, "kernel", 16);
+        {
+            let mut data = ArenaContextMut {
+                program: &mut program,
+                curr_func: Some(kernel),
+            };
+            let entry = data.layout().entry_bb().expect("entry block").bb();
+            let (p0, p1) = (data.params()[0], data.params()[1]);
+            let rec = data.new_local_value().call(kernel, vec![p0, p1]);
+            data.layout_mut().insert_before_terminator(entry, rec);
+        }
+        call_kernel(&mut program, kernel, vec![src, dst]);
+        assert!(
+            run(&mut program, kernel),
+            "recursion must not downgrade an all-aligned parameter"
         );
     }
 

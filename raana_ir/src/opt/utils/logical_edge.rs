@@ -4,7 +4,7 @@
 //! each jump/branch arm distinct so positional block arguments can be analyzed
 //! and rewritten without losing edge multiplicity.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use crate::{
@@ -84,7 +84,8 @@ pub fn outgoing_edges(data: &FunctionData, source: BasicBlock) -> SmallVec<[Logi
 /// Return block parameters that are copies rather than real phi values.
 /// A parameter is forwarded only when every logical incoming edge supplies
 /// the exact same SSA value; keeping branch arms distinct is essential when a
-/// branch targets the same block on both sides.
+/// branch targets the same block on both sides. Entry-block parameters are ABI
+/// values rather than phis and are never forwarded from loop backedges.
 pub fn forwarded_block_params(data: &FunctionData, cfg: &CFG) -> FxHashMap<Inst, Inst> {
     cfg.blocks()
         .iter()
@@ -108,9 +109,7 @@ pub fn forwarded_block_params(data: &FunctionData, cfg: &CFG) -> FxHashMap<Inst,
         .collect()
 }
 
-/// Resolve copy-parameter chains to their terminal SSA value. Cycles have no
-/// terminal value and are omitted. Results are cached while walking the map so
-/// shared tails are traversed only once.
+/// Resolve forwarding chains to their terminal SSA value, omitting cycles.
 pub fn resolve_forwarded_params(forwarded: &FxHashMap<Inst, Inst>) -> FxHashMap<Inst, Inst> {
     let mut cache = FxHashMap::<Inst, Option<Inst>>::default();
     for &start in forwarded.keys() {
@@ -118,13 +117,13 @@ pub fn resolve_forwarded_params(forwarded: &FxHashMap<Inst, Inst>) -> FxHashMap<
             continue;
         }
         let mut path = Vec::new();
-        let mut positions = FxHashMap::default();
+        let mut visited = FxHashSet::default();
         let mut current = start;
         let resolved = loop {
             if let Some(&resolved) = cache.get(&current) {
                 break resolved;
             }
-            if positions.insert(current, path.len()).is_some() {
+            if !visited.insert(current) {
                 break None;
             }
             path.push(current);

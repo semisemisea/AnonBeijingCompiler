@@ -32,13 +32,10 @@ pub struct LICM {
 
 impl LICM {
     pub fn new() -> LICM {
-        LICM {
-            analysis: None,
-            limit_computed_loads: true,
-        }
+        Self::with_computed_load_limit(true)
     }
 
-    pub fn for_target(limit_computed_loads: bool) -> LICM {
+    pub fn with_computed_load_limit(limit_computed_loads: bool) -> LICM {
         LICM {
             analysis: None,
             limit_computed_loads,
@@ -1198,7 +1195,7 @@ mod tests {
             },
         );
 
-        assert!(LICM::for_target(false).run(&mut program));
+        assert!(LICM::with_computed_load_limit(false).run(&mut program));
         let data = program.func_data(function);
         let entry = data.layout().entry_bb().unwrap().bb();
         for load in loads {

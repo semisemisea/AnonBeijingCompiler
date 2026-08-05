@@ -253,7 +253,7 @@ impl PassesManager {
         }
 
         // Hoist loop-invariant pure expressions to the preheader.
-        let licm = Box::new(licm::LICM::for_target(
+        let licm = Box::new(licm::LICM::with_computed_load_limit(
             config.target.enable_chain_to_switch,
         ));
         p.register(licm);

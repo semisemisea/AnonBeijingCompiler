@@ -1,6 +1,7 @@
 use crate::opt::{
     analysis_passes::effects::EffectAnalysis,
     prelude::*,
+    utils::{self, cfg::CFG, logical_edge::forwarded_block_params},
 };
 
 pub struct DeadPhiElimination;
@@ -478,6 +479,23 @@ mod tests {
 
 impl Pass for DeadPhiElimination {
     fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
+        let forwarded = CFG::new(data)
+            .map(|cfg| forwarded_block_params(data, &cfg))
+            .unwrap_or_default();
+        for (&parameter, &replacement) in &forwarded {
+            let mut replacement = replacement;
+            for _ in 0..forwarded.len() {
+                let Some(&next) = forwarded.get(&replacement) else {
+                    break;
+                };
+                if next == replacement {
+                    break;
+                }
+                replacement = next;
+            }
+            utils::visit_and_replace(data, parameter, replacement);
+        }
+
         let mut bb_allocator: IDAllocator<BasicBlock, BId> = IDAllocator::new(1);
         let mut unused_params_indices = Vec::with_capacity(data.layout().basicblocks().len());
 
@@ -499,7 +517,7 @@ impl Pass for DeadPhiElimination {
                 .collect::<Vec<_>>();
             unused_params_indices.push(unused_params_index);
         }
-        let mut changed = false;
+        let mut changed = !forwarded.is_empty();
         for (i, unused_params_index) in unused_params_indices.into_iter().enumerate() {
             if unused_params_index.is_empty() {
                 continue;
@@ -606,6 +624,36 @@ mod dead_phi_tests {
     }
 
     #[test]
+    fn eliminates_a_block_parameter_forwarding_one_value() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_i32(), "forwarded_phi".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let merge = data
+            .new_basic_block()
+            .basic_block("merge".into(), vec![Type::get_i32()]);
+        data.layout_mut().push_bb_back(merge);
+        let value = data.new_local_inst().integer(7);
+        let jump = data.new_local_inst().jump(merge, vec![value]);
+        data.layout_mut().insert_inst(entry, jump);
+        let parameter = data.bb_data(merge).params()[0];
+        let ret = data.new_local_inst().ret(Some(parameter));
+        data.layout_mut().insert_inst(merge, ret);
+
+        assert!(DeadPhiElimination.run(&mut program));
+        let data = program.func_data(function);
+        assert!(data.bb_data(merge).params().is_empty());
+        let InstKind::Jump(jump) = data.inst_data(jump).kind() else {
+            panic!("entry must still jump to merge");
+        };
+        assert!(jump.args().is_empty());
+        let InstKind::Return(ret) = data.inst_data(ret).kind() else {
+            panic!("merge must still return");
+        };
+        assert_eq!(ret.value(), Some(value));
+    }
+
+    #[test]
     fn jump_args_stay_aligned_when_trailing_params_are_dead() {
         // A block whose *trailing* parameters are dead: the jump arguments
         // must drop the same positions, keeping earlier args aligned.
@@ -635,19 +683,25 @@ mod dead_phi_tests {
                 );
         data.layout_mut().push_bb_back(merge);
         let cond = data.params()[0];
+        let zero = data.new_local_inst().integer(0);
         let one = data.new_local_inst().integer(1);
-        let jump = data.new_local_inst().jump(merge, vec![one; 9]);
-        data.layout_mut().insert_inst(entry, jump);
+        let branch = data.new_local_inst().branch(
+            cond,
+            merge,
+            vec![one; 9],
+            merge,
+            vec![zero; 9],
+        );
+        data.layout_mut().insert_inst(entry, branch);
         // Only params 7 and 8 are unused; use the others so only the tail
         // two get removed.
         for i in 0..7 {
             let p = data.bb_data(merge).params()[i];
             let _use = data.new_local_inst().binary(BinaryOp::Add, p, one);
-            data.layout_mut().insert_inst(entry, _use);
+            data.layout_mut().insert_inst(merge, _use);
         }
-        let _ = cond;
         let ret = data.new_local_inst().ret(None);
-        data.layout_mut().insert_inst(entry, ret);
+        data.layout_mut().insert_inst(merge, ret);
 
         assert!(DeadPhiElimination.run(&mut program));
         let data = program.func_data(function);
@@ -656,9 +710,10 @@ mod dead_phi_tests {
         let mut found = false;
         for block in data.layout().basicblocks() {
             for &inst in block.insts() {
-                if let InstKind::Jump(jump) = data.inst_data(inst).kind() {
-                    if jump.target() == merge {
-                        assert_eq!(jump.args().len(), 7);
+                if let InstKind::Branch(branch) = data.inst_data(inst).kind() {
+                    if branch.t_target() == merge && branch.f_target() == merge {
+                        assert_eq!(branch.t_args().len(), 7);
+                        assert_eq!(branch.f_args().len(), 7);
                         found = true;
                     }
                 }

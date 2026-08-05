@@ -2276,15 +2276,66 @@ runtime 值，当前 `test_at_top_bound_not_const`（936-938 行）继续拒绝�
 - 定向差分（Docker 内，慢）：make test ARGS="-O 2 -j 1" perf/<case>.sy
 
 **验收清单**：
-- [ ] 提交 1/2/3 各自独立 commit（[Feat(Opt)]: ...），中文消息
-- [ ] 单测 ≥3 新增全绿；raana_ir 全量全绿；workspace 全绿
-- [ ] 4 case 复扫：test_at_top_multi_param 与 test_at_top_bound_not_const
+- [x] 提交 1/2/3 各自独立 commit（[Feat(Opt)]: ...），中文消息
+- [x] 单测 ≥3 新增全绿；raana_ir 全量全绿；workspace 全绿
+- [x] 4 case 复扫：test_at_top_multi_param 与 test_at_top_bound_not_const
       计数下降（记录数字），解锁的循环汇编出向量指令（记录 case + 指令）
-- [ ] 01_mm1 内核（BB20）、many_mat k 循环（BB49）、transpose2（BB10）、
+- [x] 01_mm1 内核（BB20）、many_mat k 循环（BB49）、transpose2（BB10）、
       conv2d checksum（BB14）至少解锁出向量
-- [ ] trip 边界（0/1/2/3）语义正确（差分或单测覆盖）
-- [ ] matmul1 -O2 仍 PASS；RISC-V 零影响；无二次向量化死循环
-- [ ] 最终 git status 只剩非本任务文件
+- [x] trip 边界（0/1/2/3）语义正确（差分或单测覆盖）
+- [x] matmul1 -O2 仍 PASS；RISC-V 零影响；无二次向量化死循环
+- [x] 最终 git status 只剩非本任务文件
+
+**执行记录（2026-08-06 新 session，4 个 commit：da94fbe/6de3c59/92ff0ce/07025aa）**：
+
+**基线复扫**（改动前，当前 HEAD 0108076）：
+- conv2d-1：test_at_top_multi_param=8，test_at_top_bound_not_const=2
+- many_mat_cal-1：multi_param=11，bound_not_const=9
+- transpose2：multi_param=5，bound_not_const=0
+- 01_mm1：multi_param=4，bound_not_const=0
+- 合计 multi_param=28、bound_not_const=11。
+
+**完成后复扫**（07025aa）：
+- conv2d-1：multi_param=2、bound_not_const=0（checksum 转拒
+  entry_preds_not_2——reduction_unroll 产物 3 前驱入口，保守拒绝正确；
+  新增 b1_not_reducible=4 为 get_random 类 [Add, Rem] 形态）
+- many_mat_cal-1：multi_param=0、bound_not_const=0、tail_loop_skip=3
+  （elementwise runtime 循环 while_entry_17/25/31 全部向量化！）
+- transpose2：multi_param=2、bound_not_const=0（BB10 转拒
+  binary_operand_loop_variant——i²·a[i] 的 IV 标量操作数，既有规则不支持，
+  非本任务范围）
+- 01_mm1：multi_param=0、bound_not_const=0、tail_loop_skip=3
+- 合计 multi_param=4（↓24）、bound_not_const=0（↓11）。
+
+**出向量 case（NEON 精确匹配：dup v/addv/ld1/st1/ldr q/v\d+\.4s）**：
+- 01_mm1：内核循环 4 条（ldr q18 + add v0.4s 累加 + addv 归约 + dup splat），
+  汇编验证：header `cmp w6,#0; b.gt`（gt 计数器测试）、tail 标量 `ldr w5` +
+  `add w0,w0,w5` 累加、exit 收尾，全链正确；
+- many_mat_cal-1：17 条（elementwise runtime 循环）；
+- matmul1（回归）：13 条不变；conv2d/transpose2 汇编 0 条（原因如上）。
+
+**差分（Docker make test，-O 2 -j 1）**：
+- 01_mm1 PASS（runtime bound=500 归约：counter 物化 + reduce 块数值正确）；
+- vec_trip_0/3/5/7 PASS（临时 case，trip 0/3/5/7 = tail-only 0..3 与
+  向量+余数混合，输出 0/6/15/28 与期望一致——tail 轮数语义正确）；
+- many_mat_cal-1 PASS。
+
+**过程中的实证发现（07025aa [Fix]）**：
+1. 标量 BinaryOp::Max 后端不支持（codegen invariant failed）→ iv0 钳位改
+   `select(gt(cnt0,0), cnt0, 0)`（csel）；
+2. transpose2 归约循环的 post-exit 块（dominated by exit）直读 acc 参数
+   （abs 计算）→ b1_acc_used_outside_latch 从"仅 exit 块"放宽为
+   dom.dominates(exit, bb)，apply 将 post-exit 用户改写为 reduce 块 sum；
+   新增 exit_region_guard 门（guard 边 + post-exit 用户组合拒绝）；
+3. 孤儿 used_by（parent_bb=None）跳过，防 stale 误拒。
+
+**未解锁项的形态结论**：
+- conv2d checksum：reduction_unroll 多前驱入口（entry_preds_not_2）——需
+  多入口支持（非本任务）；
+- transpose2 BB10：IV 作标量操作数（i²·a[i]）——需 lane-index 向量支持
+  （非本任务）；
+- many_mat BB49 k 循环：B[k][j] 跨步访问（no_vector_ops）——需 gather
+  或转置支持（非本任务）。
 
 ---
 

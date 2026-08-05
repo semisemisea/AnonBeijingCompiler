@@ -185,6 +185,9 @@ struct VecPlan {
     /// reads the outer IVs). Their entry arguments stay live across the
     /// vectorized loop and are forwarded to the exit / epilogue chain.
     passthrough_args: Vec<Inst>,
+    /// Exit-parameter classification, in exit-parameter order (how each
+    /// exit parameter is fed at the rewritten exit edge).
+    exit_specs: Vec<ExitArgSpec>,
     /// True when the loop has the test-at-top shape (header ends in
     /// `lt iv, bound; br`, the latch is a plain jump). The mutation phase
     /// materializes a trip counter as a new header parameter and replaces
@@ -235,6 +238,23 @@ struct ReductionPlan {
     /// The exit block's accumulator parameter (receives the reduced value),
     /// or None when the exit takes no parameters.
     exit_acc_param: Option<Inst>,
+}
+
+/// How one exit-block parameter receives its value at the rewritten exit
+/// edge, in exit-parameter order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitArgSpec {
+    /// Final accumulator of a B1 reduction (the exit's first parameter).
+    Acc,
+    /// Loop-invariant passthrough value (index into `passthrough_args`).
+    Passthrough(usize),
+    /// IV final value after the vectorized loop: the latch's `iv'` value
+    /// (`j + 1` at the last scalar iteration, e.g. 01_mm1's kernel exit
+    /// `while_end_18(%vid_4, %122, %vid_6)` where `%122 = add(j, 1)`) is
+    /// replaced by the computed `i0 + VF*q` — the loop now runs `q` vector
+    /// iterations, so the exit must not receive the latch's per-iteration
+    /// update.
+    IvFinal,
 }
 
 // ---------------------------------------------------------------------------
@@ -613,11 +633,13 @@ fn analyze_loop(
     //    Test-at-top: the single parameter is the IV (its back-edge arg is
     //    `iv' = add(iv, 1)`); a counter is materialized in the mutation
     //    phase, where the bound test is replaced by the counter test. The
-    //    exit takes the passthrough values (and, for B1, the final
-    //    accumulator as its first parameter).
+    //    exit takes the passthrough values, the B1 final accumulator (as
+    //    its first parameter), and — with A4 — the IV's final value (the
+    //    latch's `iv'` value, e.g. 01_mm1's `while_end_18(%vid_4, %122,
+    //    %vid_6)`); the exact per-parameter classification happens in step
+    //    6b once the IV update is identified.
     let exit_params = data.bb_data(exit).params();
-    let expected_exit = passthrough.len() + usize::from(acc_info.is_some());
-    if exit_args.len() != exit_params.len() || exit_params.len() != expected_exit {
+    if exit_args.len() != exit_params.len() {
         trace(data, looop, "exit_has_params");
         return None;
     }
@@ -666,8 +688,8 @@ fn analyze_loop(
         return None;
     }
     // For a reduction, the accumulator's back-edge arg must be its update
-    // `acc' = binary(op, acc, delta)`; the exit's first arg carries the same
-    // final value (the remaining exit args are the passthrough values).
+    // `acc' = binary(op, acc, delta)`. The exit's first argument carries the
+    // same final value — verified by the exit classification in step 6b.
     let acc_update: Option<(Inst, Inst)> = match acc_info {
         Some((acc, acc_slot, bop)) => {
             let update = back_args[acc_slot];
@@ -677,10 +699,6 @@ fn analyze_loop(
             };
             if binary.op() != bop || binary.lhs() != acc {
                 trace(data, looop, "b1_acc_update_shape");
-                return None;
-            }
-            if !exit_params.is_empty() && exit_args[0] != update {
-                trace(data, looop, "exit_arg_not_acc");
                 return None;
             }
             let delta = binary.rhs();
@@ -725,6 +743,44 @@ fn analyze_loop(
         .iter()
         .map(|&slot| entry_args[slot])
         .collect();
+
+    // 6b. Exit parameter classification: each exit parameter is fed one of
+    //     three value classes at the rewritten exit edge — the final
+    //     accumulator (B1 reduction, parameter 0), a loop-invariant
+    //     passthrough value (the header parameter itself, or its entry
+    //     value — both are the same loop-invariant quantity), or the IV's
+    //     final value. The IV-final parameter is the back-edge argument
+    //     equal to the IV update `iv' = add(iv, 1)`: e.g. 01_mm1's kernel
+    //     exit `while_end_18(%vid_4, %122, %vid_6)` receives `%122 =
+    //     add(j, 1)` as the final `j`. After vectorization the loop runs
+    //     `q` iterations of width VF, so the exit must receive the computed
+    //     `i0 + VF*q` (plus the peeled remainder through the epilogue
+    //     chain) instead of the latch's per-iteration `iv + 1`; the rewrite
+    //     happens in `apply_vectorize` (2c). Anything else is a shape the
+    //     vectorizer does not recognize.
+    let mut exit_specs = Vec::with_capacity(exit_params.len());
+    for (pos, &arg) in exit_args.iter().enumerate() {
+        let spec = if acc_info.is_some() && pos == 0 {
+            let (update, _) = acc_update
+                .as_ref()
+                .expect("acc_update is set alongside acc_info");
+            if arg != *update {
+                trace(data, looop, "exit_arg_not_acc");
+                return None;
+            }
+            ExitArgSpec::Acc
+        } else if arg == iv_next {
+            ExitArgSpec::IvFinal
+        } else if let Some(slot) = passthrough.iter().copied().find(|&slot| {
+            arg == params[slot] || arg == entry_args[slot]
+        }) {
+            ExitArgSpec::Passthrough(slot)
+        } else {
+            trace(data, looop, "exit_has_params");
+            return None;
+        };
+        exit_specs.push(spec);
+    }
 
     // 7. Exact trip: the initial index must be a compile-time constant, and
     //    the trip must fit at least one vector iteration. Rotated loops
@@ -1114,6 +1170,7 @@ fn analyze_loop(
         vector_ty: Type::get_vector(elem_ty, VF as usize),
         reduction,
         passthrough_args,
+        exit_specs,
         test_at_top,
         arm: arm_plan,
     })
@@ -1305,6 +1362,7 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         vector_ty,
         reduction,
         passthrough_args,
+        exit_specs,
         test_at_top,
         arm,
     } = plan;
@@ -1312,6 +1370,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     let r = trip % VF;
     let i32 = Type::get_i32();
     let n_passthrough = passthrough_args.len();
+    // A4: does any exit parameter carry the IV's final value? Those slots
+    // must be fed the computed `i0 + VF*q` (+ the peeled remainder through
+    // the epilogue chain) instead of the latch's per-iteration update.
+    let has_iv_final = exit_specs.iter().any(|spec| *spec == ExitArgSpec::IvFinal);
     // The trip counter is the last header parameter; passthrough params
     // precede it ([.. passthroughs .., iv (, acc), t]). Test-at-top loops
     // have no counter parameter: one is materialized here as a new header
@@ -1378,12 +1440,25 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             VectorReduce::new_data(VectorReduceOp::Add, acc_vec_param, i32.clone()),
         );
         data.layout_mut().insert_inst(rb, acc_final);
-        let mut fwd = vec![acc_final];
-        fwd.extend(data.bb_data(rb).params()[1..].iter().copied());
-        let (target, args) = match (epi_blocks.first().copied(), red.exit_acc_param) {
-            (Some(first), _) => (first, fwd),
-            (None, Some(_)) => (exit, fwd),
-            (None, None) => (exit, vec![]),
+        let (target, args) = match epi_blocks.first().copied() {
+            Some(first) => {
+                let mut fwd = vec![acc_final];
+                fwd.extend(data.bb_data(rb).params()[1..].iter().copied());
+                (first, fwd)
+            }
+            None => {
+                // r == 0: the exit edge carries the reduced accumulator,
+                // the passthrough values, and — when declared — the
+                // computed IV final value `i0 + VF*q` (the loop ran exactly
+                // `q` vector iterations, so `i0 + 4q == i0 + trip`).
+                let iv_final_const = has_iv_final
+                    .then(|| data.new_local_inst().integer((entry_i0 + VF * q) as i32));
+                let acc_value = red.exit_acc_param.map(|_| acc_final);
+                (
+                    exit,
+                    build_exit_args(&exit_specs, &passthrough_args, acc_value, iv_final_const),
+                )
+            }
         };
         let jump = data.new_local_inst().jump(target, args);
         data.layout_mut().insert_inst(rb, jump);
@@ -1415,11 +1490,31 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 insts.push(acc_k);
                 jump_args.push(acc_k);
             }
-            // Forward the invariant passthrough values through the chain.
-            let epi_params = data.bb_data(block).params();
-            let passthrough_start = usize::from(reduction.is_some());
-            jump_args.extend(epi_params[passthrough_start..].iter().copied());
-            let target = epi_blocks.get(idx + 1).copied().unwrap_or(exit);
+            let acc_value = jump_args.first().copied();
+            let target = epi_blocks.get(idx + 1).copied();
+            let (target, jump_args) = match target {
+                Some(next) => {
+                    // Forward the invariant passthrough values through the
+                    // chain.
+                    let epi_params = data.bb_data(block).params();
+                    let passthrough_start = usize::from(reduction.is_some());
+                    jump_args.extend(epi_params[passthrough_start..].iter().copied());
+                    (next, jump_args)
+                }
+                None => {
+                    // The chain's last block jumps to the exit: rebuild the
+                    // exit's arguments from its parameter classes. The IV
+                    // final value is the computed `i0 + VF*q + r`: the
+                    // peeled scalar iterations ran with `iv = i0 + 4q + k`,
+                    // so the scalar exit value `i0 + trip` == `i0 + 4q + r`.
+                    let iv_final_const = has_iv_final
+                        .then(|| data.new_local_inst().integer((entry_i0 + VF * q + r) as i32));
+                    (
+                        exit,
+                        build_exit_args(&exit_specs, &passthrough_args, acc_value, iv_final_const),
+                    )
+                }
+            };
             insts.push(data.new_local_inst().jump(target, jump_args));
             let after = if idx == 0 {
                 reduce_block.unwrap_or(latch)
@@ -1629,8 +1724,11 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     //     the epilogue when the counter reaches zero. Runs after the
     //     accumulator update is re-typed (2b) so the branch's f_args
     //     type-check against the reduce block's vector parameter.
-    //     Passthrough values (loop-invariant) feed the chain / exit as-is.
-    if test_at_top || reduction.is_some() || r > 0 {
+    //     Passthrough values (loop-invariant) feed the chain / exit as-is;
+    //     an IV-final exit parameter (A4) is replaced by the computed
+    //     constant `i0 + VF*q` — the loop now runs `q` vector iterations,
+    //     so the exit must not receive the latch's per-iteration update.
+    if test_at_top || reduction.is_some() || r > 0 || has_iv_final {
         let (cond, t_target, t_args) = if test_at_top {
             (eff_counter, latch, vec![])
         } else {
@@ -1639,6 +1737,8 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 _ => unreachable!(),
             }
         };
+        let iv_final_const = has_iv_final
+            .then(|| data.new_local_inst().integer((entry_i0 + VF * q) as i32));
         let (f_target, f_args) = if test_at_top {
             // The epilogue chain (r > 0) and the exit both carry the
             // loop-invariant passthrough values: their header parameters
@@ -1647,7 +1747,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             if r > 0 {
                 (epi_blocks[0], passthrough_args.clone())
             } else {
-                (exit, passthrough_args.clone())
+                (
+                    exit,
+                    build_exit_args(&exit_specs, &passthrough_args, None, iv_final_const),
+                )
             }
         } else {
             match &reduction {
@@ -1659,7 +1762,15 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                         args,
                     )
                 }
-                None => (epi_blocks[0], passthrough_args.clone()),
+                None if r > 0 => (epi_blocks[0], passthrough_args.clone()),
+                None => {
+                    // r == 0: the exit is reached directly; IV-final
+                    // parameters are replaced by the computed constant.
+                    (
+                        exit,
+                        build_exit_args(&exit_specs, &passthrough_args, None, iv_final_const),
+                    )
+                }
             }
         };
         data.replace_inst_with(latch_branch)
@@ -1769,6 +1880,29 @@ fn alloc_inst(data: &mut ArenaContextMut<'_>, inst_data: crate::ir::instruction:
         arena: &mut *data as &mut dyn Arena,
     };
     lb.raw(inst_data)
+}
+
+/// Build the exit edge's argument list from the exit's parameter classes
+/// (in exit-parameter order): the reduced accumulator, loop-invariant
+/// passthrough values, and the computed IV final value.
+fn build_exit_args(
+    exit_specs: &[ExitArgSpec],
+    passthrough_args: &[Inst],
+    acc_value: Option<Inst>,
+    iv_final_value: Option<Inst>,
+) -> Vec<Inst> {
+    exit_specs
+        .iter()
+        .map(|spec| match spec {
+            ExitArgSpec::Acc => {
+                acc_value.expect("Acc exit spec requires the reduced accumulator")
+            }
+            ExitArgSpec::Passthrough(slot) => passthrough_args[*slot],
+            ExitArgSpec::IvFinal => {
+                iv_final_value.expect("IvFinal exit spec requires the computed final value")
+            }
+        })
+        .collect()
 }
 
 /// Owned snapshot of the entry edge, taken before its in-place rewrite.
@@ -3006,6 +3140,90 @@ mod tests {
         (function, header, latch, exit, seven)
     }
 
+    /// Build a rotated multi-parameter loop whose exit carries the IV's
+    /// final value (the A4 shape, mirroring 01_mm1's kernel
+    /// `while_end_18(%vid_4, %122, %vid_6)`): header `[passthrough_i, iv,
+    /// counter]`, latch payload `b[i] = a[i] + passthrough_i`, latch
+    /// terminator `br t', header([passthrough_i, iv', t']),
+    /// exit([passthrough_i, iv'])` — the exit's second parameter receives
+    /// the IV update value (`iv + 1` at the last scalar iteration).
+    #[allow(clippy::type_complexity)]
+    fn build_rotated_exit_iv_final(
+        program: &mut Program,
+        trip: i32,
+    ) -> (Function, BasicBlock, BasicBlock, BasicBlock, Inst) {
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr.clone());
+            program.new_value().global_alloc(init)
+        };
+        let b = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_i32(), "exit_iv_final".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut *program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone(), i32.clone()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data
+            .new_basic_block()
+            .basic_block("exit".into(), vec![i32.clone(), i32.clone()]);
+        for bb in [header, latch, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let seven = data.new_local_inst().integer(7);
+        let zero = data.new_local_inst().integer(0);
+        let trip_inst = data.new_local_inst().integer(trip);
+        let entry_jump = data.new_local_inst().jump(header, vec![seven, zero, trip_inst]);
+        data.layout_mut().insert_inst(entry, seven);
+        data.layout_mut().insert_inst(entry, zero);
+        data.layout_mut().insert_inst(entry, trip_inst);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let passthrough_i = data.bb_data(header).params()[0];
+        let iv = data.bb_data(header).params()[1];
+        let counter = data.bb_data(header).params()[2];
+        let header_jump = data.new_local_inst().jump(latch, vec![]);
+        data.layout_mut().insert_inst(header, header_jump);
+        let one = data.new_local_inst().integer(1);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let sum = lb.binary(BinaryOp::Add, load_a, passthrough_i);
+        let gep_b = lb.get_elem_ptr(b, vec![zero, iv]);
+        let store = lb.store(sum, gep_b);
+        drop(lb);
+        let iv_next = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        let t_next = data.new_local_inst().binary(BinaryOp::Sub, counter, one);
+        // The exit receives the passthrough value and the IV's update value
+        // (the final `j` of the scalar loop, `i0 + trip`).
+        let back = data.new_local_inst().branch(
+            t_next,
+            header,
+            vec![passthrough_i, iv_next, t_next],
+            exit,
+            vec![passthrough_i, iv_next],
+        );
+        for inst in [one, gep_a, load_a, sum, gep_b, store, iv_next, t_next, back] {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        let exit_p = data.bb_data(exit).params()[0];
+        let exit_f = data.bb_data(exit).params()[1];
+        let use_params = data.new_local_inst().binary(BinaryOp::Add, exit_p, exit_f);
+        let ret = data.new_local_inst().ret(Some(use_params));
+        data.layout_mut().insert_inst(exit, use_params);
+        data.layout_mut().insert_inst(exit, ret);
+        (function, header, latch, exit, seven)
+    }
+
     #[test]
     fn vectorizes_multi_param_test_at_top() {
         // A3: test-at-top with a constant bound (trip = 16, no remainder)
@@ -3080,6 +3298,66 @@ mod tests {
             panic!("counter entry must be the constant 4Q");
         };
         assert_eq!(init.value(), 16, "counter enters at 4Q");
+    }
+
+    #[test]
+    fn vectorizes_exit_iv_final() {
+        // A4: rotated loop `header([passthrough_i, iv, t])` whose exit
+        // takes `[passthrough_i, iv_final]` — the latch passes the IV's
+        // update value (`iv' = add(iv, 1)`) as the final `j`, the
+        // 01_mm1 kernel shape. The exit edge must feed the computed
+        // `i0 + VF*q = 16` instead of the latch's per-iteration update,
+        // and the back edge keeps stepping the IV by 4.
+        let mut program = Program::new();
+        let (function, header, latch, exit, seven) =
+            build_rotated_exit_iv_final(&mut program, 16);
+        assert!(
+            run(&mut program, function),
+            "exit-iv-final loop must vectorize"
+        );
+        let data = program.func_data(function);
+        assert_eq!(vector_load_count(&program, function), 1);
+        assert_eq!(scalar_load_count(&program, function), 0);
+        assert_eq!(
+            vector_binaries(&program, function),
+            vec![BinaryOp::Add],
+            "the payload add becomes a lane-wise add"
+        );
+        // Rotated header parameters are untouched: [passthrough_i, iv, t].
+        let params = data.bb_data(header).params();
+        assert_eq!(params.len(), 3, "rotated header keeps [passthrough_i, iv, t]");
+        // r == 0 and no reduction: the latch branch still targets the exit
+        // directly; the IV-final slot now carries the computed constant.
+        let latch_term = data.layout().basicblock(latch).terminator();
+        let InstKind::Branch(branch) = data.inst_data(latch_term).kind() else {
+            panic!("latch must end in a branch");
+        };
+        assert_eq!(branch.f_target(), exit);
+        let f_args = branch.f_args().to_vec();
+        assert_eq!(f_args.len(), 2, "exit takes [passthrough_i, iv_final]");
+        assert_eq!(
+            f_args[0], seven,
+            "the passthrough value is forwarded unchanged"
+        );
+        let InstKind::Integer(iv_final) = data.inst_data(f_args[1]).kind() else {
+            panic!("the exit's iv-final arg must be the computed constant");
+        };
+        assert_eq!(
+            iv_final.value(),
+            16,
+            "iv_final = i0 + VF*q = 0 + 4*4"
+        );
+        // The back edge steps the IV by the vector width.
+        let t_args = branch.t_args().to_vec();
+        let InstKind::Binary(step) = data.inst_data(t_args[1]).kind() else {
+            panic!("back-edge IV arg must be an add");
+        };
+        assert_eq!(step.op(), BinaryOp::Add);
+        assert_eq!(step.lhs(), params[1], "iv' = iv + 4");
+        let InstKind::Integer(step_c) = data.inst_data(step.rhs()).kind() else {
+            panic!("IV step must be a constant");
+        };
+        assert_eq!(step_c.value(), 4, "IV steps by the vector width");
     }
 
     #[test]

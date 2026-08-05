@@ -737,6 +737,30 @@ A4 exit_has_params（48 次）——**高 ROI，A3+A4+C1 解锁 01_mm**：
 - 剩余优先级: B3 归约识别（matmul1）> M43 versioning（01_mm/
   conv2d bound）> 多参数 test-at-top 2+ 有效参数 > A2（低 ROI）
 
+##### B3 归约 exit 参数值匹配方案（2026-08-05 细化, matmul1 最后一块）
+
+根因（IR 定位 /tmp/mm1_v2.ir + dependence.rs 复核）：
+- matmul1 的 temp 归约已被前端/优化改写为 c[i][j] 直接内存累加
+  （arm 内 load+add+store）——真实归约是内存（B3
+  is_elementwise_inplace 面），value_flows_to 是宽松 def-use（不要求
+  唯一 load 依赖）→ **C1 已满足，无需扩展**
+- exit_arg_not_acc 来自两个循环：
+  (a) min 循环（entry_28 [i,j,min,t]）：B1 归约路径 + exit [i, min]——
+      acc(min) 在 exit 参数**位置 1**，A4 的 `pos == 0` 位置假设误拒
+  (b) k 循环（掩码内核）：effective=[k]（1 个）→ acc_info None 不走
+      B1——但 exit [i] 的 A4 分类 pos==0 检查同样误拒
+- 修法（loop_vectorize.rs 两处）：
+  1. 6b exit 分类改**值匹配**：arg == iv_next → IvFinal；arg 匹配
+     passthrough 值 → Passthrough；arg == acc 更新值 → Acc（任意
+     位置）；其余 exit_has_params
+  2. ReductionPlan.exit_acc_param 从 exit_specs 找 Acc 位置（不再
+     假设位置 0）
+- 预期：matmul1 掩码内核（k 循环）+ min 循环解锁出向量；B1 既有
+  路径（acc 在参数 0）不回归；01_mm 不受影响（bound 运行时仍拒）
+- 验收：matmul1 -O2 汇编出 ldr q + cmgt/and/eor + add v.4s +
+  str q；make test 三级差分；raana_ir 全量；corpus 复扫
+  exit_arg_not_acc 下降
+
 #### M45：SLP 基本块向量化 + 循环展开
 
 - SLP（`raana_ir/src/opt/passes/slp.rs`）：把同一基本块内相邻、类型一致的独立

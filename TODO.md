@@ -2496,3 +2496,164 @@ test_at_top_bound_not_const 拒绝。背景实证见 TODO.md §10.10-10.12，
 - [ ] matmul1 -O2 仍 PASS（既有能力不回归）；RISC-V 零影响（不注册）
 - [ ] 最终 git status 只剩非本任务文件
 ```
+
+### 10.14 自包含 goal 提示词（rotated runtime-bound 向量化，可直接粘贴新 session）
+
+```text
+# Goal: rotated（test-at-bottom）runtime-bound 向量化支持（loop_vectorize）
+
+## 背景
+§10.12 收益评估结论：test-at-top runtime 支持（da94fbe/6de3c59/92ff0ce/
+07025aa）机制全链路正确，但解锁的循环（01_mm1 checksum、many_mat 初始化）
+均非执行大头（占比 ~0.01%）。真正的大头——01_mm1 mm 内核、fft、h-* 系列
+的计算循环——是 rotated（test-at-bottom）形态 + runtime counter，被
+entry_trip_not_const 拒绝。本提示词解决 rotated runtime-bound，直接命中
+矩阵乘法类 case 的热点。背景实证见 TODO.md §10.10-10.13，本提示词自包含。
+
+## 实证数据（2026-08-06 扫描，当前 HEAD 03a0862）
+- corpus 60 例中 entry_trip_not_const 共 **108 个循环、15 个 case**：
+  01_mm1/2/3 各 8、fft0/1/2 各 6、h-5-01/02/03 各 12、h-10-01/02/03
+  各 6、h-8-01/02/03 各 4。
+- 01_mm1 mm 内核（目标 1）：rotated，header
+  `[outer_i, j, k, counter]`，counter 来自 preheader 的 runtime 计算
+  （rotate_loops 产物 `t0 = sub(bound, i0)`，如 01_mm1 `%53 = sub %49, 0`），
+  payload `C[i][j] = C[i][j]*A[i][k] + B[k][j]`——C[i][j] 连续、A[i][k]
+  循环不变量、B[k][j] 连续，**访问形态理想**，是 elementwise（非归约）。
+- fft/h-* 系列待首扫确认形态（蝶形/归约/多参数），执行第一步先复扫。
+
+## 必须遵守的规则（用户明令）
+- 只在 hermes worktree 操作；不 push、不 rebase（遇冲突立即停并汇报）；
+  不碰其他 worktree；不读/不提交 .env 等凭据文件。
+- 只改 raana_ir crate；不碰 anon_armv8（lowering）、taki_mir、前端。
+- 无 hacky workaround（rm、手动 sed、flat pool 一律禁止），只做 root
+  cause 修复；设计中禁止 Rc<RefCell<T>> / RefCell 共享可变。
+- 不做以 benchmark/函数名/输入为条件的优化（AGENTS.md 红线）；block
+  命名（vec_tail_/vec_epi_/vec_reduce）是本 pass 产物命名空间，允许用于
+  防二次向量化，不得用于任何优化条件。
+- -O0 保留标量；vectorize 只进 aarch64 管线（RISC-V 零影响）。
+- 勤 commit、勤单测：每个原子部分完成即 commit（消息格式
+  [Feat(Opt)]: ... / [Fix(Opt)]: ... / [Docs]: ...），中文消息。
+- 改文件一律 patch；不用 python 脚本改文件；不碰 .docker-image、
+  不 rm -rf、不 cargo clean。
+- 验收粒度 = 单测 + 单 case（make test <case>）；全量测试用户自己跑。
+- 形态实证先行：任何分析改动前先用 M44_TRACE=1 复扫 01_mm1/fft0/h-5-01
+  确认 rotated runtime 循环的当前拒绝分布与形态分类，结论更新
+  TODO.md §10.14。
+
+## 现状与设计
+
+### 现状（loop_vectorize.rs，行号以 03a0862 后为准）
+- rotated 形态：header 单条 plain jump → latch；latch
+  `br t', header([iv', t', ...]), exit([acc', iv'...])`；t' = sub(t, 1)
+  双职（既是条件也是 counter back-edge arg，非零=继续）。
+- 拒绝点：analyze 1016 行 entry_trip_not_const（rotated 的 counter 必须
+  编译期常量）；814-817 is_sub_one 检查（const 形态要求 t' = sub(t,1)）；
+  1038 trip<VF。
+- 既有 runtime 基建（全部在 test_at_top 分支内，rotated 需接入）：
+  - 1725：trip = sub(bound, i0)、cnt0 = and(trip, -4)（entry 前插入）；
+  - 1749：iv0 = i0 + select(gt(cnt0,0), cnt0, 0)（负 trip 钳位，标量
+    select → csel，**不要用 Max**）；
+  - 1774：exit 直读 header IV 参数改写（test-at-top 专用，rotated 无此
+    问题——exit 收参数）；
+  - 1805：counter 物化（test_at_top 追加 header 参数；**rotated 的
+    counter 已是参数，只改 entry 值**）；
+  - 1848-1859：tail 构造（vec_tail/vec_tail_latch，参数
+    [iv_t, (acc_t), passthrough…]，payload 克隆 + iv 步进 1）；
+  - 1931+：reduce 块（rotated B1 已有：latch f 边 → reduce → exit/epi）；
+    1971 runtime 分支已把 reduce 接到 tail；
+  - 2293+ 2c exit 边重写：rotated 分支（2304 else 侧）latch f 边 →
+    reduce 块（B1）/ epi 链（r>0）/ exit（r==0, build_exit_args）；
+  - 2406：counter 步进（rotated: eff_t_next = sub(counter, four)）；
+  - 2412：four_q 常量（rotated: entry_args[counter_slot] = four_q）。
+- 防二次向量化：analyze 开头 vec_tail 前缀检查对**所有**循环生效
+  （tail_loop_skip），rotated tail 无需新机制。
+
+### 设计（rotated runtime，复用 vs 新增）
+
+**复用**（test-at-top runtime 基建，rotated 同样适用）：
+- cnt0 = and(trip, -4)（rotated 的 trip = counter entry 的运行时值）；
+- iv0 = i0 + select(gt(cnt0,0), cnt0, 0) 钳位；
+- tail 构造（1859）：entry 边 [iv0, (acc_t), passthrough…]、lt 上界、
+  exit 边重建、reduce runtime 分支（1971）；
+- 防二次向量化（vec_tail 前缀，全局生效）。
+
+**新增/改动**：
+1. analyze 1016：rotated 的 entry_trip_not_const 放宽——counter 非 const
+   记 runtime_trip=true（rotated 分支；注意 (trip, runtime_trip) 元组
+   1006 行目前只有 test_at_top 走 runtime 分支，rotated 需并行处理）；
+   1038 trip<VF 同样跳过；is_sub_one 检查（814-817）runtime 时放宽为
+   sub(counter, 4) + gt(counter, 0) 条件形态。
+2. tail 上界：rotated 无 bound_inst——bound_rt = add(i0_inst,
+   counter_entry)（runtime，preheader 插入）；tail 的 lt iv_t, bound_rt。
+3. apply counter（1805/2412）：rotated 不追加参数——entry_args[counter_slot]
+   直接替换为 cnt0（runtime）/ four_q（const）；latch 条件 runtime 时改
+   `br gt(counter, 0), header, exit`（const 保持 t' 非零测试不变，
+   **行为不能变**——既有 rotated 单测依赖）；t' 步进 -4（2406 已有）。
+4. 2c（2293+）：重写条件加 runtime_trip（现在
+   `test_at_top || reduction.is_some() || r > 0 || has_iv_final` 对
+   rotated runtime elementwise r==0 无归约不成立，会漏重写）；rotated
+   runtime elementwise：latch f 边 → tail（[iv0, passthrough…]）；
+   rotated runtime B1：latch f 边 → reduce 块（已有）→ reduce runtime
+   分支 → tail（1971 已有）。
+5. IvFinal：rotated 的 exit_specs IvFinal（收 iv'，A4）runtime 时
+   iv_final_value = bound_rt（build_exit_args 2513 的入参；const 仍是
+   i0+4q 常量）。
+6. 负 trip：rotated 的 rotate_loops 产物 preheader 通常已有
+   `gt(t0, 0)` 守卫（如 01_mm1 `br %54, preheader_33, while_end_18`），
+   负 trip 直接走 exit；但 gt(counter,0) 测试 + iv0 钳位仍加（双保险，
+   与 test-at-top 一致）。
+7. 单测注意：rotated runtime 的 entry 是 guard branch 或 plain jump
+   两种都要覆盖（01_mm1 mm 内核的 preheader 是 branch 守卫形态）。
+
+**原子提交**：
+- 提交 1：rotated runtime elementwise（01_mm1 mm 内核）——analyze 放宽
+  + counter entry 替换 cnt0 + gt 测试 + bound_rt + tail 接入；
+  单测：rotated runtime elementwise 向量化 + tail 存在 + 幂等 +
+  trip 边界结构（cnt0=0 语义）；验收：01_mm1 汇编出向量 + 差分 PASS。
+- 提交 2：rotated runtime + B1 归约（fft/h-* 归约形态）——reduce → tail
+  链（1971 已备）；单测：rotated runtime [iv, acc] 向量化 + 幂等。
+- 提交 3：性能实测落档（不一定是代码提交，可并入 [Docs]）——01_mm1
+  qemu 运行时间 baseline vs 新（mm 内核占 ~99.99%，应有显著下降）。
+
+## 验证命令
+- 单测：cargo test -p raana_ir 2>&1 | grep -E "test result"
+- corpus 复扫：M44_TRACE=1 逐个跑 15 个 case，
+  grep -oE "reject=[A-Za-z0-9_:]+" | sort | uniq -c（记录
+  entry_trip_not_const 下降数字，基线 108）
+- IR 检查：./target/release/compiler -O2 --target aarch64 --emit ir
+  -o /tmp/x.ir tests/perf/<case>.sy
+- 汇编向量：grep -cE "dup v|addv|ld1|st1|ldr q| v[0-9]+\.4s" /tmp/x.s
+- 定向差分：make test ARGS="-O 2 -j 1" perf/01_mm1.sy
+- 性能对比：make test 的 r: 列（qemu 运行时间）与 03a0862 基线对比
+  （01_mm1 基线 r≈4268ms，mm 内核解锁后应显著下降；记录数字）
+
+## 关键代码位置
+- loop_vectorize.rs analyze：1006（trip/runtime_trip 元组）、1016
+  （entry_trip_not_const 放宽点）、1021+（runtime 门）、1038（trip<VF）、
+  814-817（is_sub_one）、开头 tail_loop_skip（vec_tail 前缀，全局）
+- loop_vectorize.rs apply：1725（trip/cnt0）、1749（iv0 钳位 select）、
+  1774（exit iv 改写，test-at-top 专用）、1805（counter 物化，
+  test_at_top 专用——rotated 只改 entry 值）、1848-1859（tail 构造）、
+  1931+（reduce 块）、1971（reduce runtime → tail）、2293+（2c 重写，
+  条件需加 runtime_trip）、2406（counter 步进）、2412（four_q/cnt0 替换）
+- 工具：is_add_one（1509）、is_sub_one（1523）、constant_i64（1618）、
+  apply_vectorize（1632）、build_exit_args（2513）、clone_payload_inst
+  （2579）、subst_operand（remap_refs 统一替换）
+- 既有单测：rotated 相关（vectorizes_reduction、vectorizes_exit_iv_final、
+  rejects_non_innermost_loop 等）；VECDBG_SHAPE 插桩
+
+## 验收清单（全部满足才算完成）
+- [ ] 提交 1/2 各自独立 commit（[Feat(Opt)]: ...），中文消息，每步单测全绿
+- [ ] 形态实证：15 case 复扫 entry_trip_not_const 计数下降（基线 108，
+      记录数字）+ fft/h-* 循环形态分类，更新 TODO.md §10.14
+- [ ] 单测 ≥3 新增全绿；raana_ir 全量全绿；workspace 全绿
+- [ ] 01_mm1 mm 内核（BB 区，C[i][j]=C[i][j]*A[i][k]+B[k][j]）出向量
+      （记录 case + NEON 指令）
+- [ ] 01_mm1 -O2 差分 PASS；性能实测：qemu r: 时间较 03a0862 基线
+      （≈4268ms）显著下降（记录数字）
+- [ ] matmul1 -O2 仍 PASS（既有能力不回归）；RISC-V 零影响（不注册）
+- [ ] 无二次向量化死循环（rotated tail 被 vec_tail 前缀拒，fixed-point
+      收敛）
+- [ ] trip 边界（0/1/2/3 + 负 trip）语义正确（单测或差分覆盖）
+- [ ] 最终 git status 只剩非本任务文件
+```

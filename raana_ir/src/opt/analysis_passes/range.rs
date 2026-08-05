@@ -1059,7 +1059,7 @@ fn transfer_div(lhs: IntRange, rhs: IntRange) -> IntRange {
     IntRange::bounded(values[0].min(values[1]), values[0].max(values[1]))
 }
 
-fn transfer_rem(_lhs: IntRange, rhs: IntRange) -> IntRange {
+fn transfer_rem(lhs: IntRange, rhs: IntRange) -> IntRange {
     let Some(divisor) = rhs.singleton() else {
         return IntRange::full();
     };
@@ -1070,7 +1070,13 @@ fn transfer_rem(_lhs: IntRange, rhs: IntRange) -> IntRange {
         .unsigned_abs()
         .saturating_sub(1)
         .min(i32::MAX as u32) as i32;
-    IntRange::bounded(-magnitude, magnitude)
+    if lhs.min().is_some_and(|min| min >= 0) {
+        // A truncating remainder of a non-negative dividend is never negative
+        // and stays below |divisor|, so the sign can be dropped.
+        IntRange::bounded(0, magnitude)
+    } else {
+        IntRange::bounded(-magnitude, magnitude)
+    }
 }
 
 fn fold_binary(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
@@ -1173,6 +1179,37 @@ mod tests {
                 IntRange::constant(4)
             ),
             IntRange::bounded(-8, 12)
+        );
+    }
+
+    #[test]
+    fn remainder_of_non_negative_dividend_is_non_negative() {
+        // `x % 7` with x ∈ [0, 100) is in [0, 6], not [-6, 6].
+        assert_eq!(
+            transfer_binary(
+                BinaryOp::Rem,
+                IntRange::bounded(0, 100),
+                IntRange::constant(7),
+            ),
+            IntRange::bounded(0, 6)
+        );
+        // A possibly-negative dividend keeps the symmetric range.
+        assert_eq!(
+            transfer_binary(
+                BinaryOp::Rem,
+                IntRange::bounded(-5, 100),
+                IntRange::constant(7),
+            ),
+            IntRange::bounded(-6, 6)
+        );
+        // `i32::MIN % -1` wraps to 0; the magnitude cap must not overflow.
+        assert_eq!(
+            transfer_binary(
+                BinaryOp::Rem,
+                IntRange::bounded(0, i32::MAX),
+                IntRange::constant(i32::MIN),
+            ),
+            IntRange::bounded(0, i32::MAX)
         );
     }
 

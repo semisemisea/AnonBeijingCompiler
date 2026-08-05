@@ -514,6 +514,14 @@ fn find_interchange(program: &Program, func: Function) -> Option<Plan> {
     let data = program.func_data(func);
     let (cfg, _dom, loops) = LoopAnalysis::new(data);
     let induction = BasicInductionVariableAnalysis::new(data, &cfg, &loops);
+    let nonneg =
+        crate::opt::analysis_passes::return_summary::nonneg_preserving_functions(program);
+    let self_params = crate::opt::analysis_passes::return_summary::always_nonneg_params(
+        program, &nonneg,
+    )
+    .get(&func)
+    .cloned()
+    .unwrap_or_default();
 
     // Cheap candidate pre-filter before building the heavy analyses: at
     // least one innermost loop with a parent is required, otherwise no
@@ -535,6 +543,12 @@ fn find_interchange(program: &Program, func: Function) -> Option<Plan> {
 
     let effects = EffectAnalysis::new(program);
     let nonneg = crate::opt::analysis_passes::return_summary::nonneg_preserving_functions(program);
+    let self_params = crate::opt::analysis_passes::return_summary::always_nonneg_params(
+        program, &nonneg,
+    )
+    .get(&func)
+    .cloned()
+    .unwrap_or_default();
     // Dependence analysis is only needed for the M42 reducibility check;
     // build it lazily on the first candidate that reaches that check.
     let mut deps: Option<DependenceAnalysis> = None;
@@ -814,8 +828,7 @@ fn find_interchange(program: &Program, func: Function) -> Option<Plan> {
         for access in &dep.accesses {
             let addr = access_inst_addr(&arena, access.inst);
             let ranges = ranges.get_or_insert_with(|| {
-                let no_params = rustc_hash::FxHashSet::default();
-                RangeAnalysis::new(&arena, &cfg, &loops, &induction, &nonneg, &no_params)
+                RangeAnalysis::new(&arena, &cfg, &loops, &induction, &nonneg, &self_params)
             });
             let Some((cj, ck)) = dual_coeffs(&arena, l_j, l_k, j_iv, k_iv, ranges, addr) else {
                 all_same_sign = false;

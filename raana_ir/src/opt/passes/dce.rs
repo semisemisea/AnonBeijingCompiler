@@ -1,7 +1,11 @@
 use crate::opt::{
     analysis_passes::effects::EffectAnalysis,
     prelude::*,
-    utils::{self, cfg::CFG, logical_edge::forwarded_block_params},
+    utils::{
+        self,
+        cfg::CFG,
+        logical_edge::{forwarded_block_params, resolve_forwarded_params},
+    },
 };
 
 pub struct DeadPhiElimination;
@@ -482,17 +486,8 @@ impl Pass for DeadPhiElimination {
         let forwarded = CFG::new(data)
             .map(|cfg| forwarded_block_params(data, &cfg))
             .unwrap_or_default();
-        for (&parameter, &replacement) in &forwarded {
-            let mut replacement = replacement;
-            for _ in 0..forwarded.len() {
-                let Some(&next) = forwarded.get(&replacement) else {
-                    break;
-                };
-                if next == replacement {
-                    break;
-                }
-                replacement = next;
-            }
+        let resolved = resolve_forwarded_params(&forwarded);
+        for (&parameter, &replacement) in &resolved {
             utils::visit_and_replace(data, parameter, replacement);
         }
 
@@ -517,7 +512,7 @@ impl Pass for DeadPhiElimination {
                 .collect::<Vec<_>>();
             unused_params_indices.push(unused_params_index);
         }
-        let mut changed = !forwarded.is_empty();
+        let mut changed = !resolved.is_empty();
         for (i, unused_params_index) in unused_params_indices.into_iter().enumerate() {
             if unused_params_index.is_empty() {
                 continue;

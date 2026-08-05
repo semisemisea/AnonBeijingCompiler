@@ -14,6 +14,7 @@ use crate::opt::{
         gep::gep_index_stride,
         logical_edge::{
             LogicalEdge, LogicalEdgeRewriter, forwarded_block_params, incoming_edges,
+            resolve_forwarded_params,
             outgoing_edges,
         },
         pointer_strength_reduction_cost::estimate_aarch64_pointer_strength_reduction,
@@ -113,19 +114,6 @@ enum ApplyResult {
 }
 
 impl PointerStrengthReduction {
-    fn resolve_forwarded(mut value: Inst, forwarded_params: &FxHashMap<Inst, Inst>) -> Inst {
-        for _ in 0..forwarded_params.len() {
-            let Some(&forwarded) = forwarded_params.get(&value) else {
-                break;
-            };
-            if forwarded == value {
-                break;
-            }
-            value = forwarded;
-        }
-        value
-    }
-
     fn find_candidate(
         data: &ArenaContextMut<'_>,
         cfg: &CFG,
@@ -160,7 +148,8 @@ impl PointerStrengthReduction {
 
         let mut best = None;
         let header_params = data.bb_data(looop.header()).params().to_vec();
-        let forwarded_params = forwarded_block_params(data, cfg);
+        let forwarded_params =
+            resolve_forwarded_params(&forwarded_block_params(data, cfg));
         // A header block parameter that every backedge passes through unchanged
         // is loop-invariant: its value on the first entry equals its value in
         // every iteration, so the preheader edge argument can substitute for it
@@ -460,7 +449,7 @@ impl PointerStrengthReduction {
         gep: Inst,
         value: Inst,
     ) -> Option<IndexEvolution> {
-        let value = Self::resolve_forwarded(value, forwarded_params);
+        let value = forwarded_params.get(&value).copied().unwrap_or(value);
         if value == iv {
             return Some(IndexEvolution::Direct);
         }
@@ -484,7 +473,7 @@ impl PointerStrengthReduction {
             gep: Inst,
             value: Inst,
         ) -> Option<AffineI32Expr> {
-            let value = PointerStrengthReduction::resolve_forwarded(value, forwarded_params);
+            let value = forwarded_params.get(&value).copied().unwrap_or(value);
             if value == iv {
                 return Some(AffineI32Expr {
                     value,
@@ -701,7 +690,7 @@ impl PointerStrengthReduction {
             forwarded_params: &FxHashMap<Inst, Inst>,
             value: Inst,
         ) -> Option<i32> {
-            let value = PointerStrengthReduction::resolve_forwarded(value, forwarded_params);
+            let value = forwarded_params.get(&value).copied().unwrap_or(value);
             if value == iv {
                 return Some(initial_iv);
             }
@@ -753,7 +742,7 @@ impl PointerStrengthReduction {
             forwarded_params: &FxHashMap<Inst, Inst>,
             value: Inst,
         ) -> Inst {
-            let value = PointerStrengthReduction::resolve_forwarded(value, forwarded_params);
+            let value = forwarded_params.get(&value).copied().unwrap_or(value);
             if value == iv {
                 return initial_iv;
             }

@@ -3107,6 +3107,72 @@ MemObject::Alloc 为 Array 且 ≥16B），则该参数声明为 aligned。实�
 - [ ] 最终 git status 只剩非本任务文件
 ```
 
+### 10.17.1 执行记录（2026-08-06，分支 feat/loop-vectorize-hermes，3 commits b6569e5..0ca047c）
+
+**改动**（全部在 raana_ir/src/opt/passes/loop_vectorize.rs）：
+
+1. **b6569e5 [Feat(IR)] IPA 参数对齐推断**：`base_is_16b_aligned` 对
+   `MemObject::Param` 从直接 false 改为查新函数 `param_is_16b_aligned`——
+   复用 `EffectAnalysis` 现成的 whole-program points-to（`points_to_of`，
+   fixpoint 收敛、保守 may-set）：参数 i 对齐 ⟺ points-to 集非空且全部实参
+   为 16B 对齐基址（`AbstractObject::Global` ≥16B / `Alloc` Array ≥16B），
+   Unknown 实参或空/缺失集保守拒绝。`classify_load`/`analyze_loop`/
+   `find_vectorizable` 透传 func/effects；store 路径的 base_not_aligned 同步
+   生效。
+2. **e324944 [Test(IR)] 4 单测**：全对齐解锁（load+store 双断言）、混合对齐
+   拒绝（8B 全局混入）、无调用点拒绝、递归调用点保守（递归实参=自身参数不
+   贡献对象，具体 main 调用点携带对齐全局 → 对齐保持）。
+3. **0ca047c [Fix(Opt)] rotated runtime do-while 越界修复**（见下）。
+
+**复扫数字**（M44_TRACE=1，release，IPA 后 / 修复后）：
+
+| case | load_classify | load_unmodeled | 说明 |
+|---|---|---|---|
+| h-5-*（前） | 4 | 4 | Param 基址全拒 |
+| h-5-01（后） | 0 | 0 | 内核 k 循环解锁（B1 归约+tail） |
+| h-8-*（前） | 3 | 3 | |
+| h-8-01（后） | 0 | 0 | 但 0 循环最终解锁：主内核卡 B1 条件
+  store+runtime trip、% 循环卡 payload_inst_rejected:Rem（无向量取余，
+  合理拒绝） |
+
+**关键发现：h-5-01 解锁后数值全错（-O2 输出 32122313 vs -19365765 型）→
+根因是既有 rotated runtime 向量化的 do-while off-by-one（与 h-10 同源，
+见 §10.18.1）**：
+
+1. **entry 无守卫**：rotated 向量循环是 do-while（body 先执行、latch 后
+   测试），preheader 无条件 plain jump 进 header——cnt0=0（trip∈{1,2,3}）
+   仍执行一次向量 body（越界读 + tail 双重计算）。修复：entry 改
+   `gt(cnt0, 0)` guard branch，false 边以 iv0/seed acc 直入标量 tail。
+2. **latch 测旧 counter**：runtime 路径测试 `gt(进入 counter, 0)`（IR
+   `%254 = gt %244, 0`，back-edge 才传新值）——do-while 每轮 body 后测旧
+   值，恒多跑一次 body（cnt0=4 跑 2 次，越界读下一段数据）。const 路径
+   保留原始 latch 条件（测更新后 `t' != 0`）所以一直正确。修复：改测
+   `eff_t_next`（counter-4，back-edge 携带值）——恰跑 cnt0/4 次。
+
+**验证**：
+
+- 最小复现（ludcmp 第二内层 `w-=A[i][j]*y[j]`，i=1..15 手算 .out）：
+  修复前 i≥4 全错（-2368 vs -556），修复后 PASS
+- h-5-01/02/03 差分 PASS（r: 1672/1732/1871ms；数值正确，但性能未超
+  标量 1572ms——B1 归约每外层一次 addv + tail，短循环固定开销大，性能
+  优化后续）
+- h-8-01/02/03 差分 PASS（r: 3040/3305/2943ms；未解锁，保持标量）
+- h-10-01/02/03 差分 PASS（= 0x1.7a47acp+13，见 §10.18.1）
+- 01_mm1/2/3、matmul1 -O2 差分 PASS（i32 向量化不回归）
+- RISC-V 抽查 01_mm1 PASS（loop_vectorize 由 enable_chain_to_switch
+  门控，AArch64-only，RISC-V 零影响）
+- raana_ir 412 全绿；workspace 568 过 1 挂（abi_matrix 尾调用断言，
+  M57 已知过期，非本任务）
+
+**遗留**（未做，可后续）：
+
+- h-5 `entry_i0_not_const` 4 个循环（`j=i` test-at-top 运行时入口 iv）——
+  TODO §10.17 路线图第 2 项
+- h-8 主内核（B1 条件 store + runtime trip）——arm_remainder_not_supported
+- h-8 % 循环（Rem 无向量指令，标量合理）
+- h-5 向量化性能未提升（归约开销）——静态计数 perf_compare 未跑（qemu
+  时间已记录）
+
 ### 10.18 f32 向量化残余数值 bug（h-10 差 1.45%）调研 + goal 提示词
 
 **调研数据（2026-08-06，HEAD 9736bda，后端 fix 4039233 已合入）**
@@ -3231,6 +3297,49 @@ fadd/fsub/fmul 发射）、标量路径（真标量输出与 .out 一致）。
 - [ ] 提交历史干净（原子 commit，中文消息）；结论写入 TODO.md §10.18
 - [ ] 最终 git status 只剩非本任务文件
 ```
+
+### 10.18.1 执行记录（2026-08-06——双轨合一：subagent 根因定位 + 主 agent Track B 修复落地）
+
+**结论先行**：h-10 的 1.45% 残余误差根因**不在后端**（s/v 别名 fix 4039233
+是必要正确性修复，但非 h-10 残余根因），而在 **raana_ir 向量化器的
+rotated+runtime_trip 计数器 off-by-one**（loop_vectorize.rs:2428-2441）：
+latch 测试从原 `t' != 0`（递减后）被替换成 `gt(counter, 0)`（递减前）——
+do-while 每轮 body 后测旧值，**恒多执行一次向量 body**（N=90 → cnt0=88，
+k=88..91 被处理，越界越过行尾 4KB；随后 tail 从 88 重做 2 个元素 → 第
+88/89 列污染两遍，逐位精确输入下产生结构性误差 ~174/12105 ≈ 1.44% ✓
+与 0x1.74d3aep+13 吻合）。test-at-top 不受影响（计数器是新造的，header
+处递减前测试恰好 Q 次）——与"01_mm1（i32）PASS、h-10（f32 rotated）
+FAIL"吻合，纯循环形态 × runtime_trip 交互，与 f32/i32 无关。
+
+**subagent 调研**（deleg_9212b392，leaf，7.5 分钟）：
+
+- 独立从 h-10 侧推导出同一根因（IR `.raana` %90=gt(%79,0) 测递减前 +
+  asm `sub w23,w22,#4 → cmp w22,#0 → b.le tail` + 数值 ~1.44% 吻合）
+- 约束「只改 taki_mir/anon_armv8、不碰 raana_ir」与根因冲突 → 零 commit
+  提前收敛，上报主 agent 裁决。分支 fix/f32-vector-numeric-bug 已建
+  （基于 eb567b6，无提交）
+- 其修复建议 `gt(counter, 1)`（测进入值）经核算**数值不对**（步长 4 时
+  "最后一次"是 t==4 不是 t==1，cnt0=4 仍跑 2 次）；主 agent 实现的
+  `gt(eff_t_next, 0)`（≡ 递减后 ≠0，与 const 路径 orig_cond 一致）正确
+
+**主 agent 修复**（0ca047c，同 §10.17.1）：
+
+- entry guard（cnt0<=0 直入 tail）+ latch 测更新后 counter（恰跑 cnt0/4
+  次）——一个 commit 同时修复 h-5（i32）与 h-10（f32）两轨
+- 3 个既有 rotated runtime 测试断言更新（entry 为 guard branch +
+  f_target=vec_tail）；raana_ir 412 全绿
+
+**验收**（全部满足）：
+
+- h-10-01/02/03 差分 PASS，输出 = `0x1.7a47acp+13` = .out ✓
+  （r: 30/56/83ms）
+- 01_mm1/2/3、matmul1 -O2 差分 PASS；RISC-V 抽查 01_mm1 PASS
+- workspace 568 过 1 挂（abi_matrix 尾调用断言，M57 已知过期非本任务）；
+  后端单测未新增（根因不在后端，无需后端场景覆盖）
+- 无独立 Track A commit（修复落在 Track B 的 0ca047c）；分支
+  fix/f32-vector-numeric-bug 已 fast-forward 并入主线（分支保留，与主线
+  同 commit，可随时删除）
+- git status 仅剩 Vectorize_Progress.md（非本任务文件）
 
 ### 10.19 session 启动提示词（f32 调研 subagent + 主 agent 继续 SIMD，可直接粘贴新 session）
 

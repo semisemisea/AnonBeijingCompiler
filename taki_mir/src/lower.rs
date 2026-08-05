@@ -926,6 +926,27 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         true
     }
 
+    /// Atomically mark every `(producer, consumer)` edge in a pure,
+    /// single-use expression tree as consumed by `root`.
+    pub fn sink_pure_single_use_tree(
+        &mut self,
+        edges: &[(HirInst, HirInst)],
+        root: HirInst,
+    ) -> bool {
+        if edges
+            .iter()
+            .any(|&(producer, consumer)| {
+                !self.can_sink_pure_single_use_producer(producer, consumer, root)
+            })
+        {
+            return false;
+        }
+        for &(producer, _) in edges {
+            self.inst_sunk.insert(producer);
+        }
+        true
+    }
+
     fn can_sink_pure_single_use_producer(
         &self,
         producer: HirInst,

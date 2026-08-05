@@ -1691,6 +1691,9 @@ fn select_branch_condition(
     false_target: MirBlockIndex,
 ) -> bool {
     let arena = ctx.arena;
+    if emit_and_comparison_tree(ctx, arena, branch, cond, true_target, false_target) {
+        return true;
+    }
     // Fold `br band(b1, b2)` / `br bor(b1, b2)` into `cmp; ccmp; b.cc`.
     if let Some((first, second, is_and)) = branch_ccmp_chain(ctx, arena, branch, cond) {
         let InstKind::Binary(first_binary) = arena.inst_data(first).kind() else {
@@ -1874,6 +1877,109 @@ fn select_branch_condition(
         return false;
     }
     emit_comparison_branch(ctx, arena, outer, false, labels);
+    true
+}
+
+/// Lower a single-use conjunction tree of integer comparisons directly into
+/// flags. Frontend boolean normalization may insert `value != 0` wrappers
+/// between `and` nodes; those wrappers are transparent for canonical boolean
+/// comparison results and are consumed with the tree.
+fn emit_and_comparison_tree(
+    ctx: &mut LowerContext<'_, MInst>,
+    arena: ArenaContext<'_>,
+    branch: HirInst,
+    root: HirInst,
+    true_target: MirBlockIndex,
+    false_target: MirBlockIndex,
+) -> bool {
+    fn collect(
+        ctx: &LowerContext<'_, MInst>,
+        arena: ArenaContext<'_>,
+        node: HirInst,
+        user: HirInst,
+        comparisons: &mut Vec<HirInst>,
+        edges: &mut Vec<(HirInst, HirInst)>,
+    ) -> bool {
+        let InstKind::Binary(binary) = arena.inst_data(node).kind() else {
+            return false;
+        };
+        if binary.op() == BinaryOp::And && has_only_user(ctx, node, user) {
+            if !collect(ctx, arena, binary.lhs(), node, comparisons, edges)
+                || !collect(ctx, arena, binary.rhs(), node, comparisons, edges)
+            {
+                return false;
+            }
+            edges.push((node, user));
+            return true;
+        }
+        if binary.op() == BinaryOp::NotEq && has_only_user(ctx, node, user) {
+            let inner = if integer_constant(arena, binary.lhs()) == Some(0) {
+                Some(binary.rhs())
+            } else if integer_constant(arena, binary.rhs()) == Some(0) {
+                Some(binary.lhs())
+            } else {
+                None
+            };
+            if let Some(inner) = inner {
+                if collect(ctx, arena, inner, node, comparisons, edges) {
+                    edges.push((node, user));
+                    return true;
+                }
+            }
+        }
+        if !is_comparison(binary.op())
+            || matches!(arena.inst_data(binary.lhs()).ty().kind(), TypeKind::Float32)
+        {
+            return false;
+        }
+        comparisons.push(node);
+        if has_only_user(ctx, node, user) {
+            edges.push((node, user));
+        }
+        true
+    }
+
+    let mut comparisons = Vec::new();
+    let mut edges = Vec::new();
+    if !collect(ctx, arena, root, branch, &mut comparisons, &mut edges)
+        || comparisons.len() < 3
+        || comparisons.len() > 8
+        || !ctx.sink_pure_single_use_tree(&edges, branch)
+    {
+        return false;
+    }
+
+    let InstKind::Binary(first) = arena.inst_data(comparisons[0]).kind() else {
+        unreachable!();
+    };
+    let (size, lhs, rhs, imm) = comparison_operands(ctx, arena, first);
+    if let Some(imm) = imm {
+        ctx.emit(MInst::CmpImm { size, lhs, imm });
+    } else {
+        ctx.emit(MInst::CmpRR { size, lhs, rhs });
+    }
+    let mut condition = comparison_cond(first.op());
+    for comparison in comparisons.into_iter().skip(1) {
+        let InstKind::Binary(binary) = arena.inst_data(comparison).kind() else {
+            unreachable!();
+        };
+        let (size, lhs, rhs, imm) = ccmp_operands(ctx, arena, binary);
+        let next_condition = comparison_cond(binary.op());
+        ctx.emit(MInst::CCmp {
+            size,
+            lhs,
+            rhs,
+            imm,
+            nzcv: nzcv_making_cond_false(next_condition),
+            cond: condition,
+        });
+        condition = next_condition;
+    }
+    ctx.emit(MInst::CondBr {
+        cond: condition,
+        true_label: Label::from_block(true_target),
+        false_label: Label::from_block(false_target),
+    });
     true
 }
 
@@ -3165,6 +3271,51 @@ mod tests {
         // The dynamic index folds into the load addressing mode:
         // `ldr w?, [x?, x?, sxtw #2]` (stride 4 → scale 2).
         assert!(assembly.contains("sxtw #2]"), "{assembly}");
+    }
+
+    #[test]
+    fn conjunction_tree_branches_without_materializing_booleans() {
+        use raana_ir::ir::builder_trait::*;
+
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "and_branch".into(),
+            vec![Type::get_i32(); 6],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let yes = data.new_basic_block().basic_block("yes".into(), vec![]);
+        let no = data.new_basic_block().basic_block("no".into(), vec![]);
+        data.layout_mut().push_bb_back(yes);
+        data.layout_mut().push_bb_back(no);
+        let p = data.params().to_vec();
+        let first = data.new_local_inst().binary(BinaryOp::Lt, p[0], p[1]);
+        let second = data.new_local_inst().binary(BinaryOp::Ge, p[2], p[3]);
+        let pair = data.new_local_inst().binary(BinaryOp::And, first, second);
+        let zero = data.new_local_inst().integer(0);
+        let wrapped = data
+            .new_local_inst()
+            .binary(BinaryOp::NotEq, pair, zero);
+        let third = data.new_local_inst().binary(BinaryOp::NotEq, p[4], p[5]);
+        let condition = data
+            .new_local_inst()
+            .binary(BinaryOp::And, wrapped, third);
+        let branch = data
+            .new_local_inst()
+            .branch(condition, yes, vec![], no, vec![]);
+        for inst in [first, second, pair, wrapped, third, condition, branch] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let one = data.new_local_inst().integer(1);
+        let yes_ret = data.new_local_inst().ret(Some(one));
+        let no_ret = data.new_local_inst().ret(Some(zero));
+        data.layout_mut().insert_inst(yes, yes_ret);
+        data.layout_mut().insert_inst(no, no_ret);
+
+        let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+        assert_eq!(assembly.matches("ccmp ").count(), 2, "{assembly}");
+        assert!(!assembly.contains("cset "), "{assembly}");
     }
 
     #[test]

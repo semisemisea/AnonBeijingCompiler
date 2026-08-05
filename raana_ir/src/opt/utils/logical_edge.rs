@@ -130,7 +130,8 @@ pub fn resolve_forwarded_params(forwarded: &FxHashMap<Inst, Inst>) -> FxHashMap<
             path.push(current);
             match forwarded.get(&current).copied() {
                 Some(next) if next != current => current = next,
-                _ => break Some(current),
+                Some(_) => break None,
+                None => break Some(current),
             }
         };
         for value in path {
@@ -299,12 +300,14 @@ mod tests {
         let shared = program.new_value().integer(3);
         let cycle_a = program.new_value().integer(4);
         let cycle_b = program.new_value().integer(5);
+        let self_loop = program.new_value().integer(6);
         let forwarded = FxHashMap::from_iter([
             (first, shared),
             (second, shared),
             (shared, terminal),
             (cycle_a, cycle_b),
             (cycle_b, cycle_a),
+            (self_loop, self_loop),
         ]);
 
         let resolved = resolve_forwarded_params(&forwarded);
@@ -313,6 +316,7 @@ mod tests {
         assert_eq!(resolved.get(&shared), Some(&terminal));
         assert!(!resolved.contains_key(&cycle_a));
         assert!(!resolved.contains_key(&cycle_b));
+        assert!(!resolved.contains_key(&self_loop));
     }
 
     #[test]

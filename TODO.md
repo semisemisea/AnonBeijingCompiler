@@ -504,6 +504,32 @@ M44 v2（select 掩码）。
   内存累加 > B2 test-at-top。后续目标 2/3 完成后，白名单与新增 lowering
   直接生效。
 
+##### M44 v2 目标 2（B3 内存累加）执行记录（2026-08-05）
+
+- 实现（两个原子 commit，见 Vectorize_Progress.md 目标 2 完成记录）：
+  1. ce4976d：dependence.rs `is_elementwise_inplace`——同 base、同
+     byte_coefficient（≠0）、同 constant_part 的读-写对，store 值经纯
+     def-use 链依赖 load 值即元素级安全，跳过冲突测试；系数 0 / 无关写 /
+     跨迭代仍 Forbidden。interchange 核对：k-loop 判定面不变（纯寄存器
+     归约，line 841 拒写归约目标 base），4 测不回归。
+  2. 1263cda：loop_vectorize 外层 IV passthrough 参数支持——嵌套内核
+     内层循环 header [i, j, k, t] 形态（back_args[i]==params[i] 识别），
+     is_loop_invariant 视 passthrough 为不变式，epilogue/reduce 块转发
+     passthrough 值。这是嵌套内核（mm/matmul/conv2d/ludcmp）向量化的
+     通用前置。
+- 验证：
+  - raana_ir 337 全过；dependence 4 测改写/新增。
+  - E2E（临时用例已删）：c[i][j]+=a[i][k]*b[k][j] 内核 -O2 出
+    dup v.4s + ldr q ×2 + mul v.4s + add v.4s + str q；make test
+    -O0/-O1/-O2 三级 PASS。
+  - corpus 复扫（61 例）：0 编译错误；IntraIterationConflict 174 → 0；
+    params_not_2 162 → 12；exit_has_params ×50 新增（保守拒绝）。
+    向量化命中 0 → 3/60（matmul1/2/3 清零循环 dup+str q）。
+- 诚实边界：corpus 计算内核未出向量——01_mm 系数组参数（alignment 门，
+  需 M43 versioning 或对齐放宽）、matmul 交换后内核奇偶掩码 select
+  （目标 4）。B3 后真实优先级：目标 3（test-at-top，shape_header_multi_
+  inst 200 次）> 目标 4（select 掩码）。
+
 #### M45：SLP 基本块向量化 + 循环展开
 
 - SLP（`raana_ir/src/opt/passes/slp.rs`）：把同一基本块内相邻、类型一致的独立

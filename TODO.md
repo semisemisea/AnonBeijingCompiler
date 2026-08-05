@@ -530,6 +530,24 @@ M44 v2（select 掩码）。
   （目标 4）。B3 后真实优先级：目标 3（test-at-top，shape_header_multi_
   inst 200 次）> 目标 4（select 掩码）。
 
+##### M44 v2 目标 3（B2 test-at-top）执行记录（2026-08-05）
+
+- 实现（commit 7e01d97，详见 Vectorize_Progress.md 目标 3 完成记录）：
+  analyze_loop 识别 header 恰为 [lt iv, bound; br]（bound 编译期常量）
+  + latch plain jump 的 test-at-top 形态；trip = bound - i0；R>0 时
+  exit 读 iv 保守拒绝；apply 物化 counter（手写 add_param 等价，
+  BlockArgRef 追加 header 参数）并替换 bound 测试为 counter 测试。
+- 调试教训：T3 检查方向写反（f_target 应不在 loop 内）致正例误拒，
+  逐项 trace 定位；test-at-top 的 effective 参数计算不排除 counter_slot。
+- 验证：raana_ir 340 全过（+3 单测）；合成用例 -O2 出
+  ldr q + dup v.4s + add v.4s + str q；make test 三级 PASS；
+  corpus 复扫 shape_header_multi_inst 230 → 168、0 编译错误。
+- 诚实边界：corpus 无 test-at-top 循环出向量（单参数+常量 bound+
+  payload 干净+exit 不读 iv 无交集）；test_at_top_multi_param ×48、
+  test_at_top_bound_not_const ×18 保守拒绝；多参数 test-at-top 后置。
+- B3/B2 后真实优先级：目标 4（select 掩码，matmul 交换内核）> M43
+  versioning（数组参数 alignment）> 多参数 test-at-top。
+
 #### M45：SLP 基本块向量化 + 循环展开
 
 - SLP（`raana_ir/src/opt/passes/slp.rs`）：把同一基本块内相邻、类型一致的独立

@@ -567,6 +567,75 @@ M44 v2（select 掩码）。
   多参数 test-at-top；数组参数 alignment（M43 versioning）；matmul1
   min 归约 + 奇偶掩码内核。
 
+##### M44 v2 收官：拒绝原因分类（2026-08-05 调研，写进 TODO 的深度）
+
+Corpus 61 例（0 编译错误）拒绝分布（dedup，top）：not_innermost 276、
+shape_header_multi_inst 168、shape_body_not_2_blocks 111、
+test_at_top_multi_param 48、exit_has_params 48、non_unit_step 45、
+NoInductionVariable 30、bound_not_const 18+18、params_not_2 12、
+CallInBody 9、exit_arg_not_acc 6、Rem 3、IntraIterationConflict
+（matmul1 残余）、select_lane_cond（新增）。
+
+分类（按根因层）：
+
+A. 形态层（analyze 前置保守拒绝，纯 loop_vectorize.rs）
+- A1 not_innermost（276）：只处理最内层循环——正确保守，非缺口
+  （外层循环向量化需要多块体处理=B1 类）。
+- A2 shape_header_multi_inst（168）：header 3+ 指令。代表：conv2d
+  计算循环。根因：test-at-top 只认恰 [lt,br]、rotated 只认 [jump]；
+  bound 计算/额外指令在 header 即拒。修法候选：bound 计算提升
+  preheader 后识别（需先确认代表形态）。
+- A3 test_at_top_multi_param（48）：test-at-top + 外层 IV passthrough
+  （header 4-7 参数）。代表：conv2d 内核（i/j/k/l 4 层嵌套，每层
+  传 6-7 参数）、01_mm1 计算内核（BB20）。根因：目标 3 保守
+  n_params==1。修法：step 4 对 test-at-top 复用目标 2 的 passthrough
+  识别（back-edge 原样转发）——中等改动，**高 ROI**（01_mm/conv2d
+  内核解锁）。
+- A4 exit_has_params（48）：exit 块带额外 phi 参数。代表：matmul1
+  min/sum 循环 exit 携带归约状态。修法：确认代表形态后扩展 exit
+  参数允许集（passthrough+acc 之外）。
+- A5 non_unit_step（45）：IV 步长非 1。修法：步长归一化
+  （i=2k → 索引变换），中优先级。
+- A6 bound 非常量（36）：test_at_top_bound_not_const /
+  entry_trip_not_const。无 versioning 硬规则 → 保持拒绝（M43
+  versioning 时解锁）。
+- A7 params_not_2（12）：entry args 数量不符，passthrough 后残余。
+
+B. 体层（payload/body）
+- B1 shape_body_not_2_blocks（111）：循环体多块（if/else 未转换）。
+  代表：matmul1 奇偶掩码内核（41-50 行：
+  `if(a[i][k]*b[k][j]%2==0) temp += b[i][k]*a[k][j]`）。根因：
+  if_conversion 只提升 i32 binary（safe_arm_binary），分支含
+  load/store 不转 select。修法候选：(a) if_conversion 提升面扩展
+  （load 依赖链 hoist）；(b) vectorizer 直接处理 if 头多块体
+  （单出口 + 掩码）。**matmul1 内核最大拦路石**。
+- B2 select_lane_cond（少）：select 条件依赖循环值。代表：matmul1
+  min 归约（IR %102 = select %101, %100, %vid_6）。根因：IR 无向量
+  select、lowering 无 bsl/csel。修法：anon_armv8 VecCsel/bsl
+  lowering——非平凡。
+- B3 verdict/exit_arg_not_acc（6+）：B1 归约更新是 select/if 包裹
+  （非纯 binary）。代表：matmul1 min。修法：归约识别扩展。
+- B4 Rem payload（3）：conv2d 内核 % 运算。NEON 无整数向量除法/
+  取模（sr 只改写常量除数）→ 保持拒绝（ISA 限制）。
+- B5 load_unmodeled/load_classify（2+）：三维 GEP 列访问
+  （matmul1 转置 b[i][j]=a[j][i]）。非连续访存需 gather（硬规则
+  禁止）→ 正确拒绝，不动。
+- B6 CallInBody（9）：读入循环 getarray/getint——正确拒绝。
+- B7 NoInductionVariable（30）：M42 找不到 IV。待确认代表形态。
+
+C. 依赖层（M42/B3，dependence.rs）
+- C1 IntraIterationConflict（matmul1 内核残余）：c[i][j] += ... 在
+  if 块内——B3 豁免（is_elementwise_inplace）未覆盖：写值依赖链
+  含多个 load 或跨块条件执行。修法：value_flows_to 扩展。**依赖
+  B1 前置**（单块体后 B3 豁免面才完整）。
+
+优先级/依赖链（perf ROI）：
+- matmul1 内核 = B1（if 掩码多块体）→ C1（B3 覆盖）→ B2/B3
+  （掩码归约 select）——**B1 是前置**
+- 01_mm 系 = A3（多参数 test-at-top）
+- conv2d = A3 + A2 + B4(Rem, ISA 限制)
+- matmul1 转置（B5）、min（B2/B3）为 v3 lowering 缺口
+
 #### M45：SLP 基本块向量化 + 循环展开
 
 - SLP（`raana_ir/src/opt/passes/slp.rs`）：把同一基本块内相邻、类型一致的独立

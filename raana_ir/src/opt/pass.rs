@@ -197,6 +197,16 @@ impl PassesManager {
             p.register_initial(mulmod);
         }
 
+        // Memoize a pure self-recursive function with an additive accumulator
+        // whose single callsite drives a forward induction loop (h-1 family).
+        // The rewrite allocates a runtime-sized cache via the AArch64-only
+        // `soyo_calloc` builtin, so it must run before `inline` (which would
+        // flatten the now-redundant body) and is gated to AArch64.
+        if config.memoize && config.target.enable_chain_to_switch {
+            let memoize = Box::new(recursive_memoize::RecursiveMemoize);
+            p.register_initial(memoize);
+        }
+
         let inline = Box::new(inline::Inline);
         p.register_initial(inline);
 

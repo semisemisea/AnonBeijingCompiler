@@ -63,6 +63,10 @@ pub struct PassesConfig {
     /// Register-block the strided matrix-reduction loop (M67). Enabled by
     /// default; A/B measurement toggles it.
     pub blocked_reduction: bool,
+    /// Memoize pure self-recursive functions with an additive accumulator
+    /// (M68, h-1). AArch64-only; enabled by default, A/B measurement toggles
+    /// it.
+    pub memoize: bool,
 }
 
 impl PassesConfig {
@@ -77,6 +81,7 @@ impl PassesConfig {
             collect_stats: false,
             dead_function_elimination: true,
             blocked_reduction: true,
+            memoize: true,
         }
     }
 }

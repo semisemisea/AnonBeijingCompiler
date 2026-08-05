@@ -12,12 +12,16 @@ const INLINE_MEMZERO_MAX_STORES: usize = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddedSymbol {
     Memset,
+    /// Zero-extends its two 32-bit arguments and tail-calls glibc `calloc`
+    /// (used by the M68 recursive-memoization pass).
+    Calloc,
 }
 
 impl EmbeddedSymbol {
     pub const fn symbol(self) -> &'static str {
         match self {
             Self::Memset => ".Lsoyo_memzero",
+            Self::Calloc => ".Lsoyo_calloc",
         }
     }
 }
@@ -28,11 +32,18 @@ struct EmbeddedAssembly {
     is_required: fn(&HirProgram) -> bool,
 }
 
-const EMBEDDED_ASSEMBLIES: &[EmbeddedAssembly] = &[EmbeddedAssembly {
-    symbol: EmbeddedSymbol::Memset,
-    source: include_str!("runtime/memzero.S"),
-    is_required: needs_memset,
-}];
+const EMBEDDED_ASSEMBLIES: &[EmbeddedAssembly] = &[
+    EmbeddedAssembly {
+        symbol: EmbeddedSymbol::Memset,
+        source: include_str!("runtime/memzero.S"),
+        is_required: needs_memset,
+    },
+    EmbeddedAssembly {
+        symbol: EmbeddedSymbol::Calloc,
+        source: include_str!("runtime/calloc.S"),
+        is_required: needs_calloc,
+    },
+];
 
 pub fn mem_zero_is_inline(byte_len: usize) -> bool {
     byte_len % 4 == 0 && byte_len / 4 <= INLINE_MEMZERO_MAX_STORES
@@ -74,5 +85,26 @@ fn needs_memset(program: &HirProgram) -> bool {
                     _ => false,
                 },
             )
+    })
+}
+
+/// True when the program calls the compiler-provided `soyo_calloc` allocator
+/// declared by the M68 recursive-memoization pass.
+fn needs_calloc(program: &HirProgram) -> bool {
+    program.function_layout().iter().any(|&function| {
+        program
+            .func_data(function)
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|block| block.insts().iter())
+            .any(|&inst| {
+                matches!(
+                    program.func_data(function).inst_data(inst).kind(),
+                    InstKind::Call(call)
+                        if program.func_data(call.callee()).name()
+                            == raana_ir::opt::CALLOO_NAME
+                )
+            })
     })
 }

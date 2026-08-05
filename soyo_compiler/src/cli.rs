@@ -83,6 +83,10 @@ pub(crate) struct Arg {
     pub(crate) enable_blocked_reduction: bool,
     #[arg(long, conflicts_with = "enable_blocked_reduction")]
     pub(crate) disable_blocked_reduction: bool,
+    #[arg(long, conflicts_with = "disable_memoize")]
+    pub(crate) enable_memoize: bool,
+    #[arg(long, conflicts_with = "enable_memoize")]
+    pub(crate) disable_memoize: bool,
     #[arg(long, value_enum, default_value_t = SchedModel::CortexA53)]
     pub(crate) sched_model: SchedModel,
 }
@@ -113,6 +117,12 @@ impl Arg {
         }
         if self.disable_blocked_reduction {
             config.blocked_reduction = false;
+        }
+        if self.enable_memoize {
+            config.memoize = true;
+        }
+        if self.disable_memoize {
+            config.memoize = false;
         }
         config
     }

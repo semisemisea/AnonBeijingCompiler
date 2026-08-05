@@ -9,6 +9,9 @@ pub mod utils;
 // compiler-provided `soyo_mulmod` modmul builtin without depending on the
 // (private) pass module layout.
 pub use passes::mulmod_recognize::MULMOD_HELPER;
+// Re-exported for the AArch64 backend, which lowers calls to the M68
+// `soyo_calloc` runtime cache allocator into embedded assembly.
+pub use passes::recursive_memoize::CALLOO_NAME;
 
 /// Opt crate prelude
 pub mod prelude {

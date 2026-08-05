@@ -1,4 +1,5 @@
 pub mod boolean_simplify;
+pub mod blocked_reduction;
 pub mod chain_to_switch;
 pub mod column_major;
 pub mod const_prop;

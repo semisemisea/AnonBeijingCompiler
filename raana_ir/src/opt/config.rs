@@ -60,6 +60,9 @@ pub struct PassesConfig {
     pub loop_unroll: LoopUnrollMode,
     pub collect_stats: bool,
     pub dead_function_elimination: bool,
+    /// Register-block the strided matrix-reduction loop (M67). Enabled by
+    /// default; A/B measurement toggles it.
+    pub blocked_reduction: bool,
 }
 
 impl PassesConfig {
@@ -73,6 +76,7 @@ impl PassesConfig {
             },
             collect_stats: false,
             dead_function_elimination: true,
+            blocked_reduction: true,
         }
     }
 }

@@ -79,6 +79,10 @@ pub(crate) struct Arg {
     pub(crate) enable_const_cse: bool,
     #[arg(long, conflicts_with = "enable_const_cse")]
     pub(crate) disable_const_cse: bool,
+    #[arg(long, conflicts_with = "disable_blocked_reduction")]
+    pub(crate) enable_blocked_reduction: bool,
+    #[arg(long, conflicts_with = "enable_blocked_reduction")]
+    pub(crate) disable_blocked_reduction: bool,
     #[arg(long, value_enum, default_value_t = SchedModel::CortexA53)]
     pub(crate) sched_model: SchedModel,
 }
@@ -104,6 +108,12 @@ impl Arg {
             };
         }
         config.collect_stats = self.pass_stats;
+        if self.enable_blocked_reduction {
+            config.blocked_reduction = true;
+        }
+        if self.disable_blocked_reduction {
+            config.blocked_reduction = false;
+        }
         config
     }
 

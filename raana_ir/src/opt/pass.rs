@@ -296,6 +296,15 @@ impl PassesManager {
         let reduction_unroll = Box::new(reduction_unroll::ReductionUnroll);
         p.register(reduction_unroll);
 
+        // Register-block the strided matrix-reduction loop (`acc -= A[i][k] *
+        // B[k][j]`): four accumulator lanes plus four column pointers overlap
+        // the column-load cache misses (h-5 / matmul). Runs after
+        // `reduction_unroll`, which handles the plain `acc += a[j]` shape.
+        if config.blocked_reduction {
+            let blocked_reduction = Box::new(blocked_reduction::BlockedReduction);
+            p.register(blocked_reduction);
+        }
+
         let if_conversion = Box::new(if_conversion::IfConversion);
         p.register(if_conversion);
 

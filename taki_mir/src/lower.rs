@@ -221,6 +221,31 @@ pub struct LowerContext<'prog, I: VCodeInst> {
     /// extended to the block start (register-pressure guard).
     block_const_multi: FxHashSet<i64>,
 
+    /// Loop-scoped constant sharing: (loop_index, value) -> shared vreg.
+    /// The materialization is deferred to the loop preheader (see
+    /// `emit_loop_const_shared`); every use inside the loop body shares the
+    /// vreg, so per-iteration movz/movk chains disappear entirely.
+    loop_const_shared: FxHashMap<(usize, i64), Reg>,
+
+    /// (loop_index, value) pairs used by two or more operands across the
+    /// loop body (loop-level sharing gate, mirrors `block_const_multi`).
+    loop_const_multi: FxHashSet<(usize, i64)>,
+
+    /// Preheader block -> constant chains to emit when that block is
+    /// lowered. Each entry is (value, shared vreg).
+    loop_emissions: FxHashMap<HirBasicBlock, Vec<(i64, Reg)>>,
+
+    /// Innermost loop containing the block currently being lowered
+    /// (`None` for edge blocks and blocks outside any loop).
+    current_loop: Option<usize>,
+
+    /// Loop structure of the function being lowered (snapshot: lowering
+    /// does not mutate the IR, so the analysis stays valid).
+    loop_analysis: raana_ir::opt::prelude::loop_analysis::LoopAnalysis,
+
+    /// CFG of the function, needed by `Loop::get_preheader`.
+    loop_cfg: raana_ir::opt::utils::cfg::CFG,
+
     // ----------------- Side effect and color----------------- //
     // INFO: We give each instruction a color. The colors are same between two instruction if:
     // - There is no instruction have side effect between them.
@@ -322,6 +347,8 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             program,
             curr_func: Some(func),
         };
+        let (loop_cfg, _, loop_analysis) =
+            raana_ir::opt::prelude::loop_analysis::LoopAnalysis::new(arena.f());
         let mut abi = abi;
         abi.set_outgoing_arg_size(Self::precompute_outgoing_arg_size(arena));
         let vcode = VCodeBuilder::new(abi, block_order);
@@ -443,6 +470,12 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             ir_inst: Vec::new(),
             block_const_shared: FxHashMap::default(),
             block_const_multi: FxHashSet::default(),
+            loop_const_shared: FxHashMap::default(),
+            loop_const_multi: FxHashSet::default(),
+            loop_emissions: FxHashMap::default(),
+            current_loop: None,
+            loop_analysis,
+            loop_cfg,
         }
     }
 
@@ -477,12 +510,15 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             .collect();
         debug!(target: "taki_mir::lower", "function={} lowered block order={lowered_order:?}", self.arena.f().name());
 
+        self.loop_const_multi = self.scan_loop_const_uses();
+
         for (block_index, lb) in lowered_order.iter().enumerate().rev() {
             let block_index = MirBlockIndex::new(block_index);
             debug!(target: "taki_mir::lower", "function={} lowering block={} descriptor={lb:?}", self.arena.f().name(), block_index.index());
 
             if let Some(bb) = lb.orig_block() {
                 self.cur_block = Some(bb);
+                self.current_loop = self.loop_analysis.min_loop_contain_index(bb);
                 self.block_const_shared.clear();
                 self.block_const_multi = self.scan_block_const_uses(bb);
                 if let Some(branch_inst) =
@@ -492,6 +528,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                     self.finish_ir_inst();
                 }
             } else {
+                self.current_loop = None;
                 let &[succ] = self.vcode.block_order().succ_indices(block_index).1 else {
                     unreachable!("edge blocks must have exactly one successor")
                 };
@@ -514,8 +551,11 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
                 self.finish_ir_inst();
             }
 
-            // Emit the block's shared constant materializations at the buffer
-            // tail so the stream reversal places them at the block start.
+            // Emit loop-shared constant materializations when this block is
+            // some loop's preheader (chains land at this block's start after
+            // the stream reversal and dominate the whole loop body), then the
+            // block's own shared constants.
+            self.emit_loop_const_shared();
             self.emit_block_const_shared();
 
             self.finish_bb();
@@ -925,6 +965,87 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         }
         // Flush immediately: the emitted chain is the last code pushed for
         // this block, so the stream reversal places it at the block start.
+        self.finish_ir_inst();
+    }
+
+    /// Count Integer-constant operands per (loop, value) across each loop's
+    /// body (header included); pairs used by two or more operands become
+    /// loop-level sharing candidates.
+    fn scan_loop_const_uses(&mut self) -> FxHashSet<(usize, i64)> {
+        let mut counts: FxHashMap<(usize, i64), usize> = FxHashMap::default();
+        let func = self
+            .arena
+            .program
+            .func_data(self.arena.curr_func.expect("function is set during lowering"));
+        for (index, loop_info) in self.loop_analysis.loops().iter().enumerate() {
+            let mut blocks: Vec<HirBasicBlock> = loop_info.body().iter().copied().collect();
+            blocks.push(loop_info.header());
+            for block in blocks {
+                let insts = func.layout().basicblock(block).insts().to_vec();
+                for inst in insts {
+                    for operand in self.arena.inst_data(*inst).inst_usage() {
+                        if let InstKind::Integer(integer) = self.arena.inst_data(operand).kind() {
+                            *counts
+                                .entry((index, i64::from(integer.value())))
+                                .or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        counts
+            .into_iter()
+            .filter(|&(_, count)| count >= 2)
+            .map(|(key, _)| key)
+            .collect()
+    }
+
+    /// Loop-scoped constant sharing: return a shared vreg for `value` when
+    /// `gate_on` is used by two or more operands across the innermost loop
+    /// containing the block being lowered (for ordinary constants
+    /// `gate_on == value`; the division-magic path gates the magic
+    /// multiplier on the divisor's operand count). The materialization is
+    /// deferred to the loop preheader (see `emit_loop_const_shared`), so the
+    /// chain executes once per loop entry instead of once per iteration.
+    /// `None` means the caller should keep its per-use/block materialization
+    /// (no loop, no preheader, or a single-use constant).
+    fn loop_const_to_reg(&mut self, value: i64, gate_on: i64) -> Option<Reg> {
+        let loop_index = self.current_loop?;
+        if !self.loop_const_multi.contains(&(loop_index, gate_on)) {
+            return None;
+        }
+        if let Some(&shared) = self.loop_const_shared.get(&(loop_index, value)) {
+            return Some(shared);
+        }
+        let preheader = self.loop_analysis.loops()[loop_index]
+            .get_preheader(&self.loop_cfg)?;
+        let shared = self.alloc_tmp(HirType::get_i32());
+        self.loop_const_shared.insert((loop_index, value), shared);
+        self.loop_emissions
+            .entry(preheader)
+            .or_default()
+            .push((value, shared));
+        Some(shared)
+    }
+
+    /// Emit the deferred loop-shared constant materializations recorded for
+    /// the block being lowered (a loop preheader). Called at the end of the
+    /// block's lowering; the chains land at the preheader's start after the
+    /// stream reversal and dominate the whole loop body.
+    fn emit_loop_const_shared(&mut self) {
+        let Some(bb) = self.cur_block else {
+            return;
+        };
+        let Some(chains) = self.loop_emissions.remove(&bb) else {
+            return;
+        };
+        for (value, reg) in chains {
+            self.emit(<I::ABISpec as ABIMachineSpec>::gen_load_imm(
+                Writable::from_reg(reg),
+                value as u32 as u64,
+                I32,
+            ));
+        }
         self.finish_ir_inst();
     }
 

@@ -1126,9 +1126,12 @@ fn analyze_loop(
             let (update, delta) = acc_update.expect("acc_update set alongside acc_info");
             // The accumulator seed must be splattable at the entry edge. A
             // seed that is another loop's block parameter (e.g. the outer
-            // `sum` of a nested `sum += c[i][j]`) is not materialized
-            // correctly by the current splat path — reject for now (the
-            // loop stays scalar).
+            // `sum` of a nested `sum += c[i][j]`) is lowered to a `dup`
+            // whose source register comes out zero (rematerialize has no
+            // BlockArgRef case; the parameter vreg is not live at the
+            // preheader) — verified experimentally on matmul1. Reject for
+            // now (the loop stays scalar); fixing this needs a lowering /
+            // regalloc change.
             if matches!(
                 arena.inst_data(entry_args[acc_slot]).kind(),
                 InstKind::BlockArgRef(_)

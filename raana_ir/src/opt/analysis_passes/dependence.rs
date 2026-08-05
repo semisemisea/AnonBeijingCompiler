@@ -833,6 +833,20 @@ fn identify_reduction(
             continue;
         }
         let update = *backedge_args.get(index)?;
+        // Skip induction variables: their value feeds address computations
+        // (GEP offsets) in the body, unlike an accumulator. Without this
+        // the first matching parameter wins, which is the IV when it
+        // precedes the accumulator (`sum += c[i][j]` loops [i, j, sum, t]
+        // mislabel `j' = add(j, 1)` as a reduction).
+        let is_iv = data.inst_data(acc).used_by().iter().any(|&user| {
+            matches!(
+                data.inst_data(user).kind(),
+                InstKind::GetElemPtr(g) if g.offsets().contains(&acc)
+            )
+        });
+        if is_iv {
+            continue;
+        }
         let Some(op) = match_acc_update_op(arena, acc, update) else {
             continue;
         };

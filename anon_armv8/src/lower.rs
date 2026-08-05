@@ -1918,19 +1918,10 @@ fn emit_and_comparison_tree(
             edges.push((node, user));
             return true;
         }
-        if binary.op() == BinaryOp::NotEq {
-            let inner = if integer_constant(arena, binary.lhs()) == Some(0) {
-                Some(binary.rhs())
-            } else if integer_constant(arena, binary.rhs()) == Some(0) {
-                Some(binary.lhs())
-            } else {
-                None
-            };
-            if let Some(inner) = inner {
-                if collect(ctx, arena, inner, node, comparisons, edges, visited) {
-                    edges.push((node, user));
-                    return true;
-                }
+        if let Some((inner, false)) = zero_comparison(arena, binary) {
+            if collect(ctx, arena, inner, node, comparisons, edges, visited) {
+                edges.push((node, user));
+                return true;
             }
         }
         if !is_comparison(binary.op())

@@ -1791,3 +1791,176 @@ loop_vectorize 的 header 检查支持 `[lt, jump]` 形态（header 只有两条
 - 风险：lt 的 use 结构可能多样（body br / latch br / 死值）——先确认再放宽；放宽后 entry_trip/payload/exit 会继续拒一批（正常，逐步看）。
 - 后续链（形状检查全景）：not_innermost 276 → M42 verdict → **shape_header（本任务）** → shape_body 96（B1 已修部分）→ entry_trip_not_const 36（M43 versioning，大工程）→ payload Rem 3（ISA）→ exit 参数。
 - 已解锁（勿回退）：sum 归约（f0455b0 ipsccp Bottom + 932ee76 splat(0)+exit 加回）、B1 true 边 payload（5f87c57）、清零循环。
+
+### 10.6 全景探究：距离 clang -O2 NEON 的差距地图（2026-08-05 晚，全 corpus 实证）
+
+**当前向量化命中（60 例全扫，M44_TRACE + 汇编 grep）**：matmul1/2/3 三例——
+sum 归约循环 `dup v0.4s, w5 → ldr q1 → add v0.4s → addv s0`（BB44 链）+ 清零循环
+`dup v19.4s, w3 → str q19`（BB33）。其余 57 例零向量指令。
+
+**clang 侧 NEON 基线（同用例 clang17 aarch64 -O2 -S 实证，向量指令计数）**：
+
+| 用例 | clang NEON 条数 | 形态 | 我们的差距主因 |
+|---|---|---|---|
+| conv2d-1 | 18（fmla 系） | 邻域卷积 | A3 多参数 test-at-top + 双臂 if + Rem(ISA) |
+| 03_sort1 | 12 | 清零+基数统计 | test_at_top_multi_param + non_unit_step |
+| many_mat_cal-1 | 7 | 归约 | 已 M48 外提，剩余小 |
+| 01_mm1/2/3 | 6（ld1r+mla） | 矩阵乘 | A3 多参数 + entry_trip_not_const(M43) + CallInBody |
+| matmul1/2/3 | 4 | 矩阵乘 | 已出 sum+清零，内核掩码未解锁 |
+| transpose2 | 4 | 转置 | NonAffineIndex + test_at_top_multi_param |
+| crypto-1 | 4 | 清零 | IntraIterationConflict + shape_body |
+| sl1 | 1 | - | shape_body |
+| fft1 / huffman-01 | 0 | 递归/位操作 | clang 也不向量化（无差距） |
+
+**60 例拒绝分布（raw 次数，含 fixed-point 多轮）**：not_innermost 948（正确保守）、
+verdict=Reducible 783、shape_header_multi_inst 282、shape_body_not_2_blocks 258、
+CallInBody 180（输入循环，正确拒绝）、test_at_top_multi_param 108、entry_trip_not_const 108、
+non_unit_step 90、IntraIterationConflict 84、NoInductionVariable 57、bound_not_const 54、
+NonAffineIndex 36、LoopCarriedConflict 18、params_not_2 12、DynamicMemZero 12、
+load_unmodeled/load_classify/gep_offset_loop_variant/entry_i0_not_const 各 12。
+
+**§10 [lt,jump] 任务 ROI 实证（关键修正）**：
+- 138 个 unique [lt,jump] header（33 用例），其中 **36 个 rotate 不兜底**（后续轮从未以
+  [jump] 形态被 analyze）：01_mm1/2/3 BB5/BB16、03_sort1/2/3 BB2、conv2d-1/2/3 BB2/BB14、
+  crypto-1/2/3 BB8、fft0/1/2 BB2、h-10-01/2/3 BB5/BB11、matmul1/2/3 BB19/BB27、
+  optimization_scheduling1/2/3 BB2。
+- 36 个不兜底 header 的后续命运（同 header 全轮次拒绝点）：
+  * **形态类（[lt,jump] 支持后可解锁，真正受益面 ~6-10 个）**：conv2d-1 BB14
+    （shape_body+test_at_top_multi_param，固定点中形态多次变化）、matmul1 BB27
+    （shape_body_not_2_blocks——掩码内核 body 双臂形态）、03_sort1 BB2
+    （test_at_top_multi_param）。
+  * **语义类（[lt,jump] 支持后仍正确拒绝，仅提前拒绝无解锁收益）**：01_mm BB5/BB16
+    （CallInBody 输入循环）、crypto BB8（IntraIterationConflict 就地 R/W）、fft BB2
+    （NoInductionVariable 位反转）、h-10 BB5/BB11（CallInBody）、matmul1 BB19
+    （not_innermost——interchange 后掩码内核成外层）。
+- **结论**：[lt,jump] 支持（§10.3 设计 ~50 行）是**必要前置**而非独立收益——36 个不兜底
+  header 中形态类（conv2d/matmul/03_sort 内核）在 [lt,jump] 支持后进入 test-at-top 路径，
+  与 A3 多参数（108 次）、B1 双臂 if（shape_body 258 中剩余）串联解锁。语义类提前拒绝
+  是副产品（fixed-point 首轮收敛）。
+
+**优先级链（实证修正版，perf ROI）**：
+1. [lt,jump]（§10，~50 行）→ 解锁 conv2d BB14 / matmul BB27 / 03_sort BB2 的形态层
+2. A3 多参数 test-at-top（~中改动）→ 01_mm 计算内核 + conv2d 内核（clang 6/18 NEON 所在）
+3. B1 双臂 if 多块体（~300 行）→ matmul1 掩码内核（BB27 shape_body）
+4. M43 versioning（大工程）→ entry_trip_not_const 108 + bound_not_const 54（01_mm 系）
+5. 逐 lane select lowering（bsl/csel）→ matmul1 min 循环（select %101,%100,%vid_6）
+6. 不修：Rem payload（ISA 无整数向量 div/mod）、非连续访存（gather 禁止）、
+   CallInBody 输入循环（正确拒绝）、fft/huffman（clang 也不向量化）
+
+### 10.7 [lt,jump] 形态终局定性 + 支持设计（2026-08-05 晚，插桩实证）
+
+**形态本质（插桩实证，5 用例 33 个 [LT-JUMP] 打印全 users=[]）**：
+
+```text
+header(params):
+    %t = lt %iv, %bound     # 死值！used_by = []
+    jump body               # 无条件跳，无参数
+```
+
+- **lt 结果恒为死值**（matmul1 BB10/19/27/32/44、conv2d-1 BB2/4/14、03_sort1 BB2/28-59、
+  01_mm1 BB5/16/28-58、fft1 BB2/15/16 全部 users=[]）。
+- **来源 = rotate_count_up/down 旋转成功的残留**：rotate 只替换 header terminator
+  （rotate_loops.rs:160/388 `.jump(body, vec![])`），**不删除 header 前部的 lt 指令**；
+  DCE 在 fixed-point 尾部删除它。
+- **为什么 loop_vectorize 会看到它**：rotate 与 loop_vectorize 同轮（pass.rs:225/257），
+  rotate 刚旋转完（lt 残留）→ 同轮 loop_vectorize 首轮看到 [lt,jump] → 拒绝
+  （shape_header_multi_inst）→ 轮尾 DCE 删 lt → 下一轮 loop_vectorize 看到 [jump] 接受。
+  实证：BB44（sum 循环）首轮 [lt,jump] ×1 → 后续轮 [jump] ×5 → 向量化（matmul1 出 addv）；
+  最终 IR 无 lt 残留（while_entry_33 仅 jump）。
+
+**结论（修正 §10.2 预期）**：
+- 144 例 [lt,jump] **不是"不支持形态"，而是"已旋转的中间态"**——对最终代码生成
+  零影响（DCE 后第二轮以 [jump] 向量化，BB44/BB33 已证明）。
+- "BB19 是掩码内核卡点"不准确：BB19 的 lt 是死值，其循环 interchange 后成外层
+  （not_innermost 正确拒绝）。掩码内核真实卡点 = while_entry_17（[jump] 多块体，
+  `br %72, end_25, then_24` **false 边 arm**——B1 只支持 true 边，5f87c57 未覆盖）。
+- 36 个"rotate 不兜底" header 实际是"首轮 [lt,jump] 拒绝后循环被 interchange/
+  not_innermost 改写"，[lt,jump] 支持对它们无解。
+
+**支持设计（rotated 路径放宽，非 §10.3 的 test-at-top 变体）**：
+- 位置：loop_vectorize.rs analyze_loop header 检查（489-537 行）rotated 分支。
+- 变换：header 指令 = `[...死值指令..., jump]`——最后一条是 jump（target == latch
+  或 arm_plan.body_br、args 空，检查不变），**前面所有指令 used_by 全空则跳过**；
+  任一前指令有 users → 拒绝（保守，保持现状）。
+- 不引入 test_at_top 语义：trip 走 rotated 路径（counter 参数，entry_trip 常量）。
+- 改动量：~25 行（analyze header 检查）+ 2 单测（死值接受 / lt 有 users 拒绝）。
+- 风险：极低——接受条件 = 死值（无观察者），拒绝面不变。
+
+**收益（诚实）**：**无独立代码生成收益**（第二轮 DCE 后同样向量化）。收益 =
+fixed-point 提前一轮收敛（首轮直接向量化，免去中间 pass 改写循环体的不确定性），
+对已解锁循环（sum/清零）是确定性改善。**不建议作为独立任务优先**，可与
+B1 false 边 arm（掩码内核真正卡点）捆绑做。
+
+**真正解锁顺序（修正版，§10.6 链）**：
+1. B1 false 边 arm + 双臂 if 多块体（shape_body 258，matmul1 掩码内核）——最高 ROI
+2. A3 多参数 test-at-top（108，conv2d-1 BB14 / 01_mm 内核）
+3. M43 versioning（entry_trip_not_const 108 + bound_not_const 54，01_mm 系）
+4. B2/B3 min 归约 select（matmul1 min 循环）
+5. [lt,jump] 放宽（~25 行，收敛优化，随 1 捆绑）
+
+### 10.8 B1 复核与掩码内核真卡点：interchange used_by 泄漏（2026-08-05 晚，插桩实证）
+
+**实证推翻 §10.7 的"B1 false 边未实现"假设**：B1 true 边（5f87c57）**和 false 边
+（原始实现，loop_vectorize.rs:417-435）都已存在**。matmul1 掩码内核（interchange 后
+BB16：`BR cond t=latch f=arm`，arm jump latch）**B1 匹配成功**（B1_DBG 插桩实证），
+卡在更后面的 **value_escapes_loop**。
+
+**逃逸值（B1_DBG 插桩，3 轮一致）**：
+```text
+ESCAPE inst=Inst(133) kind=GetElemPtr(base=..., offsets=[602, 309])   # c[i][j] GEP
+  -> user=Inst(135) kind=Store { src: Inst(403), dest: Inst(133) }      # store c[i][j], temp
+  user_bb=None exit=BB21 in_loop=false
+  user in exit layout: false; user's used_by: {}                        # 游离死指令！
+```
+
+**根因链**（loop_interchange.rs migrate_reduction，1625-1632 行）：
+1. interchange 归约迁移删 E_k 的 `store temp, c[i][j]`：用 `layout_mut().remove_inst`
+   （只删 layout parent/back/insts），**未清理 store 操作数的 used_by**；
+2. store(135) 成游离死指令（不在任何块、无 users），但 **c_gep(133).used_by 仍含 store(135)**；
+3. loop_vectorize value_escapes_loop（1207-1215 行）：payload GEP(133) 的 user store(135)
+   parent_bb=None → 不在循环内 → 误判逃逸 → 拒绝整个循环。
+4. 与已修过的同类坑一致（记忆：layout remove_inst 不清理 terminator 的 target used_by）。
+
+**为什么现在才暴露**：此前掩码内核在 shape_header（[lt,jump]）就拒，走不到 escape 检查；
+[lt,jump] 中间态 + B1 匹配后检查链推进到 escape。
+
+**修复（两层）**：
+1. **根因**：loop_interchange.rs:1628 `data.layout_mut().remove_inst(e_k, inst)` →
+   `data.remove_layout_inst(e_k, inst)`（function.rs:145：detach_inst_usage + remove_inst +
+   remove_inst_data——正确清理 used_by）。注意 1601-1607 的 c_gep **移动**（remove+insert）
+   必须保留 used_by，**不动**。
+2. **防御**：loop_vectorize value_escapes_loop 跳过 `parent_bb(user) == None` 的游离 user
+   （不在 layout = 不可执行 = 无观察者，不构成逃逸；防其他 pass 同类残留）。
+
+**正确性论证**：
+- 根因修复：store 删除前 detach 其 src/dest 的 used_by——store 无其他引用（游离前唯一
+  引用就是 c_gep.used_by），删 inst_data 安全；c_gep 后续仍被新 store（1615 行）使用，
+  used_by 自动注册。
+- 防御修复：parent_bb=None 的指令不可达（CFG 外），跳过不改变任何可观察行为；escape
+  语义（payload 值不被循环外活代码使用）不受影响。
+- interchange 4 单测（matmul 交换/幂等/方向反/非零初始）+ raana_ir 全量回归。
+
+**预期解锁链**：修复后 matmul1 掩码内核（BB16）过 escape → 下一卡点（候选：
+no_vector_ops / exit 参数 / trip）逐个推进；matmul1 汇编出 `ldr q + cmgt/and/eor +
+add v.4s + str q`（clang 对照）为最终验收。
+
+**改动量**：根因 1 行 + 防御 ~5 行 + interchange 单测补 used_by 断言（可选）。
+
+**执行记录（2026-08-05 晚，完成）**：
+- **根因修复**：loop_interchange.rs migrate_reduction 删 E_k store 改用
+  `remove_layout_inst`（detach used_by）。interchange 4 单测全过。
+- **防御修复**：loop_vectorize value_escapes_loop 跳过 parent_bb=None 的游离 user。
+- **连锁发现（掩码构造正确性 bug，首次真实触发）**：修复后掩码内核向量化
+  （matmul1 汇编 6→24 条向量，ldr q + mul + cmeq + and/eor + str q），但
+  **-O1/-O2 wrong answer**（-O0 PASS，最小复现 mmask 100×100：O0=94 vs O2=68）。
+  二分定位（恒真 PASS、掩码+1 PASS、delta 版 FAIL；sched 68 / nosched 14）：
+  **B1/VecSelect 掩码构造 `m = sub(0, eq(cond, 0))` 假设 IR 比较返回 0/1，但
+  lowering 的 cmeq 返回全 1（0xFFFFFFFF）→ m = 1 而非 -1 → ~m = -2（清 bit 0）→
+  掩码损坏**。修复：**m = eq0 直接**（cmeq 全 1/全 0 即掩码），删 sub；两处
+  （B1 masked store 1687 行 + VecSelect 1761 行）同步。
+- **验证**：matmul1 -O1/-O2 PASS（掩码内核出 15 条向量）；mmask 复现 O0/O2/nosched
+  = 94/94/94；raana_ir 344 全过（含 vectorizes_lane_cond_select）；workspace 全绿；
+  corpus 复扫 matmul1/2/3 掩码内核向量化（24 条）；临时用例已删。
+- **教训**：spike 单测（vectorizes_lane_cond_select）只断言 IR 形态不断言运行语义，
+  cmeq 全 1 语义假设在 IR/lowering 层未闭环——向量比较结果必须文档化为全 1/全 0
+  （与 NEON cmeq 一致），掩码构造直接复用比较结果。

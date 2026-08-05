@@ -2319,17 +2319,20 @@ fn lower_signed_div_rem_magic(
 
     let divisor_value = i64::from(divisor as u32);
     let multiplier =
-        match ctx.const_to_reg(i64::from(magic.multiplier as u32), divisor_value) {
+        match ctx.loop_const_to_reg(i64::from(magic.multiplier as u32), divisor_value) {
             Some(reg) => reg,
-            None => {
-                let reg = ctx.alloc_tmp(HirType::get_i32());
-                ctx.emit(MInst::LoadImm {
-                    size,
-                    dst: Writable::from_reg(reg),
-                    value: u64::from(magic.multiplier as u32),
-                });
-                reg
-            }
+            None => match ctx.const_to_reg(i64::from(magic.multiplier as u32), divisor_value) {
+                Some(reg) => reg,
+                None => {
+                    let reg = ctx.alloc_tmp(HirType::get_i32());
+                    ctx.emit(MInst::LoadImm {
+                        size,
+                        dst: Writable::from_reg(reg),
+                        value: u64::from(magic.multiplier as u32),
+                    });
+                    reg
+                }
+            },
         };
     let product = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
     ctx.emit(MInst::SMulL {
@@ -2404,18 +2407,22 @@ fn lower_signed_div_rem_magic(
     });
 
     if op == BinaryOp::Rem {
-        let divisor_reg = match ctx.const_to_reg(divisor_value, divisor_value) {
-            Some(reg) => reg,
-            None => {
-                let reg = ctx.alloc_tmp(HirType::get_i32());
-                ctx.emit(MInst::LoadImm {
-                    size,
-                    dst: Writable::from_reg(reg),
-                    value: u64::from(divisor as u32),
-                });
-                reg
-            }
-        };
+        let divisor_reg =
+            match ctx.loop_const_to_reg(divisor_value, divisor_value) {
+                Some(reg) => reg,
+                None => match ctx.const_to_reg(divisor_value, divisor_value) {
+                    Some(reg) => reg,
+                    None => {
+                        let reg = ctx.alloc_tmp(HirType::get_i32());
+                        ctx.emit(MInst::LoadImm {
+                            size,
+                            dst: Writable::from_reg(reg),
+                            value: u64::from(divisor as u32),
+                        });
+                        reg
+                    }
+                },
+            };
         ctx.emit(MInst::MSub {
             size,
             dst,

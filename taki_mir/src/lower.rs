@@ -555,7 +555,9 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             // some loop's preheader (chains land at this block's start after
             // the stream reversal and dominate the whole loop body), then the
             // block's own shared constants.
-            self.emit_loop_const_shared();
+            if let Some(bb) = lb.orig_block() {
+                self.emit_loop_const_shared(bb);
+            }
             self.emit_block_const_shared();
 
             self.finish_bb();
@@ -895,6 +897,9 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         // shared; immediates folded into instructions never arrive here.
         if let InstKind::Integer(integer) = self.arena.inst_data(inst).kind() {
             let value = i64::from(integer.value());
+            if let Some(shared) = self.loop_const_to_reg(value, value) {
+                return shared;
+            }
             if let Some(shared) = self.const_to_reg(value, value) {
                 return shared;
             }
@@ -1009,7 +1014,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     /// chain executes once per loop entry instead of once per iteration.
     /// `None` means the caller should keep its per-use/block materialization
     /// (no loop, no preheader, or a single-use constant).
-    fn loop_const_to_reg(&mut self, value: i64, gate_on: i64) -> Option<Reg> {
+    pub fn loop_const_to_reg(&mut self, value: i64, gate_on: i64) -> Option<Reg> {
         let loop_index = self.current_loop?;
         if !self.loop_const_multi.contains(&(loop_index, gate_on)) {
             return None;
@@ -1029,13 +1034,11 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     }
 
     /// Emit the deferred loop-shared constant materializations recorded for
-    /// the block being lowered (a loop preheader). Called at the end of the
-    /// block's lowering; the chains land at the preheader's start after the
-    /// stream reversal and dominate the whole loop body.
-    fn emit_loop_const_shared(&mut self) {
-        let Some(bb) = self.cur_block else {
-            return;
-        };
+    /// `bb` (a loop preheader). Called at the end of the block's lowering;
+    /// the chains land at the preheader's start after the stream reversal
+    /// and dominate the whole loop body. `bb` is passed explicitly because
+    /// `lower_block` clears `cur_block` before this point.
+    fn emit_loop_const_shared(&mut self, bb: HirBasicBlock) {
         let Some(chains) = self.loop_emissions.remove(&bb) else {
             return;
         };

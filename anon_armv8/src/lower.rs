@@ -3947,6 +3947,165 @@ mod tests {
         }
     }
 
+    /// Builds a single-loop program: entry (also the preheader) jumps to a
+    /// header that branches to `body`/`exit`; `body` uses constant `c` in
+    /// two adds (results stored to pointer params to keep them alive) and
+    /// jumps back to the header (latch); `exit` returns 0.
+    fn compile_loop_with_const_uses(c: i32, body_uses: usize) -> String {
+        use raana_ir::ir::builder_trait::*;
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "loop_const".to_owned(),
+            vec![
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_pointer(Type::get_i32()),
+                Type::get_pointer(Type::get_i32()),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let header = data.new_basic_block().basic_block("header".to_owned(), vec![]);
+        let body = data.new_basic_block().basic_block("body".to_owned(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".to_owned(), vec![]);
+        for bb in [header, body, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let a = data.params()[0];
+        let b = data.params()[1];
+        let stores = [data.params()[2], data.params()[3]];
+        // entry -> header (entry is the unique loop-outside predecessor).
+        let entry_jump = data.new_local_inst().jump(header, vec![]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        // header: branch to body/exit on a constant condition.
+        let one = data.new_local_inst().integer(1);
+        let header_branch =
+            data.new_local_inst().branch(one, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, header_branch);
+        // body: `body_uses` adds with the same constant, each stored to a
+        // pointer param (side effect keeps the add alive), then the back edge.
+        let mut insts = vec![];
+        let mut last = a;
+        for i in 0..body_uses {
+            let constant = data.new_local_inst().integer(c);
+            let add = data.new_local_inst().binary(BinaryOp::Add, last, constant);
+            let store = data.new_local_inst().store(add, stores[i]);
+            insts.extend([add, store]);
+            last = add;
+        }
+        let back = data.new_local_inst().jump(header, vec![]);
+        insts.push(back);
+        for inst in insts {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        // exit: return 0.
+        let zero = data.new_local_inst().integer(0);
+        let ret = data.new_local_inst().ret(Some(zero));
+        data.layout_mut().insert_inst(exit, ret);
+        taki_mir::compile::<crate::lower::AArch64Backend>(&program)
+    }
+
+    fn movz_count_for(assembly: &str, value_hex: &str) -> usize {
+        assembly
+            .split("movz w")
+            .skip(1)
+            .filter(|rest| rest.contains(value_hex))
+            .count()
+    }
+
+    #[test]
+    fn shares_loop_constant_in_preheader() {
+        let assembly = compile_loop_with_const_uses(0xc811, 2);
+        // The 0xc811 chain must move out of the loop body into the
+        // preheader (the entry block): one movz total.
+        assert_eq!(
+            movz_count_for(&assembly, "0xc811"),
+            1,
+            "two uses in a loop body must materialize once in the preheader:\n{assembly}"
+        );
+    }
+
+    #[test]
+    fn does_not_share_single_use_loop_constant() {
+        let assembly = compile_loop_with_const_uses(0xc811, 1);
+        // Single-use constants keep their per-use materialization.
+        assert_eq!(
+            movz_count_for(&assembly, "0xc811"),
+            1,
+            "single-use loop constant keeps per-use materialization:\n{assembly}"
+        );
+    }
+
+    /// Two loop-outside predecessors of the header: `get_preheader` returns
+    /// `None`, so the loop must not share (per-use materialization stays).
+    #[test]
+    fn does_not_share_loop_without_preheader() {
+        use raana_ir::ir::builder_trait::*;
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "no_preheader".to_owned(),
+            vec![
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_pointer(Type::get_i32()),
+                Type::get_pointer(Type::get_i32()),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let extra = data.new_basic_block().basic_block("extra".to_owned(), vec![]);
+        let header = data.new_basic_block().basic_block("header".to_owned(), vec![]);
+        let body1 = data.new_basic_block().basic_block("body1".to_owned(), vec![]);
+        let body2 = data.new_basic_block().basic_block("body2".to_owned(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".to_owned(), vec![]);
+        for bb in [extra, header, body1, body2, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let a = data.params()[0];
+        let b = data.params()[1];
+        let stores = [data.params()[2], data.params()[3]];
+        // entry jumps to `extra`, and `extra` branches to header/exit: the
+        // candidate preheader has two successors, so `get_preheader` returns
+        // `None` and the loop must not share.
+        let entry_jump = data.new_local_inst().jump(extra, vec![]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let extra_cond = data.new_local_inst().integer(1);
+        let extra_branch =
+            data.new_local_inst().branch(extra_cond, header, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(extra, extra_branch);
+        let one = data.new_local_inst().integer(1);
+        let header_branch =
+            data.new_local_inst().branch(one, body1, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, header_branch);
+        let c1 = data.new_local_inst().integer(0xc811);
+        let add1 = data.new_local_inst().binary(BinaryOp::Add, a, c1);
+        let s1 = data.new_local_inst().store(add1, stores[0]);
+        let one2 = data.new_local_inst().integer(1);
+        let back1 = data.new_local_inst().branch(one2, body2, vec![], header, vec![]);
+        for inst in [add1, s1, back1] {
+            data.layout_mut().insert_inst(body1, inst);
+        }
+        let c2 = data.new_local_inst().integer(0xc811);
+        let add2 = data.new_local_inst().binary(BinaryOp::Add, b, c2);
+        let s2 = data.new_local_inst().store(add2, stores[1]);
+        let back2 = data.new_local_inst().jump(header, vec![]);
+        for inst in [add2, s2, back2] {
+            data.layout_mut().insert_inst(body2, inst);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let ret = data.new_local_inst().ret(Some(zero));
+        data.layout_mut().insert_inst(exit, ret);
+        let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+        // No preheader: each use materializes on its own.
+        assert_eq!(
+            movz_count_for(&assembly, "0xc811"),
+            2,
+            "loop without a preheader must not share:\n{assembly}"
+        );
+    }
+
     /// Builds `r = ((a + C) + (b + C))` with two same-value constant uses in
     /// one block, and returns the assembly.
     fn compile_two_same_constant_adds(c: i32) -> String {

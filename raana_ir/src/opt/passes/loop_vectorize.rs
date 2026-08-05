@@ -171,6 +171,16 @@ struct VecPlan {
     t_next: Inst,
     /// `iv' = add(iv, 1)` (the back-edge arg).
     iv_next: Inst,
+    /// Test-at-top bound instruction (the `lt`'s rhs). For a
+    /// compile-time-constant bound it equals `i0 + trip`; for a runtime
+    /// bound (`runtime_trip`) it is reused by the scalar tail loop as the
+    /// tail's upper bound and by the exit edge as the IV final value.
+    bound_inst: Inst,
+    /// True when the test-at-top bound is a runtime value: the vector
+    /// counter enters at `trip & -4` (computed on entry), and the
+    /// `trip & 3` remainder is peeled as a scalar tail loop instead of
+    /// constant epilogue blocks.
+    runtime_trip: bool,
     /// Latch instructions to rewrite / clone, in layout order (excludes the
     /// latch machinery: terminator, condition, back-edge args).
     payload: Vec<Inst>,
@@ -361,6 +371,16 @@ fn analyze_loop(
         .any(|other| other.header() != looop.header() && looop.contains(other.header()))
     {
         trace(data, looop, "not_innermost");
+        return None;
+    }
+    // Scalar tail loops produced by a previous vectorization of a
+    // runtime-bound loop must never be vectorized again — the fixed-point
+    // pipeline would otherwise keep vectorizing the new tail forever.
+    // The `vec_tail` prefix is this pass's product namespace (like
+    // `vec_epi_` / `vec_reduce`); it is a structural marker, not a
+    // benchmark/input condition.
+    if data.bb_data(looop.header()).name().starts_with("vec_tail") {
+        trace(data, looop, "tail_loop_skip");
         return None;
     }
 
@@ -903,20 +923,6 @@ fn analyze_loop(
         trace(data, looop, "entry_args_not_2");
         return None;
     }
-    // A test-at-top reduction rewrites the exit block's direct reads of
-    // the header accumulator (and, with a runtime trip, the IV) through a
-    // fresh exit parameter. That is only valid when the exit has no other
-    // predecessors whose argument values we cannot supply: the preheader
-    // guard edge (feeds the seed when the loop never runs) and the
-    // header's own exit edge (rewritten by the mutation phase).
-    if test_at_top && acc_info.is_some() {
-        for &p in cfg.predecessors_of(exit) {
-            if p != preheader && p != header {
-                trace(data, looop, "exit_extra_pred");
-                return None;
-            }
-        }
-    }
     // Passthrough entry arguments: loop-invariant values forwarded to the
     // exit / epilogue chain after vectorization (their params stay i32).
     let passthrough_args: Vec<Inst> = passthrough
@@ -974,42 +980,91 @@ fn analyze_loop(
         exit_specs.push(spec);
     }
 
-    // 7. Exact trip: the initial index must be a compile-time constant, and
-    //    the trip must fit at least one vector iteration. Rotated loops
-    //    carry the trip as a constant counter entry; test-at-top loops
-    //    derive it from a constant bound (`trip = bound - i0`, no
-    //    versioning). When the trip leaves a remainder the exit must not
+    // 7. Trip: the initial index must be a compile-time constant. Rotated
+    //    loops carry the trip as a constant counter entry; test-at-top
+    //    loops derive it from the bound — a compile-time constant
+    //    (`trip = bound - i0`, peeled as constant epilogue blocks) or a
+    //    runtime value (the vector counter enters at `trip & -4` and a
+    //    scalar tail loop covers the remainder, so no versioning is
+    //    needed). When a const trip leaves a remainder the exit must not
     //    read the IV (its final value after `q` vector iterations differs
-    //    from the scalar `bound`); with R == 0 the values coincide.
+    //    from the scalar `bound`); with R == 0 the values coincide. A
+    //    runtime trip rewrites the exit's IV reads to the final `bound`
+    //    instead.
     let Some(entry_i0) = constant_i64(arena, data, entry_args[iv_slot]) else {
         trace(data, looop, "entry_i0_not_const");
         return None;
     };
-    let trip: i64 = if test_at_top {
-        let Some(bound) = constant_i64(arena, data, bound_inst) else {
-            trace(data, looop, "test_at_top_bound_not_const");
-            return None;
-        };
-        bound - entry_i0
+    let (trip, runtime_trip): (i64, bool) = if test_at_top {
+        match constant_i64(arena, data, bound_inst) {
+            Some(bound) => (bound - entry_i0, false),
+            // Runtime bound: the exact trip is unknown; the vector loop
+            // counter enters at `trip & -4` and the `trip & 3` remainder
+            // runs in a scalar tail loop.
+            None => (0, true),
+        }
     } else {
         let Some(t) = constant_i64(arena, data, entry_args[counter_slot]) else {
             trace(data, looop, "entry_trip_not_const");
             return None;
         };
-        t
+        (t, false)
     };
-    if trip < VF {
+    if runtime_trip {
+        // The counter computation (`trip = sub(bound, i0)`) is inserted
+        // in the preheader and the tail reuses the bound, so the bound
+        // must be a loop-invariant value defined outside the loop (not a
+        // header/latch parameter — a parameter does not dominate the
+        // preheader).
+        let bound_bb = data.layout().parent_bb(bound_inst);
+        if data.bb_data(header).params().contains(&bound_inst)
+            || data.bb_data(latch).params().contains(&bound_inst)
+            || bound_bb == Some(header)
+            || bound_bb == Some(latch)
+            || !is_loop_invariant(arena, bound_inst, header, latch)
+        {
+            trace(data, looop, "runtime_bound_loop_variant");
+            return None;
+        }
+        // Runtime-bound reductions (the reduce block feeding the scalar
+        // tail) are wired up in a later commit; reject for now so the
+        // elementwise tail cannot be paired with a dangling reduce block.
+        if acc_info.is_some() {
+            trace(data, looop, "runtime_reduction_not_supported");
+            return None;
+        }
+    } else if trip < VF {
         trace(data, looop, "trip_below_vf");
         return None;
     }
-    if test_at_top && trip % VF != 0 {
+    // A test-at-top reduction rewrites the exit block's direct reads of
+    // the header accumulator (and, with a runtime trip, the IV) through a
+    // fresh exit parameter / a rewritten use. That is only valid when the
+    // exit has no other predecessors whose argument values we cannot
+    // supply: the preheader guard edge (feeds the seed when the loop
+    // never runs) and the header's own exit edge (rewritten by the
+    // mutation phase).
+    if test_at_top && (acc_info.is_some() || runtime_trip) {
+        for &p in cfg.predecessors_of(exit) {
+            if p != preheader && p != header {
+                trace(data, looop, "exit_extra_pred");
+                return None;
+            }
+        }
+    }
+    if test_at_top && (runtime_trip || trip % VF != 0) {
         // The vectorized loop runs `q` iterations; the scalar epilogue
         // substitutes constant IVs, so the header parameter's final value
         // is `i0 + 4q`, not `bound`. An exit that reads the IV is only
-        // correct when R == 0 (then `i0 + 4q == bound`).
+        // correct when R == 0 (then `i0 + 4q == bound`). With a runtime
+        // trip the exit's IV reads are rewritten to the final `bound`
+        // (apply phase), so they must be confined to the exit block.
         for &user in arena.inst_data(iv).used_by() {
             let bb = data.layout().parent_bb(user);
-            if bb != Some(header) && bb != Some(latch) {
+            if bb != Some(header)
+                && bb != Some(latch)
+                && !(runtime_trip && bb == Some(exit))
+            {
                 trace(data, looop, "test_at_top_exit_reads_iv");
                 return None;
             }
@@ -1349,8 +1404,9 @@ fn analyze_loop(
     };
 
     // B1 single-arm bodies: only exact trips are supported for now (the
-    // epilogue chain for multi-block bodies is not implemented).
-    if arm_plan.is_some() && trip % VF != 0 {
+    // epilogue chain for multi-block bodies is not implemented; a runtime
+    // trip would need the arm body cloned into the tail).
+    if arm_plan.is_some() && (runtime_trip || trip % VF != 0) {
         trace(data, looop, "arm_remainder_not_supported");
         return None;
     }
@@ -1364,6 +1420,8 @@ fn analyze_loop(
         counter,
         entry_i0,
         trip,
+        bound_inst,
+        runtime_trip,
         latch_branch,
         t_next,
         iv_next,
@@ -1556,6 +1614,8 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         counter,
         entry_i0,
         trip,
+        bound_inst,
+        runtime_trip,
         latch_branch,
         t_next,
         iv_next,
@@ -1608,6 +1668,61 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     // must be fed the computed `i0 + VF*q` (+ the peeled remainder through
     // the epilogue chain) instead of the latch's per-iteration update.
     let has_iv_final = exit_specs.iter().any(|spec| *spec == ExitArgSpec::IvFinal);
+    // Runtime-bound counter: `trip = sub(bound, i0)`, `cnt0 = and(trip,
+    // -4)` — the vector loop runs `cnt0 / 4` iterations and a scalar tail
+    // loop covers the `trip & 3` remainder. `cnt0 <= 0` (trip < 4, or a
+    // negative trip) skips the vector loop entirely; the counter test
+    // becomes `gt(counter, 0)` (not `counter != 0`) so a negative trip
+    // cannot spin forever. `i0_inst` is the compile-time initial index as
+    // an instruction (constants are not placed in layout).
+    let i0_inst = data.new_local_inst().integer(entry_i0 as i32);
+    let (trip_inst, cnt0): (Inst, Inst) = if runtime_trip {
+        let trip_rt = alloc_inst(
+            data,
+            Binary::new_data(bound_inst, i0_inst, BinaryOp::Sub, i32.clone()),
+        );
+        let neg4 = data.new_local_inst().integer(-4);
+        let cnt = alloc_inst(
+            data,
+            Binary::new_data(trip_rt, neg4, BinaryOp::And, i32.clone()),
+        );
+        data.layout_mut().insert_inst_before(entry_edge, trip_rt);
+        data.layout_mut().insert_inst_before(entry_edge, cnt);
+        (trip_rt, cnt)
+    } else {
+        // Unused placeholders for the const path.
+        let t = data.new_local_inst().integer((entry_i0 + VF * q) as i32);
+        (t, t)
+    };
+    // Runtime-bound: an exit that reads the header IV parameter directly
+    // must see the final scalar value — `bound` when the loop ran, `i0`
+    // when the trip was non-positive — not the vector loop's stale
+    // `i0 + 4Q`. Rewrite those reads to `select(gt(trip, 0), bound, i0)`.
+    if runtime_trip {
+        let exit_iv_users: Vec<Inst> = data
+            .inst_data(iv)
+            .used_by()
+            .iter()
+            .copied()
+            .filter(|&u| data.layout().parent_bb(u) == Some(exit))
+            .collect();
+        if !exit_iv_users.is_empty() {
+            let zero = data.new_local_inst().integer(0);
+            let positive = alloc_inst(
+                data,
+                Binary::new_data(trip_inst, zero, BinaryOp::Gt, i32.clone()),
+            );
+            let iv_final = alloc_inst(
+                data,
+                Select::new_data(positive, bound_inst, i0_inst, i32.clone()),
+            );
+            data.layout_mut().insert_inst_before(entry_edge, positive);
+            data.layout_mut().insert_inst_before(entry_edge, iv_final);
+            for user in exit_iv_users {
+                subst_operand(data, user, iv, iv_final);
+            }
+        }
+    }
     // The trip counter is the last header parameter; passthrough params
     // precede it ([.. passthroughs .., iv (, acc), t]). Test-at-top loops
     // have no counter parameter: one is materialized here as a new header
@@ -1790,6 +1905,63 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             }
         }
     }
+
+    // 1d. Runtime-bound scalar tail: a remainder loop
+    //     `while (iv < bound) { payload; iv++ }` entered when the vector
+    //     counter reaches zero (or is already <= 0 for trip < 4). The
+    //     payload is cloned with the IV substituted by the tail's own
+    //     parameter, so the tail runs `trip & 3` iterations (0..3) and
+    //     handles negative trips by running zero iterations. Built before
+    //     the in-place vectorization (step 2) so the payload is still
+    //     scalar when cloned. The entry edge's `iv0 = i0 + max(cnt0, 0)`
+    //     is materialized in the exit-edge rewrite (step 2c).
+    let tail_header: Option<BasicBlock> = if runtime_trip {
+        let one = data.new_local_inst().integer(1);
+        let mut param_tys = vec![i32.clone(); 1 + n_passthrough];
+        let th = data
+            .new_basic_block()
+            .basic_block("vec_tail".into(), param_tys);
+        let tl = data
+            .new_basic_block()
+            .basic_block("vec_tail_latch".into(), vec![]);
+        let iv_t = data.bb_data(th).params()[0];
+        // Blocks enter the layout before any instruction is inserted.
+        let after = reduce_block.unwrap_or(latch);
+        data.layout_mut().insert_bb_after(after, th);
+        data.layout_mut().insert_bb_after(th, tl);
+        let cond_t = alloc_inst(
+            data,
+            Binary::new_data(iv_t, bound_inst, BinaryOp::Lt, i32.clone()),
+        );
+        let iv_final_rt = has_iv_final.then_some(bound_inst);
+        let exit_args = build_exit_args(&exit_specs, &passthrough_args, None, iv_final_rt);
+        let th_br = data
+            .new_local_inst()
+            .branch(cond_t, tl, vec![], exit, exit_args);
+        data.layout_mut().insert_inst(th, cond_t);
+        data.layout_mut().insert_inst(th, th_br);
+        // Tail latch: the cloned payload, then `iv_t' = iv_t + 1`, then
+        // the jump back with the passthroughs forwarded.
+        let mut map = FxHashMap::<Inst, Inst>::default();
+        let mut insts: Vec<Inst> = Vec::with_capacity(payload.len() + 2);
+        for &orig in &payload {
+            insts.push(clone_payload_inst(data, orig, &mut map, iv, iv_t));
+        }
+        let iv_t_next = alloc_inst(
+            data,
+            Binary::new_data(iv_t, one, BinaryOp::Add, i32.clone()),
+        );
+        insts.push(iv_t_next);
+        let mut jump_args = vec![iv_t_next];
+        jump_args.extend(passthrough_args.iter().copied());
+        insts.push(data.new_local_inst().jump(th, jump_args));
+        for inst in insts {
+            data.layout_mut().insert_inst(tl, inst);
+        }
+        Some(th)
+    } else {
+        None
+    };
 
     // 2. In-place vectorization of the latch payload (instruction ids are
     //    preserved by ReplaceBuilder, so later operands stay valid).
@@ -2003,7 +2175,19 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     //     so the exit must not receive the latch's per-iteration update.
     if test_at_top || reduction.is_some() || r > 0 || has_iv_final {
         let (cond, t_target, t_args) = if test_at_top {
-            (eff_counter, latch, vec![])
+            if runtime_trip {
+                // `gt(counter, 0)`: a negative `cnt0` (negative trip)
+                // must not spin the vector loop forever.
+                let zero = data.new_local_inst().integer(0);
+                let gt = alloc_inst(
+                    data,
+                    Binary::new_data(eff_counter, zero, BinaryOp::Gt, i32.clone()),
+                );
+                data.layout_mut().insert_inst_before(latch_branch, gt);
+                (gt, latch, vec![])
+            } else {
+                (eff_counter, latch, vec![])
+            }
         } else {
             match data.inst_data(latch_branch).kind() {
                 InstKind::Branch(b) => (b.cond(), b.t_target(), b.t_args().to_vec()),
@@ -2017,16 +2201,37 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             // (the header parameter, re-typed at step 2b) to the reduce
             // block, which reduces it and feeds the scalar sum to the
             // exit (directly, or through the freshly added exit
-            // parameter). Otherwise the epilogue chain (r > 0) and the
-            // exit both carry the loop-invariant passthrough values:
-            // their header parameters stay live and unchanged across the
-            // vectorized loop, so the entry-edge values are forwarded
-            // as-is.
+            // parameter). A runtime-bound elementwise loop enters the
+            // scalar tail with `iv0 = i0 + max(cnt0, 0)` — the vector
+            // loop advanced the index by `cnt0`, and a negative trip
+            // clamps back to `i0` so the tail runs zero iterations.
+            // Otherwise the epilogue chain (r > 0) and the exit both
+            // carry the loop-invariant passthrough values: their header
+            // parameters stay live and unchanged across the vectorized
+            // loop, so the entry-edge values are forwarded as-is.
             if let Some(red) = &reduction {
                 let mut args = vec![red.acc];
                 args.extend(passthrough_args.iter().copied());
                 (
                     reduce_block.expect("reduce block built when reduction is set"),
+                    args,
+                )
+            } else if runtime_trip {
+                let zero = data.new_local_inst().integer(0);
+                let cnt_clamped = alloc_inst(
+                    data,
+                    Binary::new_data(cnt0, zero, BinaryOp::Max, i32.clone()),
+                );
+                data.layout_mut().insert_inst_before(entry_edge, cnt_clamped);
+                let iv0 = alloc_inst(
+                    data,
+                    Binary::new_data(i0_inst, cnt_clamped, BinaryOp::Add, i32.clone()),
+                );
+                data.layout_mut().insert_inst_before(entry_edge, iv0);
+                let mut args = vec![iv0];
+                args.extend(passthrough_args.iter().copied());
+                (
+                    tail_header.expect("tail built when runtime_trip"),
                     args,
                 )
             } else if r > 0 {
@@ -2102,8 +2307,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         InstKind::Branch(b) => {
             let mut t_args = b.t_args().to_vec();
             if test_at_top {
-                // The new counter parameter is appended after the IV.
-                t_args.push(four_q);
+                // The new counter parameter is appended after the IV; a
+                // runtime bound enters at `cnt0 = trip & -4` instead of
+                // the const `4Q`.
+                t_args.push(if runtime_trip { cnt0 } else { four_q });
             } else {
                 t_args[entry_arg_count - 1] = four_q;
             }
@@ -2130,7 +2337,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         InstKind::Jump(j) => {
             let mut args = j.args().to_vec();
             if test_at_top {
-                args.push(four_q);
+                // The new counter parameter is appended after the IV; a
+                // runtime bound enters at `cnt0 = trip & -4` instead of
+                // the const `4Q`.
+                args.push(if runtime_trip { cnt0 } else { four_q });
             } else {
                 args[entry_arg_count - 1] = four_q;
             }
@@ -4047,6 +4257,252 @@ mod tests {
             !run(&mut program, function),
             "non-reducible effective==2 test-at-top loop must stay scalar"
         );
+    }
+
+    /// Build a test-at-top elementwise loop with a *runtime* bound:
+    /// `n` is a scalar global read in the entry block
+    /// (`bound = load n`), and the loop is
+    /// `while (iv < bound) { b[iv] = a[iv] + 1; iv++; }`. When
+    /// `exit_reads_iv` the exit returns the header IV parameter directly
+    /// (rewritten to the final value by the apply phase).
+    fn build_runtime_bound_test_at_top(
+        program: &mut Program,
+        exit_reads_iv: bool,
+    ) -> (Function, BasicBlock, BasicBlock, BasicBlock, Inst) {
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr.clone());
+            program.new_value().global_alloc(init)
+        };
+        let b = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let n = {
+            let init = program.new_value().zero_init(i32.clone());
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(
+            if exit_reads_iv {
+                Type::get_i32()
+            } else {
+                Type::get_unit()
+            },
+            "tat_rt".into(),
+            vec![],
+        );
+        let mut data = ArenaContextMut {
+            program: &mut *program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for bb in [header, latch, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let zero = data.new_local_inst().integer(0);
+        // The bound is a global load: it must go through a
+        // `dyn Arena` builder (FunctionData-rooted builders cannot touch
+        // global operands).
+        let bound = {
+            let mut lb = LocalBuilder {
+                arena: &mut data as &mut dyn Arena,
+            };
+            lb.load(n)
+        };
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, zero);
+        data.layout_mut().insert_inst(entry, bound);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let iv = data.bb_data(header).params()[0];
+        let cond = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+        let header_br = data.new_local_inst().branch(cond, latch, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, cond);
+        data.layout_mut().insert_inst(header, header_br);
+        let one = data.new_local_inst().integer(1);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let sum = lb.binary(BinaryOp::Add, load_a, one);
+        let gep_b = lb.get_elem_ptr(b, vec![zero, iv]);
+        let store = lb.store(sum, gep_b);
+        drop(lb);
+        let iv_next = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        let latch_jump = data.new_local_inst().jump(header, vec![iv_next]);
+        for inst in [
+            one, gep_a, load_a, sum, gep_b, store, iv_next, latch_jump,
+        ] {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        let ret = if exit_reads_iv {
+            data.new_local_inst().ret(Some(iv))
+        } else {
+            data.new_local_inst().ret(None)
+        };
+        data.layout_mut().insert_inst(exit, ret);
+        (function, header, latch, exit, bound)
+    }
+
+    #[test]
+    fn vectorizes_runtime_bound_test_at_top() {
+        // A runtime bound (global load) unlocks the vector loop via a
+        // runtime counter (`trip & -4`) plus a scalar tail loop for the
+        // remainder. The tail must not be re-vectorized (idempotence).
+        let mut program = Program::new();
+        let (function, header, _latch, _exit, _bound) =
+            build_runtime_bound_test_at_top(&mut program, false);
+        assert!(
+            run(&mut program, function),
+            "runtime-bound test-at-top elementwise loop must vectorize"
+        );
+        let data = program.func_data(function);
+        assert_eq!(vector_load_count(&program, function), 1);
+        assert_eq!(
+            scalar_load_count(&program, function),
+            2,
+            "the tail keeps one scalar clone of a[i] + the entry's bound load"
+        );
+        // The tail loop exists.
+        let tail = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .map(|l| l.bb())
+            .find(|&bb| data.bb_data(bb).name().starts_with("vec_tail"))
+            .expect("tail loop must exist");
+        assert_eq!(
+            data.bb_data(tail).params().len(),
+            1,
+            "tail header carries [iv_t]"
+        );
+        // The header's bound test became the runtime counter test
+        // `gt(counter, 0)`.
+        let term = data.layout().basicblock(header).terminator();
+        let InstKind::Branch(branch) = data.inst_data(term).kind() else {
+            panic!("header must end in a branch");
+        };
+        let InstKind::Binary(gt) = data.inst_data(branch.cond()).kind() else {
+            panic!("runtime counter test must be a comparison");
+        };
+        assert_eq!(gt.op(), BinaryOp::Gt, "counter test is gt(counter, 0)");
+        // The counter enters at `cnt0 = and(sub(bound, i0), -4)`.
+        let entry_bb = data.layout().entry_bb().expect("entry block").bb();
+        let entry_edge = data.layout().basicblock(entry_bb).terminator();
+        let InstKind::Jump(entry_jump) = data.inst_data(entry_edge).kind() else {
+            panic!("entry must be a plain jump");
+        };
+        let counter_arg = entry_jump.args()[1];
+        let InstKind::Binary(and) = data.inst_data(counter_arg).kind() else {
+            panic!("counter entry must be `and(trip, -4)`");
+        };
+        assert_eq!(and.op(), BinaryOp::And);
+        let InstKind::Integer(neg4) = data.inst_data(and.rhs()).kind() else {
+            panic!("mask must be the constant -4");
+        };
+        assert_eq!(neg4.value(), -4);
+        let InstKind::Binary(sub) = data.inst_data(and.lhs()).kind() else {
+            panic!("trip must be `sub(bound, i0)`");
+        };
+        assert_eq!(sub.op(), BinaryOp::Sub);
+        // The tail entry carries `iv0 = i0 + max(cnt0, 0)`.
+        let f_args = branch.f_args().to_vec();
+        let InstKind::Binary(iv0) = data.inst_data(f_args[0]).kind() else {
+            panic!("tail entry index must be an add");
+        };
+        assert_eq!(iv0.op(), BinaryOp::Add);
+        let InstKind::Binary(clamp) = data.inst_data(iv0.rhs()).kind() else {
+            panic!("tail entry index must clamp cnt0");
+        };
+        assert_eq!(clamp.op(), BinaryOp::Max);
+        // The header's false edge targets the tail.
+        assert!(
+            data.bb_data(branch.f_target()).name().starts_with("vec_tail"),
+            "counter-zero edge enters the tail"
+        );
+        // Idempotence: the tail (and the vector loop) must not re-fire.
+        assert!(!run(&mut program, function), "tail must not be re-vectorized");
+    }
+
+    #[test]
+    fn vectorizes_runtime_bound_tail_small_trip() {
+        // A runtime bound whose value is 1..=3 (trip below one vector
+        // iteration) still vectorizes structurally: `cnt0 = 0` skips the
+        // vector loop and the tail runs the whole trip. The gate is
+        // exercised through the same IR shape — the numeric trip is only
+        // known at runtime, so the analysis cannot reject it.
+        let mut program = Program::new();
+        let (function, _header, _latch, _exit, _bound) =
+            build_runtime_bound_test_at_top(&mut program, false);
+        assert!(
+            run(&mut program, function),
+            "runtime trip below VF must still vectorize (tail covers it)"
+        );
+        let data = program.func_data(function);
+        let tail = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .map(|l| l.bb())
+            .find(|&bb| data.bb_data(bb).name().starts_with("vec_tail"))
+            .expect("tail loop must exist");
+        // The tail's latch holds the scalar payload (one scalar load).
+        let tail_latch = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .map(|l| l.bb())
+            .find(|&bb| data.bb_data(bb).name().starts_with("vec_tail_latch"))
+            .expect("tail latch must exist");
+        let scalar_loads = data
+            .layout()
+            .basicblock(tail_latch)
+            .insts()
+            .iter()
+            .copied()
+            .filter(|&inst| {
+                matches!(data.inst_data(inst).kind(), InstKind::Load(_))
+                    && !data.inst_data(inst).ty().is_vector()
+            })
+            .count();
+        assert_eq!(scalar_loads, 1, "the tail's payload stays scalar");
+        let _ = tail;
+        assert!(!run(&mut program, function), "idempotent");
+    }
+
+    #[test]
+    fn runtime_bound_rewrites_exit_iv_read() {
+        // The exit returns the header IV parameter directly: the apply
+        // phase rewrites the read to `select(gt(trip, 0), bound, i0)` —
+        // the final index is the bound when the loop ran, `i0` when the
+        // trip was non-positive.
+        let mut program = Program::new();
+        let (function, _header, _latch, exit, _bound) =
+            build_runtime_bound_test_at_top(&mut program, true);
+        assert!(
+            run(&mut program, function),
+            "runtime-bound loop with an iv-reading exit must vectorize"
+        );
+        let data = program.func_data(function);
+        let exit_ret = data.layout().basicblock(exit).terminator();
+        let InstKind::Return(ret) = data.inst_data(exit_ret).kind() else {
+            panic!("exit must return");
+        };
+        let final_value = ret.value().expect("exit returns a value");
+        let InstKind::Select(sel) = data.inst_data(final_value).kind() else {
+            panic!("the rewritten final IV must be a select");
+        };
+        let InstKind::Binary(gt) = data.inst_data(sel.cond()).kind() else {
+            panic!("the select's condition must be the trip sign test");
+        };
+        assert_eq!(gt.op(), BinaryOp::Gt);
+        assert!(!run(&mut program, function), "idempotent");
     }
 
     /// Build a rotated elementwise loop with a payload select:

@@ -2663,3 +2663,46 @@ entry_trip_not_const 拒绝。本提示词解决 rotated runtime-bound，直接�
 - [ ] trip 边界（0/1/2/3 + 负 trip）语义正确（单测或差分覆盖）
 - [ ] 最终 git status 只剩非本任务文件
 ```
+
+### 10.15 执行记录（rotated runtime-bound，2026-08-06 完成）
+
+**提交**（第二次 rebase 到新 main 643f614 后的 hash，内容与 6de030c/3bc171f
+一致）：2731143（rotated runtime 向量化支持）、bd3a45b（B1 归约单测 +
+trip 边界差分）、552aff3（rebase 遗留 const_cse 修复，soyo_compiler 测试
+目标恢复编译）。
+
+**形态实证（复扫 12 case，M44_TRACE=1）**
+- entry_trip_not_const：63 → 0（01_mm1/2/3、h-5-01/02/03、h-10-01/02/03、
+  h-8-01/02/03 全清零）。
+- 解锁形态分类：01_mm1/2/3 mm 内核 = [i, j, k, counter] elementwise
+  （passthrough×2 + IvFinal）；01_mm2/3 另有 [iv, counter] memzero 循环；
+  h-10 系列 = [iv, counter] f32 axpy elementwise；h-8 nussinov = [iv,
+  counter] elementwise；h-5 ludcmp = [iv, acc, counter] / [p, iv, acc,
+  counter] B1 归约。
+- 未解锁（非本方案范围）：h-5 卡 entry_i0_not_const（BB26，IV 入口非常量）
+  与 payload 跨步（load_classify/load_unmodeled）；h-8 卡 payload 跨步 +
+  UnknownBase。is_sub_one 保持严格（12 case 全过该检查；它是"标量循环恰跑
+  t0 轮"语义的保证，放宽不必要——设计初稿的放宽项经实证删除）。
+
+**单测**：新增 vectorizes_rotated_runtime_elementwise（mm 内核形态：
+passthrough + IvFinal + tail 上界重建）、vectorizes_rotated_runtime_guard_entry、
+vectorizes_rotated_runtime_reduction（reduce → tail [iv0, sum] 链）；
+改写 vectorizes_runtime_trip_counter_entry（原 rejects_non_exact_trip：
+函数参数 trip 现在向量化）。raana_ir 408 全绿（新基座）。
+
+**差分/语义**：01_mm1 -O2 PASS；matmul1 -O2 PASS（无回归）；RISC-V
+functional/00_main.sy -O2 PASS（门控未动，零影响）；trip 边界差分 7/7
+PASS（vec_trip_0/1/2/3/5/7/neg：0→0、1→1、2→3、3→6、5→15、7→28、
+-3→0——rotated runtime B1 全语义，含负 trip 守卫）；幂等收敛（tail_loop_skip
++ counter_not_cond，fixed-point 无二次向量化）。
+
+**性能**：01_mm1 mm 内核出 NEON（ldr q/dup/mul v.4s/add v.4s/str q，
+内核 13 条/4 元素 vs 标量 8 条/元素）。qemu r: 同机背靠背（旧基座、低负载）：
+基线 4379.83ms → 新 3862.38ms（-11.8%）。新基座（643f614）复测受 host
+负载污染（load avg 12.8，另一 session VM 100% CPU，c: 时间 76→346ms 抖动），
+数字不可用；新基座向量内核汇编与旧基座逐条一致。
+
+**遗留**：soyo_compiler abi_matrix::tests::aarch64_self_tail_call_loops_without_
+rebuilding_a_frame 失败（fact 在 O2 被 IR 层 Inline，测试期望独立函数段；
+2f4ae40 与 643f614 基座均复现，与向量化任务无关）——workspace 全绿唯一
+缺口，待单独决策（适配测试 vs 查 Inline 策略）。

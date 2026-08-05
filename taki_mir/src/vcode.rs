@@ -215,12 +215,14 @@ impl<I: VCodeInst> VCodeContainer<I> {
         let mut new_block_range = Ranges::default();
 
         // Resolve the width of an allocator edit's value from the vreg type
-        // table when it is a vector; fall back to a 128-bit vector default so
-        // vector-class edits never panic even if the type was not recorded.
+        // table. Vector-class vregs are normally 128-bit vector values, but
+        // on AArch64 f32 scalars also allocate from the Vector bank (sN ≡ vN),
+        // so the recorded type must win: an F32-typed vreg yields a 32-bit
+        // move/spill rather than a 128-bit one. Fall back to a 128-bit vector
+        // default so edits never panic even if the type was not recorded.
         let vector_ty = |vreg: Option<u32>| {
             vreg.and_then(|v| self.vreg_types.get(v as usize))
                 .copied()
-                .filter(|ty| ty.is_vector())
                 .unwrap_or(V4I32)
         };
 

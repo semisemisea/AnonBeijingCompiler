@@ -2159,3 +2159,34 @@ back_args/params 逐槽位分类：IDENTITY / binary:op / blockarg / int），
 matmul k 循环、conv2d checksum）。这属于 B1 既有单归约能力在 test-at-top
 形态上的补齐，不引入多 IV / 多归约。是否转向该方向由用户决定（本次仅
 实证 + 落档，未改 analyze）。
+
+### 10.11 补充实证：B1 放行前必须查 bound——6 个候选循环全部 runtime bound（2026-08-06）
+
+**新增插桩**：[SHAPE-BOUND]（VECDBG_SHAPE=1，打印 bound 指令形态 +
+constant_i64 结果），corpus 全扫（60 例）。
+
+**决定性数据（放行 test_at_top_multi_param 后的下一道卡点）**：
+
+| 候选循环 | bound 形态 | constant_i64 |
+|---|---|---|
+| 01_mm1 main BB(20) | Call(getint) | None（runtime） |
+| many_mat BB(49) k 循环 | Call(getint) | None（runtime） |
+| many_mat BB(55)/BB(63) | Call(getint) | None（runtime） |
+| transpose2 BB(10) | Call | None（runtime） |
+| conv2d BB(14) checksum | binary:Mul (N_eff²) | None（runtime） |
+
+**结论：6 个候选全部 runtime bound → 放行 multi_param 后会被
+test_at_top_bound_not_const（918-923 行）继续拒绝，零解锁**。唯一
+const-bound 的 test-at-top 多参数循环是 crypto-1/2/3 pseudo_md5 BB(32)
+（bound=16），但它 16 参数 15 IDENTITY → effective==1，实际卡在
+gep_offset_loop_variant（payload GEP offset 循环可变），非 multi_param
+问题。matmul1/2/3 能出向量是因为 bound 是字面常量（while(i<1000)），
+与这些 runtime-bound 循环不同类。
+
+**修正后的解锁链**：test_at_top_multi_param →（B1 放行后）
+test_at_top_bound_not_const → 需 runtime trip count 支持（动态 counter
+或 versioning），设计明确排除（"bound must be const, no versioning"）。
+即：**B1 放行是必要条件，但对 4 个验收 case 不充分**——multi_param
+计数会下降（验收项 1 满足），但"解锁循环出向量"（验收项 2）在 4 case
+上不成立。若目标是 4 case 出向量，需另行评估 runtime-bound test-at-top
+支持（新特性，超出 A3 范围）。

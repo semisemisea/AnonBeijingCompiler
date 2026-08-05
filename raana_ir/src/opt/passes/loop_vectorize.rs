@@ -638,6 +638,54 @@ fn analyze_loop(
                 data.bb_data(header).name(),
                 slot_desc.join(" | "),
             );
+            if test_at_top {
+                let bound_kind = match arena.inst_data(bound_inst).kind() {
+                    InstKind::Integer(v) => format!("int({})", v.value()),
+                    InstKind::BlockArgRef(_) => "blockarg".to_string(),
+                    InstKind::Load(_) => "load".to_string(),
+                    InstKind::Binary(b) => format!("binary:{:?}", b.op()),
+                    InstKind::GlobalAlloc(_) => "global".to_string(),
+                    other => format!("{other:?}"),
+                };
+                let bound_const = constant_i64(arena, data, bound_inst).map(|v| v.to_string());
+                eprintln!(
+                    "[SHAPE-BOUND] func={} header={:?} name={} bound={bound_inst:?} kind={bound_kind} const={bound_const:?}",
+                    data.name(),
+                    header,
+                    data.bb_data(header).name(),
+                );
+            }
+            let exit_kind = match arena.inst_data(data.layout().basicblock(exit).terminator()).kind() {
+                InstKind::Jump(_) => "jump".to_string(),
+                InstKind::Branch(_) => "branch".to_string(),
+                other => format!("{other:?}"),
+            };
+            let exit_param_desc: Vec<String> = data
+                .bb_data(exit)
+                .params()
+                .iter()
+                .map(|p| format!("{p:?}"))
+                .collect();
+            let exit_arg_desc: Vec<String> = exit_args
+                .iter()
+                .map(|a| {
+                    let k = match arena.inst_data(*a).kind() {
+                        InstKind::Binary(b) => format!("binary:{:?}", b.op()),
+                        InstKind::BlockArgRef(_) => "blockarg".to_string(),
+                        InstKind::Integer(v) => format!("int({})", v.value()),
+                        other => format!("{other:?}"),
+                    };
+                    format!("{a:?}({k})")
+                })
+                .collect();
+            eprintln!(
+                "[SHAPE-EXIT] func={} header={:?} name={} exit={exit:?} exit_term={exit_kind} exit_params={} exit_args={}",
+                data.name(),
+                header,
+                data.bb_data(header).name(),
+                exit_param_desc.join(","),
+                exit_arg_desc.join(","),
+            );
         }
     // Passthrough slots: the back-edge argument is the parameter itself.
     // The trip counter is the last parameter (its back-edge arg is the

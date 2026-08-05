@@ -771,10 +771,12 @@ fn analyze_loop(
             ExitArgSpec::Acc
         } else if arg == iv_next {
             ExitArgSpec::IvFinal
-        } else if let Some(slot) = passthrough.iter().copied().find(|&slot| {
+        } else if let Some(idx) = passthrough.iter().position(|&slot| {
             arg == params[slot] || arg == entry_args[slot]
         }) {
-            ExitArgSpec::Passthrough(slot)
+            // `idx` is the index into `passthrough` / `passthrough_args`
+            // (both are ordered identically), not the header slot.
+            ExitArgSpec::Passthrough(idx)
         } else {
             trace(data, looop, "exit_has_params");
             return None;

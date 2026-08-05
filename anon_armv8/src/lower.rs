@@ -382,10 +382,15 @@ fn lower_vector_binary(
                 );
             }
             ctx.emit(MInst::VecArithRRR {
-                op: match binary.op() {
-                    BinaryOp::Add => VecArithOp::Add,
-                    BinaryOp::Sub => VecArithOp::Sub,
-                    _ => VecArithOp::Mul,
+                // Float vectors need the `f*` NEON forms (`add v.4s` is an
+                // integer add on the float bit patterns).
+                op: match (binary.op(), is_float) {
+                    (BinaryOp::Add, false) => VecArithOp::Add,
+                    (BinaryOp::Sub, false) => VecArithOp::Sub,
+                    (BinaryOp::Mul, false) => VecArithOp::Mul,
+                    (BinaryOp::Add, true) => VecArithOp::Fadd,
+                    (BinaryOp::Sub, true) => VecArithOp::Fsub,
+                    _ => VecArithOp::Fmul,
                 },
                 shape,
                 dst,
@@ -3909,6 +3914,98 @@ mod tests {
         assert!(assembly.contains(".s[0]"), "{assembly}");
         assert!(assembly.contains("scvtf"), "{assembly}");
         assert!(assembly.contains("fmla"), "{assembly}");
+    }
+
+    #[test]
+    fn f32_scalars_do_not_alias_live_vector_results() {
+        use raana_ir::ir::builder_trait::*;
+
+        // The h-10 kernel shape: `X = X / diag + 1` — a vector divide whose
+        // divisor is an f32 scalar splat, plus a second splat of an f32
+        // constant whose live range overlaps the divide result. Before the
+        // s/v aliasing fix, the constant's register (`fmov s0`) and the div
+        // result (`fdiv v0`) shared hw_enc 0 and silently corrupted the
+        // splat: `dup v1.4s, v0.s[0]` read the div result, not 1.0f.
+        let v4f32 = Type::get_vector(Type::get_f32(), 4);
+        let mut program = Program::new();
+        let function = program.new_function(
+            v4f32.clone(),
+            "f32_splat_div_kernel".into(),
+            vec![v4f32.clone(), Type::get_f32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let x = data.params()[0];
+        let diag = data.params()[1];
+
+        let splat_diag = data.new_local_inst().vector_splat(diag, v4f32.clone());
+        let div = data.new_local_inst().binary(BinaryOp::Div, x, splat_diag);
+        let one = data.new_local_inst().float(1.0);
+        let splat_one = data.new_local_inst().vector_splat(one, v4f32.clone());
+        let add = data.new_local_inst().binary(BinaryOp::Add, div, splat_one);
+
+        // Note: the `one` constant is intentionally NOT inserted into the
+        // layout — the lowering driver rematerializes float constants.
+        for inst in [splat_diag, div, splat_one, add] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let ret = data.new_local_inst().ret(Some(add));
+        data.layout_mut().insert_inst(entry, ret);
+
+        let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+        assert!(assembly.contains("fdiv v"), "{assembly}");
+        assert!(assembly.contains("fmov s"), "{assembly}");
+        assert!(assembly.contains("fadd v"), "{assembly}");
+
+        // Every scalar f32 view that is live across the vector divide must be
+        // assigned a different hw_enc than the divide result.
+        let fdiv_dst = assembly
+            .lines()
+            .find_map(|line| {
+                let idx = line.find("fdiv v")?;
+                let digits: String = line[idx + 6..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                digits.parse::<u8>().ok()
+            })
+            .expect("vector fdiv must be present");
+
+        for line in assembly.lines() {
+            if let Some(idx) = line.find("dup v") {
+                // `dup v<d>.<arr>, v<s>.s[0]` — the scalar source register
+                // must not alias the fdiv destination.
+                let rest = &line[idx + 5..];
+                if let Some(src_idx) = rest.find(", v") {
+                    let digits: String = rest[src_idx + 3..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    if let Ok(src) = digits.parse::<u8>() {
+                        assert_ne!(
+                            src,
+                            fdiv_dst,
+                            "splat scalar source must not alias the fdiv result:\n{assembly}"
+                        );
+                    }
+                }
+            }
+            if let Some(idx) = line.find("fmov s") {
+                // `fmov s<d>, w...` — the f32 constant's register must not
+                // alias the fdiv destination.
+                let digits: String = line[idx + 6..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(dst) = digits.parse::<u8>() {
+                    assert_ne!(
+                        dst,
+                        fdiv_dst,
+                        "f32 constant must not alias the fdiv result:\n{assembly}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

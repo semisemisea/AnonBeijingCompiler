@@ -2841,6 +2841,106 @@ live range 已占用的同 hw_enc Vector PReg（及反向）。注意这是 AArc
 - [ ] 结论写入 TODO.md §10.16（根因链、改动清单、验证数字）
 ```
 
+### 10.16.1 执行记录（2026-08-06，分支 fix/regalloc-s-v-aliasing，5 commits）
+
+**结论摘要**：s/v 别名根因已按主方案修复（f32 并入 Vector 类），h-10-02 PASS
+实证；但 h-10-01/03 仍 FAIL——另有一个**独立的 raana_ir 边界 bug**（rotated
+runtime-bound 向量循环对 n%4≠0 双处理尾部元素），按任务规则不碰 raana_ir，
+留给主 agent 决策（见下文 §10.16.2）。
+
+**根因链（实证）**
+1. s/v 别名：AArch64 物理上 sN ≡ vN 低 32 位；Ion RA 按 RegClass 独立枚举
+   PReg，Float(s0-31) 与 Vector(v0-31) 无跨类干扰 → f32 常量（fmov s0）与
+   向量 fdiv 结果（v0）同 hw_enc → 静默错算。base(2bd63a2) O0/O2 均 nan。
+2. 修复后 h-10-01/02/03 输出：02 = 0x1.58adbep+38（=期望，PASS）；01 =
+   0x1.74d3aep+13（期望 0x1.7a47acp+13）；03 = -0x1.fd42c8p+43（期望
+   -0x1.fe4494p+43）。01/03 接近不等 → 非 s/v 问题。
+3. 边界 bug：.raana IR 中向量循环 `%90 = gt %79, 0`（用减 4 **之前**的计数
+   判断，且判断在 body 之后）→ 每轮多处理一块（n=9 时 k=0,4,8,12 四块）；
+   尾循环起点为 floor(n/4)*4 → [floor*4, n) 的元素被**二次处理**。
+   n%4==0 时尾为空 → 正确（h-10-02 n=120 PASS；01_mm1 n=128 PASS）。
+   n%4≠0 时尾元素双处理 → 错算（h-10-01 n=9、h-10-03 n=150 FAIL）。
+   影响面：所有 runtime-bound 向量化循环，n%4≠0 即触发。
+
+**改动清单（分支 fix/regalloc-s-v-aliasing，基于 2bd63a2，5 个原子 commit）**
+1. `75da1cf` instructions.rs：rc_for_type F32→Vector；发射器 float 判定
+   Float|Vector 统一（emit_float_reg/emit_fmov/emit_vec_scalar_reg/VecDup
+   元素形式/VecExtractLane/VecInsertLane）；**顺带修复 f32 向量 Add/Sub/Mul
+   误发射整数 add/sub/mul → 新增 VecArithOp::Fadd/Fsub/Fmul**（h-10 内核
+   依赖，否则 f32 向量加法对位模式做整数加法）。
+2. `affc234` regs.rs：machine_env 的 Float 四组集合清空（AArch64 无 Float
+   类可分配寄存器）；FLOAT_RETURN_REG = v0；删除 FLOAT_ARG_REGS。
+3. `6e09a1d` abi.rs：f32 与向量参数共享 AAPCS64 SIMD/FP 序列（单一 NSRN，
+   f(v4i32,f32)→v0,v1）。**顺带修复潜在 ABI bug**：旧 Float/Vector 双 bank
+   独立计数，混合 float+vector 参数时两个参数钉同一物理寄存器（RA 必然
+   分配失败；clang 语义为共享序列）。
+4. `e2643f9` vcode.rs：Edit::Move 类型化去掉 is_vector 过滤（f32-in-Vector
+   的 move/spill 用 32 位 fmov 而非 128 位 mov v.16b）。
+5. `4039233` lower.rs：fadd/fsub/fmul 选择 + h-10 diag 形态回归测试
+   （断言 dup 标量源/fmov 目的 ≠ fdiv 目的寄存器 + fadd 发射）。
+
+**新增单测（全绿）**
+- instructions.rs：rc_for_type(F32)=Vector；Vector 类 f32 渲染（fmov s0,w21/
+  fadd s0,s1,s2/addv s0,v1.4s/ldr s3/dup v0.4s,v5.s[0]/extract/insert）；
+  VecArithOp float 变体发射。
+- lower.rs：f32_splat_div_kernel 端到端（h-10 diag 形态），汇编断言
+  dup 源 ≠ fdiv 目的、fmov 目的 ≠ fdiv 目的、发射 fadd。
+- regs.rs：Float 类全 32 号不可分配、FLOAT_RETURN_REG=v0。
+
+**验证数字**
+- cargo test：anon_armv8 136/136、raana_ir 408/408、taki_mir 59/59、
+  tomori_utils 24/24；uika_riscv 42/43、soyo_compiler 20/21（两个失败均
+  在 base 2bd63a2 上同样失败，预存在）。
+- functional + h_functional @ -O2：与 base 失败集**完全相同**（19+7），
+  零新增。
+- perf @ -O2：零新增；h-10-02 PASS；matmul1/2/3、h-1-01/02/03 与 base
+  输出逐字节相同（预存在 -O2 失败，与本次改动无关）。
+- RISC-V：TESTS="functional/95_float.sy h_functional/35_math.sy
+  functional/00_main.sy" ARGS="-O 2" → 3/3 PASS，零影响。
+- 已知损耗：f32 spill slot 由 8B 变 16B（类级 spillslot_size，RA 无类型
+  信息），正确但略费栈；f32 在 v8-v15 的 callee-saved 存 16B。均正确。
+
+**未满足的验收项及原因**
+- h-10-01/03 PASS：被 raana_ir 边界 bug 阻塞（非 s/v 问题，见 §10.16.2）。
+  注意：h-10-01 曾有一次全量 perf 运行显示 0x1.7a47acp+13（PASS），为
+  musl 构建时间戳坑（AGENTS.md 记载）导致二进制混杂的假象；用同一二进制
+  背靠背复跑 3 次均为 0x1.74d3aep+13，确定。
+- cargo test --workspace 全绿：soyo_compiler 1 个 + uika_riscv 1 个失败
+  均预存在（base 同样失败），非本次改动引入。
+
+### 10.16.2 raana_ir 边界 bug（供主 agent 决策，本任务未动 raana_ir）
+
+**现象**：runtime-bound 向量化循环在 n%4≠0 时，[floor(n/4)*4, n) 的元素
+被向量块与标量尾循环**各处理一次**（二次处理），结果错算。
+
+**根因（IR 级）**：h-10-01 .raana 中 div 循环：
+
+    while_body_6:
+      ... 处理 k..k+3 ...
+      %88 = %vid_4 + 4        ; k_next
+      %89 = %79 - 4           ; count_next
+      %90 = gt %79, 0         ; ← 用减 4 前的计数，且判断在 body 之后
+      br %90, while_entry_5(%88, %89), vec_tail_26(%43)
+    vec_tail_26(%92):          ; %92 = floor(n/4)*4
+      %93 = lt %92, n
+      br %93, vec_tail_latch_27, end
+
+- 判断在 body 之后 → 每轮多处理一块（n=9 时 k=0,4,8,12 四块）。
+- 尾起点 = floor(n/4)*4 而非 ceil(n/4)*4 → [floor*4, n) 与最后一块重叠。
+- n%4==0 时尾为空 → 正确（h-10-02 n=120、01_mm1 n=128 均 PASS）。
+
+**候选修法（二选一，都在 vectorizer/rotated 循环生成处）**
+1. 判断改为减 4 后的计数且移到 body 前（标准 rotated 形式：
+   `if (count > 0) { do { body; count -= 4 } while (count > 0) }`，
+   尾起点保持 floor(n/4)*4）。
+2. 保持现结构，把尾起点改为 ceil(n/4)*4（尾为空，多算的越界块落在行内
+   垃圾位，从不被读，与 n%4==0 时行为一致）。
+
+**验证**：修后 h-10-01（n=9）/h-10-03（n=150）应输出 0x1.7a47acp+13 /
+-0x1.fe4494p+43；h-10-02、01_mm1 不回归；建议补 vec_trip_*（n%4≠0 的
+i32 用例，tests/perf/ 下已有但不在当前套件）做回归。
+
+
 ### 10.17 SIMD 之路调研 + 下一步 goal 提示词（函数参数数组基址向量化，h-5/h-8 内核解锁）
 
 **调研数据（2026-08-06，HEAD 2bd63a2，release 编译器 M44_TRACE 复扫）**

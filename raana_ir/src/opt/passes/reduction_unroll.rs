@@ -16,6 +16,12 @@
 //! throughput to the multiply latency, ~0.25 elem/cycle on Cortex-A53 for
 //! `tests/perf/many_mat_cal-1.sy`).
 //!
+//! A third loop-carried parameter is supported: a pointer advanced by a
+//! constant element offset each trip (the matmul inner loop `(k, acc, ptr)`
+//! shape, `many_mat_cal`'s hotspot). The four lanes then read through
+//! `ptr + {0, stride, 2*stride, 3*stride}` and the main loop advances the base
+//! pointer by `4*stride`, so lane `k` covers trip `jm + k`.
+//!
 //! Soundness:
 //! - The body is a single pure block (loads only: no store / call / memzero),
 //!   so cloning it four times cannot duplicate side effects.
@@ -23,6 +29,8 @@
 //!   form), with `E` independent of `acc`; integer addition/subtraction is
 //!   associative and commutative modulo 2³², so splitting the reduction into
 //!   four independent lanes and summing the four results equals the original.
+//! - The pointer is advanced by address arithmetic only (`getelemptr`); lane
+//!   splitting is pure address algebra and never touches memory semantics.
 //! - The main loop runs `j < (T & ~3)`; the original loop, kept intact as a
 //!   scalar epilogue, consumes the remaining `T % 4` iterations. A runtime
 //!   versioning guard `T >= 4` selects the unrolled path; smaller trip counts
@@ -31,7 +39,7 @@
 //! The trip counter must start at zero (`j_init == 0`); this holds for every
 //! reduction loop in the corpus. The recognition is purely structural: it
 //! never matches names, strings, or benchmark-specific bounds (per
-//! `docs/Illegal_optimization.md` rule two; see TODO.md §2.6).
+//! `docs/Illegal_optimization.md` rule two; see TODO.md §2.2).
 
 use rustc_hash::FxHashMap;
 
@@ -66,10 +74,26 @@ struct Candidate {
     acc: Inst,
     j: Inst,
     a_idx: usize,
+    j_idx: usize,
     /// The back-edge value of the accumulator (the update to be lane-split).
     acc_update: Inst,
     /// The back-edge value of the trip counter (not cloned into the main loop).
     j_back: Inst,
+    /// A loop-carried pointer stepped by a constant element offset (optional).
+    ptr: Option<PtrIv>,
+}
+
+/// A loop-carried pointer with its element stride.
+#[derive(Clone, Copy)]
+struct PtrIv {
+    /// Index of the pointer parameter in the header's parameter list.
+    idx: usize,
+    /// The header parameter carrying the pointer.
+    param: Inst,
+    /// The constant GEP offset (in elements) added each iteration.
+    stride: i64,
+    /// The back-edge value of the pointer (the `getelemptr ptr, stride`).
+    ptr_back: Inst,
 }
 
 /// The instructions that make up the accumulator update pattern.
@@ -107,9 +131,10 @@ impl ReductionUnroll {
             return None;
         }
 
-        // (b) Exactly two header parameters: the accumulator and the trip IV.
+        // (b) Two or three header parameters: the accumulator and trip IV,
+        // optionally plus a loop-carried pointer stepped by a constant offset.
         let params = data.bb_data(header).params().to_vec();
-        if params.len() != 2 {
+        if !(2..=3).contains(&params.len()) {
             return None;
         }
 
@@ -128,8 +153,27 @@ impl ReductionUnroll {
         }
         let j = biv.parameter();
         let j_idx = params.iter().position(|&param| param == j)?;
-        let a_idx = 1 - j_idx;
-        let acc = params[a_idx];
+        // The accumulator is the i32 non-trip parameter; the pointer (optional)
+        // is the pointer-typed parameter. Both must step back into the header.
+        let mut acc = None;
+        let mut ptr = None;
+        for (idx, &param) in params.iter().enumerate() {
+            if idx == j_idx {
+                continue;
+            }
+            if data.inst_data(param).ty().is_pointer() {
+                if ptr.is_some() {
+                    return None;
+                }
+                ptr = Some((idx, param));
+            } else {
+                if acc.is_some() {
+                    return None;
+                }
+                acc = Some((idx, param));
+            }
+        }
+        let (a_idx, acc) = acc?;
         if !data.inst_data(acc).ty().is_i32() {
             return None;
         }
@@ -159,7 +203,7 @@ impl ReductionUnroll {
         let _ = exit_block;
 
         // (e) The body ends with a jump back to the header carrying the updated
-        // accumulator and trip counter.
+        // accumulator, trip counter, and (optionally) the stepped pointer.
         let body_insts = data
             .layout()
             .basicblock(body)
@@ -175,11 +219,43 @@ impl ReductionUnroll {
             return None;
         }
         let back_args = back.args().to_vec();
-        if back_args.len() != 2 {
+        if back_args.len() != params.len() {
             return None;
         }
         let acc_update = back_args[a_idx];
         let j_back = back_args[j_idx];
+        let ptr = match ptr {
+            Some((ptr_idx, ptr_param)) => {
+                // The pointer's back-edge must be a single-offset `getelemptr`
+                // by a non-zero constant (a row/column stride), defined in the
+                // body. Anything else (dynamic offset, arbitrary value) is
+                // rejected; address algebra only, per the soundness notes.
+                let ptr_back = back_args[ptr_idx];
+                let InstKind::GetElemPtr(gep) = data.inst_data(ptr_back).kind() else {
+                    return None;
+                };
+                let offsets = gep.offsets();
+                if offsets.len() != 1 {
+                    return None;
+                }
+                let InstKind::Integer(stride) = data.inst_data(offsets[0]).kind() else {
+                    return None;
+                };
+                if stride.value() == 0 {
+                    return None;
+                }
+                if data.layout().parent_bb(ptr_back) != Some(body) {
+                    return None;
+                }
+                Some(PtrIv {
+                    idx: ptr_idx,
+                    param: ptr_param,
+                    stride: i64::from(stride.value()),
+                    ptr_back,
+                })
+            }
+            None => None,
+        };
 
         // (f) The non-back-edge initializer must start the trip counter at zero
         // so the unrolled lanes line up with `j mod 4`.
@@ -233,8 +309,10 @@ impl ReductionUnroll {
             acc,
             j,
             a_idx,
+            j_idx,
             acc_update,
             j_back,
+            ptr,
         })
     }
 
@@ -257,7 +335,7 @@ impl ReductionUnroll {
             return false;
         };
         let orig_args = jump.args().to_vec();
-        if orig_args.len() != 2 {
+        if orig_args.len() != data.bb_data(cand.header).params().len() {
             return false;
         }
         let acc_in = orig_args[cand.a_idx];
@@ -268,21 +346,27 @@ impl ReductionUnroll {
         let neg_four = data.new_local_value().integer(-4);
 
         // The versioning block and the unrolled main loop. Every main-loop
-        // block carries [acc_in, acc0, acc1, acc2, acc3, jm].
+        // block carries [acc_in, acc0, acc1, acc2, acc3, jm] and, when the
+        // loop carries a pointer, a trailing base pointer parameter.
+        let main_arity = UNROLL_FACTOR + 2 + usize::from(cand.ptr.is_some());
+        let mut main_tys = vec![i32_ty.clone(); UNROLL_FACTOR + 2];
+        if let Some(ptr) = &cand.ptr {
+            main_tys.push(data.inst_data(ptr.param).ty().clone());
+        }
         let version = data
             .new_basic_block()
             .basic_block("reduction_guard".into(), vec![]);
         let main_header = data.new_basic_block().basic_block(
             "reduction_main_header".into(),
-            vec![i32_ty.clone(); UNROLL_FACTOR + 2],
+            main_tys.clone(),
         );
         let main_body = data.new_basic_block().basic_block(
             "reduction_main_body".into(),
-            vec![i32_ty.clone(); UNROLL_FACTOR + 2],
+            main_tys.clone(),
         );
         let main_exit = data.new_basic_block().basic_block(
             "reduction_main_exit".into(),
-            vec![i32_ty.clone(); UNROLL_FACTOR + 2],
+            main_tys,
         );
         data.layout_mut().insert_bb_after(preheader, version);
         data.layout_mut().insert_bb_after(version, main_header);
@@ -296,7 +380,10 @@ impl ReductionUnroll {
         let masked = data
             .new_local_value()
             .binary(BinaryOp::And, cand.bound, neg_four);
-        let main_args = vec![acc_in, zero, zero, zero, zero, zero];
+        let mut main_args = vec![acc_in, zero, zero, zero, zero, zero];
+        if let Some(ptr) = &cand.ptr {
+            main_args.push(orig_args[ptr.idx]);
+        }
         let guard_branch =
             data.new_local_value()
                 .branch(guard, main_header, main_args, cand.header, orig_args);
@@ -312,7 +399,7 @@ impl ReductionUnroll {
         let body_params = data.bb_data(main_body).params().to_vec();
         let exit_params = data.bb_data(main_exit).params().to_vec();
         // Both targets receive the same loop-carried values as the header
-        // itself carries: [acc_in, acc0, acc1, acc2, acc3, jm].
+        // itself carries.
         let main_branch = data.new_local_value().branch(
             main_cond,
             main_body,
@@ -323,7 +410,7 @@ impl ReductionUnroll {
         data.layout_mut().insert_inst(main_header, main_cond);
         data.layout_mut().insert_inst(main_header, main_branch);
 
-        // ---- main loop body: four cloned lanes + step-4 trip update ----
+        // ---- main loop body: four cloned lanes + step-4 trip/pointer update ----
         let body_insts = data
             .layout()
             .basicblock(cand.body)
@@ -340,6 +427,23 @@ impl ReductionUnroll {
                 lane_const,
             );
             data.layout_mut().insert_inst(main_body, jmk);
+            // Lane pointer: `base + lane * stride` (in elements). Only the
+            // pointer *parameter* is re-based; the body's own `ptr + stride`
+            // back-edge (`cand.ptr.ptr_back`) is skipped along with `j_back`.
+            let ptr_lane = match &cand.ptr {
+                Some(ptr) => {
+                    let lane_off = data
+                        .new_local_value()
+                        .integer((lane as i64 * ptr.stride) as i32);
+                    let lane_ptr = data.new_local_value().get_elem_ptr(
+                        main_params[UNROLL_FACTOR + 2],
+                        vec![lane_off],
+                    );
+                    data.layout_mut().insert_inst(main_body, lane_ptr);
+                    Some(lane_ptr)
+                }
+                None => None,
+            };
             let mut mapper = LaneMapper {
                 data: &mut *data,
                 map: FxHashMap::default(),
@@ -348,10 +452,14 @@ impl ReductionUnroll {
                 acc_param: cand.acc,
                 jmk,
                 acc_lane: body_params[1 + lane],
+                ptr_param: cand.ptr.as_ref().map(|ptr| ptr.param),
+                ptr_lane,
                 block: main_body,
             };
             for &inst in &body_insts[..body_insts.len() - 1] {
-                if inst == cand.j_back {
+                if inst == cand.j_back
+                    || cand.ptr.as_ref().is_some_and(|ptr| inst == ptr.ptr_back)
+                {
                     continue;
                 }
                 mapper.clone_inst(inst);
@@ -373,8 +481,19 @@ impl ReductionUnroll {
             next_accs[1],
             next_accs[2],
             next_accs[3],
+            jm_next,
         ];
-        back_args.push(jm_next);
+        if let Some(ptr) = &cand.ptr {
+            let four_stride = data
+                .new_local_value()
+                .integer((4 * ptr.stride) as i32);
+            let ptr_next = data.new_local_value().get_elem_ptr(
+                main_params[UNROLL_FACTOR + 2],
+                vec![four_stride],
+            );
+            data.layout_mut().insert_inst(main_body, ptr_next);
+            back_args.push(ptr_next);
+        }
         let back = data.new_local_value().jump(main_header, back_args);
         data.layout_mut().insert_inst(main_body, back);
 
@@ -390,11 +509,17 @@ impl ReductionUnroll {
         let acc_final = data
             .new_local_value()
             .binary(BinaryOp::Add, exit_params[0], total);
-        // The original header's parameter order is `[j, acc]` or `[acc, j]`
-        // depending on which parameter is the accumulator; reorder accordingly.
-        let mut tail_args = vec![exit_params[UNROLL_FACTOR + 1], acc_final];
-        if cand.a_idx == 0 {
-            tail_args.swap(0, 1);
+        // Reassemble the original header's arguments in its own parameter
+        // order (j / acc / optional ptr).
+        let mut tail_args = Vec::with_capacity(main_arity);
+        for (idx, _param) in data.bb_data(cand.header).params().iter().enumerate() {
+            if idx == cand.a_idx {
+                tail_args.push(acc_final);
+            } else if idx == cand.j_idx {
+                tail_args.push(exit_params[UNROLL_FACTOR + 1]);
+            } else {
+                tail_args.push(exit_params[UNROLL_FACTOR + 2]);
+            }
         }
         let tail = data.new_local_value().jump(cand.header, tail_args);
         for inst in [s01, s23, total, acc_final, tail] {
@@ -504,11 +629,13 @@ fn match_acc_update(data: &ArenaContextMut<'_>, acc: Inst, update: Inst) -> Opti
 
 /// Clones the pure body instructions of one lane into the unrolled main body.
 ///
-/// - `j` maps to `jm + k`, the accumulator maps to the lane accumulator.
+/// - `j` maps to `jm + k`, the accumulator maps to the lane accumulator, and
+///   (when present) the pointer parameter maps to `base + k * stride`.
 /// - Values defined outside the loop are loop-invariant with respect to `j`
 ///   and `acc`; they are shared rather than duplicated.
-/// - The trip-counter update (`j + 1`) is the only instruction deliberately
-///   skipped; the main loop advances its own counter by four.
+/// - The trip-counter update (`j + 1`) and the pointer's own back-edge GEP are
+///   the only instructions deliberately skipped; the main loop advances its own
+///   counter and pointer by four.
 struct LaneMapper<'a, 'b> {
     data: &'a mut ArenaContextMut<'b>,
     map: FxHashMap<Inst, Inst>,
@@ -517,6 +644,10 @@ struct LaneMapper<'a, 'b> {
     acc_param: Inst,
     jmk: Inst,
     acc_lane: Inst,
+    /// The header pointer parameter, when the loop carries one.
+    ptr_param: Option<Inst>,
+    /// The lane pointer (`base + k * stride`) each clone should use.
+    ptr_lane: Option<Inst>,
     block: BasicBlock,
 }
 
@@ -530,6 +661,11 @@ impl LaneMapper<'_, '_> {
         }
         if inst == self.acc_param {
             return self.acc_lane;
+        }
+        if self.ptr_param == Some(inst) {
+            return self
+                .ptr_lane
+                .expect("a pointer-lane value is only requested when one was built");
         }
         if let Some(&cloned) = self.map.get(&inst) {
             return cloned;
@@ -814,5 +950,168 @@ mod tests {
             program.func_data(function).layout().basicblocks().len(),
             block_count + 4
         );
+    }
+
+    /// Build a pointer-carrying reduction loop shaped like the matmul inner
+    /// loop: `acc += C[j] * load(ptr); ptr += stride`. Header params are
+    /// `[j, acc, ptr]`; the body loads through `getelemptr ptr, 0`.
+    fn build_pointer_reduction(program: &mut Program) -> Function {
+        let function = program.new_function(
+            Type::get_i32(),
+            "ptr_reduction".into(),
+            vec![
+                Type::get_i32(),
+                Type::get_pointer(Type::get_array(Type::get_i32(), 16)),
+                Type::get_pointer(Type::get_i32()),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let n = data.params()[0];
+        let c = data.params()[1];
+        let base = data.params()[2];
+
+        let header = data.new_basic_block().basic_block(
+            "header".into(),
+            vec![
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_pointer(Type::get_i32()),
+            ],
+        );
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data
+            .new_local_inst()
+            .jump(header, vec![zero, zero, base]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let (j, acc, ptr) = {
+            let params = data.bb_data(header).params();
+            (params[0], params[1], params[2])
+        };
+        let one = data.new_local_inst().integer(1);
+
+        let zero_off = data.new_local_inst().integer(0);
+        let c_gep = data
+            .new_local_inst()
+            .get_elem_ptr(c, vec![zero_off, j]);
+        let c_val = data.new_local_inst().load(c_gep);
+        let a_gep = data.new_local_inst().get_elem_ptr(ptr, vec![zero_off]);
+        let a_val = data.new_local_inst().load(a_gep);
+        let mul = data.new_local_inst().binary(BinaryOp::Mul, c_val, a_val);
+        let acc2 = data.new_local_inst().binary(BinaryOp::Add, acc, mul);
+        let j2 = data.new_local_inst().binary(BinaryOp::Add, j, one);
+        let stride = data.new_local_inst().integer(1024);
+        let ptr2 = data.new_local_inst().get_elem_ptr(ptr, vec![stride]);
+        for inst in [c_gep, c_val, zero_off, a_gep, a_val, mul, acc2, j2, stride, ptr2] {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        let back = data.new_local_inst().jump(header, vec![j2, acc2, ptr2]);
+        data.layout_mut().insert_inst(body, back);
+
+        let compare = data.new_local_inst().binary(BinaryOp::Lt, j, n);
+        let branch = data
+            .new_local_inst()
+            .branch(compare, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, compare);
+        data.layout_mut().insert_inst(header, branch);
+
+        let ret = data.new_local_inst().ret(Some(acc));
+        data.layout_mut().insert_inst(exit, ret);
+        function
+    }
+
+    #[test]
+    fn unrolls_a_pointer_carrying_reduction_loop() {
+        let mut program = Program::new();
+        let function = build_pointer_reduction(&mut program);
+        let block_count = program.func_data(function).layout().basicblocks().len();
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        assert_eq!(
+            data.layout().basicblocks().len(),
+            block_count + 4,
+            "one pointer reduction loop adds four blocks"
+        );
+
+        // The main loop blocks carry [acc_in, 4 lanes, jm, ptr] (7 params).
+        let main_header = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .find(|layout| data.bb_data(layout.bb()).params().len() == UNROLL_FACTOR + 3)
+            .map(|layout| layout.bb())
+            .expect("main header carries acc_in + 4 lanes + jm + ptr");
+        let main_body = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .find(|layout| {
+                let insts = layout.insts();
+                matches!(
+                    data.inst_data(*insts.iter().last().unwrap()).kind(),
+                    InstKind::Jump(jump) if jump.target() == main_header
+                ) && data.bb_data(layout.bb()).params().len() == UNROLL_FACTOR + 3
+            })
+            .map(|layout| layout.bb())
+            .expect("main body jumps back to the main header");
+
+        // The lane loads must go through ptr + {0,1024,2048,3072}: the main
+        // body must contain a getelemptr whose base is the ptr parameter and
+        // whose offset is one of those lane strides. The lane pointer is
+        // derived from the main *header's* pointer parameter (the value the
+        // branch feeds the body), so scan for GEPs on that parameter.
+        let ptr_param = data.bb_data(main_header).params()[UNROLL_FACTOR + 2];
+        let mut lane_offsets = Vec::new();
+        for layout in data.layout().basicblocks() {
+            for &inst in layout.insts() {
+                if let InstKind::GetElemPtr(gep) = data.inst_data(inst).kind() {
+                    if gep.base() != ptr_param {
+                        continue;
+                    }
+                    if let [off] = gep.offsets() {
+                        if let InstKind::Integer(value) = data.inst_data(*off).kind() {
+                            lane_offsets.push(value.value());
+                        }
+                    }
+                }
+            }
+        }
+        let expected = vec![0, 1024, 2048, 3072, 4096];
+        assert!(
+            expected
+                .iter()
+                .all(|off| lane_offsets.contains(off)),
+            "lane loads must cover ptr + {{0,1024,2048,3072}} and the back-edge +4096, got {lane_offsets:?}"
+        );
+
+        // The scalar epilogue's header (two-parameter target of the main exit)
+        // must still receive its pointer slot from the main loop's carried ptr.
+        let main_exit = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .find(|layout| {
+                let insts = layout.insts();
+                matches!(
+                    data.inst_data(*insts.iter().last().unwrap()).kind(),
+                    InstKind::Jump(jump)
+                        if data.bb_data(jump.target()).params().len() == 3
+                )
+            })
+            .map(|layout| layout.bb())
+            .expect("main exit jumps to the three-parameter original header");
+        let insts = data.layout().basicblock(main_exit).insts();
+        let InstKind::Jump(jump) = data.inst_data(*insts.iter().last().unwrap()).kind() else {
+            panic!("main exit must end in a jump");
+        };
+        assert_eq!(jump.args().len(), 3);
     }
 }

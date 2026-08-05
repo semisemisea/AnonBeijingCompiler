@@ -1617,6 +1617,11 @@ fn migrate_reduction(
     data.layout_mut().insert_before_terminator(update_bb, store);
 
     // Delete `c[i][j] = temp` in E_k (the store into the migration target).
+    // `remove_layout_inst` (not bare `layout_mut().remove_inst`) so the
+    // store's operands (src, dest) are detached from their used_by lists —
+    // otherwise the migrated c_gep keeps a dangling reference to the removed
+    // store, which downstream passes (e.g. loop_vectorize's escape check)
+    // misread as a value escaping the loop.
     let e_insts: Vec<Inst> = data
         .layout()
         .basicblock(e_k)
@@ -1627,7 +1632,7 @@ fn migrate_reduction(
     for inst in e_insts {
         if let InstKind::Store(store) = data.inst_data(inst).kind() {
             if store.dest() == c_gep {
-                data.layout_mut().remove_inst(e_k, inst);
+                data.remove_layout_inst(e_k, inst);
                 break;
             }
         }

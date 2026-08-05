@@ -164,13 +164,29 @@ then we wrap it in a memoizer like `@cache` in python.
 
 Helpful in fibonacci-like function.
 
-### ADCE
+### DCE
+
+A general set of Dead Code Elimination
+
+#### ADCE
 
 Aggressive dead code elimination that based on SSA.
 
 It will assert every instruction, except the one that have side-effect,
 is `dead` at beginning. Then for every living instruction, the instruction
 it uses need to be `alive`. Then we iterate until the fix-point.
+
+#### Dead Phi Elimination
+
+If phi node always receive the same value, then delete it.
+
+#### DSE
+
+If a `store` instruction store a value that never load, then delete it.
+
+#### Dead Function Elimination
+
+Do what it says.
 
 ### (IP)SCCP
 
@@ -181,6 +197,19 @@ It's control-flow sensitive and context-insensitive.
 Most context-sensitive case is solved by `Specialize`
 
 ### General Tail Call Optimization
+
+For a function `f` return like `return f(Args...)`, we can always re-use
+the stack by jump to the entry block with arguments set.
+
+General here means we have `int bar(int i, int j)` and `int foo(int x, int y)`,
+in function bar if we `return foo(i, j)`, is also consider a tail call.
+
+This is useful for self-recursive function and mutually-recursive functions.
+
+### Column Major
+
+If an array `A[M][N]` is proved to have a better performance by switching to
+`A[N][M]` (also switch the index), then switch it.
 
 ### Specialize
 
@@ -201,10 +230,32 @@ In the whole program, function that is not a declaration, is not recursively
 called, its instruction counts is less than 40, would be inlined.
 For the call-site in the loop, the limit is raised to 200.
 
+This inline pass does not inline function with tail-call, since tail-call
+often means recursive. But if it is treated correctly, could still be inlined.
+It will be processed in `TailRecursiveInline`
+
 ### GVN
 
 Global value numbering.
 Find and replace the value/pattern that has been calculated.
+
+### GVNPRE
+
+Use GVN method to do PRE (Partial Redundancy Elimination)
+
+### Invariant Reduction Hoisting
+
+If the form of `total += a[i] * b[j]` appears in the loop `
+for(int k = 0; k < n; k++)`, then hoist it out of the loop, turning into
+`total = init + n * a[i] * b[j]`
+
+### If Conversion
+
+SysY does not support `a = b ? c : d` operator. But it often appears in the
+code using `if-else`. So if we met the assignment like this, turning it into
+a `select(cond, if_true, if_false)` instruction
+
+###
 
 ### SR
 

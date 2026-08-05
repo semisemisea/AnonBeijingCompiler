@@ -1124,22 +1124,12 @@ fn analyze_loop(
         None => None,
         Some((acc, acc_slot, bop)) => {
             let (update, delta) = acc_update.expect("acc_update set alongside acc_info");
-            // The accumulator seed must be splattable at the entry edge. A
-            // seed that is another loop's block parameter (e.g. the outer
-            // `sum` of a nested `sum += c[i][j]`) lowers to a `dup` whose
-            // source register comes out zero — the taki_mir block-param
-            // value chain (block param -> block param across loop levels)
-            // is broken at lowering/regalloc, verified experimentally on
-            // nested_sum/matmul1 (IR stays correct through every pass; the
-            // value is lost during lowering). Reject for now (the loop
-            // stays scalar); fixing needs a taki_mir change.
-            if matches!(
-                arena.inst_data(entry_args[acc_slot]).kind(),
-                InstKind::BlockArgRef(_)
-            ) {
-                trace(data, looop, "b1_acc_init_block_arg");
-                return None;
-            }
+            // The accumulator seed is splatted as a zero vector and added
+            // back at the exit, so a block-arg seed (outer loop's `sum`)
+            // is no longer splatted directly. The exit `add(seed, Σc)`
+            // references the seed across loop levels — safe since IPSCCP
+            // no longer folds vector results to a constant (fixed
+            // 2026-08-05: VectorReduce etc. now take Lattice::Bottom).
             let delta_class = payload
                 .iter()
                 .position(|&p| p == delta)
@@ -1479,7 +1469,18 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 // `q` vector iterations, so `i0 + 4q == i0 + trip`).
                 let iv_final_const = has_iv_final
                     .then(|| data.new_local_inst().integer((entry_i0 + VF * q) as i32));
-                let acc_value = red.exit_acc_param.map(|_| acc_final);
+                let acc_value = red.exit_acc_param.map(|_| {
+                    // The vector loop accumulates with a zero seed
+                    // (splat(0)), so the outer seed must be added back:
+                    // sum_final = seed + Σc. (Splatting the seed itself
+                    // would overcount 4x at the addv.)
+                    let sum = alloc_inst(
+                        data,
+                        Binary::new_data(red.acc_init, acc_final, BinaryOp::Add, i32.clone()),
+                    );
+                    data.layout_mut().insert_inst(rb, sum);
+                    sum
+                });
                 (
                     exit,
                     build_exit_args(&exit_specs, &passthrough_args, acc_value, iv_final_const),
@@ -1831,7 +1832,11 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     //    accumulator enters splatted across the vector.
     let four_q = data.new_local_inst().integer((VF * q) as i32);
     let acc_splat: Option<Inst> = reduction.as_ref().map(|red| {
-        let s = alloc_inst(data, VectorSplat::new_data(red.acc_init, vector_ty.clone()));
+        // Zero seed: the vector loop accumulates Σc and the seed is added
+        // back at the exit (see the reduce-block `acc_value` construction).
+        // Splatting a non-zero seed would overcount it 4x at the addv.
+        let zero = data.new_local_inst().integer(0);
+        let s = alloc_inst(data, VectorSplat::new_data(zero, vector_ty.clone()));
         data.layout_mut().insert_inst_before(entry_edge, s);
         s
     });

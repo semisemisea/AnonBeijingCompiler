@@ -1755,3 +1755,39 @@ P3：D（位反转无分支）——先量化 fft1 热循环占比。
 
 - 全部用 clang -O2 同用例对比 + 循环体每轮指令数 + cargo test + make test 定向；全量由用户跑。
 - 合规：全部按 IR 结构/循环结构触发，无名字/输入指纹（常量物化按"循环内使用的不可编码常量"触发，GEP 按索引结构触发，与用例无关）。
+
+## 10. 向量化接力：header [lt,jump] 形态支持（2026-08-05 计划，新 session 执行）
+
+### 10.1 任务
+
+loop_vectorize 的 header 检查支持 `[lt, jump]` 形态（header 只有两条指令：first=lt（bound 条件），second=jump→body）。当前只支持 `[lt, br]`（test-at-top）和 `[jump]`（rotated），`[lt, jump]`（条件上提中间态，rotate/simplify 产生）在 shape_header_multi_inst 拒绝。
+
+### 10.2 证据（已实证）
+
+- **批量扫描 60 例：`[lt, jump]` 形态 144 例循环**——是最大的「不支持形态」；matmul 掩码内核（BB19）只是其中 1 例。
+- shape_header_multi_inst 总数 192（含 [lt,jump] 144 + [lt,br] 变体 24 + 复杂 bound 24）。
+- matmul1 的 BB19/BB10/BB32/BB44 都是 `[lt, jump]`；BB44（sum 循环）后续轮结构变化被接受（说明该形态在 fixed-point 中可变），BB19（掩码内核）后续轮 not_innermost 未解锁。
+- 掩码内核解锁链现状：shape_body ✅（5f87c57 B1 true 边泛化）→ **shape_header_multi_inst（当前卡点）** → 后续检查（entry_trip/payload/exit）未验证。
+
+### 10.3 改动位置与设计
+
+- 文件：raana_ir/src/opt/passes/loop_vectorize.rs，analyze_loop 的 header 检查（~442-472 行 test_at_top 分支）。
+- 现状：test_at_top 要求 second 是 Branch（~452 行 `InstKind::Branch` else shape_header_multi_inst）；`[lt,jump]` 的 second 是 Jump → 拒绝。
+- 设计：first=lt（bound 条件）、second=jump→body 时，接受为 test-at-top 变体——lt 的结果被 body/latch 的 br 使用（需确认 use 结构：lt 的 users 在循环内 br 的 cond）；trip 语义由 entry_trip 检查（bound 常量）兜底验证；bound 非常量自然走 entry_trip_not_const。
+- 参考：test_at_top 现有参数（bound_inst、entry 边重写 4Q counter 物化——A3 8f4907a 已支持多参数）。
+
+### 10.4 验证步骤
+
+1. 加/用插桩：VECDBG_SHAPE=1 时 analyze 打印 [SHAPE-HDR] header={:?} insts=[...]（已在代码中，env 控制——见 analyze_loop header_insts 处）。
+2. 改 header 检查（接受 [lt,jump]）。
+3. M44_TRACE=1 跑 matmul1：BB19 应过 header 检查（后续卡点变化）。
+4. 批量扫描：shape_header_multi_inst 192 → 应显著下降（[lt,jump] 部分）。
+5. 逐例看后续检查（entry_trip_not_const / shape_body / payload / exit）——统计 [lt,jump] 循环实际解锁到哪一步。
+6. cargo test -p raana_ir 全绿；make test 定向 matmul1/2/3 三级差分 PASS。
+7. 结论落档 TODO（解锁数、剩余卡点分布）。
+
+### 10.5 风险与后续链
+
+- 风险：lt 的 use 结构可能多样（body br / latch br / 死值）——先确认再放宽；放宽后 entry_trip/payload/exit 会继续拒一批（正常，逐步看）。
+- 后续链（形状检查全景）：not_innermost 276 → M42 verdict → **shape_header（本任务）** → shape_body 96（B1 已修部分）→ entry_trip_not_const 36（M43 versioning，大工程）→ payload Rem 3（ISA）→ exit 参数。
+- 已解锁（勿回退）：sum 归约（f0455b0 ipsccp Bottom + 932ee76 splat(0)+exit 加回）、B1 true 边 payload（5f87c57）、清零循环。

@@ -5000,6 +5000,170 @@ mod tests {
         assert!(!run(&mut program, function), "idempotent");
     }
 
+    /// Build a rotated reduction loop with a *runtime* trip counter (the
+    /// h-5-style shape): `header([acc, iv, counter])` entered at
+    /// `[seed, i0, t0]` (t0 = a global load), payload
+    /// `acc' = acc + load(a[iv])`, exit receiving `[acc']`.
+    fn build_rotated_runtime_reduction(
+        program: &mut Program,
+    ) -> (Function, BasicBlock, BasicBlock, BasicBlock, Inst, Inst, Inst) {
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let n = {
+            let init = program.new_value().zero_init(i32.clone());
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_i32(), "rot_rt_red".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut *program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone(), i32.clone()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data
+            .new_basic_block()
+            .basic_block("exit".into(), vec![i32.clone()]);
+        for bb in [header, latch, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let zero = data.new_local_inst().integer(0);
+        // The runtime trip: a global load (goes through `dyn Arena`).
+        let t0 = {
+            let mut lb = LocalBuilder {
+                arena: &mut data as &mut dyn Arena,
+            };
+            lb.load(n)
+        };
+        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero, t0]);
+        data.layout_mut().insert_inst(entry, zero);
+        data.layout_mut().insert_inst(entry, t0);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let acc = data.bb_data(header).params()[0];
+        let iv = data.bb_data(header).params()[1];
+        let counter = data.bb_data(header).params()[2];
+        let header_jump = data.new_local_inst().jump(latch, vec![]);
+        data.layout_mut().insert_inst(header, header_jump);
+        let one = data.new_local_inst().integer(1);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let sum = lb.binary(BinaryOp::Add, acc, load_a);
+        let iv_next = lb.binary(BinaryOp::Add, iv, one);
+        let t_next = lb.binary(BinaryOp::Sub, counter, one);
+        let back = lb.branch(t_next, header, vec![sum, iv_next, t_next], exit, vec![sum]);
+        drop(lb);
+        for inst in [one, gep_a, load_a, sum, iv_next, t_next, back] {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        let exit_acc = data.bb_data(exit).params()[0];
+        let exit_ret = data.new_local_inst().ret(Some(exit_acc));
+        data.layout_mut().insert_inst(exit, exit_ret);
+        (function, header, latch, exit, acc, iv, counter)
+    }
+
+    #[test]
+    fn vectorizes_rotated_runtime_reduction() {
+        // A rotated single-reduction loop ([iv, acc]) with a runtime trip
+        // counter: the vector loop accumulates lane-wise, the reduce block
+        // produces `seed + Σc`, and the scalar tail continues the
+        // reduction from there — `reduce -> tail([iv0, sum])`.
+        let mut program = Program::new();
+        let (function, header, latch, exit, acc, _iv, _counter) =
+            build_rotated_runtime_reduction(&mut program);
+        assert!(
+            run(&mut program, function),
+            "rotated runtime-bound reduction loop must vectorize"
+        );
+        let data = program.func_data(function);
+        assert_eq!(vector_load_count(&program, function), 1);
+        assert!(
+            data.inst_data(acc).ty().is_vector(),
+            "the accumulator is re-typed to a vector"
+        );
+        // The reduce block exists and feeds the scalar tail: its jump
+        // target is the tail header with [iv0, sum, passthrough...].
+        let reduce = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .map(|l| l.bb())
+            .find(|&bb| data.bb_data(bb).name().starts_with("vec_reduce"))
+            .expect("reduce block must exist");
+        let reduce_term = data.layout().basicblock(reduce).terminator();
+        let InstKind::Jump(rj) = data.inst_data(reduce_term).kind() else {
+            panic!("reduce block must end in a jump");
+        };
+        assert!(
+            data.bb_data(rj.target()).name().starts_with("vec_tail"),
+            "reduce must feed the scalar tail"
+        );
+        assert_eq!(
+            rj.args().len(),
+            2,
+            "tail entry is [iv0, sum]"
+        );
+        let tail = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .map(|l| l.bb())
+            .find(|&bb| data.bb_data(bb).name().starts_with("vec_tail"))
+            .expect("tail loop must exist");
+        assert_eq!(
+            data.bb_data(tail).params().len(),
+            2,
+            "tail header carries [iv_t, acc_t]"
+        );
+        // The vectorized latch still tests `gt(counter, 0)`; its false
+        // edge carries the vector accumulator to the reduce block.
+        let latch_term = data.layout().basicblock(latch).terminator();
+        let InstKind::Branch(branch) = data.inst_data(latch_term).kind() else {
+            panic!("latch must end in the rewritten branch");
+        };
+        let InstKind::Binary(gt) = data.inst_data(branch.cond()).kind() else {
+            panic!("runtime counter test must be a comparison");
+        };
+        assert_eq!(gt.op(), BinaryOp::Gt, "counter test is gt(counter, 0)");
+        assert!(
+            data.bb_data(branch.f_target()).name().starts_with("vec_reduce"),
+            "counter-zero edge carries the vector accumulator to the reduce block"
+        );
+        // The entry feeds the splatted zero accumulator and `cnt0`.
+        let entry_bb = data.layout().entry_bb().expect("entry block").bb();
+        let entry_edge = data.layout().basicblock(entry_bb).terminator();
+        let InstKind::Jump(entry_jump) = data.inst_data(entry_edge).kind() else {
+            panic!("entry must be a plain jump");
+        };
+        assert!(
+            matches!(
+                data.inst_data(entry_jump.args()[0]).kind(),
+                InstKind::VectorSplat(_)
+            ),
+            "the accumulator enters splatted"
+        );
+        let InstKind::Binary(and) = data.inst_data(entry_jump.args()[2]).kind() else {
+            panic!("counter entry must be `and(t0, -4)`");
+        };
+        assert_eq!(and.op(), BinaryOp::And);
+        // The exit receives the final accumulator through the tail.
+        let tail_term = data.layout().basicblock(tail).terminator();
+        let InstKind::Branch(tb) = data.inst_data(tail_term).kind() else {
+            panic!("tail must end in a branch");
+        };
+        assert_eq!(tb.f_target(), exit, "tail exits to the loop exit");
+        assert_eq!(tb.f_args().len(), 1, "exit receives [acc]");
+        assert!(!run(&mut program, function), "idempotent");
+    }
+
     /// Build a test-at-top single-reduction loop with a *runtime* bound
     /// (the shape that unlocks the 4 perf cases): header
     /// `[passthrough_i, iv, acc]`, `bound = load n` (scalar global),

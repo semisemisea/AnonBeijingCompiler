@@ -1964,3 +1964,198 @@ add v.4s + str q`（clang 对照）为最终验收。
 - **教训**：spike 单测（vectorizes_lane_cond_select）只断言 IR 形态不断言运行语义，
   cmeq 全 1 语义假设在 IR/lowering 层未闭环——向量比较结果必须文档化为全 1/全 0
   （与 NEON cmeq 一致），掩码构造直接复用比较结果。
+
+### 10.9 A3 多参数 test-at-top 支持（2026-08-05 晚，goal 提示词落档）
+
+**背景（corpus 实证）**：test_at_top_multi_param 21 case（conv2d×8 / many_mat_cal×11 /
+transpose×5 / 01_mm×4）——是当前最大单一形态缺口；conv2d 是 clang NEON 收益最大目标
+（4-18 条 fmla），其计算内核 4 层嵌套（i/j/k/l），每层 header 5-7 参数（外层 IV
+passthrough），内层 bound 常量（`lt %vid_8, 5`），Rem 在 get_random（输入循环）不在
+计算内核。**障碍链：A3 → 双臂 if（B1 扩展，后续）**。
+
+**现状代码（loop_vectorize.rs）**：
+- analyze passthrough 识别（612-614 行）：`back_args[i] == params[i]`——rotated 与
+  test-at-top 共用；test-at-top 的 back_args 来自 latch plain jump args（580-587 行）。
+- effective 计算（616-626 行）：test_at_top 排除 passthrough 后要求恰好 1 个有效参数
+  （630-633 行 test_at_top_multi_param 拒绝）。
+- apply 已支持多 passthrough：VecPlan.passthrough_args、epilogue/reduce 块转发
+  （1476-1487 行）、entry 边"counter 追加、原参数保槽"（1446-1468 行）。
+
+**目标**：test-at-top 循环的额外 header 参数识别为 passthrough（外层 IV 原样转发）并
+走通向量化；conv2d/many_mat_cal 内层出向量指令。
+
+**自包含 goal 提示词（可直接粘贴新 session）**：
+
+```text
+# Goal: A3 多参数 test-at-top 向量化支持（loop_vectorize）
+
+## 背景
+SysY 编译器项目（Rust），工作目录
+/Users/azureskye/Documents/Programs/rust/AnonBeijingCompiler-hermes，
+分支 feat/loop-vectorize-hermes。AArch64 的 NEON 向量化 pass 在
+raana_ir/src/opt/passes/loop_vectorize.rs。当前 60 例 perf corpus 只有
+matmul1/2/3 出向量（sum/清零/掩码内核）；test_at_top_multi_param 是最大
+单一形态缺口（21 case：conv2d×8/many_mat_cal×11/transpose×5/01_mm×4）。
+设计背景见 TODO.md §3.2（A3）、§10.6-10.9；本提示词自包含。
+
+## 必须遵守的规则（用户明令）
+- 只在 hermes worktree 操作；不 push、不 rebase（遇冲突立即停并汇报）；
+  不碰其他 worktree；不读/不提交 .env 等凭据文件。
+- 只改 raana_ir crate；不碰 anon_armv8（lowering）、taki_mir、前端。
+  IR 层问题只改 IR 层。
+- 无 hacky workaround（rm、手动 sed、flat pool 一律禁止），只做 root
+  cause 修复；设计中禁止 Rc<RefCell<T>> / RefCell 共享可变。
+- 不做以 benchmark/函数名/输入为条件的优化（AGENTS.md 红线）。
+- -O0 保留标量；vectorize 只进 aarch64 管线（RISC-V 零影响）。
+- 勤 commit、勤单测：每个原子部分完成即 commit（消息格式
+  `[Feat(Opt)]: A3 ...` / `[Fix(Opt)]: ...` / `[Docs]: ...`），中文消息。
+- 改文件一律 patch；不用 python 脚本改文件；不碰 .docker-image、
+  不 rm -rf、不 cargo clean。
+- 验收粒度 = 单测 + 单 case（make test <case>）；全量测试用户自己跑。
+
+## 现状与设计
+
+### 现状（loop_vectorize.rs）
+- analyze 的 passthrough 识别（约 612-614 行）：
+  `passthrough = back_args[i] == params[i]`（back-edge 参数原样转发），
+  rotated 与 test-at-top 共用；test-at-top 的 back_args 取自 latch 的
+  plain jump args（约 580-587 行）。
+- effective 参数（约 616-626 行）：test_at_top 排除 passthrough 后要求
+  恰好 1 个（IV），否则 trace test_at_top_multi_param 并拒绝
+  （约 630-633 行）。
+- apply 已支持多 passthrough：VecPlan.passthrough_args、epilogue/reduce
+  块转发（约 1476-1487 行）、entry 边追加 counter 且原参数保槽
+  （约 1446-1468 行）。
+
+### 设计
+1. **形态实证先行**（禁止凭假设改代码）：M44_TRACE=1 跑 conv2d-1、
+   many_mat_cal-1、transpose2、01_mm1，定位所有 test_at_top_multi_param
+   拒绝的循环；对每个循环用 --emit ir + VECDBG_SHAPE=1 确认：
+   header 参数表、latch 形态（单块/多块）、back-edge args 与 params 的
+   对应关系（哪些是原样转发、哪些是 IV 更新、哪些是 phi 链传值）。
+   结论写入 TODO.md §10.9 更新（现象数据 + 形态分类）。
+2. **passthrough 识别扩展**（analyze）：若实证显示外层 IV 经单层 phi
+   链（中间块参数）转发，参照 rotate_loops.rs 的 value_flows_from
+   （约 419-450 行）扩展 back_args[i] 与 params[i] 的等价判定；
+   若实证显示 back_args[i] == params[i] 已覆盖但 effective 仍有多个，
+   则逐参数分类（IV / passthrough / 其他）并拒绝真正无法识别的参数
+   （保守宁漏勿错）。**不引入多 IV / 多归约支持**。
+3. **apply 核对**：确认 counter 物化 + passthrough 转发在"多 passthrough
+   + 单有效 IV"下正确（entry 边追加 counter、epilogue 链转发、exit 边
+   passthrough 传值）；如有缺漏补齐（极小改动）。
+4. **单测**（raana_ir/src/opt/passes/loop_vectorize.rs tests 模块）：
+   - 多参数 test-at-top 向量化成功（构造 4-6 参数 header：外层 IV
+     passthrough + 内层 IV + 常量 bound，断言向量指令出现 + 幂等）；
+   - 非 passthrough 额外参数仍拒绝（保守）；
+   - 已有单测不回归（vectorizes_test_at_top_loop /
+     vectorizes_multi_param_test_at_top / rejects_test_at_top_nonconstant_bound）。
+5. **端到端**：conv2d-1 / many_mat_cal-1 / transpose2 / 01_mm1 定向
+   M44_TRACE 复扫（test_at_top_multi_param 计数下降，记录解锁链推进到
+   哪个检查）；能解锁的循环出向量指令（汇编 grep）。**不承诺 conv2d
+   最内核出 fmla**（后续还需双臂 if B1 扩展）——验收口径 = 计数下降 +
+   解锁循环出向量 + 无回归。
+
+## 验证命令
+- 单测：cargo test -p raana_ir 2>&1 | grep -E "test result"
+- corpus 复扫（拒绝分布）：M44_TRACE=1 逐个跑
+  ./target/release/compiler -O2 --target aarch64 -S tests/perf/<case>.sy
+  2>/tmp/x.log，grep -oE "reject=[A-Za-z0-9_:]+" | sort | uniq -c
+- IR 检查：./target/release/compiler -O2 --target aarch64 --emit ir
+  -o /tmp/x.ir tests/perf/<case>.sy
+- 定向差分（Docker 内，慢）：make test ARGS="-O 2 -j 1" perf/<case>.sy
+- 汇编向量检查：grep -cE "addv|ldr q|str q|add v[0-9]|mul v[0-9]|dup v[0-9]"
+  /tmp/x.s
+
+## 关键代码位置
+- raana_ir/src/opt/passes/loop_vectorize.rs：analyze_loop 的
+  test_at_top 分支（约 489-537 行 header 检查、567-633 行 exit/latch/
+  passthrough/effective、630-633 行 test_at_top_multi_param 拒绝点、
+  1162 行附近 payload 分类、1446-1468 行 apply counter 物化、
+  1476-1500 行 epilogue 参数）。
+- raana_ir/src/opt/passes/rotate_loops.rs：value_flows_from（约
+  419-450 行，phi 链等价判定参考实现）。
+- 既有 test-at-top 单测：loop_vectorize.rs tests 模块
+  build_test_at_top（约 3067 行）、vectorizes_test_at_top_loop（约
+  3127 行）、build_multi_param_test_at_top（约 3156 行）、
+  vectorizes_multi_param_test_at_top（约 3314 行）。
+
+## 验收清单（全部满足才算完成）
+- [ ] 形态实证记录写入 TODO.md（conv2d/many_mat_cal/transpose/01_mm 的
+      test_at_top_multi_param 循环分类：passthrough 可识别 vs 需 phi 链
+      vs 真不可识别）
+- [ ] analyze 扩展完成：passthrough（含 phi 链）识别 + effective 修正，
+      不引入多 IV/多归约
+- [ ] 单测 ≥2 新增全绿；raana_ir 全量（344+）全绿；workspace 全绿
+- [ ] conv2d-1 / many_mat_cal-1 / transpose2 / 01_mm1 的
+      test_at_top_multi_param 计数下降（记录数字）
+- [ ] 解锁的循环汇编出向量指令（记录 case + 指令）
+- [ ] matmul1 -O2 仍 PASS（既有能力不回归）；RISC-V 零影响（不注册）
+- [ ] 每步独立 commit；最终 git status 只剩非本任务文件
+```
+
+**执行建议**：先做步骤 1 形态实证（只读 + 插桩可选），确认 conv2d 内层
+back-edge 是否 phi 链形态，再决定步骤 2 用 value_flows_from 还是直接放宽；
+若实证显示 test_at_top_multi_param 拒绝的是真多有效参数（非 passthrough），
+A3 收益归零，立即停并汇报（宁停勿猜）。
+
+---
+
+### 10.10 形态实证结论（2026-08-06 执行，M44_TRACE + VECDBG_SHAPE 插桩，4 case 全扫）
+
+**插桩**：loop_vectorize.rs analyze 增加 [SHAPE-BACK] 打印（VECDBG_SHAPE=1，
+back_args/params 逐槽位分类：IDENTITY / binary:op / blockarg / int），
+已随本次提交入库（env 门控，与 M44_TRACE 同类诊断）。
+
+**现象数据（test_at_top_multi_param 拒绝的循环，按 case）**：
+
+| case | header | name | n_params | slots（back-arg 分类） | M42 verdict |
+|---|---|---|---|---|---|
+| conv2d-1 | BB(14) | while_entry_2_checksum_inline_14 | 2 | [Add, Add] | Reducible{acc=Inst(103),IntAdd} |
+| conv2d-1 | BB(18) | reduction_main_header_18 | 5/6 | [Add×5] / [int(0), Add×5] | — |
+| conv2d-1 | BB(2) | while_entry_2 (get_random) | 2 | [Add, Rem] | — |
+| conv2d-1 | BB(16) | while_entry_2_get_random_inline_16 | 2 | [Add, Rem] | — |
+| many_mat_cal-1 | BB(49) | while_entry_49 | 13 | [IDENTITY×7, Add, Add, IDENTITY×4] | Reducible{acc=Inst(412),IntAdd} |
+| many_mat_cal-1 | BB(55) | while_entry_55 | 2 | [Add, Add] | Reducible{acc=Inst(414),IntAdd} |
+| many_mat_cal-1 | BB(63) | irh_while_entry_55_63 | 2 | [Add, Add] | Reducible{acc=Inst(509),IntAdd} |
+| many_mat_cal-1 | BB(46) | while_entry_46 | 2 | [Add, Add] | Forbidden(UnknownBase) 部分轮次 |
+| many_mat_cal-1 | BB(37) | while_entry_37 | 6 | [IDENTITY×4, Add, Div] | — |
+| many_mat_cal-1 | BB(68) | reduction_main_header_68 | 6 | [blockarg, Add×5] | — |
+| transpose2 | BB(10) | while_entry_10 | 2 | [Add, Add] | Reducible{acc=Inst(109),IntAdd} |
+| transpose2 | BB(26) | reduction_main_header_26 | 5/6 | [Add×5] / [int(0), Add×5] | — |
+| 01_mm1 | BB(20) | while_entry_20 | 3 | [IDENTITY, Add, Add] | Reducible{acc=Inst(158),IntAdd} |
+
+**形态分类（关键结论）**：
+
+1. **不存在 phi 链 passthrough 形态**。所有 IDENTITY 槽位都是直接的
+   `back_args[i] == params[i]`（已覆盖）；唯一 blockarg back-arg 出现在
+   reduction_unroll 产物（BB(68)，多累加器）中，非本任务范围。设计假说
+   （"外层 IV 经单层 phi 链转发"）**被实证推翻**——value_flows_from 扩展
+   收益为零。
+
+2. **主缺口是 test-at-top 单归约 [iv, acc]（B1 形态），不是多参数**：
+   6 个循环（conv2d BB(14)、many_mat BB(49)/BB(55)/BB(63)、transpose2
+   BB(10)、01_mm1 BB(20)）都是 2 个有效参数 = IV + 累加器，M42 已判
+   Reducible（acc 是 header 参数）。当前代码在 663 行
+   `test_at_top && effective.len() != 1` 直接拒绝，**根本没走到 667 行
+   的 acc_info 匹配**（该路径只服务 rotated 的 [iv, acc, t]）。B1 的
+   apply 侧（reduce 块、epilogue acc 参数、build_exit_args 的 Acc spec）
+   是形态无关的，只差 analyze 侧放行 test_at_top 走 acc_info。
+
+3. **真多有效参数（保守拒绝正确）**：
+   - get_random/init_matrix [Add, Rem]：PRNG 状态机（rem 递推，非 Add/Sub
+     归约、非 passthrough）→ 不可识别；
+   - many_mat BB(37) [IDENTITY×4, Add, Div]：Div 槽是"死 phi 传值"（循环
+     体内不读，仅出口转发）→ 非 passthrough 非归约，保守拒绝；
+   - many_mat BB(46)：M42 Forbidden(UnknownBase) 部分轮次 → 内存形态问题，
+     非参数问题；
+   - reduction_main_header_*（conv2d BB(18)、many_mat BB(68)、transpose2
+     BB(26)）：reduction_unroll 多累加器产物（UNROLL_FACTOR+2 参数）→
+     多归约，A3 明确排除。
+
+**结论**：A3 的"passthrough 识别扩展"设计在 4 case 上收益归零（passthrough
+已全覆盖、无 phi 链）。真正可解锁的是 **test-at-top 单归约 [iv, acc]
+（B1 形态放行）**——analyze 663 行改为"effective==2 时若 acc_info 匹配则
+放行"（复用 667 行逻辑），预计解锁 6 个循环（含 01_mm1 内核、many_mat
+matmul k 循环、conv2d checksum）。这属于 B1 既有单归约能力在 test-at-top
+形态上的补齐，不引入多 IV / 多归约。是否转向该方向由用户决定（本次仅
+实证 + 落档，未改 analyze）。

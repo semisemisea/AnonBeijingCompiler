@@ -606,6 +606,39 @@ fn analyze_loop(
         trace(data, looop, "back_args_not_2");
         return None;
     }
+        if std::env::var("VECDBG_SHAPE").is_ok() {
+            let latch_term = data.layout().basicblock(latch).terminator();
+            let latch_kind = match arena.inst_data(latch_term).kind() {
+                InstKind::Jump(_) => "jump".to_string(),
+                InstKind::Branch(_) => "branch".to_string(),
+                other => format!("{other:?}"),
+            };
+            let slot_desc: Vec<String> = params
+                .iter()
+                .zip(back_args.iter())
+                .enumerate()
+                .map(|(i, (p, ba))| {
+                    let ba_kind = if ba == p {
+                        "IDENTITY".to_string()
+                    } else {
+                        match arena.inst_data(*ba).kind() {
+                            InstKind::Binary(b) => format!("binary:{:?}", b.op()),
+                            InstKind::BlockArgRef(_) => "blockarg".to_string(),
+                            InstKind::Integer(v) => format!("int({})", v.value()),
+                            other => format!("{other:?}"),
+                        }
+                    };
+                    format!("[{i}]p={p:?} ba={ba:?} {ba_kind}")
+                })
+                .collect();
+            eprintln!(
+                "[SHAPE-BACK] func={} header={:?} name={} test_at_top={test_at_top} latch={latch:?} latch_term={latch_kind} n_params={n_params} slots={}",
+                data.name(),
+                header,
+                data.bb_data(header).name(),
+                slot_desc.join(" | "),
+            );
+        }
     // Passthrough slots: the back-edge argument is the parameter itself.
     // The trip counter is the last parameter (its back-edge arg is the
     // `t' = sub(t, 1)` condition, never the parameter itself).

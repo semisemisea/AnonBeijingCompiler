@@ -3106,3 +3106,128 @@ MemObject::Alloc 为 Array 且 ≥16B），则该参数声明为 aligned。实�
 - [ ] 提交历史干净（原子提交，中文消息）；结论写入 TODO.md §10.17
 - [ ] 最终 git status 只剩非本任务文件
 ```
+
+### 10.18 f32 向量化残余数值 bug（h-10 差 1.45%）调研 + goal 提示词
+
+**调研数据（2026-08-06，HEAD 9736bda，后端 fix 4039233 已合入）**
+
+- 直接容器编译 + qemu（权威，绕开 harness）：
+  - -O0 真标量：`0x1.7a47acp+13` = .out ✓ **正确**
+  - -O2 向量化：`0x1.74d3aep+13` ✗ **差 1.45%**（174.5/12105）
+- Python IEEE f32 精确模拟算法 = 0x1.7a47acp+13 = .out ✓（.out 与 .in 匹配）
+- 输入全精确：A 对角 2.0、下三角 1.0、C 全整数 0..178；trsm 运算（÷2、×1.0、
+  +1、减法）对精确输入应逐位精确 → **1.45% 是结构性错误，非舍入**
+- 向量 asm（fix 后）指令序列表面全对：fdiv/fadd/fmul v2.4s/fsub、dup v30.4s,
+  v16.s[0]（diag）、dup v3.4s, v0.s[0]（factor）、dup v1.4s, v1.s[0]（1.0）、
+  tail 范围（iv0=88, bound=N=90）
+- 嫌疑：某 f32 标量值仍以 Float 类分配、被向量指令同 hw_enc 踩踏（fix 类迁移
+  可能漏了某个值产生路径，如 put_value_in_reg 常量物化）；或 splat 源寄存器
+  在某次迭代被污染
+- 01_mm1（i32）PASS——i32 路径无此问题，问题锁定 f32 向量路径
+
+**工具链坑（重要，避免误导）**
+
+- `make test ARGS="-O 0"` **实际跑的是 O2 管线**（.raana 有 inline+vec_tail）——
+  -O 参数未生效，机制未查明（make 传参或 test.py 解析）；此前"标量也错"的
+  结论正是被它误导。**验证一律用直接容器调用**（见 §10.18 验证命令）。
+- 注意：target/host-musl 的 musl 编译器若过期（时间戳坑），先
+  `touch raana_ir/src/opt/pass.rs soyo_compiler/src/main.rs && make test-compiler`。
+
+**协作状态**
+
+- fix/regalloc-s-v-aliasing = 4039233（5 提交：75da1cf f32→Vector 类、
+  affc234 Float PReg 集清空、6e09a1d ABI、e2643f9 vcode、4039233
+  lower fadd/fsub/fmul）——已合入主线（9736bda），s/v 别名与整数-add
+  bug 已修，但 h-10 向量路径仍数值错误。
+- 主 agent 继续 §10.17 SIMD（参数数组基址向量化，纯 raana_ir）——本任务
+  （后端 f32 向量路径，taki_mir/anon_armv8）与其**零文件重叠**，可并行。
+
+**自包含 goal 提示词（可直接粘贴新 session）**
+
+```text
+# Goal: 排查 h-10 向量化 f32 路径 1.45% 数值误差（后端 fix 后残余 bug）
+
+## 背景
+
+h-10-01/02/03 差分 FAIL。已排除：向量化 IR 结构（rotated runtime 全链路
+正确）、s/v 寄存器别名（后端 fix 4039233 已修：f32→Vector 类 +
+fadd/fsub/fmul 发射）、标量路径（真标量输出与 .out 一致）。
+**残余：向量化路径输出 0x1.74d3aep+13 vs 正确 0x1.7a47acp+13（差 1.45%）。**
+
+## 实证（2026-08-06，HEAD 9736bda，fix 已合入）
+
+- 直接容器编译 + qemu（权威）：-O0 标量 = 0x1.7a47acp+13 ✓（= .out）；
+  -O2 向量 = 0x1.74d3aep+13 ✗
+- Python IEEE f32 精确模拟算法 = .out ✓（.out 与 .in 匹配）
+- 输入全精确（A 对角 2.0/下三角 1.0、C 全整数 0..178），trsm 运算对精确
+  输入应逐位精确 → 结构性错误，非舍入
+- 向量 asm 指令序列表面正确（fdiv v0.4s/fadd/fmul v2.4s/fsub、
+  dup v30.4s,v16.s[0] diag、dup v3.4s,v0.s[0] factor、dup v1.4s,v1.s[0]
+  1.0、tail iv0=88..N=90）
+- 嫌疑：f32 标量值仍以 Float 类分配被向量同 hw_enc 踩踏（类迁移遗漏的
+  值产生路径，如 put_value_in_reg 常量物化）；或 splat 源寄存器污染
+
+## 工具链坑（重要）
+
+- make test ARGS="-O 0" 实际跑 O2 管线（-O 未生效）——**验证必须用直接
+  容器调用**（命令见下），不要用 harness 的 -O0 做标量对照
+- musl 编译器过期：touch 源文件 + make test-compiler 重编
+
+## 必须遵守的规则
+
+- 本任务是后端修复任务：只改 taki_mir/anon_armv8；**不碰 raana_ir**（主
+  agent 在并行做 §10.17 SIMD，零重叠）；uika_riscv 零影响
+- 无 hacky workaround；root cause only；不做 benchmark/函数名条件优化；
+  禁止 Rc<RefCell<T>> / RefCell 共享可变
+- 形态实证先行：先最小复现（缩小 n 或构造 f32 向量 + 精确输入的微用例，
+  手算 .out），再动手
+- 勤 commit（中文消息、git commit -F 规避 homoglyph 扫描）；改文件一律
+  patch；不碰 .docker-image、不 rm -rf、不 cargo clean
+- 分支：从 feat/loop-vectorize-hermes（9736bda）切新分支；完成后主 agent
+  rebase/合并
+- 可参考 fix/regalloc-s-v-aliasing 分支的 5 个提交（75da1cf..4039233）
+
+## 验证命令（直接容器调用，权威）
+
+    # 1) 确保 musl 编译器最新
+    touch raana_ir/src/opt/pass.rs soyo_compiler/src/main.rs && make test-compiler
+    # 2) 直接编译（-O2 / -O0 各一次）
+    docker run --rm --entrypoint /work/target/aarch64-unknown-linux-musl/release/compiler \
+      -v /tmp:/tmp:rw -v "$(pwd)/tests:/work/tests:ro" -v "$(pwd)/target/host-musl:/work/target:ro" \
+      soyo-test-tools -O2 --target aarch64 -S -o /tmp/o2.s /work/tests/perf/h-10-01.sy
+    # 3) 链接 + qemu 运行（.in 作 stdin）
+    docker run --rm --entrypoint /bin/sh -v /tmp:/tmp:rw \
+      -v "$(pwd)/tests:/work/tests:ro" -v "$(pwd)/sysylib:/work/sysylib:ro" \
+      soyo-test-tools -c "aarch64-linux-gnu-gcc -c /tmp/o2.s -o /tmp/o2.o && \
+      aarch64-linux-gnu-gcc /tmp/o2.o /work/sysylib/libsysy_arm.a -o /tmp/o2.elf && \
+      qemu-aarch64-static /tmp/o2.elf < /work/tests/perf/h-10-01.in"
+
+- 期望：-O2 输出应为 0x1.7a47acp+13（当前错为 0x1.74d3aep+13）
+- 单测：cargo test --workspace（taki_mir/anon_armv8 全绿）
+- 回归：01_mm1/2/3、matmul1 -O2 差分 PASS；h-10-01/02/03 修后全绿；
+  RISC-V 抽查零影响
+- 最小复现建议：h-10 输入 A 对角 2.0、C 整数——构造更小 n 的同构 .sy +
+  手算 .out（Python struct 模拟），逐循环开关向量化（用 M44_TRACE 或
+  局部改 analyze 门控）定位是哪个循环/哪条指令序列引入误差
+
+## 关键代码位置
+
+- anon_armv8/src/lower.rs：lower_vector_binary（fadd/fsub/fmul 选择，
+  4039233 改过）；put_value_in_reg（f32 常量物化 fmov 路径——嫌疑）；
+  lower_vector_splat（1530）
+- taki_mir/src/vcode.rs：249/276（class→类型映射，e2643f9 改过）
+- taki_mir/src/reg_alloc/reg.rs：13-63（PReg = class<<6|hw_enc，Float/
+  Vector 同 hw_enc 物理别名）
+- 后端单测：anon_armv8 lower.rs tests（4039233 加了 fadd v 断言，
+  3835-3900 splat 测试）
+- h-10-01 汇编（fix 后正确形态）参考：/tmp/h10_v2.s 或重新生成
+
+## 验收清单（全部满足才算完成）
+
+- [ ] 定位误差根因（具体指令/寄存器/值路径），有最小复现
+- [ ] h-10-01/02/03 直接容器 -O2 运行 = .out（0x1.7a47acp+13）
+- [ ] cargo test --workspace 全绿；后端单测 ≥1 覆盖该场景
+- [ ] 01_mm1/2/3、matmul1 -O2 不回归；RISC-V 零影响
+- [ ] 提交历史干净（原子 commit，中文消息）；结论写入 TODO.md §10.18
+- [ ] 最终 git status 只剩非本任务文件
+```

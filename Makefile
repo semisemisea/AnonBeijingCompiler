@@ -96,7 +96,7 @@ endif
 HOST_TARGET_DIR := $(CURDIR)/target/host-musl
 COMPILER := /work/target/$(MUSL_TARGET)/release/compiler
 
-.PHONY: help test test-baseline test-llvm test-riscv run-elf run-elf-riscv debug-elf debug-elf-riscv mca test-image test-compiler build-lib build-lib-riscv clean-results gem5 gem5-run gem5-build
+.PHONY: help test test-baseline test-llvm test-riscv run-elf run-elf-riscv debug-elf debug-elf-riscv mca test-image test-compiler build-lib build-lib-riscv clean-results gem5 gem5-run gem5-build gen-runtime-templates check-runtime-templates
 
 help:
 	@printf '%s\n' 'make test [functional/case.sy]      Build the AArch64 compiler and run the AArch64 harness.'
@@ -112,7 +112,7 @@ help:
 	@printf '%s\n' 'make gem5-run path/to/program.elf Run an AArch64 ELF under the gem5 A53 model.'
 	@printf '%s\n' 'make gem5-build                   Clone and build gem5 into .gem5 (first run only).'
 
-test: test-compiler build-lib test-image
+test: check-runtime-templates test-compiler build-lib test-image
 	mkdir -p "$(RESULTS)"
 	@cleanup() { $(DOCKER) rm -f "$(CONTAINER)" >/dev/null 2>&1 || true; }; \
 	trap cleanup EXIT INT TERM; \
@@ -150,7 +150,7 @@ test-llvm: test-compiler build-lib test-image
 		-v "$(CURDIR)/$(RESULTS):/work/results:rw" \
 		"$(IMAGE)" --backend llvm $(ARGS) $(TESTS) $(TEST_ARGS)
 
-test-riscv: test-compiler build-lib-riscv test-image
+test-riscv: check-runtime-templates test-compiler build-lib-riscv test-image
 	mkdir -p "$(RESULTS)"
 	@cleanup() { $(DOCKER) rm -f "$(CONTAINER)" >/dev/null 2>&1 || true; }; \
 	trap cleanup EXIT INT TERM; \
@@ -330,14 +330,20 @@ build-lib: test-image
 		-v "$(CURDIR)/sysylib:/work/sysylib" \
 		-w /work/sysylib \
 		--entrypoint /bin/sh \
-		"$(IMAGE)" -c 'aarch64-linux-gnu-gcc -O9 -c sylib.c -o sylib_arm.o && rm -f libsysy_arm.a && aarch64-linux-gnu-ar rcs libsysy_arm.a sylib_arm.o'
+		"$(IMAGE)" -c 'aarch64-linux-gnu-gcc -O9 -fno-builtin -fno-tree-loop-distribute-patterns -c sylib.c -o sylib_arm.o && rm -f libsysy_arm.a && aarch64-linux-gnu-ar rcs libsysy_arm.a sylib_arm.o'
+
+gen-runtime-templates:
+	bash scripts/gen_runtime_templates.sh
+
+check-runtime-templates: test-image
+	bash scripts/gen_runtime_templates.sh --check
 
 build-lib-riscv: test-image
 	$(DOCKER) run --rm -u "$$(id -u):$$(id -g)" \
 		-v "$(CURDIR)/sysylib:/work/sysylib" \
 		-w /work/sysylib \
 		--entrypoint /bin/sh \
-		"$(IMAGE)" -c 'riscv64-linux-gnu-gcc -O9 -c sylib.c -o sylib_riscv.o && rm -f libsysy_riscv.a && riscv64-linux-gnu-ar rcs libsysy_riscv.a sylib_riscv.o'
+		"$(IMAGE)" -c 'riscv64-linux-gnu-gcc -O9 -fno-builtin -fno-tree-loop-distribute-patterns -c sylib.c -o sylib_riscv.o && rm -f libsysy_riscv.a && riscv64-linux-gnu-ar rcs libsysy_riscv.a sylib_riscv.o'
 
 clean-results:
 	rm -rf "$(RESULTS)"

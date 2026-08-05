@@ -31,6 +31,7 @@ struct Candidate {
     offsets: Vec<Inst>,
     pointer_ty: Type,
     address_evolution: FlattenedAddressEvolution,
+    forwarded_params: FxHashMap<Inst, Inst>,
 }
 
 #[derive(Clone)]
@@ -109,6 +110,19 @@ enum ApplyResult {
 }
 
 impl PointerStrengthReduction {
+    fn resolve_forwarded(mut value: Inst, forwarded_params: &FxHashMap<Inst, Inst>) -> Inst {
+        for _ in 0..forwarded_params.len() {
+            let Some(&forwarded) = forwarded_params.get(&value) else {
+                break;
+            };
+            if forwarded == value {
+                break;
+            }
+            value = forwarded;
+        }
+        value
+    }
+
     fn find_candidate(
         data: &ArenaContextMut<'_>,
         cfg: &CFG,
@@ -143,6 +157,31 @@ impl PointerStrengthReduction {
 
         let mut best = None;
         let header_params = data.bb_data(looop.header()).params().to_vec();
+        // Inlining commonly leaves affine address expressions behind chains
+        // of single-predecessor continuation blocks. Their parameters are
+        // copies, not phis. Resolve a parameter only when every logical
+        // incoming edge supplies the exact same value, preserving real merge
+        // parameters and same-target branch-arm distinctions.
+        let forwarded_params = cfg
+            .blocks()
+            .iter()
+            .flat_map(|&block| {
+                let edges = incoming_edges(data, cfg, block);
+                data.bb_data(block)
+                    .params()
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter_map(move |(position, parameter)| {
+                        let first = edges.first()?.args(data).get(position).copied()?;
+                        (first != parameter
+                            && edges
+                                .iter()
+                                .all(|edge| edge.args(data).get(position) == Some(&first)))
+                        .then_some((parameter, first))
+                    })
+            })
+            .collect::<FxHashMap<_, _>>();
         // A header block parameter that every backedge passes through unchanged
         // is loop-invariant: its value on the first entry equals its value in
         // every iteration, so the preheader edge argument can substitute for it
@@ -181,16 +220,18 @@ impl PointerStrengthReduction {
             // leave the header as a jump-through block, which is the shape
             // h-5's inner loop has.
             let iv_range = if signed_step.unsigned_abs() != 1 {
-                Some(constant_induction_range(data, iv, normalize_strict_exit(data, looop, iv)?)?)
+                Some(constant_induction_range(
+                    data,
+                    iv,
+                    normalize_strict_exit(data, looop, iv)?,
+                )?)
             } else {
                 match normalize_strict_exit(data, looop, iv) {
                     Some(exit) => constant_induction_range(data, iv, exit),
                     None => {
-                        let header_terminator = data.layout().basicblock(looop.header()).terminator();
-                        if matches!(
-                            data.inst_data(header_terminator).kind(),
-                            InstKind::Jump(..)
-                        ) {
+                        let header_terminator =
+                            data.layout().basicblock(looop.header()).terminator();
+                        if matches!(data.inst_data(header_terminator).kind(), InstKind::Jump(..)) {
                             None
                         } else {
                             continue;
@@ -250,6 +291,7 @@ impl PointerStrengthReduction {
                             looop,
                             iv.parameter(),
                             iv_range,
+                            &forwarded_params,
                             inst,
                             offset,
                         );
@@ -343,14 +385,17 @@ impl PointerStrengthReduction {
                     }
                     let removable_derived_insts = removable_chain
                         .iter()
-                        .all(|derived| {
-                            data.inst_data(*derived)
-                                .used_by()
-                                .iter()
-                                .all(|user| *user == inst || removable_chain.contains(user))
+                        .filter(|&&derived| {
+                            Self::only_reaches_candidate(
+                                data,
+                                derived,
+                                inst,
+                                &removable_chain,
+                                &forwarded_params,
+                                &mut FxHashSet::default(),
+                            )
                         })
-                        .then_some(removable_chain.len())
-                        .unwrap_or(0);
+                        .count();
                     let derived_setup_insts = index_evolutions
                         .iter()
                         .map(|evolution| match evolution {
@@ -385,6 +430,7 @@ impl PointerStrengthReduction {
                             coefficient: flat_coefficient,
                             pointer_step: signed_pointer_step,
                         },
+                        forwarded_params: forwarded_params.clone(),
                     };
                     if best
                         .as_ref()
@@ -431,9 +477,11 @@ impl PointerStrengthReduction {
         looop: &Loop,
         iv: Inst,
         iv_range: Option<ConstantInductionRange>,
+        forwarded_params: &FxHashMap<Inst, Inst>,
         gep: Inst,
         value: Inst,
     ) -> Option<IndexEvolution> {
+        let value = Self::resolve_forwarded(value, forwarded_params);
         if value == iv {
             return Some(IndexEvolution::Direct);
         }
@@ -453,9 +501,11 @@ impl PointerStrengthReduction {
             looop: &Loop,
             iv: Inst,
             iv_range: Option<ConstantInductionRange>,
+            forwarded_params: &FxHashMap<Inst, Inst>,
             gep: Inst,
             value: Inst,
         ) -> Option<AffineI32Expr> {
+            let value = PointerStrengthReduction::resolve_forwarded(value, forwarded_params);
             if value == iv {
                 return Some(AffineI32Expr {
                     value,
@@ -490,8 +540,26 @@ impl PointerStrengthReduction {
             let InstKind::Binary(binary) = data.inst_data(value).kind() else {
                 return None;
             };
-            let lhs = classify(data, ranges, looop, iv, iv_range, gep, binary.lhs())?;
-            let rhs = classify(data, ranges, looop, iv, iv_range, gep, binary.rhs())?;
+            let lhs = classify(
+                data,
+                ranges,
+                looop,
+                iv,
+                iv_range,
+                forwarded_params,
+                gep,
+                binary.lhs(),
+            )?;
+            let rhs = classify(
+                data,
+                ranges,
+                looop,
+                iv,
+                iv_range,
+                forwarded_params,
+                gep,
+                binary.rhs(),
+            )?;
             let (coefficient, offset_range) = match binary.op() {
                 BinaryOp::Add => (
                     lhs.coefficient.checked_add(rhs.coefficient)?,
@@ -501,6 +569,13 @@ impl PointerStrengthReduction {
                     lhs.coefficient.checked_sub(rhs.coefficient)?,
                     lhs.offset_range.sub(rhs.offset_range)?,
                 ),
+                // A product of two loop-invariant values is itself an
+                // invariant offset. Keep the product in the affine chain so
+                // `clone_affine_initial` moves it to the preheader. This is
+                // the common flattened-row form `row * runtime_width + iv`.
+                BinaryOp::Mul if lhs.coefficient == 0 && rhs.coefficient == 0 => {
+                    (0, lhs.offset_range.mul(rhs.offset_range)?)
+                }
                 BinaryOp::Mul if lhs.coefficient == 0 => {
                     let factor = PointerStrengthReduction::integer_constant(data, binary.lhs())?;
                     (
@@ -582,7 +657,16 @@ impl PointerStrengthReduction {
             })
         }
 
-        let affine = classify(data, ranges, looop, iv, iv_range, gep, value)?;
+        let affine = classify(
+            data,
+            ranges,
+            looop,
+            iv,
+            iv_range,
+            forwarded_params,
+            gep,
+            value,
+        )?;
         (affine.coefficient != 0).then_some(IndexEvolution::Affine(affine))
     }
 
@@ -628,14 +712,17 @@ impl PointerStrengthReduction {
         affine: &AffineI32Expr,
         iv: Inst,
         initial_iv: i32,
+        forwarded_params: &FxHashMap<Inst, Inst>,
     ) -> Option<i32> {
         fn evaluate(
             data: &ArenaContextMut<'_>,
             chain: &[Inst],
             iv: Inst,
             initial_iv: i32,
+            forwarded_params: &FxHashMap<Inst, Inst>,
             value: Inst,
         ) -> Option<i32> {
+            let value = PointerStrengthReduction::resolve_forwarded(value, forwarded_params);
             if value == iv {
                 return Some(initial_iv);
             }
@@ -645,8 +732,8 @@ impl PointerStrengthReduction {
             let InstKind::Binary(binary) = data.inst_data(value).kind() else {
                 return None;
             };
-            let lhs = evaluate(data, chain, iv, initial_iv, binary.lhs())?;
-            let rhs = evaluate(data, chain, iv, initial_iv, binary.rhs())?;
+            let lhs = evaluate(data, chain, iv, initial_iv, forwarded_params, binary.lhs())?;
+            let rhs = evaluate(data, chain, iv, initial_iv, forwarded_params, binary.rhs())?;
             Some(match binary.op() {
                 BinaryOp::Add => lhs.wrapping_add(rhs),
                 BinaryOp::Sub => lhs.wrapping_sub(rhs),
@@ -656,7 +743,14 @@ impl PointerStrengthReduction {
             })
         }
 
-        evaluate(data, &affine.chain, iv, initial_iv, affine.value)
+        evaluate(
+            data,
+            &affine.chain,
+            iv,
+            initial_iv,
+            forwarded_params,
+            affine.value,
+        )
     }
 
     fn clone_affine_initial(
@@ -667,6 +761,7 @@ impl PointerStrengthReduction {
         initial_iv: Inst,
         header_param_positions: &FxHashMap<Inst, usize>,
         edge_args: &[Inst],
+        forwarded_params: &FxHashMap<Inst, Inst>,
     ) -> Inst {
         fn clone_value(
             data: &mut ArenaContextMut<'_>,
@@ -676,8 +771,10 @@ impl PointerStrengthReduction {
             initial_iv: Inst,
             header_param_positions: &FxHashMap<Inst, usize>,
             edge_args: &[Inst],
+            forwarded_params: &FxHashMap<Inst, Inst>,
             value: Inst,
         ) -> Inst {
+            let value = PointerStrengthReduction::resolve_forwarded(value, forwarded_params);
             if value == iv {
                 return initial_iv;
             }
@@ -699,6 +796,7 @@ impl PointerStrengthReduction {
                 initial_iv,
                 header_param_positions,
                 edge_args,
+                forwarded_params,
                 lhs,
             );
             let rhs = clone_value(
@@ -709,6 +807,7 @@ impl PointerStrengthReduction {
                 initial_iv,
                 header_param_positions,
                 edge_args,
+                forwarded_params,
                 rhs,
             );
             let cloned = data.new_local_value().binary(op, lhs, rhs);
@@ -725,6 +824,7 @@ impl PointerStrengthReduction {
             initial_iv,
             header_param_positions,
             edge_args,
+            forwarded_params,
             affine.value,
         )
     }
@@ -742,6 +842,74 @@ impl PointerStrengthReduction {
                         _ => false,
                     }
             })
+    }
+
+    fn only_reaches_candidate(
+        data: &ArenaContextMut<'_>,
+        value: Inst,
+        gep: Inst,
+        chain: &FxHashSet<Inst>,
+        forwarded_params: &FxHashMap<Inst, Inst>,
+        visiting: &mut FxHashSet<Inst>,
+    ) -> bool {
+        if !visiting.insert(value) {
+            return false;
+        }
+        let result = data.inst_data(value).used_by().iter().all(|&user| {
+            if user == gep {
+                return true;
+            }
+            if chain.contains(&user) {
+                return Self::only_reaches_candidate(
+                    data,
+                    user,
+                    gep,
+                    chain,
+                    forwarded_params,
+                    visiting,
+                );
+            }
+
+            let Some(block) = data.layout().parent_bb(user) else {
+                return false;
+            };
+            if matches!(data.inst_data(user).kind(), InstKind::Branch(branch) if branch.cond() == value)
+            {
+                return false;
+            }
+            if !matches!(data.inst_data(user).kind(), InstKind::Jump(..) | InstKind::Branch(..)) {
+                return false;
+            }
+
+            let mut saw_forward = false;
+            for edge in outgoing_edges(data, block) {
+                for (position, &argument) in edge.args(data).iter().enumerate() {
+                    if argument != value {
+                        continue;
+                    }
+                    let Some(&parameter) = data.bb_data(edge.target(data)).params().get(position)
+                    else {
+                        return false;
+                    };
+                    if forwarded_params.get(&parameter) != Some(&value)
+                        || !Self::only_reaches_candidate(
+                            data,
+                            parameter,
+                            gep,
+                            chain,
+                            forwarded_params,
+                            visiting,
+                        )
+                    {
+                        return false;
+                    }
+                    saw_forward = true;
+                }
+            }
+            saw_forward
+        });
+        visiting.remove(&value);
+        result
     }
 
     fn apply_candidate(
@@ -792,6 +960,7 @@ impl PointerStrengthReduction {
                                 affine,
                                 candidate.iv,
                                 initial.value(),
+                                &candidate.forwarded_params,
                             ),
                         });
                     }
@@ -827,12 +996,12 @@ impl PointerStrengthReduction {
             let mut initial_offsets = candidate.offsets.clone();
             for (position, evolution) in candidate.address_evolution.indices.iter().enumerate() {
                 initial_offsets[position] = match evolution {
-                    IndexEvolution::Invariant => match header_param_positions
-                        .get(&candidate.offsets[position])
-                    {
-                        Some(&parameter_position) => edge_args[parameter_position],
-                        None => initial_offsets[position],
-                    },
+                    IndexEvolution::Invariant => {
+                        match header_param_positions.get(&candidate.offsets[position]) {
+                            Some(&parameter_position) => edge_args[parameter_position],
+                            None => initial_offsets[position],
+                        }
+                    }
                     IndexEvolution::Direct => initial_iv,
                     IndexEvolution::Affine(affine) => match constant_offsets
                         .as_ref()
@@ -847,6 +1016,7 @@ impl PointerStrengthReduction {
                             initial_iv,
                             &header_param_positions,
                             &edge_args,
+                            &candidate.forwarded_params,
                         ),
                     },
                 };
@@ -1659,6 +1829,86 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn carries_an_affine_address_through_a_forwarding_block() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "pointer_sr_forwarded_affine".into(),
+            vec![
+                Type::get_pointer(Type::get_i32()),
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_i32(),
+            ],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let params = data.params().to_vec();
+        let [base, bound, row, width] = params.as_slice() else {
+            unreachable!()
+        };
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let dispatch = data
+            .new_basic_block()
+            .basic_block("dispatch".into(), vec![]);
+        let access = data
+            .new_basic_block()
+            .basic_block("access".into(), vec![Type::get_i32()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, dispatch, access, latch, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let iv = data.bb_data(header).params()[0];
+        let compare = data.new_local_inst().binary(BinaryOp::Lt, iv, *bound);
+        data.layout_mut().insert_inst(header, compare);
+        let header_branch = data
+            .new_local_inst()
+            .branch(compare, dispatch, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, header_branch);
+
+        let product = data.new_local_inst().binary(BinaryOp::Mul, *row, *width);
+        let index = data.new_local_inst().binary(BinaryOp::Add, product, iv);
+        for inst in [product, index] {
+            data.layout_mut().insert_inst(dispatch, inst);
+        }
+        let dispatch_jump = data.new_local_inst().jump(access, vec![index]);
+        data.layout_mut().insert_inst(dispatch, dispatch_jump);
+
+        let forwarded_index = data.bb_data(access).params()[0];
+        let gep = data
+            .new_local_inst()
+            .get_elem_ptr(*base, vec![forwarded_index]);
+        let load = data.new_local_inst().load(gep);
+        let access_jump = data.new_local_inst().jump(latch, vec![]);
+        for inst in [gep, load, access_jump] {
+            data.layout_mut().insert_inst(access, inst);
+        }
+        let one = data.new_local_inst().integer(1);
+        let update = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        let backedge = data.new_local_inst().jump(header, vec![update]);
+        data.layout_mut().insert_inst(latch, update);
+        data.layout_mut().insert_inst(latch, backedge);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(run(&mut program, function));
+        let data = program.func_data(function);
+        let pointer = data.bb_data(header).params()[1];
+        let InstKind::GetElemPtr(rewritten) = data.inst_data(gep).kind() else {
+            unreachable!()
+        };
+        assert_eq!(rewritten.base(), pointer);
+        assert_eq!(integer_constant(data, rewritten.offsets()[0]), Some(0));
     }
 
     #[test]

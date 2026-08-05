@@ -419,12 +419,12 @@ fn analyze_loop(
     //    own [iv, t] / [iv, acc, t] parameter set.
     let params = data.bb_data(header).params();
     let n_params = params.len();
-    // Test-at-top headers carry exactly one parameter (the IV); rotated
-    // headers carry [iv, t] / [iv, acc, t] plus optional passthroughs.
-    if test_at_top && n_params != 1 {
-        trace(data, looop, "test_at_top_multi_param");
-        return None;
-    }
+    // Test-at-top headers carry the IV plus optional loop-invariant
+    // passthrough parameters (outer induction values, e.g. the enclosing
+    // loop's IV threaded through the inner loop); the single-parameter
+    // gate is replaced by the effective (non-passthrough) count check
+    // below. Rotated headers carry [iv, t] / [iv, acc, t] plus optional
+    // passthroughs.
     // The exit test: rotated loops test on the latch terminator (a branch
     // back to the header); test-at-top loops test on the header terminator
     // (a branch to the latch / exit). The back-edge arguments (rotated:
@@ -485,8 +485,7 @@ fn analyze_loop(
     let counter_slot = n_params - 1;
     let effective: Vec<usize> = if test_at_top {
         // No counter parameter yet (materialized in the mutation phase), so
-        // nothing is excluded beyond the passthroughs (none here: n_params
-        // == 1).
+        // nothing is excluded beyond the passthroughs.
         (0..n_params)
             .filter(|&i| !passthrough.contains(&i))
             .collect()
@@ -495,6 +494,13 @@ fn analyze_loop(
             .filter(|&i| i != counter_slot && !passthrough.contains(&i))
             .collect()
     };
+    // Test-at-top loops carry exactly one real induction parameter (the
+    // IV); any additional non-passthrough parameter is not a recognized
+    // shape (rotated loops may carry a second one: the B1 accumulator).
+    if test_at_top && effective.len() != 1 {
+        trace(data, looop, "test_at_top_multi_param");
+        return None;
+    }
     let acc_info: Option<(Inst, usize, BinaryOp)> = match effective.len() {
         1 => None,
         2 => {
@@ -554,11 +560,14 @@ fn analyze_loop(
     }
     let (iv, iv_next, iv_slot, counter, t_next): (Inst, Inst, usize, Inst, Inst) =
         if test_at_top {
-            // `iv' = add(iv, 1)` is the latch's plain-jump argument.
-            let iv = params[0];
-            let iv_next = back_args[0];
+            // The single effective (non-passthrough) parameter is the IV;
+            // `iv' = add(iv, 1)` is its plain-jump argument in the latch.
+            // The remaining parameters are loop-invariant passthroughs.
+            let iv_slot = effective[0];
+            let iv = params[iv_slot];
+            let iv_next = back_args[iv_slot];
             // Placeholders; unused for test-at-top (no counter yet).
-            (iv, iv_next, 0, iv, iv_next)
+            (iv, iv_next, iv_slot, iv, iv_next)
         } else {
             let t_next = match arena.inst_data(latch_branch).kind() {
                 InstKind::Branch(b) => b.cond(),
@@ -1125,12 +1134,14 @@ fn is_loop_invariant(arena: &ArenaContext<'_>, inst: Inst, header: BasicBlock, l
     }
     if let Some(slot) = arena.bb_data(header).params().iter().position(|&p| p == inst) {
         // A passthrough parameter: the back-edge argument is the parameter
-        // itself.
+        // itself. Rotated loops branch back to the header; test-at-top
+        // loops jump back to it.
         let term = arena.curr_func_data().layout().basicblock(latch).terminator();
-        let InstKind::Branch(branch) = arena.inst_data(term).kind() else {
-            return false;
+        return match arena.inst_data(term).kind() {
+            InstKind::Branch(branch) => branch.t_args().get(slot) == Some(&inst),
+            InstKind::Jump(jump) => jump.args().get(slot) == Some(&inst),
+            _ => false,
         };
-        return branch.t_args().get(slot) == Some(&inst);
     }
     if arena.bb_data(latch).params().contains(&inst) {
         return false;
@@ -1230,7 +1241,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         (counter, t_next)
     };
     let entry_arg_count = if test_at_top {
-        2 // [iv, t]
+        // Unused: the counter is *appended* after the existing entry
+        // arguments (all original parameters — passthroughs included — keep
+        // their slots).
+        2
     } else {
         2 + usize::from(reduction.is_some()) + n_passthrough
     };
@@ -1459,10 +1473,14 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             }
         };
         let (f_target, f_args) = if test_at_top {
+            // The epilogue chain (r > 0) and the exit both carry the
+            // loop-invariant passthrough values: their header parameters
+            // stay live and unchanged across the vectorized loop, so the
+            // entry-edge values are forwarded as-is.
             if r > 0 {
-                (epi_blocks[0], vec![])
+                (epi_blocks[0], passthrough_args.clone())
             } else {
-                (exit, vec![])
+                (exit, passthrough_args.clone())
             }
         } else {
             match &reduction {
@@ -2731,6 +2749,162 @@ mod tests {
             vec![BinaryOp::Add],
             "the update becomes a lane-wise add"
         );
+    }
+
+    /// Build a multi-parameter test-at-top elementwise loop (the A3 shape):
+    /// the header carries `[passthrough_i, iv]` — `passthrough_i` is an
+    /// outer induction value the latch forwards unchanged (back-edge arg ==
+    /// parameter) — and the payload consumes it (`b[i] = a[i] +
+    /// passthrough_i`). The exit takes the loop-invariant passthrough value
+    /// as its single parameter.
+    #[allow(clippy::type_complexity)]
+    fn build_multi_param_test_at_top(
+        program: &mut Program,
+        bound: i32,
+    ) -> (Function, BasicBlock, BasicBlock, BasicBlock, Inst) {
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr.clone());
+            program.new_value().global_alloc(init)
+        };
+        let b = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_i32(), "tat_multi".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut *program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data
+            .new_basic_block()
+            .basic_block("exit".into(), vec![i32.clone()]);
+        for bb in [header, latch, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let seven = data.new_local_inst().integer(7);
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![seven, zero]);
+        data.layout_mut().insert_inst(entry, seven);
+        data.layout_mut().insert_inst(entry, zero);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let passthrough_i = data.bb_data(header).params()[0];
+        let iv = data.bb_data(header).params()[1];
+        let bound = data.new_local_inst().integer(bound);
+        let cond = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+        let header_br = data
+            .new_local_inst()
+            .branch(cond, latch, vec![], exit, vec![seven]);
+        // Constants never occupy layout; the header holds exactly
+        // [lt, branch] for the test-at-top shape.
+        data.layout_mut().insert_inst(header, cond);
+        data.layout_mut().insert_inst(header, header_br);
+        let one = data.new_local_inst().integer(1);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let sum = lb.binary(BinaryOp::Add, load_a, passthrough_i);
+        let gep_b = lb.get_elem_ptr(b, vec![zero, iv]);
+        let store = lb.store(sum, gep_b);
+        drop(lb);
+        let iv_next = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        // The outer IV is forwarded unchanged; the IV steps by one.
+        let latch_jump = data
+            .new_local_inst()
+            .jump(header, vec![passthrough_i, iv_next]);
+        for inst in [
+            one, gep_a, load_a, sum, gep_b, store, iv_next, latch_jump,
+        ] {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        let exit_param = data.bb_data(exit).params()[0];
+        let ret = data.new_local_inst().ret(Some(exit_param));
+        data.layout_mut().insert_inst(exit, ret);
+        (function, header, latch, exit, seven)
+    }
+
+    #[test]
+    fn vectorizes_multi_param_test_at_top() {
+        // A3: test-at-top with a constant bound (trip = 16, no remainder)
+        // and an extra loop-invariant passthrough parameter (outer IV)
+        // forwarded unchanged by the latch. The counter is materialized as
+        // a new header parameter, the payload vectorizes, and the
+        // passthrough rides through the rewritten exit edge.
+        let mut program = Program::new();
+        let (function, header, latch, exit, seven) =
+            build_multi_param_test_at_top(&mut program, 16);
+        assert!(
+            run(&mut program, function),
+            "multi-param test-at-top loop must vectorize"
+        );
+        let data = program.func_data(function);
+        assert_eq!(vector_load_count(&program, function), 1);
+        assert_eq!(scalar_load_count(&program, function), 0);
+        assert_eq!(
+            vector_binaries(&program, function),
+            vec![BinaryOp::Add],
+            "the update becomes a lane-wise add"
+        );
+        // The header gained the materialized counter as its last parameter:
+        // [passthrough_i, iv, t].
+        let params = data.bb_data(header).params();
+        assert_eq!(params.len(), 3, "counter appended after [passthrough_i, iv]");
+        assert!(
+            data.inst_data(params[2]).ty().is_i32(),
+            "materialized counter stays scalar i32"
+        );
+        // The bound test is replaced by the counter test, and the exit edge
+        // forwards the loop-invariant passthrough value.
+        let term = data.layout().basicblock(header).terminator();
+        let InstKind::Branch(branch) = data.inst_data(term).kind() else {
+            panic!("header must end in a branch");
+        };
+        assert_eq!(
+            branch.cond(),
+            params[2],
+            "bound test must become the counter test"
+        );
+        assert_eq!(branch.f_target(), exit);
+        assert_eq!(
+            branch.f_args().to_vec(),
+            vec![seven],
+            "passthrough value forwarded to the exit"
+        );
+        // The latch jump now carries [passthrough_i, iv', t'].
+        let latch_term = data.layout().basicblock(latch).terminator();
+        let InstKind::Jump(jump) = data.inst_data(latch_term).kind() else {
+            panic!("test-at-top latch must end in a jump");
+        };
+        assert_eq!(
+            jump.target(),
+            header,
+            "latch still jumps back to the header"
+        );
+        assert_eq!(jump.args().len(), 3, "latch forwards t' alongside iv'");
+        let InstKind::Binary(t_sub) = data.inst_data(jump.args()[2]).kind() else {
+            panic!("latch's third arg must be the counter step");
+        };
+        assert_eq!(t_sub.op(), BinaryOp::Sub);
+        assert_eq!(t_sub.lhs(), params[2], "t' = t - 4");
+        // The entry edge feeds 4Q = 16 into the new counter slot.
+        let entry_bb = data.layout().entry_bb().expect("entry block").bb();
+        let entry_edge = data.layout().basicblock(entry_bb).terminator();
+        let InstKind::Jump(entry_jump) = data.inst_data(entry_edge).kind() else {
+            panic!("entry must be a plain jump");
+        };
+        assert_eq!(entry_jump.args().len(), 3, "entry feeds the counter");
+        let InstKind::Integer(init) = data.inst_data(entry_jump.args()[2]).kind() else {
+            panic!("counter entry must be the constant 4Q");
+        };
+        assert_eq!(init.value(), 16, "counter enters at 4Q");
     }
 
     #[test]

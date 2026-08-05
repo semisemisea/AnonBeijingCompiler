@@ -88,6 +88,7 @@ pub fn outgoing_edges(data: &FunctionData, source: BasicBlock) -> SmallVec<[Logi
 pub fn forwarded_block_params(data: &FunctionData, cfg: &CFG) -> FxHashMap<Inst, Inst> {
     cfg.blocks()
         .iter()
+        .filter(|&&block| block != cfg.entry())
         .flat_map(|&block| {
             let edges = incoming_edges(data, cfg, block);
             data.bb_data(block)
@@ -183,7 +184,7 @@ impl LogicalEdgeRewriter {
 
     pub fn remove_arg(&mut self, data: &FunctionData, edge: LogicalEdge, index: usize) {
         self.edit(data, edge, |_target, args| {
-            args.swap_remove(index);
+            args.remove(index);
         });
     }
 

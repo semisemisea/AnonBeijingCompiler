@@ -253,7 +253,9 @@ impl PassesManager {
         }
 
         // Hoist loop-invariant pure expressions to the preheader.
-        let licm = Box::new(licm::LICM::new());
+        let licm = Box::new(licm::LICM::for_target(
+            config.target.enable_chain_to_switch,
+        ));
         p.register(licm);
 
         let gvn = Box::new(gvn::GlobalInstNumbering);

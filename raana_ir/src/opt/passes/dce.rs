@@ -592,6 +592,36 @@ mod dead_phi_tests {
     };
 
     #[test]
+    fn never_forwards_entry_abi_parameters_from_backedges() {
+        let mut program = Program::new();
+        let function =
+            program.new_function(Type::get_i32(), "entry_loop".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        data.layout_mut().push_bb_back(exit);
+        let parameter = data.params()[0];
+        let zero = data.new_local_inst().integer(0);
+        let branch = data
+            .new_local_inst()
+            .branch(parameter, entry, vec![zero], exit, vec![]);
+        data.layout_mut().insert_inst(entry, branch);
+        let ret = data.new_local_inst().ret(Some(parameter));
+        data.layout_mut().insert_inst(exit, ret);
+
+        assert!(!DeadPhiElimination.run(&mut program));
+        let data = program.func_data(function);
+        let InstKind::Branch(branch) = data.inst_data(branch).kind() else {
+            panic!("entry terminator must remain a branch");
+        };
+        assert_eq!(branch.cond(), parameter);
+        let InstKind::Return(ret) = data.inst_data(ret).kind() else {
+            panic!("exit must remain a return");
+        };
+        assert_eq!(ret.value(), Some(parameter));
+    }
+
+    #[test]
     fn removes_dead_param_from_both_same_target_branch_arms() {
         let mut program = Program::new();
         let function =

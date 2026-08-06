@@ -3646,7 +3646,10 @@ conv2d 主内核 c-loop 的 if 内访问（UnknownBase×2）留给 arm/mask 工�
 ### 10.20.2 h-8 主内核拒绝链调研（2026-08-06，实证）
 
 **结论先行**：h-8 主内核（nussinov k-loop）**结构性无法直接向量化**——clang -O2
-也只有 5 条 NEON（基本未向量化）佐证。原次任务"期望 r 3.0s 下降"的预期需要
+实测 8 条 NEON 且**全部集中在 mod-11 循环**（111-144 行：movi#11/dup/smull/
+smull2/uzp2/sshr/usra/mls = 向量魔法数除法），k-loop 主内核 clang 也是 0 条
+NEON（基本未向量化）佐证。这同时说明 clang 把 Rem 向量化了而我们被拒绝——
+Rem 向量化是 h-8 上唯一可复制的 clang 行为。原次任务"期望 r 3.0s 下降"的预期需要
 修正：SIMD 空间有限，建议降级优先级（详见下文下一步建议）。
 
 **复扫数据**（M44_TRACE=1 h-8-01，kernel_nussinov）：
@@ -3663,8 +3666,9 @@ conv2d 主内核 c-loop 的 if 内访问（UnknownBase×2）留给 arm/mask 工�
     `if (old < cand) table[i][j] = cand` **条件覆盖写**（store 值是计算产物，
     非 load 原值）→ 豁免不命中。
 - **BB37 = mod-11 循环**（`table[i][j] = table[i][j] % 11`）：
-  `payload_inst_rejected:Rem` ×3 + verdict=Reducible ×4——elementwise 连续、
-  无 if、runtime trip 机制已就绪，**只差 Rem 向量化**。
+  `payload_inst_rejected:Rem` ×3 + `shape_header_multi_inst` ×1 +
+  verdict=Reducible ×4——elementwise 连续、无 if、runtime trip 机制已就绪，
+  **只差 Rem 向量化**。（注：shape_header_multi_inst 是 08-06 复扫补充记录。）
 - 未出现 `arm_remainder_not_supported`（1458）——k-loop 在 access 冲突测试
   （shape/arm 分析之前）就被拒，走不到 arm 阶段。
 
@@ -3777,4 +3781,98 @@ conv2d row_reduce 解锁（5 commits @ d65883a）+ h-8 拒绝链实证。你的�
 - [ ] 既有向量化（conv2d/01_mm1/h-5/h-10）不回归；RISC-V 零影响
 - [ ] 提交历史干净（原子提交，中文消息）；结论写入 TODO
 - [ ] 最终 git status 只剩非本任务文件（Vectorize_Progress.md）
+
+### 10.20.4 transpose 实证与方案（2026-08-06，新 session 复扫）
+
+**实证修正（推翻 §10.20.3 任务 b 的前提）**：goal 文档称"transpose：clang 7 条
+NEON 我们 0"。实测（transpose0/1/2 同源码，clang -O2 -x c -target
+aarch64-none-elf 严格数 v 寄存器指令）：
+
+- **transpose 主循环 clang 也是 0 条 NEON**。10 条向量指令（2 add/1 and/2 bsl/
+  1 cmeq/1 mov/3 movi）全部在 **main 的 matrix 初始化循环**（`matrix[i]=i` +
+  `if (i%4==0) matrix[i]=4`，.LBB1_4 的 bsl/cmeq select 模式，8 元素/迭代）。
+  → transpose 不是"追平 clang"的机会，是"超越 clang"的机会（clang 也放弃）。
+- 执行占比（transpose0.in：n=10^7、len=30、rowsize∈{2..3125}）：主循环每次调用
+  ~10^7 交换 × 30 次 ≈ 3×10^8 迭代（**~97% 热点**）；main 初始化 10^7（~3%）。
+
+**transpose 主循环拒绝链（j-loop，M44 复扫）**：
+
 ```
+1 [M44] func=transpose header=BasicBlock(5) reject=m42_forbidden:RuntimeCoefficient { access: Inst(59) }
+```
+
+IR 形态（inline 后 while_entry_5_transpose_inline_11）：
+- 读端 `%49 = %37 + %vid_5; %50 = gep(%18,%49); %51 = load`：A[i*rowsize+j]，
+  行连续 stride 4 ✓（可 ld1）
+- 写端 `%52 = mul %vid_5, %31; %53 = add %52, %vid_4; %54 = gep(%18,%53)`：
+  B[j*colsize+i]，stride = colsize*4（**%31=colsize 运行时值**）→ classify_index
+  Mul 分支（dependence.rs:284-288）一边 IV 系数≠0、一边运行时不变量 →
+  RuntimeCoefficient（连 AccessFunction 都构建不出来）
+- 写回 `%58 = gep(%18,%49); store %51, %58`：A 行连续（可 st1）
+
+**6 个连锁障碍（即使修 RuntimeCoefficient 也过不去）**：
+1. **AccessFunction 模型**（dependence.rs:58）：byte_coefficient 是编译期 i64，
+   无法表达运行时系数。
+2. **冲突测试**（dependence.rs:596/626）：same/cross_iteration_may_overlap 用
+   编译期系数解线性系统；运行时系数无法静态判定。且 A/B 同数组（matrix），
+   对角线（i==j）处地址真实重叠（值直通安全，静态无法证明）→ 需值直通豁免。
+3. **双 latch 形态**（loop_vectorize.rs:661 `latches().len()!=1`）：`if(i<j)
+   continue` 使 then_8 与 end_9 都跳 header → 2 个 latch。B1 只认
+   `br cond, payload, target2` + arm `jump target2`（payload 跳 branch 的 false
+   目标），continue 跳 header 不匹配。
+4. **store 分类**（loop_vectorize.rs:1483）：所有 store 必须
+   `byte_coefficient == VF`（16B 连续）+ base 16B 对齐，否则 store_not_contig_write。
+   写 B 是 strided → 拒绝。且写 B 的 base = matrix+i*4，i 非 4 倍数时不对齐。
+5. **代码生成**：标量列写需要 VectorExtractElement（IR 已有该 inst，但
+   apply_vectorize 无生成先例）+ 4 个标量 store 的地址展开
+   （base+j*colsize+{0,c,2c,3c}）。
+6. **循环携带死值**：%vid_6 每迭代携带 curr（body 内 0 使用），phi 参数克隆
+   需处理。
+
+**收益/成本评估**：4-lane 后内存指令 6/4迭代（1 ld1 + 4 str + 1 st1）vs 现状
+16/4迭代（8 ldr + 8 str），省 ~60%。但改动横跨 dependence.rs（模型+冲突）+
+loop_vectorize.rs（分析+生成），估计 3-5 天，miscompile 风险高，clang 佐证为
+0。**结论：研究级任务，本 session 不落地**（方案留档供 future agent）。
+
+**候选方案（若未来做）**：仅放宽 RuntimeCoefficient 不够。最短路 =
+a) AccessFunction 增加 runtime_coeff: Option<Inst>（byte_coefficient 保持编译期
+部分，运行时部分单独字段）；b) 冲突测试对 runtime 系数访问对：同 base 且
+值直通（B 写 = A 读值、A 写回 = A 读值，value_flows_to 已存在）→ 新豁免
+`strided_store_value_direct`；c) 双 latch 用"continue 上提"（then_8 与 end_9
+合并为单 latch，arm 内条件 store 掩码化——即把 continue 转成 B1 masked-kernel
+形态）；d) apply_vectorize 对 strided store 生成 extract+标量 store 序列。
+伪代码（4-lane，j∈[0,i]，i 循环不变，runtime bound）：
+```
+v = ld1(A + i*rowsize + j)                    # 读行 4 元素
+for k in 0..4: str(extract(v,k), B + (j+k)*colsize + i)   # 标量列写
+st1(v, A + i*rowsize + j)                     # 写回
+```
+预对齐：j 起点 0（i 可能非 4 倍数 → 尾标量循环处理 [i&~3, i]）。
+
+**transpose main 初始化循环（追平 clang 的 10 条 NEON，本 session 候选）**：
+- 形态：`store %vid_2, gep(%gv_matrix,(0,%vid_2))`（matrix[i]=i 无条件）+ arm
+  `store 4, gep(...)`（matrix[i]=4，条件，i%4==0 的 sar/shr/add/and/sub 魔法数
+  链 %12-%16 驱动）。B1 masked-kernel 匹配（arm_on_true:true，then_4 jump end_5
+  ✓），%12-%16 全在 is_vectorizable_binary_op。
+- 拒绝链：M44 `IntraIterationConflict { a: Inst(23), b: Inst(34) }`（store-store
+  同地址）。且 B1 mask 重写（loop_vectorize.rs:2548）要求 arm store 有同地址
+  load（`unreachable!("arm store without a same-address load")`）——此循环无
+  load，会崩。
+- 方案：store-store 同地址豁免（一个 body 无条件 + 一个 arm 条件 → 合并
+  select(cond, 4, i) 单 store）+ B1 mask 重写允许"用 body 同地址 store 的 src
+  作为 old"。收益 ~3% 执行（静态追平 clang 10 条），改动 2 文件局部，风险中。
+- **决策**：收益小（~3%），但这是 transpose 用例上 clang 唯一做了而我们没做的
+  差距，且解锁 M42 的"纯 store + 条件覆盖合并"新能力。**列为备选，不优先**。
+
+**03_sort 复扫（对比）**：clang 29 条（7 add/2 mla/7 mov/10 movi/3 smax）。
+我们 0。但 radix sort 核心循环全部含 getNumPos 调用（CallInBody 拒绝）或复杂
+依赖（head[i]=tail[i-1] 前缀和的 i/i-1 跨迭代依赖 → LoopCarriedConflict/
+non_unit_step ×6 循环）。**比 transpose 更难，不优先**。
+
+**h-8 Rem（任务 d）**：形态全就绪（elementwise 连续 + runtime trip），只差
+is_vectorizable_binary_op 加 Rem + 后端向量魔法数除法（anon_armv8，需先写
+TODO）。收益 <1%，与 nonlinear %97 合并研究。
+
+**本 session 决策**：transpose 主循环研究级（方案留档）；今日不落地任何
+低收益小项（main 初始化 ~3% / Rem <1% 均不符"热点解锁"验收标准）；如时间
+允许做 main 初始化作为 M42 新能力（store-store 合并）验证，否则仅留档。

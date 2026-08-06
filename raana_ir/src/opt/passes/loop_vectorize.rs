@@ -68,8 +68,11 @@ use crate::opt::{
         dependence::{AccessKind, DependenceAnalysis, ReductionOp, Verdict},
         dom_tree::v2::DominanceTree,
         effects::{AbstractObject, EffectAnalysis},
+        induction_variable::BasicInductionVariableAnalysis,
         loop_analysis::{Loop, LoopAnalysis},
         memory::MemObject,
+        range::RangeAnalysis,
+        return_summary,
     },
     pass::{ArenaContext, ArenaContextMut, Pass},
     utils::cfg::CFG,
@@ -207,6 +210,10 @@ struct VecPlan {
     vector_ty: Type,
     /// B1: register-reduction plan, or None for plain elementwise loops.
     reduction: Option<ReductionPlan>,
+    /// Mod-wrapped scalar reduction `acc' = (acc + E + C) % P` (see
+    /// [`ModReductionPlan`]). When Some, `reduction` is None and the
+    /// accumulator stays scalar in the vector loop.
+    mod_reduction: Option<ModReductionPlan>,
     /// Loop-invariant passthrough parameters: outer induction values the
     /// back edge forwards unchanged (e.g. the inner loop of a nested kernel
     /// reads the outer IVs). Their entry arguments stay live across the
@@ -268,6 +275,41 @@ struct ReductionPlan {
     acc_init: Inst,
     /// The exit block's accumulator parameter (receives the reduced value),
     /// or None when the exit takes no parameters.
+    exit_acc_param: Option<Inst>,
+}
+
+/// How one exit-block parameter receives its value at the rewritten exit
+/// edge, in exit-parameter order.
+///
+/// Mod-wrapped scalar reduction `acc' = (acc + E + C) % P`: the element
+/// computation `E` is vectorized and horizontally reduced (`addv`) once per
+/// vector round, while the accumulator stays scalar and is modded in range
+/// every round:
+/// `acc = (acc + addv(E_vec) + VF*C) % P`.
+///
+/// Lane-wise accumulation cannot be used here: `(a % P) + (b % P)` is not
+/// `(a + b) % P`, and `addv` of the vector accumulator overflows for large
+/// `P`. Keeping the accumulator scalar sidesteps both.
+struct ModReductionPlan {
+    /// The scalar accumulator header parameter (kept `<4 x T>`-free).
+    acc: Inst,
+    /// Position of `acc` in the header parameter list.
+    acc_slot: usize,
+    /// The element computation feeding the accumulation (vectorized per
+    /// round and reduced with `addv`).
+    value: Inst,
+    /// Constant added to the accumulator per scalar iteration.
+    const_sum: i64,
+    /// The modulus (a compile-time positive constant).
+    modulus: i32,
+    /// The latch's accumulator update `rem(..., P)` (rewritten in place).
+    acc_update: Inst,
+    /// The accumulator update chain's add instructions (bottom-to-top),
+    /// excluded from the payload and rebuilt flat in the mutation phase.
+    add_chain: Vec<Inst>,
+    /// Entry-edge argument for the accumulator slot (initial value).
+    acc_init: Inst,
+    /// The exit block's accumulator parameter (receives the scalar sum).
     exit_acc_param: Option<Inst>,
 }
 
@@ -349,6 +391,125 @@ fn inst_kind_name(kind: &InstKind) -> &'static str {
         InstKind::Float(_) => "Float",
         InstKind::ZeroInit => "ZeroInit",
     }
+}
+
+/// Decompose a mod-wrapped accumulator update `update = rem(X, P)` where `X`
+/// is an add chain `acc + value + C` (constant adds folded into `const_sum`)
+/// and `P` is a compile-time constant. Returns `(value, const_sum, modulus)`.
+fn decompose_mod_reduction(
+    arena: &ArenaContext<'_>,
+    update: Inst,
+    acc: Inst,
+) -> Option<(Inst, i64, i32)> {
+    fn walk(
+        arena: &ArenaContext<'_>,
+        node: Inst,
+        acc: Inst,
+        value: &mut Option<Inst>,
+        const_sum: &mut i64,
+    ) -> bool {
+        if node == acc {
+            return true;
+        }
+        match arena.inst_data(node).kind() {
+            InstKind::Integer(v) => {
+                *const_sum += i64::from(v.value());
+                true
+            }
+            InstKind::Binary(b) if b.op() == BinaryOp::Add => {
+                walk(arena, b.lhs(), acc, value, const_sum)
+                    && walk(arena, b.rhs(), acc, value, const_sum)
+            }
+            _ => {
+                if value.is_some() {
+                    return false;
+                }
+                *value = Some(node);
+                true
+            }
+        }
+    }
+    let InstKind::Binary(rem) = arena.inst_data(update).kind() else {
+        return None;
+    };
+    if rem.op() != BinaryOp::Rem {
+        return None;
+    }
+    let InstKind::Integer(modulus) = arena.inst_data(rem.rhs()).kind() else {
+        return None;
+    };
+    let mut value = None;
+    let mut const_sum = 0i64;
+    if !walk(arena, rem.lhs(), acc, &mut value, &mut const_sum) {
+        return None;
+    }
+    Some((value?, const_sum, modulus.value()))
+}
+
+/// Collect the add-chain instructions of a mod-wrapped accumulator update
+/// (bottom-to-top: closest to `acc` first), for payload exclusion and the
+/// flat rebuild in the mutation phase.
+fn mod_reduction_add_chain(arena: &ArenaContext<'_>, update: Inst, acc: Inst) -> Vec<Inst> {
+    let mut chain = Vec::new();
+    fn walk(arena: &ArenaContext<'_>, node: Inst, acc: Inst, chain: &mut Vec<Inst>) {
+        if node == acc {
+            return;
+        }
+        let InstKind::Binary(b) = arena.inst_data(node).kind() else {
+            return;
+        };
+        if b.op() != BinaryOp::Add {
+            return;
+        }
+        walk(arena, b.lhs(), acc, chain);
+        walk(arena, b.rhs(), acc, chain);
+        chain.push(node);
+    }
+    let InstKind::Binary(rem) = arena.inst_data(update).kind() else {
+        return chain;
+    };
+    walk(arena, rem.lhs(), acc, &mut chain);
+    chain
+}
+
+/// Prove that the per-round scalar update `acc = (acc + addv(E) + VF*C) % P`
+/// cannot wrap i32. The accumulator stays in `[-(P-1), P-1]` after every
+/// round; `addv(E)` spans `[4*min(E), 4*max(E)]` from the element range.
+fn mod_reduction_bounds_hold(
+    arena: &ArenaContext<'_>,
+    data: &FunctionData,
+    cfg: &CFG,
+    loops: &LoopAnalysis,
+    acc: Inst,
+    value: Inst,
+    modulus: i32,
+    const_sum: i64,
+) -> bool {
+    let p = i64::from(modulus);
+    if p <= 1 {
+        return false;
+    }
+    let ivs = BasicInductionVariableAnalysis::new(data, cfg, loops);
+    let range_arena = ArenaContext {
+        program: arena.program,
+        curr_func: arena.curr_func,
+    };
+    let nonneg = return_summary::nonneg_preserving_functions(arena.program);
+    let all_params = return_summary::always_nonneg_params(arena.program, &nonneg);
+    let self_params = all_params
+        .get(&arena.curr_func.expect("run_on always sets curr_func"))
+        .cloned()
+        .unwrap_or_default();
+    let ranges = RangeAnalysis::new(&range_arena, cfg, loops, &ivs, &nonneg, &self_params);
+    let (Some(vmin), Some(vmax)) = (ranges.range_of(value).min(), ranges.range_of(value).max())
+    else {
+        return false;
+    };
+    let acc_min = ranges.range_of(acc).min().map(i64::from).unwrap_or(-(p - 1));
+    let acc_max = ranges.range_of(acc).max().map(i64::from).unwrap_or(p - 1);
+    let upper = acc_max + 4 * i64::from(vmax) + 4 * const_sum;
+    let lower = acc_min + 4 * i64::from(vmin) + 4 * const_sum;
+    upper <= i64::from(i32::MAX) && lower >= i64::from(i32::MIN)
 }
 
 fn find_vectorizable(
@@ -1014,9 +1175,66 @@ fn analyze_loop(
         trace(data, looop, "test_at_top_multi_param");
         return None;
     }
-    let acc_info: Option<(Inst, usize, BinaryOp)> = match effective.len() {
-        1 => None,
-        2 => {
+    // A mod-wrapped accumulation `acc' = (acc + E + C) % P` is invisible to
+    // the M42 verdict (its outermost op is Rem, so the verdict labels the
+    // *counter's* IntSub instead and the loop is rejected as
+    // `b1_acc_is_passthrough_or_counter`). Scan the parameters directly and
+    // treat the inner add as the accumulation; the per-round `% P` keeps the
+    // accumulator in range and the element computation is vectorized +
+    // `addv`'d once per round (see [`ModReductionPlan`]).
+    let mut mod_plan: Option<(Inst, usize, BinaryOp)> = None;
+    let mut mod_params: Option<(Inst, i64, i32, Vec<Inst>)> = None;
+    if effective.len() <= 2 {
+        'mod_scan: for (slot, &param) in params.iter().enumerate() {
+            if passthrough.contains(&slot) || (!test_at_top && slot == counter_slot) {
+                continue;
+            }
+            let update = back_args[slot];
+            if let Some((value, const_sum, modulus)) =
+                decompose_mod_reduction(arena, update, param)
+            {
+                for &user in arena.inst_data(param).used_by() {
+                    let Some(user_bb) = data.layout().parent_bb(user) else {
+                        continue;
+                    };
+                    if user != update
+                        && user_bb != latch
+                        && !(test_at_top && dom.dominates(exit, user_bb))
+                    {
+                        trace(data, looop, "mod_acc_used_outside_latch");
+                        continue 'mod_scan;
+                    }
+                }
+                if !mod_reduction_bounds_hold(
+                    arena,
+                    data,
+                    cfg,
+                    loops,
+                    param,
+                    value,
+                    modulus,
+                    const_sum,
+                ) {
+                    trace(data, looop, "mod_bounds_overflow");
+                    continue 'mod_scan;
+                }
+                mod_plan = Some((param, slot, BinaryOp::Add));
+                mod_params = Some((
+                    value,
+                    const_sum,
+                    modulus,
+                    mod_reduction_add_chain(arena, update, param),
+                ));
+                break;
+            }
+        }
+    }
+    let acc_info: Option<(Inst, usize, BinaryOp)> = if let Some(plan) = mod_plan {
+        Some(plan)
+    } else {
+        match effective.len() {
+            1 => None,
+            2 => {
             let Verdict::Reducible { accumulator, op } = &dep.verdict else {
                 trace(data, looop, "b1_not_reducible");
                 return None;
@@ -1053,6 +1271,7 @@ fn analyze_loop(
             trace(data, looop, "params_not_2");
             return None;
         }
+    }
     };
     for &p in params.iter() {
         if !arena.inst_data(p).ty().is_i32() {
@@ -1151,15 +1370,21 @@ fn analyze_loop(
                 trace(data, looop, "b1_acc_is_iv");
                 return None;
             }
-            let InstKind::Binary(binary) = arena.inst_data(update).kind() else {
-                trace(data, looop, "b1_acc_update_not_binary");
-                return None;
+            let delta = if let Some((value, _, _, _)) = mod_params.as_ref() {
+                // Mod-wrapped: `update = rem(acc + value + C, P)`; the delta
+                // is the element computation (vectorized + addv per round).
+                *value
+            } else {
+                let InstKind::Binary(binary) = arena.inst_data(update).kind() else {
+                    trace(data, looop, "b1_acc_update_not_binary");
+                    return None;
+                };
+                if binary.op() != bop || binary.lhs() != acc {
+                    trace(data, looop, "b1_acc_update_shape");
+                    return None;
+                }
+                binary.rhs()
             };
-            if binary.op() != bop || binary.lhs() != acc {
-                trace(data, looop, "b1_acc_update_shape");
-                return None;
-            }
-            let delta = binary.rhs();
             // The accumulator must be consumed only by its update chain,
             // the latch, and — for test-at-top loops — the exit region
             // (the exit block and the blocks it dominates, which read the
@@ -1339,6 +1564,15 @@ fn analyze_loop(
         trace(data, looop, "trip_below_vf");
         return None;
     }
+    // The mod-wrapped scalar reduction is supported for rotated loops
+    // (test-at-top would need the exit region's direct accumulator reads
+    // rewritten; the accumulator stays scalar, so that path is deferred) and
+    // for trips that are an exact multiple of VF (no scalar epilogue) or
+    // runtime trips (the scalar tail covers the remainder).
+    if mod_plan.is_some() && (test_at_top || (!runtime_trip && trip % VF != 0)) {
+        trace(data, looop, "mod_shape_not_supported");
+        return None;
+    }
     // A test-at-top reduction rewrites the exit region's direct reads of
     // the header accumulator (and, with a runtime trip, the IV) to the
     // reduced scalar. That is only valid when the exit has no other
@@ -1423,6 +1657,14 @@ fn analyze_loop(
         }
         if let Some((update, _)) = acc_update {
             set.insert(update, ());
+            // The mod-wrapped update's add chain is rebuilt flat in the
+            // mutation phase; excluding it keeps the accumulator operand out
+            // of the payload's vector-operand machinery.
+            if let Some((_, _, _, chain)) = mod_params.as_ref() {
+                for &add in chain {
+                    set.insert(add, ());
+                }
+            }
         }
         set
     };
@@ -1742,7 +1984,12 @@ fn analyze_loop(
 
     // B1: the accumulator delta must be a payload value (vectorized) or a
     // loop-invariant scalar (splatted); then build the reduction plan.
-    let reduction = match acc_info {
+    // Mod-wrapped scalar reductions build no B1 plan (`mod_reduction`
+    // handles the scalar accumulator).
+    let reduction = if mod_params.is_some() {
+        None
+    } else {
+        match acc_info {
         None => None,
         Some((acc, acc_slot, bop)) => {
             let (update, delta) = acc_update.expect("acc_update set alongside acc_info");
@@ -1782,7 +2029,30 @@ fn analyze_loop(
                     .map(|pos| exit_params[pos]),
             })
         }
+        }
     };
+    // Mod-wrapped scalar reduction: the element computation is vectorized
+    // and `addv`'d per round; the accumulator stays scalar and modded.
+    let mod_reduction = mod_params.map(|(value, const_sum, modulus, add_chain)| {
+        let (acc, acc_slot, _) = mod_plan.expect("mod_params set alongside mod_plan");
+        ModReductionPlan {
+            acc,
+            acc_slot,
+            value,
+            const_sum,
+            modulus,
+            acc_update: acc_update
+                .as_ref()
+                .map(|(update, _)| *update)
+                .expect("acc_update set alongside mod_params"),
+            add_chain,
+            acc_init: entry_args[acc_slot],
+            exit_acc_param: exit_specs
+                .iter()
+                .position(|spec| matches!(spec, ExitArgSpec::Acc))
+                .map(|pos| exit_params[pos]),
+        }
+    });
 
     // B1 single-arm bodies: a compile-time trip that is not a multiple of
     // VF is unsupported (the epilogue chain for multi-block bodies is not
@@ -1812,6 +2082,7 @@ fn analyze_loop(
         classes,
         vector_ty: Type::get_vector(elem_ty, VF as usize),
         reduction,
+        mod_reduction,
         passthrough_args,
         exit_specs,
         test_at_top,
@@ -2091,6 +2362,7 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         classes,
         vector_ty,
         reduction,
+        mod_reduction,
         passthrough_args,
         exit_specs,
         test_at_top,
@@ -2290,7 +2562,7 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         // their slots).
         2
     } else {
-        2 + usize::from(reduction.is_some()) + n_passthrough
+        2 + usize::from(reduction.is_some() || mod_reduction.is_some()) + n_passthrough
     };
     // The scalar tail's upper bound. Test-at-top loops reuse the original
     // `bound` instruction (a loop-invariant value). Rotated loops have no
@@ -2343,7 +2615,7 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     let tail_header: Option<BasicBlock> = if runtime_trip {
         let one = data.new_local_inst().integer(1);
         let mut param_tys = vec![i32.clone(); 1 + n_passthrough];
-        if reduction.is_some() {
+        if reduction.is_some() || mod_reduction.is_some() {
             param_tys.insert(1, i32.clone());
         }
         let th = data
@@ -2361,7 +2633,9 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             Binary::new_data(iv_t, runtime_bound, BinaryOp::Lt, i32.clone()),
         );
         let iv_final_rt = has_iv_final.then_some(runtime_bound);
-        let tail_acc = reduction.as_ref().map(|_| data.bb_data(th).params()[1]);
+        let tail_acc =
+            reduction.as_ref().map(|_| data.bb_data(th).params()[1])
+                .or_else(|| mod_reduction.as_ref().map(|_| data.bb_data(th).params()[1]));
         let mut exit_args = build_exit_args(&exit_specs, &passthrough_args, tail_acc, iv_final_rt);
         if let Some(_) = exit_extra_acc {
             // The freshly added exit parameter carries the final scalar
@@ -2424,7 +2698,29 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             insts.push(cloned);
         }
         let mut jump_args: Vec<Inst> = Vec::new();
-        if let Some(red) = &reduction {
+        if let Some(modr) = &mod_reduction {
+            // `acc_k = (acc_t + delta_k + C) % P`: one scalar iteration per
+            // tail round (the remainder runs 0..=3 scalar iterations).
+            let delta_k = map.get(&modr.value).copied().unwrap_or(modr.value);
+            let acc_t = data.bb_data(th).params()[1];
+            let s0 = alloc_inst(
+                data,
+                Binary::new_data(acc_t, delta_k, BinaryOp::Add, i32.clone()),
+            );
+            insts.push(s0);
+            let s1 = if modr.const_sum == 0 {
+                s0
+            } else {
+                let c = data.new_local_inst().integer(modr.const_sum as i32);
+                let s = alloc_inst(data, Binary::new_data(s0, c, BinaryOp::Add, i32.clone()));
+                insts.push(s);
+                s
+            };
+            let p = data.new_local_inst().integer(modr.modulus);
+            let acc_k = alloc_inst(data, Binary::new_data(s1, p, BinaryOp::Rem, i32.clone()));
+            insts.push(acc_k);
+            jump_args.push(acc_k);
+        } else if let Some(red) = &reduction {
             // `acc_k = op(acc_t, delta_k)`: the delta clone exists when
             // the delta is a payload inst; invariant deltas are reused.
             let delta_k = map.get(&red.delta).copied().unwrap_or(red.delta);
@@ -2892,7 +3188,55 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     //     update chain into a lane-wise accumulation. The delta resolves
     //     through the same machinery as any payload value (vector load /
     //     vector binary) or is splatted when loop-invariant.
-    if let Some(red) = &reduction {
+    //
+    //     Mod-wrapped scalar reduction: the accumulator stays scalar; the
+    //     element computation is vectorized and `addv`'d once per round
+    //     (`round_sum = Σ value_lanes`), then the update is rebuilt as
+    //     `acc = (acc + round_sum + VF*C) % P`.
+    if let Some(modr) = &mod_reduction {
+        let e_vec = vector_operand(
+            data,
+            &mut splats,
+            modr.value,
+            &payload,
+            &classes,
+            &vector_ty,
+            modr.acc_update,
+        );
+        // Insert before the first chain add (the earliest use of the
+        // per-round sum), so def-before-use holds in the latch layout.
+        let anchor = modr.add_chain.first().copied().unwrap_or(modr.acc_update);
+        let round_sum = alloc_inst(
+            data,
+            VectorReduce::new_data(VectorReduceOp::Add, e_vec, i32.clone()),
+        );
+        data.layout_mut().insert_inst_before(anchor, round_sum);
+        let total = if modr.const_sum == 0 {
+            round_sum
+        } else {
+            let c = data.new_local_inst().integer((VF * modr.const_sum) as i32);
+            let t = alloc_inst(
+                data,
+                Binary::new_data(round_sum, c, BinaryOp::Add, i32.clone()),
+            );
+            data.layout_mut().insert_inst_before(anchor, t);
+            t
+        };
+        // Rebuild the excluded add chain flat: the bottom add becomes
+        // `acc + total`, the rest are identity forwards (folded by later
+        // passes).
+        let zero = data.new_local_inst().integer(0);
+        let mut prev = modr.acc;
+        for &add in &modr.add_chain {
+            let rhs = if add == modr.add_chain[0] { total } else { zero };
+            data.replace_inst_with(add)
+                .raw(Binary::new_data(prev, rhs, BinaryOp::Add, i32.clone()));
+            prev = add;
+        }
+        let p = data.new_local_inst().integer(modr.modulus);
+        data.replace_inst_with(modr.acc_update)
+            .raw(Binary::new_data(prev, p, BinaryOp::Rem, i32.clone()));
+    } else if let Some(red) = &reduction {
         data.inst_data_mut(red.acc).set_type(vector_ty.clone());
         let delta_vec = vector_operand(
             data,
@@ -3002,36 +3346,65 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 )
             }
         } else {
-            match &reduction {
-                Some(red) => {
-                    let mut args = vec![red.acc_update];
-                    args.extend(passthrough_args.iter().copied());
-                    (
-                        reduce_block.expect("reduce block built when reduction is set"),
-                        args,
-                    )
-                }
-                None if runtime_trip => {
-                    // Rotated runtime-bound elementwise: the false edge
-                    // enters the scalar tail at `iv0 = i0 + max(cnt0, 0)`
-                    // — the vector loop advanced the index by `cnt0`, and
-                    // a negative trip clamps back to `i0` so the tail runs
-                    // zero iterations.
-                    let mut args = vec![iv0.expect("runtime iv0")];
+            if let Some(modr) = &mod_reduction {
+                // Mod-wrapped scalar reduction: the accumulator never leaves
+                // the scalar domain, so the false edge carries the final
+                // modded value directly (no reduce block).
+                if runtime_trip {
+                    let mut args = vec![iv0.expect("runtime iv0"), modr.acc_update];
                     args.extend(passthrough_args.iter().copied());
                     (
                         tail_header.expect("tail built when runtime_trip"),
                         args,
                     )
-                }
-                None if r > 0 => (epi_blocks[0], passthrough_args.clone()),
-                None => {
-                    // r == 0: the exit is reached directly; IV-final
-                    // parameters are replaced by the computed constant.
+                } else {
                     (
                         exit,
-                        build_exit_args(&exit_specs, &passthrough_args, None, iv_final_const),
+                        build_exit_args(
+                            &exit_specs,
+                            &passthrough_args,
+                            Some(modr.acc_update),
+                            iv_final_const,
+                        ),
                     )
+                }
+            } else {
+                match &reduction {
+                    Some(red) => {
+                        let mut args = vec![red.acc_update];
+                        args.extend(passthrough_args.iter().copied());
+                        (
+                            reduce_block.expect("reduce block built when reduction is set"),
+                            args,
+                        )
+                    }
+                    None if runtime_trip => {
+                        // Rotated runtime-bound elementwise: the false edge
+                        // enters the scalar tail at `iv0 = i0 + max(cnt0, 0)`
+                        // — the vector loop advanced the index by `cnt0`, and
+                        // a negative trip clamps back to `i0` so the tail runs
+                        // zero iterations.
+                        let mut args = vec![iv0.expect("runtime iv0")];
+                        args.extend(passthrough_args.iter().copied());
+                        (
+                            tail_header.expect("tail built when runtime_trip"),
+                            args,
+                        )
+                    }
+                    None if r > 0 => (epi_blocks[0], passthrough_args.clone()),
+                    None => {
+                        // r == 0: the exit is reached directly; IV-final
+                        // parameters are replaced by the computed constant.
+                        (
+                            exit,
+                            build_exit_args(
+                                &exit_specs,
+                                &passthrough_args,
+                                None,
+                                iv_final_const,
+                            ),
+                        )
+                    }
                 }
             }
         };
@@ -3973,6 +4346,98 @@ mod tests {
             data.inst_data(exit_acc).ty().is_i32(),
             "exit accumulator parameter stays scalar"
         );
+    }
+
+    #[test]
+    fn vectorizes_mod_reduction() {
+        // Mod-wrapped scalar reduction: `acc' = (acc + a[iv] % 100) % 1000`
+        // on a rotated `[iv, acc, t]` loop. The M42 verdict labels such a
+        // loop Reducible on the *counter* (the acc update's outermost op is
+        // Rem), so the accumulator is found by direct parameter scan. The
+        // accumulator stays scalar; the element computation `a[iv] % 100` is
+        // vectorized and `addv`'d once per vector round.
+        let mut program = Program::new();
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_i32(), "modreduce".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone(), i32.clone()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data
+            .new_basic_block()
+            .basic_block("exit".into(), vec![i32.clone()]);
+        for bb in [header, latch, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let trip_inst = data.new_local_inst().integer(16);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero, trip_inst]);
+        data.layout_mut().insert_inst(entry, zero);
+        data.layout_mut().insert_inst(entry, trip_inst);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let iv = data.bb_data(header).params()[0];
+        let acc = data.bb_data(header).params()[1];
+        let counter = data.bb_data(header).params()[2];
+        let header_jump = data.new_local_inst().jump(latch, vec![]);
+        data.layout_mut().insert_inst(header, header_jump);
+        let one = data.new_local_inst().integer(1);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let hundred = lb.integer(100);
+        let mod100 = lb.binary(BinaryOp::Rem, load_a, hundred);
+        let sum = lb.binary(BinaryOp::Add, acc, mod100);
+        let thousand = lb.integer(1000);
+        let mod1000 = lb.binary(BinaryOp::Rem, sum, thousand);
+        let iv_next = lb.binary(BinaryOp::Add, iv, one);
+        let t_next = lb.binary(BinaryOp::Sub, counter, one);
+        let back =
+            lb.branch(t_next, header, vec![iv_next, mod1000, t_next], exit, vec![mod1000]);
+        drop(lb);
+        for inst in [one, hundred, thousand, gep_a, load_a, mod100, sum, mod1000, iv_next, t_next, back]
+        {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        let exit_acc = data.bb_data(exit).params()[0];
+        let exit_ret = data.new_local_inst().ret(Some(exit_acc));
+        data.layout_mut().insert_inst(exit, exit_ret);
+
+        assert!(
+            run(&mut program, function),
+            "mod-wrapped reductions must vectorize"
+        );
+        let data = program.func_data(function);
+        // The accumulator stays scalar (mod keeps it in range each round).
+        assert!(
+            data.inst_data(acc).ty().is_i32(),
+            "mod accumulator stays scalar"
+        );
+        // The element computation (`a[iv] % 100`) is the only vectorized op.
+        assert_eq!(
+            vector_binaries(&program, function),
+            vec![BinaryOp::Rem],
+            "only the element rem is lane-wise"
+        );
+        // A horizontal reduction feeds the scalar accumulator.
+        let has_reduce = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|l| l.insts().iter().copied())
+            .any(|inst| matches!(data.inst_data(inst).kind(), InstKind::VectorReduce(_)));
+        assert!(has_reduce, "per-round addv must exist");
     }
 
     #[test]

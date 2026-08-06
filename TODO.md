@@ -504,6 +504,46 @@ M44 v2（select 掩码）。
   内存累加 > B2 test-at-top。后续目标 2/3 完成后，白名单与新增 lowering
   直接生效。
 
+##### M44 v2 目标 4（向量常数除/模 + 模归约）执行记录（2026-08-06，feat/simd/pass rebase 到 hermes 后）
+
+- 背景：feat/simd/pass 的 M69 平行实现 rebase 到 hermes 线后，后端按
+  hermes 规范合并（保留 hermes 的 VecShift/VecNeg/VecDiv，新增
+  VecMla/VecSMull/VecNarrow，`lower_vector_constant_div_rem` 用 VecShift
+  立即数形态重写）；M69b/d 的 loop_vectorize.rs 整体弃用（hermes 版为
+  准）。本目标是 M69c/d 的"向量常数除/模 + 模归约"能力移植进 hermes
+  版 vectorizer。
+- 实现（loop_vectorize.rs，+504 行）：
+  1. **i32 常数除数放行**：`is_vectorizable_binary_op` 加入 Rem；第二遍
+     分类对 i32 Div/Rem 仅在 rhs 为字面 `Integer` 时放行（后端 magic
+     smull/xtn/mls 序列），f32 Div 保持 fdiv、f32 Rem 与变量除数标量。
+     验证：`g[i]=g[i]/7` → dup/smull2/sshr/xtn/xtn2/…/str q 完整魔法。
+  2. **模归约（ModReduction）**：`acc' = (acc + E + C) % P`（P 常数）——
+     标量累加器 + 每轮向量元素 `addv`。原因：lane-wise `%P` 再 `addv`
+     不满足 `(a%P)+(b%P)==(a+b)%P`，且对 h-4 的 P≈2^30 addv 溢出；标量
+     累加器每轮 `(acc + addv(E) + VF*C) % P` 两全其美。
+     - 分析：M42 verdict 把此类循环标到 counter（外层 op 是 Rem），故
+       直接扫参数 `decompose_mod_reduction`（rem(X,P)，X 为 acc+E+C 链）
+       + `mod_reduction_bounds_hold`（RangeAnalysis 证每轮
+       acc+addv(E)+VF*C 不溢出 i32）。
+     - 变更：mod_plan/mod_params 线程化；acc 保持标量（不 set_type）；
+       add_chain 从 payload 排除、步骤 2b 平铺重建为
+       `rem(add(add(acc,addv),VF*C),P)`；出口/标量 tail 直传标量
+       acc_update（无 reduce 块、无 acc_splat）；`entry_arg_count` 计入
+       mod 累加器槽位；tail 参数表 + 标量更新同样支持。
+     - 范围限制：仅 rotated（test-at-top 的 exit 区域直接读累加器路径
+       后置）；const trip 须 r==0（epilogue 链后置）或 runtime trip。
+- 验证：
+  - 单测 +1（vectorizes_mod_reduction，rotated [iv,acc,t]，acc 保持 i32、
+    仅元素 Rem 向量化、存在 VectorReduce）；raana_ir 409 全过（基线
+    408）；anon_armv8 136 全过。
+  - 端到端（host clang 汇编 + 原生 ARM64 运行，退出码对拍）：
+    `sum=(sum+g[i]%100)%1000` trip=2048 → exit 128；`…+1` → 176，均与
+    python 参照一致（退出码截断 8 位，300→44 等需按 &0xFF 对拍）。
+  - h-4 仍被 `shape_body_not_2_blocks` 干净拒绝（f 内联多块体是独立
+    缺口，非模归约范围）。
+- 遗留：test-at-top 模归约（exit 区域累加器直读重写）、const-trip
+  R>0 epilogue 链携带标量累加器、runtime-trip rotated 端到端验证。
+
 ##### M44 v2 目标 2（B3 内存累加）执行记录（2026-08-05）
 
 - 实现（两个原子 commit，见 Vectorize_Progress.md 目标 2 完成记录）：

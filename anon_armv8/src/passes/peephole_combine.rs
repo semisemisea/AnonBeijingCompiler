@@ -320,8 +320,13 @@ fn other_operand(lhs: &RegOrZr, rhs: &RegOrZr, mul_dst: &Reg) -> Option<Reg> {
 /// Conditions whose truth is fully determined by N/Z for a `cmp r, #0`,
 /// which `subs r, r, #imm` preserves exactly. `C` and `V` are not preserved
 /// by a subtract, so unsigned and overflow-sensing conditions are excluded.
+///
+/// `Gt` is additionally fused for the rotated-runtime vector-loop counter
+/// (M70): the counter enters at `cnt0 = trip & -4` (a non-negative multiple
+/// of VF) and steps down by 4 to exactly 0, so the `subs` can never overflow
+/// and `subs wX, wX, #4; b.gt` is exactly the `x -= 4; if (x > 0)` idiom.
 fn subs_safe_cond(cond: Cond) -> bool {
-    matches!(cond, Cond::Eq | Cond::Ne | Cond::Mi | Cond::Pl)
+    matches!(cond, Cond::Eq | Cond::Ne | Cond::Mi | Cond::Pl | Cond::Gt)
 }/// Conditions safe under `ands`/`tst` flag fusion. A logical operation sets
 /// `V = 0` and `C = 0`, same as `cmp r, #0` except for `C`, which only the
 /// unsigned conditions observe.
@@ -604,6 +609,30 @@ mod tests {
             fused.is_none(),
             "subs changes C, so unsigned conds must not fuse"
         );
+    }
+
+    #[test]
+    fn fuses_sub_cmp_condbr_into_subs_for_countdown_gt() {
+        // The rotated-runtime vector-loop counter (M70): `sub r,r,#4; cmp
+        // r,#0; b.gt` → `subs r,r,#4; b.gt`. The counter enters at a
+        // non-negative multiple of VF and steps down to exactly 0, so the
+        // `subs` cannot overflow and its N/Z flags match `cmp r, #0` — the
+        // same countdown idiom clang emits as `subs ...; b.gt`.
+        let fused = fuse_flag_triple(
+            &sub_imm(0, 0, 4),
+            &cmp_zero(0),
+            &cond_br(Cond::Gt),
+            &no_uses(),
+        );
+        assert!(matches!(
+            fused,
+            Some(MInst::SubsRRImm12 {
+                size: OperandSize::Size32,
+                dst,
+                src,
+                imm,
+            }) if dst.to_reg() == vreg(0) && src == vreg(0) && imm.value() == 4
+        ));
     }
 
     #[test]

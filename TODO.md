@@ -3588,3 +3588,57 @@ runtime trip）。
 - [ ] 提交历史干净（原子提交，中文消息）；结论写入 TODO.md §10.20
 - [ ] 最终 git status 只剩非本任务文件
 ```
+
+### 10.20.1 执行记录（2026-08-06，分支 feat/loop-vectorize-hermes）
+
+**结论**：conv2d row_reduce（归约 + 写回）与 init_matrix 填充循环解锁向量化；
+conv2d-1/2/3 差分全 PASS（r: 776.74 / 226.52 / 77.22ms，conv2d-1 已贴近 clang
+基线 756ms）；h-8 主内核次任务未做（主任务验收闭环后另起）。
+
+**根因链（实证）**：
+
+1. **Mul 缺口**（goal 假设 1 成立）：direct 形态 `A[r*N_eff+c]` → NonAffineIndex
+   `{mul(r,N)}`。classify_index 的 (None,None) 分支只处理"一边 iv 一边 invariant"，
+   两边都 invariant（外层 IV × 全局 bound）落兜底 NonAffine。
+2. **UnknownBase ≠ 独立根因**（goal 假设 2 修正）：同一表达式经 `idx()` 内联后
+   产生 index-latch 链；`layout.parent_bb(BlockArgRef)=None`（layout.rs:378 断言）
+   + M42 的 `{header,latch}` 契约被内联的中间块破坏 → base 表解析失败。最终 IR
+   两种形态 PSR 后收敛同形，差异只在 M42 时刻。**修复选链融合而非改
+   parent_bb**（全局不变量，风险大）。
+3. **IntraIterationConflict(57,60)**（goal 假设 3）：索引修好后自动消失（B3 豁免
+   本就覆盖同 base 同 offset 的 load/store 对）。
+4. **RE/miscompile 真凶（新发现）**：GVN 把写回循环 load 的 GEP CSE 成 store 的
+   GEP（同地址表达式）→ 下游按共享地址重建时把向量 load 降成标量 →
+   `sub v5, w13, v3` 非法指令。修复：GVN 通用 CSE 跳过 GetElemPtr（地址指令共享
+   无 SSA 收益，却让消费方类型串扰）。
+5. **conv2d-1 差分 WA 真凶（新发现）**：runtime_trip 归约的 post-exit 累加器
+   读（写回循环的 splat）被重写到 reduce 块的 vector-only sum，而不是经 exit
+   参数穿线的 tail 最终 acc → tail 的 acc 更新成为死代码被 DCE 整环删除
+   （trip%4≠0 时最后一个元素不进 sum）。修复：post-exit 用户统一改经
+   `exit_extra_acc` 参数读取（tail/epilogue/reduce 三路都喂该参数）。
+
+**落地修改**（全部 raana_ir，uika_riscv 零影响）：
+
+- dependence.rs：classify_index Mul/Shl (None,None) 双侧分类——两侧 invariant →
+  coefficient 0 + `range_mul`（saturating 角点积）；`extract_access` stride 累加
+  改 saturating（param 全域 range × stride 溢出 panic，单测抓到）。
+- loop_vectorize.rs：`fuse_loop_body_chains`（innermost-only + all-headers 防护 +
+  唯一 pred + 拒绝即 break + 用户集驱动的参数替换）；GEP offset 放宽 +
+  `collect_index_math` 保持标量；多 apply 循环；`exit_extra_acc` 覆盖 post-exit
+  用户（runtime tail 穿线）。
+- gvn.rs：通用 CSE 跳过 GetElemPtr。
+- 新单测 2 个（invariant×invariant 解锁、inlined-idx 端到端）；新差分测试 3 个
+  （tests/perf/simd-{fill,rowreduce,rowreduce-tail}.sy）。
+
+**验证数字**：
+
+- cargo test -p raana_ir：414/414 全绿（412 + 2 新）。
+- conv2d-1 M44 复扫：UnknownBase 17→2（剩余 2 为主内核 c-loop 的 if 内访问，
+  范围外）、NonAffineIndex 1→0、IntraIterationConflict 1→0。
+- 差分：conv2d-1/2/3 PASS（r: 776.74/226.52/77.22ms）；simd-fill / simd-rowreduce
+  / simd-rowreduce-tail（N=521，trip%4=1，tail 路径）PASS。
+- 回归：01_mm1（4625ms）、h-5-01（1686ms）、h-10-01（28.98ms）PASS；
+  RISC-V functional/75_max_flow @ -O2 PASS。
+
+**未做**：h-8 主内核 B1 runtime-trip（次任务）；nonlinear %97（Rem 向量化独立项）。
+conv2d 主内核 c-loop 的 if 内访问（UnknownBase×2）留给 arm/mask 工作。

@@ -510,6 +510,14 @@ impl Pass for GlobalInstNumbering {
                 if !numbered.eliminable {
                     continue;
                 }
+                // Skip CSE for GetElemPtr: two memory ops may share an
+                // address expression, but their consumers (vector loads
+                // re-typed by M42, scalar sibling loads) must keep their own
+                // address inst — sharing it lets a later pass rebuild one
+                // consumer from the other's type.
+                if matches!(data.inst_data(value).kind(), InstKind::GetElemPtr(..)) {
+                    continue;
+                }
                 // Call leaders are tracked separately so a write can
                 // invalidate exactly the calls whose callee reads what it
                 // writes; the generic leaders map has no such invalidation.

@@ -272,9 +272,12 @@ pub(crate) fn classify_index(
                     (Some(c), _) => (i64::from(c), binary.rhs()),
                     (None, Some(c)) => (i64::from(c), binary.lhs()),
                     (None, None) => {
-                        // Both sides dynamic: if one side depends on the IV and
-                        // the other is loop-outside, this is a runtime-scaled
-                        // coefficient; otherwise it is not affine at all.
+                        // Both sides dynamic. Classify each side against the
+                        // IV: one side moving, the other invariant is a
+                        // runtime-scaled coefficient (not modelable); both
+                        // sides loop-invariant makes the product itself
+                        // invariant — the offset range is the elementwise
+                        // product of the two ranges.
                         let lhs = classify(binary.lhs());
                         let rhs = classify(binary.rhs());
                         match (lhs, rhs) {
@@ -283,6 +286,17 @@ pub(crate) fn classify_index(
                             }
                             (Ok(l), Ok(r)) if r.coefficient != 0 && l.coefficient == 0 => {
                                 return Err(ForbidReason::RuntimeCoefficient { access: gep });
+                            }
+                            (Ok(l), Ok(r)) if l.coefficient == 0 && r.coefficient == 0 => {
+                                // `inv1 * inv2`: both factors loop-invariant
+                                // (e.g. `mul(r, N)` for an outer IV `r` and a
+                                // runtime bound `N`). The product is a plain
+                                // invariant offset whose range is the product
+                                // of the two ranges.
+                                return Ok(IndexInfo {
+                                    coefficient: 0,
+                                    offset_range: range_mul(l.offset_range, r.offset_range),
+                                });
                             }
                             _ => {
                                 return Err(ForbidReason::NonAffineIndex {
@@ -331,6 +345,21 @@ fn scale_range((min, max): (i64, i64), factor: i64) -> (i64, i64) {
     } else {
         (max * factor, min * factor)
     }
+}
+
+/// Elementwise product of two invariant ranges: `[a1,b1] * [a2,b2]` spans
+/// `min(a1*a2, a1*b2, b1*a2, b1*b2)` .. `max(...)`. `i64` overflow of the
+/// product (ranges can reach `i32::MAX` ~ 2.1e9, whose square overflows)
+/// saturates — an over-wide range only makes the later overlap tests more
+/// conservative, never unsound.
+fn range_mul((a1, b1): (i64, i64), (a2, b2): (i64, i64)) -> (i64, i64) {
+    let corners = [
+        a1.saturating_mul(a2),
+        a1.saturating_mul(b2),
+        b1.saturating_mul(a2),
+        b1.saturating_mul(b2),
+    ];
+    (*corners.iter().min().unwrap(), *corners.iter().max().unwrap())
 }
 
 /// Extract the access function of one memory address by walking its GEP chain.
@@ -399,8 +428,8 @@ fn extract_access(
                 }
             };
             coefficient += info.coefficient * stride;
-            off_min += info.offset_range.0 * stride;
-            off_max += info.offset_range.1 * stride;
+            off_min = off_min.saturating_add(info.offset_range.0.saturating_mul(stride));
+            off_max = off_max.saturating_add(info.offset_range.1.saturating_mul(stride));
         }
         cur = gep.base();
     }
@@ -1343,6 +1372,115 @@ mod tests {
         assert!(
             matches!(dep.verdict, Verdict::Vectorizable),
             "expected Vectorizable, got {:?}",
+            dep.verdict
+        );
+    }
+
+    #[test]
+    fn invariant_times_invariant_index_unlocks_row_major_access() {
+        // `sum += A[r*N_eff + c]` over `while (c < N_eff)` nested in
+        // `while (r < N_eff)` — conv2d's row_reduce reduction shape with
+        // the runtime bound in a global. The inner GEP offset is
+        // `add(mul(r, N_eff), c)`: both `r` (outer IV) and `N_eff` (global
+        // load) are loop-invariant w.r.t. the inner loop, so the Mul branch
+        // must classify the product as invariant (coefficient 0, range =
+        // product) instead of NonAffineIndex.
+        let mut program = Program::new();
+        let i32 = Type::get_i32();
+        let function = program.new_function(
+            Type::get_i32(),
+            "row_reduce".into(),
+            vec![
+                Type::get_i32(),
+                Type::get_pointer(Type::get_array(Type::get_i32(), 64)),
+            ],
+        );
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        // `n` is a function parameter: a non-constant, loop-outside value
+        // (mirrors conv2d's `N_eff`, which reaches the loop as a
+        // non-constant load) — the (None, None) Mul branch is exercised.
+        let n = data.params()[0];
+        let base = data.params()[1];
+        let outer_header = data
+            .new_basic_block()
+            .basic_block("outer_header".into(), vec![i32.clone()]);
+        let outer_body = data.new_basic_block().basic_block("outer_body".into(), vec![]);
+        let inner_header = data
+            .new_basic_block()
+            .basic_block("inner_header".into(), vec![i32.clone(), i32.clone()]);
+        let inner_body = data.new_basic_block().basic_block("inner_body".into(), vec![]);
+        let inner_exit = data.new_basic_block().basic_block("inner_exit".into(), vec![]);
+        let outer_exit = data.new_basic_block().basic_block("outer_exit".into(), vec![]);
+        for block in [
+            outer_header,
+            outer_body,
+            inner_header,
+            inner_body,
+            inner_exit,
+            outer_exit,
+        ] {
+            data.layout_mut().push_bb_back(block);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let one = data.new_local_inst().integer(1);
+        let entry_jump = data.new_local_inst().jump(outer_header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let r = data.bb_data(outer_header).params()[0];
+        let outer_cmp = data.new_local_inst().binary(BinaryOp::Lt, r, n);
+        let outer_br = data
+            .new_local_inst()
+            .branch(outer_cmp, outer_body, vec![], outer_exit, vec![]);
+        data.layout_mut().insert_inst(outer_header, outer_cmp);
+        data.layout_mut().insert_inst(outer_header, outer_br);
+        let inner_jump = data.new_local_inst().jump(inner_header, vec![zero, zero]);
+        data.layout_mut().insert_inst(outer_body, inner_jump);
+
+        let sum = data.bb_data(inner_header).params()[0];
+        let c = data.bb_data(inner_header).params()[1];
+        let idx_mul = data.new_local_inst().binary(BinaryOp::Mul, r, n);
+        let idx_add = data.new_local_inst().binary(BinaryOp::Add, idx_mul, c);
+        let gep = data.new_local_inst().get_elem_ptr(base, vec![zero, idx_add]);
+        let load = data.new_local_inst().load(gep);
+        let sum_next = data.new_local_inst().binary(BinaryOp::Add, sum, load);
+        let c_next = data.new_local_inst().binary(BinaryOp::Add, c, one);
+        for inst in [idx_mul, idx_add, gep, load, sum_next, c_next] {
+            data.layout_mut().insert_inst(inner_body, inst);
+        }
+        let back = data.new_local_inst().jump(inner_header, vec![sum_next, c_next]);
+        data.layout_mut().insert_inst(inner_body, back);
+        let inner_cmp = data.new_local_inst().binary(BinaryOp::Lt, c, n);
+        let inner_br = data
+            .new_local_inst()
+            .branch(inner_cmp, inner_body, vec![], inner_exit, vec![]);
+        data.layout_mut().insert_inst(inner_header, inner_cmp);
+        data.layout_mut().insert_inst(inner_header, inner_br);
+        // The inner exit doubles as the outer latch: `r' = r + 1` back to
+        // the outer header.
+        let r_next = data.new_local_inst().binary(BinaryOp::Add, r, one);
+        let outer_back = data.new_local_inst().jump(outer_header, vec![r_next]);
+        data.layout_mut().insert_inst(inner_exit, r_next);
+        data.layout_mut().insert_inst(inner_exit, outer_back);
+        let ret = data.new_local_inst().ret(Some(sum));
+        data.layout_mut().insert_inst(outer_exit, ret);
+
+        // Analyze the inner loop (the second loop in the nesting).
+        let effects = EffectAnalysis::new(&program);
+        let analysis = DependenceAnalysis::new(&program, function, &effects, 4);
+        let fdata = program.func_data(function);
+        let (_cfg, _dom, loops) = LoopAnalysis::new(fdata);
+        let inner = loops
+            .loops()
+            .iter()
+            .find(|l| l.header() == inner_header)
+            .expect("inner loop");
+        let dep = analysis.for_loop(inner).expect("analyzed");
+        assert!(
+            !matches!(dep.verdict, Verdict::Forbidden { .. }),
+            "invariant×invariant index must not be NonAffineIndex, got {:?}",
             dep.verdict
         );
     }

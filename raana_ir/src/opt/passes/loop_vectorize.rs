@@ -57,7 +57,7 @@ use crate::ir::{
     builder_trait::*,
     inst_kind::{
         Binary, BlockArgRef, Float, GetElemPtr, InstKind, Integer, Load, Select, Store,
-        VectorReduce, VectorReduceOp, VectorSplat,
+        VectorExtractElement, VectorInsertElement, VectorReduce, VectorReduceOp, VectorSplat,
     },
     types::{Type, TypeKind},
     BasicBlock, BinaryOp, Function, Inst, Program,
@@ -772,7 +772,11 @@ fn analyze_loop(
             trace(data, looop, "shape_header_multi_inst");
             return None;
         }
-        if branch.t_target() != latch {
+        if branch.t_target() != latch
+            && !arm_plan
+                .as_ref()
+                .is_some_and(|a| branch.t_target() == a.body_br)
+        {
             trace(data, looop, "shape_header_multi_inst");
             return None;
         }
@@ -1359,6 +1363,9 @@ fn analyze_loop(
             if bb != Some(header)
                 && bb != Some(latch)
                 && !(runtime_trip && bb == Some(exit))
+                && !arm_plan
+                    .as_ref()
+                    .is_some_and(|a| bb == Some(a.body_br) || bb == Some(a.arm))
             {
                 trace(data, looop, "test_at_top_exit_reads_iv");
                 return None;
@@ -1590,6 +1597,12 @@ fn analyze_loop(
             match operand_class {
                 Some(Class::VecLoad) | Some(Class::VecBinary) | Some(Class::VecSelect) => {}
                 _ => {
+                    // B3c: the index IV consumed as a value (not a GEP
+                    // offset) is rewritten to the lane counter at mutation
+                    // time, so it is a legal binary operand.
+                    if operand == iv {
+                        continue;
+                    }
                     if !is_loop_invariant(arena, operand, header, latch) {
         trace(data, looop, "binary_operand_loop_variant");
         return None;
@@ -1651,9 +1664,13 @@ fn analyze_loop(
         match src_class {
             Some(Class::VecLoad) | Some(Class::VecBinary) | Some(Class::VecSelect) => {}
             _ => {
+                // B3c: the index IV written as a value becomes the lane
+                // counter at mutation time.
+                if store.src() == iv {
+                    continue;
+                }
                 if !is_loop_invariant(arena, store.src(), header, latch) {
-                                        trace(data, looop, "mixed_elem_types");
-        trace(data, looop, "store_src_loop_variant");
+                                        trace(data, looop, "store_src_loop_variant");
         return None;
                 }
             }
@@ -1728,10 +1745,12 @@ fn analyze_loop(
         }
     };
 
-    // B1 single-arm bodies: only exact trips are supported for now (the
-    // epilogue chain for multi-block bodies is not implemented; a runtime
-    // trip would need the arm body cloned into the tail).
-    if arm_plan.is_some() && (runtime_trip || trip % VF != 0) {
+    // B1 single-arm bodies: a compile-time trip that is not a multiple of
+    // VF is unsupported (the epilogue chain for multi-block bodies is not
+    // implemented). A runtime trip is supported: the scalar tail loop
+    // clones the arm's store as a scalar masked store (B3b), so the tail
+    // preserves the conditional overwrite without a branch.
+    if arm_plan.is_some() && !runtime_trip && trip % VF != 0 {
         trace(data, looop, "arm_remainder_not_supported");
         return None;
     }
@@ -1790,6 +1809,28 @@ fn classify_load(
         VF => Some((Class::VecLoad, elem)),
         _ => None,
     }
+}
+
+/// Whether two GEP instructions resolve to the same address (equal base and
+/// semantically equal offsets — constants compared by value, since distinct
+/// `Integer` instructions may hold the same constant). Used to pair a body
+/// store with a same-address arm store.
+fn same_gep_addr<A: Arena>(arena: &A, a: Inst, b: Inst) -> bool {
+    let (InstKind::GetElemPtr(ga), InstKind::GetElemPtr(gb)) =
+        (arena.inst_data(a).kind(), arena.inst_data(b).kind())
+    else {
+        return false;
+    };
+    if ga.base() != gb.base() || ga.offsets().len() != gb.offsets().len() {
+        return false;
+    }
+    ga.offsets().iter().zip(gb.offsets()).all(|(&x, &y)| {
+        x == y
+            || match (arena.inst_data(x).kind(), arena.inst_data(y).kind()) {
+                (InstKind::Integer(cx), InstKind::Integer(cy)) => cx.value() == cy.value(),
+                _ => false,
+            }
+    })
 }
 
 /// `load.src` / `store.dest` must be a payload GEP or a loop-invariant
@@ -2299,8 +2340,48 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         // forwarded.
         let mut map = FxHashMap::<Inst, Inst>::default();
         let mut insts: Vec<Inst> = Vec::with_capacity(payload.len() + 2);
+        // B1: arm stores become scalar masked stores in the tail; build
+        // the arm store → same-address body store src map first.
+        let arm_old_src: FxHashMap<Inst, Inst> = arm
+            .as_ref()
+            .map(|a| {
+                payload
+                    .iter()
+                    .filter(|&&p| {
+                        data.layout().parent_bb(p) == Some(a.arm)
+                            && matches!(data.inst_data(p).kind(), InstKind::Store(_))
+                    })
+                    .map(|&p| {
+                        let InstKind::Store(s) = data.inst_data(p).kind() else {
+                            unreachable!()
+                        };
+                        let old = payload
+                            .iter()
+                            .copied()
+                            .find(|&q| {
+                                q != p
+                                    && data.layout().parent_bb(q) != Some(a.arm)
+                                    && matches!(data.inst_data(q).kind(), InstKind::Store(os)
+                                        if same_gep_addr(data, os.dest(), s.dest()))
+                            })
+                            .map(|q| match data.inst_data(q).kind() {
+                                InstKind::Store(os) => os.src(),
+                                _ => unreachable!(),
+                            });
+                        (p, old.unwrap_or(iv))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let arm_mask = arm.as_ref().map(|a| ArmMask {
+            arm_bb: a.arm,
+            mask_cond: a.mask_cond,
+            old_src: &arm_old_src,
+        });
         for &orig in &payload {
-            insts.push(clone_payload_inst(data, orig, &mut map, iv, iv_t));
+            let cloned =
+                clone_payload_inst(data, orig, &mut map, iv, iv_t, arm_mask.as_ref(), &mut insts);
+            insts.push(cloned);
         }
         let mut jump_args: Vec<Inst> = Vec::new();
         if let Some(red) = &reduction {
@@ -2435,7 +2516,9 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             let mut map = FxHashMap::<Inst, Inst>::default();
             let mut insts: Vec<Inst> = Vec::with_capacity(payload.len() + 2);
             for &orig in &payload {
-                insts.push(clone_payload_inst(data, orig, &mut map, iv, subst_iv));
+                let cloned =
+                    clone_payload_inst(data, orig, &mut map, iv, subst_iv, None, &mut insts);
+                insts.push(cloned);
             }
             let mut jump_args: Vec<Inst> = Vec::new();
             if let Some(red) = &reduction {
@@ -2501,6 +2584,81 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     // 2. In-place vectorization of the latch payload (instruction ids are
     //    preserved by ReplaceBuilder, so later operands stay valid).
     let mut splats = FxHashMap::<Inst, Inst>::default();
+    // B3c: the index IV consumed as a payload *value* (a store src or a
+    // binary operand — not a GEP offset, which stays scalar) is rewritten
+    // to the lane counter `splat(iv) + [0, 1, .., VF-1]`, not a broadcast.
+    // The lane-offset constant is built once here; it is loop-invariant and
+    // LICM hoists it out of the body.
+    let iv_as_value = payload.iter().any(|&p| {
+        match data.inst_data(p).kind() {
+            InstKind::Binary(b) => b.lhs() == iv || b.rhs() == iv,
+            InstKind::Store(s) => s.src() == iv,
+            InstKind::Select(s) => {
+                s.cond() == iv || s.if_true() == iv || s.if_false() == iv
+            }
+            _ => false,
+        }
+    });
+    if iv_as_value && !splats.contains_key(&iv) {
+        let zero = data.new_local_inst().integer(0);
+        let anchor = payload[0];
+        // Build the lane-offset constant chain and insert every
+        // instruction in def-before-use order (alloc_inst alone leaves
+        // them out of the layout, producing dangling references).
+        let mut lane_off = alloc_inst(data, VectorSplat::new_data(zero, vector_ty.clone()));
+        data.layout_mut().insert_inst_before(anchor, lane_off);
+        for k in 1..VF as i64 {
+            let c = data.new_local_inst().integer(k as i32);
+            let idx = data.new_local_inst().integer(k as i32);
+            lane_off = alloc_inst(
+                data,
+                VectorInsertElement::new_data(lane_off, c, idx, vector_ty.clone()),
+            );
+            data.layout_mut().insert_inst_before(anchor, lane_off);
+        }
+        let iv_splat = alloc_inst(data, VectorSplat::new_data(iv, vector_ty.clone()));
+        data.layout_mut().insert_inst_before(anchor, iv_splat);
+        let iv_vec = alloc_inst(
+            data,
+            Binary::new_data(iv_splat, lane_off, BinaryOp::Add, vector_ty.clone()),
+        );
+        data.layout_mut().insert_inst_before(anchor, iv_vec);
+        splats.insert(iv, iv_vec);
+    }
+    // B3b: arm stores fall back to the same-address body store's *original*
+    // src as the masked store's "old" side. Captured before the payload
+    // loop rewrites the stores (their src becomes a vector then).
+    let arm_old_src: FxHashMap<Inst, Inst> = arm
+        .as_ref()
+        .map(|a| {
+            payload
+                .iter()
+                .filter(|&&p| {
+                    data.layout().parent_bb(p) == Some(a.arm)
+                        && matches!(data.inst_data(p).kind(), InstKind::Store(_))
+                })
+                .map(|&p| {
+                    let InstKind::Store(s) = data.inst_data(p).kind() else {
+                        unreachable!()
+                    };
+                    let old = payload
+                        .iter()
+                        .copied()
+                        .find(|&q| {
+                            q != p
+                                && data.layout().parent_bb(q) != Some(a.arm)
+                                && matches!(data.inst_data(q).kind(), InstKind::Store(os)
+                                    if same_gep_addr(data, os.dest(), s.dest()))
+                        })
+                        .map(|q| match data.inst_data(q).kind() {
+                            InstKind::Store(os) => os.src(),
+                            _ => unreachable!(),
+                        });
+                    (p, old.unwrap_or(iv))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     for &inst in &payload {
         match classes.get(&inst) {
             Some(Class::VecLoad) => {
@@ -2537,15 +2695,26 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                         // with `m = -(eq(mask_cond, 0))` — all-ones exactly
                         // when the arm executes (it sits on the branch's
                         // false edge). The old value is the same-address
-                        // load already inside the arm.
-                        let old = payload.iter().copied().find(|&p| {
-                            matches!(
-                                data.inst_data(p).kind(),
-                                InstKind::Load(l) if l.src() == dest
-                            )
-                        });
+                        // load already inside the arm; when the body has no
+                        // such load (a pure overwrite shape
+                        // `a[i] = i; if (c) a[i] = 4;`), fall back to the
+                        // same-address unconditional store's *original* src
+                        // (captured before the payload loop rewrote the
+                        // stores) — its vector value re-writes the
+                        // unconditional lanes, preserving program order
+                        // (B3b).
+                        let old = payload
+                            .iter()
+                            .copied()
+                            .find(|&p| {
+                                matches!(
+                                    data.inst_data(p).kind(),
+                                    InstKind::Load(l) if l.src() == dest
+                                )
+                            })
+                            .or_else(|| arm_old_src.get(&inst).copied());
                         let Some(old) = old else {
-                            unreachable!("arm store without a same-address load");
+                            unreachable!("arm store without a same-address load or body store");
                         };
                         let vnew = vector_operand(
                             data, &mut splats, src, &payload, &classes, &vector_ty, inst,
@@ -2710,6 +2879,11 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     //     so the exit must not receive the latch's per-iteration update.
     if test_at_top || runtime_trip || reduction.is_some() || r > 0 || has_iv_final {
         let (cond, t_target, t_args) = if test_at_top {
+            // The counter test's true edge enters the loop body: the B1
+            // single-arm shape starts at body_br (the payload), otherwise
+            // the latch holds the payload. The original bound test's true
+            // edge is retargeted accordingly.
+            let body_target = arm.as_ref().map(|a| a.body_br).unwrap_or(latch);
             if runtime_trip {
                 // `gt(counter, 0)`: a negative `cnt0` (negative trip)
                 // must not spin the vector loop forever.
@@ -2719,9 +2893,9 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                     Binary::new_data(eff_counter, zero, BinaryOp::Gt, i32.clone()),
                 );
                 data.layout_mut().insert_inst_before(latch_branch, gt);
-                (gt, latch, vec![])
+                (gt, body_target, vec![])
             } else {
-                (eff_counter, latch, vec![])
+                (eff_counter, body_target, vec![])
             }
         } else {
             let (orig_cond, t_target, t_args) = match data.inst_data(latch_branch).kind() {
@@ -3051,16 +3225,30 @@ fn vector_operand(
     splat
 }
 
+/// B1 arm-store masking for the scalar tail loop: the arm's conditional
+/// store is cloned as `store select(eq(mask_cond, 0), new, old), dest`
+/// with `old` taken from the same-address body store's src (B3b), so the
+/// linear tail block needs no branch.
+struct ArmMask<'a> {
+    arm_bb: BasicBlock,
+    mask_cond: Inst,
+    old_src: &'a FxHashMap<Inst, Inst>,
+}
+
 /// Clone one payload instruction into an epilogue block, substituting the
 /// index IV with a constant. In-loop operands resolve through `map` (the
 /// payload is cloned in def-before-use order); constants are re-created per
-/// block; globals and dominating values are reused.
+/// block; globals and dominating values are reused. When `arm_mask` is
+/// Some, a store living in the B1 arm is cloned as a scalar masked store
+/// (the tail has no branch for the arm condition).
 fn clone_payload_inst(
     data: &mut ArenaContextMut<'_>,
     orig: Inst,
     map: &mut FxHashMap<Inst, Inst>,
     iv: Inst,
     subst_iv: Inst,
+    arm_mask: Option<&ArmMask<'_>>,
+    out: &mut Vec<Inst>,
 ) -> Inst {
     let (kind_snapshot, ty) = {
         let orig_data = data.inst_data(orig);
@@ -3079,10 +3267,37 @@ fn clone_payload_inst(
             map_operand(data, load.src(), map, iv, subst_iv),
             ty,
         ),
-        InstKind::Store(store) => Store::new_data(
-            map_operand(data, store.src(), map, iv, subst_iv),
-            map_operand(data, store.dest(), map, iv, subst_iv),
-        ),
+        InstKind::Store(store) => {
+            let dest = map_operand(data, store.dest(), map, iv, subst_iv);
+            if let Some(arm) = arm_mask {
+                if data.layout().parent_bb(orig) == Some(arm.arm_bb) {
+                    // B1 scalar masked store:
+                    // `store select(eq(mask_cond, 0), new, old), dest`.
+                    // `new` is the arm's value; `old` is the same-address
+                    // body store's src (cloned earlier — the payload is
+                    // cloned in def-before-use order) or the IV itself.
+                    let new = map_operand(data, store.src(), map, iv, subst_iv);
+                    let old_src = arm.old_src.get(&orig).copied().unwrap_or(iv);
+                    let old = map_operand(data, old_src, map, iv, subst_iv);
+                    let cond = map.get(&arm.mask_cond).copied().unwrap_or(arm.mask_cond);
+                    let zero = data.new_local_inst().integer(0);
+                    let eq0 = alloc_inst(
+                        data,
+                        Binary::new_data(cond, zero, BinaryOp::Eq, ty.clone()),
+                    );
+                    let sel = alloc_inst(data, Select::new_data(eq0, new, old, ty.clone()));
+                    let cloned = alloc_inst(data, Store::new_data(sel, dest));
+                    map.insert(orig, cloned);
+                    out.push(eq0);
+                    out.push(sel);
+                    return cloned;
+                }
+            }
+            Store::new_data(
+                map_operand(data, store.src(), map, iv, subst_iv),
+                dest,
+            )
+        }
         InstKind::Binary(binary) => Binary::new_data(
             map_operand(data, binary.lhs(), map, iv, subst_iv),
             map_operand(data, binary.rhs(), map, iv, subst_iv),

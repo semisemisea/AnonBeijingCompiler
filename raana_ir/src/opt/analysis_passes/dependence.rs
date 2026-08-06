@@ -711,6 +711,28 @@ fn test_access_pair(
     if a.kind == AccessKind::Read && b.kind == AccessKind::Read {
         return Ok(());
     }
+    // B3b: same-address write-write pairs. An unconditional store followed
+    // by a conditional store of the same address (e.g. the B1 single-arm
+    // `if` shape `a[i] = i; if (i%4==0) a[i] = 4;`) is merged by the
+    // vectorizer's masked-store rewrite into one masked store that keeps
+    // program order (the unconditional value is the mask's "old" side), so
+    // the pair is safe. Conditions: both accesses move with the IV
+    // (byte_coefficient != 0 — an invariant address would be written once
+    // per lane by a vector store, corrupting semantics), and both must
+    // resolve to the exact same address every iteration (equal base /
+    // coefficient / constant_part / size). Equal nonzero coefficients also
+    // guarantee no cross-iteration overlap, so the loop-carried test below
+    // is skipped.
+    if a.kind == AccessKind::Write
+        && b.kind == AccessKind::Write
+        && a.byte_coefficient != 0
+        && a.byte_coefficient == b.byte_coefficient
+        && a.constant_part == b.constant_part
+        && a.base == b.base
+        && a.size == b.size
+    {
+        return Ok(());
+    }
     if same_iteration_may_overlap(a, b, trip) {
         return Err(ForbidReason::IntraIterationConflict {
             a: a.inst,
@@ -1602,6 +1624,128 @@ mod tests {
         assert!(
             !matches!(dep.verdict, Verdict::Forbidden { .. }),
             "in-place read-modify-write must no longer be forbidden, got {:?}",
+            dep.verdict
+        );
+    }
+
+    #[test]
+    fn same_address_write_write_pair_is_allowed() {
+        // `a[j] = j; a[j] = 2;`: two same-address writes with a nonzero
+        // IV coefficient. The vectorizer keeps program order (the masked
+        // store rewrites the second one with the first's value as the
+        // "old" side), so the pair is safe — the loop must no longer be
+        // forbidden by an IntraIterationConflict.
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "f".into(),
+            vec![Type::get_pointer(Type::get_array(Type::get_i32(), 16))],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let a = data.params()[0];
+        let n = data.new_local_inst().integer(16);
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let j = data.bb_data(header).params()[0];
+        let one = data.new_local_inst().integer(1);
+        let two = data.new_local_inst().integer(2);
+        let gep = data.new_local_inst().get_elem_ptr(a, vec![zero, j]);
+        let store1 = data.new_local_inst().store(j, gep);
+        let store2 = data.new_local_inst().store(two, gep);
+        let j_update = data.new_local_inst().binary(BinaryOp::Add, j, one);
+        for inst in [gep, store1, store2, j_update] {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        let back = data.new_local_inst().jump(header, vec![j_update]);
+        data.layout_mut().insert_inst(body, back);
+        let compare = data.new_local_inst().binary(BinaryOp::Lt, j, n);
+        let branch = data
+            .new_local_inst()
+            .branch(compare, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, compare);
+        data.layout_mut().insert_inst(header, branch);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        let dep = analyze(&program, function);
+        assert!(
+            !matches!(dep.verdict, Verdict::Forbidden { .. }),
+            "same-address write-write pair must be allowed, got {:?}",
+            dep.verdict
+        );
+    }
+
+    #[test]
+    fn same_address_invariant_write_write_stays_forbidden() {
+        // `g[0] = 1; g[0] = 2;` inside a loop: the address is
+        // loop-invariant (byte_coefficient == 0), so a vector store would
+        // write the same address once per lane — the pair must stay
+        // forbidden.
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_unit(),
+            "f".into(),
+            vec![Type::get_pointer(Type::get_array(Type::get_i32(), 16))],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let g = data.params()[0];
+        let n = data.new_local_inst().integer(16);
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [header, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let j = data.bb_data(header).params()[0];
+        let one = data.new_local_inst().integer(1);
+        let one_c = data.new_local_inst().integer(1);
+        let two = data.new_local_inst().integer(2);
+        let gep = data.new_local_inst().get_elem_ptr(g, vec![zero, zero]);
+        let store1 = data.new_local_inst().store(one, gep);
+        let store2 = data.new_local_inst().store(two, gep);
+        let j_update = data.new_local_inst().binary(BinaryOp::Add, j, one_c);
+        for inst in [gep, store1, store2, j_update] {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        let back = data.new_local_inst().jump(header, vec![j_update]);
+        data.layout_mut().insert_inst(body, back);
+        let compare = data.new_local_inst().binary(BinaryOp::Lt, j, n);
+        let branch = data
+            .new_local_inst()
+            .branch(compare, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, compare);
+        data.layout_mut().insert_inst(header, branch);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+
+        let dep = analyze(&program, function);
+        assert!(
+            matches!(
+                dep.verdict,
+                Verdict::Forbidden {
+                    reason: ForbidReason::LoopCarriedConflict { .. }
+                        | ForbidReason::IntraIterationConflict { .. }
+                }
+            ),
+            "invariant-address write-write pair must stay forbidden, got {:?}",
             dep.verdict
         );
     }

@@ -436,11 +436,38 @@ fn fuse_loop_body_chains(data: &mut ArenaContextMut<'_>) -> bool {
                 let InstKind::Jump(jump) = fdata.inst_data(term).kind() else {
                     continue; // Only jump-terminated blocks are pure links.
                 };
-                let in_edges = incoming_edges(fdata, &cfg, b);
-                if in_edges.len() != 1 {
+                // Structural predecessors over the *whole layout* (not just
+                // the CFG, which can omit unreachable blocks): a dangling
+                // terminator in an unreachable block pointing at `b` would
+                // otherwise be missed, and fusing `b` away would leave that
+                // terminator targeting a removed block.
+                let mut b_preds = Vec::new();
+                for bb_l in fdata.layout().basicblocks() {
+                    let src = bb_l.bb();
+                    let Some(&t) = bb_l.insts().get_last() else {
+                        continue;
+                    };
+                    match fdata.inst_data(t).kind() {
+                        InstKind::Jump(j) => {
+                            if j.target() == b {
+                                b_preds.push(src);
+                            }
+                        }
+                        InstKind::Branch(br) => {
+                            if br.t_target() == b {
+                                b_preds.push(src);
+                            }
+                            if br.f_target() == b {
+                                b_preds.push(src);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if b_preds.len() != 1 {
                     continue;
                 }
-                let edge = in_edges[0];
+                let edge = incoming_edges(fdata, &cfg, b)[0];
                 if edge.source() == b {
                     continue; // Self loop: not a link.
                 }

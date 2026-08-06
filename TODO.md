@@ -3642,3 +3642,139 @@ conv2d-1/2/3 差分全 PASS（r: 776.74 / 226.52 / 77.22ms，conv2d-1 已贴近 
 
 **未做**：h-8 主内核 B1 runtime-trip（次任务）；nonlinear %97（Rem 向量化独立项）。
 conv2d 主内核 c-loop 的 if 内访问（UnknownBase×2）留给 arm/mask 工作。
+
+### 10.20.2 h-8 主内核拒绝链调研（2026-08-06，实证）
+
+**结论先行**：h-8 主内核（nussinov k-loop）**结构性无法直接向量化**——clang -O2
+也只有 5 条 NEON（基本未向量化）佐证。原次任务"期望 r 3.0s 下降"的预期需要
+修正：SIMD 空间有限，建议降级优先级（详见下文下一步建议）。
+
+**复扫数据**（M44_TRACE=1 h-8-01，kernel_nussinov）：
+
+- BB5/BB34/BB2 `not_innermost`：i-loop / j-loop / 外层（含子循环，正常）。
+- **BB29 = k-loop**（最内层热点）：
+  - `m42_forbidden:UnknownBase(Inst(236))` —— table[k+1][j] 的访问地址
+    base 解析失败。IR 形态：该访问已被 PSR 转成循环携带的推进指针
+    （%130 → %154 = getelemptr %130, 1400），且 table 是双 offset GEP
+    （getelemptr %5, (%135, %vid_4)）——base 表不认这两种形态。
+  - `IntraIterationConflict { a: Inst(224), b: Inst(259) }` —— table[i][j] 的
+    load + 条件 store。B3 豁免 `is_elementwise_inplace`（dependence.rs:687）
+    要求 `value_flows_to(read, store.src)`（读回写直通 RMW）；nussinov 是
+    `if (old < cand) table[i][j] = cand` **条件覆盖写**（store 值是计算产物，
+    非 load 原值）→ 豁免不命中。
+- **BB37 = mod-11 循环**（`table[i][j] = table[i][j] % 11`）：
+  `payload_inst_rejected:Rem` ×3 + verdict=Reducible ×4——elementwise 连续、
+  无 if、runtime trip 机制已就绪，**只差 Rem 向量化**。
+- 未出现 `arm_remainder_not_supported`（1458）——k-loop 在 access 冲突测试
+  （shape/arm 分析之前）就被拒，走不到 arm 阶段。
+
+**结构性障碍（即使修掉上述两个拒绝点也无法向量化的原因）**：
+
+1. **table[i][j] 是 invariant 地址的条件 store**：地址对 k 不随迭代变化，
+   向量 store 会把 4 个 lane 结果写到 table[i][j..j+3] 相邻元素——语义错误。
+   需要"标量广播 + lane 归约"新机制（等价于把条件 store 变成 reduction）。
+2. **table[k+1][j] 列访问**：k 步进 1 → 字节 stride 1400×4=5600，M42 只认
+   byte_coefficient 4 的连续访问。
+3. 唯一连续访问是 table[i][k]（stride 4）——单独向量化无收益。
+
+**下一步建议**（按收益/成本排序）：
+
+- a. **降级 h-8 优先级**（推荐）：结构性障碍 + clang 佐证，主内核收益预期低。
+- b. **Rem 向量化**（可选小项）：解锁 mod-11 循环（BB37）——elementwise 连续，
+  向量魔法数除法；但 1400²=196 万元素 vs 主内核 O(n³/6)≈4.6 亿次迭代，占比
+  <1%，收益微小。可与 nonlinear %97（Rem 向量化独立项）合并研究。
+- c. **转向 transpose**（推荐替代）：clang 7 条 NEON 我们 0——经典 SIMD 用例；
+  需要跨 lane 洗牌/列访问支持（zt1/tbl），是 M42 的新能力维度。
+- d. **03_sort 清零循环**（低成本候选）：clang 22 条（计数数组清零）我们 0——
+  先插桩实证为什么 ZeroStoreLoop/M42 未覆盖（栈 VLA 数组 + 运行时 bound）。
+
+### 10.20.3 新 session goal 提示词（h-8 调研结论 + SIMD 下一步，可直接粘贴新 session）
+
+```text
+# Goal: 验证 h-8 拒绝链调研结论，并攻克下一个 SIMD 目标（transpose 优先）
+
+## 你在这个 session 的角色
+
+你是 SIMD 推进 agent。上一 session（§10.20.1/§10.20.2）已交付：
+conv2d row_reduce 解锁（5 commits @ d65883a）+ h-8 拒绝链实证。你的任务：
+**先花 20 分钟验证 §10.20.2 的结论（形态实证先行，禁止直接改代码），
+再按下方"任务选择"攻克一个目标。**
+
+## 仓库状态（2026-08-06，分支 feat/loop-vectorize-hermes @ d65883a）
+
+- 已合入：classify_index invariant×invariant Mul 缺口（885fb8f）、M42 链融合 +
+  GEP offset 放宽 + index-math Keep + 多 apply（8a44173）、runtime 归约 tail acc
+  经 exit 参数穿线 + GVN 跳过 GEP CSE（1738d46）、simd-* 差分测试（fe1e3af）、
+  docs §10.20.1（d65883a）。
+- 全语料 SIMD 扫描（63 用例，clang vs ours 严格 NEON 指令计数）：我们完全无
+  SIMD 的只有 4 个用例族：03_sort（clang 22）、crc（8）、transpose（7）、
+  h-8（5）。其余双方都 0（huffman/knapsack/fft/h-9/h-4/h-1/shuffle/scheduling）
+  或我们已领先（many_mat_cal/01_mm/conv2d/h-5/h-10/simd-*）。
+
+## 第一步：验证 §10.20.2 的 h-8 结论（30 分钟内完成）
+
+1. `M44_TRACE=1 ./target/release/compiler -O2 --target aarch64 --emit ir -o
+   /tmp/h8.ir tests/perf/h-8-01.sy 2>&1 | grep -E "M44\]" | sort | uniq -c`
+   ——预期看到：k-loop（BB29）UnknownBase(236) + IntraIterationConflict{a:224,
+   b:259}；mod-11 循环（BB37）payload_inst_rejected:Rem；i/j/外层 not_innermost。
+2. 读 /tmp/h8.ir 的 k-loop（while_entry_26/while_body_27/then_29/end_30）确认：
+   table[i][j] 条件覆盖写（invariant 地址）、table[k+1][j] 列访问（stride
+   5600）、table[i][k] 连续（stride 4）。
+3. 对照 clang：`clang -O2 -x c -S -target aarch64-none-elf
+   -Wno-implicit-function-declaration -Wno-error=gnu-folding-constant -o
+   /tmp/c.s tests/perf/h-8-01.sy` 后数 NEON（应 ~5 条）。
+4. 若以上与文档不符，以你的实证为准并更新 TODO §10.20.2（patch，中文）。
+
+## 任务选择（验证完成后，按优先级挑一个；选 b/c 需先写方案到 TODO 再动手）
+
+- **a. h-8 主内核向量化（高难度，慎重）**：结构性障碍已实证——table[i][j]
+  是 invariant 地址的条件 store（向量 store 会写相邻元素，语义错误，需要
+  "标量广播 + lane 归约"新机制）+ table[k+1][j] 列访问（stride 5600，M42 只认
+  byte_coefficient 4）。若选此项：先写机制设计文档（接口/伪代码/预期收益）到
+  TODO，说明如何把条件覆盖写转成 lane 语义，再动手。
+- **b. transpose 向量化（推荐主攻）**：clang 7 条 NEON 我们 0。形态：内层循环
+  `B[j][i] = A[i][j]`——读端 A 行连续（可向量 load），写端 B 列 stride N*4
+  （非连续）——需要跨 lane 洗牌（tbl/uzp）或列写（st1 变体）支持，是 M42 的
+  新能力维度。先复扫 transpose0 的 M44 拒绝链（预期：写端 byte_coefficient
+  != 4 被拒），设计"读行向量 + 转置洗牌 + 连续写"或"读行 + 标量列写"方案。
+- **c. 03_sort 清零循环（低成本）**：clang 22 条（计数数组清零）我们 0。先
+  插桩实证 ZeroStoreLoop/M42 对 `int head[base]`（栈 VLA 折叠常量 + 运行时
+  bound）清零循环为何未触发，再修。
+- **d. Rem 向量化（小项，可独立）**：mod-11 循环（BB37）elementwise 连续只差
+  Rem（向量魔法数除法）。收益 <1%（196 万 vs 主内核 4.6 亿次迭代），可与
+  nonlinear %97 合并研究，不宜单独占任务。
+
+## 必须遵守的规则
+
+- 只改 raana_ir（loop_vectorize.rs / dependence.rs / 相关 pass）；不碰
+  anon_armv8/taki_mir（除非方案明确要求且先写 TODO）；uika_riscv 零影响。
+- 无 hacky workaround；root cause only；不做 benchmark/函数名/输入条件优化；
+  禁止 Rc<RefCell<T>>。
+- 形态实证先行；勤 commit（中文消息、git commit -F 规避 homoglyph 扫描）；
+  改文件一律 patch；不碰 .docker-image、不 rm -rf、不 cargo clean；不 push。
+- 验收粒度 = 单测 + 单 case（make test ... ARGS="-O 2 -j 1"）。
+
+## 验证命令
+
+- 单测：cargo test -p raana_ir 2>&1 | grep -E "test result"（全绿是底线）
+- 复扫：M44_TRACE=1 ./target/release/compiler -O2 --target aarch64 --emit ir
+  -o /tmp/x.ir tests/perf/<case>.sy 2>&1 | grep -oE "reject=[A-Za-z0-9_:{} ]+"
+  | sort | uniq -c（记录前后数字）
+- 差分：make test perf/transpose0.sy perf/transpose1.sy perf/transpose2.sy
+  （或对应目标用例）ARGS="-O 2 -j 1"（PASS + r 前后）；musl 过期先
+  touch raana_ir/src/opt/pass.rs soyo_compiler/src/main.rs
+- 回归：conv2d-1/2/3 + 01_mm1 + h-5-01 + h-10-01 不回归；RISC-V 抽查
+  （make test-riscv ARGS="-O 2" 单 case）
+- 对照：clang NEON 计数方法见 §10.20.2（clang -O2 -x c -S -target
+  aarch64-none-elf -Wno-implicit-function-declaration
+  -Wno-error=gnu-folding-constant，tr 归一化后严格模式数 v/q 寄存器指令）
+
+## 验收清单（全部满足才算完成）
+
+- [ ] §10.20.2 结论已验证（复扫数字一致）或已按实证更新
+- [ ] 选定目标的拒绝链已实证并写入 TODO（含现象数据、根因、候选方案）
+- [ ] 目标用例差分 PASS（记录 r 前后与 clang 对比）；单测全绿
+- [ ] 既有向量化（conv2d/01_mm1/h-5/h-10）不回归；RISC-V 零影响
+- [ ] 提交历史干净（原子提交，中文消息）；结论写入 TODO
+- [ ] 最终 git status 只剩非本任务文件（Vectorize_Progress.md）
+```

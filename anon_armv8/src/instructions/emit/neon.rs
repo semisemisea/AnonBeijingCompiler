@@ -61,10 +61,11 @@ pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result
         MInst::VecArithRRR {
             op,
             shape,
+            is_float,
             dst,
             lhs,
             rhs,
-        } => emit_vec_rrr(ctx, vec_arith_name(*op), *dst, *shape, *lhs, *rhs),
+        } => emit_vec_rrr(ctx, vec_arith_name(*op, *is_float), *dst, *shape, *lhs, *rhs),
         MInst::VecFmla {
             shape,
             dst,

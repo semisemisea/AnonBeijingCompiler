@@ -575,3 +575,4 @@ impl<B: LowerBackend> EmitContext for EmitBuffer<'_, B> {
 
 #[cfg(test)]
 mod tests;
+

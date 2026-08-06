@@ -72,17 +72,20 @@ impl<'a> ArgLayoutPlanner<'a> {
         stack_slot_size: impl Fn(&HirType) -> u32,
     ) -> (Vec<ArgSlot>, u32) {
         let mut slots = Vec::with_capacity(types.len());
-        let (mut int_index, mut float_index, mut vector_index, mut stack_offset) =
-            (0usize, 0usize, 0usize, 0u32);
+        // AAPCS64 allocates scalar-float and vector arguments from one shared
+        // SIMD/FP register bank (`sN` is the low 32 bits of `vN`), so a
+        // single `fp_index` advances across both. RISC-V never classifies a
+        // value as `Vector`, so its separate F bank is unaffected.
+        let (mut int_index, mut fp_index, mut stack_offset) = (0usize, 0usize, 0u32);
 
         for ty in types {
-            let (regs, index) = match classify(ty) {
-                ArgRegBank::Int => (self.int_regs, &mut int_index),
-                ArgRegBank::Float => (self.float_regs, &mut float_index),
-                ArgRegBank::Vector => (self.vector_regs, &mut vector_index),
+            let (reg, slot_index) = match classify(ty) {
+                ArgRegBank::Int => (self.int_regs.get(int_index), &mut int_index),
+                ArgRegBank::Float => (self.float_regs.get(fp_index), &mut fp_index),
+                ArgRegBank::Vector => (self.vector_regs.get(fp_index), &mut fp_index),
             };
-            let reg = regs.get(*index).copied();
-            *index = index
+            let reg = reg.copied();
+            *slot_index = slot_index
                 .checked_add(1)
                 .expect("argument register index overflow");
 

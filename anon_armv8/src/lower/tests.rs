@@ -622,6 +622,7 @@ fn explicit_vector_vcode_emits_neon_assembly() {
     builder.push(MInst::VecArithRRR {
         op: VecArithOp::Add,
         shape: VecShape::FourS,
+        is_float: false,
         dst: Writable::from_reg(sum),
         lhs: v0,
         rhs: v1,
@@ -840,7 +841,7 @@ fn f32_scalars_do_not_alias_live_vector_results() {
 
     let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
     assert!(assembly.contains("fdiv v"), "{assembly}");
-    assert!(assembly.contains("fmov s"), "{assembly}");
+    assert!(assembly.contains("dup v"), "{assembly}");
     assert!(assembly.contains("fadd v"), "{assembly}");
 
     // Every scalar f32 view that is live across the vector divide must be

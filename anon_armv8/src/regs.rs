@@ -255,6 +255,10 @@ pub fn machine_env() -> &'static MachineEnv {
             vec![],
         ],
         fixed_stack_slots: vec![],
+        // `sN` is the low 32 bits of `vN`: a vector write clobbers the
+        // aliased float register, so the allocator must treat Float and
+        // Vector as interfering on a shared hw_enc.
+        aliased_banks: &[(RegClass::Float, RegClass::Vector)],
     })
 }
 

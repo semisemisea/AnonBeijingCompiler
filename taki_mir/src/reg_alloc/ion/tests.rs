@@ -91,6 +91,7 @@ fn machine_env() -> MachineEnv {
         scratch_by_class: [Some(r2), None, None],
         post_ra_scratch_by_class: [vec![r2], vec![], vec![]],
         fixed_stack_slots: vec![],
+        aliased_banks: &[],
     }
 }
 
@@ -107,6 +108,7 @@ fn wide_env() -> MachineEnv {
         scratch_by_class: [None, None, None],
         post_ra_scratch_by_class: [vec![], vec![], vec![]],
         fixed_stack_slots: vec![],
+        aliased_banks: &[],
     }
 }
 
@@ -394,6 +396,7 @@ fn float_env() -> MachineEnv {
         scratch_by_class: [None, Some(f2), None],
         post_ra_scratch_by_class: [vec![], vec![f2], vec![]],
         fixed_stack_slots: vec![],
+        aliased_banks: &[],
     }
 }
 

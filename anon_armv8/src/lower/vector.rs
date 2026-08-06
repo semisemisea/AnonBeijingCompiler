@@ -1,5 +1,7 @@
 //! NEON vector lowering helpers.
 
+use taki_mir::types::I32;
+
 use super::arith::{integer_constant, operand_size, signed_power_of_two};
 use super::*;
 /// Select a vector binary operation onto the NEON instruction set.
@@ -66,6 +68,10 @@ pub(super) fn lower_vector_binary(
                     _ => VecArithOp::Fmul,
                 },
                 shape,
+                // Float vectors use the `fadd`/`fsub`/`fmul` instructions:
+                // the integer `add v.4s` treats the lanes as integer bit
+                // patterns, corrupting every non-trivial float sum.
+                is_float,
                 dst,
                 lhs,
                 rhs,
@@ -383,6 +389,7 @@ fn lower_vector_constant_div_rem(
                     VecArithOp::Sub
                 },
                 shape,
+                is_float: false,
                 dst: Writable::from_reg(tmp),
                 lhs: high_result,
                 rhs: lhs,
@@ -426,6 +433,7 @@ fn lower_vector_constant_div_rem(
     ctx.emit(MInst::VecArithRRR {
         op: VecArithOp::Add,
         shape,
+        is_float: false,
         dst: Writable::from_reg(quotient),
         lhs: shifted,
         rhs: sign,
@@ -487,6 +495,7 @@ fn lower_vector_signed_div_rem_power_of_two(
         ctx.emit(MInst::VecArithRRR {
             op: VecArithOp::Add,
             shape,
+            is_float: false,
             dst: Writable::from_reg(tmp),
             lhs,
             rhs: biased,
@@ -562,6 +571,7 @@ fn emit_neg_vector(
     ctx.emit(MInst::VecArithRRR {
         op: VecArithOp::Sub,
         shape,
+        is_float: false,
         dst,
         lhs: zero,
         rhs: src,
@@ -618,7 +628,24 @@ pub(super) fn lower_vector_splat(
     let result = ctx.result_reg(inst);
     let dst = Writable::from_reg(result);
     let shape = vector_shape(arena.inst_data(inst).ty().kind());
-    let src = ctx.put_value_in_reg(splat.src());
+    // A constant splat source is materialized through a GPR (`dup vd.4s,
+    // wn`), not a float scalar register: routing the constant through
+    // `fmov sN` + `dup vd.4s, vN.s[0]` lets the `fmov` clobber a
+    // concurrently live vector value that shares the aliased `vN` (on
+    // AArch64 `sN` is the low 32 bits of `vN`) — the h-10 trsm
+    // vectorization miscompile.
+    let src = match arena.inst_data(splat.src()).kind() {
+        InstKind::Float(f) => {
+            let tmp = ctx.alloc_tmp(HirType::get_i32());
+            ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_load_imm(
+                Writable::from_reg(tmp),
+                u64::from(f.value().to_bits()),
+                I32,
+            ));
+            tmp
+        }
+        _ => ctx.put_value_in_reg(splat.src()),
+    };
     ctx.emit(MInst::VecDup { shape, dst, src });
     LoweredOutput::Value(result)
 }

@@ -3287,15 +3287,15 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 _ => unreachable!(),
             };
             let cond = if runtime_trip {
-                // Test the *updated* counter (`t_next = counter - 4`, the
-                // value the back edge carries): the rotated latch is a
-                // do-while — the body runs once before the test — so
-                // testing the entry value would run one extra vector
-                // body (reading past the trip and double-counting the
-                // first `trip & 3` elements in the tail). With
-                // `gt(t_next, 0)` the loop runs exactly `cnt0 / 4`
-                // iterations. The const path keeps the original `t' != 0`
-                // test, which already compares the updated counter.
+                // Test the *updated* counter (`eff_t_next`, rewritten to
+                // `counter - 4`): the rotated latch is a do-while — the body
+                // runs once before the test — so testing the entry value
+                // would run one extra vector body (reading past the trip and
+                // double-counting the first `trip & 3` elements in the tail).
+                // `gt(counter', 0)` also guards a negative `cnt0` (negative
+                // trip) from spinning forever. The const path keeps the
+                // original `t' != 0` test, which already compares the
+                // updated counter.
                 let zero = data.new_local_inst().integer(0);
                 let gt = alloc_inst(
                     data,

@@ -544,6 +544,48 @@ M44 v2（select 掩码）。
 - 遗留：test-at-top 模归约（exit 区域累加器直读重写）、const-trip
   R>0 epilogue 链携带标量累加器、runtime-trip rotated 端到端验证。
 
+##### M44 v2 目标 5（f32 向量化修复，2026-08-06，h-10-01）
+
+- 背景：h-10-01（trsm，f32 双循环）在 -O2 输出 `nan`（-O0 正确）。根因
+  排查出四个后端/向量器缺陷（-O2 叠加），全部修复后 h-10-01 在
+  -O0/-O2 均正确（`0x1.7a47acp+13`）：
+  1. **f32 向量加法误用整数 `add v.4s`**（最直接）：向量器生成 `<4 x f32>`
+     Add，lower.rs 记录 `is_float` 但 emit 一律打 `add/sub/mul`。整数
+     `add v.4s` 按位模式相加（0.5+1.0 = 0x3F000000+0x3F800000 =
+     0x7E800000 = 2^126），lane 0 碰巧对（0.0+1.0 的位模式加法等于
+     1.0）。修复：VecArithRRR 增加 `is_float` 字段，float 输出
+     `fadd/fsub/fmul`（clang vaddq_f32 同款）。
+  2. **向量 splat 常量经 float 寄存器**：`vector_splat 1` 走
+     `fmov sN` + `dup vd.4s, vN.s[0]`；`fmov s2` 会写 v2 低位，恰好与
+     并存的 A[i][i] splat（v2）冲突 → lane 0 被改写。修复：
+     `lower_vector_splat` 对 f32 常量经 GPR 出 `dup vd.4s, wn`。
+  3. **sN/vN 寄存器别名未在 RA 建模**（存量隐患，TODO 目标 1 曾标注
+     "经寄存器别名输出 dup"）：sN 是 vN 低 32 位，RA 把 Float/Vector
+     当独立类，可把 float 值与并存 vector 值分配到同一 hw_enc → 相互
+     覆盖（h-10 的 A[j][i] 被 ldr q 覆盖）。修复：MachineEnv 新增
+     `aliased_banks`（AArch64 [(Float, Vector)]），`try_to_allocate_
+     bundle_to_reg` 主扫描后加别名扫描（Float↔Vector 同 hw_enc 视为
+     冲突）；RA 里调用返回 float 同时 clobber vN 的"同点 def"仅在别名
+     扫描跳过（主扫描跳过会放掉真实冲突，曾引起 57_sort_test3/
+     85_long_code/15_graph_coloring -O2 回归）。
+  4. **AAPCS64 参数槽位**：ArgLayoutPlanner 用独立 float/vector 计数器，
+     但 AAPCS64 用同一 SIMD/FP 槽（v0-v7）——`(v4i32, f32)` 会 v0+s0
+     （物理同寄存器）。修复：float/vector 共享 `fp_index`。
+  5. **rotated runtime-trip 向量循环 off-by-one**：latch 检查
+     `gt(counter, 0)`（decrement 前），do-while 体多跑一次 → 尾部
+     2-3 个元素被处理两遍。修复：检查 post-decrement `gt(counter', 0)`
+     （`eff_t_next`）。
+- 验证：
+  - raana_ir 409 / anon_armv8 136 / taki_mir 59 / uika 全过（仅既有
+    uika_riscv constant_binary_folds_to_immediate 失败，hermes 上游
+    同款）。
+  - make test functional+h_functional -O2 152/152；perf -O2 59/60
+    （sl1 是既有失败，无改动也 FAIL）；test-riscv -O2 218/219（sl1）。
+  - h-10-01 docker harness -O0/-O2 均 PASS；host 原生 ARM64 对拍
+    `0x1.7a47acp+13`。M69 模归约/常数除（modt、g[i]/7）无回归。
+- 遗留：sl1 -O2 既有 wrong answer（本修复前即失败，待查）；h-10
+  其余用例（h-10-02/03）未验证。
+
 ##### M44 v2 目标 2（B3 内存累加）执行记录（2026-08-05）
 
 - 实现（两个原子 commit，见 Vectorize_Progress.md 目标 2 完成记录）：

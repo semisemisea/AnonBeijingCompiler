@@ -1591,10 +1591,7 @@ fn analyze_loop(
         }
         // Shifts and bitwise ops exist only for integers: NEON has no float
         // shift/and/or/xor forms and float shift semantics do not exist.
-        // (Div vectorizes only for f32 — NEON has no integer vector divide,
-        // `sdiv` is scalar-only; constant-divisor i32 loops are rewritten to
-        // shift chains by StrengthReduction before the vectorizer's next look.
-        // Min/Max vectorize for both i32 and f32: smin/smax/fmin/fmax.)
+        // Min/Max vectorize for both i32 and f32: smin/smax/fmin/fmax.
         if matches!(
             binary.op(),
             BinaryOp::Shl
@@ -1608,9 +1605,24 @@ fn analyze_loop(
             trace(data, looop, "binary_shift_bitwise_not_i32");
             return None;
         }
-        if binary.op() == BinaryOp::Div && ty.is_i32() {
-            trace(data, looop, "binary_int_div_no_neon");
-            return None;
+        // NEON has no integer vector divide (`sdiv` is scalar-only). Integer
+        // Div/Rem vectorize only with a *constant* divisor, which the
+        // AArch64 backend lowers to a multiply-high magic sequence
+        // (`smull`/`xtn`/`mls`); a variable divisor stays scalar. f32 Div
+        // uses `fdiv`; NEON has no float remainder form.
+        match binary.op() {
+            BinaryOp::Div if ty.is_f32() => {}
+            BinaryOp::Div | BinaryOp::Rem if ty.is_i32() => {
+                if !matches!(arena.inst_data(binary.rhs()).kind(), InstKind::Integer(_)) {
+                    trace(data, looop, "binary_int_div_rem_non_const");
+                    return None;
+                }
+            }
+            BinaryOp::Div | BinaryOp::Rem => {
+                trace(data, looop, "binary_div_rem_unsupported_lane");
+                return None;
+            }
+            _ => {}
         }
         if arena.inst_data(binary.rhs()).ty() != &ty {
             trace(data, looop, "binary_operand_type_mismatch");
@@ -1917,6 +1929,7 @@ fn is_vectorizable_binary_op(op: BinaryOp) -> bool {
             | BinaryOp::Or
             | BinaryOp::Xor
             | BinaryOp::Div
+            | BinaryOp::Rem
             | BinaryOp::Min
             | BinaryOp::Max
             | BinaryOp::Eq
@@ -4536,13 +4549,14 @@ mod tests {
 
     #[test]
     fn rejects_i32_div() {
-        // NEON has no integer vector divide (`sdiv` is scalar-only), so i32
-        // Div stays scalar; constant-divisor loops are rewritten to shift
-        // chains by StrengthReduction before the vectorizer's next look.
+        // NEON has no integer vector divide (`sdiv` is scalar-only), so a
+        // *variable* i32 divisor stays scalar; a constant divisor vectorizes
+        // through the multiply-high magic sequence (`smull`/`xtn`/`mls`).
         let mut program = Program::new();
         let (function, _header, _latch, _exit) =
             build_op_chain(&mut program, Type::get_i32(), 16, &[BinaryOp::Div], &[2]);
-        assert!(!run(&mut program, function), "i32 div must be rejected");
+        assert!(run(&mut program, function), "i32 const div must vectorize");
+        assert_eq!(vector_binaries(&program, function), vec![BinaryOp::Div]);
     }
 
     #[test]

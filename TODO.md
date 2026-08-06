@@ -3876,3 +3876,44 @@ TODO）。收益 <1%，与 nonlinear %97 合并研究。
 **本 session 决策**：transpose 主循环研究级（方案留档）；今日不落地任何
 低收益小项（main 初始化 ~3% / Rem <1% 均不符"热点解锁"验收标准）；如时间
 允许做 main 初始化作为 M42 新能力（store-store 合并）验证，否则仅留档。
+
+### 10.20.5 全语料 SIMD 缺口盘点与打通路径（2026-08-06，新 session 落地后复扫）
+
+**当前无 SIMD 的 33 个用例**（旧版 22 个有向量化 + 本轮新增 crc/transpose 6 个后
+的剩余）。分三类：
+
+**A. 有差距（clang>0 我们 0）——3 族值得打通**：
+
+1. **h-8-01/02/03**（clang 8 条，最易）：
+   - 差距全部在 mod-11 循环（table[i][j] % 11）——elementwise 连续 + runtime
+     trip 就绪，只差 **Rem 向量化**。clang 模板现成（8 条：movi#11/dup/smull/
+     smull2/uzp2/sshr/usra/mls = 向量魔法数除法）。
+   - 路径：is_vectorizable_binary_op 加 Rem + 后端（anon_armv8）向量 Rem
+     lowering。**需碰 anon_armv8（先写 TODO）**。收益 <1%（§10.20.2 已量化）。
+2. **03_sort1/2/3**（clang 29 条）：
+   - clang 向量化 = getMaxNum 的 max 归约（smax 两路展开）+ radixSort 内
+     add/常量序列。
+   - 我们拒绝链：getMaxNum `Reducible{acc=Inst(45),op=IntSub}`（`if (arr[i] >
+     ret) ret = arr[i]` 被降成 select 减法形态 → max 被误判成 IntSub，且
+     shape_header_multi_inst）；radixSort 核心循环 CallInBody（getNumPos 调用
+     ——内联后 cnt 下标是数据相关 gather，仍非 M42 能力）+ 前缀和 i/i-1 串行
+     依赖（LoopCarriedConflict）。
+   - 路径：a) 修 max 归约的 select 减法识别（小改，解锁 getMaxNum）；b) cnt
+     gather 统计与并行前缀超 M42 架构。**收益：max 扫描 O(n) 占比小**。
+3. **crypto-1/2/3**（clang 30 条，最难）：
+   - clang = MD5/SHA1 主循环 4 状态字并行（shl v, #8/#16/#24 + add = 循环左移
+     打包，.LBB9_8）。**SLP 风格**（多独立标量语句打包成向量），M42 架构
+     （单循环 elementwise/reduction）不支持。我们拒绝：b1_not_reducible +
+     shape_header_multi_inst + Reducible。
+   - 路径：新机制（多标量状态打包 + 每轮旋转/加法链）——研究级；且位操作
+     密集，NEON 收益有限。
+
+**B. 双方都 0（clang 也 0）——10 族无 SIMD 空间**：fft、h-1、h-4、h-9、
+huffman、knapsack_naive、optimization_scheduling、shuffle（算法不规则访问/
+递归/串行依赖，clang 佐证放弃）。
+
+**C. 已解锁**：crc1/2/3（crc32table 初始化，B3c）、transpose0/1/2（main 初始化
++ ans 循环，B3b+B1+B3c）。
+
+**优先级**（收益/成本）：h-8 Rem（成本低、模板现成，收益 <1%）→ 03_sort max
+归约识别修复（小改，收益小）→ crypto 状态字并行 / transpose 主循环（研究级）。

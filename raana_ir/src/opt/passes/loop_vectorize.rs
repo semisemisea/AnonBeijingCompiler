@@ -50,7 +50,7 @@
 //! and a counter step of 4, which the recognition checks reject, so the
 //! fixed-point pipeline converges after one application.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ir::{
     arena::Arena,
@@ -73,6 +73,7 @@ use crate::opt::{
     },
     pass::{ArenaContext, ArenaContextMut, Pass},
     utils::cfg::CFG,
+    utils::logical_edge::{incoming_edges, LogicalEdge, LogicalEdgeRewriter},
 };
 
 /// Vector width: 128-bit NEON registers over 4-byte elements.
@@ -112,19 +113,34 @@ impl Pass for LoopVectorize {
         if data.layout().entry_bb().is_none() {
             return false;
         }
-        if self.analysis.is_none() {
-            // Direct invocations (unit tests) have no analysis yet.
+        // Fusion pre-step: collapse 1-pred/1-succ chains inside loop bodies
+        // (inlined `idx()` computations land in their own blocks) so the
+        // shape contract below sees {header, latch} bodies. Semantically a
+        // no-op; benefits every later pass in the same iteration too.
+        let fused = fuse_loop_body_chains(data);
+        // Vectorize as many loops as this function has in one invocation:
+        // a single-apply call would leave sibling loops to a later
+        // fixed-point iteration, by which point PSR has rewritten them into
+        // advancing-pointer form (unanalyzable). Each apply mutates the IR
+        // (exit-region rewrites touch sibling blocks), so the analysis is
+        // refreshed between applications.
+        let mut changed = fused;
+        loop {
+            // Direct invocations (unit tests) have no analysis yet; every
+            // apply invalidates the previous whole-program effect snapshot.
             self.analysis = Some(EffectAnalysis::new(data.program));
+            let program: &Program = data.program;
+            let effects = self.analysis.as_ref().expect("analysis built above");
+            let plan = find_vectorizable(program, func, effects);
+            let Some(plan) = plan else {
+                break;
+            };
+            // Mutation phase.
+            if apply_vectorize(data, plan) {
+                changed = true;
+            }
         }
-        // Read-only analysis phase.
-        let program: &Program = data.program;
-        let effects = self.analysis.as_ref().expect("analysis built above");
-        let plan = find_vectorizable(program, func, effects);
-        let Some(plan) = plan else {
-            return false;
-        };
-        // Mutation phase.
-        apply_vectorize(data, plan)
+        changed
     }
 }
 
@@ -355,6 +371,234 @@ fn find_vectorizable(
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Chain fusion: collapse 1-pred/1-succ loop-body chains
+// ---------------------------------------------------------------------------
+
+struct ParamSubst<'a> {
+    subst: &'a FxHashMap<Inst, Inst>,
+}
+
+impl crate::ir::remap::EntityMapper for ParamSubst<'_> {
+    type Error = ();
+    fn map_inst(&mut self, inst: Inst) -> Result<Inst, ()> {
+        Ok(self.subst.get(&inst).copied().unwrap_or(inst))
+    }
+    fn map_block(&mut self, block: BasicBlock) -> Result<BasicBlock, ()> {
+        Ok(block)
+    }
+}
+
+/// Fuse linear `1-pred/1-succ` blocks inside loop bodies so the body
+/// collapses to `{header, latch}` — M42's shape contract. The inlined
+/// `idx()` calls land in their own blocks (`forwarder -> index-latch ->
+/// payload` chains); fusing them is a semantic no-op (block parameters are
+/// resolved positionally from the edge args) that every later pass also
+/// benefits from. Runs to a fixpoint (each fusion removes one block).
+fn fuse_loop_body_chains(data: &mut ArenaContextMut<'_>) -> bool {
+    let mut changed = false;
+    loop {
+        let (cfg, _dom, loops) = {
+            let fdata = data.curr_func_data();
+            LoopAnalysis::new(fdata)
+        };
+        let fdata = data.curr_func_data();
+        // Innermost loops only: their body blocks are all in the same loop
+        // (no nested headers), so a fusion can never cross a loop boundary.
+        let innermost: Vec<BasicBlock> = loops
+            .loops()
+            .iter()
+            .filter(|looop| {
+                !loops
+                    .loops()
+                    .iter()
+                    .any(|other| other.header() != looop.header() && looop.contains(other.header()))
+            })
+            .map(|looop| looop.header())
+            .collect();
+        // Every loop header (any nesting level) is off-limits as a fusion
+        // source or target — collapsing a header into its latch would turn
+        // the loop into a self-loop.
+        let all_headers: FxHashSet<BasicBlock> =
+            loops.loops().iter().map(|looop| looop.header()).collect();
+        let mut candidate: Option<(BasicBlock, BasicBlock, LogicalEdge)> = None;
+        'scan: for &header in &innermost {
+            let Some(looop) = loops.loops().iter().find(|l| l.header() == header) else {
+                continue;
+            };
+            for &b in looop.body() {
+                if all_headers.contains(&b) {
+                    continue;
+                }
+                let term = fdata.layout().basicblock(b).terminator();
+                let InstKind::Jump(jump) = fdata.inst_data(term).kind() else {
+                    continue; // Only jump-terminated blocks are pure links.
+                };
+                let in_edges = incoming_edges(fdata, &cfg, b);
+                if in_edges.len() != 1 {
+                    continue;
+                }
+                let edge = in_edges[0];
+                if edge.source() == b {
+                    continue; // Self loop: not a link.
+                }
+                let s = jump.target();
+                if s == b || all_headers.contains(&s) || !looop.contains(s) {
+                    continue;
+                }
+                // Soundness: `s` must be reached *only* through `b` (see
+                // `fuse_block_into_succ`), and `b`'s jump args must cover
+                // `s`'s parameters. A candidate failing these checks is
+                // rejected here — the fixpoint would otherwise re-select it
+                // forever.
+                let s_in_edges = incoming_edges(fdata, &cfg, s);
+                if s_in_edges.len() != 1 || s_in_edges[0].source() != b {
+                    continue;
+                }
+                if jump.args().len() != fdata.bb_data(s).params().len() {
+                    continue;
+                }
+                candidate = Some((b, s, edge));
+                break 'scan;
+            }
+        }
+        let Some((b, s, edge)) = candidate else {
+            break;
+        };
+        if fuse_block_into_succ(data, b, s, edge) {
+            changed = true;
+        } else {
+            // The scan's checks should have rejected this candidate; refuse
+            // to re-select it forever.
+            break;
+        }
+    }
+    changed
+}
+
+/// Merge `b` into `s` (its single successor): `b`'s non-terminator
+/// instructions are prepended to `s`, `b`'s parameters are substituted by
+/// the incoming edge's args, and the edge is retargeted to `s`. Sound only
+/// when `s`'s *only* predecessor is `b`: then the merged block executes
+/// exactly when `b` executed (any other predecessor of `s` would make `b`'s
+/// instructions run on paths that never reached `b` — e.g. a conditional
+/// arm's masked store becoming unconditional). `s`'s parameters are
+/// substituted by `b`'s jump args (which may themselves reference `b`'s
+/// parameters — substituted through the same map) and dropped, so the
+/// retargeted edge passes no args.
+fn fuse_block_into_succ(
+    data: &mut ArenaContextMut<'_>,
+    b: BasicBlock,
+    s: BasicBlock,
+    edge: LogicalEdge,
+) -> bool {
+    let (a_p, a_b, b_params, s_params, b_insts, s_insts) = {
+        let fdata = data.curr_func_data();
+        let a_p: Vec<Inst> = edge.args(fdata).to_vec();
+        let term = fdata.layout().basicblock(b).terminator();
+        let InstKind::Jump(jump) = fdata.inst_data(term).kind() else {
+            return false;
+        };
+        let a_b: Vec<Inst> = jump.args().to_vec();
+        let b_params: Vec<Inst> = fdata.bb_data(b).params().to_vec();
+        let s_params: Vec<Inst> = fdata.bb_data(s).params().to_vec();
+        if a_p.len() != b_params.len() {
+            return false;
+        }
+        let (cfg, _, _) = LoopAnalysis::new(fdata);
+        let s_in_edges = incoming_edges(fdata, &cfg, s);
+        // `s` must be reached only through `b` (see the soundness note
+        // above); its parameters must be fully covered by `b`'s jump args.
+        if s_in_edges.len() != 1 || s_in_edges[0].source() != b || a_b.len() != s_params.len() {
+            return false;
+        }
+        let b_insts: Vec<Inst> = fdata.layout().basicblock(b).insts().iter().copied().collect();
+        let s_insts: Vec<Inst> = fdata.layout().basicblock(s).insts().iter().copied().collect();
+        (a_p, a_b, b_params, s_params, b_insts, s_insts)
+    };
+
+    // Substitution for `b`'s parameters: the incoming edge's args.
+    let mut subst = FxHashMap::<Inst, Inst>::default();
+    for (&p, &v) in b_params.iter().zip(a_p.iter()) {
+        if p != v {
+            subst.insert(p, v);
+        }
+    }
+    // `b`'s jump args may reference `b`'s parameters (passthrough values);
+    // resolve them through the same map.
+    let a_b_sub: Vec<Inst> = a_b
+        .iter()
+        .map(|&v| subst.get(&v).copied().unwrap_or(v))
+        .collect();
+    // Substitution for `s`'s parameters: `b`'s jump args.
+    let mut s_subst = FxHashMap::<Inst, Inst>::default();
+    for (&p, &v) in s_params.iter().zip(a_b_sub.iter()) {
+        if p != v {
+            s_subst.insert(p, v);
+        }
+    }
+
+    // Remap every user of the removed parameters — `b`'s own instructions,
+    // `s`'s instructions, and any later block that `b` dominated (its
+    // params dominated them through the chain). `b`'s terminator is
+    // dropped (the retarget rewrites the edge), so it is skipped.
+    if !subst.is_empty() || !s_subst.is_empty() {
+        let mut combined = subst.clone();
+        combined.extend(s_subst.iter().map(|(&k, &v)| (k, v)));
+        let mut users = FxHashSet::<Inst>::default();
+        for p in b_params.iter().chain(s_params.iter()) {
+            for &u in data.inst_data(*p).used_by() {
+                users.insert(u);
+            }
+        }
+        let b_term = data.layout().basicblock(b).terminator();
+        for inst in users {
+            if inst == b_term {
+                continue;
+            }
+            let remapped = data
+                .inst_data(inst)
+                .clone()
+                .remap_refs(&mut ParamSubst { subst: &combined })
+                .expect("mapping block parameters cannot fail");
+            data.replace_inst_with(inst).raw(remapped);
+        }
+    }
+    // `s`'s parameters are substituted away (their block-arg indices are no
+    // longer referenced), so drop them — the retargeted edge passes no args.
+    let n_params = data.bb_data(s).params().len();
+    for _ in 0..n_params {
+        data.bb_data_mut(s).params_mut().pop();
+    }
+    // Move `b`'s non-terminator instructions to the head of `s`.
+    let b_payload: Vec<Inst> = b_insts
+        .iter()
+        .copied()
+        .filter(|&inst| inst != *data.layout().basicblock(b).insts().get_last().unwrap())
+        .collect();
+    let s_first = s_insts.first().copied();
+    for &inst in &b_payload {
+        data.layout_mut().remove_inst(b, inst);
+    }
+    if let Some(first) = s_first {
+        // Forward order: each insertion lands immediately before `first`,
+        // so the sequence i0, i1, ... stays in program order.
+        for &inst in &b_payload {
+            data.layout_mut().insert_inst_before(first, inst);
+        }
+    } else {
+        for inst in b_payload {
+            data.layout_mut().insert_before_terminator(s, inst);
+        }
+    }
+    // Retarget the incoming edge to `s` (no args: `s` has no parameters).
+    let mut rewriter = LogicalEdgeRewriter::new();
+    rewriter.retarget(data.curr_func_data(), edge, s, Vec::new());
+    rewriter.apply(data);
+    data.curr_func_data_mut().remove_layout_basicblock(b);
+    true
 }
 
 fn analyze_loop(
@@ -1176,20 +1420,43 @@ fn analyze_loop(
     let mut elem_ty: Option<Type> = None;
     let mut vectorized_any = false;
 
+    // Index math: payload instructions that (transitively) feed a GEP
+    // offset. The offset of a contiguous access is an affine expression of
+    // the IV (`add(mul(r, N), iv)` after the fused `idx()` inline); these
+    // instructions must stay scalar — the vector body re-derives them with
+    // the vector counter substituted for the IV — and are legal GEP offset
+    // sources even though they are loop-variant.
+    let mut index_math = FxHashSet::<Inst>::default();
+    for &inst in &payload {
+        let InstKind::GetElemPtr(gep) = arena.inst_data(inst).kind() else {
+            continue;
+        };
+        for &offset in gep.offsets() {
+            if offset != iv && !is_loop_invariant(arena, offset, header, latch) {
+                collect_index_math(offset, &payload, arena, &mut index_math);
+            }
+        }
+    }
+
     // First pass: loads and stores (their classes feed the binary checks).
     for &inst in &payload {
         let kind = arena.inst_data(inst).kind();
         match kind {
             InstKind::GetElemPtr(gep) => {
-                // GEP offsets may reference only the index IV or loop
-                // invariants; the base must be loop-invariant (a global,
-                // stack alloc, or a dominating value).
+                // GEP offsets may reference only the index IV, loop
+                // invariants, or payload index math (a scalar affine
+                // expression of the IV that the vector body re-derives);
+                // the base must be loop-invariant (a global, stack alloc,
+                // or a dominating value).
                 if !is_loop_invariant(arena, gep.base(), header, latch) {
         trace(data, looop, "gep_base_loop_variant");
         return None;
                 }
                 for &offset in gep.offsets() {
-                    if offset != iv && !is_loop_invariant(arena, offset, header, latch) {
+                    if offset != iv
+                        && !is_loop_invariant(arena, offset, header, latch)
+                        && !index_math.contains(&offset)
+                    {
         trace(data, looop, "gep_offset_loop_variant");
         return None;
                     }
@@ -1235,8 +1502,15 @@ fn analyze_loop(
                 classes.insert(inst, Class::VecStore);
             }
             InstKind::Binary(binary) if is_vectorizable_binary_op(binary.op()) => {
-                // Classified in the second pass (needs the load classes).
-                classes.insert(inst, Class::VecBinary);
+                if index_math.contains(&inst) {
+                    // Index math feeding a GEP offset stays scalar (the
+                    // vector body re-derives it with the vector counter
+                    // substituted for the IV).
+                    classes.insert(inst, Class::Keep);
+                } else {
+                    // Classified in the second pass (needs the load classes).
+                    classes.insert(inst, Class::VecBinary);
+                }
             }
             InstKind::Select(select) => {
                 // A select whose condition is a payload value (lane-wise,
@@ -1582,6 +1856,30 @@ fn is_vectorizable_binary_op(op: BinaryOp) -> bool {
     )
 }
 
+/// Collect the payload instructions that (transitively) produce `seed` —
+/// the scalar index math behind a GEP offset. Only payload binary ops are
+/// followed (constants / invariants / the IV are leaves).
+fn collect_index_math(
+    seed: Inst,
+    payload: &[Inst],
+    arena: &ArenaContext<'_>,
+    out: &mut FxHashSet<Inst>,
+) {
+    let mut work = vec![seed];
+    let mut seen = FxHashSet::<Inst>::default();
+    while let Some(v) = work.pop() {
+        if !seen.insert(v) || !payload.contains(&v) {
+            continue;
+        }
+        let InstKind::Binary(binary) = arena.inst_data(v).kind() else {
+            continue;
+        };
+        out.insert(v);
+        work.push(binary.lhs());
+        work.push(binary.rhs());
+    }
+}
+
 /// Loop-invariant value: a compile-time constant, a global, a dominating
 /// (outside-the-loop) definition, an outer block parameter, or a header
 /// *passthrough* parameter (an outer induction value the back edge forwards
@@ -1732,33 +2030,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     // and that any read outside the exit block lives in a block the
     // reduce block dominates, so the parameter can be added and the
     // post-exit reads rewritten without touching unknown edges.
-    let exit_extra_acc: Option<Inst> = if test_at_top && reduction.is_some() {
-        let acc = reduction.as_ref().expect("reduction set").acc;
-        let exit_users: Vec<Inst> = data
-            .inst_data(acc)
-            .used_by()
-            .iter()
-            .copied()
-            .filter(|&u| data.layout().parent_bb(u) == Some(exit))
-            .collect();
-        if exit_users.is_empty() {
-            None
-        } else {
-            let index = data.bb_data(exit).params().len() + 1;
-            let ep = alloc_inst(data, BlockArgRef::new_data(index, i32.clone()));
-            data.bb_data_mut(exit).params_mut().push(ep);
-            for user in exit_users {
-                subst_operand(data, user, acc, ep);
-            }
-            Some(ep)
-        }
-    } else {
-        None
-    };
-    // Post-exit accumulator reads (blocks dominated by the exit — gated
-    // in analyze) are rewritten to the reduce block's scalar sum once it
-    // is built (the sum dominates the whole exit region because every
-    // path to it goes through the reduce block).
+    // Reads beyond the exit block (dominated by it) are rewritten the
+    // same way: for a runtime trip they must observe the scalar tail's
+    // final accumulator (threaded through this parameter by the tail's
+    // exit edge), not the reduce block's vector-only sum.
     let post_exit_acc_users: Vec<Inst> = if test_at_top && reduction.is_some() {
         let acc = reduction.as_ref().expect("reduction set").acc;
         data.inst_data(acc)
@@ -1773,6 +2048,29 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             .collect()
     } else {
         Vec::new()
+    };
+    let exit_extra_acc: Option<Inst> = if test_at_top && reduction.is_some() {
+        let acc = reduction.as_ref().expect("reduction set").acc;
+        let exit_users: Vec<Inst> = data
+            .inst_data(acc)
+            .used_by()
+            .iter()
+            .copied()
+            .filter(|&u| data.layout().parent_bb(u) == Some(exit))
+            .collect();
+        if exit_users.is_empty() && post_exit_acc_users.is_empty() {
+            None
+        } else {
+            let index = data.bb_data(exit).params().len() + 1;
+            let ep = alloc_inst(data, BlockArgRef::new_data(index, i32.clone()));
+            data.bb_data_mut(exit).params_mut().push(ep);
+            for user in exit_users.into_iter().chain(post_exit_acc_users.iter().copied()) {
+                subst_operand(data, user, acc, ep);
+            }
+            Some(ep)
+        }
+    } else {
+        None
     };
     // A4: does any exit parameter carry the IV's final value? Those slots
     // must be fed the computed `i0 + VF*q` (+ the peeled remainder through
@@ -2115,12 +2413,17 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         None
     };
     // Post-exit accumulator reads (blocks dominated by the exit, gated in
-    // analyze) are rewritten to the reduce block's scalar sum: the sum
-    // dominates the whole exit region because every path to it goes
-    // through the reduce block.
-    if let (Some(red), Some(sum)) = (&reduction, &reduce_sum) {
-        for user in post_exit_acc_users {
-            subst_operand(data, user, red.acc, *sum);
+    // analyze) are rewritten to the reduce block's scalar sum when no exit
+    // parameter was created — the sum dominates the whole exit region
+    // because every path to it goes through the reduce block. With an
+    // `exit_extra_acc` parameter the reads were already rewritten to it
+    // above (and for a runtime trip the tail threads its final
+    // accumulator through that parameter).
+    if exit_extra_acc.is_none() {
+        if let (Some(red), Some(sum)) = (&reduction, &reduce_sum) {
+            for user in post_exit_acc_users {
+                subst_operand(data, user, red.acc, *sum);
+            }
         }
     }
 
@@ -3116,6 +3419,16 @@ mod tests {
             .count()
     }
 
+    fn vector_reduce_count(program: &Program, function: Function) -> usize {
+        let data = program.func_data(function);
+        data.layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|l| l.insts().iter().copied())
+            .filter(|&inst| matches!(data.inst_data(inst).kind(), InstKind::VectorReduce(_)))
+            .count()
+    }
+
     fn scalar_load_count(program: &Program, function: Function) -> usize {
         let data = program.func_data(function);
         data.layout()
@@ -3730,6 +4043,102 @@ mod tests {
             !run(&mut program, function),
             "array parameter bases must be rejected in v1"
         );
+    }
+
+    #[test]
+    fn vectorizes_inlined_idx_index_computation_chain() {
+        // conv2d's row_reduce 同构: the inlined `idx(r, c, n)` lands in its
+        // own blocks — `forwarder -> index-latch -> payload` — with the GEP
+        // offset `add(mul(r, n), c)` where both `r` and `n` are
+        // loop-invariant function params. Before the chain fusion + index
+        // math classification this shape was rejected outright
+        // (shape_body_not_2_blocks / NonAffineIndex). The full pass must
+        // fuse the chain, classify the invariant×invariant product, keep
+        // the index math scalar, and vectorize the reduction.
+        let mut program = Program::new();
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let kernel = program.new_function(
+            Type::get_unit(),
+            "row_reduce".into(),
+            vec![
+                i32.clone(),
+                i32.clone(),
+                Type::get_pointer(Type::get_array(Type::get_i32(), 64)),
+            ],
+        );
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(kernel),
+        };
+        let entry = data.add_entry_block();
+        let r = data.params()[0];
+        let n = data.params()[1];
+        let base = data.params()[2];
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone()]);
+        let fwd = data.new_basic_block().basic_block("fwd".into(), vec![]);
+        let idx_latch = data
+            .new_basic_block()
+            .basic_block("idx_latch".into(), vec![i32.clone(), i32.clone(), i32.clone()]);
+        let payload = data
+            .new_basic_block()
+            .basic_block("payload".into(), vec![i32.clone()]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for bb in [header, fwd, idx_latch, payload, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let one = data.new_local_inst().integer(1);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let sum = data.bb_data(header).params()[0];
+        let c = data.bb_data(header).params()[1];
+        let cmp = data.new_local_inst().binary(BinaryOp::Lt, c, n);
+        let br = data
+            .new_local_inst()
+            .branch(cmp, fwd, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, cmp);
+        data.layout_mut().insert_inst(header, br);
+        let fwd_jump = data.new_local_inst().jump(idx_latch, vec![r, c, n]);
+        data.layout_mut().insert_inst(fwd, fwd_jump);
+        let i_r = data.bb_data(idx_latch).params()[0];
+        let i_c = data.bb_data(idx_latch).params()[1];
+        let i_n = data.bb_data(idx_latch).params()[2];
+        let idx_mul = data.new_local_inst().binary(BinaryOp::Mul, i_r, i_n);
+        let idx_add = data.new_local_inst().binary(BinaryOp::Add, idx_mul, i_c);
+        let idx_jump = data.new_local_inst().jump(payload, vec![idx_add]);
+        for inst in [idx_mul, idx_add, idx_jump] {
+            data.layout_mut().insert_inst(idx_latch, inst);
+        }
+        let idx = data.bb_data(payload).params()[0];
+        let gep = data.new_local_inst().get_elem_ptr(base, vec![zero, idx]);
+        let load = data.new_local_inst().load(gep);
+        let sum_next = data.new_local_inst().binary(BinaryOp::Add, sum, load);
+        let c_next = data.new_local_inst().binary(BinaryOp::Add, i_c, one);
+        let back = data.new_local_inst().jump(header, vec![sum_next, c_next]);
+        for inst in [gep, load, sum_next, c_next, back] {
+            data.layout_mut().insert_inst(payload, inst);
+        }
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+        drop(data);
+        // IPA alignment: the only call site passes the 16B-aligned global.
+        // The i32 actuals are program-level constants (dominate `main`).
+        let r_actual = program.new_value().integer(3);
+        let n_actual = program.new_value().integer(16);
+        call_kernel(&mut program, kernel, vec![r_actual, n_actual, a]);
+        assert!(
+            run(&mut program, kernel),
+            "the inlined-idx chain must fuse and vectorize"
+        );
+        assert!(vector_load_count(&program, kernel) >= 1, "vector load emitted");
+        assert!(vector_reduce_count(&program, kernel) >= 1, "reduction vectorized");
     }
 
     #[test]

@@ -20,8 +20,9 @@ use taki_mir::{
     vcode::{MachInst, VCodeContainer},
 };
 
-use crate::instructions::{AluOp, Cond, MInst};
+use crate::instructions::{AluOp, Cond, MInst, VecArithOp, VecMlaOp, VecShape};
 use crate::regs::RegOrZr;
+use taki_mir::register::Writable;
 
 pub struct PeepholeCombine;
 
@@ -46,6 +47,9 @@ impl MIRPass<MInst> for PeepholeCombine {
             stats.peephole.mac_pairs_formed += fused;
             changed |= fused > 0;
         }
+        let vec_fused = combine_vec_mac_in_block(vcode, &use_counts);
+        stats.peephole.mac_pairs_formed += vec_fused;
+        changed |= vec_fused > 0;
         // Flag fusion runs on the (possibly MAC-fused) instruction stream and
         // rewrites both a block's interior and its latch edge into another
         // block, so it cannot run per-block against cached ranges.
@@ -171,6 +175,123 @@ fn combine_mac_in_block(
     fused_count
 }
 
+/// Fuse `VecArithRRR(Mul)` + `VecArithRRR(Add)` into `VecMla` (`mla`).
+///
+/// Unlike the scalar MAC fusion, the vector mul and add are rarely adjacent:
+/// the vectorizer lowers the mm kernel as `mul vD; <load B>; add vA, vD, vB`,
+/// so the consumer must be located by scanning forward in the block. The
+/// fused form reuses the accumulator register (`dst` reuses `acc`'s
+/// allocation via `reg_reuse_def`), letting the emitter drop the leading
+/// copy and emit a bare `mla vacc, vlhs, vrhs`.
+fn combine_vec_mac_in_block(vcode: &mut VCodeContainer<MInst>, use_counts: &FxHashMap<Reg, u32>) -> u64 {
+    let mut fused_count = 0;
+    for block_idx in 0..vcode.num_blocks() {
+        let range = vcode.block_inst_range(block_idx);
+        let mut i = range.start;
+        while i < range.end {
+            // Candidate producer: `VecArithRRR Mul` whose result is single-use.
+            let (mul_dst, mul_lhs, mul_rhs, shape) = match vcode.inst(i) {
+                MInst::VecArithRRR {
+                    op: VecArithOp::Mul,
+                    shape,
+                    is_float: false,
+                    dst,
+                    lhs,
+                    rhs,
+                } => {
+                    if use_counts.get(&dst.to_reg()).copied().unwrap_or(0) != 1 {
+                        i += 1;
+                        continue;
+                    }
+                    (dst.to_reg(), *lhs, *rhs, *shape)
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+
+            // Locate the consumer `VecArithRRR Add` that uses `mul_dst` as
+            // exactly one operand; the other operand is the accumulator.
+            let mut j = i + 1;
+            let mut fused = None;
+            while j < range.end {
+                match vcode.inst(j) {
+                    MInst::VecArithRRR {
+                        op: VecArithOp::Add,
+                        shape: add_shape,
+                        is_float: false,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *add_shape == shape => {
+                        // Vector operands are plain `Reg`s (no `RegOrZr`).
+                        let acc = if *lhs == mul_dst {
+                            Some(*rhs)
+                        } else if *rhs == mul_dst {
+                            Some(*lhs)
+                        } else {
+                            None
+                        };
+                        if let Some(acc) = acc {
+                            if acc != mul_lhs && acc != mul_rhs {
+                                // The accumulator must be single-use (its
+                                // value is consumed in-place by the mla).
+                                if use_counts.get(&acc).copied().unwrap_or(0) == 1 {
+                                    fused = Some((j, dst.to_reg(), acc));
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    _ => {
+                        // Any intervening instruction that defines the mul
+                        // operands or the accumulator invalidates the fusion.
+                        if inst_defines_any(vcode, j, &[mul_lhs, mul_rhs, mul_dst]) {
+                            break;
+                        }
+                        j += 1;
+                    }
+                }
+            }
+
+            if let Some((j, add_dst, acc)) = fused {
+                // `VecMla { dst: add_dst, acc, lhs: mul_lhs, rhs: mul_rhs }`
+                // computes `add_dst = acc + mul_lhs*mul_rhs`, i.e. the fused
+                // mul+add. `add_dst` is what the surrounding code reads, so
+                // the register allocator's reuse-def constraint ties it to
+                // `acc`'s register (the accumulator is dead after the mla).
+                *vcode.inst_mut(i) = MInst::Removed;
+                *vcode.inst_mut(j) = MInst::VecMla {
+                    op: VecMlaOp::Mla,
+                    shape,
+                    dst: Writable::from_reg(add_dst),
+                    acc,
+                    lhs: mul_lhs,
+                    rhs: mul_rhs,
+                };
+                fused_count += 1;
+                i = j + 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    fused_count
+}
+
+/// Whether instruction `i` defines any of `regs` (as a non-removed def).
+fn inst_defines_any(vcode: &VCodeContainer<MInst>, i: usize, regs: &[Reg]) -> bool {
+    let mut defines = false;
+    let mut inst = vcode.inst(i).clone();
+    inst.get_operands(&mut |reg: &mut Reg, _constraint, kind, _pos| {
+        if kind == OperandKind::Def && regs.contains(reg) {
+            defines = true;
+        }
+    });
+    defines
+}
+
 /// Extract the `Reg` from a `RegOrZr`, if it is not the zero register.
 fn reg_or_zr_to_reg(rz: &RegOrZr) -> Option<Reg> {
     match rz {
@@ -201,9 +322,7 @@ fn other_operand(lhs: &RegOrZr, rhs: &RegOrZr, mul_dst: &Reg) -> Option<Reg> {
 /// by a subtract, so unsigned and overflow-sensing conditions are excluded.
 fn subs_safe_cond(cond: Cond) -> bool {
     matches!(cond, Cond::Eq | Cond::Ne | Cond::Mi | Cond::Pl)
-}
-
-/// Conditions safe under `ands`/`tst` flag fusion. A logical operation sets
+}/// Conditions safe under `ands`/`tst` flag fusion. A logical operation sets
 /// `V = 0` and `C = 0`, same as `cmp r, #0` except for `C`, which only the
 /// unsigned conditions observe.
 fn logical_safe_cond(cond: Cond) -> bool {
@@ -396,8 +515,9 @@ fn combine_flag_fusion(vcode: &mut VCodeContainer<MInst>, use_counts: &FxHashMap
 
 #[cfg(test)]
 mod tests {
+    use raana_ir::ir::{Program, Type};
     use taki_mir::reg_alloc::reg::{RegClass, VReg};
-    use taki_mir::register::Writable;
+    use taki_mir::register::{VRegAllocator, Writable};
 
     use super::*;
     use crate::{
@@ -528,5 +648,152 @@ mod tests {
         assert!(
             fuse_flag_triple(&sub_imm(0, 0, 1), &bad_cmp, &cond_br(Cond::Ne), &no_uses()).is_none()
         );
+    }
+
+    // --- vector MAC fusion ---
+
+    /// Build a single-block VCode with the given instructions (pushed in
+    /// reverse of final order) and a fresh set of integer/vector vregs.
+    fn build_vcode(
+        insts: impl DoubleEndedIterator<Item = MInst>,
+        num_vregs: usize,
+    ) -> VCodeContainer<MInst> {
+        use crate::abi::AArch64Abi;
+        use raana_ir::ir::builder_trait::*;
+        use taki_mir::abi::CalleeABI;
+        use taki_mir::block_order::BlockLoweringOrder;
+        use taki_mir::prelude::ArenaContext;
+        use taki_mir::vcode::VCodeBuilder;
+
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "vec_fusion".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+        let arena = ArenaContext {
+            program: &program,
+            curr_func: Some(function),
+        };
+        let abi = CalleeABI::<AArch64Abi>::new(arena);
+        let order = BlockLoweringOrder::new(arena);
+        let mut builder = VCodeBuilder::new(abi, order);
+        let mut vregs = VRegAllocator::<MInst>::with_capaticy(num_vregs);
+        for inst in insts {
+            builder.push(inst);
+        }
+        builder.end_bb();
+        builder.build(vregs)
+    }
+
+    #[test]
+    fn fuses_vec_mul_add_across_intervening_inst() {
+        use taki_mir::types::V4I32;
+
+        // Kernel shape from 01_mm1: mul vA, vC, vSplat; <load B>; add vSum, vA, vB.
+        // The mul and add are separated by an instruction defining `b`.
+        let mut vregs = VRegAllocator::<MInst>::with_capaticy(6);
+        let c = vregs.alloc(V4I32);
+        let splat = vregs.alloc(V4I32);
+        let prod = vregs.alloc(V4I32);
+        let b = vregs.alloc(V4I32);
+        let sum = vregs.alloc(V4I32);
+        let dummy = vregs.alloc(V4I32);
+
+        let mut insts = vec![
+            MInst::VecArithRRR {
+                op: VecArithOp::Mul,
+                shape: VecShape::FourS,
+                is_float: false,
+                dst: Writable::from_reg(prod),
+                lhs: c,
+                rhs: splat,
+            },
+            // intervening vector copy defining `b` (stands in for the B load)
+            MInst::VecMov {
+                dst: Writable::from_reg(b),
+                src: dummy,
+            },
+            MInst::VecArithRRR {
+                op: VecArithOp::Add,
+                shape: VecShape::FourS,
+                is_float: false,
+                dst: Writable::from_reg(sum),
+                lhs: prod,
+                rhs: b,
+            },
+        ];
+        insts.reverse();
+        let mut vcode = build_vcode(insts.into_iter(), 6);
+
+        let use_counts = build_vreg_use_counts(&mut vcode);
+        let fused = combine_vec_mac_in_block(&mut vcode, &use_counts);
+        assert_eq!(fused, 1);
+        let insts: Vec<_> = (0..vcode.num_insts()).map(|i| vcode.inst(i)).collect();
+        // mul removed, add replaced by VecMla.
+        assert!(matches!(insts[0], MInst::Removed));
+        assert!(matches!(insts[2], MInst::VecMla { .. }));
+        let MInst::VecMla {
+            op,
+            shape,
+            dst,
+            acc,
+            lhs,
+            rhs,
+        } = insts[2]
+        else {
+            panic!("expected VecMla");
+        };
+        assert_eq!(*op, VecMlaOp::Mla);
+        assert_eq!(*shape, VecShape::FourS);
+        assert_eq!(dst.to_reg(), sum);
+        assert_eq!(*acc, b);
+        assert_eq!(*lhs, c);
+        assert_eq!(*rhs, splat);
+    }
+
+    #[test]
+    fn refuses_vec_mul_add_when_accumulator_is_shared() {
+        use taki_mir::types::V4I32;
+
+        let mut vregs = VRegAllocator::<MInst>::with_capaticy(5);
+        let c = vregs.alloc(V4I32);
+        let splat = vregs.alloc(V4I32);
+        let prod = vregs.alloc(V4I32);
+        let b = vregs.alloc(V4I32);
+        let sum = vregs.alloc(V4I32);
+
+        let mut insts = vec![
+            MInst::VecArithRRR {
+                op: VecArithOp::Mul,
+                shape: VecShape::FourS,
+                is_float: false,
+                dst: Writable::from_reg(prod),
+                lhs: c,
+                rhs: splat,
+            },
+            MInst::VecArithRRR {
+                op: VecArithOp::Add,
+                shape: VecShape::FourS,
+                is_float: false,
+                dst: Writable::from_reg(sum),
+                lhs: prod,
+                rhs: b,
+            },
+            // b is used again later: not single-use, so no fusion.
+            MInst::VecArithRRR {
+                op: VecArithOp::Sub,
+                shape: VecShape::FourS,
+                is_float: false,
+                dst: Writable::from_reg(c),
+                lhs: b,
+                rhs: c,
+            },
+        ];
+        insts.reverse();
+        let mut vcode = build_vcode(insts.into_iter(), 5);
+        let use_counts = build_vreg_use_counts(&mut vcode);
+        let fused = combine_vec_mac_in_block(&mut vcode, &use_counts);
+        assert_eq!(fused, 0);
     }
 }

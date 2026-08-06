@@ -1139,13 +1139,15 @@ impl MachInst for MInst {
             Self::VecMla {
                 dst, acc, lhs, rhs, ..
             } => {
-                // The leading `mov` writes `dst` before the read-modify-write
-                // reads `lhs`/`rhs`, so `dst` is an *early* def: it must not
-                // alias any use (coalescing dst with rhs would clobber rhs).
+                // The leading `mov` copies `acc` into `dst` before the
+                // read-modify-write. `dst` reuses `acc`'s allocation (like
+                // `MovK`), so when the accumulator can be clobbered in place
+                // the copy becomes a self-move the emitter elides, giving a
+                // bare `mla` (the M70 mul+add fusion target).
                 collector.reg_use(acc);
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
-                collector.reg_early_def(dst);
+                collector.reg_reuse_def(dst, 0);
             }
             Self::VecSMull { dst, lhs, rhs, .. } => {
                 collector.reg_use(lhs);

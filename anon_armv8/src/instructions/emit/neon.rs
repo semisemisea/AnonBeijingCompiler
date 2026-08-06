@@ -283,12 +283,14 @@ pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result
             lhs,
             rhs,
         } => {
-            write!(ctx, "mov ")?;
-            emit_vec_reg(ctx, dst.to_reg())?;
-            write!(ctx, ".16b, ")?;
-            emit_vec_reg(ctx, *acc)?;
-            write!(ctx, ".16b")?;
-            ctx.end_inst()?;
+            if dst.to_reg() != *acc {
+                write!(ctx, "mov ")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".16b, ")?;
+                emit_vec_reg(ctx, *acc)?;
+                write!(ctx, ".16b")?;
+                ctx.end_inst()?;
+            }
             write!(ctx, "{} ", vec_mla_name(*op))?;
             emit_vec_reg(ctx, dst.to_reg())?;
             write!(ctx, ".{}, ", shape.arrangement())?;

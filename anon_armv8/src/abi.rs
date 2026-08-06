@@ -28,6 +28,18 @@ impl ABIMachineSpec for AArch64Abi {
     fn stack_align() -> u32 {
         16
     }
+
+    /// NEON `ldr/str q` requires 16-byte alignment for vector memory access,
+    /// so array locals must land on 16-byte boundaries.
+    fn array_slot_align() -> u32 {
+        16
+    }
+
+    /// Align globals of at least 16 bytes to 16 so vectorized global access
+    /// stays aligned.
+    fn global_align_directive() -> Option<&'static str> {
+        Some(".p2align 4")
+    }
     fn spillslot_size(regclass: RegClass) -> u32 {
         match regclass {
             RegClass::Int | RegClass::Float => 1,
@@ -129,21 +141,22 @@ impl ABIMachineSpec for AArch64Abi {
     fn compute_call_arg_loc(types: &[taki_mir::prelude::HirType]) -> (Vec<ArgSlot>, u32) {
         use raana_ir::ir::TypeKind;
 
-        ArgLayoutPlanner::with_vector_regs(
-            &regs::INT_ARG_REGS,
-            &regs::FLOAT_ARG_REGS,
-            &regs::VECTOR_ARG_REGS,
-        )
-        .compute(
-            types,
-            |ty| match ty.kind() {
-                TypeKind::Float32 => ArgRegBank::Float,
-                TypeKind::Vector(..) => ArgRegBank::Vector,
-                TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => ArgRegBank::Int,
-                _ => unreachable!("non-scalar AAPCS64 parameter: {:?}", ty.kind()),
-            },
-            |ty| if ty.is_vector() { 16 } else { 8 },
-        )
+        // AAPCS64 passes f32 and 128-bit vector arguments through one shared
+        // SIMD/FP register sequence (a single NSRN): `f(v4i32, f32)` uses v0
+        // for the vector and v1 for the float (s1). f32 scalars are
+        // Vector-class vregs (sN ≡ vN), so the Float bank is not used here;
+        // the separate Float/Vector banks remain only for backends whose
+        // scalar-FP and vector register files are physically distinct (RISC-V).
+        ArgLayoutPlanner::with_vector_regs(&regs::INT_ARG_REGS, &[], &regs::VECTOR_ARG_REGS)
+            .compute(
+                types,
+                |ty| match ty.kind() {
+                    TypeKind::Float32 | TypeKind::Vector(..) => ArgRegBank::Vector,
+                    TypeKind::Int32 | TypeKind::Pointer(_) | TypeKind::String => ArgRegBank::Int,
+                    _ => unreachable!("non-scalar AAPCS64 parameter: {:?}", ty.kind()),
+                },
+                |ty| if ty.is_vector() { 16 } else { 8 },
+            )
     }
 
     fn get_machine_env() -> &'static MachineEnv {
@@ -543,7 +556,7 @@ mod tests {
         ));
         assert!(matches!(
             locations[15],
-            ArgSlot::Reg { reg, .. } if reg == regs::float_preg(7)
+            ArgSlot::Reg { reg, .. } if reg == regs::vector_preg(7)
         ));
     }
 

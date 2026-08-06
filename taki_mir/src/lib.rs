@@ -2,13 +2,13 @@ use core::fmt::Write;
 use std::time::Instant;
 
 use crate::{
-    abi::CalleeABI,
+    abi::{ABIMachineSpec, CalleeABI},
     block_order::BlockLoweringOrder,
     emit::AsmWriter,
     lower::{LowerBackend, LowerContext},
     reg_alloc::function::Function,
     stats::{CodegenStats, FunctionCodegenStats},
-    vcode::MachInstEmit,
+    vcode::{MachInst, MachInstEmit},
 };
 
 pub mod abi;
@@ -139,6 +139,18 @@ pub struct CompileOutput {
     pub stats: CodegenStats,
 }
 
+/// Emit the backend's alignment pseudo-op (if any) before a global object of
+/// `size` bytes. SIMD backends align large globals so vectorized global access
+/// stays aligned; other backends return no directive and emit nothing.
+fn emit_global_align<B: LowerBackend>(buf: &mut String, size: u32) {
+    if size >= 16 {
+        let directive = <<B::MInst as MachInst>::ABISpec as ABIMachineSpec>::global_align_directive();
+        if let Some(directive) = directive {
+            writeln!(buf, "{directive}").unwrap();
+        }
+    }
+}
+
 pub fn compile<B: LowerBackend>(p: &HirProgram) -> String
 where
     B::MInst: MachInstEmit,
@@ -173,7 +185,9 @@ where
     if !initialized.is_empty() {
         writeln!(buf, "{}", B::data_section_directive()).unwrap();
         for (name, data) in initialized {
+            let size = data.iter().map(GlobalData::size).sum::<u32>();
             writeln!(buf, "{} {name}", B::global_directive()).unwrap();
+            emit_global_align::<B>(&mut buf, size);
             writeln!(buf, "{name}:").unwrap();
             for entry in data {
                 match entry {
@@ -195,9 +209,10 @@ where
     if !zero_initialized.is_empty() {
         writeln!(buf, "{}", B::bss_section_directive()).unwrap();
         for (name, data) in zero_initialized {
-            writeln!(buf, "{} {name}", B::global_directive()).unwrap();
-            writeln!(buf, "{name}:").unwrap();
             let size = data.iter().map(GlobalData::size).sum::<u32>();
+            writeln!(buf, "{} {name}", B::global_directive()).unwrap();
+            emit_global_align::<B>(&mut buf, size);
+            writeln!(buf, "{name}:").unwrap();
             writeln!(buf, "    {} {size}", B::zero_directive()).unwrap();
             writeln!(buf).unwrap();
         }

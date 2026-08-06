@@ -1,0 +1,24 @@
+int N_eff;
+
+int checksum(int A[]) {
+    int sum = 0;
+    int i = 0;
+    while (i < N_eff * N_eff) {
+        sum = sum + A[i];
+        i = i + 1;
+    }
+    return sum;
+}
+
+int A[64 * 64];
+
+int main() {
+    N_eff = 64;
+    int i = 0;
+    while (i < N_eff * N_eff) {
+        A[i] = -1;
+        i = i + 1;
+    }
+    putint(checksum(A));
+    return 0;
+}

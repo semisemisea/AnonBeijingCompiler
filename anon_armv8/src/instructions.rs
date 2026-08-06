@@ -376,6 +376,26 @@ pub enum VecArithOp {
     Add,
     Sub,
     Mul,
+    /// Floating-point vector arithmetic (`fadd`/`fsub`/`fmul`): `<4 x f32>`
+    /// lanes. The plain forms above are the integer NEON ops and must not be
+    /// used on float vectors.
+    Fadd,
+    Fsub,
+    Fmul,
+}
+
+/// Vector shift operations. Immediate forms use `shl`/`ushr`/`sshr`;
+/// register (variable-amount) forms use `sshl`/`ushl`, with the amount
+/// vector pre-negated for right shifts (NEON has no register-form right
+/// shift; `sshl`/`ushl` with a negative amount shift right).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecShiftOp {
+    /// Logical left shift.
+    Shl,
+    /// Logical right shift (`ushr`/`ushl`).
+    Shr,
+    /// Arithmetic right shift (`sshr`/`sshl`).
+    Sar,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -813,6 +833,31 @@ pub enum MInst {
         lhs: Reg,
         rhs: Reg,
     },
+    /// Vector shift: immediate form `shl/ushr/sshr v{d}.<shape>, v{lhs}.<shape>, #imm`;
+    /// register form `sshl/ushl v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>` with the
+    /// amount vector pre-negated for right shifts (`neg` emitted separately).
+    VecShift {
+        op: VecShiftOp,
+        shape: VecShape,
+        dst: WritableReg,
+        lhs: Reg,
+        rhs: Reg,
+        imm: Option<u8>,
+    },
+    /// Vector float divide: `fdiv v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>`.
+    /// (NEON has no integer vector divide; i32 Div stays scalar.)
+    VecDiv {
+        shape: VecShape,
+        dst: WritableReg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    /// Vector negation: `neg v{d}.<shape>, v{src}.<shape>`.
+    VecNeg {
+        shape: VecShape,
+        dst: WritableReg,
+        src: Reg,
+    },
     FMovFromZero {
         dst: WritableReg,
     },
@@ -1018,6 +1063,7 @@ impl MachInst for MInst {
             | Self::VecDup { dst, src, .. }
             | Self::VecCvt { dst, src, .. }
             | Self::VecAddv { dst, src }
+            | Self::VecNeg { dst, src, .. }
             | Self::Scvtf { dst, src }
             | Self::Fcvtzs { dst, src } => {
                 collector.reg_use(src);
@@ -1034,7 +1080,9 @@ impl MachInst for MInst {
             Self::VecArithRRR { dst, lhs, rhs, .. }
             | Self::VecBitwise { dst, lhs, rhs, .. }
             | Self::VecCmp { dst, lhs, rhs, .. }
-            | Self::VecMinMax { dst, lhs, rhs, .. } => {
+            | Self::VecMinMax { dst, lhs, rhs, .. }
+            | Self::VecShift { dst, lhs, rhs, .. }
+            | Self::VecDiv { dst, lhs, rhs, .. } => {
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
                 collector.reg_def(dst);
@@ -1266,7 +1314,12 @@ impl MachInst for MInst {
         match ty {
             I32 => (&[RegClass::Int], &[I32]),
             I64 => (&[RegClass::Int], &[I64]),
-            F32 => (&[RegClass::Float], &[F32]),
+            // f32 scalars share the NEON register bank with vectors: `sN` is
+            // the low 32 bits of `vN`, so a single RegClass lets the allocator
+            // prevent s/v aliasing (a Float-class vreg could otherwise be
+            // assigned the same hw_enc as a live Vector-class vreg and be
+            // silently clobbered). Emission renders these as `sN`.
+            F32 => (&[RegClass::Vector], &[F32]),
             V4I32 => (&[RegClass::Vector], &[V4I32]),
             V2I64 => (&[RegClass::Vector], &[V2I64]),
             V4F32 => (&[RegClass::Vector], &[V4F32]),
@@ -1766,7 +1819,24 @@ impl MachInstEmit for MInst {
                 write!(ctx, "dup ")?;
                 emit_vec_reg(ctx, dst.to_reg())?;
                 write!(ctx, ".{}, ", shape.arrangement())?;
-                emit_vec_scalar_reg(ctx, *src, *shape)
+                // A float scalar source is read through the aliased vector
+                // register (`sN` is the low 32 bits of `vN`): LLVM MC rejects
+                // `dup vd.4s, sn`; the accepted form is the element form
+                // `dup vd.4s, vn.s[0]` (clang emits the same for vdupq_n_f32).
+                // f32 scalars are Vector-class vregs (sN ≡ vN lane 0), so the
+                // element form covers both the old Float-class pins and the
+                // current Vector-class allocations.
+                match src.to_real_reg() {
+                    Some(preg) if matches!(preg.class(), RegClass::Float | RegClass::Vector) => {
+                        write!(
+                            ctx,
+                            "v{}.{}[0]",
+                            preg.hw_enc(),
+                            if *shape == VecShape::TwoD { "d" } else { "s" }
+                        )
+                    }
+                    _ => emit_vec_scalar_reg(ctx, *src, *shape),
+                }
             }
             Self::VecArithRRR {
                 op,
@@ -1888,7 +1958,16 @@ impl MachInstEmit for MInst {
                 lane,
             } => {
                 write!(ctx, "mov ")?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
+                // The extracted scalar is a GPR (i32/i64) or an f32 in a
+                // Vector-class register (`sN`); render the scalar side by class.
+                match dst.to_reg().to_real_reg() {
+                    Some(preg)
+                        if matches!(preg.class(), RegClass::Float | RegClass::Vector) =>
+                    {
+                        emit_float_reg(ctx, dst.to_reg(), *size == OperandSize::Size64)?;
+                    }
+                    _ => emit_reg(ctx, dst.to_reg(), *size)?,
+                }
                 write!(ctx, ", ")?;
                 emit_vec_reg(ctx, *src)?;
                 write!(
@@ -1927,7 +2006,16 @@ impl MachInstEmit for MInst {
                     },
                     lane
                 )?;
-                emit_reg(ctx, *src, *size)
+                // The inserted scalar is a GPR (i32/i64) or an f32 in a
+                // Vector-class register (`sN`); render the scalar side by class.
+                match src.to_real_reg() {
+                    Some(preg)
+                        if matches!(preg.class(), RegClass::Float | RegClass::Vector) =>
+                    {
+                        emit_float_reg(ctx, *src, *size == OperandSize::Size64)
+                    }
+                    _ => emit_reg(ctx, *src, *size),
+                }
             }
             Self::VecMinMax {
                 op,
@@ -1942,6 +2030,49 @@ impl MachInstEmit for MInst {
                 emit_vec_reg(ctx, *lhs)?;
                 write!(ctx, ".{}, ", shape.arrangement())?;
                 emit_vec_reg(ctx, *rhs)?;
+                write!(ctx, ".{}", shape.arrangement())
+            }
+            Self::VecShift {
+                op,
+                shape,
+                dst,
+                lhs,
+                rhs,
+                imm,
+            } => {
+                let is_reg = imm.is_none();
+                write!(ctx, "{} ", vec_shift_name(*op, is_reg))?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".{}, ", shape.arrangement())?;
+                emit_vec_reg(ctx, *lhs)?;
+                write!(ctx, ".{}, ", shape.arrangement())?;
+                match imm {
+                    Some(imm) => write!(ctx, "#{imm}"),
+                    None => {
+                        emit_vec_reg(ctx, *rhs)?;
+                        write!(ctx, ".{}", shape.arrangement())
+                    }
+                }
+            }
+            Self::VecDiv {
+                shape,
+                dst,
+                lhs,
+                rhs,
+            } => {
+                write!(ctx, "fdiv ")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".{}, ", shape.arrangement())?;
+                emit_vec_reg(ctx, *lhs)?;
+                write!(ctx, ".{}, ", shape.arrangement())?;
+                emit_vec_reg(ctx, *rhs)?;
+                write!(ctx, ".{}", shape.arrangement())
+            }
+            Self::VecNeg { shape, dst, src } => {
+                write!(ctx, "neg ")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".{}, ", shape.arrangement())?;
+                emit_vec_reg(ctx, *src)?;
                 write!(ctx, ".{}", shape.arrangement())
             }
             Self::FMovFromZero { dst } => {
@@ -2157,12 +2288,14 @@ fn emit_float_rr(ctx: &mut dyn EmitContext, op: &str, dst: Reg, src: &Reg) -> co
     emit_float_reg(ctx, *src, false)
 }
 fn emit_fmov(ctx: &mut dyn EmitContext, dst: Reg, src: &Reg) -> core::fmt::Result {
-    let dst_float = dst
-        .to_real_reg()
-        .is_none_or(|preg| preg.class() == RegClass::Float);
-    let src_float = src
-        .to_real_reg()
-        .is_none_or(|preg| preg.class() == RegClass::Float);
+    // f32 scalars live in Vector-class registers (`sN` ≡ `vN` lane 0), so
+    // both the scalar-FP class and the vector bank render as `sN`/`dN` here.
+    let is_f32_reg = |reg: Reg| {
+        reg.to_real_reg()
+            .is_none_or(|preg| matches!(preg.class(), RegClass::Float | RegClass::Vector))
+    };
+    let dst_float = is_f32_reg(dst);
+    let src_float = is_f32_reg(*src);
     write!(ctx, "fmov ")?;
     if dst_float {
         emit_float_reg(ctx, dst, false)?;
@@ -2263,7 +2396,10 @@ fn emit_data_reg(ctx: &mut dyn EmitContext, reg: Reg, ty: MemoryType) -> core::f
 }
 fn emit_float_reg(ctx: &mut dyn EmitContext, reg: Reg, is_double: bool) -> core::fmt::Result {
     match reg.to_real_reg() {
-        Some(preg) if preg.class() == RegClass::Float => {
+        // f32 scalars are Vector-class vregs; the scalar-FP view of a NEON
+        // register (`sN`/`dN`) is just its low 32/64 bits, so Float and
+        // Vector classes render identically in scalar-FP contexts.
+        Some(preg) if matches!(preg.class(), RegClass::Float | RegClass::Vector) => {
             write!(
                 ctx,
                 "{}{}",
@@ -2288,7 +2424,7 @@ fn emit_vec_scalar_reg(ctx: &mut dyn EmitContext, reg: Reg, shape: VecShape) -> 
         Some(preg) if preg.class() == RegClass::Int => {
             write!(ctx, "{}{}", if wide { "x" } else { "w" }, preg.hw_enc())
         }
-        Some(preg) if preg.class() == RegClass::Float => {
+        Some(preg) if matches!(preg.class(), RegClass::Float | RegClass::Vector) => {
             write!(ctx, "{}{}", if wide { "d" } else { "s" }, preg.hw_enc())
         }
         _ => ctx.write_reg(&reg),
@@ -2299,6 +2435,9 @@ fn vec_arith_name(op: VecArithOp) -> &'static str {
         VecArithOp::Add => "add",
         VecArithOp::Sub => "sub",
         VecArithOp::Mul => "mul",
+        VecArithOp::Fadd => "fadd",
+        VecArithOp::Fsub => "fsub",
+        VecArithOp::Fmul => "fmul",
     }
 }
 fn vec_bit_name(op: VecBitOp) -> &'static str {
@@ -2328,6 +2467,20 @@ fn vec_minmax_name(op: VecMinMaxOp) -> &'static str {
         VecMinMaxOp::Umax => "umax",
         VecMinMaxOp::Fmin => "fmin",
         VecMinMaxOp::Fmax => "fmax",
+    }
+}
+fn vec_shift_name(op: VecShiftOp, is_reg: bool) -> &'static str {
+    match (op, is_reg) {
+        // Immediate forms: `shl` / `ushr` / `sshr v.4s, v.4s, #imm`.
+        (VecShiftOp::Shl, false) => "shl",
+        (VecShiftOp::Shr, false) => "ushr",
+        (VecShiftOp::Sar, false) => "sshr",
+        // Register forms: `sshl` / `ushl v.4s, v.4s, v.4s`. Right shifts use
+        // a pre-negated amount vector (`neg` emitted before this), because
+        // NEON has no register-form right-shift instruction.
+        (VecShiftOp::Shl, true) => "sshl",
+        (VecShiftOp::Shr, true) => "ushl",
+        (VecShiftOp::Sar, true) => "sshl",
     }
 }
 fn emit_gpr(ctx: &mut dyn EmitContext, reg: &Gpr, size: OperandSize) -> core::fmt::Result {
@@ -2635,8 +2788,8 @@ mod tests {
         vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
     };
 
-    use super::{CCmpStep, Cond, Imm12, ImmLogic, MInst, SelectCmp, SelectValue, call_clobbers};
-    use crate::regs::{OperandSize, float_reg, int_reg};
+    use super::{CCmpStep, Cond, FpuOp, Imm12, ImmLogic, MInst, SelectCmp, SelectValue, call_clobbers};
+    use crate::regs::{OperandSize, float_reg, int_reg, vector_reg};
 
     #[derive(Default)]
     struct TestEmitContext(String);
@@ -3060,7 +3213,97 @@ mod tests {
             dst: Writable::from_reg(vec_reg(0)),
             src: float_reg(5),
         });
-        assert_eq!(dup_f32, "dup v0.4s, s5");
+        // LLVM MC rejects `dup vd.4s, sn`; the float scalar is read through
+        // the aliased vector register (`s5` is the low 32 bits of `v5`).
+        assert_eq!(dup_f32, "dup v0.4s, v5.s[0]");
+    }
+
+    #[test]
+    fn rc_for_type_maps_f32_to_the_vector_class() {
+        use taki_mir::types::F32;
+        // f32 scalars must allocate from the same bank as NEON vectors (`sN`
+        // is the low 32 bits of `vN`): a separate Float class would let the
+        // allocator hand an f32 and a live vector the same hw_enc, silently
+        // clobbering one (the h-10 `fmov s0` / `fdiv v0` corruption).
+        let (classes, types) = MInst::rc_for_type(F32);
+        assert_eq!(classes, &[RegClass::Vector]);
+        assert_eq!(types, &[F32]);
+    }
+
+    #[test]
+    fn f32_scalars_in_vector_class_render_as_s_registers() {
+        // The h-10 corruption sequence: an f32 constant materialized with
+        // `fmov s0, w21` (dst is a Vector-class vreg) must render as `sN`,
+        // and every scalar-f32 view of a Vector-class register does.
+        let fmov = emit(MInst::FMov {
+            dst: Writable::from_reg(vec_reg(0)),
+            src: int_reg(21),
+        });
+        assert_eq!(fmov, "fmov s0, w21");
+
+        let fadd = emit(MInst::FAlu {
+            op: FpuOp::Add,
+            dst: Writable::from_reg(vec_reg(0)),
+            lhs: vec_reg(1),
+            rhs: vec_reg(2),
+        });
+        assert_eq!(fadd, "fadd s0, s1, s2");
+
+        let addv = emit(MInst::VecAddv {
+            dst: Writable::from_reg(vec_reg(0)),
+            src: vec_reg(1),
+        });
+        assert_eq!(addv, "addv s0, v1.4s");
+
+        let load = emit(MInst::Load {
+            ty: super::MemoryType::F32,
+            dst: Writable::from_reg(vec_reg(3)),
+            addr: super::AMode::UnsignedOffset {
+                base: int_reg(0),
+                offset: super::UImm12Scaled::new(0, 4).unwrap(),
+            },
+        });
+        assert_eq!(load, "ldr s3, [x0, #0]");
+
+        let store = emit(MInst::Store {
+            ty: super::MemoryType::F32,
+            src: vec_reg(3),
+            addr: super::AMode::UnsignedOffset {
+                base: int_reg(0),
+                offset: super::UImm12Scaled::new(0, 4).unwrap(),
+            },
+        });
+        assert_eq!(store, "str s3, [x0, #0]");
+
+        // Lane extract/insert of an f32 element: the scalar side is `sN`.
+        let extract = emit(MInst::VecExtractLane {
+            size: OperandSize::Size32,
+            dst: Writable::from_reg(vec_reg(0)),
+            src: vec_reg(1),
+            lane: 0,
+        });
+        assert_eq!(extract, "mov s0, v1.s[0]");
+
+        let insert = emit(MInst::VecInsertLane {
+            size: OperandSize::Size32,
+            dst: Writable::from_reg(vec_reg(0)),
+            vector: vec_reg(1),
+            src: vec_reg(2),
+            lane: 1,
+        });
+        assert_eq!(insert, "mov v0.16b, v1.16b\n    mov v0.s[1], s2");
+    }
+
+    #[test]
+    fn dup_from_vector_class_f32_scalar_uses_element_form() {
+        // Post-merge, the splat source of an f32 is a Vector-class register;
+        // `dup vd.4s, sn` is rejected by LLVM MC, so the element form is used.
+        let dup_f32 = emit(MInst::VecDup {
+            shape: super::VecShape::FourS,
+            dst: Writable::from_reg(vec_reg(0)),
+            src: vec_reg(5),
+        });
+        assert_eq!(dup_f32, "dup v0.4s, v5.s[0]");
     }
 
     #[test]
@@ -3069,6 +3312,11 @@ mod tests {
             (super::VecArithOp::Add, "add"),
             (super::VecArithOp::Sub, "sub"),
             (super::VecArithOp::Mul, "mul"),
+            // Float vectors must use the `f*` NEON forms: the plain integer
+            // ops would add the float bit patterns.
+            (super::VecArithOp::Fadd, "fadd"),
+            (super::VecArithOp::Fsub, "fsub"),
+            (super::VecArithOp::Fmul, "fmul"),
         ] {
             let text = emit(MInst::VecArithRRR {
                 op,
@@ -3217,6 +3465,63 @@ mod tests {
             });
             assert_eq!(text, format!("{mnemonic} v0.4s, v1.4s, v2.4s"));
         }
+    }
+
+    #[test]
+    fn emits_vector_shift_div_neg_forms() {
+        // Immediate shifts: shl / ushr / sshr with a #imm amount.
+        for (op, mnemonic) in [
+            (super::VecShiftOp::Shl, "shl"),
+            (super::VecShiftOp::Shr, "ushr"),
+            (super::VecShiftOp::Sar, "sshr"),
+        ] {
+            let text = emit(MInst::VecShift {
+                op,
+                shape: super::VecShape::FourS,
+                dst: Writable::from_reg(vec_reg(0)),
+                lhs: vec_reg(1),
+                rhs: vec_reg(2),
+                imm: Some(3),
+            });
+            assert_eq!(text, format!("{mnemonic} v0.4s, v1.4s, #3"));
+        }
+        // Register (variable-amount) forms: sshl / ushl / sshl v,v,v.
+        for (op, mnemonic) in [
+            (super::VecShiftOp::Shl, "sshl"),
+            (super::VecShiftOp::Shr, "ushl"),
+            (super::VecShiftOp::Sar, "sshl"),
+        ] {
+            let text = emit(MInst::VecShift {
+                op,
+                shape: super::VecShape::FourS,
+                dst: Writable::from_reg(vec_reg(0)),
+                lhs: vec_reg(1),
+                rhs: vec_reg(2),
+                imm: None,
+            });
+            assert_eq!(text, format!("{mnemonic} v0.4s, v1.4s, v2.4s"));
+        }
+        let neg = emit(MInst::VecNeg {
+            shape: super::VecShape::FourS,
+            dst: Writable::from_reg(vec_reg(0)),
+            src: vec_reg(2),
+        });
+        assert_eq!(neg, "neg v0.4s, v2.4s");
+        let fdiv = emit(MInst::VecDiv {
+            shape: super::VecShape::FourS,
+            dst: Writable::from_reg(vec_reg(0)),
+            lhs: vec_reg(1),
+            rhs: vec_reg(2),
+        });
+        assert_eq!(fdiv, "fdiv v0.4s, v1.4s, v2.4s");
+        // Float-scalar dup prints through the aliased vector register
+        // (`s0` is the low 32 bits of `v0`); LLVM MC rejects `dup vd.4s, sn`.
+        let dup_float = emit(MInst::VecDup {
+            shape: super::VecShape::FourS,
+            dst: Writable::from_reg(vec_reg(0)),
+            src: float_reg(3),
+        });
+        assert_eq!(dup_float, "dup v0.4s, v3.s[0]");
     }
 
     #[test]

@@ -1,0 +1,45 @@
+int N_eff;
+
+int idx(int r, int c, int n) { return r * n + c; }
+
+void row_reduce(int A[]) {
+    int r = 0;
+    while (r < N_eff) {
+        int sum = 0;
+        int c = 0;
+        while (c < N_eff) {
+            sum = sum + A[idx(r, c, N_eff)];
+            c = c + 1;
+        }
+        c = 0;
+        while (c < N_eff) {
+            A[idx(r, c, N_eff)] = A[idx(r, c, N_eff)] - sum;
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+}
+
+int checksum(int A[]) {
+    int sum = 0;
+    int i = 0;
+    while (i < N_eff * N_eff) {
+        sum = sum + A[i];
+        i = i + 1;
+    }
+    return sum;
+}
+
+int A[64 * 64];
+
+int main() {
+    N_eff = 64;
+    int i = 0;
+    while (i < N_eff * N_eff) {
+        A[i] = i + 1;
+        i = i + 1;
+    }
+    row_reduce(A);
+    putint(checksum(A));
+    return 0;
+}

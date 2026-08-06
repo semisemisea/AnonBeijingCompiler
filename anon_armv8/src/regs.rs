@@ -106,17 +106,10 @@ pub const INT_ARG_REGS: [Reg; 8] = [
     int_reg(7),
 ];
 
-pub const FLOAT_ARG_REGS: [Reg; 8] = [
-    float_reg(0),
-    float_reg(1),
-    float_reg(2),
-    float_reg(3),
-    float_reg(4),
-    float_reg(5),
-    float_reg(6),
-    float_reg(7),
-];
-
+// AAPCS64 passes f32 arguments in s0-s7 — the low 32 bits of v0-v7. f32
+// scalars are Vector-class vregs (sN ≡ vN) and share the SIMD/FP argument
+// sequence with 128-bit vectors (a single NSRN), so argument slots for f32
+// come from `VECTOR_ARG_REGS`; there is no separate float argument bank.
 pub const VECTOR_ARG_REGS: [Reg; 8] = [
     vector_reg(0),
     vector_reg(1),
@@ -129,7 +122,8 @@ pub const VECTOR_ARG_REGS: [Reg; 8] = [
 ];
 
 pub const INT_RETURN_REG: Reg = int_reg(0);
-pub const FLOAT_RETURN_REG: Reg = float_reg(0);
+/// s0, the low 32 bits of v0 (f32 scalars are Vector-class vregs).
+pub const FLOAT_RETURN_REG: Reg = vector_reg(0);
 pub const VECTOR_RETURN_REG: Reg = vector_reg(0);
 
 pub const DEFAULT_CLOBBERS: PRegSet = PRegSet::empty()
@@ -229,12 +223,11 @@ pub fn machine_env() -> &'static MachineEnv {
                 &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
                 RegClass::Int,
             ),
-            preg_set(
-                &[
-                    0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
-                ],
-                RegClass::Float,
-            ),
+            // RegClass::Float has no allocatable registers on AArch64: f32
+            // scalars are Vector-class vregs (sN ≡ vN, so `sN` would alias a
+            // live `vN` if the two classes allocated independently). The class
+            // variant remains for the shared RA and the RISC-V backend.
+            PRegSet::empty(),
             // Vector preferred: v0-v7 (ABI arg/return regs) plus v16-v31
             // (caller-saved upper NEON regs). Callee-saved v8-v15 are
             // non-preferred so a call-free function never touches them.
@@ -248,17 +241,17 @@ pub fn machine_env() -> &'static MachineEnv {
         ],
         non_preferred_regs_by_class: [
             preg_set(&[19, 20, 21, 22, 23, 24, 25, 26, 27, 28], RegClass::Int),
-            preg_set(&[8, 9, 10, 11, 12, 13, 14, 15], RegClass::Float),
+            PRegSet::empty(),
             preg_set(&[8, 9, 10, 11, 12, 13, 14, 15], RegClass::Vector),
         ],
         scratch_by_class: [
             Some(int_preg(INT_ALLOCATOR_SCRATCH)),
-            Some(float_preg(FLOAT_ALLOCATOR_SCRATCH)),
+            None,
             None,
         ],
         post_ra_scratch_by_class: [
             INT_POST_RA_SCRATCH.map(int_preg).to_vec(),
-            FLOAT_POST_RA_SCRATCH.map(float_preg).to_vec(),
+            vec![],
             vec![],
         ],
         fixed_stack_slots: vec![],
@@ -296,10 +289,31 @@ mod tests {
             env.scratch_by_class[0],
             Some(int_preg(INT_ALLOCATOR_SCRATCH))
         );
-        assert_eq!(
-            env.scratch_by_class[1],
-            Some(float_preg(FLOAT_ALLOCATOR_SCRATCH))
-        );
+    }
+
+    #[test]
+    fn float_class_is_merged_into_vector_class() {
+        // AArch64's `sN` registers alias the low 32 bits of `vN`, so f32
+        // scalars must allocate from the Vector bank; the Float class must
+        // hold no allocatable registers on this backend (it remains only for
+        // the shared RA and the RISC-V backend).
+        let env = machine_env();
+        let allocatable = PRegSet::from(env);
+        for index in 0..=31u8 {
+            assert!(
+                !allocatable.contains(float_preg(index)),
+                "Float-class PReg {index} must not be allocatable on AArch64"
+            );
+        }
+        assert!(env.preferred_regs_by_class[1].is_empty(RegClass::Float));
+        assert!(env.non_preferred_regs_by_class[1].is_empty(RegClass::Float));
+        assert_eq!(env.scratch_by_class[1], None);
+        assert!(env.post_ra_scratch_by_class[1].is_empty());
+
+        // The f32 ABI registers are the low 32 bits of the vector ABI
+        // registers: the f32 return register is v0, and there is no separate
+        // float argument bank (f32 args share the SIMD/FP sequence).
+        assert_eq!(FLOAT_RETURN_REG, vector_reg(0));
     }
 }
 

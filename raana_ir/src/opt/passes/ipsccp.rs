@@ -596,7 +596,14 @@ impl Pass for IPSCCP {
                     | InstKind::VectorExtractElement(..)
                     | InstKind::VectorInsertElement(..)
                     | InstKind::VectorReduce(..) => {
-                        merge_and_extend(node, Lattice::Top, &mut lattice_map);
+                        // These vector ops cannot be constant-folded, but
+                        // their results are *definitely* not constants.
+                        // Marking them Top (undef) lets the optimistic SCCP
+                        // merge fold a loop block-param to the entry edge's
+                        // constant (e.g. `sum` -> 0 for `sum += c[i][j]`
+                        // nested loops), silently zeroing the accumulator.
+                        // Bottom (overdefined) is the correct lattice value.
+                        merge_and_extend(node, Lattice::Bottom, &mut lattice_map);
                     }
                     InstKind::Jump(jump) => {
                         let params = data.bb_data(jump.target()).params();

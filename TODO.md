@@ -3420,3 +3420,171 @@ delegate_task 派给 subagent（leaf，任务文本见下）。两轨并行，**
   新增单测 ≥3；raana_ir 全量全绿；01_mm1/2/3、matmul1 不回归；RISC-V 零影响。
 - 双轨结论分别落 TODO §10.17/§10.18；git status 只剩非本任务文件。
 ```
+
+### 10.20 SIMD 差距盘点 + conv2d 调研（2026-08-06，clang -O2 对比 + 最小复现实证）
+
+**背景**：上一 session（§10.17.1/§10.18.1）完成后，对 perf 全语料（60 case）
+做 clang -O2 vs 我们的 NEON 指令对比（clang 基线 = test-baseline 生成，
+results/perf/*.s）。
+
+**差距表**（修正 movi/dup 误报后的真实差距）：
+
+| case | clang | 我们 | 差距 | 我们拒绝点 |
+|---|---|---|---|---|
+| crypto-1/2/3 | ld4 多数组 | 0 | 外围搬移向量化 | IntraIterationConflict×4、gep_offset×3；md5 64 轮核心是 A/B/C/D 串行依赖链，本质不可 SIMD——**收益上限 ~10ms，不做** |
+| h-8-01/02/03 | %11 魔数序列 | 0 | % 循环向量化 | payload_inst_rejected:Rem；但 % 循环占 h-8 执行 <1%（196 万 vs 主内核 4.6 亿次迭代）——**收益 ~0.4%，不做** |
+| conv2d-1/2/3 | 部分 | 0 | row_reduce/nonlinear | 见下根因 |
+| 03_sort | 1 addv | 4 | 持平 | — |
+| crc/transpose/fft/huffman/knapsack/shuffle/opt_sched/h-1/h-4/h-9 | 0 | 0 | clang 也没向量化 | 无差距 |
+| 01_mm/h-10/many_mat_cal/matmul/sl | 少 | 多 | 我们已超 clang（但指令数多≠快：B1 归约 mul+sub+dup+addv vs clang fmla 一条） | — |
+
+**conv2d 根因实证（本 session）**：
+
+- conv2d-1 执行 r=756ms（大头）。主内核 = repeat×N_eff²×KSIZE²（kc 内层
+  连续，trip=5 常量，卡 if 内条件归约 + B1 余数）；row_reduce/nonlinear
+  是标准 B1 归约/elementwise 形态却 NEON=0。
+- M44_TRACE：row_reduce 三循环全拒——BB5 归约（Reducible 识别成功）
+  UnknownBase(30)、BB8 UnknownBase(57)+IntraIterationConflict(57,60)、
+  BB18 UnknownBase(158)。
+- 最小复现（tests 外同构，参数数组 A + idx=r*N+c）→ **NonAffineIndex{
+  index: mul(r,N)}**：`A[r*N+c]` 的 GEP 索引是 `add(mul(r,N), c)` 表达式树，
+  classify_index（dependence.rs:241-326）的 Mul 分支 (None,None) 只处理
+  "一边 iv 一边 invariant"（281/284 行 RuntimeCoefficient），**两边都
+  loop-invariant（r 外层 iv × 全局 N）落入 287 行 NonAffineIndex**——缺
+  "invariant×invariant → coefficient 0 + range 乘积"分支。conv2d 的
+  UnknownBase 是同根因经 idx() 函数内联后的另一表现（具体差异待新 session
+  实证：is_loop_outside 判定或 range 路径）。
+- 影响面（通用缺口）：conv2d row_reduce（归约+写回）、conv2d 主内核 kc
+  循环（cc=c+kc-pad）、transpose（idx 乘法索引）、一切 idx(r,c,n)=r*n+c
+  形态。
+
+**候选修复（按收益/成本排序，见 §10.20 goal 提示词）**：
+
+1. **conv2d row_reduce/nonlinear 解锁**（小改）：classify_index Mul 分支加
+   "invariant×invariant" 分支（几行）+ 实证 conv2d 的 UnknownBase 为何与
+   最小复现不同（可能是 is_loop_outside 的 parent_bb 判定或 loop 包含
+   关系——若同根因则一修两得）；附带排查 BB8 IntraIterationConflict(57,60)
+   （同 GEP 的 load+store，B3 元素安全 RMW 应豁免）。
+2. **h-8 主内核：B1 条件 store + runtime trip**（大收益）：解除
+   loop_vectorize.rs:1458 `arm_plan && runtime_trip` 拒绝，rotated runtime
+   tail 机制接入 B1 arm；h-8 r 3.0s 的大头（n³/6≈4.6 亿次）。
+3. **向量 MAC 折叠**（mla.v.4s / fmls / fmla）：已解锁循环（h-5/h-10/mm）
+   的 B1 归约从 mul+sub+addv 压到 mla+addv；后端缺 VecMla/VecFmls/元素
+   索引形式；Cranelift 审查（§10.17.1 附）结论：整数向量 mla 折叠
+   Cranelift 也没有，浮点走显式 fma opcode + fneg/splat 吸收。
+4. **不做**：crypto（串行依赖本质）、h-8 % 循环（0.4%）、conv2d 主内核
+   （if 内条件归约，B1 只支持条件 store，形态最重——除非 2 顺带覆盖）。
+
+**自包含 goal 提示词（可直接粘贴新 session）**
+
+```text
+# Goal: SIMD 推进——conv2d row_reduce/nonlinear 解锁（主）+ h-8 主内核 B1 runtime-trip（次）
+
+## 背景
+
+loop_vectorize 已完成：rotated runtime 向量化、i32/f32 elementwise + B1
+归约 + tail 链、IPA 参数对齐（§10.17.1，feat/loop-vectorize-hermes @
+7ac9c0e）；rotated runtime do-while off-by-one 已修（0ca047c，h-5/h-10
+同源）。当前分支 feat/loop-vectorize-hermes。
+
+perf 全语料 clang -O2 对比（§10.20）：conv2d（r≈756ms，大头）、h-8
+（r≈3.0s）是剩余主要缺口。本任务先解锁 conv2d 的标准形态循环
+（row_reduce 归约 + 写回、nonlinear），再攻 h-8 主内核（B1 条件 store +
+runtime trip）。
+
+## 现状与根因（已实证，2026-08-06）
+
+- conv2d-1 row_reduce 三循环全拒（M44_TRACE）：BB5 归约（Reducible 识别
+  成功）UnknownBase(30)、BB8 UnknownBase(57)+IntraIterationConflict(57,60)、
+  BB18 UnknownBase(158)。
+- 最小复现（参数数组 A + A[r*N+c] 同构）→ NonAffineIndex{index: mul(r,N)}：
+  GEP 索引 add(mul(r,N), c) 分解失败。classify_index（dependence.rs:
+  241-326）Mul 分支 (None,None) 缺 "两边都 loop-invariant → coefficient 0 +
+  range 乘积" 分支（281/284 只处理一边 iv 一边 invariant，287 兜底
+  NonAffineIndex）。
+- conv2d 显示 UnknownBase 而非 NonAffineIndex：同根因经 idx() 函数内联后
+  的另一表现（差异待实证：is_loop_outside 的 parent_bb 判定 / loop 包含
+  关系 / range 分析路径）。
+- h-8 主内核（k 循环，if 内条件 store + runtime trip）卡
+  loop_vectorize.rs:1458 `arm_plan && (runtime_trip || trip%VF!=0)` 拒绝
+  （arm_remainder_not_supported）。
+
+## 必须遵守的规则
+
+- 只改 raana_ir（loop_vectorize.rs、dependence.rs）；不碰
+  anon_armv8/taki_mir（除非做候选 3 向量 MAC 折叠——那是独立任务，先做完
+  主次任务再说）；uika_riscv 零影响。
+- 无 hacky workaround；root cause only；不做 benchmark/函数名/输入条件
+  优化；禁止 Rc<RefCell<T>> / RefCell 共享可变。
+- 形态实证先行：先确认 conv2d 的 UnknownBase 与最小复现的 NonAffineIndex
+  是否同根因（插桩/细读），再动手。
+- 勤 commit（中文消息、git commit -F 规避 homoglyph 扫描）；改文件一律
+  patch；不碰 .docker-image、不 rm -rf、不 cargo clean；不 push。
+- 验收粒度 = 单测 + 单 case（make test perf/conv2d-1.sy ARGS="-O 2 -j 1"）。
+
+## 主任务：conv2d row_reduce/nonlinear 解锁
+
+1. 修复 classify_index 的 Mul 缺口（dependence.rs:266-317）：(None, None)
+   时若 classify 两边都 coefficient 0（loop-invariant），返回
+   IndexInfo{coefficient: 0, offset_range: 两边 range 的乘积范围}；若一边
+   coeff≠0 一边 coeff==0 维持 RuntimeCoefficient；其余维持 NonAffine。
+   Shl 分支同理检查。
+2. 实证并修复 conv2d 的 UnknownBase 路径：为什么同一表达式在 conv2d 是
+   UnknownBase、最小复现是 NonAffineIndex——可能是 is_loop_outside
+   （dependence.rs:202-227）的 range 路径未命中（ranges.range_before 对
+   mul(r,N) 返回 Empty？）或 loop 包含关系；修到两个 case 都解锁。
+3. 排查 BB8 IntraIterationConflict(57,60)：同 GEP 的 load+store（写回
+   A[r*N+c] = A[r*N+c] - sum）应被 B3 元素安全 RMW 豁免——确认豁免条件
+   是否覆盖"同 base 同 offset 的 load/store 对"。
+4. nonlinear（% 97）不在此任务（Rem 向量化是独立项，见 §10.20 不做清单）。
+
+## 次任务：h-8 主内核（若主任务完成后有余力）
+
+1. loop_vectorize.rs:1458 解除 `arm_plan && runtime_trip` 拒绝：rotated
+   runtime 的 cnt0/tail 机制接入 B1 arm（arm body 克隆进 tail，参照
+   tail_header 现有构造 1964-2034）；trip%VF!=0 的 B1 exact-trip 已有
+   epilogue 链（r>0），确认与 arm 的组合。
+2. 条件 store 的 mask 重写（现有 arm 机制）应覆盖 if 内 store；验证
+   table[i][j] < X 型 max 更新（h-8 主内核是 if 内赋值非纯 store——
+   需确认 arm 的 body 重写支持）。
+3. 验收：h-8-01/02/03 差分 PASS（qemu r: 前后记录，期望 3.0s 下降）。
+
+## 验证命令
+
+- 单测：cargo test -p raana_ir 2>&1 | grep -E "test result"（新增单测
+  ≥2：invariant×invariant 索引解锁、conv2d 同构形态）
+- 复扫：M44_TRACE=1 ./target/release/compiler -O2 --target aarch64
+  --emit ir -o /tmp/x.ir tests/perf/conv2d-1.sy 2>&1 | grep -oE
+  "reject=[A-Za-z0-9_:]+" | sort | uniq -c（UnknownBase/NonAffineIndex
+  下降，记录数字）
+- 差分：make test perf/conv2d-1.sy perf/conv2d-2.sy perf/conv2d-3.sy
+  ARGS="-O 2 -j 1"（PASS + r 前后）；h-8 三例同
+- 回归：make test perf/01_mm1.sy perf/h-5-01.sy perf/h-10-01.sy
+  ARGS="-O 2 -j 1"（既有向量化不回归）；RISC-V 抽查（make test-riscv
+  ARGS="-O 2" 单 case）
+- musl 过期：touch raana_ir/src/opt/pass.rs soyo_compiler/src/main.rs &&
+  make test-compiler
+
+## 关键代码位置
+
+- dependence.rs：241-326 classify_index（Mul/Shl 缺口）；202-227
+  is_loop_outside/range 路径；659-682 冲突测试（IntraIterationConflict）；
+  B3 元素安全豁免（1028-1030 附近）
+- loop_vectorize.rs：1458 arm_remainder_not_supported；1964-2034
+  tail_header 构造；2632-2638 arm 分支 mask 重写
+- 既有单测参考：vectorizes_param_base_all_aligned、rejects_strided_access、
+  rot_rt 系列
+
+## 验收清单（全部满足才算完成）
+
+- [ ] classify_index invariant×invariant 修复落地；conv2d-1
+      UnknownBase/NonAffineIndex 计数下降（记录复扫数字）；row_reduce
+      归约 + 写回至少一个解锁（记录 NEON 计数）
+- [ ] 新增单测 ≥2 全绿（invariant 索引乘积解锁 + conv2d 同构拒绝原因
+      实证）；raana_ir 全量全绿
+- [ ] conv2d-1/2/3 差分 PASS（记录 qemu r: 前后）；若有性能提升记录
+- [ ] h-8 主内核（若做）：h-8-01/02/03 差分 PASS，r 下降记录
+- [ ] 01_mm1、h-5-01、h-10-01 不回归；RISC-V 零影响
+- [ ] 提交历史干净（原子提交，中文消息）；结论写入 TODO.md §10.20
+- [ ] 最终 git status 只剩非本任务文件
+```

@@ -14,7 +14,7 @@ use taki_mir::{
     block_order::{LoweredBlock, MirBlockIndex},
     div_magic::{MagicCorrection, signed_magic_i32},
     lower::{
-        LowerBackend, LowerContext, LoweredOutput, analyze_gep, fold_gep_constant_offset,
+        LowerBackend, LowerContext, LoweredOutput, analyze_gep, fold_gep_constant_offset_shared,
         sink_gep_into_address,
     },
     prelude::{ArenaContext, HirFunction, HirFunctionData, HirInst},

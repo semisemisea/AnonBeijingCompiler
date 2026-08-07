@@ -429,10 +429,15 @@ pub(super) fn memory_address(
     AMode::Reg { base: address }
 }
 
-/// Fold a single-use constant GEP into a `(base, offset)` pair whose offset is
+/// Fold a constant GEP into a `(base, offset)` pair whose offset is
 /// encodable in AArch64 load/store addressing for `width`-byte accesses.
-/// Returns `None` for dynamic-index GEPs, unencodable offsets, or multi-user
-/// GEPs; callers then materialize the address as before.
+/// Returns `None` for dynamic-index GEPs or unencodable offsets; callers then
+/// materialize the address as before.
+///
+/// Unlike the single-use variant, the GEP may be shared by several loads and
+/// stores (e.g. a 2x-unrolled vectorizer continuation GEP consumed by both the
+/// unrolled vector load and its paired store): every memory user folds it into
+/// its own addressing mode, so the producer is never materialized.
 pub(super) fn try_fold_gep_offset(
     ctx: &mut LowerContext<'_, MInst>,
     arena: ArenaContext<'_>,
@@ -440,7 +445,7 @@ pub(super) fn try_fold_gep_offset(
     consumer: HirInst,
     width: u8,
 ) -> Option<(taki_mir::register::Reg, i64)> {
-    fold_gep_constant_offset(ctx, arena, gep, consumer, |off| {
+    fold_gep_constant_offset_shared(ctx, arena, gep, consumer, |off| {
         crate::instructions::UImm12Scaled::new(off as u64, width).is_some()
             || i16::try_from(off)
                 .ok()

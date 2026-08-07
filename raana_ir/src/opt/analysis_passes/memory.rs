@@ -262,6 +262,7 @@ impl BaseEnv {
                 };
                 let mut result: Option<MemObject> = None;
                 let mut all_set = true;
+                let mut saw_independent_edge = false;
                 for &user in arena.bb_data(block).used_by() {
                     let arg = match arena.inst_data(user).kind() {
                         InstKind::Jump(jump) if jump.target() == block => {
@@ -281,6 +282,21 @@ impl BaseEnv {
                     let Some(arg) = arg else {
                         return Some(MemObject::Unknown);
                     };
+                    // A back edge that forwards the parameter itself, or a
+                    // GEP of the parameter itself (a loop-carried pointer
+                    // bump), carries the *same* base as this parameter — it
+                    // must not introduce a self-dependency that otherwise
+                    // stalls the fixed point. Skip it: the base is decided
+                    // by the independent incoming edges.
+                    if arg == ptr
+                        || matches!(
+                            arena.inst_data(arg).kind(),
+                            InstKind::GetElemPtr(gep) if gep.base() == ptr
+                        )
+                    {
+                        continue;
+                    }
+                    saw_independent_edge = true;
                     match work.get(&arg) {
                         None => all_set = false,
                         Some(Some(MemObject::Unknown)) => return Some(MemObject::Unknown),
@@ -293,6 +309,10 @@ impl BaseEnv {
                 }
                 if all_set {
                     result.or(Some(MemObject::Unknown))
+                } else if !saw_independent_edge {
+                    // Only self-referential back edges (no independent
+                    // incoming value): the base is genuinely unprovable.
+                    Some(MemObject::Unknown)
                 } else {
                     None
                 }
@@ -493,7 +513,9 @@ pub fn integer_constant<A: Arena + ?Sized>(arena: &A, inst: Inst) -> Option<i32>
 mod tests {
     use super::*;
     use crate::{
-        ir::{Program, Type, arena::Arena, builder_trait::*},
+        ir::{
+            Program, Type, arena::Arena, builder_trait::*, inst_kind::GetElemPtr,
+        },
         opt::pass::ArenaContext,
     };
 
@@ -796,5 +818,58 @@ mod tests {
 
         let (env, ctx) = env_of(&program, function);
         assert_eq!(env.base_of(&ctx, param), MemObject::Unknown);
+    }
+
+    #[test]
+    fn loop_carried_bumped_row_pointer_resolves_through_back_edge() {
+        // A loop header row-pointer parameter whose back edge forwards a GEP
+        // of the parameter itself (a pointer bump) must still resolve to the
+        // alloc base carried by the entry edge. Before the fix the
+        // self-referential back edge stalled the base fixed point, so the
+        // header parameter (and every load through it) came out Unknown.
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "f".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+
+        let base_alloc = data.new_local_inst().alloc(Type::get_i32());
+        data.layout_mut().insert_inst(entry, base_alloc);
+        let zero = data.new_local_inst().integer(0);
+        data.layout_mut().insert_inst(entry, zero);
+        let row = data.new_local_inst().raw(GetElemPtr::new_data(
+            base_alloc,
+            vec![zero],
+            Type::get_i32().reference(),
+        ));
+        data.layout_mut().insert_inst(entry, row);
+        let stride = data.new_local_inst().integer(4);
+        data.layout_mut().insert_inst(entry, stride);
+
+        let head = data
+            .new_basic_block()
+            .basic_block("head".into(), vec![Type::get_i32().reference()]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        data.layout_mut().push_bb_back(head);
+        data.layout_mut().push_bb_back(exit);
+
+        let param = data.bb_data(head).params()[0];
+        let entry_jump = data.new_local_inst().jump(head, vec![row]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        // Back edge: `%param' = gep %param, 4` forwarded to the header.
+        let bumped = data.new_local_inst().raw(GetElemPtr::new_data(
+            param,
+            vec![stride],
+            Type::get_i32().reference(),
+        ));
+        data.layout_mut().insert_inst(head, bumped);
+        let back_jump = data.new_local_inst().jump(head, vec![bumped]);
+        data.layout_mut().insert_inst(head, back_jump);
+        let ret_head = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(head, ret_head);
+        let ret_exit = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret_exit);
+
+        let (env, ctx) = env_of(&program, function);
+        assert_eq!(env.base_of(&ctx, param), MemObject::Alloc(base_alloc));
     }
 }

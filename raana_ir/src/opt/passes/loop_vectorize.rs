@@ -1379,10 +1379,36 @@ fn analyze_loop(
                 trace(data, looop, "b1_acc_is_iv");
                 return None;
             }
-            let delta = if let Some((value, _, _, _)) = mod_params.as_ref() {
+            let (update, delta) = if let Some((value, _, _, _)) = mod_params.as_ref() {
                 // Mod-wrapped: `update = rem(acc + value + C, P)`; the delta
                 // is the element computation (vectorized + addv per round).
-                *value
+                (update, *value)
+            } else if let Some(arm_plan) = &arm_plan {
+                // B1 masked reduction: the accumulator update lives in the
+                // arm (`delta = binary(op, acc, rhs)`); the arm's jump
+                // forwards `delta` to the merge, whose back edge feeds the
+                // header's accumulator slot. The merge phi is the masked
+                // value `select(cond, acc, delta)` — the apply phase rewrites
+                // the arm's `delta` in place and the merge carries the
+                // vector accumulator.
+                let arm_term = data.layout().basicblock(arm_plan.arm).terminator();
+                let InstKind::Jump(arm_jump) = arena.inst_data(arm_term).kind() else {
+                    trace(data, looop, "b1_arm_not_jump");
+                    return None;
+                };
+                let Some(arm_arg) = arm_jump.args().first().copied() else {
+                    trace(data, looop, "b1_arm_no_acc_arg");
+                    return None;
+                };
+                let InstKind::Binary(binary) = arena.inst_data(arm_arg).kind() else {
+                    trace(data, looop, "b1_arm_update_not_binary");
+                    return None;
+                };
+                if binary.op() != bop || binary.lhs() != acc {
+                    trace(data, looop, "b1_arm_update_shape");
+                    return None;
+                }
+                (arm_arg, binary.rhs())
             } else {
                 let InstKind::Binary(binary) = arena.inst_data(update).kind() else {
                     trace(data, looop, "b1_acc_update_not_binary");
@@ -1392,7 +1418,7 @@ fn analyze_loop(
                     trace(data, looop, "b1_acc_update_shape");
                     return None;
                 }
-                binary.rhs()
+                (update, binary.rhs())
             };
             // The accumulator must be consumed only by its update chain,
             // the latch, and — for test-at-top loops — the exit region
@@ -1408,8 +1434,15 @@ fn analyze_loop(
                 let Some(user_bb) = data.layout().parent_bb(user) else {
                     continue;
                 };
+                // B1 single-arm bodies: the body_br's branch forwards the
+                // untouched accumulator on its true edge (the mask's "no
+                // update" path), so the body_br block is a legal consumer.
+                let in_body_br = arm_plan
+                    .as_ref()
+                    .is_some_and(|a| user_bb == a.body_br);
                 if user != update
                     && user_bb != latch
+                    && !in_body_br
                     && !(test_at_top && dom.dominates(exit, user_bb))
                 {
                     trace(data, looop, "b1_acc_used_outside_latch");
@@ -1486,7 +1519,12 @@ fn analyze_loop(
             let ok = acc_update
                 .as_ref()
                 .is_some_and(|(update, _)| arg == *update)
-                || (test_at_top && arg == params[*acc_slot]);
+                || (test_at_top && arg == params[*acc_slot])
+                // B1 masked reduction: the exit leaves through the merge
+                // (latch) block, whose accumulator phi (fed `acc` on the
+                // body_br true edge and the masked delta on the arm edge) is
+                // the final value. `arg` is that merge parameter.
+                || (arm_plan.is_some() && arg == back_args[*acc_slot]);
             if !ok {
                 trace(data, looop, "exit_arg_not_acc");
                 return None;
@@ -1893,9 +1931,16 @@ fn analyze_loop(
                     if operand == iv {
                         continue;
                     }
-                    if !is_loop_invariant(arena, operand, header, latch) {
-        trace(data, looop, "binary_operand_loop_variant");
-        return None;
+                    // The B1 accumulator operand (a header parameter re-typed
+                    // to a vector in the mutation phase) is a legal vector
+                    // operand even though its back-edge value changes: it
+                    // feeds the arm's masked reduction update.
+                    let is_acc = acc_info
+                        .as_ref()
+                        .is_some_and(|(acc, _, _)| *acc == operand);
+                    if !is_acc && !is_loop_invariant(arena, operand, header, latch) {
+                        trace(data, looop, "binary_operand_loop_variant");
+                        return None;
                     }
                 }
             }
@@ -2951,6 +2996,23 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
 
     // 2. In-place vectorization of the latch payload (instruction ids are
     //    preserved by ReplaceBuilder, so later operands stay valid).
+    //    The B1 accumulator is re-typed *before* the payload is rewritten:
+    //    the arm's masked reduction (`acc' = binary(acc, delta)`) reads the
+    //    accumulator as a vector operand, so it must already be a vector
+    //    when the payload loop splats binary operands.
+    if let Some(red) = &reduction {
+        data.inst_data_mut(red.acc).set_type(vector_ty.clone());
+        // B1 masked reduction: the merge (latch) block's accumulator phi —
+        // the back-edge argument for the accumulator slot — must become a
+        // vector too (it carries the masked `select(cond, acc, acc+rhs)`).
+        if let Some(arm_plan) = &arm {
+            if let InstKind::Branch(b) = data.inst_data(latch_branch).kind() {
+                if let Some(&merge_param) = b.t_args().get(red.acc_slot) {
+                    data.inst_data_mut(merge_param).set_type(vector_ty.clone());
+                }
+            }
+        }
+    }
     let mut splats = FxHashMap::<Inst, Inst>::default();
     // B3c: the index IV consumed as a payload *value* (a store src or a
     // binary operand — not a GEP offset, which stays scalar) is rewritten
@@ -3280,18 +3342,107 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         data.replace_inst_with(modr.acc_update)
             .raw(Binary::new_data(prev, p, BinaryOp::Rem, i32.clone()));
     } else if let Some(red) = &reduction {
-        data.inst_data_mut(red.acc).set_type(vector_ty.clone());
-        let delta_vec = vector_operand(
-            data,
-            &mut splats,
-            red.delta,
-            &payload,
-            &classes,
-            &vector_ty,
-            red.acc_update,
-        );
-        data.replace_inst_with(red.acc_update)
-            .raw(Binary::new_data(red.acc, delta_vec, red.op, vector_ty.clone()));
+        if let Some(arm_plan) = &arm {
+            // B1 masked reduction: the arm's `delta` (now `acc + rhs`, the
+            // payload loop already rewrote it lane-wise) executes only when
+            // the arm runs. Rewrite it into a lane-wise mask selection
+            // `(acc & ~m) | (delta & m)` with `m = -(eq(cond, 0))` —
+            // all-ones exactly when the arm runs (it sits on the branch's
+            // false edge). The merge phi then carries the masked
+            // accumulator.
+            let vacc = vector_operand(
+                data,
+                &mut splats,
+                red.acc,
+                &payload,
+                &classes,
+                &vector_ty,
+                red.acc_update,
+            );
+            let vcond = vector_operand(
+                data,
+                &mut splats,
+                arm_plan.mask_cond,
+                &payload,
+                &classes,
+                &vector_ty,
+                red.acc_update,
+            );
+            let zero = data.new_local_inst().integer(0);
+            let vzero = vector_operand(
+                data,
+                &mut splats,
+                zero,
+                &payload,
+                &classes,
+                &vector_ty,
+                red.acc_update,
+            );
+            let m = alloc_inst(
+                data,
+                Binary::new_data(vcond, vzero, BinaryOp::Eq, vector_ty.clone()),
+            );
+            data.layout_mut().insert_inst_before(red.acc_update, m);
+            let neg_one = data.new_local_inst().integer(-1);
+            let vneg = vector_operand(
+                data,
+                &mut splats,
+                neg_one,
+                &payload,
+                &classes,
+                &vector_ty,
+                red.acc_update,
+            );
+            let nm = alloc_inst(
+                data,
+                Binary::new_data(m, vneg, BinaryOp::Xor, vector_ty.clone()),
+            );
+            data.layout_mut().insert_inst_before(red.acc_update, nm);
+            // The arm sits on the branch's true edge when `arm_on_true`:
+            // then it executes when `cond != 0`, so `delta` is gated by
+            // `~m` and `acc` by `m` (inverted from the false-edge case).
+            let (m_new, m_old) = if arm_plan.arm_on_true { (nm, m) } else { (m, nm) };
+            // `delta` = the payload-rewritten `acc + rhs` (red.acc_update).
+            let vdelta = red.acc_update;
+            let tn = alloc_inst(
+                data,
+                Binary::new_data(vdelta, m_new, BinaryOp::And, vector_ty.clone()),
+            );
+            data.layout_mut().insert_inst_before(red.acc_update, tn);
+            let fo = alloc_inst(
+                data,
+                Binary::new_data(vacc, m_old, BinaryOp::And, vector_ty.clone()),
+            );
+            data.layout_mut().insert_inst_before(red.acc_update, fo);
+            let sel = alloc_inst(
+                data,
+                Binary::new_data(tn, fo, BinaryOp::Or, vector_ty.clone()),
+            );
+            data.layout_mut().insert_inst_before(red.acc_update, sel);
+            // The merge phi reads the masked accumulator: retarget the arm's
+            // jump argument (the delta) to the selection result. The delta
+            // instruction becomes dead and is swept by DCE.
+            let arm_term = data.layout().basicblock(arm_plan.arm).terminator();
+            let users: Vec<Inst> = data.inst_data(red.acc_update).used_by().iter().copied().collect();
+            for user in users {
+                if data.layout().parent_bb(user) == Some(arm_plan.arm) {
+                    subst_operand(data, user, red.acc_update, sel);
+                }
+            }
+            let _ = arm_term;
+        } else {
+            let delta_vec = vector_operand(
+                data,
+                &mut splats,
+                red.delta,
+                &payload,
+                &classes,
+                &vector_ty,
+                red.acc_update,
+            );
+            data.replace_inst_with(red.acc_update)
+                .raw(Binary::new_data(red.acc, delta_vec, red.op, vector_ty.clone()));
+        }
     }
 
     // 2c. Retarget the exit edge: the reduce block (reduction) or the
@@ -3838,6 +3989,11 @@ fn vector_operand(
             Some(Class::VecLoad) | Some(Class::VecBinary) => return operand,
             _ => {}
         }
+    }
+    // Already a vector value (e.g. the B1 accumulator, re-typed in the
+    // mutation phase): use it directly rather than splatting.
+    if data.inst_data(operand).ty().is_vector() {
+        return operand;
     }
     if let Some(&splat) = splats.get(&operand) {
         return splat;
@@ -7263,6 +7419,131 @@ mod tests {
             run(&mut program, function),
             "lane-wise select condition must vectorize via mask rewrite"
         );
+    }
+
+    /// `sum += (a[i] & 1) ? b[i] : 0` — the matmul masked-kernel shape: a
+    /// single-arm if whose arm is a *register reduction* (`acc' = acc + d`)
+    /// rather than a memory store. The arm's accumulator update must be
+    /// masked (`acc' = (acc & ~m) | (acc + d & m)`, `m = -(cond == 0)`) so
+    /// the branch disappears and the accumulator vectorizes.
+    fn build_masked_reduction_loop(program: &mut Program) -> Function {
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr.clone());
+            program.new_value().global_alloc(init)
+        };
+        let b = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_i32(), "masked_reduce".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut *program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone(), i32.clone()]);
+        let body_br = data.new_basic_block().basic_block("body_br".into(), vec![]);
+        let arm = data.new_basic_block().basic_block("arm".into(), vec![]);
+        // merge = the latch: it carries the (masked) accumulator phi, then
+        // performs the iv/t updates and the back branch. Its parameter is
+        // the *post-mask* accumulator value.
+        let merge = data
+            .new_basic_block()
+            .basic_block("merge".into(), vec![i32.clone()]);
+        let exit = data
+            .new_basic_block()
+            .basic_block("exit".into(), vec![i32.clone()]);
+        for bb in [header, body_br, arm, merge, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let trip_inst = data.new_local_inst().integer(16);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero, trip_inst]);
+        for inst in [zero, trip_inst, entry_jump] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let acc = data.bb_data(header).params()[0];
+        let iv = data.bb_data(header).params()[1];
+        let counter = data.bb_data(header).params()[2];
+        let header_jump = data.new_local_inst().jump(body_br, vec![]);
+        data.layout_mut().insert_inst(header, header_jump);
+        let one = data.new_local_inst().integer(1);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        // body_br: cond = (a[i] & 1); br cond, merge(acc), arm
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let cond = lb.binary(BinaryOp::And, load_a, one);
+        let br = lb.branch(cond, merge, vec![acc], arm, vec![]);
+        drop(lb);
+        for inst in [one, gep_a, load_a, cond, br] {
+            data.layout_mut().insert_inst(body_br, inst);
+        }
+        // arm: delta = acc + b[i]; jump merge(delta)
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_b = lb.get_elem_ptr(b, vec![zero, iv]);
+        let load_b = lb.load(gep_b);
+        let delta = lb.binary(BinaryOp::Add, acc, load_b);
+        let arm_jump = lb.jump(merge, vec![delta]);
+        drop(lb);
+        for inst in [gep_b, load_b, delta, arm_jump] {
+            data.layout_mut().insert_inst(arm, inst);
+        }
+        // merge: phi acc (parameter), iv', t', back branch to header.
+        let merge_acc = data.bb_data(merge).params()[0];
+        let iv_next = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        let t_next = data.new_local_inst().binary(BinaryOp::Sub, counter, one);
+        let back = data.new_local_inst().branch(
+            t_next,
+            header,
+            vec![merge_acc, iv_next, t_next],
+            exit,
+            vec![merge_acc],
+        );
+        for inst in [iv_next, t_next, back] {
+            data.layout_mut().insert_inst(merge, inst);
+        }
+        let exit_acc = data.bb_data(exit).params()[0];
+        let exit_ret = data.new_local_inst().ret(Some(exit_acc));
+        data.layout_mut().insert_inst(exit, exit_ret);
+        function
+    }
+
+    #[test]
+    fn vectorizes_masked_reduction() {
+        // B1 + register reduction: `sum += (a[i] & 1) ? b[i] : 0` on a
+        // rotated `[acc, iv, t]` loop. The accumulator update lives in the
+        // arm (single-exit, masked); it must vectorize with the accumulator
+        // re-typed to <4 x i32> and a horizontal reduce at the exit.
+        let mut program = Program::new();
+        let function = build_masked_reduction_loop(&mut program);
+        assert!(
+            run(&mut program, function),
+            "single-arm if with register reduction must vectorize"
+        );
+        let data = program.func_data(function);
+        // The accumulator header parameter was re-typed to a vector.
+        let acc_is_vector = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|l| data.bb_data(l.bb()).params().iter().copied())
+            .any(|p| data.inst_data(p).ty().is_vector());
+        assert!(acc_is_vector, "accumulator must be re-typed to <4 x i32>");
+        let has_reduce = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .flat_map(|l| l.insts().iter().copied())
+            .any(|inst| matches!(data.inst_data(inst).kind(), InstKind::VectorReduce(_)));
+        assert!(has_reduce, "the vector loop must exit through VectorReduce");
     }
 
     #[test]

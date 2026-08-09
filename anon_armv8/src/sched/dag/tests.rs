@@ -462,3 +462,40 @@ fn barrier_is_ordered_after_the_entire_prefix() {
     assert!(has_edge(&graph, 0, 2));
     assert!(has_edge(&graph, 1, 2));
 }
+
+#[test]
+fn vector_store_orders_against_aliasable_scalar_store() {
+    // A 16-byte vector store to [stack] must not be reordered past an
+    // alias-maybe scalar store to the same stack base: the scheduler
+    // would otherwise corrupt stack-initializer order (79_var_name).
+    // The vector store's base register is the stack pointer (known
+    // provenance); the scalar store is at an overlapping offset.
+    let insts = vec![
+        MInst::VecSt1 {
+            src: int_reg(1),
+            base: crate::regs::stack_reg(),
+        },
+        MInst::Store {
+            ty: MemoryType::I64,
+            src: int_reg(2),
+            addr: crate::instructions::AMode::SignedOffset {
+                base: crate::regs::stack_reg(),
+                offset: crate::instructions::SImm9::new(0).unwrap(),
+            },
+        },
+    ];
+    let graph = DepGraph::build(&insts);
+
+    // The vector store must be ordered against the scalar store (memory
+    // edges are added in program order, prev -> i).
+    assert!(has_edge(&graph, 0, 1));
+}
+
+#[test]
+fn vector_load_reads_a_memory_access() {
+    let deps = inst_deps(&MInst::VecLd1 {
+        dst: writable(1),
+        base: crate::regs::stack_reg(),
+    });
+    assert!(deps.mem.is_some(), "VecLd1 must be a memory read");
+}

@@ -207,6 +207,57 @@ pub(super) fn lower_const_mem_zero(
         }
         return LoweredOutput::None;
     }
+    // Vector-batched inline zeroing for small compile-time sizes (16-128B,
+    // multiples of 16): `movi v0.4s,#0` + one 16B `st1` per block replaces a
+    // `bl memset` call. This is cheaper than a call for sizes below the
+    // runtime `memset`/`memzero` setup cost (the crypto-1 `words[80]={0}`
+    // 320B case stays a call; the hot per-block `words[80]` under the sha1
+    // loop is 320B too, so the vector path targets the smaller locals).
+    if byte_len % 16 == 0 && byte_len <= 128 {
+        let alloc = matches!(arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
+            .then_some(mem_zero.dest());
+        let (dest, stack_offset) = if let Some(alloc) = alloc {
+            let pointee = arena.inst_data(alloc).ty().derefernce();
+            let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
+            (
+                ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
+                Some(offset),
+            )
+        } else {
+            (ctx.put_value_in_reg(mem_zero.dest()), None)
+        };
+        if let Some(offset) = stack_offset {
+            ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
+                StackAMode::Slot(offset),
+                Writable::from_reg(dest),
+            ));
+        }
+        let vzero = ctx.alloc_tmp(HirType::get_vector(HirType::get_i32(), 4));
+        ctx.emit(MInst::VecMovImm {
+            shape: VecShape::FourS,
+            dst: Writable::from_reg(vzero),
+            imm: 0,
+            shift: 0,
+        });
+        let mut base = dest;
+        for _ in 0..(byte_len / 16) {
+            ctx.emit(MInst::VecSt1 {
+                src: vzero,
+                base,
+            });
+            // Advance the base by one 16B block.
+            let next = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+            ctx.emit(MInst::AluRRImm12 {
+                op: AluOp::Add,
+                size: OperandSize::Size64,
+                dst: Writable::from_reg(next),
+                src: base,
+                imm: Imm12::new(16, false).unwrap(),
+            });
+            base = next;
+        }
+        return LoweredOutput::None;
+    }
 
     let alloc = matches!(arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
         .then_some(mem_zero.dest());

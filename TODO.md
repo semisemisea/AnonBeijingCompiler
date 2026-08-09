@@ -170,7 +170,7 @@ TCO, TailRecursiveInline, BooleanSimplification, GVNPRE, DeadPhiElim, DCE。
 | 方向 | 论文 | 优先级 | 里程碑 |
 |---|---|---|---|
 | A. SLP 基本块向量化（M45） | SuperVectorization | P1 | 4 |
-| B. matmul1 掩码内核（B1→C1 多参数化） | SuperVectorization | P0 | 1 |
+| B. matmul1 掩码内核（j/k interchange 解锁） | SuperVectorization | P0 | 1 |
 | C. test-at-top Reducible 循环解锁（01_mm/conv2d） | SuperVectorization + Parsimony | P0 | 2 |
 | D. 向量化盈利性成本模型 | Coyote | P2 | §6 候选 |
 | E. 标量 min/max ISel + select→min/max | Minotaur | P1 | 3 |

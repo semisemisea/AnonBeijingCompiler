@@ -403,6 +403,64 @@ fn dual_coeffs(
             ck += info_k.coefficient * stride;
         }
         cur = gep.base();
+        // A *stepped pointer* base: the header carries a pointer parameter
+        // whose back-edge advances it by a constant byte stride per iteration
+        // (e.g. matmul1's `b[k][j]` column pointer `%69 → getelemptr %69, 1000`,
+        // or the transpose loop's `a[j][i]` column pointer). Without this the
+        // access is invisible to the direction/row-stride check and the
+        // interchange refuses the nest. Walk the loop's header parameters:
+        // `cur` is such a parameter iff its back-edge arg is
+        // `getelemptr(param, const)`.
+        let data = arena.curr_func_data();
+        let h_k_params = data.bb_data(l_k.header()).params().to_vec();
+        if let Some(pos) = h_k_params.iter().position(|&p| p == cur) {
+            if let Some((back_args, _)) = latch_args(data, arena, l_k) {
+                if let Some(&back) = back_args.get(pos) {
+                    if let InstKind::GetElemPtr(ptr_gep) = arena.inst_data(back).kind() {
+                        if ptr_gep.base() == cur
+                            && ptr_gep.offsets().len() == 1
+                            && arena
+                                .inst_data(ptr_gep.offsets()[0])
+                                .kind()
+                                .is_const()
+                        {
+                            if let Some(constant) =
+                                integer_constant(arena, ptr_gep.offsets()[0])
+                            {
+                                ck += constant as i64;
+                            }
+                            // The pointer's own base is loop-outside; stop.
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // Same for the j loop: a stepped column pointer carried by H_j
+        // (e.g. the transpose loop's `a[j][i]`).
+        let h_j_params = data.bb_data(l_j.header()).params().to_vec();
+        if let Some(pos) = h_j_params.iter().position(|&p| p == cur) {
+            if let Some((back_args, _)) = latch_args(data, arena, l_j) {
+                if let Some(&back) = back_args.get(pos) {
+                    if let InstKind::GetElemPtr(ptr_gep) = arena.inst_data(back).kind() {
+                        if ptr_gep.base() == cur
+                            && ptr_gep.offsets().len() == 1
+                            && arena
+                                .inst_data(ptr_gep.offsets()[0])
+                                .kind()
+                                .is_const()
+                        {
+                            if let Some(constant) =
+                                integer_constant(arena, ptr_gep.offsets()[0])
+                            {
+                                cj += constant as i64;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
     Some((cj, ck))
 }
@@ -773,8 +831,7 @@ fn find_interchange(program: &Program, func: Function) -> Option<Plan> {
                         chain_ok = false;
                         break;
                     }
-                }
-                if !chain_ok {
+                }                if !chain_ok {
                     break;
                 }
             }

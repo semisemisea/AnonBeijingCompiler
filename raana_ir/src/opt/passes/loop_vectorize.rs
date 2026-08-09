@@ -3394,7 +3394,14 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 data,
                 Binary::new_data(vcond, vzero, BinaryOp::Eq, vector_ty.clone()),
             );
-            data.layout_mut().insert_inst_before(red.acc_update, m);
+            // `tn`/`fo`/`sel` reference `red.acc_update` (the lane-wise
+            // `acc + rhs` in the arm). They must be defined *after* the
+            // update instruction, so insert them before the arm's terminator
+            // (not before the update — `insert_inst_before(red.acc_update, ..)`
+            // would place the mask reads before the value they read, a
+            // use-before-def that the backend SSA verifier rejects).
+            let arm_term = data.layout().basicblock(arm_plan.arm).terminator();
+            data.layout_mut().insert_inst_before(arm_term, m);
             let neg_one = data.new_local_inst().integer(-1);
             let vneg = vector_operand(
                 data,
@@ -3409,7 +3416,7 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 data,
                 Binary::new_data(m, vneg, BinaryOp::Xor, vector_ty.clone()),
             );
-            data.layout_mut().insert_inst_before(red.acc_update, nm);
+            data.layout_mut().insert_inst_before(arm_term, nm);
             // The arm sits on the branch's true edge when `arm_on_true`:
             // then it executes when `cond != 0`, so `delta` is gated by
             // `~m` and `acc` by `m` (inverted from the false-edge case).
@@ -3420,24 +3427,33 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 data,
                 Binary::new_data(vdelta, m_new, BinaryOp::And, vector_ty.clone()),
             );
-            data.layout_mut().insert_inst_before(red.acc_update, tn);
+            data.layout_mut().insert_inst_before(arm_term, tn);
             let fo = alloc_inst(
                 data,
                 Binary::new_data(vacc, m_old, BinaryOp::And, vector_ty.clone()),
             );
-            data.layout_mut().insert_inst_before(red.acc_update, fo);
+            data.layout_mut().insert_inst_before(arm_term, fo);
             let sel = alloc_inst(
                 data,
                 Binary::new_data(tn, fo, BinaryOp::Or, vector_ty.clone()),
             );
-            data.layout_mut().insert_inst_before(red.acc_update, sel);
+            data.layout_mut().insert_inst_before(arm_term, sel);
             // The merge phi reads the masked accumulator: retarget the arm's
             // jump argument (the delta) to the selection result. The delta
-            // instruction becomes dead and is swept by DCE.
+            // instruction becomes dead and is swept by DCE. The mask-expansion
+            // instructions created above (`tn`, `fo`, `sel`) reference the
+            // delta as their operand and must NOT be rewritten — substituting
+            // `sel` for the delta inside `tn = delta & m_new` would make
+            // `tn = sel & m_new` while `sel = tn | fo`, an Inst-level cycle
+            // (GVN then recurses forever on `And(Or(..),..) <-> Or(And(..),..)`).
             let arm_term = data.layout().basicblock(arm_plan.arm).terminator();
             let users: Vec<Inst> = data.inst_data(red.acc_update).used_by().iter().copied().collect();
             for user in users {
-                if data.layout().parent_bb(user) == Some(arm_plan.arm) {
+                if data.layout().parent_bb(user) == Some(arm_plan.arm)
+                    && user != tn
+                    && user != fo
+                    && user != sel
+                {
                     subst_operand(data, user, red.acc_update, sel);
                 }
             }
@@ -7556,6 +7572,31 @@ mod tests {
             .flat_map(|l| l.insts().iter().copied())
             .any(|inst| matches!(data.inst_data(inst).kind(), InstKind::VectorReduce(_)));
         assert!(has_reduce, "the vector loop must exit through VectorReduce");
+        // The arm's mask expansion (`m`/`nm`/`tn`/`fo`/`sel`) must be
+        // inserted *after* the lane-wise accumulator update it reads —
+        // otherwise `tn = delta & m` references the update before it is
+        // defined (use-before-def), which the backend SSA verifier rejects.
+        for l in data.layout().basicblocks() {
+            if data.bb_data(l.bb()).name() != "arm" {
+                continue;
+            }
+            let insts: Vec<Inst> = l.insts().iter().copied().collect();
+            for (idx, &inst) in insts.iter().enumerate() {
+                let defined_before: FxHashSet<Inst> =
+                    insts.iter().take(idx).copied().collect();
+                for used in data.inst_data(inst).inst_usage() {
+                    // Only enforce intra-block ordering: a use defined in
+                    // another block is governed by dominance, not layout.
+                    if !insts.contains(&used) {
+                        continue;
+                    }
+                    assert!(
+                        defined_before.contains(&used),
+                        "arm inst {inst:?} uses {used:?} before its definition"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

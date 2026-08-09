@@ -4,11 +4,13 @@
 以 Git 提交记录和代码测试为准，不在这里重复维护。
 
 > 进行中：§3 SIMD/NEON 优化计划（2026-08-09 依据 9 篇论文重新规划）——
-> **milestone 5（内联向量零初始化）已完成（2026-08-09）**；剩余：
-> matmul1 掩码内核（P0，需 j/k interchange，当前被 shell 中 j 依赖的 b[0][j]
-> 列指针拦截）、test-at-top Reducible 解锁（P0，conv2d 被
-> shape_header_multi_inst 拦截）、标量 min/max ISel（P1，IR 无实例，低价值）、
-> M45 SLP（P1）。
+> **milestone 5（内联向量零初始化）已完成（2026-08-09）**；
+> **milestone 1（matmul1 掩码内核 j/k interchange）前置已提交**：dual_coeffs
+> 步进指针识别（8762d45）+ B1 掩码归约 use-before-def/GVN 指令环修复
+> （3e5f5ee，i-k-j 形态掩码内核已能完整向量化）；剩余 apply 深度地址重写
+> （列指针→行指针，类型反转，风险高）。
+> 剩余：test-at-top Reducible 解锁（P0，conv2d 被 shape_header_multi_inst
+> 拦截）、标量 min/max ISel（P1，IR 无实例，低价值）、M45 SLP（P1）。
 > 待做：§5 主计划 E 剩余项（M51 指针槽/SROA、M55、M56）与 §6 后续候选。
 
 ## 已完成里程碑摘要
@@ -114,7 +116,7 @@ TCO, TailRecursiveInline, BooleanSimplification, GVNPRE, DeadPhiElim, DCE。
 | 用例 | 向量指令数 | 说明 |
 |---|---|---|
 | 01_mm1 | 14 | mm 内核 8 元素/轮（M70） |
-| matmul1 | 6 | sum 循环（addv）+ 清零循环；掩码内核仍未向量化 |
+| matmul1 | 6 | sum 循环（addv）+ 清零循环；掩码内核需 j/k interchange（前置 bug 已修，apply 地址重写进行中） |
 | h-10-01 | 9 | f32 循环 |
 | conv2d-1 | 26 | 清零/零初始化 + sum 循环；计算内核仍被拒 |
 
@@ -206,11 +208,23 @@ TCO, TailRecursiveInline, BooleanSimplification, GVNPRE, DeadPhiElim, DCE。
   拒绝——不是主拦截。
 
 **实现步骤**（`loop_interchange.rs`）：
-1. shell 不变量检查放行"j 依赖的列指针 GEP"（`b[0][j]`），将其视为交换后
-   新 k 循环的步进指针基址（apply 侧同步重写）。
-2. 交换后内层 j 循环的 B1 掩码归约（arm 内 `temp'=add(temp,mul)` + jump
-   merge）复用现有 apply 路径；GEP 步进指针参数按 passthrough/步进处理。
-3. 若 apply 侧指针重写复杂，先以"列指针 GEP 提升到 preheader 后重算"的最小
+1. **已提交（8762d45）**：`dual_coeffs` 识别 GEP 步进指针参数——列指针
+   （header 参数 back-edge 是 `getelemptr(param, const)`）被分类为
+   ck/cj=步进常数，使 matmul1 掩码内核 nest 通过 row-stride 判定。
+2. **已提交（3e5f5ee）**：B1 掩码归约两个正确性 bug——
+   (a) 掩码展开 `m/nm/tn/fo/sel` 的 use-before-def（原本插到 lane-wise 累加器
+   更新之前，后端 SSA 验证拒绝）；(b) `subst_operand` 把掩码展开自身创建的
+   `tn/fo/sel` 也替换成 `sel`，产生 `And(Or(..),..)↔Or(And(..),..)` 指令环，
+   GVN 无限递归 stack overflow。修复后 i-k-j 形态掩码内核（合成用例）完整
+   向量化（ldr q + mul + and + cmeq/eor + orr + addv，每轮 8 条向量指令），
+   -O2 差分 PASS。
+3. **剩余（apply 深度地址重写，风险高）**：shell 放行 j 依赖的 `b[0][j]`
+   列指针 GEP + apply 把列指针形态转行指针。已实现 shell 放行 + apply 的
+   列指针读重写（`getelemptr ptr, 0` → `getelemptr ptr, j`），但暴露**类型
+   不匹配**：列指针是 `*i32`（固定 j 扫 k），交换后需 `b[k]+j`（固定 k 扫 j，
+   行指针 `*[i32;1000]`）——指针语义和类型都需反转，超出 apply 现有假设
+   （H_k 纯 `[i,j,k,temp]` 4 参数）。需要重新设计 apply 的地址/类型处理。
+4. 若 apply 侧重写复杂，先以"列指针 GEP 提升到 preheader 后重算"的最小
    正确形态落地。
 
 **涉及文件**：`raana_ir/src/opt/passes/loop_interchange.rs`（+可能

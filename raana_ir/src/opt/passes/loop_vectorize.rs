@@ -1384,6 +1384,18 @@ fn analyze_loop(
                 // is the element computation (vectorized + addv per round).
                 (update, *value)
             } else if let Some(arm_plan) = &arm_plan {
+                // B1 masked register reduction is validated for *rotated*
+                // loops. A test-at-top loop whose latch back-argument is a
+                // phi (e.g. a fused `clusters = select(cond, clusters+1,
+                // clusters)` single-arm body) has an arm jump carrying the
+                // binary update but a latch arg that is the select phi — the
+                // apply side (merge re-typing, exit edge) is only wired for
+                // the rotated shape. Keep it conservative until the
+                // test-at-top arm reduction path is completed.
+                if test_at_top {
+                    trace(data, looop, "b1_arm_test_at_top_unsupported");
+                    return None;
+                }
                 // B1 masked reduction: the accumulator update lives in the
                 // arm (`delta = binary(op, acc, rhs)`); the arm's jump
                 // forwards `delta` to the merge, whose back edge feeds the
@@ -3005,13 +3017,13 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         // B1 masked reduction: the merge (latch) block's accumulator phi —
         // the back-edge argument for the accumulator slot — must become a
         // vector too (it carries the masked `select(cond, acc, acc+rhs)`).
-        if let Some(arm_plan) = &arm {
-            if let InstKind::Branch(b) = data.inst_data(latch_branch).kind() {
-                if let Some(&merge_param) = b.t_args().get(red.acc_slot) {
-                    data.inst_data_mut(merge_param).set_type(vector_ty.clone());
+            if let Some(arm_plan) = &arm {
+                if let InstKind::Branch(b) = data.inst_data(latch_branch).kind() {
+                    if let Some(&merge_param) = b.t_args().get(red.acc_slot) {
+                        data.inst_data_mut(merge_param).set_type(vector_ty.clone());
+                    }
                 }
             }
-        }
     }
     let mut splats = FxHashMap::<Inst, Inst>::default();
     // B3c: the index IV consumed as a payload *value* (a store src or a

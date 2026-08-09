@@ -875,6 +875,9 @@ fn f32_scalars_do_not_alias_live_vector_results() {
                         "splat scalar source must not alias the fdiv result:\n{assembly}"
                     );
                 }
+                // GPR source (`dup vd.4s, wn`): constants route through a
+                // GPR, which lives in a different domain than the vector
+                // registers — no aliasing possible.
             }
         }
         if let Some(idx) = line.find("fmov s") {

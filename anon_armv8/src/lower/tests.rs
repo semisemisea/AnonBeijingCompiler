@@ -622,7 +622,6 @@ fn explicit_vector_vcode_emits_neon_assembly() {
     builder.push(MInst::VecArithRRR {
         op: VecArithOp::Add,
         shape: VecShape::FourS,
-        is_float: false,
         dst: Writable::from_reg(sum),
         lhs: v0,
         rhs: v1,

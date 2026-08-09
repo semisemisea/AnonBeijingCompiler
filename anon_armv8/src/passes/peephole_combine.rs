@@ -194,7 +194,6 @@ fn combine_vec_mac_in_block(vcode: &mut VCodeContainer<MInst>, use_counts: &FxHa
                 MInst::VecArithRRR {
                     op: VecArithOp::Mul,
                     shape,
-                    is_float: false,
                     dst,
                     lhs,
                     rhs,
@@ -220,7 +219,6 @@ fn combine_vec_mac_in_block(vcode: &mut VCodeContainer<MInst>, use_counts: &FxHa
                     MInst::VecArithRRR {
                         op: VecArithOp::Add,
                         shape: add_shape,
-                        is_float: false,
                         dst,
                         lhs,
                         rhs,
@@ -733,7 +731,6 @@ mod tests {
             MInst::VecArithRRR {
                 op: VecArithOp::Mul,
                 shape: VecShape::FourS,
-                is_float: false,
                 dst: Writable::from_reg(prod),
                 lhs: c,
                 rhs: splat,
@@ -746,7 +743,6 @@ mod tests {
             MInst::VecArithRRR {
                 op: VecArithOp::Add,
                 shape: VecShape::FourS,
-                is_float: false,
                 dst: Writable::from_reg(sum),
                 lhs: prod,
                 rhs: b,
@@ -796,7 +792,6 @@ mod tests {
             MInst::VecArithRRR {
                 op: VecArithOp::Mul,
                 shape: VecShape::FourS,
-                is_float: false,
                 dst: Writable::from_reg(prod),
                 lhs: c,
                 rhs: splat,
@@ -804,7 +799,6 @@ mod tests {
             MInst::VecArithRRR {
                 op: VecArithOp::Add,
                 shape: VecShape::FourS,
-                is_float: false,
                 dst: Writable::from_reg(sum),
                 lhs: prod,
                 rhs: b,
@@ -813,7 +807,6 @@ mod tests {
             MInst::VecArithRRR {
                 op: VecArithOp::Sub,
                 shape: VecShape::FourS,
-                is_float: false,
                 dst: Writable::from_reg(c),
                 lhs: b,
                 rhs: c,

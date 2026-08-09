@@ -752,10 +752,11 @@ pub enum MInst {
         src: Reg,
     },
     /// Vector add/sub/mul: `{op} v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>`.
+    /// Float vectors use the `Fadd`/`Fsub`/`Fmul` variants (the integer
+    /// `add v.4s` on float bit patterns is wrong).
     VecArithRRR {
         op: VecArithOp,
         shape: VecShape,
-        is_float: bool,
         dst: WritableReg,
         lhs: Reg,
         rhs: Reg,
@@ -1902,18 +1903,14 @@ fn emit_vec_rrr(
     emit_vec_reg(ctx, rhs)?;
     write!(ctx, ".{}", shape.arrangement())
 }
-fn vec_arith_name(op: VecArithOp, is_float: bool) -> &'static str {
-    match (op, is_float) {
-        // Explicit float variants win regardless of the flag.
-        (VecArithOp::Fadd, _) => "fadd",
-        (VecArithOp::Fsub, _) => "fsub",
-        (VecArithOp::Fmul, _) => "fmul",
-        (VecArithOp::Add, true) => "fadd",
-        (VecArithOp::Sub, true) => "fsub",
-        (VecArithOp::Mul, true) => "fmul",
-        (VecArithOp::Add, false) => "add",
-        (VecArithOp::Sub, false) => "sub",
-        (VecArithOp::Mul, false) => "mul",
+fn vec_arith_name(op: VecArithOp) -> &'static str {
+    match op {
+        VecArithOp::Add => "add",
+        VecArithOp::Sub => "sub",
+        VecArithOp::Mul => "mul",
+        VecArithOp::Fadd => "fadd",
+        VecArithOp::Fsub => "fsub",
+        VecArithOp::Fmul => "fmul",
     }
 }
 fn vec_bit_name(op: VecBitOp) -> &'static str {

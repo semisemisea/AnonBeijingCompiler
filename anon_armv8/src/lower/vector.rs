@@ -68,10 +68,6 @@ pub(super) fn lower_vector_binary(
                     _ => VecArithOp::Fmul,
                 },
                 shape,
-                // Float vectors use the `fadd`/`fsub`/`fmul` instructions:
-                // the integer `add v.4s` treats the lanes as integer bit
-                // patterns, corrupting every non-trivial float sum.
-                is_float,
                 dst,
                 lhs,
                 rhs,
@@ -389,7 +385,6 @@ fn lower_vector_constant_div_rem(
                     VecArithOp::Sub
                 },
                 shape,
-                is_float: false,
                 dst: Writable::from_reg(tmp),
                 lhs: high_result,
                 rhs: lhs,
@@ -433,7 +428,6 @@ fn lower_vector_constant_div_rem(
     ctx.emit(MInst::VecArithRRR {
         op: VecArithOp::Add,
         shape,
-        is_float: false,
         dst: Writable::from_reg(quotient),
         lhs: shifted,
         rhs: sign,
@@ -495,7 +489,6 @@ fn lower_vector_signed_div_rem_power_of_two(
         ctx.emit(MInst::VecArithRRR {
             op: VecArithOp::Add,
             shape,
-            is_float: false,
             dst: Writable::from_reg(tmp),
             lhs,
             rhs: biased,
@@ -571,7 +564,6 @@ fn emit_neg_vector(
     ctx.emit(MInst::VecArithRRR {
         op: VecArithOp::Sub,
         shape,
-        is_float: false,
         dst,
         lhs: zero,
         rhs: src,

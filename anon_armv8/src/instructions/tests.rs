@@ -544,24 +544,6 @@ fn emits_vector_arith_forms() {
         let text = emit(MInst::VecArithRRR {
             op,
             shape: super::VecShape::FourS,
-            is_float: false,
-            dst: Writable::from_reg(vec_reg(0)),
-            lhs: vec_reg(1),
-            rhs: vec_reg(2),
-        });
-        assert_eq!(text, format!("{mnemonic} v0.4s, v1.4s, v2.4s"));
-    }
-    // Float vectors select the `f*` forms even with the plain integer op
-    // variants, driven by the `is_float` flag.
-    for (op, mnemonic) in [
-        (super::VecArithOp::Add, "fadd"),
-        (super::VecArithOp::Sub, "fsub"),
-        (super::VecArithOp::Mul, "fmul"),
-    ] {
-        let text = emit(MInst::VecArithRRR {
-            op,
-            shape: super::VecShape::FourS,
-            is_float: true,
             dst: Writable::from_reg(vec_reg(0)),
             lhs: vec_reg(1),
             rhs: vec_reg(2),
@@ -571,7 +553,6 @@ fn emits_vector_arith_forms() {
     let two_d = emit(MInst::VecArithRRR {
         op: super::VecArithOp::Add,
         shape: super::VecShape::TwoD,
-        is_float: false,
         dst: Writable::from_reg(vec_reg(0)),
         lhs: vec_reg(1),
         rhs: vec_reg(2),
@@ -771,7 +752,6 @@ fn vector_instructions_expose_their_operands() {
     let mut inst = MInst::VecArithRRR {
         op: super::VecArithOp::Add,
         shape: super::VecShape::FourS,
-        is_float: false,
         dst: Writable::from_reg(virtual_reg(0, RegClass::Vector)),
         lhs: virtual_reg(1, RegClass::Vector),
         rhs: virtual_reg(2, RegClass::Vector),

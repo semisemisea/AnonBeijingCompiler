@@ -5,12 +5,11 @@
 
 > 进行中：§3 SIMD/NEON 优化计划（2026-08-09 依据 9 篇论文重新规划）——
 > **milestone 5（内联向量零初始化）已完成（2026-08-09）**；
-> **milestone 1（matmul1 掩码内核 j/k interchange 解锁）apply 已提交
-> （2026-08-10）**：find 放行 j 依赖列指针 GEP + apply 步进指针参数支持
-> （重写 body 的 ptr 读取为 3D GEP + drop ptr），interchange 触发、IR 正确、
-> -O2 语义 PASS、无回归。**但掩码内核仍未被向量化**：swap 后 GSP 提升行指针
-> 产生的 BlockArgRef 使 base_of 解析失败（`UnknownBase`），内层 j 循环被
-> loop_vectorize 保守拒绝——GSP/base_of 交互问题，待修复。
+> **milestone 1（matmul1 掩码内核 j/k interchange 解锁）已完成（2026-08-10，
+> 2dc0a17 + stale used_by 修复）**：find 放行 j 依赖列指针 GEP + apply 步进
+> 指针参数支持 + used_by 清理，matmul1 掩码内核完整向量化（内层 j 循环出
+> ldr q ×3 + dup ×2 + mul/and/cmeq/eor/orr + add v + str q），-O2 语义 PASS、
+> 无回归。
 > **milestone 2 A3（test-at-top 多参数 passthrough）已完成（2caf984）**：
 > 正确性改进（消除对 loop-invariant 常量 back-arg 的误拒）。剩余：
 > test-at-top Reducible 解锁（P0，conv2d 被 shape_header_multi_inst 拦截）、
@@ -51,7 +50,8 @@
   select 掩码（VecSelect）。matmul 清零循环出 `dup+str q`。
 - **B1 掩码寄存器归约（2026-08-07，49a2825）**：单臂 if + 寄存器累加器向量化
   （arm 内 `delta=binary(acc,rhs)` → 掩码化为 select，merge phi 同步向量化）。
-  单测 +1，matmul1 掩码内核（P0 目标）仍需多参数扩展，见 §3.2 里程碑 1。
+  单测 +1，matmul1 掩码内核（P0 目标）经里程碑 1 的 j/k interchange 解锁后
+  完整向量化（见 §3.2 里程碑 1）。
 - **M70 系列（2026-08-07，提交 4）**：LICM 支持 VectorSplat hoisting、向量
   mul+add → mla 融合、向量循环计数器 subs 融合、2x 展开 + ldp/stp pair。
   01_mm1 mm 内核 8 元素/轮（ldp q×2 + mla×2 + stp q + subs #8），qemu ~1200ms。
@@ -120,7 +120,7 @@ TCO, TailRecursiveInline, BooleanSimplification, GVNPRE, DeadPhiElim, DCE。
 | 用例 | 向量指令数 | 说明 |
 |---|---|---|
 | 01_mm1 | 14 | mm 内核 8 元素/轮（M70） |
-| matmul1 | 6 | sum 循环（addv）+ 清零循环；掩码内核 interchange 已解锁（j/k 交换，外层 k + 内层 j 连续），但被 GSP/base_of 竞态阻断向量化（待修） |
+| matmul1 | 掩码内核向量化 | sum 循环（addv）+ 清零循环；掩码内核 j/k interchange 解锁 + 完整向量化（内层 j：ldr q ×3 + dup ×2 + mul/and/cmeq/eor/orr + add v + str q） |
 | h-10-01 | 9 | f32 循环 |
 | conv2d-1 | 26 | 清零/零初始化 + sum 循环；计算内核仍被拒 |
 | crypto-1 | 2 | 既有向量化循环 |
@@ -223,16 +223,17 @@ TCO, TailRecursiveInline, BooleanSimplification, GVNPRE, DeadPhiElim, DCE。
    GVN 无限递归 stack overflow。修复后 i-k-j 形态掩码内核（合成用例）完整
    向量化（ldr q + mul + and + cmeq/eor + orr + addv，每轮 8 条向量指令），
    -O2 差分 PASS。
-3. **已提交（2026-08-10）**：find 放行 shell 中 j 依赖的 `b[0][j]` 列指针 GEP
-   + apply 支持步进指针参数（识别 ptr_idx、重写 body 的 `getelemptr(ptr, X)`
-   为 3D GEP `getelemptr(root, (0, k, j))`、删除 latch 的 ptr 步进、drop ptr
-   参数、shell 死代码清理 + i 引用重写外层、E_k 死指令清理）。matmul1 掩码
-   内核 **interchange 触发**，IR 正确、-O2 语义 PASS、functional + h_functional
-   152/152、RISC-V 无新回归。**但掩码内核仍未被 loop_vectorize 向量化**：
-   swap 后外层 H_k（4 参数）被后续 GSP 提升行指针成 5 参数时，产生指向
-   while_entry_19 index 4 的 BlockArgRef，base_of 解析失败
-   （`m42_forbidden:UnknownBase`，M44_TRACE 可见）——GSP/base_of 交互问题
-   （非本 pass 引入），使内层 j 循环被保守拒绝。向量化待 base_of 竞态修复。
+3. **已提交（2026-08-10，2dc0a17 + 后续）**：find 放行 shell 中 j 依赖的
+   `b[0][j]` 列指针 GEP + apply 支持步进指针参数（识别 ptr_idx、重写 body 的
+   `getelemptr(ptr, X)` 为 3D GEP `getelemptr(root, (0, k, j))`、删除 latch 的
+   ptr 步进、drop ptr 参数、shell 死代码清理 + i 引用重写外层、E_k 死指令
+   清理）。matmul1 掩码内核 **interchange 触发 + 完整向量化**：内层 j 循环
+   出 `ldr q ×3（b[k][j]/a[k][j]/c[i][j]）+ dup ×2（a[i][k]/b[i][k]）+
+   mul v.4s ×2 + and/cmeq/eor/orr 掩码 + add v.4s + str q`。**关键修复**：
+   apply 的 stale used_by 清理（`replace_inst_with` 重建的 branch 在旧 Inst
+   id 上残留 used_by 条目，base_of 遍历 block 进边时解引用已删除的
+   terminator → `UnknownBase`，使内层 j 循环被保守拒绝）。-O2 语义 PASS，
+   functional + h_functional 152/152、RISC-V 无新回归。
 4. 备选：不通用化 apply，而是在 interchange 前用独立规范化 pass 把 matmul1
    k 循环的 counter/ptr 参数消除（counter 内联、ptr 改 3D GEP），使 H_k 变
    4 参数走标准路径。

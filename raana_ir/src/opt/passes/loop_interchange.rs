@@ -1774,6 +1774,24 @@ fn apply_interchange(data: &mut ArenaContextMut<'_>, plan: Plan) -> bool {
     }
 
     let _ = b_j;
+    // 8.9. Clean stale block-edge registrations: remove_inst detaches a
+    //    removed terminator from its targets' used_by sets, but an
+    //    instruction replaced via `replace_inst_with` (the rebuilt j-test /
+    //    k-test branches) leaves its old Inst id in the target's used_by.
+    //    Drop any used_by entry that is no longer in the layout so later
+    //    analyses (e.g. base_of's fixed point over a block's incoming
+    //    arguments) do not dereference a removed terminator.
+    let h_k_users: Vec<Inst> = data.bb_data(h_k).used_by().iter().copied().collect();
+    for u in h_k_users {
+        let in_layout = data
+            .layout()
+            .basicblocks()
+            .iter()
+            .any(|l| l.insts().iter().any(|&i| i == u));
+        if !in_layout {
+            data.bb_data_mut(h_k).used_by_mut().remove(&u);
+        }
+    }
     true
 }
 

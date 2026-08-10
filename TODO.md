@@ -4,20 +4,17 @@
 以 Git 提交记录和代码测试为准，不在这里重复维护。
 
 > 进行中：§3 SIMD/NEON 优化计划（2026-08-09 依据 9 篇论文重新规划）——
-> **milestone 5（内联向量零初始化）已完成（2026-08-09）**；
-> **milestone 1（matmul1 掩码内核 j/k interchange 解锁）已完成（2026-08-10，
-> 2dc0a17 + stale used_by 修复）**：find 放行 j 依赖列指针 GEP + apply 步进
-> 指针参数支持 + used_by 清理，matmul1 掩码内核完整向量化（内层 j 循环出
-> ldr q ×3 + dup ×2 + mul/and/cmeq/eor/orr + add v + str q），-O2 语义 PASS、
-> 无回归。
-> **milestone 2 A3（test-at-top 多参数 passthrough）已完成（2caf984）**：
-> 正确性改进（消除对 loop-invariant 常量 back-arg 的误拒）。剩余：
-> conv2d 计算内核多臂 if（P0，大工程，2026-08-10 实证：5 点卷积边界检查链
-> 需多臂 if 掩码合并）；checksum 循环（唯一新目标）需 load bound 提升但暴露
-> LoopUnroll 对 runtime bound 循环的展开 bug（85_long_code arrCopy 回归），
-> 暂缓；shape_header 放宽单独零收益（conv2d 拒绝分布不变）。01_mm1 mm 内核
-> 已完全向量化（M70，验收达成）。标量 min/max ISel（P1，IR 无实例，低价值）、
-> M45 SLP（P1）。
+> **milestone 5（内联向量零初始化）已完成（2026-08-09）**。
+> **milestone 1（matmul1 掩码内核 j/k interchange 解锁）已完成（2026-08-10）**：
+> matmul1 掩码内核完整向量化（-O2 语义 PASS、functional + h_functional 152/152、
+> RISC-V 无新回归）。
+> **milestone 2（P0）：conv2d 计算内核多臂 if 掩码向量化**（进行中）——2026-08-10
+> 深入收益分析确认：conv2d-1 的 5×5 卷积内核占 83.3% 权重（N_eff=521 → 6.78M
+> 乘加），是唯一高收益目标（向量化 3-4 倍 → 整体 ~60% 静态加速）。详细计划见
+> §3.3。其余候选已实证低收益或受阻：checksum（3.3% 权重）需 load bound 提升但
+> 暴露 LoopUnroll runtime-bound 展开 bug（85_long_code arrCopy 回归）；shape_header
+> 放宽单独零收益；01_mm1 mm 内核已完全向量化（M70）；row_reduce/nonlinear 已
+> 向量化；标量 min/max ISel（P1，IR 无实例，低价值）；M45 SLP（P1）。
 > 待做：§5 主计划 E 剩余项（M51 指针槽/SROA、M55、M56）与 §6 后续候选。
 
 ## 已完成里程碑摘要
@@ -56,6 +53,13 @@
   （arm 内 `delta=binary(acc,rhs)` → 掩码化为 select，merge phi 同步向量化）。
   单测 +1，matmul1 掩码内核（P0 目标）经里程碑 1 的 j/k interchange 解锁后
   完整向量化（见 §3.2 里程碑 1）。
+- **里程碑 1：matmul1 掩码内核 j/k interchange 解锁（2026-08-10，2dc0a17 +
+  ab4b05b）**：find 放行 shell 中 j 依赖列指针 GEP + apply 步进指针参数支持
+  （重写 body 的 ptr 读取为 3D GEP、drop ptr 参数、shell 死代码清理）+ stale
+  used_by 清理（`replace_inst_with` 重建 branch 残留旧 Inst id 于 used_by，
+  base_of 解引用已删 terminator → `UnknownBase`）。matmul1 掩码内核完整向量化：
+  内层 j 循环 `ldr q ×3 + dup ×2 + mul/and/cmeq/eor/orr + add v + str q`，
+  -O2 语义 PASS、functional + h_functional 152/152、RISC-V 无新回归。
 - **M70 系列（2026-08-07，提交 4）**：LICM 支持 VectorSplat hoisting、向量
   mul+add → mla 融合、向量循环计数器 subs 融合、2x 展开 + ldp/stp pair。
   01_mm1 mm 内核 8 元素/轮（ldp q×2 + mla×2 + stp q + subs #8），qemu ~1200ms。
@@ -119,14 +123,14 @@ TCO, TailRecursiveInline, BooleanSimplification, GVNPRE, DeadPhiElim, DCE。
 - 约束（宁漏勿错）：只最内层；test-at-top 只认恰 `[lt,br]`；rotated 只认
   `[jump]`；对齐未知时非对齐 ld/st；无 gather/scatter；AArch64-only。
 
-### 1.3 当前向量化命中（2026-08-09 实证，perf 语料 -O2 静态汇编）
+### 1.3 当前向量化命中（2026-08-10 复扫，perf 语料 -O2 静态汇编）
 
 | 用例 | 向量指令数 | 说明 |
 |---|---|---|
-| 01_mm1 | 14 | mm 内核 8 元素/轮（M70） |
-| matmul1 | 掩码内核向量化 | sum 循环（addv）+ 清零循环；掩码内核 j/k interchange 解锁 + 完整向量化（内层 j：ldr q ×3 + dup ×2 + mul/and/cmeq/eor/orr + add v + str q） |
+| 01_mm1 | 14 | mm 内核 8 元素/轮（M70），验收达成 |
+| matmul1 | 掩码内核向量化 | 掩码内核 j/k interchange 解锁 + 完整向量化（内层 j：ldr q ×3 + dup ×2 + mul/and/cmeq/eor/orr + add v + str q），sum + 清零循环也向量化 |
 | h-10-01 | 9 | f32 循环 |
-| conv2d-1 | 26 | 清零/零初始化 + sum 循环；计算内核仍被拒 |
+| conv2d-1 | 21 | 清零/零初始化 + row_reduce + nonlinear + sum 循环向量化；**5×5 计算内核（83.3% 权重）仍标量**（里程碑 2 目标） |
 | crypto-1 | 2 | 既有向量化循环 |
 
 ### 1.4 当前拒绝分布（2026-08-10 复扫，M44_TRACE=1，dedup top）
@@ -158,7 +162,7 @@ TCO, TailRecursiveInline, BooleanSimplification, GVNPRE, DeadPhiElim, DCE。
   全部落地。corpus 命中从 0 → 3/60（matmul 清零），后经 B1/M70 提升到当前 §1.3。
 - **M44 v2 拒绝原因分类 / A2-A4 调研 / B1 细化计划 / 最短路 sum 计划**：已完成，
   细节归档到 Git 提交与代码注释，不重复维护。核心结论仍有效的部分已并入 §3.2
-  各里程碑的"现状根因"。
+  里程碑 1 完成摘要与 §3.3 里程碑 2 现状根因。
 - **M52 执行记录（DSE 三个变换 + 三个遗留 bug 修复）**：全部完成，见摘要。
 - **§6 工作区未提交改动 / §7 vs clang 差距 / §8 A2 内联 / §9 全量审查 /
   §10 向量化接力（10.x 全部 session 记录）**：已归档或已完成，从本文档删除。
@@ -178,140 +182,144 @@ TCO, TailRecursiveInline, BooleanSimplification, GVNPRE, DeadPhiElim, DCE。
 | 方向 | 论文 | 优先级 | 里程碑 |
 |---|---|---|---|
 | A. SLP 基本块向量化（M45） | SuperVectorization | P1 | 4 |
-| B. matmul1 掩码内核（j/k interchange 解锁） | SuperVectorization | P0 | 1 |
-| C. test-at-top Reducible 循环解锁（01_mm/conv2d） | SuperVectorization + Parsimony | P0 | 2 |
+| B. matmul1 掩码内核（j/k interchange 解锁） | SuperVectorization | P0 | 1（已完成） |
+| C. conv2d 计算内核多臂 if 掩码向量化 | SuperVectorization + Parsimony | P0 | 2 |
 | D. 向量化盈利性成本模型 | Coyote | P2 | §6 候选 |
 | E. 标量 min/max ISel + select→min/max | Minotaur | P1 | 3 |
 | F. NEON 寄存器压力预算 | CHOPPER | P2 | §6 候选 |
 | G. 非循环内联向量零初始化 | Minotaur | P1 | 5 |
 | H. 回边 blockparam mov 消除 / 调度验证器 | Diospyros/Isaria/Minotaur | P2/P3 | §6 候选 |
 
-### 3.2 里程碑 1（P0）：matmul1 掩码内核 —— j/k interchange 解锁（根因更正）
+### 3.2 里程碑 1（P0）：matmul1 掩码内核 —— j/k interchange 解锁（已完成）
 
 **论文依据**：SuperVectorization §3.4（masked load/store + vector select）：
 控制依赖转数据依赖（掩码选择），使向量化跨控制流。
 
-**目标形态**：`if(a[i][k]*b[k][j]%2==0) temp += b[i][k]*a[k][j]`
-（matmul1 奇偶掩码内核，源码 41-50 行）出向量指令。
+**完成摘要（2026-08-10，2dc0a17 + ab4b05b）**：matmul1 掩码内核
+（`if(a[i][k]*b[k][j]%2==0) temp += b[i][k]*a[k][j]`）经 j/k interchange 解锁并
+完整向量化。根因（2026-08-09 实证）：该循环是 **k 循环**，`b[k][j]`（GEP 步进
+指针 %69）与 `a[k][j]` 在 k 上 strided（4000B）——B1 无法向量化；**真正解锁是
+j/k interchange**（i-j-k → i-k-j，内层 j 连续）。实现：find 放行 shell 中 j 依赖
+列指针 GEP + apply 步进指针参数支持（识别 ptr_idx、重写 body 的 `getelemptr(ptr,X)`
+为 3D GEP、drop ptr 参数、shell 死代码清理 + i 引用重写、E_k 死指令清理）+
+stale used_by 清理。结果：内层 j 循环 `ldr q ×3 + dup ×2 + mul/and/cmeq/eor/orr +
+add v + str q`，-O2 语义 PASS、152/152、RISC-V 无新回归。历史设计与细节以 Git
+提交记录为准。
 
-**根因更正（2026-08-09 实证）**：
-- 原规划假定该循环是 `Reducible{IntAdd}` 寄存器归约、只需 B1 多参数解锁。
-  **错误**：该循环是 **k 循环**，`b[k][j]`（经 GEP 步进行指针 %69，每轮 +1000）
-  与 `a[k][j]`（`getelemptr gv_a,(0,k,j)`）在 k 上步进 4000B——**strided**，
-  B1 向量化在 payload 载荷分类处会拒绝（`classify_load` byte_coefficient=4000
-  ≠ VF）。M44_FORCE 实验证实：即使放开 `effective.len()==2` 门（含 counter
-  动态检测），循环在 iv 槽检测 `slots.len()==1` 断言处崩溃，且载荷本就不能
-  向量化。
-- **真正的解锁是 j/k interchange**（i-j-k → i-k-j，使内层 j 连续）：
-  交换后 `b[k][j]`/`a[k][j]`/`c[i][j]` 在 j 上连续，`a[i][k]`/`b[i][k]`
-  invariant → splat。
-- **interchange 当前被拦截**：shell（preheader_18）计算 `%63 = getelemptr
-  %44, (0, %vid_2)` = b[0][j] 列指针，用 j IV——不 invariant →
-  `chain_ok` 失败（`reject: shell chain not invariant`）。这是
-  loop_interchange 的 shell 不变量检查无法处理 j 依赖列指针的局限。
-- 附带发现：`counter_slot = n_params - 1` 假设在"counter 后跟 GEP 步进指针"
-  时错误（本循环 counter 在 slot 4、ptr 在 slot 5），但修正后仍被载荷 strided
-  拒绝——不是主拦截。
-
-**实现步骤**（`loop_interchange.rs`）：
-1. **已提交（8762d45）**：`dual_coeffs` 识别 GEP 步进指针参数——列指针
-   （header 参数 back-edge 是 `getelemptr(param, const)`）被分类为
-   ck/cj=步进常数，使 matmul1 掩码内核 nest 通过 row-stride 判定。
-2. **已提交（3e5f5ee）**：B1 掩码归约两个正确性 bug——
-   (a) 掩码展开 `m/nm/tn/fo/sel` 的 use-before-def（原本插到 lane-wise 累加器
-   更新之前，后端 SSA 验证拒绝）；(b) `subst_operand` 把掩码展开自身创建的
-   `tn/fo/sel` 也替换成 `sel`，产生 `And(Or(..),..)↔Or(And(..),..)` 指令环，
-   GVN 无限递归 stack overflow。修复后 i-k-j 形态掩码内核（合成用例）完整
-   向量化（ldr q + mul + and + cmeq/eor + orr + addv，每轮 8 条向量指令），
-   -O2 差分 PASS。
-3. **已提交（2026-08-10，2dc0a17 + 后续）**：find 放行 shell 中 j 依赖的
-   `b[0][j]` 列指针 GEP + apply 支持步进指针参数（识别 ptr_idx、重写 body 的
-   `getelemptr(ptr, X)` 为 3D GEP `getelemptr(root, (0, k, j))`、删除 latch 的
-   ptr 步进、drop ptr 参数、shell 死代码清理 + i 引用重写外层、E_k 死指令
-   清理）。matmul1 掩码内核 **interchange 触发 + 完整向量化**：内层 j 循环
-   出 `ldr q ×3（b[k][j]/a[k][j]/c[i][j]）+ dup ×2（a[i][k]/b[i][k]）+
-   mul v.4s ×2 + and/cmeq/eor/orr 掩码 + add v.4s + str q`。**关键修复**：
-   apply 的 stale used_by 清理（`replace_inst_with` 重建的 branch 在旧 Inst
-   id 上残留 used_by 条目，base_of 遍历 block 进边时解引用已删除的
-   terminator → `UnknownBase`，使内层 j 循环被保守拒绝）。-O2 语义 PASS，
-   functional + h_functional 152/152、RISC-V 无新回归。
-4. 备选：不通用化 apply，而是在 interchange 前用独立规范化 pass 把 matmul1
-   k 循环的 counter/ptr 参数消除（counter 内联、ptr 改 3D GEP），使 H_k 变
-   4 参数走标准路径。
-
-**涉及文件**：`raana_ir/src/opt/passes/loop_interchange.rs`（+可能
-`loop_vectorize.rs` 的 B1 多参数）。
-
-**验收**：
-- matmul1 掩码内核出 `ldr q ×2-3 + cmgt/and/eor + add v.4s + addv + str q`；
-  `M44_TRACE=1` 复扫该 header 不再报 `params_not_2`。
-- `cargo test -p raana_ir`；`make test ARGS="-O 2"` functional + h_functional
-  无回归；`make test-riscv ARGS="-O 2"` 无回归。
-
-**风险**：中。shell 放行需与 apply 的指针重写配套，否则产生错误寻址；先做
-rotated 形态，保持 test-at-top + arm 归约的 gate（union_find 教训）。
-
-### 3.3 里程碑 2（P0）：test-at-top Reducible 循环解锁 —— 01_mm1/conv2d-1 计算内核
+### 3.3 里程碑 2（P0）：conv2d 计算内核多臂 if 掩码向量化
 
 **论文依据**：SuperVectorization（循环 co-iteration / 跨控制流打包：外层 IV 以
 passthrough 线程化进内层）+ Parsimony（uniform/varying 分类：uniform 分支/值用
 标量，varying 才向量）。对应 M44 拒绝分类 A2/A3。
 
-**目标形态**：01_mm1 mm 内核（`C[i][j] += A[i][k]*B[k][j]`）与 conv2d-1 计算
-循环（i/j/k 4 层嵌套，每层 6-7 参数）出向量。
+**收益分析（2026-08-10 深入实证）**：
+- conv2d-1 输入 state=4561、repeat_factor=1 → N_eff=521。各循环迭代权重：
+  | 循环 | 迭代次数 | 权重 | 现状 |
+  |---|---|---|---|
+  | **conv2d 计算内核（5×5 卷积）** | 6.78M 乘加 | **83.3%** | 标量，未向量化 |
+  | row_reduce | 542K | 6.7% | 已向量化 |
+  | checksum | 271K | 3.3% | 标量，未向量化（需修 LoopUnroll） |
+  | nonlinear | 271K | 3.3% | 已向量化 |
+  | init_matrix | 271K | 3.3% | 含调用，难向量化 |
+- **conv2d 计算内核是唯一高收益目标**：向量化后约 **3-4 倍内核加速 → 整体约
+  60% 静态加速**。checksum 收益仅 ~2.5%（且被 LoopUnroll bug 阻塞），其余循环
+  已向量化或低价值。
+- 静态指令对比估算（c 循环，4 个 c 值）：标量 4 轮 ≈ 220 条（25 乘加 + 边界）
+  vs 向量 1 轮 ≈ 40 条（25 掩码乘加 + 边界掩码 + Out store）→ 约 5 倍乘加密集
+  区加速，保守估 3-4 倍。
 
-**现状根因（2026-08-09 代码实证 + 2026-08-10 补充调查）**：
-- 01_mm1 mm 内核（`C[i][j] += A[i][k]*B[k][j]`）：**已完全向量化**（M70，8 元素/轮，
-  `ldp q×2 + mla×2 + stp q + subs`），验收达成，无剩余工作。
-- conv2d-1 计算内核（5 点卷积，while_entry_7，i/j/k 4 层嵌套）：被
-  `shape_body_not_2_blocks` 拦截（**多臂 if**——land_merge_10/then_23/end_12
-  的边界检查链 + unroll 展开，5 个分支），需**多臂 if 掩码合并**（P0，大工程）。
+**目标形态（conv2d 计算内核，c 循环向量化）**：
+- c 循环 `while_entry_7`（`c < N_eff`，test-at-top，IV 步进 1）body 有 **52 个
+  基本块**：25 次乘加（5×5 卷积，kr/kc 全展开）+ 25 个边界检查
+  （`cc=c+kc-2` 的 `ge/lt/and/neq` 链）。
+- 目标（VF=4）：
+  ```
+  sum_v = 0
+  for (kr, kc) in 5×5:                    # 25 项展开
+    cc_vec = c_vec + kc - 2
+    mask = (cc_vec >= 0) & (cc_vec < N_eff) & rr_ok   # 向量掩码
+    sum_v += (ldr q In[rr][cc_vec]) * splat(K[kr][kc]) & mask
+  Out[r][c_vec] = sum_v                   # 连续 store
+  ```
+- 与现有 B1 的**互斥 `select`**（`tn = delta&m | fo = acc&~m`）不同，25 个
+  (kr,kc) 是**串行掩码累加**（`sum_v += delta & mask`），逻辑更简单（无 fo
+  分支），但需识别 25 个独立贡献并累加。
+- In/Out 为 16B 对齐全局数组 ✓；c 循环访问连续 ✓；现有 B1 掩码基础设施
+  （`tn/fo/sel` 组合 + `vector_operand` splat）可作扩展起点。
+
+**现状根因（2026-08-10 代码实证）**：
+- conv2d 计算内核被 `shape_body_not_2_blocks` 拦截——**多臂 if**（land_merge_10
+  /then_23/end_12 的边界检查链，5 kc × 5 kr 全展开，52 个基本块）。
 - conv2d-1 的 `shape_header_multi_inst`（26）**大多是已向量化循环的固定点噪声**
-  （init_kernel/row_reduce/nonlinear 等已向量化，header 二次迭代含 bound 计算）。
-- **checksum 循环**（`sum += Out[i]`，bound=`N_eff²` 在 header 计算）是唯一的新目标：
-  2026-08-10 实证——shape_header 放宽放行后，apply 正确向量化（load→VecLoad、
-  acc_update 合法），但**需要 load bound 提升**（bound 定义在 header，runtime trip
-  计算引用它 → lowering use-before-def）。提升 load bound 到 preheader 后 checksum
-  向量化（conv2d +3 向量指令，`ldr q + add v + addv`）。**但 load bound 提升触发了
-  arrCopy 循环（85_long_code）回归**：arrCopy bound=`load len`（全局）被放行后，
-  LoopUnroll 将其全展开成错误常量 store（基线是标量循环）。load bound 源在循环内
-  不被写（依赖分析确认），但展开仍出错——**LoopUnroll 对 runtime bound 循环的
-  展开有预存 bug**。因此 load bound 提升方案暂缓，需先修 LoopUnroll。
-- **shape_header 放宽（只放行 loop-invariant 纯计算 bound，不含 load）单独零收益**
-  （2026-08-10 实证：conv2d 拒绝分布不变，perf 语料向量指令数全不变）——被
-  shape_header 拒的循环本就是噪声或需 runtime bound。
+  （init_kernel/row_reduce/nonlinear 等已向量化）。
+- **checksum 循环**（`sum += Out[i]`，bound=`N_eff²` 在 header 计算）：shape_header
+  放宽放行后 apply 正确向量化，但需 **load bound 提升**（bound 定义在 header，
+  runtime trip 引用 → lowering use-before-def）。提升后 checksum 向量化（conv2d
+  +3 向量指令），但**触发 LoopUnroll runtime-bound 展开 bug**（85_long_code
+  arrCopy 回归：bound=`load len` 被放行后 LoopUnroll 全展开成错误常量 store）。
+  → checksum 方案暂缓，需先修 LoopUnroll（见 §4）。
+- **shape_header 放宽（只放行纯计算 bound，不含 load）单独零收益**：conv2d 拒绝
+  分布不变，perf 语料向量指令数全不变。
 
 **实现步骤**：
-1. **shape_header_multi_inst 放宽**：header 内的 bound 计算指令（乘法/取模链，
-   循环不变量）提升 preheader 后识别（A2 子类 2：bound 常量表达式）。此前
-   标"低 ROI"，但 rebase 后它是 01_mm1/conv2d-1 的**头号拦截**，升 P0。
-2. **Reducible 内存累加放行**：`verdict=Reducible` 但依赖判定为
-   `is_elementwise_inplace`（同 base 同系数读写对，store 依赖 load）时，按 B3
-   内存累加路径向量化（写 `C[i][j]` 为普通内存写 → ld1/add/st1），不做寄存器
-   归约。
-3. **conv2d 双臂 if**：`if(cond) store A else store B`（或 if 内 load+store）的
-   双臂形态，用 `VecCsel/bsl` 或双掩码合并（`(a&m)|(b&~m)`）——需要新增
-   VecBsl lowering 或复用现有 `(t&~m)|(f&m)` 组合。**若 lowering 是瓶颈，先以
-   "双臂→单臂（真臂保留、假臂掩码为 0）"的最小正确形态落地。**
-4. **A3 test-at-top 多参数 passthrough（已完成 2026-08-09，2caf984）**：
-   test-at-top 的 effective 排除 loop-invariant back-arg（常量/循环外值），
-   `is_loop_invariant` 对常量 back-arg 的 header 参数判 invariant。这是
-   正确性/健壮性改进（消除对合法形态的误拒）；当前 perf 语料无新增向量化
-   收益（crypto 的 ldr q16 为既有循环、03_sort 的 3 条 movi 来自里程碑 5）。
-   单测 `vectorizes_test_at_top_with_invariant_constant_args` 覆盖。
 
-**涉及文件**：`loop_vectorize.rs`、`anon_armv8/src/lower.rs` +
-`instructions.rs`（VecBsl lowering，若需）。
+*阶段 1 —— 识别与 gate（loop_vectorize）*
+1. 识别 c 循环的多臂 if 累加结构：52 个基本块 body 的 25 个
+   `br mask_kc, then_kc, end_kc` 模式（每 (kr,kc) 一个边界检查 + 乘加 + 累加
+   合并）。新增 `M44` 通过路径（多臂掩码 plan），形状门控：test-at-top、
+   IV 步进 1、25 个串行掩码累加。
+2. 新增单测：合成 5 点卷积形态（连续 In/Out + 边界检查 + 累加），验证识别。
+
+*阶段 2 —— 掩码乘加核心（loop_vectorize apply + 可能 lower）*
+3. 扩展 ArmPlan/B1：单臂 → 多臂。对每个 (kr,kc)：
+   - 向量边界掩码生成：`mask_kc = (c_vec + kc - pad) >= 0 & < N_eff`，
+     与 `rr_ok`（标量 splat）合取。
+   - `sum_v += (ldr q In[rr][cc_vec]) * splat(K[kr][kc]) & mask_kc`。
+   - K[kr][kc] 是循环外常量（全局 K 数组），splat。
+4. 掩码乘加 lowering：复用现有 `VecMla` + `and`（或新增掩码 mla 变体）。
+   边界比较 lowering：向量 `cmeq/eor` 组合或新增 VecCmp。
+
+*阶段 3 —— sum_v 累加 + Out store*
+5. sum_v 向量累加器（25 次展开，header 参数 re-type）。
+6. `Out[r][c_vec] = sum_v` 连续向量 store（B3 路径扩展 / VecStore）。
+7. 标量尾循环处理（r = trip%4 余数，复用现有 tail）。
+
+*阶段 4 —— 验证与回归*
+8. `cargo test -p raana_ir`（新增多臂掩码单测）。
+9. `make test functional h_functional ARGS="-O 2"`（152 用例）。
+10. `make test-riscv ARGS="-O 2"`。
+11. perf 静态指令数对比：conv2d-1 计算内核指令数应大幅下降（`scripts/perf_compare.sh`）。
+
+**涉及文件**：
+- `raana_ir/src/opt/passes/loop_vectorize.rs`（多臂掩码识别 + apply，核心）
+- `raana_ir/src/opt/analysis_passes/dependence.rs`（多臂 if 的依赖/别名判定）
+- `anon_armv8/src/lower.rs` + `instructions.rs`（向量掩码乘加 / 向量比较 lowering，
+  若现有 `VecMla`+`and` 组合不够）
+- `anon_armv8/src/sched/dag.rs`（新向量指令的调度内存边，若新增 MInst）
 
 **验收**：
-- 01_mm1 计算内核出 `ldr q + dup v.4s + mla + str q`；conv2d-1 计算循环出
-  `ldr q + fmla/mla + str q`。
-- `cargo test -p raana_ir`；`make test ARGS="-O 2"` + `make test-riscv
-  ARGS="-O 2"` 无回归；`scripts/perf_compare.sh` 静态计数 ≤ 现基线。
+- conv2d-1 计算内核出 `ldr q ×N + dup v + mla v ×25 + and v ×25 + add v + str q`；
+  `M44_TRACE=1` 复扫该 header 不再报 `shape_body_not_2_blocks`。
+- conv2d-1 -O2 语义 PASS；`cargo test -p raana_ir`；`make test ARGS="-O 2"`
+  functional + h_functional 无回归；`make test-riscv ARGS="-O 2"` 无回归；
+  `scripts/perf_compare.sh` conv2d-1 静态计数显著下降（目标 ≥2 倍）。
+- **禁止针对测试用例的优化**：多臂掩码识别须基于通用 IR 结构（边界检查 +
+  串行累加），不得匹配 conv2d 函数名/常量。
 
-**风险**：中。header 放宽需确认 rotate 不兜底的子类确实存在（否则零收益）；
-双臂 if 的掩码合并须保证真/假臂语义正确（内存副作用顺序用现有 EffectAnalysis
-校验）。bound 计算指令提升是 IR 移动，须遵守 layout/use-def 一致性规则。
+**风险**：
+- 向量掩码边界语义错误（`cc` 在向量内部分满足）——高：保守掩码 + on/off 差分 +
+  语义 PASS。
+- 25 次累加链 use-def / 指令环（GVN 递归，参考里程碑 1 的 3e5f5ee 教训）——高：
+  严格依赖判定 + 后端 SSA 验证。
+- In/Out 对齐（16B）——中：全局数组已验证对齐；若参数指针需 IPA 对齐证明。
+- IR 复杂度（52 基本块 → 向量化）——中：阶段 1 先小 VF/子集验证，再全量。
+- 掩码乘加 lowering 缺 VecCmp——中：复用 `cmeq/eor/and` 组合或新增。
+
+**已完成的子项（压缩）**：
+- **A3 test-at-top 多参数 passthrough（2026-08-09，2caf984）**：正确性改进
+  （消除对 loop-invariant 常量 back-arg 的误拒），无 perf 收益。
+- **01_mm1 mm 内核（M70）**：已完全向量化（`ldp q×2 + mla×2 + stp q`，8 元素/轮），
+  验收达成。
 
 ### 3.4 里程碑 3（P1）：标量 min/max ISel + select→min/max 模式匹配
 
@@ -409,10 +417,10 @@ SLP 现成输入；conv2d `init_matrix`/`row_reduce`、01_mm/matmul 内层展开
 ### 3.7 执行顺序与门禁
 
 ```
-里程碑 1（matmul1 掩码内核，P0，rotated 多参数 B1）
-  → 里程碑 2（test-at-top Reducible 解锁 01_mm/conv2d，P0）
-  → 里程碑 3（标量 min/max ISel，P1，最小）
-  → 里程碑 5（内联向量零初始化，P1，最小）
+里程碑 1（matmul1 掩码内核，P0，rotated 多参数 B1）——已完成 2026-08-10
+  → 里程碑 2（conv2d 计算内核多臂 if 掩码向量化，P0，大工程）——进行中
+  → 里程碑 3（标量 min/max ISel，P1，最小，IR 无实例低价值，暂缓）
+  → 里程碑 5（内联向量零初始化，P1，最小）——已完成 2026-08-09
   → 里程碑 4（M45 SLP，P1，最大）
 ```
 
@@ -428,13 +436,19 @@ SLP 现成输入；conv2d `init_matrix`/`row_reduce`、01_mm/matmul 内层展开
 
 ---
 
-## 4. 已知边界与遗留（2026-08-09 rebase 后）
+## 4. 已知边界与遗留（2026-08-10 更新）
 
+- **LoopUnroll 对 runtime-bound 循环的展开 bug（2026-08-10 发现，未修）**：
+  conv2d checksum 循环（bound=`N_eff²` 在 header）需 load bound 提升才能向量化，
+  但提升后 LoopUnroll 会把 runtime-bound 的 arrCopy 循环（85_long_code）全展开成
+  错误常量 store（基线是标量循环）。bound load 源在循环内不被写（依赖分析确认），
+  展开仍出错——LoopUnroll 的 `constant_trip_count` 对 runtime trip 处理有误。
+  **修复它是解锁 checksum（+3 向量指令，~2.5% 整体收益）的前提**；优先级低于
+  conv2d 计算内核（83.3%）。
 - **test-at-top + B1 单臂 if 归约 = 保守拒绝**（`b1_arm_test_at_top_unsupported`，
   commit 238812e）：union_find 的 `if(parent[i]==i) clusters += 1` 形态（arm
   jump 带 binary 更新但 latch back arg 是 select phi）在 apply 侧未接线，GVN
-  会死循环。matmul1 掩码内核是 rotated（不受影响）。待里程碑 1 完成后评估
-  test-at-top 版本。
+  会死循环。matmul1 掩码内核是 rotated（不受影响）。
 - **55c7221 编译时间优化未适配**（rebase 跳过）：hermes 的 run_on 每函数重建
   nonneg 集合，`dependence.rs` 仍 O(F²)。23_json 类大文件 -O2 编译时间敏感，后续
   按 hermes 新接口移植（`opt/pass.rs` + `analysis_passes/dependence.rs`）。
@@ -470,7 +484,7 @@ SLP 现成输入；conv2d `init_matrix`/`row_reduce`、01_mm/matmul 内层展开
 | G. 回边 blockparam mov 消除（`_and/_xor/_or` 回边 3 mov） | Diospyros/Isaria | M35 遗留 |
 | H. 调度验证器闭环（verify_sched_deps） | Minotaur | §5.2 P2 |
 | 外层循环向量化（not_innermost） | SuperVectorization | 跨块，大改 |
-| VecCsel/bsl、fcmgt lowering | SuperVectorization | 随里程碑 1/2 伴生 |
+| VecCsel/bsl、向量比较 lowering | SuperVectorization | 随里程碑 2 伴生（掩码乘加，若 `VecMla`+`and`/`cmeq/eor` 组合不够才新增） |
 | 批量 int↔float 转换 | — | 排除（perf 无实证） |
 | ld2/ld3/ld4 交错存取（AoS→SoA） | — | 排除（perf 无交错布局） |
 
@@ -518,8 +532,8 @@ SLP 现成输入；conv2d `init_matrix`/`row_reduce`、01_mm/matmul 内层展开
 | 对齐假设错误导致 SIGBUS | 中 | 已知对齐才用对齐 `ld1/st1`；未知走非对齐或 versioning |
 | RISC-V 无 NEON 引入回归 | 中 | 向量化 pass 按 target 注册；双 target 回归 |
 | B1/test-at-top 归约 apply 未接线（GVN 死循环） | 高 | 保守 gate（`b1_arm_test_at_top_unsupported`）；里程碑 1 只做 rotated |
-| 双臂 if 掩码合并语义错误 | 中 | 真/假臂副作用顺序用 EffectAnalysis 校验；先最小正确形态 |
-| header bound 指令提升破坏 use-def | 中 | layout/use-def 一致性规则；rotate 不兜底子类确认后再做 |
+| 多臂 if 掩码累加语义错误（conv2d 边界） | 高 | 向量掩码 `cc` 边界检查 + on/off 差分 + 语义 PASS；25 次累加链依赖判定 + 后端 SSA 验证（参考 3e5f5ee 指令环教训） |
+| header bound 指令提升破坏 use-def | 中 | layout/use-def 一致性规则；rotate 不兜底子类确认后再做（checksum 场景被 LoopUnroll bug 阻塞，见 §4） |
 | regalloc ion 对 Vector class 支持缺口 | 中 | 先拆 vcode move/spill panic + ion 单测，再启用向量化 |
 | 显式向量类型污染标量流水线 | 中 | 类型下沉到 MIR 后由 `reg_class_for_type` 分流，标量路径不动 |
 | if-conversion 投机上提改变执行语义 | 中 | 仅纯整数算术 + head 支配 merge 才转换；on/off 差分 |

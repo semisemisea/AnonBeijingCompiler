@@ -12,8 +12,12 @@
 > 无回归。
 > **milestone 2 A3（test-at-top 多参数 passthrough）已完成（2caf984）**：
 > 正确性改进（消除对 loop-invariant 常量 back-arg 的误拒）。剩余：
-> test-at-top Reducible 解锁（P0，conv2d 被 shape_header_multi_inst 拦截）、
-> 标量 min/max ISel（P1，IR 无实例，低价值）、M45 SLP（P1）。
+> conv2d 计算内核多臂 if（P0，大工程，2026-08-10 实证：5 点卷积边界检查链
+> 需多臂 if 掩码合并）；checksum 循环（唯一新目标）需 load bound 提升但暴露
+> LoopUnroll 对 runtime bound 循环的展开 bug（85_long_code arrCopy 回归），
+> 暂缓；shape_header 放宽单独零收益（conv2d 拒绝分布不变）。01_mm1 mm 内核
+> 已完全向量化（M70，验收达成）。标量 min/max ISel（P1，IR 无实例，低价值）、
+> M45 SLP（P1）。
 > 待做：§5 主计划 E 剩余项（M51 指针槽/SROA、M55、M56）与 §6 后续候选。
 
 ## 已完成里程碑摘要
@@ -125,17 +129,14 @@ TCO, TailRecursiveInline, BooleanSimplification, GVNPRE, DeadPhiElim, DCE。
 | conv2d-1 | 26 | 清零/零初始化 + sum 循环；计算内核仍被拒 |
 | crypto-1 | 2 | 既有向量化循环 |
 
-### 1.4 当前拒绝分布（2026-08-09 复扫，M44_TRACE=1，dedup top）
+### 1.4 当前拒绝分布（2026-08-10 复扫，M44_TRACE=1，dedup top）
 
-- matmul1 掩码内核（`if(a[i][k]*b[k][j]%2==0) temp += b[i][k]*a[k][j]`，
-  while_entry_19）：loop 是 `Reducible{IntAdd}`（真寄存器归约）但被
-  `params_not_2` / `b1_acc_is_passthrough_or_counter` 拒绝——6 参数形态
-  （i/j 外层 passthrough + k IV + temp acc + counter + GEP 步进行指针）超过
-  B1 的 `effective.len()==2` 门。
-- conv2d-1：`shape_header_multi_inst`(26)、`verdict=Reducible`(17)、
-  `test_at_top_multi_param`(4)、`non_unit_step`(3)。
-- 01_mm1：`verdict=Reducible`(24，mm 内核)、`shape_header_multi_inst`(14)、
-  `counter_not_cond`(11)、`IntraIterationConflict`(7)。
+- conv2d-1 计算内核（5 点卷积，while_entry_7）：`shape_body_not_2_blocks`（多臂
+  if，需多臂 if 掩码合并）；其余 `shape_header_multi_inst` 多为已向量化循环的
+  固定点噪声（init_kernel/row_reduce/nonlinear 等已向量化）。
+- checksum 循环（`sum += Out[i]`）：bound=`N_eff²` 在 header 计算，需 load bound
+  提升，但触发 LoopUnroll 对 runtime bound 循环的展开 bug（见 §3.3）。
+- 01_mm1：mm 内核已完全向量化（M70），无剩余。
 - 通用：`not_innermost`（外层循环，正常）、`tail_loop_skip`（本 pass 产物，
   防固定点再向量化）。
 
@@ -259,13 +260,26 @@ passthrough 线程化进内层）+ Parsimony（uniform/varying 分类：uniform 
 **目标形态**：01_mm1 mm 内核（`C[i][j] += A[i][k]*B[k][j]`）与 conv2d-1 计算
 循环（i/j/k 4 层嵌套，每层 6-7 参数）出向量。
 
-**现状根因（2026-08-09 代码实证）**：
-- 01_mm1 mm 内核被 `verdict=Reducible`（24 次）+ `shape_header_multi_inst`（14，
-  header 含 bound 计算指令）+ `counter_not_cond`（11）拒绝。该内核是**内存累加**
-  （B3 `is_elementwise_inplace` 已实现）——`Reducible` 判定本身是 counter 误标
-  （既有已知：旋转循环 counter 恒标 Reducible）。
-- conv2d-1 被 `shape_header_multi_inst`（26）+ `verdict=Reducible`（17）拒绝；
-  体层还有 `shape_body_not_2_blocks` 的**双臂/多出口 if**（非单臂）。
+**现状根因（2026-08-09 代码实证 + 2026-08-10 补充调查）**：
+- 01_mm1 mm 内核（`C[i][j] += A[i][k]*B[k][j]`）：**已完全向量化**（M70，8 元素/轮，
+  `ldp q×2 + mla×2 + stp q + subs`），验收达成，无剩余工作。
+- conv2d-1 计算内核（5 点卷积，while_entry_7，i/j/k 4 层嵌套）：被
+  `shape_body_not_2_blocks` 拦截（**多臂 if**——land_merge_10/then_23/end_12
+  的边界检查链 + unroll 展开，5 个分支），需**多臂 if 掩码合并**（P0，大工程）。
+- conv2d-1 的 `shape_header_multi_inst`（26）**大多是已向量化循环的固定点噪声**
+  （init_kernel/row_reduce/nonlinear 等已向量化，header 二次迭代含 bound 计算）。
+- **checksum 循环**（`sum += Out[i]`，bound=`N_eff²` 在 header 计算）是唯一的新目标：
+  2026-08-10 实证——shape_header 放宽放行后，apply 正确向量化（load→VecLoad、
+  acc_update 合法），但**需要 load bound 提升**（bound 定义在 header，runtime trip
+  计算引用它 → lowering use-before-def）。提升 load bound 到 preheader 后 checksum
+  向量化（conv2d +3 向量指令，`ldr q + add v + addv`）。**但 load bound 提升触发了
+  arrCopy 循环（85_long_code）回归**：arrCopy bound=`load len`（全局）被放行后，
+  LoopUnroll 将其全展开成错误常量 store（基线是标量循环）。load bound 源在循环内
+  不被写（依赖分析确认），但展开仍出错——**LoopUnroll 对 runtime bound 循环的
+  展开有预存 bug**。因此 load bound 提升方案暂缓，需先修 LoopUnroll。
+- **shape_header 放宽（只放行 loop-invariant 纯计算 bound，不含 load）单独零收益**
+  （2026-08-10 实证：conv2d 拒绝分布不变，perf 语料向量指令数全不变）——被
+  shape_header 拒的循环本就是噪声或需 runtime bound。
 
 **实现步骤**：
 1. **shape_header_multi_inst 放宽**：header 内的 bound 计算指令（乘法/取模链，

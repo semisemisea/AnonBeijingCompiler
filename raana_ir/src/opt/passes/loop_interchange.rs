@@ -110,6 +110,15 @@ struct Plan {
     e_j: BasicBlock,
     /// Position of `temp` in `H_k` parameters.
     temp_idx: usize,
+    /// Position of the stepped-pointer parameter in `H_k` parameters (the
+    /// loop-carried column pointer, e.g. matmul1's `b[k][j]`). Its body
+    /// reads are rewritten to multi-dim GEPs and the parameter dropped.
+    ptr_idx: Option<usize>,
+    /// Root base of the stepped pointer's initial value GEP chain (the
+    /// global the column pointer walks), e.g. `gv_b` for matmul1's
+    /// `b[k][j]` pointer. `None` when `ptr_idx` is `None` or the chain is
+    /// not a plain GEP over a global.
+    ptr_root: Option<Inst>,
     /// The reduction accumulator (`H_k` parameter).
     temp: Inst,
     /// Address GEP of the reduction target `c[i][j]` (lives in `E_k`).
@@ -799,9 +808,39 @@ fn find_interchange(program: &Program, func: Function) -> Option<Plan> {
         // Verify the shell chain: H_j jumps into the first shell, each shell
         // jumps into the next, and the last jumps into H_k. Non-terminator
         // instructions must be invariant (only use constants, globals, or
-        // values flowing back to an invariant H_j parameter).
+        // values flowing back to an invariant H_j parameter). One exception:
+        // a column-pointer GEP whose *only* non-invariant use is the j IV —
+        // `%col = getelemptr base, (0, j)` feeding a stepped-pointer slot of
+        // H_k (e.g. matmul1's `b[k][j]` column pointer). It is loop-invariant
+        // in k (the swapped outer loop) and apply rewrites the pointer reads
+        // to multi-dim GEPs, so the shell compute survives the swap.
         let mut prev = h_j;
         let mut chain_ok = true;
+        // H_k parameters whose back-edge advances by a constant GEP stride
+        // (the stepped-pointer slots; their initial values come from the last
+        // shell's jump).
+        let h_k_params_for_ptr = data.bb_data(h_k).params().to_vec();
+        let stepped_ptr_params: SmallVec<[Inst; 2]> = latch_args(data, &arena, l_k)
+            .map(|(back_args, _)| {
+                h_k_params_for_ptr
+                    .iter()
+                    .enumerate()
+                    .filter(|&(pos, &p)| {
+                        matches!(
+                            arena.inst_data(back_args[pos]).kind(),
+                            InstKind::GetElemPtr(gep)
+                                if gep.base() == p
+                                    && gep.offsets().len() == 1
+                                    && arena
+                                        .inst_data(gep.offsets()[0])
+                                        .kind()
+                                        .is_const(),
+                        )
+                    })
+                    .map(|(_, &p)| p)
+                    .collect()
+            })
+            .unwrap_or_default();
         for &shell in &shells {
             let prev_term = data.layout().basicblock(prev).terminator();
             let InstKind::Jump(prev_jump) = arena.inst_data(prev_term).kind() else {
@@ -817,21 +856,51 @@ fn find_interchange(program: &Program, func: Function) -> Option<Plan> {
                 chain_ok = false;
                 break;
             };
+            let shell_jump_args = shell_jump.args().to_vec();
             for &inst in data.layout().basicblock(shell).insts() {
                 if inst == term {
                     continue;
                 }
+                let mut saw_non_invariant_use = false;
+                let mut col_ptr_ok = false;
                 for used in arena.inst_data(inst).inst_usage() {
                     let ok = used.is_global()
                         || arena.inst_data(used).kind().is_const()
                         || invariant_params.iter().any(|&p| {
                             value_flows_from(data, &arena, used, p, &mut FxHashSet::default())
                         });
-                    if !ok {
-                        chain_ok = false;
-                        break;
+                    if ok {
+                        continue;
                     }
-                }                if !chain_ok {
+                    saw_non_invariant_use = true;
+                    // A GEP whose only non-invariant use is the j IV, and
+                    // whose result feeds a stepped-pointer parameter of H_k
+                    // via the shell's jump: column-pointer setup.
+                    if used == j_iv
+                        && matches!(arena.inst_data(inst).kind(), InstKind::GetElemPtr(_))
+                        && shell_jump_args.iter().any(|&a| {
+                            a == inst
+                                && stepped_ptr_params.iter().any(|&p| {
+                                    h_k_params_for_ptr
+                                        .iter()
+                                        .position(|&q| q == p)
+                                        .map_or(false, |pos| {
+                                            shell_jump_args.get(pos).copied() == Some(inst)
+                                        })
+                                })
+                        })
+                    {
+                        col_ptr_ok = true;
+                        continue;
+                    }
+                    chain_ok = false;
+                    break;
+                }
+                if saw_non_invariant_use && !col_ptr_ok {
+                    chain_ok = false;
+                    break;
+                }
+                if !chain_ok {
                     break;
                 }
             }
@@ -1020,6 +1089,47 @@ fn find_interchange(program: &Program, func: Function) -> Option<Plan> {
             })
             .map(|(pos, _)| pos);
 
+        // Stepped-pointer parameter: a H_k parameter whose back-edge value
+        // is `getelemptr(param, const)` (loop-carried column pointer, e.g.
+        // matmul1's `b[k][j]`). It is not the IV/trip/temp/accumulator.
+        let ptr_idx = h_k_params
+            .iter()
+            .enumerate()
+            .find(|&(pos, &p)| {
+                p != k_iv
+                    && Some(pos) != k_trip_idx
+                    && matches!(
+                        arena.inst_data(k_latch_args[pos]).kind(),
+                        InstKind::GetElemPtr(gep)
+                            if gep.base() == p
+                                && gep.offsets().len() == 1
+                                && arena.inst_data(gep.offsets()[0]).kind().is_const(),
+                    )
+            })
+            .map(|(pos, _)| pos);
+        // Root base of the pointer's initial value (its GEP chain base).
+        // matmul1: ptr0 = `getelemptr %gv_b, (0, 0, j)` -> root `gv_b`.
+        let ptr_root = ptr_idx.and_then(|pi| {
+            let ptr0 = *last_args.get(pi)?;
+            let mut cur = ptr0;
+            loop {
+                let InstKind::GetElemPtr(gep) = arena.inst_data(cur).kind() else {
+                    break;
+                };
+                cur = gep.base();
+            }
+            if matches!(arena.inst_data(cur).kind(), InstKind::GlobalAlloc(..)) {
+                Some(cur)
+            } else {
+                None
+            }
+        });
+        // Without a provable root base the pointer reads cannot be rewritten
+        // to multi-dim GEPs; refuse the nest (conservative).
+        if ptr_idx.is_some() && ptr_root.is_none() {
+            continue;
+        }
+
         return Some(Plan {
             b_i,
             h_j,
@@ -1030,6 +1140,8 @@ fn find_interchange(program: &Program, func: Function) -> Option<Plan> {
             e_j,
             temp_idx,
             temp,
+            ptr_idx,
+            ptr_root,
             c_gep,
             j_iv,
             j_trip_idx,
@@ -1071,6 +1183,8 @@ fn apply_interchange(data: &mut ArenaContextMut<'_>, plan: Plan) -> bool {
         e_j,
         temp_idx,
         temp,
+        ptr_idx,
+        ptr_root,
         c_gep,
         j_iv,
         j_trip_idx,
@@ -1295,6 +1409,65 @@ fn apply_interchange(data: &mut ArenaContextMut<'_>, plan: Plan) -> bool {
         visit_and_replace(data, h_k_params_pre[j_pos_hk], h_j_params[j_pos_hj]);
     }
 
+    // 4.5. Rewrite stepped-pointer reads: the loop-carried column pointer
+    //    (e.g. matmul1's `b[k][j]` through `%69`) reads a fixed column while
+    //    the k IV steps the row. After the swap the inner loop is j, so the
+    //    read must become a direct multi-dim GEP `(0, k, j)` on the pointer's
+    //    root base. The pointer parameter itself is then dropped (its back
+    //    edge advance is dead). The k parameter lives in H_k (outer after
+    //    the swap) and dominates the body; the j parameter is H_j's live IV.
+    if let Some(ptr_pos) = ptr_idx {
+        let ptr = h_k_params_pre[ptr_pos];
+        let root = ptr_root.expect("ptr_root present when ptr_idx is set");
+        let k_inst = {
+            // The k IV is the H_k parameter updated by k_update.
+            h_k_params_pre
+                .iter()
+                .find(|&&p| {
+                    matches!(
+                        data.inst_data(k_update).kind(),
+                        InstKind::Binary(b) if b.lhs() == p || b.rhs() == p
+                    )
+                })
+                .copied()
+                .expect("k IV parameter")
+        };
+        let j_inst = h_j_params[j_pos_hj];
+        let zero = data.new_local_inst().integer(0);
+        let scan_blocks: Vec<BasicBlock> = k_body.iter().copied().collect();
+        for bb in scan_blocks {
+            let insts: Vec<Inst> = data
+                .layout()
+                .basicblock(bb)
+                .insts()
+                .iter()
+                .copied()
+                .collect();
+            for inst in insts {
+                let InstKind::GetElemPtr(gep) = data.inst_data(inst).kind().clone() else {
+                    continue;
+                };
+                if gep.base() != ptr {
+                    continue;
+                }
+                // In the latch the pointer is advanced (`getelemptr(ptr, c)`)
+                // to feed the back edge; with the parameter dropped that
+                // advance is dead. Remove it.
+                let is_latch_advance = bb == b_k
+                    && gep.offsets().len() == 1
+                    && data.inst_data(gep.offsets()[0]).kind().is_const();
+                if is_latch_advance {
+                    remove_inst(data, bb, inst);
+                    continue;
+                }
+                // Body read: `getelemptr(ptr, X)` -> `getelemptr(root, (0,k,j))`.
+                data.replace_inst_with(inst)
+                    .get_elem_ptr(root, vec![zero, k_inst, j_inst]);
+            }
+        }
+        drop_header_param(data, h_k, ptr_pos);
+    }
+
     // 5. Swap instruction tails: k parts go to E_k; the j-test goes to B_k.
     //    (The old j-update depends on E_k's parameters and is dropped; a
     //    fresh one is built below from H_j's live j.)
@@ -1363,6 +1536,27 @@ fn apply_interchange(data: &mut ArenaContextMut<'_>, plan: Plan) -> bool {
         .new_local_inst()
         .branch(k_test, h_k, k_args, e_j, e_j_args);
     data.layout_mut().insert_inst(e_k, k_test_br);
+
+    // 7.5. E_k now holds only the k parts: the moved k-update/k-test and the
+    //    freshly built k-test branch. The pre-swap j-update / j-test
+    //    instructions left in E_k (e.g. `Add(j, 1)` referencing the old E_k
+    //    j parameter) are dead and their operands may dangle after E_k's
+    //    parameter list is cleared. Remove everything except the three.
+    {
+        let e_insts: Vec<Inst> = data
+            .layout()
+            .basicblock(e_k)
+            .insts()
+            .iter()
+            .copied()
+            .collect();
+        for inst in e_insts {
+            if inst == k_update || inst == k_test || inst == k_test_br {
+                continue;
+            }
+            remove_inst(data, e_k, inst);
+        }
+    }
 
     // 8. Rewire the shell chain and the loop-entry jumps.
     //    B_i: jump H_j -> jump H_k, args (i, j0, k0, trip_k0).
@@ -1448,19 +1642,19 @@ fn apply_interchange(data: &mut ArenaContextMut<'_>, plan: Plan) -> bool {
         rewrite_jump(data, shell, next, args);
     }
     //    Last shell: jump H_k -> jump H_j, args per H_j's parameter list:
-    //    invariants from the old jump (same position), j from the old jump's
-    //    H_k-j slot (or the initial j0 when j is not a H_k parameter), and
-    //    the j trip counter from B_i's original jump.
+    //    invariants from the old jump (same position), j from B_i's original
+    //    j0 (the initial IV, an outer value that dominates the shell), and
+    //    the j trip counter from B_i's original jump. The pre-swap H_j
+    //    parameters live below the shell after the swap and must not be
+    //    referenced here.
     let mut last_args: Vec<Inst> = Vec::with_capacity(h_j_params.len());
     for (p, _param) in h_j_params.iter().enumerate() {
         let v = if Some(p) == j_trip_idx {
             b_i_old_args[p]
         } else if p == j_pos_hj {
-            j_pos_hk_adj
-                .and_then(|hp| last_old_args.get(hp).copied())
-                .unwrap_or(j0)
+            b_i_old_args.get(p).copied().unwrap_or(j0)
         } else {
-            last_old_args[p]
+            b_i_old_args.get(p).copied().unwrap_or(last_old_args[p])
         };
         last_args.push(v);
     }
@@ -1529,6 +1723,55 @@ fn apply_interchange(data: &mut ArenaContextMut<'_>, plan: Plan) -> bool {
     //    is now the j-loop body. B_k is the k-loop latch (now the j-test)
     //    and must not be the entry.
     rewrite_jump(data, h_j, k_first, vec![]);
+
+    // 8.75. Dead-code sweep on the shells: after the swap a shell sits
+    //    between the outer H_k and the inner H_j. It originally referenced
+    //    H_j's parameters (the pre-swap outer loop), which now live in the
+    //    inner header *below* the shell and no longer dominate it. The shell
+    //    must be reduced to instructions that only use values in scope at
+    //    the outer loop:
+    //      * uses of the inner j IV / j trip counter: dead (they fed the
+    //        dropped column pointer / the moved trip counter); remove them.
+    //      * uses of the inner i parameter: `i` is also an outer H_k
+    //        parameter; rewrite to the outer value so row-pointer GEPs
+    //        survive.
+    let mut shell_dead: Vec<(BasicBlock, Inst)> = Vec::new();
+    for &shell in &shells {
+        let term = data.layout().basicblock(shell).terminator();
+        for &inst in data.layout().basicblock(shell).insts() {
+            if inst == term {
+                continue;
+            }
+            let uses_j = data.inst_data(inst).inst_usage().any(|used| {
+                !used.is_global()
+                    && !data.inst_data(used).kind().is_const()
+                    && value_flows_from(&**data, &**data, used, j_iv, &mut FxHashSet::default())
+            });
+            if uses_j {
+                shell_dead.push((shell, inst));
+            }
+        }
+    }
+    // Remap the shell's H_j `i` references to the outer H_k `i` parameter
+    // (the only pre-swap H_j parameter that survives in outer scope).
+    let i_hj = h_j_params
+        .iter()
+        .position(|&p| p != j_iv && Some(&p) != j_trip_idx.map(|t| &h_j_params[t]))
+        .map(|idx| h_j_params[idx]);
+    // The outer `i` parameter: the first H_k parameter that is neither the
+    // j IV nor the k trip counter (trip_idx is already in h_k_params scope).
+    let i_hk = h_k_params.iter().position(|&p| {
+        p != j_iv
+            && !k_trip_idx
+                .map(|t| t < h_k_params.len() && h_k_params[t] == p)
+                .unwrap_or(false)
+    });
+    if let (Some(i_hj), Some(i_pos)) = (i_hj, i_hk) {
+        visit_and_replace(data, i_hj, h_k_params[i_pos]);
+    }
+    for (shell, inst) in shell_dead {
+        remove_inst(data, shell, inst);
+    }
 
     let _ = b_j;
     true

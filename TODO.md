@@ -7,10 +7,12 @@
 > **milestone 5（内联向量零初始化）已完成（2026-08-09）**；
 > **milestone 1（matmul1 掩码内核 j/k interchange）前置已提交**：dual_coeffs
 > 步进指针识别（8762d45）+ B1 掩码归约 use-before-def/GVN 指令环修复
-> （3e5f5ee，i-k-j 形态掩码内核已能完整向量化）；剩余 apply 深度地址重写
-> （列指针→行指针，类型反转，风险高）。
-> 剩余：test-at-top Reducible 解锁（P0，conv2d 被 shape_header_multi_inst
-> 拦截）、标量 min/max ISel（P1，IR 无实例，低价值）、M45 SLP（P1）。
+> （3e5f5ee，i-k-j 形态掩码内核已能完整向量化）；剩余 apply 系统性重构
+> （参数表硬编码 4 参数，需按角色通用化）。
+> **milestone 2 A3（test-at-top 多参数 passthrough）已完成（2caf984）**：
+> crypto md5 w 循环解锁（ldr q16+str q16）。剩余：test-at-top Reducible
+> 解锁（P0，conv2d 被 shape_header_multi_inst 拦截）、标量 min/max ISel
+> （P1，IR 无实例，低价值）、M45 SLP（P1）。
 > 待做：§5 主计划 E 剩余项（M51 指针槽/SROA、M55、M56）与 §6 后续候选。
 
 ## 已完成里程碑摘要
@@ -119,6 +121,7 @@ TCO, TailRecursiveInline, BooleanSimplification, GVNPRE, DeadPhiElim, DCE。
 | matmul1 | 6 | sum 循环（addv）+ 清零循环；掩码内核需 j/k interchange（前置 bug 已修，apply 地址重写进行中） |
 | h-10-01 | 9 | f32 循环 |
 | conv2d-1 | 26 | 清零/零初始化 + sum 循环；计算内核仍被拒 |
+| crypto-1 | 2 | md5 w 数组初始化循环（A3 解锁，ldr q16+str q16） |
 
 ### 1.4 当前拒绝分布（2026-08-09 复扫，M44_TRACE=1，dedup top）
 
@@ -218,14 +221,18 @@ TCO, TailRecursiveInline, BooleanSimplification, GVNPRE, DeadPhiElim, DCE。
    GVN 无限递归 stack overflow。修复后 i-k-j 形态掩码内核（合成用例）完整
    向量化（ldr q + mul + and + cmeq/eor + orr + addv，每轮 8 条向量指令），
    -O2 差分 PASS。
-3. **剩余（apply 深度地址重写，风险高）**：shell 放行 j 依赖的 `b[0][j]`
-   列指针 GEP + apply 把列指针形态转行指针。已实现 shell 放行 + apply 的
-   列指针读重写（`getelemptr ptr, 0` → `getelemptr ptr, j`），但暴露**类型
-   不匹配**：列指针是 `*i32`（固定 j 扫 k），交换后需 `b[k]+j`（固定 k 扫 j，
-   行指针 `*[i32;1000]`）——指针语义和类型都需反转，超出 apply 现有假设
-   （H_k 纯 `[i,j,k,temp]` 4 参数）。需要重新设计 apply 的地址/类型处理。
-4. 若 apply 侧重写复杂，先以"列指针 GEP 提升到 preheader 后重算"的最小
-   正确形态落地。
+3. **剩余（apply 系统性重构，风险高）**：已实现 shell 放行 j 依赖的 `b[0][j]`
+   列指针 GEP + apply 列指针读重写（`getelemptr ptr, 0` → 3D GEP
+   `getelemptr %gv_b, (0, k, j)`，根 base 从 M42 access 分析识别），interchange
+   能触发。但暴露**apply 参数表硬编码 4 参数**（`[i,j,k,temp]`）假设：matmul1
+   的 H_k 是 6 参数 `[i,j,k,temp,counter,ptr]`，H_j 是 3 参数 `[i,j,counter]`，
+   交换后外层 H_k 应保留 `[i,k,counter]`、内层 H_j 应接收 j，但 apply 的
+   `b_i_args`/`last_args`/`e_j_args` 构造（1470-1520 行）按 4 参数布局重排，
+   产生参数错位/残留 ptr 引用。需要**通用化 apply 的参数表重排**：按角色
+   （i/j/k/temp/counter/ptr）识别参数而非位置假设。
+4. 备选：不通用化 apply，而是在 interchange 前用独立规范化 pass 把 matmul1
+   k 循环的 counter/ptr 参数消除（counter 内联、ptr 改 3D GEP），使 H_k 变
+   4 参数走标准路径。
 
 **涉及文件**：`raana_ir/src/opt/passes/loop_interchange.rs`（+可能
 `loop_vectorize.rs` 的 B1 多参数）。
@@ -268,6 +275,12 @@ passthrough 线程化进内层）+ Parsimony（uniform/varying 分类：uniform 
    双臂形态，用 `VecCsel/bsl` 或双掩码合并（`(a&m)|(b&~m)`）——需要新增
    VecBsl lowering 或复用现有 `(t&~m)|(f&m)` 组合。**若 lowering 是瓶颈，先以
    "双臂→单臂（真臂保留、假臂掩码为 0）"的最小正确形态落地。**
+4. **A3 test-at-top 多参数 passthrough（已完成 2026-08-09，2caf984）**：
+   test-at-top 的 effective 排除 loop-invariant back-arg（常量/循环外值），
+   `is_loop_invariant` 对常量 back-arg 的 header 参数判 invariant。crypto
+   md5 w 数组初始化循环（16 passthrough + 2 常量 + IV）出 `ldr q16 + str q16`。
+   crypto-1/2/3 -O2 差分 PASS；152/152；单测
+   `vectorizes_test_at_top_with_invariant_constant_args`。
 
 **涉及文件**：`loop_vectorize.rs`、`anon_armv8/src/lower.rs` +
 `instructions.rs`（VecBsl lowering，若需）。

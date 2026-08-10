@@ -10,9 +10,9 @@
 > （3e5f5ee，i-k-j 形态掩码内核已能完整向量化）；剩余 apply 系统性重构
 > （参数表硬编码 4 参数，需按角色通用化）。
 > **milestone 2 A3（test-at-top 多参数 passthrough）已完成（2caf984）**：
-> crypto md5 w 循环解锁（ldr q16+str q16）。剩余：test-at-top Reducible
-> 解锁（P0，conv2d 被 shape_header_multi_inst 拦截）、标量 min/max ISel
-> （P1，IR 无实例，低价值）、M45 SLP（P1）。
+> 正确性改进（消除对 loop-invariant 常量 back-arg 的误拒）。剩余：
+> test-at-top Reducible 解锁（P0，conv2d 被 shape_header_multi_inst 拦截）、
+> 标量 min/max ISel（P1，IR 无实例，低价值）、M45 SLP（P1）。
 > 待做：§5 主计划 E 剩余项（M51 指针槽/SROA、M55、M56）与 §6 后续候选。
 
 ## 已完成里程碑摘要
@@ -121,7 +121,7 @@ TCO, TailRecursiveInline, BooleanSimplification, GVNPRE, DeadPhiElim, DCE。
 | matmul1 | 6 | sum 循环（addv）+ 清零循环；掩码内核需 j/k interchange（前置 bug 已修，apply 地址重写进行中） |
 | h-10-01 | 9 | f32 循环 |
 | conv2d-1 | 26 | 清零/零初始化 + sum 循环；计算内核仍被拒 |
-| crypto-1 | 2 | md5 w 数组初始化循环（A3 解锁，ldr q16+str q16） |
+| crypto-1 | 2 | 既有向量化循环 |
 
 ### 1.4 当前拒绝分布（2026-08-09 复扫，M44_TRACE=1，dedup top）
 
@@ -277,10 +277,10 @@ passthrough 线程化进内层）+ Parsimony（uniform/varying 分类：uniform 
    "双臂→单臂（真臂保留、假臂掩码为 0）"的最小正确形态落地。**
 4. **A3 test-at-top 多参数 passthrough（已完成 2026-08-09，2caf984）**：
    test-at-top 的 effective 排除 loop-invariant back-arg（常量/循环外值），
-   `is_loop_invariant` 对常量 back-arg 的 header 参数判 invariant。crypto
-   md5 w 数组初始化循环（16 passthrough + 2 常量 + IV）出 `ldr q16 + str q16`。
-   crypto-1/2/3 -O2 差分 PASS；152/152；单测
-   `vectorizes_test_at_top_with_invariant_constant_args`。
+   `is_loop_invariant` 对常量 back-arg 的 header 参数判 invariant。这是
+   正确性/健壮性改进（消除对合法形态的误拒）；当前 perf 语料无新增向量化
+   收益（crypto 的 ldr q16 为既有循环、03_sort 的 3 条 movi 来自里程碑 5）。
+   单测 `vectorizes_test_at_top_with_invariant_constant_args` 覆盖。
 
 **涉及文件**：`loop_vectorize.rs`、`anon_armv8/src/lower.rs` +
 `instructions.rs`（VecBsl lowering，若需）。

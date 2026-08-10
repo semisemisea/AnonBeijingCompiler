@@ -1165,9 +1165,15 @@ fn analyze_loop(
     let counter_slot = n_params - 1;
     let effective: Vec<usize> = if test_at_top {
         // No counter parameter yet (materialized in the mutation phase), so
-        // nothing is excluded beyond the passthroughs.
+        // nothing is excluded beyond the passthroughs and loop-invariant
+        // back-edge arguments (constants / loop-outside values forwarded
+        // unchanged — crypto's md5/sha1 state loops carry many such
+        // invariant pass-throughs alongside the real IV).
         (0..n_params)
-            .filter(|&i| !passthrough.contains(&i))
+            .filter(|&i| {
+                !passthrough.contains(&i)
+                    && !is_loop_invariant(arena, back_args[i], header, latch)
+            })
             .collect()
     } else {
         (0..n_params)
@@ -2332,13 +2338,31 @@ fn is_loop_invariant(arena: &ArenaContext<'_>, inst: Inst, header: BasicBlock, l
         return true;
     }
     if let Some(slot) = arena.bb_data(header).params().iter().position(|&p| p == inst) {
-        // A passthrough parameter: the back-edge argument is the parameter
-        // itself. Rotated loops branch back to the header; test-at-top
-        // loops jump back to it.
+        // A passthrough parameter (the back-edge argument is the parameter
+        // itself) or a loop-invariant one (the back-edge argument is a
+        // constant — crypto's md5/sha1 state loops forward constants like
+        // 256000 / 1 alongside the real IV). Rotated loops branch back to
+        // the header; test-at-top loops jump back to it.
         let term = arena.curr_func_data().layout().basicblock(latch).terminator();
         return match arena.inst_data(term).kind() {
-            InstKind::Branch(branch) => branch.t_args().get(slot) == Some(&inst),
-            InstKind::Jump(jump) => jump.args().get(slot) == Some(&inst),
+            InstKind::Branch(branch) => {
+                branch.t_args().get(slot) == Some(&inst)
+                    || branch.t_args().get(slot).is_some_and(|&ba| {
+                        matches!(
+                            arena.inst_data(ba).kind(),
+                            InstKind::Integer(_) | InstKind::Float(_) | InstKind::ZeroInit
+                        )
+                    })
+            }
+            InstKind::Jump(jump) => {
+                jump.args().get(slot) == Some(&inst)
+                    || jump.args().get(slot).is_some_and(|&ba| {
+                        matches!(
+                            arena.inst_data(ba).kind(),
+                            InstKind::Integer(_) | InstKind::Float(_) | InstKind::ZeroInit
+                        )
+                    })
+            }
             _ => false,
         };
     }
@@ -6116,6 +6140,91 @@ mod tests {
         let ret = data.new_local_inst().ret(Some(acc));
         data.layout_mut().insert_inst(exit, ret);
         (function, header, latch, exit, seven)
+    }
+
+    #[test]
+    fn vectorizes_test_at_top_with_invariant_constant_args() {
+        // A3 extension: a test-at-top loop whose header carries the IV plus
+        // loop-invariant *constant* back-edge arguments (not the parameter
+        // itself — e.g. crypto's md5/sha1 state loops forward constants like
+        // 256000 / 1 alongside the real IV). Those invariants must not count
+        // as effective parameters, or `test_at_top_multi_param` rejects the
+        // shape even though the payload is a plain elementwise loop.
+        let mut program = Program::new();
+        let i32 = Type::get_i32();
+        let arr = Type::get_array(i32.clone(), 64);
+        let a = {
+            let init = program.new_value().zero_init(arr.clone());
+            program.new_value().global_alloc(init)
+        };
+        let b = {
+            let init = program.new_value().zero_init(arr);
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_unit(), "tat_inv".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        // header = [iv, const_k1, const_k2].
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone(), i32.clone()]);
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for bb in [header, latch, exit] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let k1 = data.new_local_inst().integer(7);
+        let k2 = data.new_local_inst().integer(256000);
+        let zero = data.new_local_inst().integer(0);
+        let iv = data.bb_data(header).params()[0];
+        let p1 = data.bb_data(header).params()[1];
+        let p2 = data.bb_data(header).params()[2];
+        let entry_jump = data.new_local_inst().jump(header, vec![zero, k1, k2]);
+        data.layout_mut().insert_inst(entry, zero);
+        data.layout_mut().insert_inst(entry, k1);
+        data.layout_mut().insert_inst(entry, k2);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let bound = data.new_local_inst().integer(16);
+        let cond = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+        let header_br = data
+            .new_local_inst()
+            .branch(cond, latch, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, cond);
+        data.layout_mut().insert_inst(header, header_br);
+        let ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret);
+        let one = data.new_local_inst().integer(1);
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let gep_a = lb.get_elem_ptr(a, vec![zero, iv]);
+        let load_a = lb.load(gep_a);
+        let sum = lb.binary(BinaryOp::Add, load_a, p1);
+        let gep_b = lb.get_elem_ptr(b, vec![zero, iv]);
+        let store = lb.store(sum, gep_b);
+        drop(lb);
+        let iv_next = data.new_local_inst().binary(BinaryOp::Add, iv, one);
+        // The two invariant constants are re-forwarded unchanged (their back
+        // arguments are the constants themselves, not the header parameters
+        // — the crypto md5/sha1 shape); only the IV steps by one.
+        let latch_jump = data
+            .new_local_inst()
+            .jump(header, vec![iv_next, k1, k2]);
+        for inst in [
+            one, gep_a, load_a, sum, gep_b, store, iv_next, latch_jump,
+        ] {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        assert!(
+            run(&mut program, function),
+            "test-at-top with invariant constant args must vectorize"
+        );
+        let data = program.func_data(function);
+        assert_eq!(vector_load_count(&program, function), 1);
+        assert_eq!(vector_binaries(&program, function), vec![BinaryOp::Add]);
     }
 
     #[test]

@@ -231,6 +231,18 @@ pub(crate) fn classify_index(
             index: value,
         });
     }
+    // A compile-time integer constant is invariant regardless of where it is
+    // laid out (the loop may hold a folded constant, e.g. the conv2d kernel's
+    // `cc = sub(add(iv, k), 2)` offsets). The loop-outside branch above only
+    // catches constants placed outside the loop; an in-loop `Integer` would
+    // otherwise be rejected as a non-binary index.
+    if let Some(constant) = integer_constant(arena, value) {
+        let c = i64::from(constant);
+        return Ok(IndexInfo {
+            coefficient: 0,
+            offset_range: (c, c),
+        });
+    }
     let InstKind::Binary(binary) = data.inst_data(value).kind() else {
         return Err(ForbidReason::NonAffineIndex {
             access: gep,

@@ -15,6 +15,10 @@
 > 暴露 LoopUnroll runtime-bound 展开 bug（85_long_code arrCopy 回归）；shape_header
 > 放宽单独零收益；01_mm1 mm 内核已完全向量化（M70）；row_reduce/nonlinear 已
 > 向量化；标量 min/max ISel（P1，IR 无实例，低价值）；M45 SLP（P1）。
+> **阶段 1（识别+gate+单测）已完成（2026-08-11，a96d8c9）**：conv2d 计算内核
+> 25 个串行掩码累加单元全部识别（`br mask, then, end(acc)` 链），M44_TRACE 复扫
+> 不再报 `shape_body_not_2_blocks`；apply 保守拒绝（`multi_arm_apply_unsupported`），
+> 行为零变化，raana_ir 424 全绿。
 > 待做：§5 主计划 E 剩余项（M51 指针槽/SROA、M55、M56）与 §6 后续候选。
 
 ## 已完成里程碑摘要
@@ -263,32 +267,47 @@ passthrough 线程化进内层）+ Parsimony（uniform/varying 分类：uniform 
 
 **实现步骤**：
 
-*阶段 1 —— 识别与 gate（loop_vectorize）*
+*阶段 1 —— 识别与 gate（loop_vectorize）—— 已完成 2026-08-11（a96d8c9）*
 1. 识别 c 循环的多臂 if 累加结构：52 个基本块 body 的 25 个
    `br mask_kc, then_kc, end_kc` 模式（每 (kr,kc) 一个边界检查 + 乘加 + 累加
    合并）。新增 `M44` 通过路径（多臂掩码 plan），形状门控：test-at-top、
    IV 步进 1、25 个串行掩码累加。
-2. 新增单测：合成 5 点卷积形态（连续 In/Out + 边界检查 + 累加），验证识别。
+2. 新增单测：合成 5 点卷积形态（连续 In/Out + 边界检查 + 累加），验证识别
+   （`recognizes_multi_arm_masked_kernel`，+1）。修复 iv_offset 对纯常量误判
+   （Integer(0) 曾被视为 iv 项）→ 引入 contains_iv。
+3. apply 保守拒绝（`multi_arm_apply_unsupported`），行为零变化；conv2d-1
+   M44_TRACE 复扫不再报 `shape_body_not_2_blocks`。
 
-*阶段 2 —— 掩码乘加核心（loop_vectorize apply + 可能 lower）*
-3. 扩展 ArmPlan/B1：单臂 → 多臂。对每个 (kr,kc)：
-   - 向量边界掩码生成：`mask_kc = (c_vec + kc - pad) >= 0 & < N_eff`，
-     与 `rr_ok`（标量 splat）合取。
+*阶段 2 —— analyze 完整支持（前置，进行中）*
+4. **步进指针参数**：Out 指针（`%146`）回边 arg 是 `getelemptr(ptr, 1)`（每轮
+   +1 元素）——现有 `effective` 识别不认它（非 passthrough、非 invariant），
+   导致 conv2d 计算内核 effective=[iv, acc, ptr] 被 `test_at_top_multi_param`
+   拒绝。需新增步进指针参数类（回边 = getelemptr(param, 常量 1)），从
+   effective 排除，apply 时步进改为 VF。
+5. **exit-only 死 passthrough**：`%9`/`%62` 在 body 无 use、仅 exit/latch 转发，
+   但其回边 arg 是 loop-variant（`%9` 回边 `%153 = iv+2`），现有
+   `is_loop_invariant(back_args[i])` 误判为 effective。需识别"参数 body 无 use、
+   仅 exit 引用"的死 passthrough 并排除（或先由 DCE 清理死参数）。
+6. acc 识别（M42 Reducible）+ exit 分类（IvFinal/Acc/Passthrough）在排除上述
+   后应能通过（conv2d exit `while_end_8` 传 iv、acc、%62、%9）。
+
+*阶段 3 —— 掩码乘加核心 + sum_v 累加 + Out store（apply）*
+7. 扩展 ArmPlan/B1：单臂 → 多臂。对每个 (kr,kc)：
+   - 向量边界掩码生成：`mask_kc = (c_vec + kc - 2) >= 0 & < N_eff` 与
+     `rr_ok`（标量 splat）合取。
    - `sum_v += (ldr q In[rr][cc_vec]) * splat(K[kr][kc]) & mask_kc`。
    - K[kr][kc] 是循环外常量（全局 K 数组），splat。
-4. 掩码乘加 lowering：复用现有 `VecMla` + `and`（或新增掩码 mla 变体）。
-   边界比较 lowering：向量 `cmeq/eor` 组合或新增 VecCmp。
-
-*阶段 3 —— sum_v 累加 + Out store*
-5. sum_v 向量累加器（25 次展开，header 参数 re-type）。
-6. `Out[r][c_vec] = sum_v` 连续向量 store（B3 路径扩展 / VecStore）。
-7. 标量尾循环处理（r = trip%4 余数，复用现有 tail）。
+8. sum_v 向量累加器 re-type（header acc slot + 25 个 end block param + branch
+   f_args 链），latch 的 Out store 向量化（连续 store），ptr 步进改 VF。
+9. 掩码乘加 lowering：复用现有 `VecMla` + `and` + 向量比较（VecCmp 已支持
+   Ge/Lt，mvn 反相）。
+10. 尾循环：runtime bound（N_eff）→ 标量 tail（复用现有 `vec_tail` 机制）。
 
 *阶段 4 —— 验证与回归*
-8. `cargo test -p raana_ir`（新增多臂掩码单测）。
-9. `make test functional h_functional ARGS="-O 2"`（152 用例）。
-10. `make test-riscv ARGS="-O 2"`。
-11. perf 静态指令数对比：conv2d-1 计算内核指令数应大幅下降（`scripts/perf_compare.sh`）。
+11. `cargo test -p raana_ir`（新增多臂掩码向量化单测）。
+12. `make test functional h_functional ARGS="-O 2"`（152 用例）。
+13. `make test-riscv ARGS="-O 2"`。
+14. perf 静态指令数对比：conv2d-1 计算内核指令数应大幅下降（`scripts/perf_compare.sh`）。
 
 **涉及文件**：
 - `raana_ir/src/opt/passes/loop_vectorize.rs`（多臂掩码识别 + apply，核心）
@@ -298,8 +317,10 @@ passthrough 线程化进内层）+ Parsimony（uniform/varying 分类：uniform 
 - `anon_armv8/src/sched/dag.rs`（新向量指令的调度内存边，若新增 MInst）
 
 **验收**：
-- conv2d-1 计算内核出 `ldr q ×N + dup v + mla v ×25 + and v ×25 + add v + str q`；
-  `M44_TRACE=1` 复扫该 header 不再报 `shape_body_not_2_blocks`。
+- （阶段 1 已达成）conv2d-1 `M44_TRACE=1` 复扫不再报 `shape_body_not_2_blocks`
+  / `shape_header_multi_inst`，25 单元识别成功。
+- （待阶段 3-4）conv2d-1 计算内核出 `ldr q ×N + dup v + mla v ×25 + and v ×25
+  + add v + str q`。
 - conv2d-1 -O2 语义 PASS；`cargo test -p raana_ir`；`make test ARGS="-O 2"`
   functional + h_functional 无回归；`make test-riscv ARGS="-O 2"` 无回归；
   `scripts/perf_compare.sh` conv2d-1 静态计数显著下降（目标 ≥2 倍）。
@@ -419,6 +440,9 @@ SLP 现成输入；conv2d `init_matrix`/`row_reduce`、01_mm/matmul 内层展开
 ```
 里程碑 1（matmul1 掩码内核，P0，rotated 多参数 B1）——已完成 2026-08-10
   → 里程碑 2（conv2d 计算内核多臂 if 掩码向量化，P0，大工程）——进行中
+     阶段 1 识别+gate+单测 已完成 2026-08-11（a96d8c9）
+     阶段 2 analyze 完整支持（步进指针 + exit-only 死 passthrough）进行中
+     阶段 3-4 apply 向量化核心 + 验证
   → 里程碑 3（标量 min/max ISel，P1，最小，IR 无实例低价值，暂缓）
   → 里程碑 5（内联向量零初始化，P1，最小）——已完成 2026-08-09
   → 里程碑 4（M45 SLP，P1，最大）

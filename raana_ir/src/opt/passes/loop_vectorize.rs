@@ -138,9 +138,14 @@ impl Pass for LoopVectorize {
             let Some(plan) = plan else {
                 break;
             };
-            // Mutation phase.
+            // Mutation phase. A rejection leaves the IR untouched (or
+            // partially rewritten by a later-stage guard) — break instead of
+            // spinning: `find_vectorizable` is deterministic, so re-running
+            // it without an IR change yields the same plan forever.
             if apply_vectorize(data, plan) {
                 changed = true;
+            } else {
+                break;
             }
         }
         changed
@@ -1097,6 +1102,21 @@ fn contains_iv(arena: &ArenaContext<'_>, inst: Inst, iv: Inst) -> bool {
     }
 }
 
+/// A step-pointer header parameter: a pointer whose back-edge argument
+/// advances it by one element (`getelemptr(param, 1)` — the compiler's
+/// row-pointer form of `Out[r][c]` in the conv2d kernel). Excluded from
+/// `effective` (it is neither the IV, an accumulator, nor a passthrough);
+/// the mutation phase advances it by `VF` elements per vector round.
+fn is_step_ptr(arena: &ArenaContext<'_>, back_arg: Inst, param: Inst) -> bool {
+    matches!(
+        arena.inst_data(back_arg).kind(),
+        InstKind::GetElemPtr(g)
+            if g.base() == param
+                && g.offsets().len() == 1
+                && matches!(arena.inst_data(g.offsets()[0]).kind(), InstKind::Integer(i) if i.value() == 1)
+    )
+}
+
 /// A load whose address is a GEP whose *element* offset (the last one; the
 /// outer offsets resolve the pointer/array nesting) has no IV term and is
 /// loop-invariant (a `K[k]`-style element fetch — splatted at vector use).
@@ -1289,12 +1309,30 @@ fn build_multi_arm_plan(
     let last_end = units.last().unwrap().end;
     let acc_final = data.bb_data(last_end).params()[0];
     let acc_init = units[0].acc_in;
+    // The accumulator header slot: the parameter whose back-edge argument
+    // is the final accumulated value (the last unit's `end` parameter).
+    // The header parameter is the compiler's carrier of the final value to
+    // the loop exit (SSA dominance); the body chain seeds from `acc_init`.
+    let acc_slot = {
+        let latch_term = data.layout().basicblock(latch).terminator();
+        let args: &[Inst] = match arena.inst_data(latch_term).kind() {
+            InstKind::Jump(j) => j.args(),
+            _ => return None, // multi-arm requires a test-at-top plain-jump latch
+        };
+        let slot = args.iter().position(|&a| a == acc_final)?;
+        let params = data.bb_data(header).params();
+        if slot >= params.len() {
+            return None;
+        }
+        slot
+    };
+    let acc = data.bb_data(header).params()[acc_slot];
     Some(MultiArmPlan {
         units,
         acc_init,
         acc_final,
-        acc_slot: 0,
-        acc: acc_init,
+        acc_slot,
+        acc,
         acc_entry_arg: acc_init,
     })
 }
@@ -1518,15 +1556,6 @@ fn analyze_loop(
         (false, first)
     };
 
-    // Milestone 2 phase 1: the multi-arm masked-accumulate kernel (conv2d
-    // 5×5) is now *recognized* (the shape gate above accepts it), but the
-    // apply side lands in phase 2. Keep the loop scalar until then
-    // (conservative, 宁漏勿错).
-    if multi_arm.is_some() {
-        trace(data, looop, "multi_arm_apply_unsupported");
-        return None;
-    }
-
     // 4. Header parameters: [iv, t] (elementwise), [iv, acc, t] (B1
     //    reduction), optionally extended with loop-invariant *passthrough*
     //    parameters — outer induction values the back edge forwards
@@ -1684,8 +1713,14 @@ fn analyze_loop(
     let passthrough: Vec<usize> = (0..n_params)
         .filter(|&i| back_args[i] == params[i])
         .collect();
+    // Step-pointer slots: pointer parameters advanced by one element per
+    // iteration (the conv2d kernel's Out row pointer `%146`). Excluded from
+    // `effective` like passthroughs; the mutation phase advances them by VF.
+    let step_ptrs: FxHashSet<usize> = (0..n_params)
+        .filter(|&i| is_step_ptr(arena, back_args[i], params[i]))
+        .collect();
     let counter_slot = n_params - 1;
-    let effective: Vec<usize> = if test_at_top {
+    let effective_initial: Vec<usize> = if test_at_top {
         // No counter parameter yet (materialized in the mutation phase), so
         // nothing is excluded beyond the passthroughs and loop-invariant
         // back-edge arguments (constants / loop-outside values forwarded
@@ -1694,12 +1729,13 @@ fn analyze_loop(
         (0..n_params)
             .filter(|&i| {
                 !passthrough.contains(&i)
+                    && !step_ptrs.contains(&i)
                     && !is_loop_invariant(arena, back_args[i], header, latch)
             })
             .collect()
     } else {
         (0..n_params)
-            .filter(|&i| i != counter_slot && !passthrough.contains(&i))
+            .filter(|&i| i != counter_slot && !passthrough.contains(&i) && !step_ptrs.contains(&i))
             .collect()
     };
     // Test-at-top loops carry exactly one real induction parameter (the
@@ -1707,7 +1743,44 @@ fn analyze_loop(
     // goes through the acc_info matching below — a non-Reducible
     // effective==2 shape is rejected there (`b1_not_reducible` etc.).
     // Rotated loops may also carry the B1 accumulator. More than two
-    // effective parameters stays a rejected shape.
+    // effective parameters is rejected — except that the compiler may emit
+    // *exit-only dead* parameters: a header parameter with no body use that
+    // is merely forwarded to the latch (back edge) and exit (a stale carry
+    // like the kernel's `%9`, whose back-edge argument `iv + 2` is
+    // loop-variant and would otherwise be counted as effective). Such
+    // parameters are dropped; the M42 accumulator (recognized below) is
+    // never exit-only and is protected.
+    let effective: Vec<usize> = if test_at_top && effective_initial.len() > 2 {
+        let red_acc = match &dep.verdict {
+            Verdict::Reducible { accumulator, .. } => Some(*accumulator),
+            _ => None,
+        };
+        // The multi-arm accumulator carrier is a header parameter whose body
+        // chain re-seeds from a constant, so it has no body use — protect it
+        // alongside the M42 accumulator.
+        let multi_acc = multi_arm.as_ref().map(|m| m.acc);
+        let kept: Vec<usize> = effective_initial
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let p = params[i];
+                red_acc == Some(p)
+                    || multi_acc == Some(p)
+                    || data.inst_data(p).used_by().iter().any(|&u| {
+                        data.layout()
+                            .parent_bb(u)
+                            .is_some_and(|bb| bb != header && bb != latch && bb != exit)
+                    })
+            })
+            .collect();
+        if kept.len() > 2 {
+            trace(data, looop, "test_at_top_multi_param");
+            return None;
+        }
+        kept
+    } else {
+        effective_initial
+    };
     if test_at_top && effective.len() > 2 {
         trace(data, looop, "test_at_top_multi_param");
         return None;
@@ -1766,7 +1839,13 @@ fn analyze_loop(
             }
         }
     }
-    let acc_info: Option<(Inst, usize, BinaryOp)> = if let Some(plan) = mod_plan {
+    let acc_info: Option<(Inst, usize, BinaryOp)> = if let Some(multi) = &multi_arm {
+        // Milestone 2: the accumulator chain lives in the body; M42 sees the
+        // loop as `Vectorizable` (the latch back argument is the final block
+        // parameter, not a binary update), so the accumulator is recognized
+        // from the chain's header carrier slot instead.
+        Some((multi.acc, multi.acc_slot, BinaryOp::Add))
+    } else if let Some(plan) = mod_plan {
         Some(plan)
     } else {
         match effective.len() {
@@ -1842,16 +1921,29 @@ fn analyze_loop(
             // `iv' = add(iv, 1)` is its plain-jump argument in the latch.
             // The remaining parameters are loop-invariant passthroughs.
             let iv_slot = match acc_info {
-                Some((_, acc_slot, _)) => {
+                Some((acc_inst, acc_slot, _)) => {
                     let slots: Vec<usize> = effective
                         .iter()
                         .copied()
                         .filter(|&i| i != acc_slot)
                         .collect();
-                    debug_assert_eq!(slots.len(), 1);
+                    // A fixed-point sibling pass (PSR) may have rewritten the
+                    // loop mid-iteration into a shape this analyzer does not
+                    // recognize — reject conservatively instead of indexing
+                    // out of bounds.
+                    if slots.len() != 1 {
+                        trace(data, looop, "multi_iv_slot");
+                        return None;
+                    }
                     slots[0]
                 }
-                None => effective[0],
+                None => {
+                    if effective.len() != 1 {
+                        trace(data, looop, "multi_iv_slot");
+                        return None;
+                    }
+                    effective[0]
+                }
             };
             let iv = params[iv_slot];
             let iv_next = back_args[iv_slot];
@@ -1911,6 +2003,13 @@ fn analyze_loop(
                 // Mod-wrapped: `update = rem(acc + value + C, P)`; the delta
                 // is the element computation (vectorized + addv per round).
                 (update, *value)
+            } else if let Some(multi) = &multi_arm {
+                // Milestone 2: the accumulator chain lives in the body — the
+                // units' `end` block parameters — and the latch back argument
+                // is the final accumulated value, not a binary update. The
+                // mutation phase re-uses the chain directly (no delta).
+                let _ = multi;
+                (update, update)
             } else if let Some(arm_plan) = &arm_plan {
                 // B1 masked register reduction is validated for *rotated*
                 // loops. A test-at-top loop whose latch back-argument is a
@@ -2214,6 +2313,13 @@ fn analyze_loop(
                 && !arm_plan
                     .as_ref()
                     .is_some_and(|a| bb == Some(a.body_br) || bb == Some(a.arm))
+                && !multi_arm.as_ref().is_some_and(|m| {
+                    // The multi-arm kernel's mask bounds and index math are
+                    // computed inside the units' body_br / then blocks.
+                    m.units.iter().any(|u| {
+                        bb == Some(u.body_br) || bb == Some(u.then) || bb == Some(u.end)
+                    })
+                })
             {
                 trace(data, looop, "test_at_top_exit_reads_iv");
                 return None;
@@ -2255,7 +2361,21 @@ fn analyze_loop(
         }
         set
     };
-    let payload: Vec<Inst> = if let Some(arm_plan) = &arm_plan {
+    let payload: Vec<Inst> = if let Some(multi) = &multi_arm {
+        // Milestone 2: the payload lives in every unit's `then` block —
+        // the contiguous In load, the invariant K load, the mul, and the
+        // masked accumulator add. The `end` blocks carry only block
+        // parameters (accumulator chain); the latch holds machinery.
+        let mut insts = Vec::new();
+        for unit in &multi.units {
+            for &inst in data.layout().basicblock(unit.then).insts() {
+                if inst != data.layout().basicblock(unit.then).terminator() {
+                    insts.push(inst);
+                }
+            }
+        }
+        insts
+    } else if let Some(arm_plan) = &arm_plan {
         // B1 single-arm body: the payload lives in body_br (before the
         // branch) and in the arm (before the jump). The latch only holds
         // machinery.
@@ -2579,8 +2699,11 @@ fn analyze_loop(
     // B1: the accumulator delta must be a payload value (vectorized) or a
     // loop-invariant scalar (splatted); then build the reduction plan.
     // Mod-wrapped scalar reductions build no B1 plan (`mod_reduction`
-    // handles the scalar accumulator).
-    let reduction = if mod_params.is_some() {
+    // handles the scalar accumulator). Milestone 2 multi-arm kernels keep
+    // the accumulator chain in the body (see `MultiArmPlan`); the B1
+    // ReductionPlan is left unset and `apply_vectorize` branches on
+    // `multi_arm` instead.
+    let reduction = if mod_params.is_some() || multi_arm.is_some() {
         None
     } else {
         match acc_info {
@@ -3004,6 +3127,18 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         multi_arm,
         unroll,
     } = plan;
+    // Milestone 2 phase 2: the multi-arm masked-accumulate kernel is now
+    // fully *analyzed* (the shape gate and parameter classification above
+    // accept it), but the apply side lands in phase 3. Keep the loop scalar
+    // until then (conservative, 宁漏勿错) — the elementwise apply path does
+    // not understand the body accumulator chain and would corrupt the IR.
+    if multi_arm.is_some() {
+        if std::env::var("M44_TRACE").is_ok() {
+            eprintln!("[M44] func={} header={header:?} reject=multi_arm_apply_unsupported",
+                data.name());
+        }
+        return false;
+    }
     let step: i64 = if unroll { VF * 2 } else { VF };
     let q = trip / step;
     let r = trip % step;

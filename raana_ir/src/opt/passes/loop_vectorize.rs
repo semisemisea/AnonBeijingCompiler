@@ -234,6 +234,11 @@ struct VecPlan {
     /// masked stores, and the merge reaches the latch. The arm's stores
     /// are rewritten with a lane-wise mask so the branch disappears.
     arm: Option<ArmPlan>,
+    /// Milestone 2: a chain of masked multiply-accumulate units (the conv2d
+    /// 5×5 kernel). Mutually exclusive with `arm`. When Some, the payload is
+    /// collected from every unit's `then` block and the accumulator chain is
+    /// re-typed to a vector.
+    multi_arm: Option<MultiArmPlan>,
     /// 2x unroll the vector loop body: duplicate the payload so each array's
     /// two loads/stores are adjacent with a constant continuation GEP
     /// (`getelemptr %addr, 4`), which lowering folds into `[x, #16]` and the
@@ -261,6 +266,70 @@ struct ArmPlan {
     /// (`br cond, arm, merge` — the matmul masked-kernel shape), so the
     /// mask polarity flips (`m = -(cond != 0)` instead of `-(cond == 0)`).
     arm_on_true: bool,
+}
+
+/// One masked multiply-accumulate unit of a multi-arm if body (milestone
+/// 2, the conv2d 5×5 convolution kernel). The unit is
+/// `br mask, then, end(acc)`; `then` computes `acc' = acc + In[rr][cc] * K[k]`
+/// (a contiguous In load, an invariant K load, a mul, an add) and jumps to
+/// `end`, which forwards `acc'` to the next unit. When the mask is false the
+/// accumulator passes through `end` unchanged. The accumulator chain is
+/// carried by block parameters; the final value is stored by the latch.
+struct MultiArmUnit {
+    /// The block ending in `br mask, then, end(acc_in)`.
+    body_br: BasicBlock,
+    /// The block computing the multiply-accumulate (`jump end(acc_out)`).
+    then: BasicBlock,
+    /// The block forwarding the accumulator (`jump next`).
+    end: BasicBlock,
+    /// The branch's mask condition (a scalar bound test on `cc = iv + kc_off`
+    /// conjoined with an optional row-bound invariant).
+    mask_cond: Inst,
+    /// The accumulator entering this unit (constant `acc_init` for unit 0,
+    /// else the previous unit's `end` block parameter).
+    acc_in: Inst,
+    /// `load In[rr][cc]` (contiguous — vectorized to a `<4 x T>` load).
+    load_in: Inst,
+    /// `load K[k]` (loop-invariant — splatted at use).
+    load_k: Inst,
+    /// `mul(load_in, load_k)`.
+    mul: Inst,
+    /// `add(acc_in, mul)` — the masked accumulator update.
+    add: Inst,
+    /// The value jumped into `end` (`acc_out = add`).
+    acc_out: Inst,
+    /// The contiguous access column `cc = iv + kc_off`.
+    cc: Inst,
+    /// The constant offset of `cc` from the IV (`kc - 2` for the kernel).
+    kc_off: i64,
+    /// The row-bound invariant scalar (`rr_ok`, 0/1), None when the mask
+    /// has no row term.
+    rr_ok: Option<Inst>,
+    /// The upper bound on `cc` (loop-invariant), e.g. `N_eff`.
+    bound: Inst,
+}
+
+/// Milestone 2: a chain of masked multiply-accumulate units forming a
+/// multi-arm if body. All units share one accumulator chain seeded from
+/// `acc_init` (a constant 0) and ending in `acc_final` (the last unit's
+/// `end` block parameter), which the latch stores and forwards as the
+/// header accumulator slot's back-edge argument. The slot is re-typed to a
+/// vector and horizontally reduced at the loop exit (like a B1 reduction).
+struct MultiArmPlan {
+    /// Units in program order.
+    units: Vec<MultiArmUnit>,
+    /// The first unit's incoming accumulator (a compile-time 0).
+    acc_init: Inst,
+    /// The final accumulator value (the last unit's `end` block parameter).
+    acc_final: Inst,
+    /// Header parameter slot carrying the accumulator to the exit.
+    acc_slot: usize,
+    /// The header accumulator parameter itself.
+    acc: Inst,
+    /// The entry edge's argument for `acc_slot` (re-typed to a vector in
+    /// place; the body chain seeds from `acc_init`, so the initial lanes
+    /// are irrelevant, but the slot must stay type-consistent).
+    acc_entry_arg: Inst,
 }
 
 /// B1: a register accumulator recognized by M42 (`Reducible`) on a 3-param
@@ -348,7 +417,11 @@ enum ExitArgSpec {
 fn trace(data: &FunctionData, looop: &Loop, reason: &str) {
     if std::env::var("M44_TRACE").is_ok() {
         let name = data.name();
-        eprintln!("[M44] func={name} header={:?} reject={reason}", looop.header());
+        eprintln!(
+            "[M44] func={name} header={:?} hdr_name={} reject={reason}",
+            looop.header(),
+            data.bb_data(looop.header()).name()
+        );
     }
 }
 
@@ -736,7 +809,6 @@ fn fuse_block_into_succ(
             s_subst.insert(p, v);
         }
     }
-
     // Remap every user of the removed parameters — `b`'s own instructions,
     // `s`'s instructions, and any later block that `b` dominated (its
     // params dominated them through the chain). `b`'s terminator is
@@ -796,6 +868,435 @@ fn fuse_block_into_succ(
     rewriter.apply(data);
     data.curr_func_data_mut().remove_layout_basicblock(b);
     true
+}
+
+/// If `inst` is the IV plus a compile-time constant (coefficient +1),
+/// return the constant. Recurses through `add`/`sub` chains, so conv2d's
+/// `cc = sub(add(iv, k), 2)` decomposes to `-2`. Any non-unit coefficient
+/// (`mul iv, k`), a `const - iv` term, or a non-IV leaf yields `None`.
+fn iv_offset(arena: &ArenaContext<'_>, inst: Inst, iv: Inst) -> Option<i64> {
+    if inst == iv {
+        return Some(0);
+    }
+    match arena.inst_data(inst).kind() {
+        InstKind::Integer(i) => Some(i.value() as i64),
+        InstKind::Binary(b) => {
+            let (lo, ro) = (iv_offset(arena, b.lhs(), iv), iv_offset(arena, b.rhs(), iv));
+            match (b.op(), lo, ro) {
+                (BinaryOp::Add, Some(l), Some(r)) => Some(l + r),
+                (BinaryOp::Sub, Some(l), Some(r)) => Some(l - r),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Split a conjunction tree into its leaf instructions.
+fn collect_and_leaves(arena: &ArenaContext<'_>, inst: Inst, out: &mut Vec<Inst>) {
+    if let InstKind::Binary(b) = arena.inst_data(inst).kind() {
+        if b.op() == BinaryOp::And {
+            collect_and_leaves(arena, b.lhs(), out);
+            collect_and_leaves(arena, b.rhs(), out);
+            return;
+        }
+    }
+    out.push(inst);
+}
+
+/// The mask's deconstructed bound test on the contiguous column `cc`.
+struct MaskDecomp {
+    /// `cc = iv + kc_off` (the access column).
+    cc: Inst,
+    /// Constant offset of `cc` from the IV.
+    kc_off: i64,
+    /// The upper bound (`cc < bound`), loop-invariant.
+    bound: Inst,
+    /// The optional row-bound invariant scalar (0/1), None when absent.
+    rr_ok: Option<Inst>,
+}
+
+/// Match an upper-bound leaf `lt(cc, bound)` / `gt(bound, cc)` (le/ge with
+/// swapped polarity are rejected: the canonical kernel uses strict tests).
+fn match_bound_test(arena: &ArenaContext<'_>, leaf: Inst, iv: Inst) -> Option<(Inst, Inst)> {
+    let InstKind::Binary(b) = arena.inst_data(leaf).kind() else {
+        return None;
+    };
+    let (cc, bound) = match b.op() {
+        BinaryOp::Lt if iv_offset(arena, b.lhs(), iv).is_some() => (b.lhs(), b.rhs()),
+        BinaryOp::Gt if iv_offset(arena, b.rhs(), iv).is_some() => (b.rhs(), b.lhs()),
+        _ => return None,
+    };
+    Some((cc, bound))
+}
+
+/// Match a lower-bound leaf on `cc`: `neq(and(rr_ok, ge(cc, 0)), 0)` — the
+/// row-bound invariant conjoined with `cc >= 0` (or `gt(cc, -1)`), normalized
+/// through `neq(_, 0)`. Returns `(cc, rr_ok)`; `rr_ok` is None when the lower
+/// test is a bare `ge(cc, 0)`.
+fn match_lower_test(
+    arena: &ArenaContext<'_>,
+    data: &FunctionData,
+    leaf: Inst,
+    iv: Inst,
+    header: BasicBlock,
+    latch: BasicBlock,
+) -> Option<(Inst, Option<Inst>)> {
+    // `neq(and(rr_ok, ge(cc, 0)), 0)`: peel the neq normalization.
+    let inner = if let InstKind::Binary(b) = arena.inst_data(leaf).kind() {
+        if b.op() == BinaryOp::NotEq {
+            b.lhs()
+        } else {
+            leaf
+        }
+    } else {
+        leaf
+    };
+    if let InstKind::Binary(b) = arena.inst_data(inner).kind() {
+        if b.op() == BinaryOp::And {
+            // One conjunct is the row invariant, the other `ge(cc, 0)`.
+            let (l, r) = (b.lhs(), b.rhs());
+            let ge_l = match_ge_zero(arena, l, iv);
+            let ge_r = match_ge_zero(arena, r, iv);
+            if let Some(cc) = ge_l {
+                if is_loop_invariant(arena, r, header, latch) {
+                    return Some((cc, Some(r)));
+                }
+            }
+            if let Some(cc) = ge_r {
+                if is_loop_invariant(arena, l, header, latch) {
+                    return Some((cc, Some(l)));
+                }
+            }
+            return None;
+        }
+    }
+    // Bare `ge(cc, 0)` / `gt(cc, -1)`.
+    match_ge_zero(arena, inner, iv).map(|cc| (cc, None))
+}
+
+/// `ge(cc, 0)` or `gt(cc, -1)` (the canonical non-negative column test).
+fn match_ge_zero(arena: &ArenaContext<'_>, inst: Inst, iv: Inst) -> Option<Inst> {
+    let InstKind::Binary(b) = arena.inst_data(inst).kind() else {
+        return None;
+    };
+    let (cc, bound) = match b.op() {
+        BinaryOp::Ge if iv_offset(arena, b.lhs(), iv).is_some() => (b.lhs(), b.rhs()),
+        BinaryOp::Gt if iv_offset(arena, b.rhs(), iv).is_some() => (b.rhs(), b.lhs()),
+        _ => return None,
+    };
+    if !matches!(arena.inst_data(bound).kind(), InstKind::Integer(i) if i.value() == 0) {
+        return None;
+    }
+    Some(cc)
+}
+
+/// Deconstruct a unit's scalar mask into its bound tests on `cc`. The mask is
+/// the conjunction of an upper test `cc < bound` and a lower test
+/// `neq(and(rr_ok, ge(cc, 0)), 0)` (rr_ok optional). Both leaves must test the
+/// same `cc` column and decompose to the same IV offset.
+fn deconstruct_mask(
+    arena: &ArenaContext<'_>,
+    data: &FunctionData,
+    mask_cond: Inst,
+    iv: Inst,
+    header: BasicBlock,
+    latch: BasicBlock,
+) -> Option<MaskDecomp> {
+    let mut leaves = Vec::new();
+    collect_and_leaves(arena, mask_cond, &mut leaves);
+    if leaves.is_empty() {
+        return None;
+    }
+    let mut cc: Option<Inst> = None;
+    let mut kc_off: Option<i64> = None;
+    let mut bound: Option<Inst> = None;
+    let mut rr_ok: Option<Inst> = None;
+    for &leaf in &leaves {
+        if let Some((c, b)) = match_bound_test(arena, leaf, iv) {
+            if cc.is_some() && cc != Some(c) {
+                return None;
+            }
+            cc = Some(c);
+            kc_off = Some(iv_offset(arena, c, iv)?);
+            if bound.is_some() && bound != Some(b) {
+                return None;
+            }
+            bound = Some(b);
+            continue;
+        }
+        if let Some((c, rok)) = match_lower_test(arena, data, leaf, iv, header, latch) {
+            if cc.is_some() && cc != Some(c) {
+                return None;
+            }
+            cc = Some(c);
+            kc_off = Some(iv_offset(arena, c, iv)?);
+            if rok.is_some() {
+                if rr_ok.is_some() && rr_ok != rok {
+                    return None;
+                }
+                rr_ok = rok;
+            }
+            continue;
+        }
+        return None;
+    }
+    let cc = cc?;
+    if !contains_iv(arena, cc, iv) {
+        return None;
+    }
+    Some(MaskDecomp {
+        cc,
+        kc_off: kc_off?,
+        bound: bound?,
+        rr_ok,
+    })
+}
+
+/// Find the IV term inside a contiguous access offset: the offset is
+/// `invariant + (iv + kc_off)` (or directly `iv + const`). Returns the `cc`
+/// instruction and its offset from the IV.
+fn find_iv_term(
+    arena: &ArenaContext<'_>,
+    data: &FunctionData,
+    offset: Inst,
+    iv: Inst,
+    header: BasicBlock,
+    latch: BasicBlock,
+) -> Option<(Inst, i64)> {
+    if let Some(off) = iv_offset(arena, offset, iv) {
+        return Some((offset, off));
+    }
+    if let InstKind::Binary(b) = arena.inst_data(offset).kind() {
+        if b.op() == BinaryOp::Add {
+            if let Some(off) = iv_offset(arena, b.lhs(), iv) {
+                if is_loop_invariant(arena, b.rhs(), header, latch) {
+                    return Some((b.lhs(), off));
+                }
+            }
+            if let Some(off) = iv_offset(arena, b.rhs(), iv) {
+                if is_loop_invariant(arena, b.lhs(), header, latch) {
+                    return Some((b.rhs(), off));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether `inst` references the IV (anywhere in an add/sub chain). A bare
+/// constant or loop-invariant expression is *not* an IV term — `iv_offset`
+/// alone cannot distinguish `iv + 0` from a constant `0` (both yield 0).
+fn contains_iv(arena: &ArenaContext<'_>, inst: Inst, iv: Inst) -> bool {
+    if inst == iv {
+        return true;
+    }
+    match arena.inst_data(inst).kind() {
+        InstKind::Binary(b) => contains_iv(arena, b.lhs(), iv) || contains_iv(arena, b.rhs(), iv),
+        _ => false,
+    }
+}
+
+/// A load whose address is a GEP whose *element* offset (the last one; the
+/// outer offsets resolve the pointer/array nesting) has no IV term and is
+/// loop-invariant (a `K[k]`-style element fetch — splatted at vector use).
+fn is_invariant_load(
+    arena: &ArenaContext<'_>,
+    data: &FunctionData,
+    load: Inst,
+    iv: Inst,
+    header: BasicBlock,
+    latch: BasicBlock,
+) -> bool {
+    let InstKind::Load(l) = arena.inst_data(load).kind() else {
+        return false;
+    };
+    let InstKind::GetElemPtr(gep) = arena.inst_data(l.src()).kind() else {
+        return false;
+    };
+    let Some(&elem_off) = gep.offsets().last() else {
+        return false;
+    };
+    !contains_iv(arena, elem_off, iv)
+        && is_loop_invariant(arena, elem_off, header, latch)
+}
+
+/// A contiguous In load: a GEP whose element offset (the last one) carries
+/// the IV term (`invariant + iv + kc_off`). Returns the `cc` instruction.
+fn is_contiguous_iv_load(
+    arena: &ArenaContext<'_>,
+    data: &FunctionData,
+    load: Inst,
+    iv: Inst,
+    header: BasicBlock,
+    latch: BasicBlock,
+) -> Option<Inst> {
+    let InstKind::Load(l) = arena.inst_data(load).kind() else {
+        return None;
+    };
+    let InstKind::GetElemPtr(gep) = arena.inst_data(l.src()).kind() else {
+        return None;
+    };
+    let &elem_off = gep.offsets().last()?;
+    if !contains_iv(arena, elem_off, iv) {
+        return None;
+    }
+    let (cc, _) = find_iv_term(arena, data, elem_off, iv, header, latch)?;
+    Some(cc)
+}
+
+/// Build the multi-arm masked-accumulate plan for a test-at-top loop whose
+/// body is a chain of `br mask, then, end(acc)` units (the conv2d 5×5
+/// kernel). Returns None when any structural check fails (conservative).
+fn build_multi_arm_plan(
+    arena: &ArenaContext<'_>,
+    data: &FunctionData,
+    looop: &Loop,
+    header: BasicBlock,
+    latch: BasicBlock,
+) -> Option<MultiArmPlan> {
+    // Rotated multi-arm deferred (the conv2d kernel is test-at-top). The
+    // IV is header slot 0 (the pass-wide convention) and the test-at-top
+    // header is exactly `[lt, br]` ending in a branch.
+    let header_term = data.layout().basicblock(header).terminator();
+    let InstKind::Branch(hb) = arena.inst_data(header_term).kind() else {
+        return None;
+    };
+    let iv = data.bb_data(header).params()[0];
+    let mut units = Vec::new();
+    let mut cur = hb.t_target();
+    let mut prev_end_param: Option<Inst> = None;
+    while looop.contains(cur) && cur != latch {
+        let body_br = cur;
+        let term = data.layout().basicblock(body_br).terminator();
+        let InstKind::Branch(branch) = arena.inst_data(term).kind() else {
+            return None;
+        };
+        let then = branch.t_target();
+        let end = branch.f_target();
+        if !looop.contains(then) || !looop.contains(end) {
+            return None;
+        }
+        // `then`: single-exit `jump end(...)` holding the multiply-accumulate.
+        let then_term = data.layout().basicblock(then).terminator();
+        let InstKind::Jump(tjump) = arena.inst_data(then_term).kind() else {
+            return None;
+        };
+        if tjump.target() != end {
+            return None;
+        }
+        // `end`: single-exit `jump next` (the next unit's body_br or the latch).
+        let end_term = data.layout().basicblock(end).terminator();
+        let InstKind::Jump(ejump) = arena.inst_data(end_term).kind() else {
+            return None;
+        };
+        let next = ejump.target();
+        if !looop.contains(next) && next != latch {
+            return None;
+        }
+        // The accumulator enters this unit through the branch's false edge
+        // (`br mask, then, end(acc_in)`): a constant for unit 0, the previous
+        // unit's `end` parameter afterwards.
+        if branch.f_args().len() != 1 {
+            return None;
+        }
+        let acc_in = branch.f_args()[0];
+        if units.is_empty() {
+            if !matches!(arena.inst_data(acc_in).kind(), InstKind::Integer(_)) {
+                return None;
+            }
+        } else if prev_end_param != Some(acc_in) {
+            return None;
+        }
+        // `then` body: `acc_out = add(acc_in, mul(load_in, load_k)); jump end`.
+        if tjump.args().len() != 1 {
+            return None;
+        }
+        let add = tjump.args()[0];
+        let InstKind::Binary(add_b) = arena.inst_data(add).kind() else {
+            return None;
+        };
+        if add_b.op() != BinaryOp::Add {
+            return None;
+        }
+        let (acc_op, mul_candidate) = if add_b.lhs() == acc_in {
+            (add_b.lhs(), add_b.rhs())
+        } else if add_b.rhs() == acc_in {
+            (add_b.rhs(), add_b.lhs())
+        } else {
+            return None;
+        };
+        debug_assert_eq!(acc_op, acc_in);
+        let InstKind::Binary(mul_b) = arena.inst_data(mul_candidate).kind() else {
+            return None;
+        };
+        if mul_b.op() != BinaryOp::Mul {
+            return None;
+        }
+        let (load_in, load_k) = match (
+            is_contiguous_iv_load(arena, data, mul_b.lhs(), iv, header, latch),
+            is_contiguous_iv_load(arena, data, mul_b.rhs(), iv, header, latch),
+        ) {
+            (Some(_), None) => (mul_b.lhs(), mul_b.rhs()),
+            (None, Some(_)) => (mul_b.rhs(), mul_b.lhs()),
+            _ => return None,
+        };
+        if !is_invariant_load(arena, data, load_k, iv, header, latch) {
+            return None;
+        }
+        // The mask deconstructs to the same `cc` column the In load uses
+        // (same instruction and same offset from the IV).
+        let decomp = match deconstruct_mask(arena, data, branch.cond(), iv, header, latch) {
+            Some(d) => d,
+            None => {
+                return None;
+            }
+        };
+        let load_cc = match is_contiguous_iv_load(arena, data, load_in, iv, header, latch) {
+            Some(c) => c,
+            None => {
+                return None;
+            }
+        };
+        // The In offset is `invariant + (iv + kc_off)`, so the load and the
+        // mask agree when their IV offsets match (not instruction identity —
+        // an integer row offset may fold into the iv term).
+        if iv_offset(arena, load_cc, iv)? != decomp.kc_off {
+            return None;
+        }
+        units.push(MultiArmUnit {
+            body_br,
+            then,
+            end,
+            mask_cond: branch.cond(),
+            acc_in,
+            load_in,
+            load_k,
+            mul: mul_candidate,
+            add,
+            acc_out: add,
+            cc: decomp.cc,
+            kc_off: decomp.kc_off,
+            rr_ok: decomp.rr_ok,
+            bound: decomp.bound,
+        });
+        prev_end_param = Some(data.bb_data(end).params()[0]);
+        cur = next;
+    }
+    if cur != latch || units.is_empty() {
+        return None;
+    }
+    let last_end = units.last().unwrap().end;
+    let acc_final = data.bb_data(last_end).params()[0];
+    let acc_init = units[0].acc_in;
+    Some(MultiArmPlan {
+        units,
+        acc_init,
+        acc_final,
+        acc_slot: 0,
+        acc: acc_init,
+        acc_entry_arg: acc_init,
+    })
 }
 
 fn analyze_loop(
@@ -870,7 +1371,15 @@ fn analyze_loop(
     // (`jump merge`) on the false edge (conservative). The arm's stores
     // are mask-rewritten so the branch disappears.
     let mut arm_plan = None;
+    let mut multi_arm = None;
     if looop.body().len() != 2 {
+        // Milestone 2: a chain of masked multiply-accumulate units (the
+        // conv2d 5×5 kernel). Tried before the single-arm scan because a
+        // multi-arm body also satisfies the single-arm shape for some
+        // interior unit (whose body_br then mismatches the header's
+        // direct target, failing the test-at-top header check below).
+        multi_arm = build_multi_arm_plan(arena, data, looop, header, latch);
+        if multi_arm.is_none() {
         for &bb in looop.body() {
             if bb == header || bb == latch {
                 continue;
@@ -921,9 +1430,10 @@ fn analyze_loop(
                 }
             }
         }
-        if arm_plan.is_none() {
+        if arm_plan.is_none() && multi_arm.is_none() {
             trace(data, looop, "shape_body_not_2_blocks");
             return None;
+        }
         }
     }
     let header_insts = data.layout().basicblock(header).insts();
@@ -973,6 +1483,9 @@ fn analyze_loop(
             && !arm_plan
                 .as_ref()
                 .is_some_and(|a| branch.t_target() == a.body_br)
+            && !multi_arm
+                .as_ref()
+                .is_some_and(|m| branch.t_target() == m.units[0].body_br)
         {
             trace(data, looop, "shape_header_multi_inst");
             return None;
@@ -1004,6 +1517,15 @@ fn analyze_loop(
         // a header parameter).
         (false, first)
     };
+
+    // Milestone 2 phase 1: the multi-arm masked-accumulate kernel (conv2d
+    // 5×5) is now *recognized* (the shape gate above accepts it), but the
+    // apply side lands in phase 2. Keep the loop scalar until then
+    // (conservative, 宁漏勿错).
+    if multi_arm.is_some() {
+        trace(data, looop, "multi_arm_apply_unsupported");
+        return None;
+    }
 
     // 4. Header parameters: [iv, t] (elementwise), [iv, acc, t] (B1
     //    reduction), optionally extended with loop-invariant *passthrough*
@@ -2179,6 +2701,7 @@ fn analyze_loop(
         exit_specs,
         test_at_top,
         arm: arm_plan,
+        multi_arm,
         unroll,
     })
 }
@@ -2478,6 +3001,7 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         exit_specs,
         test_at_top,
         arm,
+        multi_arm,
         unroll,
     } = plan;
     let step: i64 = if unroll { VF * 2 } else { VF };
@@ -7705,6 +8229,190 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Milestone 2: a synthetic 5-point convolution kernel. A test-at-top
+    /// loop whose body is a chain of 5 masked multiply-accumulate units
+    /// (`br mask, then, end(acc)`; `then: acc += In[row][cc] * K[k]`) —
+    /// the conv2d 5×5 shape with a single row. `cc = iv + k - 2` with the
+    /// mask `(cc >= 0) & (cc < bound)`. Returns (function, header).
+    fn build_multi_arm_kernel(program: &mut Program) -> (Function, BasicBlock) {
+        let i32 = Type::get_i32();
+        let in_arr = Type::get_array(i32.clone(), 64);
+        let k_arr = Type::get_array(i32.clone(), 5);
+        let inp = {
+            let init = program.new_value().zero_init(in_arr);
+            program.new_value().global_alloc(init)
+        };
+        let k = {
+            let init = program.new_value().zero_init(k_arr);
+            program.new_value().global_alloc(init)
+        };
+        let function = program.new_function(Type::get_unit(), "multi_arm_kernel".into(), vec![]);
+        let mut data = ArenaContextMut {
+            program: &mut *program,
+            curr_func: Some(function),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone()]);
+        let n_units = 5;
+        let mut body_brs = Vec::new();
+        let mut thens = Vec::new();
+        let mut ends = Vec::new();
+        for i in 0..n_units {
+            let body = data
+                .new_basic_block()
+                .basic_block(format!("body_br{i}").into(), vec![]);
+            let then = data
+                .new_basic_block()
+                .basic_block(format!("then{i}").into(), vec![]);
+            let end = data
+                .new_basic_block()
+                .basic_block(format!("end{i}").into(), vec![i32.clone()]);
+            body_brs.push(body);
+            thens.push(then);
+            ends.push(end);
+        }
+        let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for bb in std::iter::once(header)
+            .chain(body_brs.iter().copied())
+            .chain(thens.iter().copied())
+            .chain(ends.iter().copied())
+            .chain([latch, exit])
+        {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let bound = data.new_local_inst().integer(64);
+        let two = data.new_local_inst().integer(2);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero]);
+        for inst in [zero, bound, two, entry_jump] {
+            data.layout_mut().insert_inst(entry, inst);
+        }
+        let iv = data.bb_data(header).params()[0];
+        let header_cond = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
+        let header_br = data.new_local_inst().branch(header_cond, body_brs[0], vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, header_cond);
+        data.layout_mut().insert_inst(header, header_br);
+        // The shared row offset (loop-invariant).
+        let row_off = data.new_local_inst().integer(0);
+        data.layout_mut().insert_inst(thens[0], row_off);
+        let mut prev_end_param: Option<Inst> = None;
+        for i in 0..n_units {
+            let body = body_brs[i];
+            let then = thens[i];
+            let end = ends[i];
+            let i_const = data.new_local_inst().integer(i as i32);
+            let k_idx = data.new_local_inst().integer(i as i32);
+            let mut lb = LocalBuilder {
+                arena: &mut data as &mut dyn Arena,
+            };
+            // mask = (cc >= 0) & (cc < bound), cc = sub(add(iv, i), 2).
+            let iv_plus = lb.binary(BinaryOp::Add, iv, i_const);
+            let cc = lb.binary(BinaryOp::Sub, iv_plus, two);
+            let ge0 = lb.binary(BinaryOp::Ge, cc, zero);
+            let lt_b = lb.binary(BinaryOp::Lt, cc, bound);
+            let mask = lb.binary(BinaryOp::And, ge0, lt_b);
+            let acc_in = prev_end_param.unwrap_or(zero);
+            let br = lb.branch(mask, then, vec![], end, vec![acc_in]);
+            // then: off = add(row_off, cc); ld_in = load In[off]; ld_k = load K[i];
+            // mul = mul(ld_in, ld_k); acc' = add(acc_in, mul); jump end(acc').
+            let off = lb.binary(BinaryOp::Add, row_off, cc);
+            let gep_in = lb.get_elem_ptr(inp, vec![zero, off]);
+            let ld_in = lb.load(gep_in);
+            let gep_k = lb.get_elem_ptr(k, vec![zero, k_idx]);
+            let ld_k = lb.load(gep_k);
+            let mul = lb.binary(BinaryOp::Mul, ld_in, ld_k);
+            let acc_new = lb.binary(BinaryOp::Add, acc_in, mul);
+            let jmp = lb.jump(end, vec![acc_new]);
+            drop(lb);
+            for inst in [i_const, iv_plus, cc, ge0, lt_b, mask, br] {
+                data.layout_mut().insert_inst(body, inst);
+            }
+            for inst in [k_idx, off, gep_in, ld_in, gep_k, ld_k, mul, acc_new, jmp] {
+                data.layout_mut().insert_inst(then, inst);
+            }
+            // end: jump next (the next body_br, or the latch for the last).
+            let end_jump = if i + 1 < n_units {
+                data.new_local_inst().jump(body_brs[i + 1], vec![])
+            } else {
+                data.new_local_inst().jump(latch, vec![])
+            };
+            data.layout_mut().insert_inst(end, end_jump);
+            prev_end_param = Some(data.bb_data(end).params()[0]);
+        }
+        // latch: store acc to a synthetic Out slot, then back-branch.
+        let mut lb = LocalBuilder {
+            arena: &mut data as &mut dyn Arena,
+        };
+        let out_gep = lb.get_elem_ptr(inp, vec![zero, iv]);
+        let store = lb.store(prev_end_param.unwrap(), out_gep);
+        let one_const = lb.integer(1);
+        let iv_next = lb.binary(BinaryOp::Add, iv, one_const);
+        let back = lb.jump(header, vec![iv_next, prev_end_param.unwrap()]);
+        drop(lb);
+        for inst in [out_gep, store, one_const, iv_next, back] {
+            data.layout_mut().insert_inst(latch, inst);
+        }
+        let exit_ret = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, exit_ret);
+        (function, header)
+    }
+
+    #[test]
+    fn recognizes_multi_arm_masked_kernel() {
+        // Milestone 2 phase 1: the 5-unit masked multiply-accumulate chain
+        // (conv2d kernel shape) must be recognized, with each unit's cc
+        // offset (`iv + k - 2`), bound, and accumulator chain collected.
+        let mut program = Program::new();
+        let (function, header) = build_multi_arm_kernel(&mut program);
+        let data = program.func_data(function);
+        let (_, _, loops) = LoopAnalysis::new(data);
+        let looop = loops
+            .loops()
+            .iter()
+            .find(|l| l.header() == header)
+            .expect("the kernel loop is analyzed");
+        let latch = looop.latches()[0];
+        let arena = ArenaContext {
+            program: &program,
+            curr_func: Some(function),
+        };
+        let plan = build_multi_arm_plan(&arena, data, looop, header, latch);
+        let plan = plan.expect("the multi-arm kernel must be recognized");
+        assert_eq!(plan.units.len(), 5, "all 5 units are recognized in order");
+        for (i, unit) in plan.units.iter().enumerate() {
+            // cc = iv + (i - 2).
+            assert_eq!(unit.kc_off, i as i64 - 2, "unit {i} cc offset");
+            // The mask's bound is the loop-invariant 64.
+            assert!(matches!(
+                arena.inst_data(unit.bound).kind(),
+                InstKind::Integer(b) if b.value() == 64
+            ));
+            // Unit 0 seeds the accumulator from a constant; later units take
+            // the previous unit's end parameter.
+            if i == 0 {
+                assert!(matches!(
+                    arena.inst_data(unit.acc_in).kind(),
+                    InstKind::Integer(_)
+                ));
+            } else {
+                assert_eq!(
+                    unit.acc_in,
+                    data.bb_data(plan.units[i - 1].end).params()[0],
+                    "unit {i} accumulator chains from the previous end"
+                );
+            }
+            let InstKind::Binary(mul_b) = arena.inst_data(unit.mul).kind() else {
+                panic!("unit {i} mul is a binary Mul");
+            };
+            assert_eq!(mul_b.op(), BinaryOp::Mul, "unit {i} mul op");
+            assert_eq!(mul_b.rhs(), unit.load_k, "unit {i} K load feeds the mul");
+            assert_eq!(mul_b.lhs(), unit.load_in, "unit {i} In load feeds the mul");
         }
     }
 

@@ -28,7 +28,7 @@ use crate::{
     instructions::{
         AMode, AluOp, CCmpStep, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift, MInst,
         MemoryType, SelectCmp, SelectValue, ShiftOp, VecArithOp, VecBitOp, VecCmpOp, VecCvtOp,
-        VecMinMaxOp, VecShape,
+        VecMinMaxOp, VecShape, invert_cond,
     },
     labels::Label,
     regs::{self, OperandSize, RegOrZr},
@@ -1991,8 +1991,7 @@ fn emit_and_comparison_tree(
         &mut comparisons,
         &mut edges,
         &mut visited,
-    )
-        || comparisons.len() < 3
+    ) || comparisons.len() < 3
         || comparisons.len() > 8
         || !ctx.sink_pure_single_use_tree(&edges, branch)
     {
@@ -2157,25 +2156,6 @@ fn is_comparison(op: BinaryOp) -> bool {
     )
 }
 
-fn invert_cond(cond: Cond) -> Cond {
-    match cond {
-        Cond::Eq => Cond::Ne,
-        Cond::Ne => Cond::Eq,
-        Cond::Hs => Cond::Lo,
-        Cond::Lo => Cond::Hs,
-        Cond::Mi => Cond::Pl,
-        Cond::Pl => Cond::Mi,
-        Cond::Vs => Cond::Vc,
-        Cond::Vc => Cond::Vs,
-        Cond::Hi => Cond::Ls,
-        Cond::Ls => Cond::Hi,
-        Cond::Ge => Cond::Lt,
-        Cond::Lt => Cond::Ge,
-        Cond::Gt => Cond::Le,
-        Cond::Le => Cond::Gt,
-    }
-}
-
 fn invert_float_comparison_cond(op: BinaryOp) -> Cond {
     match op {
         BinaryOp::Eq => Cond::Ne,
@@ -2318,22 +2298,22 @@ fn lower_signed_div_rem_magic(
     let size = OperandSize::Size32;
 
     let divisor_value = i64::from(divisor as u32);
-    let multiplier =
-        match ctx.loop_const_to_reg(i64::from(magic.multiplier as u32), divisor_value) {
+    let multiplier = match ctx.loop_const_to_reg(i64::from(magic.multiplier as u32), divisor_value)
+    {
+        Some(reg) => reg,
+        None => match ctx.const_to_reg(i64::from(magic.multiplier as u32), divisor_value) {
             Some(reg) => reg,
-            None => match ctx.const_to_reg(i64::from(magic.multiplier as u32), divisor_value) {
-                Some(reg) => reg,
-                None => {
-                    let reg = ctx.alloc_tmp(HirType::get_i32());
-                    ctx.emit(MInst::LoadImm {
-                        size,
-                        dst: Writable::from_reg(reg),
-                        value: u64::from(magic.multiplier as u32),
-                    });
-                    reg
-                }
-            },
-        };
+            None => {
+                let reg = ctx.alloc_tmp(HirType::get_i32());
+                ctx.emit(MInst::LoadImm {
+                    size,
+                    dst: Writable::from_reg(reg),
+                    value: u64::from(magic.multiplier as u32),
+                });
+                reg
+            }
+        },
+    };
     let product = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
     ctx.emit(MInst::SMulL {
         dst: Writable::from_reg(product),
@@ -2407,22 +2387,21 @@ fn lower_signed_div_rem_magic(
     });
 
     if op == BinaryOp::Rem {
-        let divisor_reg =
-            match ctx.loop_const_to_reg(divisor_value, divisor_value) {
+        let divisor_reg = match ctx.loop_const_to_reg(divisor_value, divisor_value) {
+            Some(reg) => reg,
+            None => match ctx.const_to_reg(divisor_value, divisor_value) {
                 Some(reg) => reg,
-                None => match ctx.const_to_reg(divisor_value, divisor_value) {
-                    Some(reg) => reg,
-                    None => {
-                        let reg = ctx.alloc_tmp(HirType::get_i32());
-                        ctx.emit(MInst::LoadImm {
-                            size,
-                            dst: Writable::from_reg(reg),
-                            value: u64::from(divisor as u32),
-                        });
-                        reg
-                    }
-                },
-            };
+                None => {
+                    let reg = ctx.alloc_tmp(HirType::get_i32());
+                    ctx.emit(MInst::LoadImm {
+                        size,
+                        dst: Writable::from_reg(reg),
+                        value: u64::from(divisor as u32),
+                    });
+                    reg
+                }
+            },
+        };
         ctx.emit(MInst::MSub {
             size,
             dst,
@@ -3373,13 +3352,9 @@ mod tests {
         let second = data.new_local_inst().binary(BinaryOp::Ge, p[2], p[3]);
         let pair = data.new_local_inst().binary(BinaryOp::And, first, second);
         let zero = data.new_local_inst().integer(0);
-        let wrapped = data
-            .new_local_inst()
-            .binary(BinaryOp::NotEq, pair, zero);
+        let wrapped = data.new_local_inst().binary(BinaryOp::NotEq, pair, zero);
         let third = data.new_local_inst().binary(BinaryOp::NotEq, p[4], p[5]);
-        let condition = data
-            .new_local_inst()
-            .binary(BinaryOp::And, wrapped, third);
+        let condition = data.new_local_inst().binary(BinaryOp::And, wrapped, third);
         let branch = data
             .new_local_inst()
             .branch(condition, yes, vec![], no, vec![]);
@@ -4007,7 +3982,9 @@ mod tests {
         );
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
-        let tail = data.new_basic_block().basic_block("tail".to_owned(), vec![]);
+        let tail = data
+            .new_basic_block()
+            .basic_block("tail".to_owned(), vec![]);
         data.layout_mut().push_bb_back(tail);
         let a = data.params()[0];
         let b = data.params()[1];

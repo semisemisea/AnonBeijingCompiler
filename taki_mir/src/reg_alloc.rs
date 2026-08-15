@@ -28,8 +28,8 @@
 //!   → ion::run(func, machine_env)
 //!       ├─ 归一化：客户端 VReg → 稠密 VReg（DenseVRegFunction）
 //!       ├─ liveness：计算每个 VReg 的活跃区间（LiveRange）并合并成 bundle
-//!       ├─ 主循环：按溢出权重处理每个 bundle，尝试分配寄存器；冲突则
-//!       │   驱逐/分裂/溢出（process_bundles）
+//!       ├─ 主循环：按 bundle 优先级（区间长度之和）处理每个 bundle，尝试分配
+//!       │   寄存器；冲突则按溢出权重博弈：驱逐/分裂/溢出（process_bundles）
 //!       ├─ 解析：为 block 参数和跨边界的值插入 move（move resolution）
 //!       └─ 溢出：为溢出的 bundle 分配栈槽（spillslot allocation）
 //!   → Output（每个 VReg 的物理寄存器/栈槽 + 插入的 move 指令）

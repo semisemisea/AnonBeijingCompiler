@@ -360,14 +360,14 @@ impl DepGraph {
             if d.is_barrier {
                 // A barrier cannot move before any instruction in its prefix.
                 // Together with last_barrier above this pins both sides.
-                for prev in 0..i {
+                for (prev, dep) in deps.iter().enumerate().take(i) {
                     add_edge(
                         &mut succs,
                         &mut preds,
                         &mut stats,
                         prev,
                         i,
-                        deps[prev].profile().latency,
+                        dep.profile().latency,
                         EdgeKind::Barrier,
                     );
                 }

@@ -2544,7 +2544,8 @@ fn cond_name(cond: Cond) -> &'static str {
     }
 }
 
-fn invert_cond(cond: Cond) -> Cond {
+/// AArch64 condition-code negation table.
+pub(crate) fn invert_cond(cond: Cond) -> Cond {
     match cond {
         Cond::Eq => Cond::Ne,
         Cond::Ne => Cond::Eq,

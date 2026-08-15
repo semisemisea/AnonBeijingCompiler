@@ -13,6 +13,21 @@
 //! Milestone M25 introduces the buffer and moves every backend through it
 //! without enabling any branch optimization. The `optimize_branches` and
 //! `resolve` (range-check + veneer) machinery is wired up in later milestones.
+//!
+//! ## 发射三阶段（中文速览）
+//!
+//! 1. **填充**：`bind_label` 绑定块标签位置；每条指令以 text slot（固定 4
+//!    字节宽）写入，分支以符号化 [`BranchRef`] 槽写入（目标仍是
+//!    `MirBlockIndex`，尚未定址）；
+//! 2. **优化**：[`optimize_branches`](EmitBuffer::optimize_branches) 在
+//!    O(1) 内截断/取反/改写分支（条件翻转、`goto next` 消除、标签别名合并，
+//!    受 `LABEL_LIST_THRESHOLD` 防二次方退化）；
+//! 3. **解析与输出**：[`resolve`](EmitBuffer::resolve) 做范围检查（超出
+//!    `LabelKind` 可达范围的分支插入 veneer 跳板），[`finish`](EmitBuffer::finish)
+//!    把全部槽渲染成最终汇编字符串。
+//!
+//! [`Slot`] 是缓冲区的核心：`Text`（普通指令文本）/`Branch`（符号化分支）/
+//! `Label`（标签位置）/`Veneer`（跳板）。
 
 use core::fmt::Write as _;
 use std::marker::PhantomData;

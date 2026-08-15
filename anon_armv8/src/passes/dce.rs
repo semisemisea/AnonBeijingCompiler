@@ -96,53 +96,53 @@ impl InstInfo {
 /// `CmpImm` / `FCmp` (implicit NZCV definitions), `Nop` (a real instruction
 /// with placement semantics), and anything not proven pure.
 fn is_dce_removable(inst: &MInst) -> bool {
-    match inst {
+    matches!(
+        inst,
         MInst::AluRRR { .. }
-        | MInst::AluRRRR { .. }
-        | MInst::AluRRImm12 { .. }
-        | MInst::AluRRImmLogic { .. }
-        | MInst::AluRRImmShift { .. }
-        | MInst::AluRRRShift { .. }
-        | MInst::AluRRRExtend { .. }
-        | MInst::SDiv { .. }
-        | MInst::SMulL { .. }
-        | MInst::MAdd { .. }
-        | MInst::MSub { .. }
-        | MInst::Mov { .. }
-        | MInst::MovPhys { .. }
-        | MInst::LoadImm { .. }
-        | MInst::MovZ { .. }
-        | MInst::MovN { .. }
-        | MInst::MovK { .. }
-        | MInst::MovFromZero { .. }
-        | MInst::Sxtw { .. }
-        | MInst::LoadAddr { .. }
-        | MInst::StackAddr { .. }
-        | MInst::CSet { .. }
-        | MInst::CmpSelect { .. }
-        | MInst::FMov { .. }
-        | MInst::VecMov { .. }
-        | MInst::VecLd1 { .. }
-        | MInst::VecDup { .. }
-        | MInst::VecArithRRR { .. }
-        | MInst::VecFmla { .. }
-        | MInst::VecBitwise { .. }
-        | MInst::VecCmp { .. }
-        | MInst::VecBsl { .. }
-        | MInst::VecCvt { .. }
-        | MInst::VecAddv { .. }
-        | MInst::VecMovImm { .. }
-        | MInst::VecExtractLane { .. }
-        | MInst::VecInsertLane { .. }
-        | MInst::VecMinMax { .. }
-        | MInst::FMovFromZero { .. }
-        | MInst::FAlu { .. }
-        | MInst::Scvtf { .. }
-        | MInst::Fcvtzs { .. }
-        | MInst::Load { .. }
-        | MInst::LoadPair { .. } => true,
-        _ => false,
-    }
+            | MInst::AluRRRR { .. }
+            | MInst::AluRRImm12 { .. }
+            | MInst::AluRRImmLogic { .. }
+            | MInst::AluRRImmShift { .. }
+            | MInst::AluRRRShift { .. }
+            | MInst::AluRRRExtend { .. }
+            | MInst::SDiv { .. }
+            | MInst::SMulL { .. }
+            | MInst::MAdd { .. }
+            | MInst::MSub { .. }
+            | MInst::Mov { .. }
+            | MInst::MovPhys { .. }
+            | MInst::LoadImm { .. }
+            | MInst::MovZ { .. }
+            | MInst::MovN { .. }
+            | MInst::MovK { .. }
+            | MInst::MovFromZero { .. }
+            | MInst::Sxtw { .. }
+            | MInst::LoadAddr { .. }
+            | MInst::StackAddr { .. }
+            | MInst::CSet { .. }
+            | MInst::CmpSelect { .. }
+            | MInst::FMov { .. }
+            | MInst::VecMov { .. }
+            | MInst::VecLd1 { .. }
+            | MInst::VecDup { .. }
+            | MInst::VecArithRRR { .. }
+            | MInst::VecFmla { .. }
+            | MInst::VecBitwise { .. }
+            | MInst::VecCmp { .. }
+            | MInst::VecBsl { .. }
+            | MInst::VecCvt { .. }
+            | MInst::VecAddv { .. }
+            | MInst::VecMovImm { .. }
+            | MInst::VecExtractLane { .. }
+            | MInst::VecInsertLane { .. }
+            | MInst::VecMinMax { .. }
+            | MInst::FMovFromZero { .. }
+            | MInst::FAlu { .. }
+            | MInst::Scvtf { .. }
+            | MInst::Fcvtzs { .. }
+            | MInst::Load { .. }
+            | MInst::LoadPair { .. }
+    )
 }
 
 /// Tombstone every dead instruction in `insts`, returning the number of

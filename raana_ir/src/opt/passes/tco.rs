@@ -1,6 +1,6 @@
 use crate::opt::prelude::*;
 
-/// Rewrites ABI-compatible tail calls into a [`TailCall`], which the backend
+/// Rewrites ABI-compatible tail calls into a [`crate::ir::inst_kind::TailCall`], which the backend
 /// lowers to a frame-reusing jump (`b callee`).
 ///
 /// The caller and callee must currently have identical signatures so the

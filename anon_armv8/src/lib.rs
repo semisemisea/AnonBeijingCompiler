@@ -46,9 +46,9 @@
 //! | [`instructions`] | 类型化指令形式 [`instructions::MInst`] 与编码合法操作数（ALU/内存/向量/分支） |
 //! | [`labels`] | 汇编标签：block/函数/全局量/内嵌符号 |
 //! | [`lower`] | 指令选择：Raana HIR → VCode，入口 [`AArch64Backend`] |
-//! | [`passes`] | 目标相关 MIR pass：chain fusion（链式 compare 折叠）、const CSE（常量物化去重+循环外提）、DCE、pair combine（load/store 合成 LDP/STP）、peephole（指令融合）、list scheduler（A53 顺序调度） |
+//! | [`passes`] | 目标相关 MIR pass：DCE、peephole（指令融合）、chain fusion（链式 compare 折叠）、const CSE（常量物化去重+循环外提）为 **Pre-RA**；pair combine（load/store 合成 LDP/STP）、list scheduler（A53 顺序调度）为 **Post-RA** |
 //! | [`regs`] | AArch64 物理寄存器与分配策略：Gpr/Vector 类、scratch 寄存器、FP/LR |
-//! | [`runtime`] | 内嵌汇编符号（memset/calloc）与汇编片段 |
+//! | [`runtime`] | 内嵌汇编符号（memset/calloc，`.S` 经 `include_str!` 编译期嵌入；calloc 供递归记忆化 IR pass（M68）分配缓存用） |
 //! | [`sched`] | Cortex-A53 调度模型：依赖图、延迟表（供 list scheduler 使用） |
 //!
 //! ## 入口调用链（一次编译的旅程）
@@ -58,8 +58,9 @@
 //!    `lower_branch` 处理跳转/分支 terminator；ABI 相关由 [`abi::AArch64Abi`]
 //!    决定（参数进哪些寄存器/栈、返回值如何传递）。
 //! 2. **MIR passes**：[`passes::build_pipeline`] 按 [`AArch64CodegenConfig`]
-//!    组装 Pre-RA pass（peephole 融合、pair 融合、chain fusion、const CSE、DCE）
-//!    与 Post-RA pass（[`sched`] 驱动的 list scheduler）。
+//!    组装 **Pre-RA** pass（DCE、peephole 融合、chain fusion、const CSE）与
+//!    **Post-RA** pass（pair combine、list scheduler）——pair 融合在寄存器
+//!    分配之后（见 `build_pipeline` 的 `add_post_ra`）。
 //! 3. **寄存器分配**：taki_mir 的 ION 分配器把虚拟寄存器映射到 [`regs`] 定义的
 //!    物理寄存器；溢出槽由 [`abi`] 的栈帧布局决定。
 //! 4. **发射**：每条 [`instructions::MInst`] 通过 `MachInstEmit` 写入 `AsmWriter`（emit_buffer），
@@ -70,14 +71,15 @@
 //! 以 SysY `a = b + 1;` 为例（a/b 为 int）：
 //!
 //! ```text
-//! IR（raana_ir）   %r1 = add %b, 1        ← Binary(Add)
-//! lower 选择       AluRRR { op: Add, dst: v0, lhs: v1(b), rhs: Imm12(1) }
-//! 寄存器分配后      x1 存 b，v0 → x0
-//! emit 输出        add w0, w1, #1
+//! IR（raana_ir）    %r1 = add %b, 1        ← Binary(Add)
+//! lower 选择        AluRRImm12 { op: Add, size: Size32, dst: v0, src: v1(b), imm: Imm12(1) }
+//! 寄存器分配后       w1 存 b，v0 → w0
+//! emit 输出         add w0, w1, #1
 //! ```
 //!
 //! 读懂 lower 的路径：先看 `lower.rs` 的 `lower`（按 `InstKind` 分派）→
-//! 进入 `lower_binary`（标量/向量分派）→ 找到 `AluRRR` 的 emit（`instructions.rs`）。
+//! 进入 `lower_binary`（标量/向量分派）→ 找到 `add_sub_immediate`
+//! （`AluRRImm12` 的 emit 在 `instructions.rs`）。
 //!
 //! ## 扩展指引
 //!

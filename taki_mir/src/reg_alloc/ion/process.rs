@@ -16,8 +16,9 @@
 
 //! Main allocation loop that processes bundles.
 //!
-//! 这是 ION 分配器的**心脏**：`Env::process_bundles` 按溢出权重从大到小处理
-//! 每个 bundle，核心决策路径：
+//! 这是 ION 分配器的**心脏**：`Env::process_bundles` 按 bundle 优先级
+//! （活跃区间长度之和，`compute_bundle_prio`）从大到小处理每个 bundle，
+//! 核心决策路径：
 //!
 //! 1. [`try_to_allocate_bundle_to_reg`](Env::try_to_allocate_bundle_to_reg)：
 //!    为 bundle 找一个可用物理寄存器（考虑固定约束 requirement 与

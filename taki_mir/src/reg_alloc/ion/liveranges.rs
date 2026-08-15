@@ -21,13 +21,14 @@
 //! 聚合**（`spill_weight_from_constraint`）：
 //!
 //! ```text
-//! 单点权重 = hot_bonus（循环深度每层 ×4：1000 → 4000 → 16000…）
+//! 单点权重 = hot_bonus（基础 1000，循环深度每层 ×4：1000 → 4000 → 16000…）
 //!          + def_bonus（定义点 +2000）
-//!          + constraint_bonus（无约束 Any +1000；固定寄存器约束 Reg/FixedReg +2000）
+//!          + constraint_bonus（无约束 Any +1000；寄存器约束 Reg/FixedReg +2000）
 //! ```
 //!
-//! 权重高的 bundle 优先拿寄存器，冲突时低权重者被驱逐。**调溢出策略**改
-//! `liveranges.rs` 里的这些 bonus 常量。
+//! 权重高的 bundle 在驱逐博弈与 spill 排序中占优。**调溢出策略**改
+//! `liveranges.rs` 里的这些 bonus 常量（注意：处理顺序由
+//! `compute_bundle_prio` 决定，不受这些常量影响）。
 
 use super::IndexSet;
 use super::data_structures::{

@@ -12,7 +12,7 @@
 //! | [`index`] | `define_index!` 宏生成的稠密下标类型（VRegIndex/Block/Inst/InstRange 等） |
 //! | [`reg`] | 寄存器模型：[`reg::RegClass`]（Int/Float/Vector）、[`reg::PReg`]（物理寄存器）、[`reg::VReg`]（虚拟寄存器）、[`reg::MachineEnv`]（机器环境）、[`reg::Output`]（分配结果） |
 //! | [`ion`] | ION 回溯分配器（移植自 regalloc2）：核心分配算法，入口 [`ion::run`] |
-//! | [`moves`] | 分配结果回写：把 Output 的寄存器映射应用到 VCode 指令上 |
+//! | [`moves`] | `ParallelMoves` 并行移动工具（真正的 Output 回写发生在 `taki_mir/src/lib.rs` 编译流程） |
 //!
 //! ## 两个核心概念（先理解再读流程）
 //!

@@ -5,10 +5,13 @@
 
 ## 0. 前置条件（离线环境第一次跑）
 
-- Docker 可用；`rustup target add aarch64-unknown-linux-musl`（交叉编译 compiler）；
+- Docker 可用；`rustup target add <triple>-unknown-linux-musl`（triple 按
+  主机架构：Apple Silicon → `aarch64`，x86_64 → `x86_64`，见 Makefile 的
+  uname 分支）；
 - 在 repo 根目录执行 make；首次运行自动构建 test 镜像（`.docker-image` 是
   校验和戳，改 Dockerfile 才需要重建）；
-- 示例统一带 `-j 2`（与 CI 一致，快一倍）。
+- **`-j 2` 放 ARGS 里**（`ARGS="-O 2 -j 2"`）才是 CI 同款——那是 test.py
+  的并行 worker 数；make 级 `make -j 2` 是另一回事。
 
 ## 1. 整体架构
 
@@ -76,7 +79,7 @@ case.gem5-stats/     （gem5 模式）stats.txt + exitcode
 
 | 目标 | 作用 |
 |------|------|
-| `make test [TESTS=...] [ARGS="..."]` | 主测试（默认 functional+h_functional） |
+| `make test [TESTS=...] [ARGS="..."]` | 主测试；**不传 TESTS 时默认跑 `tests/` 下全部 .sy（functional + h_functional + perf，很慢——perf 有 30s+ 的用例）**；冒烟请显式 `TESTS="functional h_functional"` |
 | `make test TESTS="functional h_functional" ARGS="-O 2"` | 指定用例集 + 优化级别 |
 | `make test functional/75_max_flow.sy ARGS="-O 2"` | 单用例 |
 | `make test-riscv ARGS="-O 2"` | RISC-V 后端测试（**改 pass 必跑**） |
@@ -101,8 +104,10 @@ CLI 默认 -O2），权威对照 = 容器编译 + qemu。
    退出码 = 程序 main 返回值：先 `make test functional/case.sy` 跑一次，从
    `results/functional/case.runtime.return` 读真实退出码写进 `.out`
    （绝大多数用例为 0）。需要 stdin 时加 `case.in`。
-3. 本地验证：`make test functional/case.sy ARGS="-O 2" -j 2`（make 自动清
-   容器；被强杀过才需 `docker rm -f soyo-test`）。
+3. 本地验证：`make test functional/case.sy ARGS="-O 2"`（make 自动清
+   容器；被强杀过才需 `docker rm -f soyo-test`）。全量并行：
+   `make test TESTS="functional h_functional" ARGS="-O 2 -j 2"`（-j 在
+   ARGS 里是 test.py worker）。
 4. 性能用例另跑 `scripts/perf_compare.sh` 看静态指令数对照 clang。
 
 ## 7. 常见坑

@@ -7,11 +7,17 @@
 
 ## 路线图总览
 
+> **编号线警告**：仓库根 TODO.md 里有**两套并行编号**的优化线——M56-M69 线
+> （IR/后端优化，含 M69 NEON）与 §4 主计划 F 的 M57-M61 线（矩阵乘标量优化，
+> 其 M57/M58 与上一条线的 M57/M58 **不是同一个东西**）。本文沿用 TODO.md
+> 的上下文称呼，读 TODO.md 时注意区分。
+
 | 优先级 | 项 | 目标用例 | 预期收益 | 风险 |
 |--------|----|---------|---------|------|
 | P0 | M69 NEON 自动向量化 | h-4/h-8/matmul/huffman | 2-4× | 大/高 |
 | P1 | M68 Phase D 记忆化微调 | h-1 族 | QEMU 6.5s→≤4s | 中 |
-| P1 | M59 j 循环寄存器阻塞 | many_mat_cal | 1.5-2× | 中 |
+| P1 | M59（主计划 F 线）j 循环寄存器阻塞 | many_mat_cal | 1.5-2× | 中 |
+| P1 | M60 递归模乘识别改写 + M61 非负性分析/守卫消除 | h-1 族 | 中 | 中 |
 | P2 | 向量运算方法扩展 | 见 vectorization.md | 视用例 | 低-中 |
 
 ## 1. M69：NEON 自动向量化（IR 层 loop 向量化）【P0 下一大项】
@@ -26,8 +32,10 @@ splat/select/reduce，NEON v0-v31，ABI 向量参数），但 **IR 从不产生�
 **实现步骤**：
 1. 新 pass `loop_vectorize.rs`（`raana_ir/src/opt/passes/`），**仅 AArch64**
    （`TargetPolicy` 门控，RISC-V 不注册）；
-2. 候选筛选：trip-count 已知（版本化守卫）、循环体纯（仅 load/算术，无
-   store/call/memzero）、访存连续（GEP 步进 = 元素大小）；
+2. 候选筛选：循环体纯（仅 load/算术，无 store/call/memzero）、访存连续
+   （GEP 步进 = 元素大小）、无回环依赖。**trip-count 未知时做版本化**
+   （版本化守卫：运行时检查 T≥4 走向量路径，否则原标量路径）；trip-count
+   已知（常量）则不需要守卫；
 3. 变换：4 路展开 + `VectorSplat`/向量 Binary/`VectorReduce` 收尾；尾部标量
    回退（T%4 余数）；
 4. 顺序建议：① h-4 型纯算术循环（无访存，风险最低）→ ② h-8 内层 k 循环
@@ -52,7 +60,10 @@ splat/select/reduce，NEON v0-v31，ABI 向量参数），但 **IR 从不产生�
 
 **验收**：h-1 族 QEMU 动态计时改进；非 h-1 静态零回归。
 
-## 3. M59：内层 j 循环寄存器阻塞 + 部分展开【P1】
+## 3. M59（主计划 F 线）：内层 j 循环寄存器阻塞 + 部分展开【P1】
+
+> 注意：本节 M57/M58/M59 属于 TODO.md §4 主计划 F 线（矩阵乘标量优化），
+> 与 M56-M69 线的 M57/M58 撞号但**不是同一个东西**。
 
 **现状**：M57（reduction_unroll 3 参数化，4 路累加器）+ M58（i-j-k → i-k-j
 循环交换 + 输出行缓冲）已落地：many_mat_cal-1 qemu 35.2s → 7.8s。残余差距
@@ -70,13 +81,21 @@ M58 的就地改写正确性约束（`Mout == M2` 别名，行缓冲写回在 k 
 **验收**：many_mat_cal-1 qemu 继续下降（目标标量手段 1-3s，残余差距交给
 M69 NEON）；`make test ARGS="-O 2"` 152 通过 + RISC-V 回归。
 
-## 4. 向量运算方法扩展【P2】
+## 4. M60/M61（主计划 F 线，h-1 相关）【P1】
+
+- **M60 递归模乘识别改写**：`multiply(a,b)` → `b<0 ? 慢路径 : (i64)a*b % P`，
+  后端扩展为模乘内建（见 TODO.md §4）；
+- **M61 过程间非负性分析与守卫消除**：`soyo_mulmod` 纯化 + `main` 中
+  `power` 的 CSE。
+- 详情以仓库根 TODO.md 为准；两条都依赖 `mulmod_recognize` 管线。
+
+## 5. 向量运算方法扩展【P2】
 
 详见 `vectorization.md`（G9）：fmls 乘减、整数 mla v.4s、VecMul+VecSub 融合、
 浮点向量比较、.2d 乘法、逐 lane 掩码 select、归约扩展、交错加载。每条都给了
 "改哪层 + 验证"。
 
-## 5. 通用实现纪律（每个优化开工前读）
+## 6. 通用实现纪律（每个优化开工前读）
 
 1. **先确认形态**：`--emit ir` 看 IR 是否符合模式（预告-失败循环被点名批评
    过的教训：先批量实证形态假设再承诺）；
@@ -89,7 +108,7 @@ M69 NEON）；`make test ARGS="-O 2"` 152 通过 + RISC-V 回归。
    optimization.md`）；
 5. **文档**：落地后更新仓库根 TODO.md（只保留未完成项，完成项压一行摘要）。
 
-## 6. 关键上下文（改管线前必读）
+## 7. 关键上下文（改管线前必读）
 
 - IR 管线（`raana_ir/src/opt/pass.rs`）：SSA → Specialize → mulmod_recognize
   （AArch64）→ Memoize → Inline → TCO → ColumnMajor → GSP；固定点内：IPSCCP,

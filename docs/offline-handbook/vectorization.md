@@ -28,36 +28,43 @@ lower 层（anon_armv8::lower）：
 | `VecMov` | 向量拷贝 | |
 | `VecLd1` / `VecSt1` | 128 位加载/存储 | |
 | `VecDup` | 广播（splat） | |
-| `VecArithRRR` | Add / Sub / Mul | **仅 .4s/.2s/.4h 等；`.2d` 乘法会 panic**（AArch64 无 mul v.2d） |
+| `VecArithRRR` | Add / Sub / Mul | **形状仅 `.4s`/`.2d` 两种**（`vector_shape` 只产出这两个，其他形状直接 panic）；Add/Sub 两种都可用，**Mul 仅 .4s**（.2d 乘法 panic） |
 | `VecFmla` | 乘加 acc+a\*b | 浮点 v.4s/v.2d；**无负号 fmls、无整数 mla** |
 | `VecBitwise` | And / Orr / Eor | |
-| `VecCmp` | Eq / Gt | **仅整数**；浮点比较（fcmgt 等）会 panic |
+| `VecCmp` | Eq / Gt | **仅整数**；f32 比较会 panic，**但 f64（V2F64）比较不 panic**（`is_float` 只匹配 f32，会静默生成整数比较——隐患） |
 | `VecBsl` | 位选择（掩码 select） | |
+| `VecMinMax` | Smin/Smax/Umin/Umax/Fmin/Fmax | 元素级 min/max（lower_vector_binary 已支持） |
 | `VecCvt` | Scvtf / Fcvtzs | int↔float 转换 |
-| `VecAddv` | 横向加（归约） | v4s → 标量 |
+| `VecAddv` | 横向加（归约） | 仅 .4s 整数 addv；f32→faddp 缺失、.2d 缺失 |
 | `VecMovImm` | 立即数 | |
 | `VecExtractLane` | 提取 lane | |
+| `VecInsertLane` | 插入 lane | |
 
-**结论**：能力覆盖"广播 + 逐元素算术 + 位运算 + 整数比较 + 归约"；**缺**：
-乘减（fmls）、整数乘加（mla）、浮点比较、.2d 乘法、多种归约（maxv/minv）。
+**结论**：能力覆盖"广播 + 逐元素算术 + 位运算 + 整数比较 + min/max + 归约"；
+**缺**：乘减（fmls）、整数乘加（mla）、浮点比较（f32/f64 都有缺口）、.2d 乘法、
+多种归约（maxv/minv）。
 
 ## 3. 可实现运算方法清单（按性价比排序）
 
 ### M1. fmls：浮点向量乘减（f32 a - b\*c）【高性价比】
 - **原理**：NEON `fmls vd, vn, vm` = `vd - vn*vm`（乘减，AArch64 一条指令）。
 - **改哪层**：① `instructions.rs`：`VecFmla` 加 `neg: bool` 字段或新增
-  `VecFmls` 变体（emit 打印 `fmls`）；② `lower.rs` `lower_fma`：当 IR 形态是
-  `acc - mul(lhs, rhs)`（Fma 的 acc 前有 Sub，或 Fma 语义为负）时选择 fmls；
-  ③ 或在 `peephole_combine` 里把 `VecSub + VecMul` 融合成 fmls。
+  `VecFmls` 变体（emit 打印 `fmls`）；② `lower.rs` `lower_fma`：当前实现
+  （1416 行起）对 `Fma` 无脑 emit `VecFmla`（acc 是显式 SSA 读，Fma 本身
+  无 neg 字段）——需要先识别 `acc - mul(lhs,rhs)` 形态（IR 层 Fma 折叠或
+  lower 时看 lhs 是否来自 Sub），或在 `peephole_combine` 里把
+  `VecSub + VecMul` 融合成 fmls。
 - **IR 形态**：`fma(sub(a, ...), ...)` 或 `sub(x, mul(y, z))`。
-- **验证**：`make test h_functional/xxx ARGS="-O 2"` + 汇编核对出现 `fmls`。
+- **验证**：`cargo test -p taki_mir -p anon_armv8` + `make test
+  h_functional/xxx ARGS="-O 2"` + 汇编核对出现 `fmls`。
 - **解锁**：h-10 类 f32 乘减循环（当前是 mul+sub 两条）。
 
 ### M2. 整数 mla：v.4s 整数乘加【高性价比】
 - **原理**：NEON `mla vd.4s, vn.4s, vm.4s`（整数乘加）或 `mls`（乘减）。
-- **改哪层**：`VecFmla` 目前隐含浮点；扩成同时支持整数（emit 按类型选
-  `fmla`/`mla`），`lower_fma` 对 `V4I32` 类型直接放行（现在整数 Fma 可能
-  没走到向量路径）。
+- **现状坑（先修这个）**：`Fma`（`raana_ir` fma.rs）和 `lower_fma` 目前都
+  **不检查类型**——V4I32 的 Fma 一旦出现会**静默生成错误的 fmla 汇编**
+  而不是 panic。第一步应在 `lower_fma` 加类型分派：整数 emit `mla`/`mls`、
+  浮点 emit `fmla`/`fmls`（或先 panic 兜底）。
 - **解锁**：h-5 类 i32 内积循环（clang 用 mla 的核心位置）。
 
 ### M3. 向量 MAC 融合（VecMul + VecSub/VecAdd → fmls/fmla）【中】
@@ -72,27 +79,30 @@ lower 层（anon_armv8::lower）：
 ### M4. 浮点向量比较（fcmgt / fcmeq）【中】
 - **原理**：NEON `fcmgt vd.4s, vn.4s, vm.4s` 等浮点比较。
 - **改哪层**：`instructions.rs` `VecCmpOp` 加 `Fgt`/`Feq`/`Fge`…；
-  `lower.rs` `lower_vector_binary` 去掉浮点 panic 分支，按 `is_float` 选 op。
+  `lower.rs` `lower_vector_binary` 去掉 f32 panic 分支，按 `is_float` 选 op；
+  **顺带修 V2F64 比较的静默隐患**（`is_float` 只匹配 f32）。
 - **解锁**：浮点掩码/条件路径（如浮点循环的边界掩码向量化）。
 
 ### M5. .2d 乘法（V2F64/V2I64 mul）【中低】
-- **原理**：AArch64 无 `mul v.2d`；`fmul v.2d` 存在但整数需 `smull/umull`
-  （产生 .1q 结果）。当前 `lower_vector_binary` 对 TwoD × Mul 直接 panic。
-- **改哪层**：`lower.rs`——V2F64 用 `fmul.2d`；V2I64 走 smull/umull 或拆
-  两个标量（取决于用例收益）。
-- **解锁**：64 位向量算术循环（目前此类循环应极少，先验证有用例再实现）。
+- **原理**：AArch64 无 `mul v.2d`。`fmul v.2d` 存在（浮点）；但 `smull`/
+  `umull` 是 `.2s × .2s → .2d` 的 **widening 乘法**，不能直接做
+  V2I64×V2I64——V2I64 乘法实际只能拆标量（或前端降成 V4I32）。
+- **改哪层**：`lower.rs`——V2F64 用 `fmul.2d`；V2I64 拆标量（先验证有
+  用例再实现）。
+- **解锁**：64 位向量算术循环（此类循环应极少，先验证有用例）。
 
-### M6. 逐 lane 掩码 select（VecBsl v3）【中低】
-- **原理**：`VecBsl`（位选择）已存在；v2 是标量条件选择，v3 是**逐 lane**
-  条件（比较结果作为掩码直接 bsl）。
-- **改哪层**：`lower.rs` `lower_select`：向量类型 + 条件为向量比较结果 →
-  直接 VecBsl；IR 层需先有向量 Select 形态。
-- **解锁**：conv2d 边界、transpose 的逐元素条件路径。
+### M6. 逐 lane 掩码 select（VecBsl v3）【✅ 已完成，勿重复实现】
+- **现状**：`lower_select` 对向量类型**已直接 emit `VecBsl`**
+  （lower.rs:690-706，注释 "select(mask, if_true, if_false) over vectors:
+  bit-select"）。真正缺的只是 M4 的浮点比较掩码（比较产生 mask 的路径）。
 
 ### M7. 归约扩展（smaxv / sminv / fmaxv）【低】
 - **原理**：`VecAddv` 已实现 addv 归约；`smaxv`/`sminv`/`fmaxv` 同类。
-- **改哪层**：`instructions.rs` 加 `VecReduceOp` 扩展 + `lower_vector_reduce`
-  按 `VectorReduceOp` 分派。
+- **改哪层**：IR 层 `VectorReduceOp` 加成员（定义在
+  `raana_ir/src/ir/inst_kind/vector_reduce.rs`，目前只有 `Add`）+ 后端
+  `lower_vector_reduce` 分派（`instructions.rs` 已有 `VecMinMaxOp`
+  枚举可直接支撑 smaxv/sminv/fmaxv）。现状限制：`lower_vector_reduce`
+  仅 .4s 整数 addv，f32→faddp 缺失、.2d 缺失。
 - **解锁**：min/max 归约循环（若 perf 语料有）。
 
 ### M8. 交错加载（ld2/ld3/ld4）【低】
@@ -107,8 +117,9 @@ lower 层（anon_armv8::lower）：
    + `--emit ir` 看 IR 形态是否匹配你的模式）；
 2. **改 IR 层**（如需要）→ **改 instructions.rs**（新 op/变体）→ **改
    lower.rs**（选择）→ 需要调度则更新 `sched/` 延迟表；
-3. **验证**：单 case 差分（输出一致）→ 汇编核对新指令出现 → `make test
-   ARGS="-O 2"` 全量 → `make test-riscv`（若动共享层）→
+3. **验证**：`cargo test -p taki_mir -p anon_armv8`（含 instructions.rs
+   内联 emit 单测）→ 单 case 差分（输出一致）→ 汇编核对新指令出现 →
+   `make test ARGS="-O 2"` 全量 → `make test-riscv`（若动共享层）→
    `scripts/perf_compare.sh` 看静态指令数 vs clang。
 
 ## 5. 红线

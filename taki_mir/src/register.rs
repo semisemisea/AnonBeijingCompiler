@@ -1,3 +1,14 @@
+//! 寄存器句柄类型（`Reg`/`Writable`/`VRegAllocator`）。
+//!
+//! - [`Reg`]：一条指令里命名的寄存器，**分配前**是虚拟寄存器（vreg），
+//!   **分配后**被回写为物理寄存器（preg）——同一个类型两种含义，靠
+//!   `pinned_vreg_to_preg`/`preg_to_pinned_vreg` 互相转换。前 192 个 vreg
+//!   （64 int + 64 float + 64 vec）被"钉"在物理寄存器上（`PINNED_PREG`），
+//!   不进分配器。
+//! - [`Writable<T>`]：可写寄存器包装（区分 def 与 use 位置，regalloc 需要）。
+//! - [`VRegAllocator<I>`]：lower 阶段分配新虚拟寄存器的分配器（按指令类型
+//!   `I` 的类型信息决定寄存器类）。
+
 use std::marker::PhantomData;
 
 use crate::{

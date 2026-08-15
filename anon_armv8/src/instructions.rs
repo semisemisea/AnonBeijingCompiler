@@ -475,7 +475,7 @@ pub enum SelectValue {
     Bool { dst: WritableReg },
 }
 
-/// A chained conditional-compare step between a [`CmpSelect`]'s first
+/// A chained conditional-compare step between a `CmpSelect`'s first
 /// comparison and its select, or between a comparison and a conditional
 /// branch. Semantics: if `cond` holds (based on the preceding NZCV), compare
 /// `lhs` with `rhs`/`imm` and set NZCV from the result; otherwise set NZCV to

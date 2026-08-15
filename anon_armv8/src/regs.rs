@@ -1,4 +1,16 @@
 //! AArch64 physical register and AAPCS64 allocation policy.
+//!
+//! 定义 AArch64 物理寄存器集合与分配策略：
+//!
+//! - 寄存器类：`RegClass::Int`（x0-x28，x29=FP/x30=LR 保留）、
+//!   `RegClass::Float`（d0-d31）、`RegClass::Vector`（v0-v31，与 Float 共用
+//!   同一物理寄存器文件，见 `vector_reg` 系列工厂函数）；
+//! - [`Gpr`] 与 [`RegOrZr`] 的类型级区分：编码 31 在数据处理指令里是 ZR、
+//!   在内存指令里是 SP，两个枚举分别约束这两种位置（SP 本身以普通 `Reg`
+//!   流经全流程，见 [`stack_reg`]）；
+//! - scratch 寄存器：分配器/RA 前后可自由使用的寄存器（`INT_ALLOCATOR_
+//!   SCRATCH` 等常量），`MachineEnv` 里排除在可分配集合之外；
+//! - 特殊寄存器：`FP`(29)/`LR`(30)/`SP_HW_ENC`(63)。
 
 use std::sync::OnceLock;
 

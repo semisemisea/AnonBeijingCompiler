@@ -29,7 +29,7 @@
 //! | [`abi`] | AAPCS64 调用约定：参数布局、栈帧（spill slot、callee-saved）、ABI 钩子 |
 //! | [`config`] | 代码生成配置：各 MIR pass 开关、调度模型（[`AArch64SchedModel`]） |
 //! | [`constants`] | 整数常量物化规划：MOVZ/MOVN/MOVK/logical immediate 的选择 |
-//! | [`instructions`] | 类型化指令形式 [`MInst`] 与编码合法操作数（ALU/内存/向量/分支） |
+//! | [`instructions`] | 类型化指令形式 [`instructions::MInst`] 与编码合法操作数（ALU/内存/向量/分支） |
 //! | [`labels`] | 汇编标签：block/函数/全局量/内嵌符号 |
 //! | [`lower`] | 指令选择：Raana HIR → VCode，入口 [`AArch64Backend`] |
 //! | [`passes`] | 目标相关 MIR pass：chain fusion、const CSE、DCE、pair combine、peephole、list scheduler |
@@ -40,7 +40,7 @@
 //! ## 入口调用链（一次编译的旅程）
 //!
 //! 1. **lower**：[`AArch64Backend`] 实现 [`taki_mir::lower::LowerBackend`]，
-//!    [`lower`](`AArch64Backend::lower`) 把每条 HIR 指令选择为 [`MInst`]，
+//!    `lower` 方法把每条 HIR 指令选择为 [`instructions::MInst`]，
 //!    `lower_branch` 处理跳转/分支 terminator；ABI 相关由 [`abi::AArch64Abi`]
 //!    决定（参数进哪些寄存器/栈、返回值如何传递）。
 //! 2. **MIR passes**：[`passes::build_pipeline`] 按 [`AArch64CodegenConfig`]
@@ -48,7 +48,7 @@
 //!    与 Post-RA pass（[`sched`] 驱动的 list scheduler）。
 //! 3. **寄存器分配**：taki_mir 的 ION 分配器把虚拟寄存器映射到 [`regs`] 定义的
 //!    物理寄存器；溢出槽由 [`abi`] 的栈帧布局决定。
-//! 4. **发射**：每条 [`MInst`] 通过 `MachInstEmit` 写入 `AsmWriter`（emit_buffer），
+//! 4. **发射**：每条 [`instructions::MInst`] 通过 `MachInstEmit` 写入 `AsmWriter`（emit_buffer），
 //!    最终输出汇编文本。
 //!
 //! ## 扩展指引

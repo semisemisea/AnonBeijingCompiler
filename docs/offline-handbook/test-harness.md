@@ -3,6 +3,13 @@
 > 离线工作手册 G8。对象：`tests/test.py`（855 行）+ Makefile + Docker 流程。
 > 这是本项目的**真正质量门禁**（比 `cargo test` 更重要）。
 
+## 0. 前置条件（离线环境第一次跑）
+
+- Docker 可用；`rustup target add aarch64-unknown-linux-musl`（交叉编译 compiler）；
+- 在 repo 根目录执行 make；首次运行自动构建 test 镜像（`.docker-image` 是
+  校验和戳，改 Dockerfile 才需要重建）；
+- 示例统一带 `-j 2`（与 CI 一致，快一倍）。
+
 ## 1. 整体架构
 
 ```
@@ -17,7 +24,8 @@ make test                      # 入口（Makefile）
 ```
 
 **关键**：只有 `Dockerfile` 改动才需重建镜像；`test.py`/用例是挂载的，改了
-直接生效。`docker rm -f soyo-test` 清残留容器（残留会导致跑成上次的用例集）。
+直接生效。make 的 test 系列目标自带容器清理（cleanup trap），只有上次 run 被
+强杀（SIGKILL）后才需手动 `docker rm -f soyo-test`。
 
 ## 2. 一个用例的生命周期（run_test，test.py:280）
 
@@ -45,7 +53,7 @@ make test                      # 入口（Makefile）
 | CE | 编译错误 | compiler 或 IR dump 退出非 0 |
 | RE | 运行错误 | 链接失败 / 运行退出非 0 且有 stderr |
 | TLE | 超时 | 编译/链接/运行任一步超 TEST_TIMEOUT |
-| SKIP | 跳过 | 用例在 SKIP_TESTS（缺输入） |
+| SKIP | 跳过 | `SKIP_TESTS` 命中（**当前为空集，暂不触发**） |
 
 **注意**：`.out` 文件里**包含退出码行**（combined_output 语义）——手写
 `.out` 时最后一行必须是程序退出码，否则必然 FAIL。
@@ -79,27 +87,32 @@ case.gem5-stats/     （gem5 模式）stats.txt + exitcode
 | `make mca path.s` | llvm-mca 静态分析（cortex-a53） |
 | `make gem5 <case>` | gem5 全系统模拟（慢，只用小输入） |
 
-**坑**：harness 默认优化级别是 **-O0**！CI 只跑 -O0。性能里程碑必须显式
-`ARGS="-O 2"`。另外 `make test ARGS="-O 0"` 实测会跑 O2（参数解析陷阱），
-权威对照 = 容器编译 + qemu。
+**坑**：harness 默认优化级别是 **-O0**。**CI 用 `-O 2` 跑 functional +
+h_functional + perf 全量**（见 `.github/workflows/compiler-ci.yml`）——CI 就是
+验证 -O2 的门禁。本地性能里程碑也要显式 `ARGS="-O 2"`。另外
+`make test ARGS="-O 0"` 实测会跑 O2（opt_level=0 是 falsy 不传 -O，compiler
+CLI 默认 -O2），权威对照 = 容器编译 + qemu。
 
 ## 6. 如何加一个测试用例
 
 1. 放对目录：`tests/functional/`（功能）、`tests/h_functional/`（隐藏/特殊）、
    `tests/perf/`（性能）。
-2. 写 `case.sy`（SysY 源码）+ `case.out`（期望输出，**最后一行 = 退出码**）；
-   需要 stdin 时加 `case.in`。
-3. 本地验证：`make test functional/case.sy ARGS="-O 2"`（先
-   `docker rm -f soyo-test` 清残留容器）。
+2. 写 `case.sy`（SysY 源码）+ `case.out`（期望输出，**最后一行 = 退出码**）。
+   退出码 = 程序 main 返回值：先 `make test functional/case.sy` 跑一次，从
+   `results/functional/case.runtime.return` 读真实退出码写进 `.out`
+   （绝大多数用例为 0）。需要 stdin 时加 `case.in`。
+3. 本地验证：`make test functional/case.sy ARGS="-O 2" -j 2`（make 自动清
+   容器；被强杀过才需 `docker rm -f soyo-test`）。
 4. 性能用例另跑 `scripts/perf_compare.sh` 看静态指令数对照 clang。
 
 ## 7. 常见坑
 
 - **改了 test.py 不用重建镜像**（挂载）；改 Dockerfile 才需要。
-- **残留容器**：`docker rm -f soyo-test`，否则跑的是上次的用例集。
-- **退出码行**：.out 末行是 returncode，别漏。
+- **残留容器**：make 目标自带 cleanup，仅上次被强杀（SIGKILL）后才需
+  `docker rm -f soyo-test`。
+- **退出码行**：.out 末行是 returncode，别漏（读 `results/.../case.runtime.return`）。
 - **IR dump 崩溃 = CE**：汇编 OK 但 raana dump 崩，同样算编译失败。
 - **QEMU 慢**：性能用例（如 huffman）-O2 可能 30s+；迭代优先用静态计数
   （perf_compare.sh），gem5 更慢（只用小输入）。
 - **Docker 时间戳坑**：`make test` 前 touch 源文件重编 musl，否则可能用上
-  过期二进制（本地 compiler 过期 → M44_TRACE 之类静默无输出）。
+  过期二进制（本地 compiler 过期 → 调试 trace 静默无输出）。

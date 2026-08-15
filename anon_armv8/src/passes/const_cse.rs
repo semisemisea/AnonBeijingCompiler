@@ -31,7 +31,6 @@ use taki_mir::{
 };
 
 use crate::instructions::MInst;
-use crate::regs::OperandSize;
 
 pub struct ConstCse;
 

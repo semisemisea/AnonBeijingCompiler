@@ -27,16 +27,12 @@
 use taki_mir::{
     passes::MIRPass,
     prelude::ArenaContext,
-    reg_alloc::{
-        function::Function,
-        index::{Block, Inst},
-        reg::VReg,
-    },
+    reg_alloc::{function::Function, index::Block},
     stats::FunctionCodegenStats,
     vcode::{MachInst, VCodeContainer},
 };
 
-use crate::instructions::{Imm12, MInst};
+use crate::instructions::MInst;
 
 pub struct ChainFusion;
 
@@ -158,7 +154,11 @@ fn fuse_block(vcode: &mut VCodeContainer<MInst>, split: Block) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{instructions::Cond, labels::Label, regs::OperandSize};
+    use crate::{
+        instructions::{Cond, Imm12},
+        labels::Label,
+        regs::OperandSize,
+    };
     use taki_mir::{
         block_order::MirBlockIndex,
         reg_alloc::reg::{RegClass, VReg},

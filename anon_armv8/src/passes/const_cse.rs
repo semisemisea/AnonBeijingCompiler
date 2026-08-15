@@ -20,11 +20,7 @@ use std::collections::HashMap;
 use taki_mir::{
     passes::MIRPass,
     prelude::ArenaContext,
-    reg_alloc::{
-        function::Function,
-        index::Block,
-        reg::OperandKind,
-    },
+    reg_alloc::{function::Function, index::Block, reg::OperandKind},
     register::Reg,
     stats::FunctionCodegenStats,
     vcode::{MachInst, VCodeContainer},
@@ -180,10 +176,7 @@ fn plan_const_cse(vcode: &VCodeContainer<MInst>) -> Option<Plan> {
             let Some((size, value)) = const_key(vcode.inst(i)) else {
                 continue;
             };
-            groups
-                .entry((target, size, value))
-                .or_default()
-                .push(i);
+            groups.entry((target, size, value)).or_default().push(i);
         }
     }
     if groups.is_empty() {
@@ -199,7 +192,8 @@ fn plan_const_cse(vcode: &VCodeContainer<MInst>) -> Option<Plan> {
         plan.movers.push((leader, target));
         let leader_reg = def_reg(vcode.inst(leader));
         for &victim in &group[1..] {
-            plan.redirects.push((def_reg(vcode.inst(victim)), leader_reg));
+            plan.redirects
+                .push((def_reg(vcode.inst(victim)), leader_reg));
         }
     }
     if std::env::var("SOYO_CONST_CSE_DEBUG").is_ok() {
@@ -295,12 +289,14 @@ fn const_key(inst: &MInst) -> Option<(u8, u64)> {
     match inst {
         MInst::LoadImm { size, value, .. } => Some((size.bits(), *value)),
         MInst::MovFromZero { size, .. } => Some((size.bits(), 0)),
-        MInst::MovZ { size, imm, .. } => {
-            Some((size.bits(), u64::from(imm.bits()) << imm.shift()))
-        }
+        MInst::MovZ { size, imm, .. } => Some((size.bits(), u64::from(imm.bits()) << imm.shift())),
         MInst::MovN { size, imm, .. } => {
             let value = !(u64::from(imm.bits()) << imm.shift());
-            let mask = if size.bits() == 32 { 0xFFFF_FFFF } else { u64::MAX };
+            let mask = if size.bits() == 32 {
+                0xFFFF_FFFF
+            } else {
+                u64::MAX
+            };
             Some((size.bits(), value & mask))
         }
         _ => None,
@@ -428,7 +424,7 @@ fn find_loops(
 mod tests {
     use super::*;
     use crate::instructions::MoveWideConst;
-    use crate::regs::{OperandSize, int_reg};
+    use crate::regs::{int_reg, OperandSize};
     use taki_mir::register::Writable;
 
     #[test]
@@ -453,7 +449,11 @@ mod tests {
             dst: Writable::from_reg(int_reg(2)),
             imm: MoveWideConst::new(0x1, 0, OperandSize::Size32).unwrap(),
         };
-        assert_eq!(const_key(&movz), Some((32, 1)), "single-step movz is a constant");
+        assert_eq!(
+            const_key(&movz),
+            Some((32, 1)),
+            "single-step movz is a constant"
+        );
         assert_eq!(def_reg(&movz), int_reg(2));
         let movn = MInst::MovN {
             size: OperandSize::Size32,
@@ -472,7 +472,11 @@ mod tests {
             src: int_reg(5),
             imm: MoveWideConst::new(0x1, 16, OperandSize::Size32).unwrap(),
         };
-        assert_eq!(const_key(&movk), None, "standalone movk is not a complete constant");
+        assert_eq!(
+            const_key(&movk),
+            None,
+            "standalone movk is not a complete constant"
+        );
         let sxtw = MInst::Sxtw {
             size: OperandSize::Size64,
             dst: Writable::from_reg(int_reg(6)),

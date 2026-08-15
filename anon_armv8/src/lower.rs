@@ -3,19 +3,19 @@
 use std::collections::HashSet;
 
 use raana_ir::ir::{
+    arena::Arena,
+    inst_kind::{MemZero, MemZeroLen},
     Binary, BinaryOp, Call, Cast, Fma, GetElemPtr, InstKind, Load, Return, Select, Store, TailCall,
     Type as HirType, TypeKind, VectorExtractElement, VectorInsertElement, VectorReduce,
     VectorReduceOp, VectorSplat,
-    arena::Arena,
-    inst_kind::{MemZero, MemZeroLen},
 };
 use taki_mir::{
     abi::{ABIMachineSpec, ArgSlot, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::{LoweredBlock, MirBlockIndex},
-    div_magic::{MagicCorrection, signed_magic_i32},
+    div_magic::{signed_magic_i32, MagicCorrection},
     lower::{
-        LowerBackend, LowerContext, LoweredOutput, analyze_gep, fold_gep_constant_offset,
-        sink_gep_into_address,
+        analyze_gep, fold_gep_constant_offset, sink_gep_into_address, LowerBackend, LowerContext,
+        LoweredOutput,
     },
     prelude::{ArenaContext, HirFunction, HirFunctionData, HirInst},
     reg_alloc::reg::PReg,
@@ -26,9 +26,9 @@ use taki_mir::{
 use crate::{
     abi::AArch64Abi,
     instructions::{
-        AMode, AluOp, CCmpStep, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift, MInst,
-        MemoryType, SelectCmp, SelectValue, ShiftOp, VecArithOp, VecBitOp, VecCmpOp, VecCvtOp,
-        VecMinMaxOp, VecShape, invert_cond,
+        invert_cond, AMode, AluOp, CCmpStep, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift,
+        MInst, MemoryType, SelectCmp, SelectValue, ShiftOp, VecArithOp, VecBitOp, VecCmpOp,
+        VecCvtOp, VecMinMaxOp, VecShape,
     },
     labels::Label,
     regs::{self, OperandSize, RegOrZr},
@@ -2578,15 +2578,11 @@ fn is_mul(arena: ArenaContext<'_>, inst: HirInst) -> bool {
     )
 }
 
-fn fusion_types_match(
-    arena: ArenaContext<'_>,
-    size: OperandSize,
-    insts: [HirInst; 6],
-) -> bool {
+fn fusion_types_match(arena: ArenaContext<'_>, size: OperandSize, insts: [HirInst; 6]) -> bool {
     insts.into_iter().all(|inst| {
-            let ty = arena.inst_data(inst).ty().kind();
-            matches!(ty, TypeKind::Int32 | TypeKind::Pointer(_)) && operand_size(ty) == size
-        })
+        let ty = arena.inst_data(inst).ty().kind();
+        matches!(ty, TypeKind::Int32 | TypeKind::Pointer(_)) && operand_size(ty) == size
+    })
 }
 
 /// Fold `rhs = input <<const shift` (or its logical/arithmetic right-shift

@@ -12,8 +12,8 @@ use taki_mir::register::Reg;
 
 use crate::instructions::{AMode, AluOp, MInst, PairAMode};
 use crate::labels::Label;
-use crate::regs::{FP, OperandSize, RegOrZr, int_preg, stack_preg};
-use crate::sched::aarch53::{InstrProfile, SchedClass, instr_profile};
+use crate::regs::{int_preg, stack_preg, OperandSize, RegOrZr, FP};
+use crate::sched::aarch53::{instr_profile, InstrProfile, SchedClass};
 
 /// Memory access type for dependency tracking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1307,7 +1307,7 @@ mod tests {
     use super::*;
     use crate::{
         instructions::{Cond, Imm12, MemoryType},
-        regs::{OperandSize, RegOrZr, int_reg},
+        regs::{int_reg, OperandSize, RegOrZr},
     };
 
     fn writable(index: u8) -> Writable<Reg> {
@@ -1333,11 +1333,10 @@ mod tests {
     fn args_pseudo_is_a_free_nop_with_register_defs() {
         let deps = args_deps();
         assert_eq!(deps.class, SchedClass::Nop);
-        assert!(
-            deps.defs
-                .iter()
-                .all(|p| matches!(*p, p if p.hw_enc() == 0 || p.hw_enc() == 1))
-        );
+        assert!(deps
+            .defs
+            .iter()
+            .all(|p| matches!(*p, p if p.hw_enc() == 0 || p.hw_enc() == 1)));
         assert!(deps.uses.is_empty());
         assert!(!deps.flags_def && !deps.flags_use);
         assert!(deps.mem.is_none());

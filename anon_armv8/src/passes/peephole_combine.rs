@@ -511,15 +511,13 @@ mod tests {
 
     #[test]
     fn refuses_mismatched_registers_and_nonzero_compare() {
-        assert!(
-            fuse_flag_triple(
-                &sub_imm(0, 1, 1),
-                &cmp_zero(2),
-                &cond_br(Cond::Ne),
-                &no_uses()
-            )
-            .is_none()
-        );
+        assert!(fuse_flag_triple(
+            &sub_imm(0, 1, 1),
+            &cmp_zero(2),
+            &cond_br(Cond::Ne),
+            &no_uses()
+        )
+        .is_none());
         let bad_cmp = MInst::CmpImm {
             size: OperandSize::Size32,
             lhs: vreg(0),

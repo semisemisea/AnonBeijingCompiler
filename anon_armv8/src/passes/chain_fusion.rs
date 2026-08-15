@@ -29,7 +29,7 @@ use taki_mir::{
     prelude::ArenaContext,
     reg_alloc::{function::Function, index::Block},
     stats::FunctionCodegenStats,
-    vcode::{MachInst, VCodeContainer},
+    vcode::VCodeContainer,
 };
 
 use crate::instructions::MInst;

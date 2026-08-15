@@ -1364,17 +1364,7 @@ impl MachInstEmit for MInst {
                 dst,
                 src,
                 imm,
-            } => {
-                write!(ctx, "{} ", alu_name(*op))?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
-                write!(ctx, ", ")?;
-                emit_reg(ctx, *src, *size)?;
-                write!(ctx, ", #{}", imm.value())?;
-                if imm.shift12() {
-                    write!(ctx, ", lsl #12")?;
-                }
-                Ok(())
-            }
+            } => emit_add_sub_imm12(ctx, alu_name(*op), *size, *dst, *src, *imm),
             Self::AluRRImmLogic {
                 op,
                 size,
@@ -1487,17 +1477,7 @@ impl MachInstEmit for MInst {
                 dst,
                 src,
                 imm,
-            } => {
-                write!(ctx, "subs ")?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
-                write!(ctx, ", ")?;
-                emit_reg(ctx, *src, *size)?;
-                write!(ctx, ", #{}", imm.value())?;
-                if imm.shift12() {
-                    write!(ctx, ", lsl #12")?;
-                }
-                Ok(())
-            }
+            } => emit_add_sub_imm12(ctx, "subs", *size, *dst, *src, *imm),
             Self::AndsRRImmLogic {
                 size,
                 dst,
@@ -2120,6 +2100,28 @@ fn emit_load_imm(
     }
     Ok(())
 }
+
+/// Emit an add/sub-immediate form (`op rd, rn, #imm`, optionally
+/// `, lsl #12`).  Shared by `AluRRImm12` and the fused `SubsRRImm12`.
+fn emit_add_sub_imm12(
+    ctx: &mut dyn EmitContext,
+    mnemonic: &str,
+    size: OperandSize,
+    dst: WritableReg,
+    src: Reg,
+    imm: Imm12,
+) -> core::fmt::Result {
+    write!(ctx, "{mnemonic} ")?;
+    emit_reg(ctx, dst.to_reg(), size)?;
+    write!(ctx, ", ")?;
+    emit_reg(ctx, src, size)?;
+    write!(ctx, ", #{}", imm.value())?;
+    if imm.shift12() {
+        write!(ctx, ", lsl #12")?;
+    }
+    Ok(())
+}
+
 fn emit_float_rr(ctx: &mut dyn EmitContext, op: &str, dst: Reg, src: &Reg) -> core::fmt::Result {
     write!(ctx, "{op} ")?;
     emit_float_reg(ctx, dst, false)?;

@@ -3105,6 +3105,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     // own apply path (the elementwise/B1 machinery does not understand the
     // body accumulator chain).
     if plan.multi_arm.is_some() {
+        let _ = std::env::var("MULTI_ARM_OFF");
+        if std::env::var("MULTI_ARM_OFF").is_ok() {
+            return false;
+        }
         return apply_multi_arm(data, plan);
     }
     let VecPlan {
@@ -4488,7 +4492,7 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         counter: _,
         entry_i0,
         trip,
-        bound_inst: _,
+        bound_inst,
         runtime_trip,
         latch_branch,
         t_next: _,
@@ -4503,39 +4507,82 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         test_at_top,
         arm: _,
         multi_arm,
-        unroll,
+        unroll: _,
     } = plan;
     let Some(multi) = multi_arm else {
         return false;
     };
     let step = VF;
     let i32 = Type::get_i32();
-    // Phase 3a only: compile-time trip that is a multiple of VF (no scalar
-    // tail / epilogue). Runtime bounds and remainders stay scalar.
+    if !test_at_top {
+        return false;
+    }
+    // Phase 3a only: a compile-time trip that is a multiple of VF. A scalar
+    // epilogue for remainders is not wired, and the runtime-bound tail loop
+    // lowering (spilled row offsets) is not yet correct — such loops stay
+    // scalar (conservative) until the apply side handles them soundly.
     if runtime_trip || trip % step != 0 {
         if std::env::var("M44_TRACE").is_ok() {
-            eprintln!("[M44] func={} header={header:?} reject=multi_arm_tail_unsupported",
+            eprintln!("[M44] func={} header={header:?} reject=multi_arm_runtime_unsupported",
                 data.name());
         }
         return false;
     }
-    if !test_at_top {
-        return false;
-    }
     let q = trip / step;
     let n_passthrough = passthrough_args.len();
-    // The exit arguments: the accumulator (reduced), the IV final value
-    // (`i0 + step*q`, the loop runs exactly `q` vector iterations), and the
-    // passthrough values.
     let has_iv_final = exit_specs.iter().any(|spec| *spec == ExitArgSpec::IvFinal);
     let has_acc = exit_specs.iter().any(|spec| *spec == ExitArgSpec::Acc);
-    let iv_final_const = has_iv_final
-        .then(|| data.new_local_inst().integer((entry_i0 + step * q) as i32));
+    let i0_inst = data.new_local_inst().integer(entry_i0 as i32);
+    // Runtime-bound counter: `trip = bound - i0`, `cnt0 = trip & -4` — the
+    // vector loop runs `cnt0 / 4` iterations and the scalar tail covers the
+    // `trip & 3` remainder.
+    let (counter_entry, iv0): (Inst, Inst) = if runtime_trip {
+        let trip_rt = alloc_inst(
+            data,
+            Binary::new_data(bound_inst, i0_inst, BinaryOp::Sub, i32.clone()),
+        );
+        data.layout_mut().insert_inst_before(entry_edge, trip_rt);
+        let neg_four = data.new_local_inst().integer(-(step as i32));
+        let cnt0 = alloc_inst(
+            data,
+            Binary::new_data(trip_rt, neg_four, BinaryOp::And, i32.clone()),
+        );
+        data.layout_mut().insert_inst_before(entry_edge, cnt0);
+        // `iv0 = i0 + max(cnt0, 0)` — the scalar tail's entry index (a
+        // negative trip clamps back to `i0` so the tail runs zero rounds).
+        let zero_cmp = data.new_local_inst().integer(0);
+        let positive = alloc_inst(
+            data,
+            Binary::new_data(cnt0, zero_cmp, BinaryOp::Gt, i32.clone()),
+        );
+        let cnt_clamped = alloc_inst(
+            data,
+            Select::new_data(positive, cnt0, zero_cmp, i32.clone()),
+        );
+        data.layout_mut().insert_inst_before(entry_edge, positive);
+        data.layout_mut().insert_inst_before(entry_edge, cnt_clamped);
+        let start = alloc_inst(
+            data,
+            Binary::new_data(i0_inst, cnt_clamped, BinaryOp::Add, i32.clone()),
+        );
+        data.layout_mut().insert_inst_before(entry_edge, start);
+        (cnt0, start)
+    } else {
+        let cq = data.new_local_inst().integer(q as i32);
+        (cq, cq)
+    };
+    let iv_final_const = has_iv_final.then(|| {
+        if runtime_trip {
+            bound_inst
+        } else {
+            data.new_local_inst().integer((entry_i0 + step * q) as i32)
+        }
+    });
 
     // ---- 1. Trip counter (test-at-top): a new header parameter entered at
-    //      `q`, stepped by `-1` per vector round (counter' = counter - 4,
-    //      with the `-4` folding into the loop's step idiom), and tested
-    //      `!= 0` at the header in place of the bound test.
+    //      `counter_entry` (q, or the runtime `trip & -4`), stepped by
+    //      `-step` per vector round, tested at the header in place of the
+    //      bound test.
     let four = data.new_local_inst().integer(step as i32);
     let param_index = data.bb_data(header).params().len() + 1;
     let counter_bar = alloc_inst(data, BlockArgRef::new_data(param_index, i32.clone()));
@@ -4557,11 +4604,16 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         }
     }
     // Unit 0's branch seeds the chain with a compile-time 0; it must become
-    // a zero vector (`splat(0)`). The then block's `add 0, mul` splats the
-    // scalar 0 independently.
+    // a zero vector (`splat(0)`). Defined in the entry block (it dominates
+    // the body_br0 branch and the entry edge's accumulator argument). The
+    // then block's `add 0, mul` splats the scalar 0 independently.
     let zero = data.new_local_inst().integer(0);
     let vzero = alloc_inst(data, VectorSplat::new_data(zero, vector_ty.clone()));
-    data.layout_mut().insert_inst_before(multi.units[0].add, vzero);
+    {
+        let preheader = data.layout().parent_bb(entry_edge).unwrap();
+        let entry_term = data.layout().basicblock(preheader).terminator();
+        data.layout_mut().insert_inst_before(entry_term, vzero);
+    }
     {
         let (cond, t_target, t_args, f_target, f_args) = {
             let branch = data.layout().basicblock(multi.units[0].body_br).terminator();
@@ -4587,11 +4639,16 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
 
     // ---- 3. Body vectorization.
     //      The lane counter `iv_vec = splat(iv) + [0,1,2,3]` drives the
-    //      mask columns; shared by every unit (then0 dominates the chain).
+    //      mask columns; shared by every unit. It must be defined in the
+    //      first unit's *body_br* (the chain's common dominator): the units'
+    //      `then` blocks are reachable around each other via the mask's
+    //      false edge (`br mask, then, end`), so no single `then` dominates
+    //      the rest.
+    let body_br0_term = data.layout().basicblock(multi.units[0].body_br).terminator();
     let iv_splat = alloc_inst(data, VectorSplat::new_data(iv, vector_ty.clone()));
-    data.layout_mut().insert_inst_before(multi.units[0].add, iv_splat);
+    data.layout_mut().insert_inst_before(body_br0_term, iv_splat);
     let lane_off = alloc_inst(data, VectorSplat::new_data(zero, vector_ty.clone()));
-    data.layout_mut().insert_inst_before(multi.units[0].add, lane_off);
+    data.layout_mut().insert_inst_before(body_br0_term, lane_off);
     for k in 1..VF as i64 {
         let c = data.new_local_inst().integer(k as i32);
         let idx = data.new_local_inst().integer(k as i32);
@@ -4599,13 +4656,13 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             data,
             VectorInsertElement::new_data(lane_off, c, idx, vector_ty.clone()),
         );
-        data.layout_mut().insert_inst_before(multi.units[0].add, lane_off);
+        data.layout_mut().insert_inst_before(body_br0_term, lane_off);
     }
     let iv_vec = alloc_inst(
         data,
         Binary::new_data(iv_splat, lane_off, BinaryOp::Add, vector_ty.clone()),
     );
-    data.layout_mut().insert_inst_before(multi.units[0].add, iv_vec);
+    data.layout_mut().insert_inst_before(body_br0_term, iv_vec);
 
     for unit in &multi.units {
         // load_in: contiguous vector load (address stays scalar).
@@ -4615,7 +4672,8 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         };
         data.replace_inst_with(unit.load_in)
             .raw(Load::new_data(load_src, vector_ty.clone()));
-        // mul: lane-wise.
+        // mul: lane-wise. The invariant K splat must be defined *before* the
+        // mul (anchor on the mul itself, not the later add).
         let vl = vector_operand(
             data,
             &mut FxHashMap::default(),
@@ -4623,7 +4681,7 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             &payload,
             &classes,
             &vector_ty,
-            unit.add,
+            unit.mul,
         );
         let vr = vector_operand(
             data,
@@ -4632,7 +4690,7 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             &payload,
             &classes,
             &vector_ty,
-            unit.add,
+            unit.mul,
         );
         data.replace_inst_with(unit.mul)
             .raw(Binary::new_data(vl, vr, BinaryOp::Mul, vector_ty.clone()));
@@ -4714,6 +4772,41 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             .raw(Binary::new_data(acc_v, mul_masked, BinaryOp::Add, vector_ty.clone()));
     }
 
+    // The scalar tail (runtime trips) references each unit's row-bound
+    // `rr_ok` and the In access's invariant row offset — both of which the
+    // compiler may have placed inside the loop body. That would leave the
+    // loop-external tail with a non-dominating definition (and the vector
+    // loop may run zero iterations, so the body never executes). Promote
+    // the invariant chains to the header.
+    for unit in &multi.units {
+        if let Some(rr) = unit.rr_ok {
+            promote_body_invariant(data, rr, &multi.units, header, iv);
+        }
+        // The In offset's invariant row term (`invariant_part + cc`).
+        if let InstKind::Load(l) = data.inst_data(unit.load_in).kind() {
+            if let InstKind::GetElemPtr(g) = data.inst_data(l.src()).kind() {
+                if let Some(&off) = g.offsets().last() {
+                    if let InstKind::Binary(b) = data.inst_data(off).kind() {
+                        if b.op() == BinaryOp::Add {
+                            let (lhs, rhs) = (b.lhs(), b.rhs());
+                            let lhs_iv = offset_contains_iv(data, lhs, iv);
+                            let rhs_iv = offset_contains_iv(data, rhs, iv);
+                            match (lhs_iv, rhs_iv) {
+                                (true, false) => {
+                                    promote_body_invariant(data, rhs, &multi.units, header, iv);
+                                }
+                                (false, true) => {
+                                    promote_body_invariant(data, lhs, &multi.units, header, iv);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ---- 4. Step the IV and the accumulator pointer by VF; append the
     //      counter to the latch's back jump. The latch's Out store already
     //      carries the (re-typed) vector accumulator — no rewrite needed.
@@ -4761,8 +4854,7 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     }
 
     // ---- 5. Entry edge: seed the accumulator carrier with `splat(0)` and
-    //      enter the counter at `q`.
-    let q_inst = data.new_local_inst().integer(q as i32);
+    //      enter the counter at `counter_entry` (q or the runtime `trip&-4`).
     let entry_kind = data.inst_data(entry_edge).kind().clone();
     match entry_kind {
         InstKind::Jump(j) => {
@@ -4774,17 +4866,18 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             if multi.acc_slot < args.len() {
                 args[multi.acc_slot] = vzero;
             }
-            args.push(q_inst);
+            args.push(counter_entry);
             data.replace_inst_with(entry_edge).jump(j.target(), args);
         }
         _ => unreachable!(),
     }
 
-    // ---- 6. Reduce block + exit. The header's bound test becomes the
-    //      counter test (`counter != 0`); its false edge enters a reduce
-    //      block that horizontally reduces the vector accumulator and
-    //      jumps to the exit with the scalar sum, the IV final value, and
-    //      the passthrough values.
+    // ---- 6. Reduce block + (runtime) scalar tail + exit. The header's
+    //      bound test becomes the counter test; its false edge enters a
+    //      reduce block that horizontally reduces the vector accumulator.
+    //      A runtime trip then enters a scalar tail loop that continues the
+    //      accumulation over the `trip & 3` remainder; a const trip jumps
+    //      straight to the exit.
     let mut reduce_param_tys = vec![i32.clone(); n_passthrough];
     reduce_param_tys.insert(0, vector_ty.clone());
     let reduce_block = data
@@ -4797,21 +4890,122 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         VectorReduce::new_data(VectorReduceOp::Add, acc_v_param, i32.clone()),
     );
     data.layout_mut().insert_inst(reduce_block, acc_scalar);
-    let exit_args = build_exit_args(
-        &exit_specs,
-        &passthrough_args,
-        has_acc.then_some(acc_scalar),
-        iv_final_const,
-    );
-    let reduce_jump = data.new_local_inst().jump(exit, exit_args);
+    // The tail's scalar accumulator parameter (runtime trips), resolved after
+    // the tail loop is built; used to rewrite the exit terminator's reads.
+    let mut tail_acc: Option<Inst> = None;
+    let (reduce_target, reduce_args): (BasicBlock, Vec<Inst>) = if runtime_trip {
+        // Build the scalar tail loop (below) and enter it at `iv0` with the
+        // reduced sum as the accumulator seed. The tail's Out writes mirror
+        // the latch's Out store (base + iv-t-indexed offsets).
+        // The tail's Out write mirrors the latch's Out store: `base +
+        // (invariant_row_off + iv_t)`.
+        let (out_base, out_row_off) = {
+            let lt = data.layout().basicblock(latch);
+            let store_dest = lt
+                .insts()
+                .iter()
+                .copied()
+                .find_map(|i| match data.inst_data(i).kind() {
+                    InstKind::Store(s) => Some(s.dest()),
+                    _ => None,
+                })
+                .expect("a multi-arm latch stores the accumulator");
+            let (base, offsets) = match data.inst_data(store_dest).kind() {
+                InstKind::GetElemPtr(g) => (g.base(), g.offsets().to_vec()),
+                _ => unreachable!(),
+            };
+            let off = *offsets.last().unwrap();
+            let inv = match data.inst_data(off).kind() {
+                InstKind::Binary(b) if b.op() == BinaryOp::Add => {
+                    let (l, r) = (b.lhs(), b.rhs());
+                    let l_iv = offset_contains_iv(data, l, iv);
+                    let r_iv = offset_contains_iv(data, r, iv);
+                    match (l_iv, r_iv) {
+                        (true, false) => r,
+                        (false, true) => l,
+                        _ => off,
+                    }
+                }
+                _ => off,
+            };
+            (base, inv)
+        };
+        let tail_h = build_multi_arm_tail(
+            data,
+            &multi,
+            &exit_specs,
+            &passthrough_args,
+            bound_inst,
+            out_base,
+            out_row_off,
+            entry_i0,
+            exit,
+            reduce_block,
+            has_acc,
+            has_iv_final,
+            n_passthrough,
+        );
+        let mut fwd = vec![iv0, acc_scalar];
+        fwd.extend(passthrough_args.iter().copied());
+        tail_acc = Some(data.bb_data(tail_h).params()[1]);
+        (tail_h, fwd)
+    } else {
+        let exit_args = build_exit_args(
+            &exit_specs,
+            &passthrough_args,
+            has_acc.then_some(acc_scalar),
+            iv_final_const,
+        );
+        (exit, exit_args)
+    };
+    let reduce_jump = data.new_local_inst().jump(reduce_target, reduce_args);
     data.layout_mut().insert_inst(reduce_block, reduce_jump);
+    // The exit block has no parameters (its terminator jumps to the outer
+    // loop), but it reads the header IV and accumulator by SSA dominance.
+    // Both are now vector / stale: rewrite the terminator's references to
+    // the scalar final values (the reduced accumulator — defined in the
+    // reduce block, or the tail's scalar accumulator — and the IV final).
+    {
+        let exit_term = data.layout().basicblock(exit).terminator();
+        let mut uses_acc = false;
+        let mut uses_iv = false;
+        if let InstKind::Jump(j) = data.inst_data(exit_term).kind() {
+            uses_acc = j.args().contains(&multi.acc);
+            uses_iv = j.args().contains(&iv);
+        }
+        if uses_acc {
+            let acc_v = match tail_acc {
+                Some(t) => t,
+                None => acc_scalar,
+            };
+            subst_operand(data, exit_term, multi.acc, acc_v);
+        }
+        if uses_iv {
+            let iv_v = if runtime_trip {
+                bound_inst
+            } else {
+                data.new_local_inst().integer((entry_i0 + step * q) as i32)
+            };
+            subst_operand(data, exit_term, iv, iv_v);
+        }
+    }
 
     let header_term = data.layout().basicblock(header).terminator();
-    if let InstKind::Branch(hb) = data.inst_data(header_term).kind() {
-        let counter_test = alloc_inst(
-            data,
-            Binary::new_data(counter_bar, zero, BinaryOp::NotEq, i32.clone()),
-        );
+    if let InstKind::Branch(_) = data.inst_data(header_term).kind() {
+        let counter_test = if runtime_trip {
+            // `gt(counter, 0)`: a negative `cnt0` (negative trip) must not
+            // spin the vector loop forever.
+            let z = data.new_local_inst().integer(0);
+            alloc_inst(
+                data,
+                Binary::new_data(counter_bar, z, BinaryOp::Gt, i32.clone()),
+            )
+        } else {
+            alloc_inst(
+                data,
+                Binary::new_data(counter_bar, zero, BinaryOp::NotEq, i32.clone()),
+            )
+        };
         data.layout_mut().insert_inst_before(header_term, counter_test);
         let body_target = multi.units[0].body_br;
         let mut reduce_args = vec![multi.acc];
@@ -4827,6 +5021,230 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
 
     let _ = latch_branch;
     true
+}
+
+/// Promote the loop-invariant chain rooted at `root` — instructions defined
+/// in the multi-arm body blocks (a row-bound `rr_ok` scalar, whose
+/// definition the compiler placed inside the loop) — into the header, so the
+/// loop-external scalar tail can reference them. Returns None when any
+/// body-defined dependency references the IV (not invariant).
+fn promote_body_invariant(
+    data: &mut ArenaContextMut<'_>,
+    root: Inst,
+    units: &[MultiArmUnit],
+    header: BasicBlock,
+    iv: Inst,
+) -> Option<Inst> {
+    let mut ordered: Vec<Inst> = Vec::new();
+    let mut seen: FxHashSet<Inst> = FxHashSet::default();
+    fn visit(
+        data: &FunctionData,
+        inst: Inst,
+        units: &[MultiArmUnit],
+        iv: Inst,
+        ordered: &mut Vec<Inst>,
+        seen: &mut FxHashSet<Inst>,
+    ) -> bool {
+        if !seen.insert(inst) {
+            return true;
+        }
+        let in_body = data.layout().parent_bb(inst).is_some_and(|bb| {
+            units
+                .iter()
+                .any(|u| u.body_br == bb || u.then == bb || u.end == bb)
+        });
+        if !in_body {
+            return true;
+        }
+        if offset_contains_iv(data, inst, iv) {
+            return false;
+        }
+        for dep in data.inst_data(inst).inst_usage() {
+            if !visit(data, dep, units, iv, ordered, seen) {
+                return false;
+            }
+        }
+        ordered.push(inst);
+        true
+    }
+    if !visit(data, root, units, iv, &mut ordered, &mut seen) {
+        return None;
+    }
+    let in_loop_blocks: Vec<(BasicBlock, Inst)> = ordered
+        .iter()
+        .filter_map(|&inst| data.layout().parent_bb(inst).map(|bb| (bb, inst)))
+        .collect();
+    for (bb, inst) in in_loop_blocks {
+        data.layout_mut().remove_inst(bb, inst);
+    }
+    let header_term = data.layout().basicblock(header).terminator();
+    for inst in ordered {
+        data.layout_mut().insert_inst_before(header_term, inst);
+    }
+    Some(root)
+}
+
+/// Build the scalar tail loop for a multi-arm kernel over the `trip & 3`
+/// remainder (`while (iv < bound) { acc op= mask·In·K; Out[iv] = acc; iv++ }`).
+/// The tail's Out write mirrors the latch's store at `base + (row_off +
+/// iv_t)`. Returns the tail header.
+#[allow(clippy::too_many_arguments)]
+fn build_multi_arm_tail(
+    data: &mut ArenaContextMut<'_>,
+    multi: &MultiArmPlan,
+    exit_specs: &[ExitArgSpec],
+    passthrough_args: &[Inst],
+    bound: Inst,
+    out_base: Inst,
+    out_row_off: Inst,
+    i0: i64,
+    exit: BasicBlock,
+    after: BasicBlock,
+    has_acc: bool,
+    has_iv_final: bool,
+    n_passthrough: usize,
+) -> BasicBlock {
+    let i32 = Type::get_i32();
+    let mut param_tys = vec![i32.clone(); 1 + n_passthrough];
+    param_tys.insert(1, i32.clone());
+    let tail_h = data
+        .new_basic_block()
+        .basic_block("vec_tail_ma".into(), param_tys);
+    let tail_l = data
+        .new_basic_block()
+        .basic_block("vec_tail_ma_latch".into(), vec![]);
+    data.layout_mut().insert_bb_after(after, tail_h);
+    data.layout_mut().insert_bb_after(tail_h, tail_l);
+    let iv_t = data.bb_data(tail_h).params()[0];
+    let acc_t = data.bb_data(tail_h).params()[1];
+    let cond = alloc_inst(data, Binary::new_data(iv_t, bound, BinaryOp::Lt, i32.clone()));
+    let exit_args = build_exit_args(
+        exit_specs,
+        passthrough_args,
+        has_acc.then_some(acc_t),
+        has_iv_final.then_some(bound),
+    );
+    let tail_br = data
+        .new_local_inst()
+        .branch(cond, tail_l, vec![], exit, exit_args);
+    data.layout_mut().insert_inst(tail_h, cond);
+    data.layout_mut().insert_inst(tail_h, tail_br);
+
+    // Tail latch: straight-line masked multiply-accumulate chain.
+    let mut insts: Vec<Inst> = Vec::new();
+    let one = data.new_local_inst().integer(1);
+    let zero = data.new_local_inst().integer(0);
+    let i0_inst = data.new_local_inst().integer(i0 as i32);
+    let mut acc_cur = acc_t;
+    for unit in &multi.units {
+        let kc = data.new_local_inst().integer(unit.kc_off as i32);
+        let cc_t = alloc_inst(data, Binary::new_data(iv_t, kc, BinaryOp::Add, i32.clone()));
+        insts.push(cc_t);
+        let ge0 = alloc_inst(data, Binary::new_data(cc_t, zero, BinaryOp::Ge, i32.clone()));
+        insts.push(ge0);
+        let lt = alloc_inst(data, Binary::new_data(cc_t, bound, BinaryOp::Lt, i32.clone()));
+        insts.push(lt);
+        let mut m = alloc_inst(data, Binary::new_data(ge0, lt, BinaryOp::And, i32.clone()));
+        insts.push(m);
+        if let Some(rr) = unit.rr_ok {
+            m = alloc_inst(data, Binary::new_data(m, rr, BinaryOp::And, i32.clone()));
+            insts.push(m);
+        }
+        // In[rr][cc] = *(In_base + off), off = row_off + cc_t.
+        let (in_base, off) = match data.inst_data(unit.load_in).kind() {
+            InstKind::Load(l) => match data.inst_data(l.src()).kind() {
+                InstKind::GetElemPtr(g) => (
+                    g.base(),
+                    g.offsets().last().copied().unwrap_or(unit.cc),
+                ),
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        let inv_part: Inst = match data.inst_data(off).kind() {
+            InstKind::Binary(b) if b.op() == BinaryOp::Add => {
+                let (l, r) = (b.lhs(), b.rhs());
+                if l == unit.cc {
+                    r
+                } else if r == unit.cc {
+                    l
+                } else {
+                    off
+                }
+            }
+            _ => off,
+        };
+        let off_t = alloc_inst(data, Binary::new_data(inv_part, cc_t, BinaryOp::Add, i32.clone()));
+        insts.push(off_t);
+        let addr_t = alloc_inst(
+            data,
+            GetElemPtr::new_data(in_base, vec![off_t], data.inst_data(in_base).ty().clone()),
+        );
+        insts.push(addr_t);
+        let ld_in = alloc_inst(data, Load::new_data(addr_t, i32.clone()));
+        insts.push(ld_in);
+        // K[k].
+        let (k_base, k_off) = match data.inst_data(unit.load_k).kind() {
+            InstKind::Load(l) => match data.inst_data(l.src()).kind() {
+                InstKind::GetElemPtr(g) => (
+                    g.base(),
+                    g.offsets().last().copied().unwrap(),
+                ),
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        let k_addr = alloc_inst(
+            data,
+            GetElemPtr::new_data(k_base, vec![k_off], data.inst_data(k_base).ty().clone()),
+        );
+        insts.push(k_addr);
+        let ld_k = alloc_inst(data, Load::new_data(k_addr, i32.clone()));
+        insts.push(ld_k);
+        let mul = alloc_inst(data, Binary::new_data(ld_in, ld_k, BinaryOp::Mul, i32.clone()));
+        insts.push(mul);
+        let delta = alloc_inst(data, Select::new_data(m, mul, zero, i32.clone()));
+        insts.push(delta);
+        acc_cur = alloc_inst(data, Binary::new_data(acc_cur, delta, BinaryOp::Add, i32.clone()));
+        insts.push(acc_cur);
+    }
+    // Out[iv_t] = acc: `out_base + (out_row_off + iv_t)`.
+    let out_off = alloc_inst(
+        data,
+        Binary::new_data(out_row_off, iv_t, BinaryOp::Add, i32.clone()),
+    );
+    insts.push(out_off);
+    let out_addr = alloc_inst(
+        data,
+        GetElemPtr::new_data(out_base, vec![out_off], data.inst_data(out_base).ty().clone()),
+    );
+    insts.push(out_addr);
+    let out_store = alloc_inst(data, Store::new_data(acc_cur, out_addr));
+    insts.push(out_store);
+    let iv_t_next = alloc_inst(data, Binary::new_data(iv_t, one, BinaryOp::Add, i32.clone()));
+    insts.push(iv_t_next);
+    let mut back_args: Vec<Inst> = vec![iv_t_next, acc_cur];
+    back_args.extend(passthrough_args.iter().copied());
+    insts.push(data.new_local_inst().jump(tail_h, back_args));
+    for inst in insts {
+        data.layout_mut().insert_inst(tail_l, inst);
+    }
+    tail_h
+}
+
+/// Whether a GEP offset expression references the index IV (recursing the
+/// add/sub tree); the multi-arm tail uses it to split an Out offset into its
+/// invariant row term and the IV term.
+fn offset_contains_iv(data: &FunctionData, inst: Inst, iv: Inst) -> bool {
+    if inst == iv {
+        return true;
+    }
+    match data.inst_data(inst).kind() {
+        InstKind::Binary(b) => {
+            offset_contains_iv(data, b.lhs(), iv) || offset_contains_iv(data, b.rhs(), iv)
+        }
+        _ => false,
+    }
 }
 
 /// Allocate a local instruction through the mutable arena context. A

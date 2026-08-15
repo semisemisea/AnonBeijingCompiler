@@ -8,7 +8,7 @@
 //!
 //! - [`pass`]：`Pass` trait、`ArenaContext`/`ArenaContextMut`（pass 读写 IR
 //!   的句柄）、`PassesManager`（管线装配与固定点循环）。
-//! - `passes/`（32 个）：具体优化。例：`simplify_cfg`、`licm`、`gvn`、
+//! - `passes/`（31 个模块）：具体优化。例：`simplify_cfg`、`licm`、`gvn`、
 //!   `loop_unroll`、`rotate_loops`、`ipsccp`、`inline`、`tco`、
 //!   `pointer_strength_reduction`、`chain_to_switch`（仅 AArch64）、
 //!   `matmul_interchange`、`recursive_memoize` 等。

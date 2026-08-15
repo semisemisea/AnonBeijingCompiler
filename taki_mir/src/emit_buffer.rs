@@ -1,6 +1,6 @@
 //! Text-level machine-code emission buffer, modeled on Cranelift's MachBuffer.
 //!
-//! Every slot corresponds to exactly one fixed-width (4-byte) instruction.
+//! Every **text** slot corresponds to exactly one fixed-width (4-byte) instruction.
 //! Instructions are accumulated as text templates, so branch optimization can
 //! truncate, invert, or retarget a branch in O(1) without patching bytes.
 //!
@@ -35,7 +35,7 @@
 //!
 //! [`Slot`] 是缓冲区的核心，枚举成员只有三类：`Text`（普通指令文本）、
 //! `Branch`（符号化分支）、`Veneer`（跳板）——**没有独立的 Label 槽**，
-//! 标签位置由 `bind_label` 记录在单独的结构里（branch 槽持有
+//! 标签位置由 `bind_label` 记录在单独的结构里（branch 的簿记记录持有
 //! `labels_at_this_branch`）。
 
 use core::fmt::Write as _;

@@ -14,9 +14,10 @@
 //!   VCode，返回整段汇编文本。后端可直接用它发射手工构造的机器层程序
 //!   （如显式 SIMD VCode 验证）。
 //! - `emit_legalized`：发射前先跑 `ABISpec::legalize_inst` 做**伪寻址展开**——
-//!   把分配后依赖栈帧的伪寻址指令（如 `StackAMode` 伪指令）展开成实际
-//!   sp 偏移的指令（`FrameLayout` 已知），再逐条 emit。实现见
-//!   `anon_armv8/src/abi.rs` 的 `legalize_inst`。
+//!   把分配后依赖栈帧的伪寻址指令（`MInst::StackAddr` + `AMode::FrameSlot`）
+//!   展开成实际 sp 偏移的指令（`FrameLayout` 已知），再逐条 emit。**仅作用于
+//!   ABI 生成的序言/尾声指令**；正文 VCode 指令已 finalize，直接走
+//!   `inst.emit`。实现见 `anon_armv8/src/abi.rs` 的 `legalize_inst`。
 //!
 //! ## 与 emit_buffer 的分工
 //!

@@ -10,7 +10,7 @@ SysY2026 源码
   ├─ soyo_compiler（前端）：sysy.lalrpop 语法 → AST → RaanaIR 下降
   ├─ raana_ir（IR + 优化）：
   │  ├─ ir/        IR 定义（Program/Function/Inst/arena）
-  │  ├─ opt/passes.rs     优化 pass 注册（31 个模块，约 33 个 pass 实例，目标无关）
+  │  ├─ opt/passes.rs     优化 pass 注册（31 个模块，约 33 个 pass 实例；chain_to_switch 等按 TargetPolicy 门控）
   │  ├─ opt/passes/       pass 实现（dce.rs 一个文件含多个 pass）
   │  ├─ opt/analysis_passes/ 分析（11 个，快照）
   │  ├─ opt/pass.rs        管线调度（PassesManager::from_config）
@@ -43,7 +43,7 @@ SysY2026 源码
 | `taki_mir::lower::LowerBackend` | taki_mir | `AArch64Backend`/RISC-V 后端 | **加新 IR 指令**或改指令选择时 |
 | `taki_mir::abi::ABIMachineSpec` | taki_mir | `AArch64Abi` | **改调用约定/栈帧/参数布局**时 |
 | `taki_mir::reg_alloc::function::Function` | taki_mir | VCode（已实现，一般不用动） | 基本不动 |
-| `raana_ir::opt::pass::Pass` | raana_ir | 每个优化 pass | **加新优化**时实现 `run` |
+| `raana_ir::opt::pass::Pass` | raana_ir | 每个优化 pass | **加新优化**时实现 `run_on`（trait 提供按函数分发的 `run` 默认实现） |
 | `raana_ir::ir::arena::Arena` | raana_ir | `ArenaContext`/`ArenaContextMut` | 基本不动 |
 | `anon_armv8::regs` 工厂函数 | anon_armv8 | — | 改寄存器分配策略（MachineEnv）时 |
 
@@ -114,9 +114,9 @@ trait、后端实现；要接入"IR 优化管线"的东西，就在 raana_ir 实
    →unreachable；
 3. 实现 `MachInstEmit`：`emit` 里写 `fmls v{d}, v{n}, v{m}`；
 4. `lower.rs`：在 `lower_binary`/`lower_fma` 的 match 里，当 op 匹配且目标
-   f32 向量时产出 `Fmls` 而不是 `Fmla`+`Neg`；
-5. `sched/`：若 A53 上 fmls 延迟与 fmla 不同，更新 `sched/dag.rs` 的延迟表
-   （`aarch53.rs` 是周期模型，`dag.rs` 才有指令分支）；
+   f32 向量时产出 `VecFmls` 而不是 `VecFmla`+`Neg`；
+5. `sched/`：`dag.rs` 加 `Fmls` 分支（定 SchedClass），`aarch53.rs` 的
+   `instr_profile` 设延迟（数值表在这里，`dag.rs` 只按 SchedClass 建边）；
 6. 验证：`cargo test -p taki_mir -p anon_armv8` + 单 case 差分
    （`make test functional/xxx.sy ARGS="-O 2"`）。
 

@@ -9,10 +9,11 @@
 SysY2026 源码
   ├─ soyo_compiler（前端）：sysy.lalrpop 语法 → AST → RaanaIR 下降
   ├─ raana_ir（IR + 优化）：
-  │    ir/        IR 定义（Program/Function/Inst/arena）
-  │    opt/passes/        优化 pass（32 个，目标无关）
-  │    opt/analysis_passes/ 分析（11 个，快照）
-  │    opt/pass.rs        管线调度（PassesManager::from_config）
+  │  ├─ ir/        IR 定义（Program/Function/Inst/arena）
+  │  ├─ opt/passes.rs     优化 pass 注册（31 个模块，约 33 个 pass 实例，目标无关）
+  │  ├─ opt/passes/       pass 实现（dce.rs 一个文件含多个 pass）
+  │  ├─ opt/analysis_passes/ 分析（11 个，快照）
+  │  ├─ opt/pass.rs        管线调度（PassesManager::from_config）
   ├─ taki_mir（共享后端基础设施）：
   │    vcode.rs   机器 IR（VCodeContainer<I>，指令泛型 I: VCodeInst）
   │    reg_alloc/ ION 寄存器分配（ion::run）
@@ -25,7 +26,9 @@ SysY2026 源码
   │    regs.rs    物理寄存器策略
   │    passes/    目标相关 MIR pass（build_pipeline）
   │    sched/     Cortex-A53 调度模型
-  └─ uika_riscv（RISC-V 后端，结构同上）
+  └─ uika_riscv（RISC-V 后端）：只有 abi/instructions/labels/lib/lower/regs
+       六个文件——**没有 passes/、sched/、config.rs、constants.rs**（RISC-V
+       当前无 MIR pass 层与调度模型）
 ```
 
 **判断口诀**：目标无关 → raana_ir；目标相关 → 对应后端；两个后端共用 → taki_mir；
@@ -59,7 +62,9 @@ trait、后端实现；要接入"IR 优化管线"的东西，就在 raana_ir 实
 │
 ├─ Q2: 是 IR 层优化（目标无关，如新 LICM 变体）？
 │    → raana_ir/src/opt/passes/ 新建 my_pass.rs 实现 Pass
-│    → passes/mod.rs 注册 → pass.rs::from_config 挂进管线
+│    → raana_ir/src/opt/passes.rs（**扁平文件**，非目录 mod.rs）加一行
+│      `pub mod my_pass;`
+│    → pass.rs::from_config 挂进管线
 │    → 需要分析先看 analysis_passes/ 有没有现成的（快照！）
 │
 ├─ Q3: 是目标相关优化（只对 AArch64 生效）？
@@ -103,25 +108,28 @@ trait、后端实现；要接入"IR 优化管线"的东西，就在 raana_ir 实
 ### 示例 A：加一条新指令（如 `fmls` 向量乘减）
 
 1. `anon_armv8/src/instructions.rs`：`MInst` 加 `Fmls { rd, rn, rm }` 变体
-   （参考现有 `Fmla`）；
+   （参考现有 `VecFmla`，instructions.rs:737）；
 2. 实现 `MachInst`：`get_operands` 上报三个操作数（分配器需要知道）；
    `is_move`→None；`is_term`→None；`rc_for_type`→Vector 类；`gen_jump`
    →unreachable；
 3. 实现 `MachInstEmit`：`emit` 里写 `fmls v{d}, v{n}, v{m}`；
 4. `lower.rs`：在 `lower_binary`/`lower_fma` 的 match 里，当 op 匹配且目标
    f32 向量时产出 `Fmls` 而不是 `Fmla`+`Neg`；
-5. `sched/`：若 A53 上 fmls 延迟与 fmla 不同，更新延迟表；
+5. `sched/`：若 A53 上 fmls 延迟与 fmla 不同，更新 `sched/dag.rs` 的延迟表
+   （`aarch53.rs` 是周期模型，`dag.rs` 才有指令分支）；
 6. 验证：`cargo test -p taki_mir -p anon_armv8` + 单 case 差分
    （`make test functional/xxx.sy ARGS="-O 2"`）。
 
 ### 示例 B：加一个 IR 优化 pass（如"冗余 load 消除"）
 
 1. `raana_ir/src/opt/passes/` 新建 `redundant_load_elim.rs`：
-   `pub struct RedundantLoadElim;` 实现 `Pass`（`run` 里用
-   `ArenaContextMut` 改写）；
+   `pub struct RedundantLoadElim;` 实现 `Pass`。`Pass` trait（pass.rs:90）
+   签名是 `fn run(&mut self, program: &mut Program) -> bool`（按函数分发的
+   默认实现）+ `fn run_on(&mut self, data: &mut ArenaContextMut) -> bool`——
+   **新 pass 通常实现 `run_on`**，返回是否改变了 IR（固定点收敛信号）；
 2. 需要内存分析 → 复用 `analysis_passes::memory`（注意它是快照，改 IR 后
    要重建）；
-3. `passes/mod.rs` 注册 `pub mod redundant_load_elim;`；
+3. `raana_ir/src/opt/passes.rs`（扁平文件）加 `pub mod redundant_load_elim;`；
 4. `pass.rs::from_config`：挂到固定点内（若需要迭代到不动点）或固定点外；
 5. 目标无关 → 不需要 TargetPolicy；若只想 AArch64 生效则加门控字段；
 6. 验证：inline 单测 → `cargo test -p raana_ir` → `make test ARGS="-O 2"`
@@ -135,4 +143,16 @@ trait、后端实现；要接入"IR 优化管线"的东西，就在 raana_ir 实
   `params()` 切片；
 - **只改后端不查 IR**：语义改动可能更适合在 IR 层做（更通用）；
 - **新 crate 依赖**：`dependencies/` 是 vendored 目录，新依赖必须先 vendor
-  （`.cargo/config.toml`），离线环境尤其注意。
+  （`.cargo/config.toml`），离线环境尤其注意；
+- **新增 `InstKind` 的跨层改动面**：除 lower（Q4/Q5）外，还要同步 IR dump
+  （`raana_ir/src/fmt/`）与 LLVM 导出（`raana_ir/src/llvm/`），漏一处后端
+  会 panic；
+- **测试 harness 默认 -O0**：性能改动必须显式 `make test ARGS="-O 2"`；
+  每用例编译两次（`--emit ir` dump 崩溃显示为 CE）；残留容器 `soyo-test`
+  会导致跑错用例集（详见 test-harness.md）。
+
+## 5. 与 rustdoc 的关系
+
+本文件第 1 节的 trait 方法清单与 `taki_mir/src/vcode.rs` 的 rustdoc 表格
+高度重复——**以 rustdoc 为准**（`cargo doc` 可查），本文件只保留"改什么
+看哪"的落点列，trait 改方法名时只改 rustdoc 一处。

@@ -33,6 +33,18 @@
 //!   （`docs/Convention.md`）；
 //! - block 参数的位置必须匹配目标块 `params()` 切片（[`BlockArgRef`]），
 //!   不是随便一个 index。
+//!
+//! ## 新增指令/类型的检查清单（防漏改）
+//!
+//! 加一个 `InstKind` 变体或 `TypeKind` 成员，以下位置**全部**要同步：
+//!
+//! 1. `inst_kind.rs`（或对应子模块）加变体；
+//! 2. `instruction.rs`/`InstData`（若需要新字段）；
+//! 3. `builder.rs` 加构造方法（builder 是唯一写入口）；
+//! 4. `fmt/`（IR dump 打印，`--emit ir` 会崩）；
+//! 5. `llvm/`（LLVM IR 导出，漏了 `make test-llvm` 会 CE）；
+//! 6. 后端 lower：`anon_armv8/src/lower.rs` 与 `uika_riscv/src/lower.rs`
+//!    （漏了会 unreachable panic）。
 
 pub mod arena;
 pub mod basic_block;

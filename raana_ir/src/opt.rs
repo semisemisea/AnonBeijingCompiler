@@ -22,23 +22,47 @@
 //!
 //! ## 管线结构（from_config 速览）
 //!
+//! 缩写展开：**GSP**=标量全局提升（scalar global promotion）、**PSR**=指针
+//! 强度削减（pointer strength reduction）、**SR**=强度削减（strength
+//! reduction）、**TCO**=尾调用优化、**IPSCCP**=过程间稀疏条件常量传播、
+//! **GVNPRE**=基于 GVN 的部分冗余消除。
+//!
 //! 初始阶段：SSA → Specialize → Inline → TCO → ColumnMajor → GSP；
 //! 固定点内循环：IPSCCP, SimplifyCFG, LoopUnroll, RotateLoops, ZeroStoreLoop,
 //! ChainToSwitch, LICM, GVN, PSR, SR, InvariantReductionHoisting,
 //! ReductionUnroll, IfConversion, TCO, TailRecursiveInline,
-//! BooleanSimplification, GVNPRE, DeadPhiElim, DCE（完整顺序以
-//! `pass.rs::from_config` 为准）。
+//! BooleanSimplification, GVNPRE, DeadPhiElim, DCE。
+//! 另有 DSE、GuardElimination、ModFold、MulmodRecognize（AArch64）、
+//! RecursiveMemoize（M68）、BlockedReduction、MatmulInterchange（AArch64）、
+//! DeadFunctionElimination 等按配置注册——**此处仅列主要 pass，完整顺序以
+//! `pass.rs::from_config` 为准**。
 //!
 //! ## 如何加一个 pass（详细）
 //!
-//! 1. 在 `passes/` 新建 `my_pass.rs`，实现 [`pass::Pass`]（run 里通过
-//!    `ArenaContextMut` 改 IR）；新分析放 `analysis_passes/`；
-//! 2. 在 `passes/mod.rs` 注册模块；在 `pass.rs::from_config` 按优化级别挂进
-//!    管线（固定点内：迭代到不动点；固定点外：只跑一遍）;
+//! 1. 在 `passes/` 新建 `my_pass.rs`，实现 [`pass::Pass`]——`Pass` trait
+//!    签名（pass.rs:90）：`fn run(&mut self, program: &mut Program) -> bool`
+//!    （按函数分发的默认实现）+ `fn run_on(&mut self, data: &mut
+//!    ArenaContextMut) -> bool`。**新 pass 通常实现 `run_on`，且必须如实
+//!    返回是否改变了 IR**——返回值是固定点收敛信号，恒返回 true 会在
+//!    `MAX_PIPELINE_ITERATIONS = 100` 轮后 panic；新分析放 `analysis_passes/`；
+//! 2. 在 `passes.rs`（扁平文件）注册模块；在 `pass.rs::from_config` 按优化
+//!    级别挂进管线（固定点内：迭代到不动点；固定点外：只跑一遍）;
 //! 3. **目标相关 pass 必须用 `TargetPolicy` 门控**（如
 //!    `enable_chain_to_switch`），否则 RISC-V 回归；
 //! 4. inline 单测 + `cargo test -p raana_ir` + `make test ARGS="-O 2"`
 //!    + `make test-riscv`（性能改动门禁，见 AGENTS.md）。
+//!
+//! 最小实现骨架：
+//!
+//! ```rust,ignore
+//! pub struct MyPass;
+//! impl Pass for MyPass {
+//!     fn run_on(&mut self, ctx: &mut ArenaContextMut) -> bool {
+//!         // 通过 ctx.program / ctx.curr_func 改 IR；返回是否真的改了
+//!         false
+//!     }
+//! }
+//! ```
 
 mod analysis_passes;
 pub mod config;

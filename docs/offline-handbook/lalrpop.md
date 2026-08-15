@@ -67,15 +67,18 @@ Stmt = MatchedStmt | OpenStmt      // 经典解法，见 §4
 | `r"regex"` | 正则 token（如 `Ident: Rc<str> = r"[_a-zA-Z][_a-zA-Z0-9]*"`） |
 | `<sym>` | 捕获符号值，放在动作表达式里的 `<>` 位置 |
 | `<name: sym>` | 命名捕获，动作里用 `name` |
-| `<T>*` / `<T>+` / `<T>?` | 重复/可选（`*` 配 `mut` 可 push） |
+| `<mut name: sym>` | 可变命名捕获（配 `<T>*` 用 `push` 收集列表，见 `Comma<T>` 规则） |
+| `<name: sym>?` | 可选捕获，动作里类型是 `Option<T>` |
+| `<T>*` / `<T>+` | 重复（`*` 配 `mut` 可 push） |
 | `<a: A> <b: B> => Expr {a, b}` | 动作代码：Rust 表达式，构造 AST |
 | `pub Name: ...` | 生成公开解析器（顶层规则必须 pub） |
 | `Comma<T>` | 规则可以泛型（本项目用它做逗号列表） |
 
-**正则 token 注意**：`match` 块里的正则最先匹配；数字字面量 `IntConst` 分三
-条：十进制 `[1-9][0-9]*`、八进制 `0[0-7]*`、十六进制 `0[xX]...`（顺序敏感，
-`0` 前缀要小心）。`FloatConst` 支持小数/科学计数/十六进制浮点，经辅助函数
-`parse_float_const` 处理。
+**正则 token 注意**：`match` 块里的正则最先匹配；**规则内字面量 token
+（`"int"`）永远优先于规则内正则 token（`Ident` 的 `r"..."`）**——这是
+lalrpop 与手写 lexer 的最大差异，也是"为什么不用写 `r"int"`"的答案。
+`IntConst` 三条（十进制/八进制/十六进制，顺序敏感）；`FloatConst` 支持
+小数/科学计数/十六进制浮点。
 
 ## 4. 两个关键技巧（本项目特色，维护时别拆坏）
 
@@ -92,27 +95,44 @@ Stmt = MatchedStmt | OpenStmt      // 经典解法，见 §4
 匹配。**新增带嵌套语句的语法（如 for/do-while）时，body 一律用
 `MatchedStmt`，否则会产生 shift/reduce 冲突。**
 
-## 5. 如何加一条语法规则（示例：加 `for` 循环）
+## 5. 如何加一条语法规则（示例：加 `for` 循环，完整可照抄）
 
-1. **AST**：`frontend/items.rs` 的 `Stmt` 枚举加 `ForStmt` 变体（含 init/
-   cond/step/body 字段，注意 body 用 `Box<Stmt>`）。
-2. **语法**：`sysy.lalrpop` 里加
+1. **AST**：`soyo_compiler/src/frontend/items.rs` 的 `Stmt` 枚举加变体：
+   ```rust
+   pub struct ForStmt {
+       pub init: Option<Exp>,
+       pub cond: Option<Exp>,
+       pub step: Option<Exp>,
+       pub body: Box<Stmt>,        // 嵌套语句必须 Box
+   }
+   // Stmt 枚举里：ForStmt(ForStmt),
+   ```
+2. **语法**：`sysy.lalrpop` 加规则，并加进 `MatchedStmt` 的分支（body 用
+   `MatchedStmt`！）：
    ```
    ForStmt: Stmt = "for" "(" <init: Exp?> ";" <cond: Exp?> ";" <step: Exp?> ")"
-                    <body: MatchedStmt> => Stmt::ForStmt(ForStmt{...});
+                    <body: MatchedStmt> =>
+       Stmt::ForStmt(ForStmt { init, cond, step, body: Box::new(body) }),
    ```
-   并把它加进 `MatchedStmt` 的分支（body 用 `MatchedStmt`！）。
    > 注：SysY2022 无 for，此例仅为演示；按比赛规则新增语法须谨慎。
-3. **下降**：`frontend.rs` 的 AST→RaanaIR 转换里处理 `Stmt::ForStmt`，
-   展开成 while + 块（init/step 放进块首尾）。
-4. 验证：`cargo build`（自动重新生成解析器）→ 写一个 `.sy` 用例编译。
+3. **下降**：`soyo_compiler/src/frontend/ast.rs` 的 AST→RaanaIR 转换
+   （`ToRaanaIR` impl）里处理 `Stmt::ForStmt`，展开成 while + 块（init 放
+   循环前、step 放块尾）。
+4. 验证：`cargo build`（自动重新生成解析器）→
+   `target/debug/compiler -S --target aarch64 -o /tmp/out.s 用例.sy` 编译
+   一个含 for 的用例；或看 `src/sysy.rs` 时间戳是否更新。
+
+> 若新语法无法展开成现有 IR 而需新指令，后续见 `interfaces.md`（G5）的
+> Q4/Q5。
 
 ## 6. 常见坑
 
 - **改 `.lalrpop` 后没生效**：`cargo build` 会自动跑 build.rs 重新生成；
   若用了增量缓存仍不生效，`touch` 一下 `.lalrpop` 或 `cargo clean -p soyo_compiler`。
-- **shift/reduce 冲突**：lalrpop 编译报错会列出冲突位置。先看是否涉及
-  `if` 嵌套（→ 用 MatchedStmt/OpenStmt）或 `BType Ident`（→ 用后缀闭包）。
+- **shift/reduce 冲突**：lalrpop 编译报错会列出冲突位置与涉及规则。排查
+  顺序：新加的规则是否带嵌套 body（→ 用 MatchedStmt/OpenStmt）？是否前缀
+  重叠（`BType Ident` → 用后缀闭包）？都不是 → 看 lalrpop 报错的
+  `ambiguous grammar` 段落，它直接给出冲突的两条推导路径。
 - **动作代码编译错**：`<>` 占位符按捕获顺序填；命名捕获后 `<>` 数量减少，
   顺序别乱。
 - **正则优先级**：`match` 块先匹配的赢；数字/标识符正则边界要写对

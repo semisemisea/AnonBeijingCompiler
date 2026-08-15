@@ -9,8 +9,10 @@
 - `soyo_compiler/Cargo.toml`：`lalrpop = "0.22.1"`（构建期生成解析器）、
   `lalrpop-util = { version = "0.22.1", features = ["lexer"] }`（运行时）。
 - `soyo_compiler/build.rs`：`lalrpop::process_root()` —— 编译时自动扫描
-  `src/*.lalrpop` 生成 `src/sysy.rs`（**改语法后重新 `cargo build` 即可，
-  生成是自动的**）。
+  `src/*.lalrpop` 并**生成解析器到 OUT_DIR**（`target/<profile>/build/
+  soyo_compiler-*/out/sysy.rs`），由 `main.rs:16` 的
+  `lalrpop_util::lalrpop_mod!(sysy)` 引入（改语法后重新 `cargo build` 即可，
+  生成是自动的）。
 - `frontend.rs` 里 `pub mod items;` 定义 AST 类型（`CompUnit`/`Stmt`/`Exp`…），
   `.lalrpop` 的动作代码直接引用这些类型（文件头 `use crate::frontend::items::*;`）。
 - 解析入口：生成的 `sysy::CompUnitsParser::new().parse(...)`，产出 `CompUnits`
@@ -105,7 +107,8 @@ lalrpop 与手写 lexer 的最大差异，也是"为什么不用写 `r"int"`"的
        pub step: Option<Exp>,
        pub body: Box<Stmt>,        // 嵌套语句必须 Box
    }
-   // Stmt 枚举里：ForStmt(ForStmt),
+   // Stmt 枚举里加：
+   //   ForStmt(ForStmt),
    ```
 2. **语法**：`sysy.lalrpop` 加规则，并加进 `MatchedStmt` 的分支（body 用
    `MatchedStmt`！）：
@@ -116,11 +119,20 @@ lalrpop 与手写 lexer 的最大差异，也是"为什么不用写 `r"int"`"的
    ```
    > 注：SysY2022 无 for，此例仅为演示；按比赛规则新增语法须谨慎。
 3. **下降**：`soyo_compiler/src/frontend/ast.rs` 的 AST→RaanaIR 转换
-   （`ToRaanaIR` impl）里处理 `Stmt::ForStmt`，展开成 while + 块（init 放
-   循环前、step 放块尾）。
+   （`ToRaanaIR` impl）里处理 `Stmt::ForStmt`，展开成 while + 块：
+   ```rust,ignore
+   Stmt::ForStmt(f) => {
+       // for (init; cond; step) body  ≡  init; while (cond) { body; step; }
+       let body = build_block(vec![f.body, block_of_stmt(f.step)]);
+       let while_loop = loop_from(cond_or_true(f.cond), body);
+       build_block(vec![block_of_stmt(f.init), while_loop])
+   }
+   ```
+   （辅助函数 `loop_from`/`block_of_stmt`/`cond_or_true` 按项目现有 while
+   下降写法实现。）
 4. 验证：`cargo build`（自动重新生成解析器）→
    `target/debug/compiler -S --target aarch64 -o /tmp/out.s 用例.sy` 编译
-   一个含 for 的用例；或看 `src/sysy.rs` 时间戳是否更新。
+   一个含 for 的用例；或看 OUT_DIR 里 `sysy.rs` 时间戳是否更新。
 
 > 若新语法无法展开成现有 IR 而需新指令，后续见 `interfaces.md`（G5）的
 > Q4/Q5。
@@ -137,5 +149,6 @@ lalrpop 与手写 lexer 的最大差异，也是"为什么不用写 `r"int"`"的
   顺序别乱。
 - **正则优先级**：`match` 块先匹配的赢；数字/标识符正则边界要写对
   （`IntConst` 三条顺序不能交换）。
-- **生成文件**：`src/sysy.rs` 是生成的，**不要手改**；git 里确认它是
-  提交的（本仓库生成文件入库，离线环境无网络也能编译）。
+- **生成文件**：解析器生成在 OUT_DIR（`target/<profile>/build/soyo_compiler-*/out/
+  sysy.rs`），**不入库、不要手改**；离线可编译是因为依赖已 vendor
+  （`dependencies/` 目录）。

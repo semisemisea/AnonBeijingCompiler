@@ -17,7 +17,7 @@
 | P0 | M69 NEON 自动向量化 | h-4/h-8/matmul/huffman | 2-4× | 大/高 |
 | P1 | M68 Phase D 记忆化微调 | h-1 族 | QEMU 6.5s→≤4s | 中 |
 | P1 | M59（主计划 F 线）j 循环寄存器阻塞 | many_mat_cal | 1.5-2× | 中 |
-| P1 | M60 递归模乘识别改写 + M61 非负性分析/守卫消除 | h-1 族 | 中 | 中 |
+| P3 | F 线 M60 元素级循环标量展开（低优先） | many_mat_cal 变换循环 | 很小 | 低 |
 | P2 | 向量运算方法扩展 | 见 vectorization.md | 视用例 | 低-中 |
 
 ## 1. M69：NEON 自动向量化（IR 层 loop 向量化）【P0 下一大项】
@@ -71,8 +71,8 @@ splat/select/reduce，NEON v0-v31，ABI 向量参数），但 **IR 从不产生�
 
 **原理**：i-k-j 形状下，内层 j 循环对输出行缓冲 `acc[j]` 做连续累加——把
 `cik` 的乘加按 j 分块（寄存器阻塞），动机是：① 隐藏 `A[k][j]` 的 load
-延迟（多个独立累加器并行，A53 双发射不空转）；② 促成 `ldp/stp` 配对；
-③ 减少重复 load `A[k][j]`（L1 命中已好，进一步压内存指令数）。
+延迟（多个独立累加器并行，A53 双发射不空转）；② 促成 `ldp/stp` 配对
+（TODO.md M59 口径）。
 
 **实现**：`raana_ir/src/opt/passes/`（如 `reduction_unroll.rs` 扩展或新
 pass）：识别 i-k-j 巢 + 行缓冲写回形态，j 循环内按 **2-4 个独立累加器**
@@ -82,13 +82,18 @@ pass）：识别 i-k-j 巢 + 行缓冲写回形态，j 循环内按 **2-4 个独
 **验收**：many_mat_cal-1 qemu 继续下降（目标标量手段 1-3s，残余差距交给
 M69 NEON）；`make test ARGS="-O 2"` 152 通过 + RISC-V 回归。
 
-## 4. M60/M61（主计划 F 线，h-1 相关）【P1】
+## 4. M60/M61（M56-M69 线，✅ 已完成，勿重复实现）
 
-- **M60 递归模乘识别改写**：`multiply(a,b)` → `b<0 ? 慢路径 : (i64)a*b % P`，
-  后端扩展为模乘内建（见 TODO.md §4）；
-- **M61 过程间非负性分析与守卫消除**：`soyo_mulmod` 纯化 + `main` 中
-  `power` 的 CSE。
-- 详情以仓库根 TODO.md 为准；两条都依赖 `mulmod_recognize` 管线。
+> 这两项属于 **M56-M69 主线**（非主计划 F 线），且**已落地**（TODO.md 已完成
+> 清单 L23-25）：
+> - **M60 递归模乘识别改写**：`multiply(a,b)` → `b<0 ? 慢路径 : (i64)a*b % P`，
+>   后端扩为 `smull;sxtw;sdiv;msub`（`mulmod_recognize.rs`，fft0 QEMU
+>   14.93s→~0.5s，静态 373→368）；
+> - **M61 过程间非负性分析与守卫消除**：`soyo_mulmod` 纯化 + main 中 `power`
+>   CSE（`guard_elimination.rs` + `return_summary.rs`）。
+>
+> 注意：主计划 F 线也有 M60/M61（TODO.md §4：M60=元素级循环标量展开，低优先
+> 可选；M61=验证与门禁），**与主线 M60/M61 不是同一个东西**。
 
 ## 5. 向量运算方法扩展【P2】
 

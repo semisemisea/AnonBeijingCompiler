@@ -2826,17 +2826,17 @@ fn memory_address(
     ty: MemoryType,
 ) -> AMode {
     if offset == 0 {
-        return AMode::Reg { base: base };
+        return AMode::Reg { base };
     }
     if offset > 0 {
         if let Some(offset) = crate::instructions::UImm12Scaled::new(offset as u64, ty.byte_size())
         {
-            return AMode::UnsignedOffset { base: base, offset };
+            return AMode::UnsignedOffset { base, offset };
         }
     }
     if let Ok(offset) = i16::try_from(offset) {
         if let Some(offset) = crate::instructions::SImm9::new(offset) {
-            return AMode::SignedOffset { base: base, offset };
+            return AMode::SignedOffset { base, offset };
         }
     }
 

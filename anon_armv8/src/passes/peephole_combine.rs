@@ -13,7 +13,7 @@ use taki_mir::{
     reg_alloc::{
         function::Function,
         index::{Block, Inst},
-        reg::{OperandKind, OperandVisitor as _, VReg},
+        reg::{OperandKind, VReg},
     },
     register::Reg,
     stats::FunctionCodegenStats,
@@ -401,7 +401,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        instructions::{Imm12, ImmLogic, SelectCmp},
+        instructions::{Imm12, ImmLogic},
         regs::OperandSize,
     };
 

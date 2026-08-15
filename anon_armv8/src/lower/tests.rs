@@ -97,7 +97,6 @@
     /// Emits `parameter <op> divisor` as a whole function and returns its
     /// AArch64 assembly.
     fn compile_constant_binary(op: BinaryOp, divisor: i32) -> String {
-        use raana_ir::ir::arena::Arena;
         use raana_ir::ir::builder_trait::*;
 
         let mut program = Program::new();
@@ -149,7 +148,6 @@
 
     #[test]
     fn division_by_a_variable_still_uses_sdiv() {
-        use raana_ir::ir::arena::Arena;
         use raana_ir::ir::builder_trait::*;
 
         let mut program = Program::new();
@@ -307,7 +305,6 @@
 
     #[test]
     fn single_use_dynamic_gep_folds_into_extended_addressing() {
-        use raana_ir::ir::arena::Arena;
         use raana_ir::ir::builder_trait::*;
 
         let mut program = Program::new();
@@ -375,7 +372,6 @@
 
     #[test]
     fn dynamic_gep_with_constant_offset_folds_into_extended_addressing() {
-        use raana_ir::ir::arena::Arena;
         use raana_ir::ir::builder_trait::*;
 
         let mut program = Program::new();
@@ -407,7 +403,6 @@
 
     #[test]
     fn multi_use_dynamic_gep_is_not_folded() {
-        use raana_ir::ir::arena::Arena;
         use raana_ir::ir::builder_trait::*;
 
         let mut program = Program::new();
@@ -926,7 +921,6 @@
     /// Builds `r = ((a + C) + (b + C))` with two same-value constant uses in
     /// one block, and returns the assembly.
     fn compile_two_same_constant_adds(c: i32) -> String {
-        use raana_ir::ir::arena::Arena;
         use raana_ir::ir::builder_trait::*;
 
         let mut program = Program::new();
@@ -972,7 +966,6 @@
 
     #[test]
     fn keeps_per_block_materialization_for_cross_block_uses() {
-        use raana_ir::ir::arena::Arena;
         use raana_ir::ir::builder_trait::*;
 
         let mut program = Program::new();

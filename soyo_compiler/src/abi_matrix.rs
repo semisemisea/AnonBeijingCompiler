@@ -312,6 +312,7 @@ mod tests {
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
             branch_opt: true,
             chain_fusion: true,
+            const_cse: true,
         };
         let output = taki_mir::compile_with_config::<AArch64Backend>(&program, &config);
 
@@ -360,6 +361,7 @@ mod tests {
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
             branch_opt: true,
             chain_fusion: true,
+            const_cse: true,
         };
         let output = taki_mir::compile_with_config::<AArch64Backend>(&program, &config);
 
@@ -402,6 +404,7 @@ mod tests {
             sched_model: anon_armv8::AArch64SchedModel::CortexA53,
             branch_opt,
             chain_fusion: false,
+            const_cse: true,
         };
         taki_mir::compile_with_config::<AArch64Backend>(&program, &config)
     }

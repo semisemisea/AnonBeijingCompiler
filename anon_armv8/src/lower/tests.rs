@@ -282,20 +282,20 @@
     /// definition AArch64 uses (`LE` is `Z || (N != V)`, `GT` is
     /// `Z == 0 && N == V`, ...).
     fn evaluates(cond: Cond, nzcv: u8) -> bool {
-        let n = nzcv >> 3 & 1 == 1;
-        let z = nzcv >> 2 & 1 == 1;
+        let n = (nzcv >> 3) & 1 == 1;
+        let z = (nzcv >> 2) & 1 == 1;
         let v = nzcv & 1 == 1;
         match cond {
             Cond::Eq => z,
             Cond::Ne => !z,
-            Cond::Hs => nzcv >> 1 & 1 == 1,
-            Cond::Lo => nzcv >> 1 & 1 == 0,
+            Cond::Hs => (nzcv >> 1) & 1 == 1,
+            Cond::Lo => (nzcv >> 1) & 1 == 0,
             Cond::Mi => n,
             Cond::Pl => !n,
             Cond::Vs => v,
             Cond::Vc => !v,
-            Cond::Hi => nzcv >> 1 & 1 == 1 && !z,
-            Cond::Ls => nzcv >> 1 & 1 == 0 || z,
+            Cond::Hi => (nzcv >> 1) & 1 == 1 && !z,
+            Cond::Ls => (nzcv >> 1) & 1 == 0 || z,
             Cond::Ge => n == v,
             Cond::Lt => n != v,
             Cond::Gt => !z && n == v,

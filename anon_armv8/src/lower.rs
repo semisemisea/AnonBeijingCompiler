@@ -726,9 +726,9 @@ fn lower_select(
         let InstKind::Binary(second_binary) = arena.inst_data(second).kind() else {
             unreachable!("ccmp chain operand is a binary comparison");
         };
-        let (cmp, cond1) = comparison_cmp(ctx, arena, &first_binary);
+        let (cmp, cond1) = comparison_cmp(ctx, arena, first_binary);
         let (second_size, second_lhs, second_rhs, second_imm) =
-            ccmp_operands(ctx, arena, &second_binary);
+            ccmp_operands(ctx, arena, second_binary);
         let cond2 = comparison_cond(second_binary.op());
         // `ccmp second, #nzcv, cond1` executes when `cond1` holds. For `and`
         // the fallback NZCV must make the final condition false (b1 false =>
@@ -1750,7 +1750,7 @@ fn select_branch_condition(
         let InstKind::Binary(second_binary) = arena.inst_data(second).kind() else {
             unreachable!("ccmp chain operand is a binary comparison");
         };
-        let (size, lhs, rhs, imm) = comparison_operands(ctx, arena, &first_binary);
+        let (size, lhs, rhs, imm) = comparison_operands(ctx, arena, first_binary);
         if let Some(imm) = imm {
             ctx.emit(MInst::CmpImm { size, lhs, imm });
         } else {
@@ -1758,7 +1758,7 @@ fn select_branch_condition(
         }
         let cond1 = comparison_cond(first_binary.op());
         let (second_size, second_lhs, second_rhs, second_imm) =
-            ccmp_operands(ctx, arena, &second_binary);
+            ccmp_operands(ctx, arena, second_binary);
         let cond2 = comparison_cond(second_binary.op());
         let (ccmp_cond, nzcv) = if is_and {
             (cond1, nzcv_making_cond_false(cond2))

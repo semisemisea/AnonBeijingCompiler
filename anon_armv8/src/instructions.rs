@@ -1515,13 +1515,7 @@ impl MachInstEmit for MInst {
                 emit_reg_or_zr(ctx, src, *size)?;
                 write!(ctx, ", #0x{:x}", imm.value())
             }
-            Self::Mov { size, dst, src } => {
-                write!(ctx, "mov ")?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
-                write!(ctx, ", ")?;
-                emit_reg(ctx, *src, *size)
-            }
-            Self::MovPhys { size, dst, src } => {
+            Self::Mov { size, dst, src } | Self::MovPhys { size, dst, src } => {
                 write!(ctx, "mov ")?;
                 emit_reg(ctx, dst.to_reg(), *size)?;
                 write!(ctx, ", ")?;

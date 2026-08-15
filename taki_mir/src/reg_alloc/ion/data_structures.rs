@@ -13,6 +13,18 @@
  */
 
 //! Data structures for backtracking allocator.
+//!
+//! 分配器几乎全部状态都在这里，全部按下标索引（`VRegIndex`/`LiveRangeIndex`/
+//! `LiveBundleIndex`/`SpillSlotIndex`/`PRegIndex`），避免指针/引用带来的借用
+//! 复杂度：
+//!
+//! - [`LiveRange`](data_structures::LiveRange)：一个 VReg 的连续活跃区间
+//!   （`CodeRange` 起止 + 使用点列表 `UseList`）；
+//! - [`LiveBundle`](data_structures::LiveBundle)：合并后参与博弈的最小单元；
+//! - [`Ctx`](data_structures::Ctx)：可复用的分配上下文（预分配容量，多次编译
+//!   间复用避免内存抖动）；
+//! - [`Env`](data_structures::Env)：一次分配的完整环境——所有区/束/槽的存储
+//!   与分配进度，`process.rs` 的主循环与 `moves.rs`/`spill.rs` 都操作它。
 
 use super::{CFGInfo, CFGInfoCtx, IndexSet, SpillWeight};
 use crate::define_index;

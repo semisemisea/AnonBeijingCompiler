@@ -15,6 +15,10 @@
  */
 
 //! Move resolution.
+//!
+//! 寄存器分配完成后，跨 block 边界传递的值（block 参数 blockparam）可能落在
+//! 不同的物理寄存器/栈槽上——本模块负责在边界**插入 move 指令**（并遵循
+//! `InsertMovePrio` 的优先级，处理并行移动/循环边界的交换问题）。
 
 use super::data_structures::{
     BlockparamIn, BlockparamOut, CodeRange, Edits, FixedRegFixupLevel, LiveRangeKey,

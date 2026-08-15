@@ -16,6 +16,11 @@
  */
 
 //! Bundle merging.
+//!
+//! 同一个 VReg 的多个 LiveRange（例如被 call 指令或固定约束打断的区间）在
+//! 分配前**合并**成 LiveBundle——分配器以 bundle 为最小博弈单元。若区间之间
+//! 有无法合并的硬约束（如跨 call 的 caller-saved 冲突），它们会保持为多个
+//! bundle 但共享同一个 spill slot（保证 spill/reload 后值一致）。
 
 use super::data_structures::{
     BlockparamOut, CodeRange, Env, LiveBundleIndex, SpillSet, SpillSlotIndex, VRegIndex,

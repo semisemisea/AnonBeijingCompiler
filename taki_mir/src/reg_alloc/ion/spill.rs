@@ -15,6 +15,11 @@
  */
 
 //! Spillslot allocation.
+//!
+//! 为被溢出（spill）的 bundle 分配栈槽。`SpillSlotData` 记录每个溢出槽的
+//! 大小/对齐/偏移；同一 VReg 的多个 bundle 共享槽位，槽位按需合并（两个不
+//! 相交的溢出区间可以复用同一栈槽，节省栈帧）。布局最终交给
+//! `abi::FrameLayout` 确定栈帧偏移。
 
 use super::{
     AllocRegResult, Env, LiveRangeKey, PRegIndex, RegTraversalIter, SpillSetIndex, SpillSlotData,

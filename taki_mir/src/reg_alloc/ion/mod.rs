@@ -13,6 +13,49 @@
 //! allocator while this port is validated.  In particular, it normalizes the
 //! client's VRegs into allocator-local dense VRegs before constructing Ion's
 //! VReg-indexed state.
+//!
+//! ## 为什么叫"回溯"（backtracking）
+//!
+//! 分配不是一遍过的：主循环按**溢出权重**从大到小处理活跃区间（bundle），
+//! 尝试为每个 bundle 找寄存器；找不到时不是立刻放弃，而是**驱逐**（evict）
+//! 权重更低的已有 occupant，把被驱逐者重新入队。被驱逐者若仍无处可去，
+//! 就**分裂**（split）成更小的区间或**溢出**（spill）到栈。这是 Firefox
+//! IonMonkey 的 BacktrackingAllocator 血统（经 regalloc2 移植）。
+//!
+//! ## 子模块职责
+//!
+//! | 模块 | 职责 |
+//! |------|------|
+//! | [`cfg`](cfg) | CFG 与支配信息（`CFGInfo`），供 liveness/merge 使用 |
+//! | [`data_structures`] | 分配器核心数据结构：`LiveRange`/`LiveBundle`/`Use`/`VRegIndex`/`SpillSlotData`/`Ctx`/`Env` |
+//! | [`domtree`] | 支配树（Cooper–Harvey–Kennedy 算法） |
+//! | [`function`] | `DenseVRegFunction`：把客户端 VReg 归一化为稠密 VReg 的函数视图 |
+//! | [`indexset`] | 稀疏无界索引集合（分配器内部集合） |
+//! | [`liveranges`] | 活跃区间计算（`Liveness`）与溢出权重（`SpillWeight`） |
+//! | [`merge`] | 把同一 VReg 的多个 LiveRange 合并成 LiveBundle |
+//! | [`moves`] | 移动解析：跨 block 边界的值搬运（blockparam in/out） |
+//! | [`postorder`] | 迭代式后序遍历（CFG 分析用） |
+//! | [`process`] | **主分配循环**：逐 bundle 分配/驱逐/分裂/溢出（本模块核心） |
+//! | [`redundant_moves`] | 冗余 move 消除（`RedundantMoveEliminator`） |
+//! | [`reg_traversal`] | 可用寄存器遍历迭代器（`RegTraversalIter`） |
+//! | [`requirement`] | 固定寄存器约束（`Requirement`，如 ABI 参数必须进特定寄存器） |
+//! | [`spill`] | 溢出槽分配（`SpillSlotData` 的布局） |
+//!
+//! ## 主流程（[`run`] 内部）
+//!
+//! 1. **归一化**：`DenseVRegFunction` 把客户端 VReg 重编号为 `0..n` 稠密区间；
+//! 2. **liveness**（liveranges）：逐指令扫描，为每个 VReg 计算活跃区间；
+//! 3. **merge**：同一 VReg 的所有区间合成一个 bundle（若区间被约束拆开则
+//!    多个 bundle 共享 spill slot）；
+//! 4. **process**（主循环，process.rs）：按权重处理 bundle——
+//!    `try_to_allocate_bundle_to_reg` → 冲突则 `evict_bundle` /
+//!    `split_and_requeue_bundle` / `get_or_create_spill_bundle`；
+//! 5. **解析**（moves）：为 block 参数与跨边界的活跃值插入 move，
+//!    并跑 `RedundantMoveEliminator` 清理；
+//! 6. **溢出**（spill）：给每个溢出 bundle 分配栈槽。
+//!
+//! 结果以 [`Output`](crate::reg_alloc::reg::Output) 返回：每个 VReg 的物理
+//! 寄存器或栈槽 + 需要插入的 move 列表，由 `taki_mir` 回写进 VCode。
 
 mod cfg;
 mod data_structures;

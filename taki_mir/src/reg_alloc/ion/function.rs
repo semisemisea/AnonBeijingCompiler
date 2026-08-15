@@ -8,6 +8,11 @@
  */
 
 //! Dense allocator-local VReg numbering for Ion.
+//!
+//! 分配器内部所有状态都按 VReg 下标索引，因此先把客户端的稀疏 VReg 重编号为
+//! `0..n` 的稠密区间（`DenseVRegFunction`）。它同时缓存每个 VReg 的约束信息
+//! （寄存器类、固定寄存器要求、是否跨 call），供 liveness/process 阶段直接
+//! 查询。分配结束后再按映射回写到客户端 VReg。
 
 use rustc_hash::FxHashMap;
 

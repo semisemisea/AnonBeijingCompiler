@@ -13,6 +13,11 @@
  */
 
 //! Requirements computation.
+//!
+//! `Requirement` 描述一个使用点对操作数的**固定约束**：必须落在某个具体物理
+//! 寄存器（如 ABI 参数寄存器、返回寄存器、架构要求如乘法的固定输入），或必须
+//! 是寄存器/栈槽。liveness 阶段为每个 use 计算 requirement，process 阶段据此
+//! 限制候选寄存器集合；约束冲突（`RequirementConflict`）会导致区间分裂或溢出。
 
 use super::data_structures::{Env, LiveBundleIndex};
 use crate::reg_alloc::{

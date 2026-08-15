@@ -13,6 +13,13 @@
  */
 
 //! Live-range computation.
+//!
+//! 逐指令扫描函数体，为每个 VReg 计算**活跃区间**（LiveRange：从定义点覆盖到
+//! 最后一次使用的连续指令区间）。`Liveness` 同时产出 block 级 livein/liveout。
+//!
+//! [`SpillWeight`] 是回溯博弈的关键输入：权重 = 活跃区间长度 × 使用次数
+//! （循环内使用会显著提高权重），权重高的 bundle 优先拿寄存器，冲突时低权重者
+//! 被驱逐。
 
 use super::IndexSet;
 use super::data_structures::{

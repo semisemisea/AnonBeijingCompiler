@@ -15,6 +15,22 @@
  */
 
 //! Main allocation loop that processes bundles.
+//!
+//! 这是 ION 分配器的**心脏**：`Env::process_bundles` 按溢出权重从大到小处理
+//! 每个 bundle，核心决策路径：
+//!
+//! 1. [`try_to_allocate_bundle_to_reg`](Env::try_to_allocate_bundle_to_reg)：
+//!    为 bundle 找一个可用物理寄存器（考虑固定约束 requirement 与
+//!    `RegTraversalIter` 的遍历顺序）；
+//! 2. 失败时按权重博弈：[`evict_bundle`](Env::evict_bundle) 驱逐权重更低的
+//!    occupant 并重新入队，或 [`split_and_requeue_bundle`](Env::split_and_requeue_bundle)
+//!    把区间在冲突点分裂，或 [`get_or_create_spill_bundle`](Env::get_or_create_spill_bundle)
+//!    直接溢出；
+//! 3. [`process_bundle`](Env::process_bundle) 是单个 bundle 的完整处理入口。
+//!
+//! 辅助设施：`recompute_bundle_properties`（权重/亲和性重算）、
+//! `split_into_minimal_bundles`（按使用点彻底拆分的兜底策略）、
+//! `maximum_spill_weight_in_bundle_set`（博弈比较用）。
 
 use super::{
     Env, LiveBundleIndex, LiveBundleVec, LiveRangeFlag, LiveRangeIndex, LiveRangeKey,

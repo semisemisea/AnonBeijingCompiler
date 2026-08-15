@@ -100,9 +100,10 @@ lower 层（anon_armv8::lower）：
 - **原理**：`VecAddv` 已实现 addv 归约；`smaxv`/`sminv`/`fmaxv` 同类。
 - **改哪层**：IR 层 `VectorReduceOp` 加成员（定义在
   `raana_ir/src/ir/inst_kind/vector_reduce.rs`，目前只有 `Add`）+ 后端
-  `lower_vector_reduce` 分派（`instructions.rs` 已有 `VecMinMaxOp`
-  枚举可直接支撑 smaxv/sminv/fmaxv）。现状限制：`lower_vector_reduce`
-  仅 .4s 整数 addv，f32→faddp 缺失、.2d 缺失。
+  `lower_vector_reduce` 分派。注意：`VecMinMaxOp` 支撑的是**逐元素**
+  min/max，横向 maxv/minv 需新增类 `VecAddv` 的 MInst 变体（如 `VecMaxv`）
+  + emit，可复用其 op 命名但不能直接复用指令。现状限制：
+  `lower_vector_reduce` 仅 .4s 整数 addv，f32→faddp 缺失、.2d 缺失。
 - **解锁**：min/max 归约循环（若 perf 语料有）。
 
 ### M8. 交错加载（ld2/ld3/ld4）【低】

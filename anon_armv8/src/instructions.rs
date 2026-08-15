@@ -1502,31 +1502,10 @@ impl MachInstEmit for MInst {
                 emit_reg(ctx, *src, *size)
             }
             Self::LoadImm { size, dst, value } => emit_load_imm(ctx, dst.to_reg(), *value, *size),
-            Self::MovZ { size, dst, imm } | Self::MovN { size, dst, imm } => {
-                write!(
-                    ctx,
-                    "{} ",
-                    if matches!(self, Self::MovZ { .. }) {
-                        "movz"
-                    } else {
-                        "movn"
-                    }
-                )?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
-                write!(ctx, ", #0x{:x}", imm.bits())?;
-                if imm.shift() != 0 {
-                    write!(ctx, ", lsl #{}", imm.shift())?;
-                }
-                Ok(())
-            }
+            Self::MovZ { size, dst, imm } => emit_move_wide(ctx, "movz", *size, *dst, *imm),
+            Self::MovN { size, dst, imm } => emit_move_wide(ctx, "movn", *size, *dst, *imm),
             Self::MovK { size, dst, imm, .. } => {
-                write!(ctx, "movk ")?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
-                write!(ctx, ", #0x{:x}", imm.bits())?;
-                if imm.shift() != 0 {
-                    write!(ctx, ", lsl #{}", imm.shift())?;
-                }
-                Ok(())
+                emit_move_wide(ctx, "movk", *size, *dst, *imm)
             }
             Self::MovFromZero { size, dst } => {
                 write!(ctx, "mov ")?;
@@ -2118,6 +2097,24 @@ fn emit_add_sub_imm12(
     write!(ctx, ", #{}", imm.value())?;
     if imm.shift12() {
         write!(ctx, ", lsl #12")?;
+    }
+    Ok(())
+}
+
+/// Emit a move-wide form (`movz`/`movn`/`movk`): `op rd, #imm`, optionally
+/// `, lsl #shift`.
+fn emit_move_wide(
+    ctx: &mut dyn EmitContext,
+    mnemonic: &str,
+    size: OperandSize,
+    dst: WritableReg,
+    imm: MoveWideConst,
+) -> core::fmt::Result {
+    write!(ctx, "{mnemonic} ")?;
+    emit_reg(ctx, dst.to_reg(), size)?;
+    write!(ctx, ", #0x{:x}", imm.bits())?;
+    if imm.shift() != 0 {
+        write!(ctx, ", lsl #{}", imm.shift())?;
     }
     Ok(())
 }

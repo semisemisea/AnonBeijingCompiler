@@ -17,9 +17,17 @@
 //! 逐指令扫描函数体，为每个 VReg 计算**活跃区间**（LiveRange：从定义点覆盖到
 //! 最后一次使用的连续指令区间）。`Liveness` 同时产出 block 级 livein/liveout。
 //!
-//! [`SpillWeight`] 是回溯博弈的关键输入：权重 = 活跃区间长度 × 使用次数
-//! （循环内使用会显著提高权重），权重高的 bundle 优先拿寄存器，冲突时低权重者
-//! 被驱逐。
+//! [`SpillWeight`] 是回溯博弈的关键输入。**权重按每个使用点（Use）计算后累加
+//! 聚合**（`spill_weight_from_constraint`）：
+//!
+//! ```text
+//! 单点权重 = hot_bonus（循环深度每层 ×4：1000 → 4000 → 16000…）
+//!          + def_bonus（定义点 +2000）
+//!          + constraint_bonus（无约束 Any +1000；固定寄存器约束 Reg/FixedReg +2000）
+//! ```
+//!
+//! 权重高的 bundle 优先拿寄存器，冲突时低权重者被驱逐。**调溢出策略**改
+//! `liveranges.rs` 里的这些 bonus 常量。
 
 use super::IndexSet;
 use super::data_structures::{

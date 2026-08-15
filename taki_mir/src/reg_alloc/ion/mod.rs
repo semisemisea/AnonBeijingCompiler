@@ -31,7 +31,7 @@
 //! | [`domtree`] | 支配树（Cooper–Harvey–Kennedy 算法） |
 //! | [`function`] | `DenseVRegFunction`：把客户端 VReg 归一化为稠密 VReg 的函数视图 |
 //! | [`indexset`] | 稀疏无界索引集合（分配器内部集合） |
-//! | [`liveranges`] | 活跃区间计算（`Liveness`）与溢出权重（`SpillWeight`） |
+//! | [`liveranges`] | 活跃区间计算（`Liveness`）与溢出权重（`SpillWeight`，见下） |
 //! | [`merge`] | 把同一 VReg 的多个 LiveRange 合并成 LiveBundle |
 //! | [`moves`] | 移动解析：跨 block 边界的值搬运（blockparam in/out） |
 //! | [`postorder`] | 迭代式后序遍历（CFG 分析用） |
@@ -56,6 +56,30 @@
 //!
 //! 结果以 [`Output`](crate::reg_alloc::reg::Output) 返回：每个 VReg 的物理
 //! 寄存器或栈槽 + 需要插入的 move 列表，由 `taki_mir` 回写进 VCode。
+//!
+//! ## 最小示例（分配前后）
+//!
+//! 三条指令的玩具函数：
+//!
+//! ```text
+//! 分配前（虚拟寄存器）        分配后（物理寄存器/栈）
+//!   v0 = v1 + v2         →    x0 = x1 + x2
+//!   v3 = v0 * v4         →    x3 = x0 * x4
+//!   v5 = v3 + 1          →    ldr x5, [sp, #8]   ← v3 被溢出到栈槽
+//!                                （x3 的区间短、权重低，冲突时被驱逐）
+//! ```
+//!
+//! 溢出发生在寄存器耗尽且权重博弈失败时：低权重的 bundle 让位给高权重者，
+//! 自己的值在定义点 store 到栈、使用点 load 回来。
+//!
+//! ## 常见修改点（调策略动哪里）
+//!
+//! - **调溢出权重** → `liveranges.rs::spill_weight_from_constraint` 的 bonus 常量；
+//! - **加寄存器类** → `reg.rs::RegClass` + `reg_traversal.rs` 的遍历顺序；
+//! - **改 ABI 固定寄存器约束** → `requirement.rs`；
+//! - **调栈槽复用** → `spill.rs`；
+//! - 上游参考：本模块移植自 regalloc2 0.15.1（文件头 license 注明来源），
+//!   结构性改动先对照上游同结构。
 
 mod cfg;
 mod data_structures;

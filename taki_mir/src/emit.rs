@@ -13,8 +13,10 @@
 //! - [`emit_vcode_assembly`]：**顶层入口**——给定程序/函数/已 finalize 的
 //!   VCode，返回整段汇编文本。后端可直接用它发射手工构造的机器层程序
 //!   （如显式 SIMD VCode 验证）。
-//! - `emit_legalized`：发射前先跑 `ABISpec::legalize_inst` 做指令合法化
-//!   （把一条语义指令拆成目标机允许的若干条），再逐条 emit。
+//! - `emit_legalized`：发射前先跑 `ABISpec::legalize_inst` 做**伪寻址展开**——
+//!   把分配后依赖栈帧的伪寻址指令（如 `StackAMode` 伪指令）展开成实际
+//!   sp 偏移的指令（`FrameLayout` 已知），再逐条 emit。实现见
+//!   `anon_armv8/src/abi.rs` 的 `legalize_inst`。
 //!
 //! ## 与 emit_buffer 的分工
 //!

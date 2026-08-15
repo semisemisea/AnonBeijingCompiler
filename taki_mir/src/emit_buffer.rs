@@ -14,6 +14,13 @@
 //! without enabling any branch optimization. The `optimize_branches` and
 //! `resolve` (range-check + veneer) machinery is wired up in later milestones.
 //!
+//! ## 为什么需要 buffer（动机）
+//!
+//! 指令文本先以 text slot 进缓冲、分支以符号化 `Branch` 槽进缓冲，**而不是
+//! 直接写字符串**，是为了让分支优化能在 O(1) 内做：截断/取反/改写分支只需
+//! 改槽内容，无需回填字节偏移；标签解析推迟到 `finish()` 一次完成。这是
+//! Cranelift MachBuffer 的设计（见上方英文说明）。
+//!
 //! ## 发射三阶段（中文速览）
 //!
 //! 1. **填充**：`bind_label` 绑定块标签位置；每条指令以 text slot（固定 4
@@ -26,8 +33,10 @@
 //!    `LabelKind` 可达范围的分支插入 veneer 跳板），[`finish`](EmitBuffer::finish)
 //!    把全部槽渲染成最终汇编字符串。
 //!
-//! [`Slot`] 是缓冲区的核心：`Text`（普通指令文本）/`Branch`（符号化分支）/
-//! `Label`（标签位置）/`Veneer`（跳板）。
+//! [`Slot`] 是缓冲区的核心，枚举成员只有三类：`Text`（普通指令文本）、
+//! `Branch`（符号化分支）、`Veneer`（跳板）——**没有独立的 Label 槽**，
+//! 标签位置由 `bind_label` 记录在单独的结构里（branch 槽持有
+//! `labels_at_this_branch`）。
 
 use core::fmt::Write as _;
 use std::marker::PhantomData;

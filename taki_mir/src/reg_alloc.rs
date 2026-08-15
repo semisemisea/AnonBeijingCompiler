@@ -9,9 +9,17 @@
 //! | 模块 | 职责 |
 //! |------|------|
 //! | [`function`] | [`function::Function`] trait：客户端（VCode）必须实现的函数视图，分配器只通过它读取程序 |
+//! | [`index`] | `define_index!` 宏生成的稠密下标类型（VRegIndex/Block/Inst/InstRange 等） |
 //! | [`reg`] | 寄存器模型：[`reg::RegClass`]（Int/Float/Vector）、[`reg::PReg`]（物理寄存器）、[`reg::VReg`]（虚拟寄存器）、[`reg::MachineEnv`]（机器环境）、[`reg::Output`]（分配结果） |
 //! | [`ion`] | ION 回溯分配器（移植自 regalloc2）：核心分配算法，入口 [`ion::run`] |
 //! | [`moves`] | 分配结果回写：把 Output 的寄存器映射应用到 VCode 指令上 |
+//!
+//! ## 两个核心概念（先理解再读流程）
+//!
+//! - **LiveRange（活跃区间）**：一个值从定义点覆盖到最后一次使用的连续指令
+//!   区间；
+//! - **bundle**：同一 VReg 的多个 LiveRange 合并后的集合，是分配博弈的**原子
+//!   单位**（权重、驱逐、溢出都以 bundle 计）。
 //!
 //! ## 一次分配的数据流
 //!

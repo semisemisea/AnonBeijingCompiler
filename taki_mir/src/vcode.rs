@@ -1,5 +1,9 @@
 //! # VCode：后端共享的机器中间表示
 //!
+//! 定位链：SysY 源码 → RaanaIR（平台无关 SSA，`raana_ir` crate）→ **VCode**
+//! （机器指令级）→ 汇编。**lower** = 把 RaanaIR 指令翻译成机器指令的指令
+//! 选择阶段（AArch64 在 `anon_armv8/src/lower.rs`）。
+//!
 //! VCode 是**机器指令级**的中间表示：每条指令已选定目标指令形式（AArch64 的
 //! `MInst` 或 RISC-V 的对应类型），操作数是
 //! 虚拟寄存器（VReg）/物理寄存器/立即数/内存地址。VCode 夹在 lower 与发射之间，
@@ -16,6 +20,11 @@
 //! | [`MachInstEmit`] | [`emit`](MachInstEmit::emit) 把指令打印成汇编文本 | 发射阶段 |
 //! | [`VCodeInst`] | 空标记 trait = MachInst + MachInstEmit | 容器约束 |
 //! | [`EmitContext`] | 发射时的写入接口 | 由 emit_buffer 实现，提供寄存器/标签/分支的符号化输出 |
+//!
+//! 术语：**操作数表** = `build` 时经 `get_operands` 收集的每条指令 vreg 读写
+//! 清单（分配器算活跃性用）；**符号化输出** = `write_label_ref`/
+//! `write_function_label` 把 block 索引/函数/全局量写成汇编符号（而非地址），
+//! 由 emit_buffer 在 `finish()` 统一解析。
 //!
 //! [`MachTerminator`] 标注指令是否结束基本块：`None`（普通指令）/`Return`/
 //! `TailReturn`/`Branch`。
@@ -39,23 +48,34 @@
 //! lower（指令选择）
 //!   → VCodeBuilder::push 逐条产出 MInst
 //!   → build() → VCodeContainer
-//!   → MIR passes（peephole/pair combine/dce/chain fusion/const CSE…，见 anon_armv8::passes）
+//!   → Pre-RA MIR passes（DCE/peephole/chain fusion/const CSE）
 //!   → reg_alloc::ion::run(&vcode, machine_env) → Output
-//!   → write_back_allocs(Output)      （虚拟寄存器 → 物理寄存器）
-//!   → finalize_for_emission(Output)  （block 参数 move、溢出指令落定）
+//!   → write_back_allocs(Output)       （虚拟寄存器 → 物理寄存器）
+//!   → abi.compute_frame_layout(..)    （溢出槽 → 栈帧布局）
+//!   → finalize_for_emission(Output)   （block 参数 move、溢出指令落定）
+//!   → Post-RA MIR passes（pair combine/list scheduler）
 //!   → emit：每条指令 MachInstEmit::emit 写入 AsmWriter
 //! ```
 //!
+//! 注意：pass 分 **pre-RA / post-RA 两段**，见 `anon_armv8::passes::
+//! build_pipeline`；`machine_env` = 物理寄存器偏好集合（来自 ABI）。分配算法
+//! 与 `Output` 结构详见 [`crate::reg_alloc`] 模块文档；发射缓冲见
+//! [`crate::emit_buffer`]。
+//!
 //! ## 如何加一条新指令（四步）
 //!
-//! 1. **定义形式**：在后端 `instructions.rs` 里定义指令枚举变体与操作数类型；
+//! 1. **定义形式**：在后端 `instructions.rs` 里定义指令枚举变体与操作数类型
+//!    （RISC-V：`uika_riscv/src/instructions.rs`）；
 //! 2. **实现 [`MachInst`]**：`get_operands` 上报操作数（分配器需要）、
 //!    `is_move`/`is_term`/`rc_for_type`/`gen_jump` 按语义填写；
 //! 3. **实现 [`MachInstEmit`]**：`emit` 里用 `EmitContext` 打印汇编文本；
-//! 4. **在 lower 中选择它**：`anon_armv8/src/lower.rs` 的 `lower`/`lower_branch`
-//!    匹配对应 HIR 指令并产出新指令。
+//! 4. **在 lower 中选择它**：AArch64 在 `anon_armv8/src/lower.rs` 的
+//!    `lower`/`lower_branch` 匹配对应 HIR 指令并产出新指令（RISC-V：
+//!    `uika_riscv/src/lower.rs`）。
 //!
-//! 若新指令需要调度信息，还要更新 `anon_armv8/src/sched/` 的延迟表。
+//! 调度信息**仅 AArch64 需要**（RISC-V 无调度器）：更新
+//! `anon_armv8/src/sched/` 的延迟表。**验证**：`cargo test -p taki_mir
+//! -p anon_armv8` + 本地 `compiler -S -O 2` 编一个用例目检 `.s`。
 
 use std::fmt::Debug;
 

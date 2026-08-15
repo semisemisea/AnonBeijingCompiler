@@ -832,7 +832,6 @@
 
         let v4i32 = Type::get_vector(Type::get_i32(), 4);
         let build = |program: &Program| {
-            let mut program = program.clone();
             let mut programs = Vec::new();
             for config in [
                 AArch64CodegenConfig {
@@ -867,12 +866,12 @@
                 },
             ] {
                 let first = taki_mir::compile_with_config::<crate::lower::AArch64Backend>(
-                    &program, &config,
+                    program, &config,
                 )
                 .assembly;
                 for _ in 0..4 {
                     let again = taki_mir::compile_with_config::<crate::lower::AArch64Backend>(
-                        &program, &config,
+                        program, &config,
                     )
                     .assembly;
                     assert_eq!(first, again, "recompilation diverged");

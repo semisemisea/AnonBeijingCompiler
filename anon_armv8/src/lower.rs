@@ -2547,13 +2547,8 @@ fn fold_mul_add_sub(
     if mul.op() != BinaryOp::Mul
         || !fusion_types_match(
             arena,
-            consumer,
-            lhs,
-            rhs,
-            mul_inst,
-            mul.lhs(),
-            mul.rhs(),
             size,
+            [consumer, lhs, rhs, mul_inst, mul.lhs(), mul.rhs()],
         )
         // Only fuse within one block. A multiplication hoisted by LICM to a
         // preheader (or any other dominator) executes less often than the
@@ -2585,17 +2580,10 @@ fn is_mul(arena: ArenaContext<'_>, inst: HirInst) -> bool {
 
 fn fusion_types_match(
     arena: ArenaContext<'_>,
-    consumer: HirInst,
-    lhs: HirInst,
-    rhs: HirInst,
-    mul: HirInst,
-    mul_lhs: HirInst,
-    mul_rhs: HirInst,
     size: OperandSize,
+    insts: [HirInst; 6],
 ) -> bool {
-    [consumer, lhs, rhs, mul, mul_lhs, mul_rhs]
-        .into_iter()
-        .all(|inst| {
+    insts.into_iter().all(|inst| {
             let ty = arena.inst_data(inst).ty().kind();
             matches!(ty, TypeKind::Int32 | TypeKind::Pointer(_)) && operand_size(ty) == size
         })

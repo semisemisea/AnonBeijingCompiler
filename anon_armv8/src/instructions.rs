@@ -1774,15 +1774,7 @@ impl MachInstEmit for MInst {
                 dst,
                 lhs,
                 rhs,
-            } => {
-                write!(ctx, "{} ", vec_arith_name(*op))?;
-                emit_vec_reg(ctx, dst.to_reg())?;
-                write!(ctx, ".{}, ", shape.arrangement())?;
-                emit_vec_reg(ctx, *lhs)?;
-                write!(ctx, ".{}, ", shape.arrangement())?;
-                emit_vec_reg(ctx, *rhs)?;
-                write!(ctx, ".{}", shape.arrangement())
-            }
+            } => emit_vec_rrr(ctx, vec_arith_name(*op), *dst, *shape, *lhs, *rhs),
             Self::VecFmla {
                 shape,
                 dst,
@@ -1819,15 +1811,7 @@ impl MachInstEmit for MInst {
                 dst,
                 lhs,
                 rhs,
-            } => {
-                write!(ctx, "{} ", vec_cmp_name(*op))?;
-                emit_vec_reg(ctx, dst.to_reg())?;
-                write!(ctx, ".{}, ", shape.arrangement())?;
-                emit_vec_reg(ctx, *lhs)?;
-                write!(ctx, ".{}, ", shape.arrangement())?;
-                emit_vec_reg(ctx, *rhs)?;
-                write!(ctx, ".{}", shape.arrangement())
-            }
+            } => emit_vec_rrr(ctx, vec_cmp_name(*op), *dst, *shape, *lhs, *rhs),
             Self::VecBsl {
                 dst,
                 mask,
@@ -1935,15 +1919,7 @@ impl MachInstEmit for MInst {
                 dst,
                 lhs,
                 rhs,
-            } => {
-                write!(ctx, "{} ", vec_minmax_name(*op))?;
-                emit_vec_reg(ctx, dst.to_reg())?;
-                write!(ctx, ".{}, ", shape.arrangement())?;
-                emit_vec_reg(ctx, *lhs)?;
-                write!(ctx, ".{}, ", shape.arrangement())?;
-                emit_vec_reg(ctx, *rhs)?;
-                write!(ctx, ".{}", shape.arrangement())
-            }
+            } => emit_vec_rrr(ctx, vec_minmax_name(*op), *dst, *shape, *lhs, *rhs),
             Self::FMovFromZero { dst } => {
                 write!(ctx, "fmov ")?;
                 emit_float_reg(ctx, dst.to_reg(), false)?;
@@ -2293,6 +2269,26 @@ fn emit_vec_scalar_reg(ctx: &mut dyn EmitContext, reg: Reg, shape: VecShape) -> 
         }
         _ => ctx.write_reg(&reg),
     }
+}
+
+/// Emit a three-register vector instruction with the same arrangement on all
+/// three operands (`{op} v{d}.<arr>, v{l}.<arr>, v{r}.<arr>`).  Kept as a
+/// single helper so the arith/compare/minmax families cannot drift apart.
+fn emit_vec_rrr(
+    ctx: &mut dyn EmitContext,
+    mnemonic: &str,
+    dst: WritableReg,
+    shape: VecShape,
+    lhs: Reg,
+    rhs: Reg,
+) -> core::fmt::Result {
+    write!(ctx, "{mnemonic} ")?;
+    emit_vec_reg(ctx, dst.to_reg())?;
+    write!(ctx, ".{}, ", shape.arrangement())?;
+    emit_vec_reg(ctx, lhs)?;
+    write!(ctx, ".{}, ", shape.arrangement())?;
+    emit_vec_reg(ctx, rhs)?;
+    write!(ctx, ".{}", shape.arrangement())
 }
 fn vec_arith_name(op: VecArithOp) -> &'static str {
     match op {

@@ -5,7 +5,7 @@ use taki_mir::{
     emit_buffer::LabelKind,
     reg_alloc::reg::{OperandVisitor, OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
-    types::{F32, I32, I64, LoweredType, V2F64, V2I64, V4F32, V4I32},
+    types::{LoweredType, F32, I32, I64, V2F64, V2I64, V4F32, V4I32},
     vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
 };
 
@@ -1504,9 +1504,7 @@ impl MachInstEmit for MInst {
             Self::LoadImm { size, dst, value } => emit_load_imm(ctx, dst.to_reg(), *value, *size),
             Self::MovZ { size, dst, imm } => emit_move_wide(ctx, "movz", *size, *dst, *imm),
             Self::MovN { size, dst, imm } => emit_move_wide(ctx, "movn", *size, *dst, *imm),
-            Self::MovK { size, dst, imm, .. } => {
-                emit_move_wide(ctx, "movk", *size, *dst, *imm)
-            }
+            Self::MovK { size, dst, imm, .. } => emit_move_wide(ctx, "movk", *size, *dst, *imm),
             Self::MovFromZero { size, dst } => {
                 write!(ctx, "mov ")?;
                 emit_reg(ctx, dst.to_reg(), *size)?;
@@ -2625,8 +2623,8 @@ mod tests {
         vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
     };
 
-    use super::{CCmpStep, Cond, Imm12, ImmLogic, MInst, SelectCmp, SelectValue, call_clobbers};
-    use crate::regs::{OperandSize, float_reg, int_reg};
+    use super::{call_clobbers, CCmpStep, Cond, Imm12, ImmLogic, MInst, SelectCmp, SelectValue};
+    use crate::regs::{float_reg, int_reg, OperandSize};
 
     #[derive(Default)]
     struct TestEmitContext(String);

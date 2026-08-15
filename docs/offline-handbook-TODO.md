@@ -47,7 +47,7 @@
   `AArch64Backend`。
 - 验收：`cargo doc -p anon_armv8` 无 warning；小白读完能复述后端 5 个阶段与
   入口调用链。
-- 状态：`[ ]` 待执行（0 轮）
+- 状态：`[~]` 初稿完成（第 1 轮，评级中）
 
 ### G2 寄存器分配 —— taki_mir::reg_alloc (ion) rustdoc
 - 范围：`taki_mir/src/reg_alloc/` 全部 13 文件（domtree/function/indexset/
@@ -58,7 +58,7 @@
   （`allocate_registers` 入口签名与调用方）。
 - 验收：`cargo doc -p taki_mir` 生成；小白能讲清"虚拟寄存器 → 物理寄存器"的
   完整路径。
-- 状态：`[ ]` 待执行（0 轮）
+- 状态：`[~]` 初稿完成（第 1 轮，评级中）
 
 ### G3 vcode —— taki_mir::vcode rustdoc
 - 范围：`taki_mir/src/vcode.rs`（MachInst/VCode/MachInstEmit）。
@@ -66,14 +66,14 @@
   `MachInst` 表示法、"如何加一条新指令"的伪代码步骤（define inst → lowering →
   emit → regalloc 兼容性）。
 - 验收：cargo doc 生成；小白照文档能加一条新指令。
-- 状态：`[ ]` 待执行（0 轮）
+- 状态：`[~]` 初稿完成（第 1 轮，评级中）
 
 ### G4 emit —— taki_mir::emit + emit_buffer rustdoc
 - 范围：`taki_mir/src/emit.rs`、`taki_mir/src/emit_buffer.rs`。
 - 内容：`AsmWriter` 接口、emit_buffer 缓冲/刷出机制、指令 emit 流程、标签/缩进/
   对齐处理。
 - 验收：cargo doc 生成；能讲清一条指令从 MachInst 到汇编文本的路径。
-- 状态：`[ ]` 待执行（0 轮）
+- 状态：`[~]` 初稿完成（第 1 轮，评级中）
 
 ### G5 泛型与接口加在哪 —— 方法论 md + 相关 rustdoc
 - 范围：新建 `docs/offline-handbook/interfaces.md` + 泛型热点文件的 rustdoc 补注
@@ -83,7 +83,7 @@
   lower？emit？）——每条路径的判定问题 + 示例（如：新优化→raana_ir opt/pass.rs；
   新指令→anon_armv8 instructions.rs + lower.rs；新 ABI 规则→abi.rs）。
 - 验收：小白拿到新需求能按决策树定位到具体文件。
-- 状态：`[ ]` 待执行（0 轮）
+- 状态：`[~]` 初稿完成（第 1 轮，评级中）
 
 ### G6 raana_ir rustdoc
 - 范围：`raana_ir/src/lib.rs`（crate 级）+ `ir` / `opt` 模块。
@@ -92,7 +92,7 @@
   "如何加一个 pass"（注册 → config 门控 → 单测 → TargetPolicy 注意）。
 - 参考：`docs/Convention.md`、`AGENTS.md` 的 IR 架构要点。
 - 验收：cargo doc 生成；小白能加一个新 pass 并接入管线。
-- 状态：`[ ]` 待执行（0 轮）
+- 状态：`[~]` 初稿完成（第 1 轮，评级中）
 
 ### G7 lalrpop 指南 —— 独立 md（外部库）
 - 范围：新建 `docs/offline-handbook/lalrpop.md`。
@@ -100,7 +100,7 @@
   `soyo_compiler/src/sysy.lalrpop`（292 行）结构逐节讲解、"如何加一条语法规则"
   （.lalrpop → AST → RaanaIR 下降的完整接线）。
 - 验收：小白能加一个新关键字/新语法并跑通。
-- 状态：`[ ]` 待执行（0 轮）
+- 状态：`[~]` 初稿完成（第 1 轮，评级中）
 
 ### G8 测试 harness —— 独立 md
 - 范围：新建 `docs/offline-handbook/test-harness.md`。
@@ -110,7 +110,7 @@
   如何加测试用例、失败类型（WA/CE/RE/TLE）与排查路径。
 - 参考：AGENTS.md 测试 harness 节。
 - 验收：小白能加一个用例并解释三种失败类型的含义。
-- 状态：`[ ]` 待执行（0 轮）
+- 状态：`[~]` 初稿完成（第 1 轮，评级中）
 
 ### G9 向量化可能的运算方法 —— rustdoc + md
 - 范围：`anon_armv8/src/instructions.rs`（Vec* 指令族）、`anon_armv8/src/lower.rs`
@@ -120,7 +120,7 @@
   每条给原理、改哪层、伪代码/IR 形态、预期解锁用例（如 f32 fmls、整数 mla v.4s、
   VecSub 与 fmls 融合、掩码 select v3 等——参考 skill 的 SIMD gap 分析）。
 - 验收：小白能挑一条清单项直接开工实现。
-- 状态：`[ ]` 待执行（0 轮）
+- 状态：`[~]` 初稿完成（第 1 轮，评级中）
 
 ### G10 可能的优化与实现路线 —— 独立 md
 - 范围：新建 `docs/offline-handbook/future-optimizations.md`。
@@ -129,7 +129,7 @@
   候选方向：SIMD Phase 2（M42-M46 搁置项）、常量物化（clang 差距 P1）、
   PSR 扩展、loop interchange 等。
 - 验收：每个方向都有可执行的实现步骤。
-- 状态：`[ ]` 待执行（0 轮）
+- 状态：`[~]` 初稿完成（第 1 轮，评级中）
 
 ## 执行顺序建议
 

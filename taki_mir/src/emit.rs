@@ -22,8 +22,19 @@
 //!
 //! 指令文本先以 **text slot** 形式进 [`EmitBuffer`](crate::emit_buffer::EmitBuffer)
 //! （每条指令一个槽，固定 4 字节宽度），分支则作为符号化 `Branch` 槽保存
-//! 目标（`MirBlockIndex`），由 buffer 在 `finish()` 时统一做标签解析与
-//! 分支优化（截断/取反/改写）。详见 [`emit_buffer`](crate::emit_buffer) 模块文档。
+//! 目标（`MirBlockIndex`）。分支优化与标签解析由 `write_function` **显式调用**
+//! `buffer.optimize_branches()` → `buffer.resolve()` 完成，`finish()` 只负责
+//! 把槽渲染成最终汇编字符串。详见 [`emit_buffer`](crate::emit_buffer) 模块文档。
+//!
+//! 前置概念（VCodeContainer/寄存器分配/finalize_for_emission）见
+//! [`vcode`](crate::vcode) 模块文档。
+//!
+//! ## 常见修改点
+//!
+//! - 加分支优化规则 → `emit_buffer.rs` 的 `optimize_branches` 规则区
+//!   （+ `LABEL_LIST_THRESHOLD` 防退化）；
+//! - 改输出文本格式 → `EmitBuffer::finish`；
+//! - 改分支可达范围 → `emit_buffer.rs` 的 `LabelKind` 常量（BRANCH14/BRANCH19…）。
 
 use core::fmt::Write;
 

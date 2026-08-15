@@ -257,7 +257,9 @@ mod tests {
     #[test]
     fn aarch64_self_tail_call_loops_without_rebuilding_a_frame() {
         let case = MATRIX.iter().find(|c| c.name == "tail_recursion").unwrap();
-        let asm = compile_deterministically(case, Target::Aarch64, 1);
+        // -O1 inlines `fact` into `main`; disable dead-function elimination so
+        // the standalone `fact` section is still available for ABI inspection.
+        let asm = compile_deterministically_with(case, Target::Aarch64, 1, false);
         let fact = function_section(&asm, "fact");
 
         assert!(

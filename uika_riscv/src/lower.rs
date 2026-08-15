@@ -2436,9 +2436,9 @@ mod tests {
         let asm = compile_constant_binary_imm(BinaryOp::Shl, 3);
         assert!(asm.contains("slli"), "{asm}");
         assert!(!asm.contains("\n    li "), "{asm}");
-        // eq: xori + seqz, no sub, no li.
+        // eq: addiw(x, -5) + seqz, no sub, no li.
         let asm = compile_constant_binary_imm(BinaryOp::Eq, 5);
-        assert!(asm.contains("xori"), "{asm}");
+        assert!(asm.contains("addiw"), "{asm}");
         assert!(asm.contains("seqz"), "{asm}");
         assert!(!asm.contains("\n    sub"), "{asm}");
         assert!(!asm.contains("\n    li "), "{asm}");

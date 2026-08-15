@@ -4521,7 +4521,10 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     // epilogue for remainders is not wired, and the runtime-bound tail loop
     // lowering (spilled row offsets) is not yet correct — such loops stay
     // scalar (conservative) until the apply side handles them soundly.
-    if runtime_trip || trip % step != 0 {
+    // M44_ALLOW_RUNTIME=1 temporarily bypasses the guard for MIR-level
+    // debugging of the runtime-bound lowering path (stage 3b).
+    let runtime_ok = runtime_trip && std::env::var("M44_ALLOW_RUNTIME").is_ok();
+    if (runtime_trip && !runtime_ok) || trip % step != 0 {
         if std::env::var("M44_TRACE").is_ok() {
             eprintln!("[M44] func={} header={header:?} reject=multi_arm_runtime_unsupported",
                 data.name());
@@ -4647,12 +4650,12 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     let body_br0_term = data.layout().basicblock(multi.units[0].body_br).terminator();
     let iv_splat = alloc_inst(data, VectorSplat::new_data(iv, vector_ty.clone()));
     data.layout_mut().insert_inst_before(body_br0_term, iv_splat);
-    let lane_off = alloc_inst(data, VectorSplat::new_data(zero, vector_ty.clone()));
+    let mut lane_off = alloc_inst(data, VectorSplat::new_data(zero, vector_ty.clone()));
     data.layout_mut().insert_inst_before(body_br0_term, lane_off);
     for k in 1..VF as i64 {
         let c = data.new_local_inst().integer(k as i32);
         let idx = data.new_local_inst().integer(k as i32);
-        let lane_off = alloc_inst(
+        lane_off = alloc_inst(
             data,
             VectorInsertElement::new_data(lane_off, c, idx, vector_ty.clone()),
         );
@@ -4747,9 +4750,27 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 &vector_ty,
                 unit.add,
             );
+            // `rr_ok` is a scalar 0/1 (a `neq(..., 0)` result). Splatting it
+            // gives `{0 | 1}` per lane, but the vector mask needs all-ones
+            // (`-1`) so `mul & mask` keeps full lanes: `rr != 0` re-derives
+            // the boolean as an all-ones mask on the vector lanes.
+            let zero_splat = vector_operand(
+                data,
+                &mut FxHashMap::default(),
+                zero,
+                &payload,
+                &classes,
+                &vector_ty,
+                unit.add,
+            );
+            let rr_bool = alloc_inst(
+                data,
+                Binary::new_data(rr_splat, zero_splat, BinaryOp::NotEq, vector_ty.clone()),
+            );
+            data.layout_mut().insert_inst_before(unit.add, rr_bool);
             mask = alloc_inst(
                 data,
-                Binary::new_data(mask, rr_splat, BinaryOp::And, vector_ty.clone()),
+                Binary::new_data(mask, rr_bool, BinaryOp::And, vector_ty.clone()),
             );
             data.layout_mut().insert_inst_before(unit.add, mask);
         }

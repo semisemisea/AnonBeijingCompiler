@@ -309,11 +309,16 @@ passthrough 线程化进内层）+ Parsimony（uniform/varying 分类：uniform 
    - M42 依赖分析修复：loop 内 Integer 常量索引系数 0（4e57d90 前提交）
    - 单测 vectorizes_multi_arm_masked_kernel（const trip 64）+1，raana_ir 425 全绿
 8. **runtime bound / trip%VF 残留 = 保守拒绝**（multi_arm_runtime_unsupported）：
-   实测 conv2d 主循环 In 行基址被 lowering 成 `rr*4`（而非 `rr*N_eff`），
-   读错行导致 checksum 错误（Out[r][c] 值逐行线性递增）。apply 后 IR 正确
-   （offset = Add(Mul(row_off, N_eff), Sub(cc))），二进制 row_off=128（r=32
-   应 2048）——问题在 lowering/后续 pass 对 dynamic GEP term 的处理。已记录
-   标量 tail 循环骨架（build_multi_arm_tail）但未启用。
+   apply 后 IR 正确（offset = Add(Mul(row_off, N_eff), Sub(cc))），但 lowering
+   后主循环 In 行基址错（r=32 时应 rr*N_eff=2048，实际 rr*4=128，cc 也错为 11）
+   读错行 → checksum 错误（Out[r][c] 逐行线性递增）。2026-08-11 深入定位：
+   - **排除 const_cse**（禁用仍错；它只外提 init_matrix/get_random 的常量）
+   - **排除全部 MIR pass**（DCE/Peephole/ChainFusion/ConstCse/PairCombine/
+     ListScheduler 逐个禁用仍错）
+   - **定位到 lowering 本身**：analyze_gep 把双动态 offset（Add(Mul, Sub)）
+     作为单个 dynamic term（stride 4），index 求值在 MIR 中错（Mul/Sub 操作数
+     被算成 rr*4 / 11）——需在 taki_mir lower 层深查 index 求值（Hir 层
+     --emit ir 正确）。标量 tail 骨架已建但未启用。
 9. 掩码乘加 lowering：复用现有 `VecMla` + `and` + 向量比较（VecCmp 已支持
    Ge/Lt，mvn 反相）——无需新 MInst。
 10. （待 3b 修复后）runtime bound（N_eff）→ 标量 tail（骨架已建）。

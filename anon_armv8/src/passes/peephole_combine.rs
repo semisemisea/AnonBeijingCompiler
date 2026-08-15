@@ -300,9 +300,9 @@ fn combine_flag_fusion(vcode: &mut VCodeContainer<MInst>, use_counts: &HashMap<R
         let mut i = range.start;
         while i + 2 < range.end {
             let fused = fuse_flag_triple(
-                &*vcode.inst(i),
-                &*vcode.inst(i + 1),
-                &*vcode.inst(i + 2),
+                vcode.inst(i),
+                vcode.inst(i + 1),
+                vcode.inst(i + 2),
                 use_counts,
             );
             if let Some(fused_inst) = fused {

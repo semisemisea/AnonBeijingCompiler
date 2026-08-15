@@ -19,6 +19,13 @@
 > 25 个串行掩码累加单元全部识别（`br mask, then, end(acc)` 链），M44_TRACE 复扫
 > 不再报 `shape_body_not_2_blocks`；apply 保守拒绝（`multi_arm_apply_unsupported`），
 > 行为零变化，raana_ir 424 全绿。
+> **阶段 2（analyze 完整支持）已完成（2026-08-11，068abe9）**：步进指针/exit-only
+> 死参数/多臂 acc 识别，analyze 全通、apply 安全拒绝（修固定点死循环）。
+> **阶段 3a（apply 常量 trip 向量化核心）已完成（2026-08-11，4e57d90）**：合成
+> 5 点卷积内核真正向量化（单测 +1），后端 SSA 安全（iv_vec/vzero 定义位置修复）。
+> **阶段 3b 阻塞（2026-08-11 实证）**：runtime bound 的主循环 In 行基址被 lowering
+> 成 `rr*4`（应 `rr*N_eff`）读错行 → checksum 错误；标量 tail 骨架已建但未启用，
+> runtime 保守拒绝（行为零变化 835 指令，152/152）。
 > 待做：§5 主计划 E 剩余项（M51 指针槽/SROA、M55、M56）与 §6 后续候选。
 
 ## 已完成里程碑摘要
@@ -291,17 +298,25 @@ passthrough 线程化进内层）+ Parsimony（uniform/varying 分类：uniform 
 6. acc 识别（M42 Reducible）+ exit 分类（IvFinal/Acc/Passthrough）在排除上述
    后应能通过（conv2d exit `while_end_8` 传 iv、acc、%62、%9）。
 
-*阶段 3 —— 掩码乘加核心 + sum_v 累加 + Out store（apply）*
-7. 扩展 ArmPlan/B1：单臂 → 多臂。对每个 (kr,kc)：
-   - 向量边界掩码生成：`mask_kc = (c_vec + kc - 2) >= 0 & < N_eff` 与
-     `rr_ok`（标量 splat）合取。
-   - `sum_v += (ldr q In[rr][cc_vec]) * splat(K[kr][kc]) & mask_kc`。
-   - K[kr][kc] 是循环外常量（全局 K 数组），splat。
-8. sum_v 向量累加器 re-type（header acc slot + 25 个 end block param + branch
-   f_args 链），latch 的 Out store 向量化（连续 store），ptr 步进改 VF。
+*阶段 3 —— 掩码乘加核心 + sum_v 累加 + Out store（apply）—— 阶段 3a 已完成*
+7. apply_multi_arm：常量 trip（% VF == 0）多臂掩码累加向量化：
+   - acc 链 re-type（header carrier + 25 end param），splat(0) 种子
+   - 每单元 In 连续向量 load、K splat、mul/add lane-wise、mask lane-wise
+     （cc_vec = iv_vec + splat(kc_off) 的 ge/lt + rr_ok 合取，add += mul & mask）
+   - 计数器 materialize、iv 步进 VF、latch Out 连续 store、
+     reduce block（VectorReduce addv）+ exit terminator 改写（标量 acc/iv final）
+   - 后端 SSA 安全：iv_vec 定义在 body_br0（链公共支配点）、vzero 在 preheader
+   - M42 依赖分析修复：loop 内 Integer 常量索引系数 0（4e57d90 前提交）
+   - 单测 vectorizes_multi_arm_masked_kernel（const trip 64）+1，raana_ir 425 全绿
+8. **runtime bound / trip%VF 残留 = 保守拒绝**（multi_arm_runtime_unsupported）：
+   实测 conv2d 主循环 In 行基址被 lowering 成 `rr*4`（而非 `rr*N_eff`），
+   读错行导致 checksum 错误（Out[r][c] 值逐行线性递增）。apply 后 IR 正确
+   （offset = Add(Mul(row_off, N_eff), Sub(cc))），二进制 row_off=128（r=32
+   应 2048）——问题在 lowering/后续 pass 对 dynamic GEP term 的处理。已记录
+   标量 tail 循环骨架（build_multi_arm_tail）但未启用。
 9. 掩码乘加 lowering：复用现有 `VecMla` + `and` + 向量比较（VecCmp 已支持
-   Ge/Lt，mvn 反相）。
-10. 尾循环：runtime bound（N_eff）→ 标量 tail（复用现有 `vec_tail` 机制）。
+   Ge/Lt，mvn 反相）——无需新 MInst。
+10. （待 3b 修复后）runtime bound（N_eff）→ 标量 tail（骨架已建）。
 
 *阶段 4 —— 验证与回归*
 11. `cargo test -p raana_ir`（新增多臂掩码向量化单测）。

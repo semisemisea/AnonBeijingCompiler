@@ -147,7 +147,7 @@ fn plan_const_cse(vcode: &VCodeContainer<MInst>) -> Option<Plan> {
     // Innermost hoistable loop preheader per block. Hoisting to the innermost
     // preheader keeps the constant's live range as small as possible.
     let mut hoist_target: Vec<Option<Block>> = vec![None; blocks];
-    for b in 0..blocks {
+    for (b, target) in hoist_target.iter_mut().enumerate() {
         let mut best: Option<usize> = None;
         for (index, loop_info) in loops.iter().enumerate() {
             if !hoistable[index] {
@@ -160,7 +160,7 @@ fn plan_const_cse(vcode: &VCodeContainer<MInst>) -> Option<Plan> {
                 && best.is_none_or(|cur| loop_info.blocks.len() < loops[cur].blocks.len())
             {
                 best = Some(index);
-                hoist_target[b] = Some(preheader);
+                *target = Some(preheader);
             }
         }
     }
@@ -172,8 +172,8 @@ fn plan_const_cse(vcode: &VCodeContainer<MInst>) -> Option<Plan> {
     // first occurrence is the leader (moved); the rest are eliminated and
     // their uses redirected to the leader.
     let mut groups: HashMap<(Block, u8, u64), Vec<usize>> = HashMap::new();
-    for block in 0..blocks {
-        let Some(target) = hoist_target[block] else {
+    for (block, target) in hoist_target.iter().enumerate() {
+        let Some(target) = *target else {
             continue;
         };
         for i in vcode.block_inst_range(block) {

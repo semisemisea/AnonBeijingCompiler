@@ -72,7 +72,6 @@ const TINY_HOIST_BODY_LIMIT: usize = 150;
 
 /// An innermost natural loop with a unique preheader.
 struct LoopInfo {
-    header: Block,
     /// All blocks of the loop, including the header.
     blocks: Vec<Block>,
     /// The unique block that dominates the header and is not part of the
@@ -418,7 +417,6 @@ fn find_loops(
             None
         };
         loops.push(LoopInfo {
-            header,
             blocks: loop_blocks,
             preheader,
         });

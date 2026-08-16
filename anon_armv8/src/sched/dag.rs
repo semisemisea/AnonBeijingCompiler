@@ -19,7 +19,9 @@ mod graph;
 mod inst_deps;
 mod memory;
 
-)
+pub use graph::{DagBuildStats, DepEdge, DepGraph, EdgeKind};
+pub use inst_deps::{InstDeps, inst_deps};
+pub use memory::{MemAccess, MemKind, MemRoot};
 
 #[cfg(test)]
 mod tests;

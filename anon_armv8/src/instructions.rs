@@ -2,7 +2,6 @@
 
 use taki_mir::{
     abi::{ArgPair, CallArgPair, CallRetPair, RetPair, StackAMode},
-    emit_buffer::LabelKind,
     reg_alloc::reg::{OperandVisitor, OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
     types::{F32, I32, I64, LoweredType, V2F64, V2I64, V4F32, V4I32},

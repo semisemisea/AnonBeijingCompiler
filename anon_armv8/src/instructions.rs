@@ -17,6 +17,8 @@ use crate::{
 
 pub type WritableReg = Writable<Reg>;
 
+mod emit;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Imm12 {
     value: u16,
@@ -1343,592 +1345,8 @@ impl MachInstEmit for MInst {
         match self {
             Self::Nop => write!(ctx, "nop"),
             Self::Removed => Ok(()),
-            Self::AluRRR {
-                op,
-                size,
-                dst,
-                lhs,
-                rhs,
-            } => emit_sized_data_rrr(ctx, alu_name(*op), *size, dst.to_reg(), lhs, rhs),
-            Self::AluRRRR {
-                op,
-                size,
-                dst,
-                lhs,
-                rhs,
-                carry,
-            } => emit_sized_rrrr(ctx, alu_name(*op), *size, dst.to_reg(), lhs, rhs, carry),
-            Self::AluRRImm12 {
-                op,
-                size,
-                dst,
-                src,
-                imm,
-            } => emit_add_sub_imm12(ctx, alu_name(*op), *size, *dst, *src, *imm),
-            Self::AluRRImmLogic {
-                op,
-                size,
-                dst,
-                src,
-                imm,
-            } => {
-                write!(ctx, "{} ", alu_name(*op))?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
-                write!(ctx, ", ")?;
-                emit_reg_or_zr(ctx, src, *size)?;
-                write!(ctx, ", #0x{:x}", imm.value())
-            }
-            Self::AluRRImmShift {
-                op,
-                size,
-                dst,
-                src,
-                shift,
-            } => {
-                write!(ctx, "{} ", alu_name(*op))?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
-                write!(ctx, ", ")?;
-                emit_reg(ctx, *src, *size)?;
-                write!(ctx, ", #{}", shift.value())
-            }
-            Self::AluRRRShift {
-                op,
-                size,
-                dst,
-                lhs,
-                rhs,
-                shift,
-                amount,
-            } => {
-                write!(ctx, "{} ", alu_name(*op))?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
-                write!(ctx, ", ")?;
-                emit_reg_or_zr(ctx, lhs, *size)?;
-                write!(ctx, ", ")?;
-                emit_reg_or_zr(ctx, rhs, *size)?;
-                write!(ctx, ", {} #{}", shift_name(*shift), amount.value())
-            }
-            Self::AluRRRExtend {
-                op,
-                size,
-                dst,
-                lhs,
-                rhs,
-                extend,
-                shift,
-            } => {
-                write!(ctx, "{} ", alu_name(*op))?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
-                write!(ctx, ", ")?;
-                emit_reg(ctx, *lhs, *size)?;
-                write!(ctx, ", ")?;
-                emit_reg(ctx, *rhs, extend_source_size(*extend, *size))?;
-                write!(ctx, ", {}", extend_name(*extend))?;
-                if *shift != 0 {
-                    write!(ctx, " #{}", shift)?;
-                }
-                Ok(())
-            }
-            Self::SDiv {
-                size,
-                dst,
-                lhs,
-                rhs,
-            } => emit_sized_rrr(ctx, "sdiv", *size, dst.to_reg(), lhs, rhs),
-            Self::SMulL { dst, lhs, rhs } => {
-                write!(ctx, "smull ")?;
-                emit_reg(ctx, dst.to_reg(), OperandSize::Size64)?;
-                write!(ctx, ", ")?;
-                emit_reg(ctx, *lhs, OperandSize::Size32)?;
-                write!(ctx, ", ")?;
-                emit_reg(ctx, *rhs, OperandSize::Size32)
-            }
-            Self::MAdd {
-                size,
-                dst,
-                lhs,
-                rhs,
-                addend,
-            } => emit_sized_rrrr(ctx, "madd", *size, dst.to_reg(), lhs, rhs, addend),
-            Self::MSub {
-                size,
-                dst,
-                lhs,
-                rhs,
-                subtrahend,
-            } => emit_sized_rrrr(ctx, "msub", *size, dst.to_reg(), lhs, rhs, subtrahend),
-            Self::CmpRR { size, lhs, rhs } => {
-                write!(ctx, "cmp ")?;
-                emit_reg(ctx, *lhs, *size)?;
-                write!(ctx, ", ")?;
-                emit_reg_or_zr(ctx, rhs, *size)
-            }
-            Self::CmpImm { size, lhs, imm } => {
-                write!(ctx, "cmp ")?;
-                emit_reg(ctx, *lhs, *size)?;
-                write!(ctx, ", #{}", imm.value())?;
-                if imm.shift12() {
-                    write!(ctx, ", lsl #12")?;
-                }
-                Ok(())
-            }
-            Self::SubsRRImm12 {
-                size,
-                dst,
-                src,
-                imm,
-            } => emit_add_sub_imm12(ctx, "subs", *size, *dst, *src, *imm),
-            Self::AndsRRImmLogic {
-                size,
-                dst,
-                src,
-                imm,
-            } => {
-                write!(ctx, "ands ")?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
-                write!(ctx, ", ")?;
-                emit_reg_or_zr(ctx, src, *size)?;
-                write!(ctx, ", #0x{:x}", imm.value())
-            }
-            Self::TstRRImmLogic { size, src, imm } => {
-                write!(ctx, "tst ")?;
-                emit_reg_or_zr(ctx, src, *size)?;
-                write!(ctx, ", #0x{:x}", imm.value())
-            }
-            Self::Mov { size, dst, src } | Self::MovPhys { size, dst, src } => {
-                write!(ctx, "mov ")?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
-                write!(ctx, ", ")?;
-                emit_reg(ctx, *src, *size)
-            }
-            Self::LoadImm { size, dst, value } => emit_load_imm(ctx, dst.to_reg(), *value, *size),
-            Self::MovZ { size, dst, imm } => emit_move_wide(ctx, "movz", *size, *dst, *imm),
-            Self::MovN { size, dst, imm } => emit_move_wide(ctx, "movn", *size, *dst, *imm),
-            Self::MovK { size, dst, imm, .. } => emit_move_wide(ctx, "movk", *size, *dst, *imm),
-            Self::MovFromZero { size, dst } => {
-                write!(ctx, "mov ")?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
-                write!(ctx, ", ")?;
-                emit_gpr(ctx, &Gpr::Zr, *size)
-            }
-            Self::Sxtw { size, dst, src } => {
-                write!(ctx, "sxtw ")?;
-                emit_reg(ctx, dst.to_reg(), OperandSize::Size64)?;
-                write!(ctx, ", ")?;
-                emit_reg(ctx, *src, *size)
-            }
-            Self::LoadAddr { dst, label } => {
-                write!(ctx, "adrp ")?;
-                emit_reg(ctx, dst.to_reg(), OperandSize::Size64)?;
-                write!(ctx, ", ")?;
-                label.emit(ctx)?;
-                ctx.end_inst()?;
-                write!(ctx, "add ")?;
-                emit_reg(ctx, dst.to_reg(), OperandSize::Size64)?;
-                write!(ctx, ", ")?;
-                emit_reg(ctx, dst.to_reg(), OperandSize::Size64)?;
-                write!(ctx, ", :lo12:")?;
-                label.emit(ctx)
-            }
             Self::StackAddr { .. } => {
                 unreachable!("stack addresses must be legalized before emission")
-            }
-            Self::BCond { cond, label } => {
-                let target = label
-                    .block()
-                    .expect("BCond target must be an intra-function block");
-                let cond_text = cond_name(*cond);
-                let inverted_text = cond_name(invert_cond(*cond));
-                ctx.put_branch(
-                    &format!("b.{cond_text} "),
-                    Some(&format!("b.{inverted_text} ")),
-                    target,
-                    LabelKind::BRANCH19,
-                )
-            }
-            Self::Cbz {
-                size,
-                reg,
-                true_label,
-                false_label,
-            }
-            | Self::Cbnz {
-                size,
-                reg,
-                true_label,
-                false_label,
-            } => {
-                let (mnemonic, inverted_mnemonic) = match self {
-                    Self::Cbz { .. } => ("cbz", "cbnz"),
-                    _ => ("cbnz", "cbz"),
-                };
-                let true_target = true_label
-                    .block()
-                    .expect("Cbz/Cbnz target must be an intra-function block");
-                let false_target = false_label
-                    .block()
-                    .expect("Cbz/Cbnz target must be an intra-function block");
-                let prefix = branch_prefix(ctx, mnemonic, *reg, *size)?;
-                let inv_prefix = branch_prefix(ctx, inverted_mnemonic, *reg, *size)?;
-                ctx.put_branch(&prefix, Some(&inv_prefix), true_target, LabelKind::BRANCH19)?;
-                ctx.put_uncond_branch("b ", false_target, LabelKind::BRANCH26)
-            }
-            Self::Tbz {
-                size,
-                reg,
-                bit,
-                true_label,
-                false_label,
-            }
-            | Self::Tbnz {
-                size,
-                reg,
-                bit,
-                true_label,
-                false_label,
-            } => {
-                let (mnemonic, inverted_mnemonic) = match self {
-                    Self::Tbz { .. } => ("tbz", "tbnz"),
-                    _ => ("tbnz", "tbz"),
-                };
-                let true_target = true_label
-                    .block()
-                    .expect("Tbz/Tbnz target must be an intra-function block");
-                let false_target = false_label
-                    .block()
-                    .expect("Tbz/Tbnz target must be an intra-function block");
-                let prefix = branch_prefix_bit(ctx, mnemonic, *reg, *size, *bit)?;
-                let inv_prefix = branch_prefix_bit(ctx, inverted_mnemonic, *reg, *size, *bit)?;
-                ctx.put_branch(&prefix, Some(&inv_prefix), true_target, LabelKind::BRANCH14)?;
-                ctx.put_uncond_branch("b ", false_target, LabelKind::BRANCH26)
-            }
-            Self::CondBr {
-                cond,
-                true_label,
-                false_label,
-            } => {
-                let true_target = true_label
-                    .block()
-                    .expect("CondBr target must be an intra-function block");
-                let false_target = false_label
-                    .block()
-                    .expect("CondBr target must be an intra-function block");
-                let cond_text = cond_name(*cond);
-                let inverted_text = cond_name(invert_cond(*cond));
-                ctx.put_branch(
-                    &format!("b.{cond_text} "),
-                    Some(&format!("b.{inverted_text} ")),
-                    true_target,
-                    LabelKind::BRANCH19,
-                )?;
-                ctx.put_uncond_branch("b ", false_target, LabelKind::BRANCH26)
-            }
-            Self::Jump { label } => {
-                let target = label
-                    .block()
-                    .expect("Jump target must be an intra-function block");
-                ctx.put_uncond_branch("b ", target, LabelKind::BRANCH26)
-            }
-            Self::CSet { cond, dst } => {
-                write!(ctx, "cset ")?;
-                emit_reg(ctx, dst.to_reg(), OperandSize::Size32)?;
-                write!(ctx, ", {}", cond_name(*cond))
-            }
-            Self::CCmp {
-                size,
-                lhs,
-                rhs,
-                imm,
-                nzcv,
-                cond,
-            } => emit_ccmp(ctx, *size, *lhs, rhs, *imm, *nzcv, *cond),
-            Self::CmpSelect {
-                cmp,
-                ccmp,
-                cond,
-                value,
-            } => {
-                emit_select_cmp(ctx, cmp)?;
-                ctx.end_inst()?;
-                if let Some(ccmp) = ccmp {
-                    emit_ccmp(
-                        ctx, ccmp.size, ccmp.lhs, &ccmp.rhs, ccmp.imm, ccmp.nzcv, ccmp.cond,
-                    )?;
-                    ctx.end_inst()?;
-                }
-                match value {
-                    SelectValue::Int {
-                        size,
-                        dst,
-                        if_true,
-                        if_false,
-                    } => {
-                        write!(ctx, "csel ")?;
-                        emit_reg(ctx, dst.to_reg(), *size)?;
-                        write!(ctx, ", ")?;
-                        emit_reg(ctx, *if_true, *size)?;
-                        write!(ctx, ", ")?;
-                        emit_reg(ctx, *if_false, *size)?;
-                        write!(ctx, ", {}", cond_name(*cond))
-                    }
-                    SelectValue::Float {
-                        dst,
-                        if_true,
-                        if_false,
-                    } => {
-                        write!(ctx, "fcsel ")?;
-                        emit_float_reg(ctx, dst.to_reg(), false)?;
-                        write!(ctx, ", ")?;
-                        emit_float_reg(ctx, *if_true, false)?;
-                        write!(ctx, ", ")?;
-                        emit_float_reg(ctx, *if_false, false)?;
-                        write!(ctx, ", {}", cond_name(*cond))
-                    }
-                    SelectValue::Bool { dst } => {
-                        write!(ctx, "cset ")?;
-                        emit_reg(ctx, dst.to_reg(), OperandSize::Size32)?;
-                        write!(ctx, ", {}", cond_name(*cond))
-                    }
-                }
-            }
-            Self::FMov { dst, src } => emit_fmov(ctx, dst.to_reg(), src),
-            Self::VecMov { dst, src } => {
-                write!(ctx, "mov ")?;
-                emit_vec_reg(ctx, dst.to_reg())?;
-                write!(ctx, ".16b, ")?;
-                emit_vec_reg(ctx, *src)?;
-                write!(ctx, ".16b")
-            }
-            Self::VecLd1 { dst, base } => {
-                write!(ctx, "ld1 {{")?;
-                emit_vec_reg(ctx, dst.to_reg())?;
-                write!(ctx, ".16b}}, [")?;
-                emit_reg(ctx, *base, OperandSize::Size64)?;
-                write!(ctx, "]")
-            }
-            Self::VecSt1 { src, base } => {
-                write!(ctx, "st1 {{")?;
-                emit_vec_reg(ctx, *src)?;
-                write!(ctx, ".16b}}, [")?;
-                emit_reg(ctx, *base, OperandSize::Size64)?;
-                write!(ctx, "]")
-            }
-            Self::VecDup { shape, dst, src } => {
-                write!(ctx, "dup ")?;
-                emit_vec_reg(ctx, dst.to_reg())?;
-                write!(ctx, ".{}, ", shape.arrangement())?;
-                emit_vec_scalar_reg(ctx, *src, *shape)
-            }
-            Self::VecArithRRR {
-                op,
-                shape,
-                dst,
-                lhs,
-                rhs,
-            } => emit_vec_rrr(ctx, vec_arith_name(*op), *dst, *shape, *lhs, *rhs),
-            Self::VecFmla {
-                shape,
-                dst,
-                acc,
-                lhs,
-                rhs,
-            } => {
-                write!(ctx, "mov ")?;
-                emit_vec_reg(ctx, dst.to_reg())?;
-                write!(ctx, ".16b, ")?;
-                emit_vec_reg(ctx, *acc)?;
-                write!(ctx, ".16b")?;
-                ctx.end_inst()?;
-                write!(ctx, "fmla ")?;
-                emit_vec_reg(ctx, dst.to_reg())?;
-                write!(ctx, ".{}, ", shape.arrangement())?;
-                emit_vec_reg(ctx, *lhs)?;
-                write!(ctx, ".{}, ", shape.arrangement())?;
-                emit_vec_reg(ctx, *rhs)?;
-                write!(ctx, ".{}", shape.arrangement())
-            }
-            Self::VecBitwise { op, dst, lhs, rhs } => {
-                write!(ctx, "{} ", vec_bit_name(*op))?;
-                emit_vec_reg(ctx, dst.to_reg())?;
-                write!(ctx, ".16b, ")?;
-                emit_vec_reg(ctx, *lhs)?;
-                write!(ctx, ".16b, ")?;
-                emit_vec_reg(ctx, *rhs)?;
-                write!(ctx, ".16b")
-            }
-            Self::VecCmp {
-                op,
-                shape,
-                dst,
-                lhs,
-                rhs,
-            } => emit_vec_rrr(ctx, vec_cmp_name(*op), *dst, *shape, *lhs, *rhs),
-            Self::VecBsl {
-                dst,
-                mask,
-                lhs,
-                rhs,
-            } => {
-                write!(ctx, "mov ")?;
-                emit_vec_reg(ctx, dst.to_reg())?;
-                write!(ctx, ".16b, ")?;
-                emit_vec_reg(ctx, *mask)?;
-                write!(ctx, ".16b")?;
-                ctx.end_inst()?;
-                write!(ctx, "bsl ")?;
-                emit_vec_reg(ctx, dst.to_reg())?;
-                write!(ctx, ".16b, ")?;
-                emit_vec_reg(ctx, *lhs)?;
-                write!(ctx, ".16b, ")?;
-                emit_vec_reg(ctx, *rhs)?;
-                write!(ctx, ".16b")
-            }
-            Self::VecCvt {
-                op,
-                shape,
-                dst,
-                src,
-            } => {
-                write!(ctx, "{} ", vec_cvt_name(*op))?;
-                emit_vec_reg(ctx, dst.to_reg())?;
-                write!(ctx, ".{}, ", shape.arrangement())?;
-                emit_vec_reg(ctx, *src)?;
-                write!(ctx, ".{}", shape.arrangement())
-            }
-            Self::VecAddv { dst, src } => {
-                write!(ctx, "addv ")?;
-                emit_float_reg(ctx, dst.to_reg(), false)?;
-                write!(ctx, ", ")?;
-                emit_vec_reg(ctx, *src)?;
-                write!(ctx, ".4s")
-            }
-            Self::VecMovImm {
-                shape,
-                dst,
-                imm,
-                shift,
-            } => {
-                write!(ctx, "movi ")?;
-                emit_vec_reg(ctx, dst.to_reg())?;
-                write!(ctx, ".{}, #0x{:x}", shape.arrangement(), imm)?;
-                if *shift != 0 {
-                    write!(ctx, ", lsl #{shift}")?;
-                }
-                Ok(())
-            }
-            Self::VecExtractLane {
-                size,
-                dst,
-                src,
-                lane,
-            } => {
-                write!(ctx, "mov ")?;
-                emit_reg(ctx, dst.to_reg(), *size)?;
-                write!(ctx, ", ")?;
-                emit_vec_reg(ctx, *src)?;
-                write!(
-                    ctx,
-                    ".{}[{}]",
-                    if *size == OperandSize::Size64 {
-                        "d"
-                    } else {
-                        "s"
-                    },
-                    lane
-                )
-            }
-            Self::VecInsertLane {
-                size,
-                dst,
-                vector,
-                src,
-                lane,
-            } => {
-                write!(ctx, "mov ")?;
-                emit_vec_reg(ctx, dst.to_reg())?;
-                write!(ctx, ".16b, ")?;
-                emit_vec_reg(ctx, *vector)?;
-                write!(ctx, ".16b")?;
-                ctx.end_inst()?;
-                write!(ctx, "mov ")?;
-                emit_vec_reg(ctx, dst.to_reg())?;
-                write!(
-                    ctx,
-                    ".{}[{}], ",
-                    if *size == OperandSize::Size64 {
-                        "d"
-                    } else {
-                        "s"
-                    },
-                    lane
-                )?;
-                emit_reg(ctx, *src, *size)
-            }
-            Self::VecMinMax {
-                op,
-                shape,
-                dst,
-                lhs,
-                rhs,
-            } => emit_vec_rrr(ctx, vec_minmax_name(*op), *dst, *shape, *lhs, *rhs),
-            Self::FMovFromZero { dst } => {
-                write!(ctx, "fmov ")?;
-                emit_float_reg(ctx, dst.to_reg(), false)?;
-                write!(ctx, ", wzr")
-            }
-            Self::FAlu { op, dst, lhs, rhs } => {
-                emit_float_rrr(ctx, fpu_name(*op), dst.to_reg(), lhs, rhs)
-            }
-            Self::FCmp { lhs, rhs } => emit_float_rr(ctx, "fcmp", *lhs, rhs),
-            Self::Scvtf { dst, src } => {
-                write!(ctx, "scvtf ")?;
-                emit_float_reg(ctx, dst.to_reg(), false)?;
-                write!(ctx, ", ")?;
-                emit_reg(ctx, *src, OperandSize::Size32)
-            }
-            Self::Fcvtzs { dst, src } => {
-                write!(ctx, "fcvtzs ")?;
-                emit_reg(ctx, dst.to_reg(), OperandSize::Size32)?;
-                write!(ctx, ", ")?;
-                emit_float_reg(ctx, *src, false)
-            }
-            Self::Load { ty, dst, addr } => {
-                write!(ctx, "ldr ")?;
-                emit_data_reg(ctx, dst.to_reg(), *ty)?;
-                write!(ctx, ", ")?;
-                emit_amode(ctx, addr)
-            }
-            Self::Store { ty, src, addr } => {
-                write!(ctx, "str ")?;
-                emit_data_reg(ctx, *src, *ty)?;
-                write!(ctx, ", ")?;
-                emit_amode(ctx, addr)
-            }
-            Self::LoadPair {
-                ty,
-                dst1,
-                dst2,
-                addr,
-            } => {
-                write!(ctx, "ldp ")?;
-                emit_data_reg(ctx, dst1.to_reg(), *ty)?;
-                write!(ctx, ", ")?;
-                emit_data_reg(ctx, dst2.to_reg(), *ty)?;
-                write!(ctx, ", ")?;
-                emit_pair_amode(ctx, addr)
-            }
-            Self::StorePair {
-                ty,
-                src1,
-                src2,
-                addr,
-            } => {
-                write!(ctx, "stp ")?;
-                emit_data_reg(ctx, *src1, *ty)?;
-                write!(ctx, ", ")?;
-                emit_data_reg(ctx, *src2, *ty)?;
-                write!(ctx, ", ")?;
-                emit_pair_amode(ctx, addr)
             }
             Self::RetVal { .. } => Ok(()),
             Self::Args { .. } => Ok(()),
@@ -1941,6 +1359,66 @@ impl MachInstEmit for MInst {
                 label.emit(ctx)
             }
             Self::Ret => write!(ctx, "ret"),
+            Self::AluRRR { .. }
+            | Self::AluRRRR { .. }
+            | Self::AluRRImm12 { .. }
+            | Self::AluRRImmLogic { .. }
+            | Self::AluRRImmShift { .. }
+            | Self::AluRRRShift { .. }
+            | Self::AluRRRExtend { .. }
+            | Self::SDiv { .. }
+            | Self::SMulL { .. }
+            | Self::MAdd { .. }
+            | Self::MSub { .. }
+            | Self::CmpRR { .. }
+            | Self::CmpImm { .. }
+            | Self::SubsRRImm12 { .. }
+            | Self::AndsRRImmLogic { .. }
+            | Self::TstRRImmLogic { .. }
+            | Self::Mov { .. }
+            | Self::MovPhys { .. }
+            | Self::LoadImm { .. }
+            | Self::MovZ { .. }
+            | Self::MovN { .. }
+            | Self::MovK { .. }
+            | Self::MovFromZero { .. }
+            | Self::Sxtw { .. }
+            | Self::LoadAddr { .. } => emit::emit_alu(self, ctx),
+            Self::BCond { .. }
+            | Self::Cbz { .. }
+            | Self::Cbnz { .. }
+            | Self::Tbz { .. }
+            | Self::Tbnz { .. }
+            | Self::CondBr { .. }
+            | Self::Jump { .. }
+            | Self::CSet { .. }
+            | Self::CmpSelect { .. }
+            | Self::CCmp { .. } => emit::emit_branch(self, ctx),
+            Self::FMov { .. }
+            | Self::VecMov { .. }
+            | Self::VecLd1 { .. }
+            | Self::VecSt1 { .. }
+            | Self::VecDup { .. }
+            | Self::VecArithRRR { .. }
+            | Self::VecFmla { .. }
+            | Self::VecBitwise { .. }
+            | Self::VecCmp { .. }
+            | Self::VecBsl { .. }
+            | Self::VecCvt { .. }
+            | Self::VecAddv { .. }
+            | Self::VecMovImm { .. }
+            | Self::VecExtractLane { .. }
+            | Self::VecInsertLane { .. }
+            | Self::VecMinMax { .. }
+            | Self::FMovFromZero { .. }
+            | Self::FAlu { .. }
+            | Self::FCmp { .. }
+            | Self::Scvtf { .. }
+            | Self::Fcvtzs { .. } => emit::emit_neon(self, ctx),
+            Self::Load { .. }
+            | Self::Store { .. }
+            | Self::LoadPair { .. }
+            | Self::StorePair { .. } => emit::emit_memory(self, ctx),
         }
     }
 }

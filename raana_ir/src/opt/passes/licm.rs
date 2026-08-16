@@ -1,3 +1,58 @@
+//! # LICM：循环不变代码外提
+//!
+//! 把循环内**每轮结果相同**的表达式移到 preheader，只算一次。经典 LICM 的
+//! 保守实现 + 两个增强：**副作用感知**（`EffectAnalysis` 判定纯调用与
+//! load 能否安全外提）与**外提规模限制**（地址计算型 load 批量外提会拉长
+//! 活跃区间、引发 spill，见 `MAX_HOISTED_COMPUTED_LOADS`）。
+//!
+//! ## 变换形态（IR 示例）
+//!
+//! ```text
+//! 前：                             后：
+//! pre:  jump header(...)          pre:  t = a * 4            ← 外提
+//! header(...):                          jump header(...)
+//!   ...                             header(...):
+//!   p = gep base, [i, a*4]            ...
+//!   v = load p                        p = gep base, [i, t]    ← 引用外提值
+//!   ...                               v = load p
+//!                                    （p 的 GEP 若整条不变也可外提）
+//! ```
+//!
+//! 外提的指令用 `substitute_header_params` 把 header/单前驱 body 参数替换成
+//! preheader 边实参——外提指令落在 preheader，不能引用循环内定义的参数
+//! （否则违反 SSA 支配；fft0/fft1 曾在此触发 VCode SSA 校验 panic）。
+//!
+//! ## 触发 / 放弃条件
+//!
+//! - 标量计算（Binary/Cast/Select/GEP）：操作数都是循环不变量
+//!   （`Lattice::Invariant` 数据流标记，循环外定义/常量/全局/不随 IV 变）；
+//! - `load`：仅当 `load_hoist_safe`——`EffectAnalysis` 证明循环内没有任何
+//!   指令可能写该地址（按 `WriteRoot` 别名判定）；**直接标量 load** 保留
+//!   资格，地址计算型 load 受限（`limit_computed_loads` 时 ≤ 8 条）；
+//! - 纯 `call`（无副作用、无写内存）：可外提，实参需全部不变量；
+//! - 放弃：副作用不确定、写内存可能命中、外提预算超限；无 `EffectAnalysis`
+//!   的裸 `run_on` 调用（单测路径）不外提任何 load。
+//!
+//! ## 正确性
+//!
+//! - 外提指令每轮值相同（不变量）且无副作用 → 执行次数减少不改变语义；
+//! - load 外提要求循环内无人写该地址（否则提前读会读到旧值）；
+//! - 外提目标 preheader 支配循环内所有使用点，SSA 支配保持。
+//!
+//! ## 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `from_config`，fixpoint 段，`chain_to_switch`
+//!   之后、`gvn` 之前；
+//! - 门控：`with_computed_load_limit(config.target.enable_chain_to_switch)`
+//!   ——AArch64 限制地址计算型 load 外提，RISC-V 不限制；
+//! - 依赖：`EffectAnalysis`（`analysis_passes/effects.rs`）在每次
+//!   `Pass::run` 重建。
+//!
+//! ## 验证
+//!
+//! - 本文件 `mod tests` 覆盖不变量判定、load 安全性、参数替换与拒绝路径；
+//! - 端到端：`make test` 差分比对。
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::opt::{

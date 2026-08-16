@@ -34,7 +34,105 @@
 //! runtime guard skips caching a value that does not. Out-of-bounds `K` and
 //! out-of-range residuals degrade to the uncached computation (correctness is
 //! preserved for every input).
-
+//!
+//! ---
+//!
+//! ## 补充说明（中文）
+//!
+//! 术语：记忆化（memoization）/ 缓存 / 累加器（accumulator）/ 自递归
+//! （self-recursion）/ 运行时大小缓存 等见 `docs/offline-handbook/glossary.md`
+//! 的"优化与 pass 概念"分组，本模块只给最小解释。
+//!
+//! ### 一句话定位
+//!
+//! **M68**：把「纯自递归 + 加性累加器」形态的函数 `f(K, C)` 改写成记忆化版本
+//! `f_memo(K, C, cache, size)`——命中直接返回、未命中跑原函数体并回填缓存。
+//! 动机是 h-1 家族热点 `fun(n, dep)`：单链递归（`n` 只增或减半，`[1, lim]`
+//! 每个 `n` 都是独立节点），朴素递归访问约 3.16G 节点；按 `n` 记忆化残差后
+//! 塌缩为每 `n` 一次调用（50M）+ 每次未命中一次链步（约 33M），约 63x
+//! 加速（实测 QEMU 22.79s → 约 3.7s）。
+//!
+//! ### 变换形态
+//!
+//! 缓存按 `K` 存残差 `h(K) = f(K, 0)` 外加 1 bit 分类：
+//!
+//! - **leaf**：`f(K, C) = C + h(K)`（h-1 的 `fun(n, dep)` 叶返回 `dep`）；
+//! - **fixed**：`f(K, C) = v(K)`，与 `C` 无关（h-1 的 `return 7` 屏障）。
+//!
+//! 缓存是打包 `i32` 数组：`entry = (val << 2) | tag`，`tag ∈ {1, 2}`
+//! （`TAG_LEAF` = 1 = leaf 残差，`TAG_FIXED` = 2 = fixed 值），`0` = 空槽；
+//! `val` 必须落在低 30 位（`val & FIT_MASK == 0`）才缓存，否则跳过回填
+//! （正确性不依赖回填是否发生）。
+//!
+//! `f_memo` 结构（`build_memoized` 用 `BodyClonePlan` 克隆原函数体，新函数名
+//! 为 `{原函数名}_memo`，形参 `(K, C, cache, size)`）：
+//! 前导块 `entry`（`1 <= key < size` 越界检查）→ `memo_in_bounds`（取槽、
+//! 算 tag）→ `memo_hit`（leaf → `C + (val >> 2)`，fixed → `val >> 2`）／
+//! `memo_miss`（跳进克隆体）。`(K, cache, size)` 作为块参数穿线（thread）
+//! 过每个克隆块；克隆体内的自调用重定向为 `f_memo`（多传 `cache, size`）；
+//! 每个 `ret` 改为「受保护的 store 回填 + ret」（`emit_store`；`ReturnKind`
+//! 三分类 Leaf / Fixed / Rec，`Rec` 的父残差由子节点缓存项派生）。
+//!
+//! ### 触发 / 放弃条件
+//!
+//! 全部是结构性、与输入无关的判定（`detect` → `detect_callsite`，任一不满足
+//! 即放弃，宁漏勿错）：
+//!
+//! - **函数形态**（`detect` / `classify` / `derived_set`）：恰好两个 `i32`
+//!   参数、返回 `i32`、有入口块；无副作用（无 store / `MemZero` / `Alloc`）、
+//!   无外部调用、load 只来自全局；非入口块无块参数（保证 `derived_set` 精确）；
+//!   每个自调用恰好两个实参、结果只作返回值；两参中一个必须是**加性累加器**
+//!   `C`：`C` 的每个使用只能是 `C + k`（`k` 不依赖 `C`）、自调用的累加器
+//!   实参、或原样返回；key 实参不依赖 `C`；返回值必须同时含 `Rec`（返回
+//!   自调用结果）与 `Leaf`（`C` 派生值）两类。
+//! - **调用点**（`detect_callsite` / `classify_bound`）：唯一外部调用点在自然
+//!   循环中，key 实参是前向归纳变量（步长为正常数），header 终结符为
+//!   `key <= bound` 或 `key < bound`；`bound` 只接受常量 / 全局 load /
+//!   调用者入口块参数；循环体无 store、无其它调用（否则 `f` 读的全局与缓存
+//!   结果可能跨迭代变化）；存在 preheader。
+//! - **内置名保护**：源码里存在带入口块、名为 `CALLOO_NAME`（`soyo_calloc`）
+//!   的函数时整个 pass 放弃，避免遮蔽编译器提供的分配器
+//!   （`find_or_declare_calloc` 只声明、不重复定义）。
+//!
+//! 缓存大小 = `bound + 1`（运行时才知道；`bound` 为负时 clamp 到 0），在
+//! preheader 里经 `soyo_calloc(size, 4)` 分配（`rewrite_callsite`），并把
+//! 调用点改写为 `f_memo(key, acc, cache, size)`。
+//!
+//! ### 正确性要点
+//!
+//! - 纯性由结构保证：`f` 无副作用、load 仅全局、循环体无 store / 无调用 →
+//!   循环期间 `f` 的输入与读到的全局稳定，`f(K, C)` 只由 `(K, C)` 决定；
+//! - 缓存不变量：槽内要么空（`0`），要么 `(h(K), tag)` 且满足
+//!   `f(K, 0) = h(K)`；命中分支由 tag 恢复 `f(K, C)`（leaf → `C + h`，
+//!   fixed → `v`），与定义一致；
+//! - `Rec` 返回：父残差由子节点缓存项派生（`select(is_leaf, child_val + inc,
+//!   child_val)`，`inc` 是递归累加器实参 `C' = C + inc` 的非 `C` 部分，
+//!   `residual_of` 求取），回填附加 `ok` 守卫（子 `K` 在界内且子项非空）——
+//!   子槽为空说明子调用走了降级路径，父项也不缓存；
+//! - 降级路径：`K` 越界 / 值不 fit（`FIT_MASK`）/ 守卫失败 → 槽保持 `0`
+//!   （`emit_store` 写回 `select(ok, packed, 0)`，失败即写 `0` 不变），下次
+//!   探测仍 miss、重算原计算，任意输入结果与未记忆化时一致；
+//! - 幂等：改写后原函数不再有外部调用点，第二轮 `run` 无候选
+//!   （`the_pass_is_idempotent` 测试）。
+//!
+//! ### 管线位置与门控
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，**initial 段**
+//!   （`register_initial`），`specialize` / `mulmod_recognize` 之后、`inline`
+//!   **之前**——必须先于 `inline`（inline 会把已冗余的原函数体拍平）；
+//! - 门控：`config.memoize && config.target.enable_chain_to_switch`
+//!   ——AArch64 专属（`soyo_calloc` 由 AArch64 后端展开为「零扩展两个 32 位
+//!   实参后 tail-call glibc `calloc`」的内嵌汇编包装，零初始化让空槽免费），
+//!   RISC-V 保持原递归；`config.rs` 的 `memoize` 默认开启，可 A/B 测量关闭。
+//!
+//! ### 验证
+//!
+//! - 本文件 `mod tests`（1054 行起）：识别 / 拒绝 / 改写 / 幂等共 6 个测试
+//!   （`detects_the_accumulator_shape`、`rejects_an_accumulator_used_in_a_
+//!   comparison`、`rewrites_the_recursion_and_the_callsite` 等）；
+//! - 端到端：`make test` 差分比对（AArch64 `-O2`，性能对照
+//!   `scripts/perf_compare.sh`）。
+//!
 use crate::{
     ir::{BasicBlock, BinaryOp, Function, Inst, InstKind, Program, Type, builder_trait::*},
     opt::{

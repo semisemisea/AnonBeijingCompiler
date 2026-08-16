@@ -12,6 +12,80 @@
 //! Powers of two are skipped so the backend's cheaper `and` lowering handles
 //! them. The divisor must be a positive compile-time constant; negative and
 //! `0`/`±1` divisors keep their current lowering.
+//!
+//! ---
+//!
+//! ## 补充说明（中文）
+//!
+//! 术语：range 分析 / 条件减法 / csel / 掩码 / magic-number 乘高序列等见
+//! `docs/offline-handbook/glossary.md` 的"强度削减"分组。
+//!
+//! ### 定位与动机
+//!
+//! 把可证明被除数落在 `[0, 2P)` 的 `x % P`（`P` 为编译期正整数常量）折叠成
+//! `x >= P ? x - P : x` 的条件减法——一条 `sub; cmp; csel` 替代后端对常量
+//! 除数发射的 4-6 条 magic-number 乘高序列（乘、右移、再乘、减……）。2 的幂
+//! 除数留给 `sr` 的掩码化，本 pass 只吃**非 2 幂**的常量除数。
+//!
+//! ### 变换形态
+//!
+//! ```text
+//! r = x % P        →   sub = x - P;  cond = x >= P;
+//!                      r  = select(cond, sub, x)
+//! ```
+//!
+//! 实现上（`run_on` 的改写段）：在 `rem` 指令之前插入 `sub`（`BinaryOp::Sub`）
+//! 与 `cond`（`BinaryOp::Ge`）两条指令，再把 `rem` 本身 `replace_inst_with`
+//! 为 `select(cond, sub, x)`。
+//!
+//! ### 触发 / 放弃条件
+//!
+//! `run_on` 先做**廉价预扫描**：只有存在"`Rem` 除以正整数非 2 幂常量"的候选
+//! 指令时，才构建比较贵的 range 分析（CFG / 循环 / 基本归纳变量 +
+//! `RangeAnalysis`）。逐项检查（真实函数）：
+//!
+//! - `rem_of`：识别 `BinaryOp::Rem`，取出 `(被除数, 除数)`；
+//! - `positive_constant`：除数必须是正整数常量（`Integer` 且 `value() > 0`）；
+//! - `is_power_of_two`：排除 2 的幂（`1` 也是 2 的幂，一并跳过）；
+//! - `foldable`：`RangeAnalysis::range_before(inst, dividend)` 证明被除数在
+//!   `rem` 处取值有界且 `min >= 0`、`max < 2P`（i64 运算，防 `2P` 溢出）。
+//!
+//! 放弃（宁漏勿错）：被除数 range 无界 / 可能为负 / 上界 ≥ `2P`（如英文文档
+//! 提到的 `f(x)` 包装中间值）；除数不是正常量、是 2 的幂、或 `≤ 0`（`±1`：
+//! `1` 是 2 的幂，`-1` 过不了 `positive_constant`）。截断余数对负数不满足该
+//! 恒等式，负被除数永不折叠。
+//!
+//! ### 正确性
+//!
+//! - 恒等式：对 `0 <= x < 2P`，截断余数 `x % P = x >= P ? x - P : x`——
+//!   `x < P` 时商为 0、余数为 `x` 本身；`P <= x < 2P` 时商为 1、余数为
+//!   `x - P`；
+//! - `[0, 2P)` 的来源：`foldable` 从 `RangeAnalysis::range_before` 的
+//!   `min` / `max` 证明（range 分析内部依赖循环 / IV 分析，并经
+//!   `return_summary` 拿到跨过程的非负事实，见英文文档）；
+//! - 不溢出：`x < 2P` 且 `P >= 1`，`x - P` 落在 `[0, P)`；边界比较用 i64
+//!   运算，`P` 接近 `i32::MAX` 时 `2P` 也不会溢出。
+//!
+//! ### 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，fixpoint 段
+//!   （`register`），**`guard_elimination` 之后、`sr` 之前**——guard
+//!   elimination 先消化 modmul 的负值守卫，range 事实稳定后再折叠（见
+//!   pass.rs 的注册注释）；
+//! - 与 `sr` 互补：非 2 幂的 `x % P` 归本 pass，2 的幂除 / 余归 `sr`
+//!   （`sr.rs` 文档同述）；
+//! - 无目标门控、无 config 开关（AArch64 / RISC-V 都跑）。
+//!
+//! ### 验证
+//!
+//! - 本文件 `mod tests`（216 行起）覆盖命中与各拒绝形态：
+//!   `folds_bounded_nonnegative_dividend`（`x & 7` 除 5 折叠）、
+//!   `keeps_unbounded_or_too_wide_dividend`（`x & 31` 除 5 保留）、
+//!   `skips_power_of_two_divisor`（除 16 保留）、
+//!   `rewrite_equals_rem_for_bounded_values`（穷举 `[0, 2P)` 逐值比对
+//!   select 与截断余数等价）；
+//! - 端到端：`make test` 差分比对（本地快速回归另可用
+//!   `cargo test -p raana_ir`）。
 
 use crate::{
     ir::{BinaryOp, Inst, InstKind},

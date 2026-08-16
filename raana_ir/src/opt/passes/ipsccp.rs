@@ -1,4 +1,104 @@
 //! Implementation of *Interprocedural Sparse Condition Constant Propagation*
+//!
+//! ---
+//!
+//! # IPSCCP：过程间稀疏条件常量传播
+//!
+//! 在**整个程序**（而非单个函数）上做稀疏条件常量传播：沿调用边把常量实参
+//! 传入被调函数的形参、沿返回边把常量返回值传回调用点，并据此折叠条件已知
+//! 的分支。动机：函数内 SCCP（`opt/passes/const_prop.rs`，未注册、已被本模块
+//! 取代）在 `Call` 处直接降 Bottom，跨函数边界的常量信息完全丢失；本 pass 用
+//! ICFG + 内存摘要把传播打通到过程间。术语：SSA / block 参数（Phi）、ICFG、
+//! 格 Top-Bottom、固定点、支配等见 `docs/offline-handbook/glossary.md`，不在此
+//! 展开。
+//!
+//! ## 核心机制
+//!
+//! - **三值格**：`Lattice` = Top（未知，默认，最乐观）→ `Constant(i32)` →
+//!   Bottom（非常量，最保守），只降不升；`merge` 是格 meet，`update` 返回是否
+//!   变化。初始化：`InstKind::Integer` → Constant，`Float` → Bottom（`new_var`），
+//!   其余缺席即 Top；零初始化全局先登记为零区间。
+//! - **ICFG 边**（`opt/analysis_passes/icfg.rs` 的 `EdgeType`）：`Normal` /
+//!   `Call` / `Return` / `CallToReturn` 四类。`Call` 边把调用点实参的格值写入
+//!   被调函数形参（`Node::new(callee, param)`）；`Return` 边把返回值格值写回
+//!   调用点的 `.call` 节点（`call_site_before` 解析）；一条虚设的 `start_edge`
+//!   （`src == dst` 的 Normal 自环）触发 main 入口。
+//! - **双工作队列**：`edge_worklist` 存边，目标节点首次到达时入队（`node_visited`
+//!   去重），并记录所属块已访问（`block_visited`）；`node_worklist` 按指令种类
+//!   求格值，变化时沿 `used_by` 扩散（`extend_affected_node_used_by`，只进入已
+//!   访问块的指令）并重推出边——没被边到达的代码不参与，构成"稀疏"。
+//! - **节点求值**：`Binary` 双操作数都是 Constant 才折叠
+//!   （`mathematic_operation`，wrapping 语义）；`Select` 条件已知选一臂、Bottom
+//!   时两臂 meet；`Cast` 仅 i32 目标且源是常量 `Float` 时可折叠（`fold_f32_to_i32`）；
+//!   `GetElemPtr` / `Alloc`（地址不是 i32 常量）→ Bottom；vector 类指令 → Top；
+//!   `Branch` 条件为 Constant 只推可达臂，Top 两臂都不推（保守，等后续迭代
+//!   暴露），Bottom 两臂都推。
+//! - **调用边传播**：`Call` / `TailCall` 的实参格值 zip 进形参（`is_decl` 的
+//!   外部函数降 Bottom）。尾调用必须同样传播：否则递归尾调用间变化的实参会
+//!   被误传播成常量（测试 `tail_call_args_prevent_constant_mispropagation`）。
+//! - **返回值中继**：`Return` 沿出边把 `ret` 值写回调用点；尾调用是中继节点
+//!   （故意不在 `callsite_by_continuation` 里），返回值先写入它，再靠
+//!   `relay_targets` 重调度，让其 `TailCall` 臂沿 Return 边继续向上转发。
+//! - **内存摘要**：`MemState` 模拟常量偏移内存。`CellKey` =（局部/全局对象 +
+//!   字节偏移），`RootKey` = 整个对象；每 cell 按写者存格值，折叠值 = 写者的
+//!   meet；`MemZero` 与零初始化全局用零区间回答 load。`EffectAnalysis`
+//!   （`opt/analysis_passes/effects.rs`）提供基址/偏移解析（`BaseEnv` 的
+//!   `constant_offset` / `base_of`）、不可解析地址的 points-to 目标
+//!   （`targets_of`）与被调函数写集（`call_write_roots`）。
+//! - **调用失效**：`invalidate_call` 按 `call_write_roots` 清掉被调函数可达的
+//!   根并重调度受影响的 load；写集未知时清全部，并把根加入 `cleared_roots`
+//!   ——未知写可能落在任意 store 与 load 之间，此后该根不再折叠 load。load 用
+//!   `insert_or_replace`（快照语义）而非 merge，避免新旧快照 meet 错误塌缩成
+//!   Bottom。
+//!
+//! ## 变换形态（IR 示例）
+//!
+//! ```text
+//! // 传播前
+//! main:   a = 10
+//!         b = call inc(a)          // Call 边：实参 a 的格值 10 流入 inc 的形参 p
+//!         br b != 0, L1, L2        // b 是 inc 的返回值
+//! inc(p): q = p + 1                // p 格 = Constant(10)，q 折叠为 Constant(11)
+//!         ret q                    // Return 边：11 写回调用点 → b 格 = Constant(11)
+//!
+//! // 传播后（常量替换 + 分支折叠）
+//! main:   b = 11                   // 调用点被替换为立即数，inc 不再被调用
+//!         jump L1                  // 11 != 0 恒真：br 折叠为无条件 jump
+//! ```
+//!
+//! ## 正确性要点
+//!
+//! - 格值只降不升、工作队列覆盖所有可达节点，有限格上必然收敛到固定点；
+//! - 只有格值为 `Constant` 的节点才被替换，Bottom 绝不替换；
+//! - 替换在传播收敛后一次性进行：有使用者的 `Call` / `TailCall` /
+//!   `BlockArgRef` 用 `visit_and_replace` 换成新建的立即数指令，其余用
+//!   `replace_inst_with` 后脱离布局（`detach_layout_inst`）；
+//! - 分支折叠只发生在条件被传播成 `InstKind::Integer` 的终结符上；块删除要求
+//!   非入口且块内**每条指令**都无使用（防止删掉仍被可达块引用的 LICM 外提值）；
+//! - 常量 `Div` / `Rem` 折叠断言除数非 0；`fold_f32_to_i32` 只折叠可表示的
+//!   有限值（截断向零），饱和 `as` 转换与目标指令不符，其余保持运行时转换。
+//!
+//! ## 管线位置与门控
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`——initial 段（SSA →
+//!   Specialize → [MulmodRecognize / RecursiveMemoize，仅 AArch64] → Inline →
+//!   TCO → ColumnMajor → ScalarGlobalPromotion）之后，**fixpoint 段首位**
+//!   （第一个 `register`，即 `fixed_point_start` 处），其后是 `simplify_cfg`、
+//!   `loop_unroll`（`--loop-unroll` 门控）等。常量信息是后续 pass 的前提，故
+//!   排在 fixpoint 最前；
+//! - 无独立 config 开关、无目标门控（AArch64 / RISC-V 都跑）；`-O0` 时
+//!   `from_config` 直接返回空管线，本 pass 不挂载；
+//! - fixpoint 循环（`run_passes`）最多迭代 `MAX_PIPELINE_ITERATIONS`（100）轮
+//!   直到整段无变化。
+//!
+//! ## 验证
+//!
+//! - 本文件 `#[cfg(test)] mod tests` 位于 `passes/ipsccp/tests.rs`（533 行）：
+//!   f32→i32 折叠边界、尾调用实参防误传播、常量形参替换、全局 cell 的
+//!   store/load 往返、零初始化全局 load、`MemZero`、调用写者失效、确定性写者
+//!   折叠、不同偏移隔离、写者分歧 merge 为 Bottom 等；
+//! - 端到端：`make test` 差分比对；静态指令数回归用 `scripts/perf_compare.sh`。
+//!
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ir::inst_kind::mem_zero::MemZeroLen;

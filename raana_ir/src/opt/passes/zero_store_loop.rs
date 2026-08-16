@@ -13,6 +13,92 @@
 //! the whole loop collapses to `MemZero(row, t0 * elem_size)` executed on the
 //! guard's true path. One `bl memset` replaces one store (and loop control)
 //! per element.
+//!
+//! ---
+//!
+//! ## 补充说明（中文）
+//!
+//! 术语：header / latch / preheader / 回边 / test-at-top / test-at-bottom /
+//! trip count 等见 `docs/offline-handbook/glossary.md` 的"循环"分组；`MemZero`
+//! 指令与 `TargetPolicy` 目标门控见同一文件的"本项目特有"分组。零初始化循环、
+//! countdown 形态、旋转等概念按字面理解，不再展开。
+//!
+//! ### 一句话定位
+//!
+//! `ZeroStoreLoop` 把"逐元素写 0"的零初始化循环折叠成**一条**运行时长度的
+//! `MemZero`（AArch64 后端展开为 `bl memset`），用一次内存清零调用替换每个元素
+//! 的一次 store 加整套循环控制（递减、测试、回边）。典型收益对象是 SysY 的
+//! `int a[1024] = {0}` 这类大数组零初始化。
+//!
+//! ### 变换形态
+//!
+//! 英文文档上方的示意图就是折叠前形态（旋转后的 countdown 循环）；折叠后：
+//!
+//! ```text
+//! pre:  byte_len = t0 * elem_size;
+//!       row_start = gep(base, row_offsets);   // row_offsets 为空时直接用 base
+//!       MemZero(row_start, byte_len); jump exit
+//! ```
+//!
+//! 旋转已把 guard `t0 > 0` 放进 pre-header，guard 失败直跳 exit；折叠只在 guard
+//! 的真路径上执行，因此 trip = 0 的"零次执行"语义不变。`byte_len` 是运行时值
+//! （`MemZeroLen::Value`），因为 `t0` 来自 entry 边传入的参数。
+//!
+//! ### 触发 / 放弃条件
+//!
+//! `run_on` 对除 entry 外的每个块调用 `convert_zero_loop` 做候选检查（`header ==
+//! entry` 直接跳过），任一条件不满足即放弃：
+//!
+//! - **countdown 形态**：header 终结符必须是**无参数** `Jump`（旋转后的
+//!   `jump body`）；body 终结符必须是 latch 形态 `br (t - 1), header, exit`——
+//!   条件为 `BinaryOp::Sub` 且 rhs 是 `Integer(1)`，`t` 是 header 参数；
+//! - **exit 干净**：`exit` 无参数，且不读任何 header 参数（否则旋转后绕过
+//!   header 的值流会失效）；
+//! - **体内容**：body 里**恰好一条**零 store——源是 `Integer(0)` 或 `ZeroInit`，
+//!   目标是 `GetElemPtr` 且其**最后一个偏移**是 header 参数（IV `j`，且
+//!   `j_pos != t_pos`）；body 不得含 `Call` / `TailCall` / `Load` / `MemZero`；
+//! - **地址在循环前可用**：`base` 与所有前导偏移（`row_offsets`）必须通过
+//!   `available_before_loop`——常量 / 全局 / 函数参数，或定义在 header / body
+//!   之外的块里（无 parent 的 `BlockArgRef` 也可用）；header 参数与 body 内定义
+//!   的值会随循环一起消失，不可用；
+//! - **恰好一条 entry 边**：header 除回边外唯一的前驱是参数个数与 header 参数
+//!   一致的 `Jump`；
+//! - **长度可行**：元素大小 `elem_size`（store GEP 指针类型 deref 的大小）
+//!   非零且 ≤ `i32::MAX`（`MemZero` 长度是 i32 量）。
+//!
+//! ### 正确性要点
+//!
+//! - 折叠的安全依据与旋转相同：guard 只 gate 第一次迭代，guard 通过则循环体
+//!   至少执行一次，而 `MemZero` 清零的地址范围 `[row_start, row_start +
+//!   t0 * elem_size)` 恰好等于逐元素 store 0 覆盖的范围，效果一致；
+//! - 长度 `byte_len = entry_args[t_pos] * elem_size` 与（需要时的）`row_start`
+//!   都插在 entry 块终结符之前；`row_offsets` 为空时直接用 `base`，不新建 GEP
+//!   （`uses_base_pointer_when_the_row_has_no_leading_offsets` 专门验证这一点）；
+//! - entry 的 jump 改写为 `jump(exit)`（`replace_inst_with`），header / body 变成
+//!   不可达死代码，由后续 fixpoint 轮里的 `simplify_cfg` / `dce` 清理；
+//! - `elem_size == 0` 拒绝：`t0 * 0` 长度恒为 0，`memset` 无效。
+//!
+//! ### 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，fixpoint 段，
+//!   `rotate_loops` **之后**、`chain_to_switch` 之前；
+//! - 依赖旋转：本 pass 识别的是旋转后的 countdown 形态（body 终结符
+//!   `br (t-1), header, exit`），所以必须排在 `rotate_loops` 后面；
+//! - 目标门控：`config.target.enable_chain_to_switch`——AArch64 专属，RISC-V
+//!   不注册（`MemZero` 展开为 `bl memset` 是 AArch64 后端的做法）。
+//!
+//! ### 验证
+//!
+//! - 本文件 `mod tests`（240 行起）：
+//!   - `converts_a_zeroing_countdown_loop_to_memzero`：entry 出现运行时长度
+//!     `MemZero`（`byte_len` 是 `BinaryOp::Mul`：`t0 * 4`），entry jump 直跳
+//!     exit，header 不再被 entry 引用；
+//!   - `uses_base_pointer_when_the_row_has_no_leading_offsets`：flat 数组
+//!     （store GEP 只有 IV 一个偏移）时 `MemZero` 目标直接是数组指针参数，
+//!     不新建 GEP，块里也没有 `BlockArgRef`；
+//!   - `refuses_loops_that_store_a_nonzero_value`：store 非零常量（`Integer(7)`）
+//!     时放弃，IR 不变；
+//! - 端到端：`cargo test -p raana_ir` 与 `make test`（差分比对）。
 
 use crate::opt::prelude::*;
 

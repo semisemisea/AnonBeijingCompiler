@@ -1,3 +1,52 @@
+//! # BooleanSimplification：布尔值规范化与化简
+//!
+//! 把"真值测试"统一到规范形态，并消除布尔包装。核心约定（见
+//! `BooleanSimplification` 的英文文档）：**比较指令产生规范的 0/1**；
+//! `branch` / `select` 只把条件当作"非零即真"。本 pass 在**确认值确实是
+//! 规范布尔**（`is_canonical_bool`：常量 0/1、比较结果、或两臂都是规范
+//! 布尔的 select）之后才做替换，绝不把任意 i32 真值（如 2）当布尔用——
+//! 这是正确性的根基。
+//!
+//! ## 变换形态（IR 示例）
+//!
+//! ```text
+//! ① x == x              →   1        （Eq/Ge/Le → 1；NotEq/Gt/Lt → 0）
+//! ② (a < b) != 0        →   a < b     （比较结果的 truthiness 包装剥掉）
+//!    (a < b) == 1        →   a < b
+//!    (a < b) == 0        →   a >= b    （补比较 complement_integer_compare）
+//! ③ br (c == 0), A, B   →   br c, B, A（交换两臂）
+//! ④ select(c, c, 0)     →   c
+//!    select(c, 1, 0)    →   c         （规范布尔投影）
+//!    select(c, 0, 1)    →   c == 0
+//!    select(c == 0, a, b) → select(c, b, a)
+//! ```
+//!
+//! ## 触发 / 放弃条件
+//!
+//! - ①只认 i32 比较且操作数相同；
+//! - ②③④都要求涉及的布尔值是**规范布尔**（`is_canonical_bool`，带
+//!   `visiting` 集合防环）；不是则放弃；
+//! - ②的 `== 0` / `!= 1` 分支要求内层是比较指令且能取补（
+//!   `complement_integer_compare`），否则放弃；
+//! - ③要求条件形如 `value == 0` / `value != 0`（`zero_comparison`）。
+//!
+//! ## 正确性
+//!
+//! - 所有替换都保持"条件非零即真"的语义；补比较只在规范布尔上做，0/1
+//!   域内取补恒等；
+//! - `is_canonical_bool` 的递归检查确保 select 展开后仍是 0/1。
+//!
+//! ## 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `from_config`，fixpoint 段，`tail_recursive_inline`
+//!   之后、`gvn_pre` 之前（尽早把布尔形态规范化，供后续 pass 匹配）；
+//! - 无目标门控、无 config 开关。
+//!
+//! ## 验证
+//!
+//! - 本文件 `mod tests`（232 行起）覆盖各规则与真值边界；
+//! - 端到端：`make test` 差分比对。
+
 use crate::ir::{Binary, Branch, Select};
 use crate::opt::prelude::*;
 

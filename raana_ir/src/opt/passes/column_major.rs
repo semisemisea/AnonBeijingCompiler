@@ -1,3 +1,74 @@
+//! # ColumnMajor：二维数组列主序布局转换（矩阵转置存储）
+//!
+//! 把**二维标量数组**（类型 `[rows][columns]` 的元素）从行主序改成列主序
+//! 存储（`[columns][rows]`），使其**最热循环**内的访问变成单位步长
+//! （unit stride）连续访存。典型受益：行主序数组上按列遍历的循环
+//! （如 `A[k][j]` 列访问），转置后连续元素落在同一缓存行。
+//!
+//! ## 变换形态（IR 示例）
+//!
+//! ```text
+//! 前：root = alloc [N][M] i32           // 行主序：a[i][j] 地址 = base + i*M + j
+//!     ...p = gep root, [0, i, j]        // 行主序下标
+//!     ...load p
+//! 后：root = alloc [M][N] i32           // 列主序：a[i][j] 地址 = base + j*N + i
+//!     ...p = gep root, [0, j, i]        // 下标交换（offset[1]↔offset[2]）
+//!     ...load p
+//! ```
+//!
+//! 所有被识别的访问 GEP 的第 1、2 个偏移（行、列）对调；全局变量的初始化器
+//! 同步转置（`transpose_initializer`：`ZeroInit` 保持，`Aggregate` 按
+//! `flatten` 后重排）；debug 构建下 `verify_rewrite` 断言根类型、GEP 偏移与
+//! 使用者集合不变。
+//!
+//! ## 候选与收益判定
+//!
+//! **候选**（`collect_candidates` + `collect_uses`）：
+//! - 根是 `Alloc`（局部）或 `GlobalAlloc`（全局），类型为二维标量数组
+//!   `[rows][columns]`（元素必须标量，维度乘积不溢出）；
+//! - 数组的**所有**使用者必须被识别：三维偏移 GEP（`[0, row, column]`）
+//!   且 GEP 只被 `load`/`store` 使用，或 `MemZero`（全局的初始化器还必须是
+//!   `ZeroInit` 或元素数匹配的 `Aggregate`）；任何其它用法（地址逃逸、传参
+//!   等）→ 放弃。
+//!
+//! **收益**（`candidate_is_profitable`，按函数逐个访问评估）：
+//! - 每个访问的行/列下标对最内层循环的 IV 求系数（`classify_access_delta`
+//!   → `(row_delta, column_delta)`），算出当前步长与转置后步长（字节）；
+//! - 访问所在循环巢的执行次数估计（`loop_nest_executions`）× 该 GEP 的
+//!   内存使用者数 = 权重；
+//! - 成本模型（`opt/utils/column_major_cost.rs`）：步长惩罚 = 覆盖的缓存行
+//!   数（≥64B 按行计、≥4KB 额外页惩罚），加权求和；
+//! - **转置收益条件**（`is_profitable`）：转置后产生单位步长
+//!   （`current_stride > element_size && transposed == element_size`），且
+//!   总代价下降的绝对节省 ≥ 8、相对节省 ≥ 10%。
+//!
+//! ## 正确性
+//!
+//! - 转置是纯**布局**变换：元素集合与初始化内容不变，下标 `[i][j]` 映射到
+//!   新布局 `[j][i]`，所有访问点同步交换偏移，读写关系不变；
+//! - 必须确认**所有**使用点都被重写（`used_by` 全量核对），漏掉任何一个
+//!   访问都会造成语义错乱——这是 `collect_uses` 严格的原因。
+//!
+//! ## 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `from_config`，initial 段，`tco` 之后、`gsp`
+//!   之前（GEP 形状重塑之前调整布局）；
+//! - **AArch64 门控**（`config.target.enable_chain_to_switch`）——成本模型
+//!   按 Cortex-A53 缓存行/页参数标定，RISC-V 不注册；
+//! - 无独立 config 开关。
+//!
+//! ## 验证
+//!
+//! - 本文件 `mod tests`（632 行起）覆盖候选识别/收益判定/重写与初始化器
+//!   转置；
+//! - 端到端：`make test` 差分比对（AArch64）。
+//!
+//! ## 已知边界
+//!
+//! - 只处理**二维**数组（`matrix_type` 恰好两层数组）；三维及以上不识别；
+//! - 非单位步长但仍有收益（如两列步长交错）的访问不处理——收益模型要求
+//!   转置后必须产生单位步长。
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{

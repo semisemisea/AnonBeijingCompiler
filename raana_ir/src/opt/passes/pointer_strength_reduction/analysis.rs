@@ -1,4 +1,40 @@
 //! Affine index-evolution and range analysis for pointer strength reduction.
+//!
+//! ---
+//!
+//! ## 中文说明
+//!
+//! PSR 的**分析**子模块：把候选 GEP 的索引值分类成三种演化形态
+//! （`IndexEvolution`，定义在父文件），并求出仿射表达式的系数与偏移范围，供
+//! `candidate` 子模块判定"步长每轮恒定、可安全改写"：
+//!
+//! - `Invariant`：全局 / 常量 / 循环外定义的值——每轮不变；
+//! - `Direct`：索引就是本循环的归纳变量本身（系数 1）；
+//! - `Affine(AffineI32Expr)`：索引是 IV 的仿射函数
+//!   `value = coefficient * iv + offset`（`offset` 是区间
+//!   `I64Range { min, max }`，含符号；`chain` 记录参与组合的指令链，
+//!   `invariants` 记录需要移到 preheader 的循环不变量）。
+//!
+//! `classify` 沿指令树递归（`classify_index_evolution` 先做参数转发
+//! `forwarded_params` 再分类）：
+//!
+//! | 组合 | 系数 / 偏移 |
+//! |------|-------------|
+//! | `lhs + rhs` | 系数相加、区间相加 |
+//! | `lhs - rhs` | 系数相减、区间相减 |
+//! | `lhs * rhs`（两者均不变量） | 不变量偏移 = 区间相乘（`row * runtime_width` 扁平行形态，整条乘积进 `chain` 供 preheader 克隆） |
+//! | `lhs * const` | 系数 × 常量因子、区间 × 常量 |
+//!
+//! 减法/乘法用 `checked_*` 全程 i64 运算，任何一步溢出即返回 `None`
+//! （放弃该候选）。`affine_range_fits_i32` 在改写前再确认仿射值域能落回
+//! i32（地址计算不允许回绕语义被破坏）。
+//!
+//! 与兄弟子模块的协作：`candidate`（候选发现）调用本模块分类索引并做
+//! 溢出检查；`rewrite`（改写）用 `evaluate_affine_initial` 计算 preheader
+//! 里克隆的指针初值。正确性根基：仿射闭式 = 初值 + 系数 × 迭代数，只要
+//! 初值、系数、步长逐轮一致，指针递进与每轮重算 GEP 逐轮相等。
+//!
+//! 验证：`tests.rs` 覆盖索引分类与范围边界；端到端 `make test` 差分。
 
 use super::*;
 

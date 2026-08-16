@@ -40,6 +40,118 @@
 //! reduction loop in the corpus. The recognition is purely structural: it
 //! never matches names, strings, or benchmark-specific bounds (per
 //! `docs/Illegal_optimization.md` rule two; see TODO.md §2.2).
+//!
+//! ---
+//!
+//! ## 补充说明（中文）
+//!
+//! 术语：归约（reduction，把一整个循环的运算收敛到一个累加值）、累加器
+//! （accumulator，循环携带的中间和）、依赖链、latch / preheader / backedge、
+//! 基本归纳变量（BIV）、严格 exit、运行时版本化（versioning）等见
+//! `docs/offline-handbook/glossary.md`。
+//!
+//! ### 一句话定位与动机
+//!
+//! 识别**单位步长、单累加器**的标量归约循环（`for j: acc += a[j]` 形态），
+//! 把一趟循环按 `UNROLL_FACTOR = 4` 拆成 4 条互相独立的累加通道，打破
+//! 串行的累加依赖链。标量归约每轮 `acc' = acc ± E` 都读上一轮的 `acc`，
+//! 在 AArch64 上退化成一条串行 `madd w11, w11, ...` 链，吞吐被乘法延迟
+//! 卡死（Cortex-A53 上约 0.25 元素/周期，见
+//! `tests/perf/many_mat_cal-1.sy`）；拆成 4 条独立链后 4 个累加器可以
+//! 并行发射，循环退出时再把 4 个部分和相加。
+//!
+//! ### 变换形态
+//!
+//! 英文文档上方的 IR 就是原循环形态。改写后（`apply`）新增 4 个块：
+//!
+//! ```text
+//! preheader:   jump version
+//! version:     guard = T >= 4; masked = T & ~3; br guard, main_header, header
+//! main_header: br jm < masked, main_body, main_exit   // 参数 [acc_in, a0..a3, jm]
+//! main_body:   4 份克隆的纯 body（lane k 用 jm+k 与自己的累加器 a_k），
+//!              jm' = jm + 4; jump main_header
+//! main_exit:   acc = acc_in + a0 + a1 + a2 + a3; jump header
+//! ```
+//!
+//! 原循环整体保留，作为标量 epilogue 吃掉剩余 `T % 4` 轮；版本化守卫
+//! `T >= 4` 在运行时选择展开路径。带指针的循环（matmul 内层 `(k, acc,
+//! ptr)` 形态）把指针作为第 3 个循环携带参数：4 条通道分别经
+//! `ptr + {0, stride, 2*stride, 3*stride}` 读取，主循环基指针每轮前进
+//! `4*stride`，通道 k 覆盖第 `jm + k` 轮。
+//!
+//! ### 触发条件
+//!
+//! `run_on` 先跳过声明函数（`is_decl`）与无环函数（`cfg.is_acyclic`）；
+//! 之后 `find_candidate` 对每个循环逐条检查，任一不满足即拒绝：
+//!
+//! - 循环恰好 2 个基本块（header + 唯一的 latch/body），latch 无参数；
+//! - header 恰好 2~3 个参数：i32 累加器 + trip 计数器 +（可选）指针；
+//! - 恰好 1 个基本归纳变量（`BasicInductionVariableAnalysis`），步长
+//!   +1、严格前向 exit（`normalize_strict_exit` +
+//!   `InductionDirection::Forward`）；
+//! - bound 支配循环入口（`dominates_loop_entry`），否则版本化守卫无法
+//!   放进 preheader（conv2d 的 checksum bound 是循环内值，被拒）；
+//! - body 以 `jump` 回 header，回边参数个数与 header 参数一致；
+//! - trip 计数器初值必须是整数 0（`is_integer_zero`），展开通道才能与
+//!   `j mod 4` 对齐（语料里所有归约循环都满足）；
+//! - 指针回边必须是单个**非零常数**偏移的 `getelemptr` 且定义在 body 内
+//!   （动态偏移 / 任意值一律拒绝：地址只能做纯代数运算）；
+//! - 累加器更新匹配 `match_acc_update`：`acc ± E`（E ≠ acc）或
+//!   `select(c, acc ± E, acc)`（`AccPattern { add, select }`）；
+//! - body 内无 `store` / `call` / `tailcall` / `memzero` / `global_alloc`，
+//!   且 `acc` 除上述更新模式外不被 body 内任何指令使用。
+//!
+//! 识别是纯结构性的：从不匹配名字、字符串或特定基准的边界
+//! （`docs/Illegal_optimization.md` 规则二，TODO.md §2.2）。
+//!
+//! ### 放弃条件
+//!
+//! - 上述任一检查失败（`find_candidate` 各 `return None` 点）；
+//! - `apply` 需要新建 preheader（`ensure_preheader` 返回
+//!   `EnsurePreheader::Created`）时返回 true 让 fixpoint 从零重跑，避免
+//!   半改写状态落地；preheader 拿不到则本次不改写；
+//! - 守卫 `T >= 4` 运行时失败：不进主循环，直接走原标量循环（常量
+//!   bound < 4 也照常发射版本化结构，只是运行时总走标量路径）；
+//! - 每次 `run_on` 只改写一个循环（成功即返回 true），其余候选由
+//!   fixpoint 多轮迭代处理。
+//!
+//! ### 正确性要点
+//!
+//! - 副作用：body 是单块纯代码（只 load），克隆 4 次不会复制副作用；
+//! - 代数：累加器只经 `acc ± E`（或 select 形式）更新且 E 与 acc 独立；
+//!   i32 加减在模 2³² 下满足结合律与交换律，4 条通道之和 ≡ 原序列结果；
+//! - 指针：只做 `getelemptr` 地址算术，通道拆分是纯地址代数，不改变
+//!   任何 load 的内存语义；
+//! - 边界：主循环只跑 `j < (T & ~3)`，剩余 `T % 4` 轮由原样保留的标量
+//!   epilogue 消费；守卫失败时整趟退回标量路径；
+//! - SSA：主循环退出按原 header 的参数顺序回填（`a_idx` / `j_idx` /
+//!   指针槽位），`[acc, j]` 与 `[j, acc]` 两种参数顺序都正确
+//!   （`preserves_the_accumulator_position_in_the_epilogue_join`）；
+//! - 幂等：改写后原循环不再满足识别条件，fixpoint 内不会二次改写
+//!   （`unrolls_a_symbolic_bound_reduction_loop` 断言 second run 返回
+//!   false）。
+//!
+//! ### 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，fixpoint 段，
+//!   **`invariant_reduction_hoisting` 之后、`blocked_reduction` 之前**
+//!   （后者有 `config.blocked_reduction` 门控；本 pass 无门控、无 config
+//!   开关，无条件挂载）；
+//! - 前后配合：`invariant_reduction_hoisting` 先把外层 trip 循环的不变
+//!   归约退化掉，让本 pass 看到未动过的嵌套循环；本 pass 处理
+//!   `acc += a[j]` 形态；`blocked_reduction` 处理跨步矩阵归约
+//!   `acc -= A[i][k] * B[k][j]`（4 累加器 + 4 列指针重叠列装载的缓存
+//!   未命中），与本 pass 互补。
+//!
+//! ### 验证
+//!
+//! - 本文件 `mod tests`（808 行起）：符号 bound 展开（新增 4 块、主循环
+//!   bound 为 `n & ~3`、标量 epilogue 保留、幂等）、header 参数顺序
+//!   `[acc, j]` / `[j, acc]`、select 形式条件累加、常量 bound < 4、
+//!   指针携带循环（lane 偏移 {0, 1024, 2048, 3072} + 回边 4096）；
+//! - 本地：`cargo test -p raana_ir`；端到端：`make test`（Docker
+//!   harness，stdout + 退出码差分比对）。
+//!
 
 use rustc_hash::FxHashMap;
 

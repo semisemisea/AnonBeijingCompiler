@@ -1,3 +1,108 @@
+//! # SSATransform：SSA 构造（内存槽提升，mem2reg 风格）
+//!
+//! 把函数内基于内存槽的标量局部变量（`Alloc` + `Store`/`Load`）提升为 SSA
+//! 值：汇合点插入 block 参数（本项目的 Phi），读写直接折叠进 SSA 数据流，
+//! 槽本身从 IR 中删除。这是优化流水线的**第一个** pass——后续 pass
+//! （IPSCCP / GVN / LICM / 寄存器分配）都要求"每个值只定义一次、def-use
+//! 链直接"的 SSA 形态；局部变量若不提升，就表现为内存读写，任何分析都要
+//! 面对"可能别名"的不确定性。术语（SSA、block 参数/Phi、支配、backedge、
+//! header/latch/preheader、固定点、归纳变量、trip count、test-at-top 等）：
+//! 见 `docs/offline-handbook/glossary.md`，下文不逐一展开。
+//!
+//! ## 变换形态（IR 示例）
+//!
+//! 一个用局部变量 `x` 累加的循环，提升前（内存形态）：
+//!
+//! ```text
+//! entry:   %slot = alloc i32            // 局部变量 x 的内存槽
+//!          store 0, %slot               // x = 0
+//!          jump header
+//! header:  br cond, body, exit
+//! body:    %t = load %slot              // 读 x
+//!          %x1 = add %t, 1
+//!          store %x1, %slot             // x = x + 1
+//!          jump header
+//! exit:    ret
+//! ```
+//!
+//! 提升后（SSA 形态；block 参数即 Phi，不是指令）：
+//!
+//! ```text
+//! entry:    jump header(0)              // 初值 store 折叠进参数
+//! header(x): br cond, body(x), exit(x)  // 汇合点按参数合并各版本
+//! body(x):  %x1 = add x, 1
+//!           jump header(%x1)            // backedge 携带新版本
+//! exit(x):  ret
+//! ```
+//!
+//! `add_param` 在基本块上挂参数，`Jump`/`Branch` 的实参按目标块 `params()`
+//! 顺序补齐（见 `dfs` 对终结符的处理）——实参列表必须与目标参数切片一一对应。
+//!
+//! 算法骨架（`run_on` 内顺序）：`cfg::build_cfg_both` 建 CFG 与反图 →
+//! `cfg::rpo_path` 求 RPO（入口块编号必须为 0）→ `dom_tree::idom` 求立即
+//! 支配者 → `dom_tree::build_dominance_tree` 建支配树 → `dominance_analysis`
+//! 求支配边界 → `variable_analysis` 收集可提升槽 → 工作队列插参数 →
+//! `dfs` 沿支配树重命名并改写指令。
+//!
+//! ## 触发 / 放弃条件
+//!
+//! - 触发：任何**有函数体**的函数（`run_on` 开头 `entry_bb().is_none()` 判定
+//!   为函数声明，直接返回）；无 config 开关、无目标门控——O1/O2 无条件挂载
+//!   （O0 在 `PassesManager::from_config` 早退，流水线为空）。
+//! - 候选槽判定在 `variable_analysis`：`Alloc` 的槽类型必须是标量或指针
+//!   （`ty.is_scalar() || ty.is_pointer()`），且地址不逃逸
+//!   （`alloca_does_not_escape`：槽的所有使用者只能是 `Store`（dest == 该槽）
+//!   或 `Load`）。`FUNC_ARG_OPT_ENABLE`（当前 `false`）打开时跳过前 N 个槽
+//!   （对应函数形参的槽），属历史遗留开关。
+//! - 放弃：聚合类型槽（数组等）、地址逃逸的槽（传给 `Call`、存入其它内存、
+//!   `GetElemPtr` 取址、返回地址）保留在内存——地址一旦逃逸就可能被别名
+//!   访问，提升会破坏语义。
+//!
+//! ## 正确性
+//!
+//! - **Phi 放置**：`dominance_analysis` 对入边 ≥ 2 的块沿前驱链走到 idom
+//!   （Wikipedia 算法）求支配边界；插参数时再用工作队列迭代到**迭代支配
+//!   边界（IDF）**——每在一个块插了参数，就继续向该块的支配边界传播，
+//!   `worked` 去重保证每个 (vid, 块) 至多插一个参数。这正是"Phi 必须位于
+//!   各定义块支配边界"的标准论证；
+//! - **重命名**：`dfs` 沿支配树深度优先（显式栈 + Enter/Exit 事件），
+//!   `ValStack` 维护每个 vid 沿当前路径的"最新版本"：进块先压入 block 参数
+//!   （`insert_table` 记录 (vid, 参数下标)），`Store` 把源值压栈，`Load` 用
+//!   栈顶值替换（`utils::visit_and_replace`），出块弹栈——支配关系保证任意
+//!   使用点看到的栈顶就是唯一到达它的定义，不同路径互不串值；
+//! - **未初始化读**：`Load` 时栈为空（该路径上尚无 `Store`）用 `undef`
+//!   替换；`Jump`/`Branch` 补参数时栈为空同样补 `undef`（类型取目标参数
+//!   类型）——对应 SysY 未初始化局部变量的未定义行为，同时保证每条入边都
+//!   为目标参数提供实参、参数个数一致；
+//! - **逃逸判定**：`alloca_does_not_escape` 是提升安全性的核心；指针类型槽
+//!   同样可提升（测试 `promotes_pointer_slot_alloca`：GEP base 变为函数参数）；
+//! - **清理**：被替换/删除的指令记入 `remove_list`，逆序
+//!   `remove_layout_inst` 删除，`run` 最后对整程序跑 `DeadCodeElimination`
+//!   清掉悬空指令（含生成的 `undef`）。
+//!
+//! ## 管线位置与门控
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，
+//!   `register_initial(ssa::SSATransform)`——initial 段（一次性，非固定点）
+//!   的第一个 pass，在 `specialize` / `inline` / `tco` / `column_major` /
+//!   `scalar_global_promotion` 之前，之后才是固定点段（IPSCCP、SimplifyCFG、
+//!   LoopUnroll、…）。
+//! - 为什么必须最先跑：`inline` 等 pass 会生成新代码，而所有依赖 def-use /
+//!   block 参数的 pass 都假设 IR 已是 SSA 形态；内存形态下 IPSCCP / GVN 无法
+//!   跟踪局部变量。
+//! - 门控：无 config 开关、无 `TargetPolicy` 门控（AArch64 / RISC-V 都跑）；
+//!   仅 `-O0` 例外（`from_config` 直接返回空 manager）。每个函数 `run_on`
+//!   开头先跑 `dce::UnreachableBasicBlock` 清不可达块，整程序跑完再跑
+//!   `DeadCodeElimination`。
+//!
+//! ## 验证
+//!
+//! - 本文件 `mod tests`：`promotes_pointer_slot_alloca` 构造"指针槽 + 逃逸
+//!   判定通过"场景，断言提升后 `Alloc`/`Load` 计数归零、仅剩最终 `Store`、
+//!   GEP base 变为函数参数；`count_kind` 辅助统计指令种类；
+//! - 单测：`cargo test -p raana_ir`；端到端差分：`make test`
+//!   （优化路径务必 `ARGS="-O 2"`）。
+
 use crate::opt::prelude::*;
 
 pub struct SSATransform;

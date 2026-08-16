@@ -1,3 +1,58 @@
+//! # Specialize：函数特化（按常量实参克隆）
+//!
+//! 对每个函数扫描全部调用点，把**带常量实参**的普通 `call` 重定向到按
+//! (函数, 常量实参组合) 克隆出的专用版本（`{name}_specialized_{n}`）；同一
+//! 常量组合的多个调用点共享同一份克隆（`specialized` 缓存），避免重复克隆。
+//! 目标：克隆体随后被 `inline` 内联进各调用点后，其参数恒为同一组常量，
+//! 后续常量传播 / 折叠（const_prop / IPSCCP）能比"一个函数体喂多种实参"
+//! 更彻底地折叠。
+//!
+//! 这是经典的过程间优化（interprocedural specialization）。动机示例：
+//!
+//! ```text
+//! f(a, n) { return a * n; }          // 通用版本保留
+//! 调用点1: call f(3, n)              // → 改指 f_specialized_0
+//! 调用点2: call f(3, m)              // → 复用 f_specialized_0
+//! 调用点3: call f(7, k)              // → 新建 f_specialized_1
+//! ```
+//!
+//! 内联后克隆体内的 `a` 恒为常量，`a * n` 可被强度削减 / 常量折叠处理。
+//! 注意：克隆时**不**把参数替换成常量（`call` 仍传原实参），收益完全来自
+//! "每个常量组合一个专用副本"这一形态，由后续 pass 兑现。
+//!
+//! ## 触发条件
+//!
+//! - 被调函数是**已定义**函数（跳过声明 `is_decl`）；
+//! - 被调函数**不自递归**（`CallGraph::reaches(f, f)` 则跳过——自递归克隆
+//!   的递归调用仍指向原函数，克隆是字节级重复，只多一层间接调用；自尾递归
+//!   循环形态由 `tail_recursive_inline` pass 处理）；
+//! - 调用点至少一个实参是编译期常量（`InstKind::Integer` / `Float`）；
+//! - `BodyClonePlan::capture` 克隆成功；
+//! - 只处理普通 `Call`（tailcall 暂跳过，代码有 TODO 注释）；
+//! - 防无限递归：`created` 集合记录已克隆函数，每个候选函数只特化一轮
+//!   （代码注释自认 "Very rough way"）。
+//!
+//! ## 正确性
+//!
+//! - 克隆体由 `BodyClonePlan` 完整复制原函数体，行为与原函数一致；调用点
+//!   只是换了个"实参组合固定"的入口，语义不变；
+//! - 不同常量组合 → 不同克隆（`Const::Int` / `Float` 参与缓存 key），
+//!   互不干扰。
+//!
+//! ## 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `from_config`，**initial 段**（一次性），`ssa`
+//!   之后、`inline` 之前——特化必须先于内联，内联才能把专用克隆展开进
+//!   调用点；
+//! - `run` 循环执行 `run_on_one` 直到无变化（一次特化可能暴露新的候选）；
+//! - 无目标门控、无 config 开关。
+//!
+//! ## 验证
+//!
+//! - 本文件 `mod tests`（138 行起）当前被整体注释（`// #[cfg(test)]`），
+//!   如启用需先恢复；
+//! - 端到端：`make test` 差分比对。
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::opt::{prelude::*, utils::body_clone::BodyClonePlan};

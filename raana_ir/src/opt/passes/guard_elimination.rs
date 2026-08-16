@@ -11,6 +11,87 @@
 //!
 //! The program-level summaries are computed once per run and shared across
 //! functions.
+//!
+//! ---
+//!
+//! ## 补充说明（中文）
+//!
+//! ### 定位与动机
+//!
+//! M60 `mulmod_recognize` 把 FFT/NTT 的"倍增式"模乘递归重写为 `soyo_mulmod`
+//! 内建调用，并在每次调用前插一条 `br (b < 0)` 守卫，以保留原递归"负数 `b`
+//! 返回 0"的语义。内联进调用方后，这条守卫变成热蝴蝶路径上的 `cmp; b.lt`
+//! 条件分支。本 pass（配合 M61 的 `return_summary` 非负性摘要）在能证明守卫
+//! 条件恒假时把它折成直跳，从热路径上删掉这次比较与分支。
+//!
+//! 术语：pass / fixpoint / TargetPolicy 等见 `docs/offline-handbook/glossary.md`
+//! 的"优化与 pass 概念"与"本项目特有"分组；guard / return_summary / 非负性
+//! 为本项目内部概念，含义见下文与 `opt/analysis_passes/return_summary.rs`。
+//!
+//! ### 变换形态
+//!
+//! 对每个基本块的终结符匹配形如
+//!
+//! ```text
+//! br (x < 0), A, B
+//! ```
+//!
+//! 的 `Branch`（条件必须是 `BinaryOp::Lt`、右操作数必须是整型常量 `0`）；若
+//! `x` 可证恒 `>= 0`，则 `x < 0` 恒假、false 边（`B`）恒取，把终结符替换为
+//!
+//! ```text
+//! jump B
+//! ```
+//!
+//! 携带原 false 边的 block 参数（`f_args`）。实现是 `replace_inst_with(inst)
+//! .jump(target, args)`，只改终结符；`x < 0` 的比较指令随后成为死代码，由
+//! 管线里的 DCE 清理。
+//!
+//! ### 触发 / 放弃条件
+//!
+//! - 形状闸门：终结符必须是 `Branch`；条件必须是 `BinaryOp::Lt`（仅此一种，
+//!   `x <= -1` 等变体不匹配）；右操作数必须是整型常量 `0`（`InstKind::Integer`
+//!   且 `value() == 0`）。
+//! - 非负性闸门：`x` 必须落在 `nonneg_in_function` 的函数内事实集里。事实
+//!   来源（见 `return_summary.rs`）：非负常量；**每个调用点**都可证 `>= 0`
+//!   的入口参数（`always_nonneg_params`，greatest fixpoint）；非负和/积/余/
+//!   select；两个非负操作数的 `soyo_mulmod`（`(i64)a * b % p` 对非负被除数
+//!   取截断余数不会变负，是基例）；对非负保持函数（`nonneg_preserving_
+//!   functions`，co-inductive fixpoint，自递归的 `power` 也能从自己的递归
+//!   调用点证明）且实参全非负的调用；block 参数取各入边事实的 meet。
+//!   `multiply` / `power` 的 `a` / `b` 参数由此继承非负性，其守卫随之折叠。
+//! - 放弃（守卫保留）：`x` 来自输入派生值（如数组元素的 load）时无法证明
+//!   非负，守卫保留——两个摘要都是**条件式**的，调用方喂入可能为负的值就
+//!   保守处理。声明（`is_decl`）函数直接跳过。
+//!
+//! ### 正确性
+//!
+//! i32 上 `x >= 0` ⟹ `x < 0` 恒假，分支必然走 false 边；换成对 false 边目标
+//! 的无条件 `jump`（携带原 block 参数）行为逐点一致。守卫存在的意义是保住
+//! 原递归"负数 `b` 返回 0"的语义——折叠只在证明"不可能取负"时才发生，不改变
+//! 任何可观察行为；证明不了的守卫原样保留。程序级摘要（`nonneg_preserving_
+//! functions`、`always_nonneg_params`）每次 `run` 只算一遍、跨函数共享；
+//! 函数内事实（`nonneg_in_function`）逐函数重算。fixpoint 多轮迭代重复执行
+//! 是幂等的：折掉的守卫不会再生。
+//!
+//! ### 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，fixpoint 段，
+//!   `pointer_strength_reduction` **之后**、`mod_fold` **之前**（pass.rs
+//!   282–285 行）；`mod_fold` 的注册注释说明它要等守卫折完后 range 事实
+//!   稳定再跑。
+//! - 无目标门控、无 config 开关（AArch64 / RISC-V 都注册）；守卫的源头
+//!   `mulmod_recognize`（M60）是 AArch64-only（pass.rs 195 行
+//!   `enable_chain_to_switch` 门控），RISC-V 上只有用户代码自身的 `x < 0`
+//!   分支可能被折（形态通用、语义保持）。
+//!
+//! ### 验证
+//!
+//! - 本文件 `mod tests`（82 行起）：`folds_guard_on_constant_nonneg_and_keeps_
+//!   param_guard` 覆盖"常量非负守卫折成 `Jump`、输入派生参数守卫保持
+//!   `Branch`"（`main` 用 `load` 调 `f_param`，证明不了非负）；
+//! - 全量：`cargo test -p raana_ir`（单元测试）+ `make test`（Docker harness
+//!   差分比对）。
 
 use crate::{
     ir::{BasicBlock, BinaryOp, Inst, InstKind, Program},

@@ -17,6 +17,85 @@
 //! `base_of` + `constant_offset`, including pointer-slot resolution and
 //! block-parameter phi offsets). Everything conservative: an unresolvable
 //! address never triggers a deletion or rewrite.
+//!
+//! ---
+//!
+//! ## 补充说明（中文）
+//!
+//! 死存储消除（DSE）：删掉"写了也不会被读到"的 store，并把"刚写入的值"
+//! 直接转发给紧接着的 load，减少内存往返。术语：SSA / block 参数（Phi）/
+//! 死存储 / used_by / def-use 链 等见 `docs/offline-handbook/glossary.md`
+//! 的"IR 与 SSA 基础"与"优化与 pass 概念"分组；GSP（标量全局提升 pass）
+//! 见 `scalar_global_promotion.rs`。
+//!
+//! ### 一句话定位 + 动机
+//!
+//! 函数内（within-function）的存储优化：`run` 对每个非 decl 函数跑一遍
+//! `run_on_func`，消除不可能被观察到的写入。动机：GSP 把可观察性受限的
+//! 标量全局提升为 SSA 值、寄存器保存副本（"load once, write back once"），
+//! 若函数内没人改过内存，写回的就是 load 出来的原值——纯开销；DSE 顺手
+//! 清掉被覆盖的 store、做 store-to-load 转发，让后续 pass 看到更干净的内存图。
+//!
+//! ### 变换形态（英文文档所列四类的简要版）
+//!
+//! 1. **GSP 冗余写回删除**：`store v, p` 且 `v` 是 `load p` 的结果，该单元
+//!    在函数内没有其它写、任何调用都不会写它、也无 MemZero 覆盖 → 写回
+//!    原值原样，是死操作，删除。
+//! 2. **覆盖存储删除**：同一单元两次 store、中间无读 → 前一个 store 的值
+//!    必然被覆盖，删除。
+//! 3. **store-to-load 转发**：load 的单元最近一次"未被读过的操作"是 store
+//!    （中间无写、无可能读）→ load 用被存的值替换（`visit_and_replace`
+//!    重写使用点）。
+//! 4. **覆盖 MemZero 删除**：MemZero 的整个字节区间被后续 store 覆盖（同
+//!    base、常量偏移、已知 store 宽度、中间无读/调用）→ 删除
+//!    （`LiveMemZero` + `record_coverage` 用排序不相交区间并集跟踪覆盖）。
+//!
+//! ### 触发 / 放弃条件
+//!
+//! 地址解析是热路径：`resolve_cell`（`BaseEnv::base_of` + `constant_offset`，
+//! 含指针槽解析与 block 参数 phi 偏移）把地址归约成 `Cell = (MemObject, i64)`；
+//! **只有栈分配（`MemObject::Alloc`）和全局（`Global`）有单元语义**，参数
+//! （ABI 指针）与未知 base 解析为 `None`。解析不出就什么都不做——全部保守。
+//! 具体放弃点：
+//! - 冗余写回（Transform 1）：单元被函数内其它写命中（`writes[cell].len() != 1`）、
+//!   store 的源不是同单元的 load、任何调用可能写它（`call_write_roots` 为
+//!   `None` 视为全写屏障）或 MemZero 可能覆盖它；
+//! - 覆盖存储 / 转发（Transform 2+3，块内前向扫描）：遇到**不可解析地址**
+//!   的 store/load/MemZero（可能别名任意单元）时清空 `pending`；调用按
+//!   `call_write_roots` / `call_read_roots` / `call_may_read` 保守保留可能
+//!   被写/被读的 pending store；MemZero 对其区间内的 pending store 同样是屏障；
+//! - 覆盖 MemZero（Transform 4）：只有常量长度（`MemZeroLen::Const`）才可能
+//!   被证明完全覆盖；运行时长度（M53 零存储循环，`MemZeroLen::Value`）视为
+//!   无限区间，永不删除。
+//!
+//! ### 正确性要点
+//!
+//! - 全保守：任何解析不出 / 无法证明的地址、调用、MemZero 都按"可能读写
+//!   一切"处理；
+//! - 转发只发生在同一基本块内、按指令序前向扫描，且仅当单元的最新操作是
+//!   尚未被观察的 pending store；被转发的 load 留在布局中（不消耗 pending
+//!   store，后面同单元的 store 仍可覆盖删除它），失去使用者的死 load 交给
+//!   DCE 收尾；
+//! - MemZero 覆盖只累计"已被后续 store 覆盖"的字节，任何对区间内字节的
+//!   load 都使 MemZero 必须保留；
+//! - 删除用 `remove_layout_inst`、改写用 `visit_and_replace`，保持 arena 与
+//!   used_by 一致。
+//!
+//! ### 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，fixpoint 段，
+//!   **`gvn` 之后、`pointer_strength_reduction` 之前**（注册处注释：让
+//!   后续 pass 看到更干净的内存图）；
+//! - 前后配合：GVN 先做值编号 / 冗余消除，DSE 再清内存图，PSR 随后把
+//!   仿射地址计算改写为指针递进；
+//! - 无目标门控、无 config 开关（AArch64 / RISC-V 都跑）。
+//!
+//! ### 验证
+//!
+//! - 本文件 `mod tests`（449 行起）覆盖：冗余写回删除 / 单元被改后写回保留 /
+//!   覆盖存储删除 / 中间读转发 / 不可解析地址屏障 / MemZero 屏障 /
+//!   MemZero 完全覆盖删除 / 部分覆盖保留 / 中间读保留；
+//! - 端到端：`make test` 差分比对。
 
 use crate::ir::inst_kind::mem_zero::MemZeroLen;
 use crate::opt::{

@@ -1,3 +1,133 @@
+//! # Inline：预算控制的函数内联
+//!
+//! 在调用点把被调函数体克隆进调用方，消除 call/ret 的调用开销（参数搬运、
+//! 保存恢复、跳转），并把小函数的代码并入调用方的基本块，给后续标量 / 循环
+//! pass 提供更大的优化窗口。触发对象是**成本模型内的小函数**：估计克隆大小
+//! × 静态调用点数不超过预算即内联，让热内核里的小工具函数（如 huffman-01 的
+//! `rotlN` / `rotrN`）在每个调用点都被展开，同时不让"多调用点的大叶子函数"
+//! 把程序撑爆。CLI：无独立开关，`-O1` / `-O2` 下始终运行。术语（SSA、
+//! block 参数（Phi）、支配、自然循环 / header / 回边、固定点）见
+//! `docs/offline-handbook/glossary.md` 的"内联"条目，本模块不展开。
+//!
+//! ## 变换形态（IR 示例）
+//!
+//! 内联前：`main` 的 entry 调用 `choose`，返回值直接 `ret`；`choose` 有两条
+//! 返回路径（if / else）：
+//!
+//! ```text
+//! main:
+//!   entry:        v = call choose(cond); ret v
+//!
+//! choose(c):
+//!   entry:        br c, then, else
+//!   then:         ret 1
+//!   else:         ret 2
+//! ```
+//!
+//! 内联后（`choose` 本体保留；`main` 里出现克隆体与续体块；块名为示例，
+//! 真实命名见下）：
+//!
+//! ```text
+//! main:
+//!   entry:              jump entry_choose_inline(cond)   // 原 call 换成进入克隆体的 jump
+//!   entry_choose_inline(c):                             // 克隆的 entry
+//!                       br c, then_choose_inline, else_choose_inline
+//!   then_choose_inline: jump entry_inline_cont(1)        // 克隆的 ret → 跳续体，携带返回值
+//!   else_choose_inline: jump entry_inline_cont(2)
+//!   entry_inline_cont(v): ret v                         // 续体：v 是块参数（返回值）
+//! ```
+//!
+//! 结构上：`once` 先 `split_block_after` 把含 call 的块切成两半，后半成为带
+//! 一个返回类型参数的续体块（`{原块名}_inline_cont`；unit 返回则无参数）；
+//! `BodyClonePlan::clone_into` 把被调函数全部块克隆到 call 块之后（克隆块名
+//! `{原块名}_{被调函数名}_inline`）；每条克隆的 `ret` 重写为带返回值的
+//! `jump` 汇入续体；call 指令的所有使用点替换为续体参数后删除；最后在 call
+//! 位置插入带原实参的 `jump` 进入克隆入口。多条返回路径通过续体的块参数
+//! 合并——正是本项目 Phi 的形态。
+//!
+//! ## 触发 / 放弃条件
+//!
+//! 候选筛选在 `find_candidate` 逐条进行，任一不满足即放弃该被调函数：
+//!
+//! - 有函数体：`layout().is_decl()` 的声明跳过；
+//! - **不在递归环中**：`call_graph.reaches(callee, callee)` 为真则放弃。
+//!   原因（代码注释）：克隆一次后环内调用点就位于调用方内部，可达性 guard
+//!   不再排除它，会无限内联下去；保守规则沿用 cranelift 的
+//!   `does_not_inline_across_a_recursive_call_cycle`；
+//! - 有静态调用点：`call_graph.incoming_callsites_of(callee)` 非空；
+//! - **成本模型**（`estimate_size` + 四个预算常量）：`size` = 被调函数各
+//!   基本块指令数之和（当前实现即 `layout().basicblocks()` 各块
+//!   `insts().len()` 求和），`total = size × 调用点数`（`saturating_mul`）。
+//!   `size ≤ CALL_SIZE_LIMIT`（40）且 `total ≤ TOTAL_SIZE_LIMIT`（100）即
+//!   接受；超限时仅当 `any_callsite_in_loop` 为真且
+//!   `size ≤ CALL_SIZE_LIMIT_LOOP`（200）、`total ≤ TOTAL_SIZE_LIMIT_LOOP`
+//!   （300）才接受，否则放弃；
+//! - 选中的调用点满足 caller ≠ callee 且 `!call_graph.reaches(callee,
+//!   callsite.func)`——caller 不可从被调函数到达，防止把调用点内联进"被调
+//!   函数能到达的函数"形成爆炸；
+//! - 类型匹配：call 结果类型 == `callee_data.ret_ty()`、实参数 == 形参数
+//!   （`call.args().len() == params_ty().len()`）、逐个实参类型 == 形参类型；
+//! - unit 型 call 必须 `used_by` 为空（unit 值不能有使用者）；
+//! - 克隆预检：`BodyClonePlan::capture` 成功（放弃原因见下）且克隆体不含
+//!   尾调用（`plan.contains_tail_call()` 为假）。
+//!
+//! 放弃（`BodyClonePlan::capture` 的 `CloneError` 各变体）：`Declaration`
+//! （无函数体）/ `MissingEntry` / `EmptyBlock` / `InvalidTerminator` /
+//! `MissingTargetBlock`（控制流目标逃出被调函数体）/ `MissingLocalOperand` /
+//! `LocalGlobalAlloc`（函数体含 `GlobalAlloc`：克隆会产生多份全局分配，破坏
+//! "只分配一次"语义）；另有克隆体含 `TailCall` 时放弃（尾调用有自己的处理
+//! 路径，见 fixpoint 里的 `tail_recursive_inline`）。
+//!
+//! 循环内放宽的理由（`CALL_SIZE_LIMIT_LOOP` 常量注释）：调用点位于调用方
+//! 自然循环内时，被移除的调用开销每轮迭代都要付一次，一次性更大的克隆动态上
+//! 划算（如 huffman-01 decode 循环里的 `read_bits_specialized_*`）；且循环内
+//! 被调函数可能通过链式内联继续变大（`read_bits` 141 + `rotlN` 34 = 175），
+//! 预算须覆盖链后尺寸而非裸函数体。
+//!
+//! ## 正确性
+//!
+//! - 返回值路由：续体块参数即返回类型；每个克隆 `ret` 的返回值作为 jump 实参
+//!   传入续体（多条返回路径汇入同一续体，由块参数按入边合并）；
+//! - call 的**所有**使用点替换为续体参数（`utils::visit_and_replace`），删除
+//!   call 前断言 `used_by` 为空（"call must have no users before removal"）；
+//! - 实参按**位置**传给克隆入口（`jump(cloned.entry, args)`），不重排——回归
+//!   测试 `preserves_argument_order_for_many_params_with_array_parameters`
+//!   （`functional/88_many_params2.sy`：多参数含数组指针参数时位置必须保持）；
+//! - 克隆只重映射局部值，全局值共享（`CloneMapper` 对 `is_global()` 原样
+//!   保留）；块参数与块间跳转目标同步重映射，克隆体自洽；
+//! - 类型匹配在克隆前完成，保证实参 / 形参、结果 / 返回类型一一对应；
+//! - 终止性：递归环 guard、调用点可达性 guard 与预算上限三者共同保证
+//!   `run` 的 `while Self::once(program)`（每次只内联一个调用点）一定收敛。
+//!
+//! ## 管线位置与门控
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，**initial 段**
+//!   （`register_initial`，整条管线只跑一次、不进 fixpoint），无条件挂载
+//!   （`-O0` 在 `from_config` 开头早退，故实际仅 `-O1` / `-O2` 生效）；
+//!   无目标门控（AArch64 / RISC-V 都跑）。
+//! - 前驱：`ssa`（SSATransform）、`specialize`，以及 AArch64 门控的
+//!   `mulmod_recognize` 与 `recursive_memoize`——注册注释明确它们必须跑在
+//!   inline 之前：前者把递归模乘改写为内置调用后，缩小的 callee 会被本 pass
+//!   内联；后者把自递归函数改写为带缓存循环后，inline 不会把"已冗余的函数
+//!   体"拍平。
+//! - 后继：initial 的 `tco`（TailCallElim）、`column_major`、`gsp`
+//!   （ScalarGlobalPromotion）——gsp 的注册注释要求跑在 inline 之后
+//!   （"so the callee-touch analysis sees the final call graph"：全局标量
+//!   提升的 callee 触达分析需要看到内联后的最终调用图）；之后进入 fixpoint
+//!   （IPSCCP 起），fixpoint 内的 `TailRecursiveInline` 在 TCO 之后把纯自尾
+//!   递归转成循环，与本 pass 的普通调用内联互补。
+//!
+//! ## 验证
+//!
+//! - 本文件 `mod tests`（228 行起）9 个用例：单调用内联与续体路由、多参数
+//!   （含数组参数）位置保持、多返回值合并、超预算 leaf 拒绝、递归环拒绝、
+//!   循环内放宽（超 `CALL_SIZE_LIMIT` 的 callee 在自然循环内内联、循环外
+//!   拒绝；34 × 3 = 102 > `TOTAL_SIZE_LIMIT`（100）的跨线形状在循环内通过
+//!   合计预算 300 内联、循环外拒绝）；
+//! - 端到端：`make test` 差分（性能用例用 `ARGS="-O 2"`），静态指令数对照
+//!   `scripts/perf_compare.sh`——huffman-01 的 `rotlN` / `rotrN` 等热辅助
+//!   函数在每个调用点展开；也可用 `--emit ir` dump 直接观察内联后的 IR。
+
 use crate::{
     ir::arena::Arena,
     opt::{

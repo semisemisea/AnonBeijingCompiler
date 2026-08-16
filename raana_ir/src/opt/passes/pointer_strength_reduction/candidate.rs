@@ -1,4 +1,122 @@
 //! Candidate discovery and reachability checks for pointer strength reduction.
+//!
+//! ---
+//!
+//! # Candidate 子模块：候选发现与可达性检查（PSR 阶段一）
+//!
+//! 在**最内层循环**里寻找"每轮都要重新计算、适合改写成指针递进"的 GEP
+//! 地址，并完成可达性 / 安全性 / 收益性检查；只有这里产出的 `Candidate`
+//! 才会被 `rewrite` 子模块实际改写。触发形状：循环 header 存在基本归纳变量
+//! （IV）、循环内有以 IV 的仿射函数作索引的 GEP、且该 GEP 只被循环内的
+//! load/store 当地址使用（不逃逸）。术语（header / latch / preheader /
+//! backedge / 归纳变量 IV / 仿射 / GEP / block 参数）：见
+//! `docs/offline-handbook/glossary.md`，不在此展开；父 pass 与三个子模块的
+//! 整体分工见 `pointer_strength_reduction.rs` 的模块文档。
+//!
+//! ## 主流程：find_candidate 的检查步骤（按代码顺序）
+//!
+//! 1. **backedge 收集与分组**：`incoming_edges` 取 header 的全部入边，过滤出
+//!    源块在循环内的边即 backedge；为空直接返回 `None`（不成循环）。按源块
+//!    合并成 `BackedgeGroup`（同源多条边共享一个指针更新）。
+//! 2. **循环不变量 header 参数**：`forwarded_block_params` +
+//!    `resolve_forwarded_params` 先建 block 参数转发表；凡是所有 backedge 都
+//!    原样传递的 header 参数（`invariant_header_params`）在循环内恒等于首轮
+//!    值，计算初始指针时可用 preheader 边的参数作替身。
+//! 3. **IV 步长必须为常量**：`iv.step()` 须为 `InductionStep::Add`/`Sub` 且
+//!    `integer_constant` 能读出数值（`Sub` 取负）。循环里任一 IV 步长非常量
+//!    会经 `?` 短路，**整个循环的候选搜索直接放弃**（保守处理）。
+//! 4. **无回绕证明（iv_range）**：非单位步长必须同时满足
+//!    `normalize_strict_exit`（严格 exit、常量边界）与
+//!    `constant_induction_range`（常量归纳范围），任一失败即放弃——指针直接
+//!    跟随 IV，步长可能跳过边界；单位步长只要求严格 exit，缺失时 header
+//!    终结符须为 `Jump`（rotated countdown 形态：测试被移到 latch），否则
+//!    跳过该 IV；header 分支是 `Le` 之类非严格比较（`normalize_strict_exit`
+//!    拒绝）时 IV 可能绕过边界，同样拒绝。
+//! 5. **IV 在 header 参数中的位置**：找不到 IV 参数位置则跳过；所有 backedge
+//!    在该位置必须传 `iv.update_values()` 之一，否则跳过。
+//! 6. **GEP 扫描与可达性**：只扫 `loops.min_loop_contain` 恰好是本循环的块
+//!    （嵌套循环留给外层迭代）。候选 GEP 须同时满足：
+//!    - base 在 header 处可得（`available_at_header`：全局 / 常量 /
+//!      不变量 header 参数 / 循环外支配 header 的块中定义；`BlockArgRef`
+//!      按 `parameter_blocks` 查其定义块，同样判定）；
+//!    - 只被循环内内存操作使用（`has_only_loop_memory_users`：
+//!      `Load`/`Store`/`MemZero` 以它为地址，或作为内层 GEP 的 base 递归
+//!      满足；深度上限 `MAX_TRANSITIVE_GEP_DEPTH` = 8，visited 集防环）；
+//!    - GEP 所在块支配所有 backedge 源（保证每条 backedge 携带同一指针值）。
+//! 7. **索引演化分类与扁平化**：逐维 `classify_index_evolution` 得
+//!    `IndexEvolution::Invariant`（须 `available_at_header`）/
+//!    `Direct`（系数 1）/ `Affine`（系数 + 派生链 + 不变量，不变量逐个复核
+//!    header 可得）；`gep_index_stride` 查该维元素步长，贡献 = 系数 × 步长，
+//!    checked 累加进 `flat_coefficient`；任一失败即放弃该 GEP。
+//! 8. **步长、溢出与成本闸门**：
+//!    - `flat_coefficient != 0`（全抵消则没有可递进的东西）；
+//!    - `signed_step × flat_coefficient` 必须装进 i32（`signed_pointer_step`）；
+//!    - GEP 类型须为指针，`index_delta × element_size` 得每轮字节步长
+//!      `signed_byte_delta`；
+//!    - 运行期边界循环（`iv_range` 未知）跳过 i32 中间范围证明（增量方案只做
+//!      64 位指针加法，被保护的 32 位计算已不存在），但每轮字节步长
+//!      |Δ| > 2^20 拒绝（防地址跨度爆炸与立即数编码）；
+//!    - 派生链中只有 `only_reaches_candidate` 的指令才计入可删收益（用作分支
+//!      条件、非 `Jump`/`Branch` 角色、转发参数不一致都拒绝删除）；
+//!    - `estimate_aarch64_pointer_strength_reduction` 估 AArch64 成本，
+//!      `!cost.is_profitable()` 放弃。
+//! 9. **选优**：同一循环多个候选按 `cost.is_better_than` 只留一个最佳
+//!    （`run_on` 每轮 fixpoint 只改写一个候选，然后重建分析重跑）。
+//!
+//! ## 触发 / 放弃条件（小结）
+//!
+//! - 触发：backedge 存在、IV 步长为常量、GEP 索引对本循环 IV 呈仿射 / 直接 /
+//!   不变量、GEP 不逃逸、改写有正收益；
+//! - 放弃：无 backedge、IV 步长非常量、非严格或无常量界的 exit（单位步长 +
+//!   jump-through header 除外）、backedge 更新值不一致、base / 不变量索引
+//!   header 不可得、GEP 有循环外或非内存使用、GEP 块不支配 backedge 源、
+//!   步长或字节增量溢出、运行期边界下字节步长过大、成本不盈利。
+//!
+//! ## 正确性要点
+//!
+//! - **逐轮相等**：改写后指针序列 = 原 GEP 地址序列（数学归纳：初值在
+//!   preheader 用 IV 初值算出，每轮步长 = IV 步长 × 各维系数 × 元素大小，
+//!   与每轮重算的地址一致，`rewrite` 子模块据此实施）；
+//! - **header 可得性前置**：改写只在 preheader 计算初值、向 header 新增参数，
+//!   因此 base 与一切不变量索引都必须在 header 处可得
+//!   （`available_at_header`），不允许引用循环内才定义的值；
+//! - **不逃逸**：GEP 只被循环内 `Load`/`Store`/`MemZero` 使用，地址不会进
+//!   call / 返回 / 数据存储，循环外无人引用中间指针；
+//! - **backedge 一致性**：IV 位置必须传更新值、GEP 块支配所有 backedge 源，
+//!   保证无论从哪条边进入下一轮，指针步进一致；
+//! - **无回绕**：非单位步长要求严格 exit 的常量界（`normalize_strict_exit`
+//!   拒绝 `Le` 等非严格比较）；仿射 i32 中间范围检查
+//!   （`affine_range_fits_i32`，`analysis` 子模块）保证折叠不溢出；运行期边界
+//!   时改以每轮字节步长上界防护；
+//! - **保守删除**：`only_reaches_candidate` 只放行"所有使用最终都汇到候选
+//!   GEP"的派生指令，分支条件等旁路使用一律不删。
+//!
+//! ## 管线位置
+//!
+//! - 父 pass `PointerStrengthReduction` 注册于 `opt/pass.rs` 的 `from_config`，
+//!   fixpoint 段，`dse` 之后、`guard_elimination` 之前（内存画像稳定后改写
+//!   地址）；无目标门控、无 config 开关；
+//! - `run_on` 每轮 fixpoint：`find_candidate` 选候选 → `apply_candidate`
+//!   改写 → 重跑分析直到无变换；本文件只读 IR、不改写。
+//!
+//! ## 验证
+//!
+//! - 单测：父模块 `mod tests` 委托 `tests.rs`，正向覆盖单位 / 非单位步长、
+//!   常量与运行期边界、仿射 / 负数系数 / 移位派生索引、多 latch、转发块、
+//!   嵌套 GEP 链等；拒绝覆盖非严格边界、i32 中间回绕、非内存使用链、深链
+//!   （超 `MAX_TRANSITIVE_GEP_DEPTH`）、超过两个 backedge 源等；
+//! - 端到端：`make test` 差分比对。
+//!
+//! ## 与兄弟子模块的协作
+//!
+//! - `analysis`（索引演化分析）：`classify_index_evolution` 把每个 GEP 偏移
+//!   分类为不变量 / 直接 IV / 仿射（系数、派生链、不变量与范围），并完成
+//!   `affine_range_fits_i32` 的 i32 中间范围证明；本文件消费其结果，再独立
+//!   复核各项的 header 可达性；
+//! - `rewrite`（改写实施）：本文件产出的 `Candidate`（GEP、IV 参数位置、
+//!   `backedge_groups`、`FlattenedAddressEvolution` 扁平化地址演化等）交给
+//!   `apply_candidate`：preheader 克隆初值、header 新增携带指针的参数、
+//!   backedge 传"指针 + 步长"。
 
 use super::*;
 

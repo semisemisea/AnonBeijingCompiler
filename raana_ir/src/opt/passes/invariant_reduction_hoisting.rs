@@ -34,6 +34,115 @@
 //! This is a structure-only optimization (per `docs/Illegal_optimization.md`
 //! rule two; see TODO.md §2.6): it never matches names, strings, or
 //! benchmark-specific bounds.
+//!
+//! ## 补充说明（中文）
+//!
+//! ### 一句话定位与动机
+//!
+//! 把**外层 trip 循环体里整棵不变归约巢**外提为单次计算（`many_mat_cal`
+//! 热点）：外层循环每次迭代只剩 `acc = acc + D_total` 一次加法。
+//! `many_mat_cal-1/2/3` 是语料中仅有的三个外层循环呈此形态的程序——`R` 次
+//! trip 的循环每轮都重算 `T×T` 平方和（约 1.5×10¹⁰ 次元素运算）；降级后归约巢
+//! 只跑一次（约 10⁶ 次）再加 `R` 次平凡加法，与 gcc 对该基准的处理一致。
+//!
+//! 术语（归约 / 外层循环、内层循环 / 纯函数 / trip 计数 / latch / preheader /
+//! backedge 等）以 `docs/offline-handbook/glossary.md` 为准，本文不展开。
+//!
+//! ### 变换形态
+//!
+//! 原始形态（外层 trip 循环 + 内层归约巢，见上方英文示例）：
+//!
+//! ```text
+//! L_out(r, ..., acc, ...):  br r < R, entry, exit
+//! entry:                    jump i_header(...)
+//! i_header(...):            ... 只读内存、只做 acc = acc ± D_i 的嵌套循环 ...
+//! latch:                    r = r + 1; jump L_out(..., acc, r, ...)
+//! exit:                     ... 使用 acc ...
+//! ```
+//!
+//! 变换后（`apply`）：
+//!
+//! ```text
+//! preheader:    jump entry_clone        // 归约巢克隆一份：seed acc = 0、r = 0
+//! entry_clone:  ... 原巢克隆（只跑一次，得出 D_total）...
+//! latch_clone:  jump compute_done(D_total)
+//! compute_done: jump L_out(..., acc, r, ..., D_total)  // D_total 作新 carrier 参数
+//! L_out(r, ..., acc, ..., carrier):  br r < R, irh_latch, exit  // 跳过巢
+//! irh_latch:    acc2 = acc + carrier; r2 = r ± step; jump L_out(...)
+//! exit:         ... 使用 acc ...
+//! ```
+//!
+//! 要点：header 追加一个循环携带参数 `carrier`（承载 `D_total`，每轮不变）；
+//! 原 header 终结符改为直接分支到新建的 `irh_latch`（降级 latch）；原 latch 与
+//! 归约巢整体变成不可达代码，留给 DCE。
+//!
+//! ### 触发条件
+//!
+//! `find_outer` 对每个循环按 7 项检查，全部满足才接受：
+//!
+//! 1. header 终结符是 `branch`，continue 边进巢、exit 边出环，且巢入口块无参数
+//!    （克隆体以空 `jump` 开始）；
+//! 2. 出口测试形如 `r < bound` 或 `bound > r`，被比较的 header 参数 `r` 即 trip
+//!    计数器；不用通用 BIV 分析（`r` 先穿过嵌套循环头才在 latch 更新，BIV 看不
+//!    到它），结构测试 + `trace_invariant` 才是关键；
+//! 3. 恰好 1 个 latch，且巢（循环体去掉 header）≥ 2 块并包含 latch；
+//! 4. 巢内无 `store` / `call` / `tail_call` / `memzero` / `global_alloc`，块引用
+//!    只能落在巢内或回 header；`trace_invariant` 证明巢不依赖 `r`（`r` 只允许穿
+//!    过嵌套循环头参数透传、在 latch 里做 trip 更新）；
+//! 5. latch 以 `jump header` 结尾，回边实参个数与 header 参数个数一致；
+//! 6. **恰好一个**累加器：非 trip 的 i32 header 参数，巢内每处使用都是
+//!    `acc ± E`（`Add` / `Sub`，另一操作数不是 `acc` 自身）或透传进嵌套循环头，
+//!    且追踪终点恰是 latch 回边里 acc 自己的槽位（`trace_accumulator`）；出现两
+//!    个候选则拒绝；
+//! 7. 巢只引用 header **参数**，不引用 header 内计算的局部值（克隆体没有它们的
+//!    支配定义）。
+//!
+//! ### 放弃条件
+//!
+//! - `run_on`：decl 函数、无环 CFG（`is_acyclic`）直接返回；`find_outer` 拒绝即
+//!   跳过该循环；
+//! - `apply`：`ensure_preheader` 失败；preheader 终结符不是 `jump` 或实参个数不
+//!   匹配；原 latch 的 trip 更新不是 `r ± const`（`Add` / `Sub` 且恰好一个常量
+//!   操作数——否则建不出降级 latch 的步长）；
+//! - preheader 是新建的（`EnsurePreheader::Created`）时本轮只返回"已改动"，真正
+//!   的改写留到下一轮 fixpoint 迭代（届时 preheader 已存在）。
+//!
+//! ### 正确性
+//!
+//! - 巢**纯**（无 store / call / memzero）且只读循环不变内存 → 克隆跑一次不复制
+//!   任何副作用；
+//! - `acc` 在巢内只做加法累加：`nest(acc) = acc + D`，`D` 与 `acc` 无关，`R` 次
+//!   应用等于 `acc_init + D_total × R`（i32 按 mod 2³² 回绕）；
+//! - 巢不读 trip 计数器 `r`（`trace_invariant`）→ `D` 与迭代无关，单次克隆计算
+//!   合法；
+//! - 克隆体 SSA 合法性：header 参数按映射替换（累加器与 `r` → 0，其余 → 进入值，
+//!   进入值支配克隆体）；巢内值克隆、巢外定义的值（全局 / 常量 / 循环不变）共享；
+//! - 陈旧回边补齐：header 增加 `carrier` 参数后，所有仍指向 header 的终结符（含
+//!   不可达的原 latch）实参个数必须同步补齐，否则遍历 `used_by` 的消费者（如
+//!   DeadPhiElimination）会因参数不匹配 panic（many_mat_cal 回归点）；补的哑值
+//!   永不执行；
+//! - 原 latch 引用巢内值，不可达后不能复用为降级 latch，故新建 `irh_latch`，
+//!   只接触可达值（header 自身参数 + `carrier`）。
+//!
+//! 纯结构优化（`docs/Illegal_optimization.md` 规则二，见 TODO.md §2.6）：不匹配
+//! 任何函数名 / 字符串 / 基准特定边界。
+//!
+//! ### 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，fixpoint 段，
+//!   **`matmul_interchange` 之后**、**`reduction_unroll` 之前**——靠前才能看到
+//!   未被分片破坏的原始嵌套归约巢（`matmul_interchange` 自身受
+//!   `enable_chain_to_switch` 门控，本 pass 不带门控、无 config 开关）；
+//! - 与 `reduction_unroll` 先后配合：本 pass 先把整巢降级成 `acc += D_total`，
+//!   `reduction_unroll` 再拆单累加器循环为四条独立车道。
+//!
+//! ### 验证
+//!
+//! - 本文件 `mod tests`（750 行起）：`degrades_an_invariant_outer_reduction_nest`
+//!   验证降级改写、`carrier` 参数、陈旧回边补齐与幂等性（二次运行不再改写）；
+//!   `skips_a_nest_with_a_store_in_the_outer_body` 验证巢内有 `store` 时拒绝且
+//!   不改写；
+//! - 全量：`make test`（Docker harness 差分比对），性能口径见 AGENTS.md。
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;

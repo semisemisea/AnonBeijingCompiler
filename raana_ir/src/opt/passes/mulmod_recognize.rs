@@ -1,3 +1,114 @@
+//! # MulmodRecognize：模乘递归识别（M60，AArch64-only）
+//!
+//! 识别"乘加翻倍"（multiply by doubling）线性递归——NTT 内核 fft0/fft1 里
+//! `multiply` 这类用 halving/doubling 计算 `a * b % P` 的自递归函数——并改写为
+//! `b < 0` guard 加一次 `soyo_mulmod(a, b, P)` builtin 调用。AArch64 后端把该
+//! 调用原地展开成 `smull; sxtw; sdiv; msub` 四条指令（不产生真实调用），递归的
+//! 调用 / 分支 / 取模开销全部消失。无独立 CLI 开关，由目标门控
+//! `enable_chain_to_switch`（仅 AArch64）决定是否挂载。术语（SSA / block 参数
+//! (Phi) / guard / 内联 / builtin）见 `docs/offline-handbook/glossary.md`。
+//!
+//! ## 变换形态（IR 示例）
+//!
+//! 改写前的递归函数（SSA 伪码，`P` 是匹配到的常数模数）：
+//!
+//! ```text
+//! f(a, b):
+//!   br b, cont, ret0            ; b == 0 → ret 0（前端也可能发出 eq(b, 0)）
+//!   ret0:  ret 0
+//!   cont:  br eq(b, 1), base, rec
+//!   base:  ret a % P
+//!   rec:   half = sar(add(b, shr(b, 31)), 1)   ; b/2（向 -∞ 取整）
+//!          r    = call f(a, half)
+//!          dbl  = (r + r) % P
+//!          br eq(and(b, 0x80000001), 1), odd, even
+//!          odd:  ret (dbl + a) % P
+//!          even: ret dbl
+//! ```
+//!
+//! 改写后（入口块参数 `a`、`b` 保留，新建 `mulmod_zero` / `mulmod_fast` 两个块）：
+//!
+//! ```text
+//! f(a, b):
+//!   cond = b < 0
+//!   br cond, mulmod_zero, mulmod_fast
+//!   mulmod_zero:  ret 0
+//!   mulmod_fast:  ret call soyo_mulmod(a, b, P)   // (i64)a*b % P
+//! ```
+//!
+//! 对任意 `b >= 0`，递归与 fast path 同值（模运算对翻倍 `2x` 与 `+a` 步骤可分配）；
+//! 对 `b < 0`，halving 链（前端形态 `sar(add(b, shr(b, 31)), 1)`，向 -∞ 取整）在
+//! `-1`/`0` 处终止、递归返回 0；且负数的符号位恒为 1，使 `b & 0x80000001` 永不
+//! 等于 1，奇偶分支对负输入不进入——guard 路径同样返回 0，对所有输入语义保持。
+//!
+//! ## 触发条件
+//!
+//! `recognize` 对每个函数做形状匹配，全部满足才返回模数 `P`（`Modulus = i32`）：
+//!
+//! - **函数形状**：有入口块、返回 `i32`、恰好 2 个 `i32` 参数 `(a, b)`；
+//! - **指令集合**：恰好 1 个自递归 `Call`，不允许其它 Call / TailCall / 携带块
+//!   参数的 Branch / Jump / 其它指令种类；全部 Return / Branch / Binary 被收集；
+//! - **halving**：自调用第二实参 `half` 必须是 `b / 2` 的三种前端形态之一
+//!   （`half_binaries`）：`sar(b, 1)`、`sar(add(b, shr(b, 31)), 1)`（前端实际发出
+//!   的形态）或 `div(b, 2)`；
+//! - **翻倍与加**：存在 `double_add = rec + rec`、`double = double_add % P`
+//!   （`P > 0` 常数，即模数）、`odd_add = double + a`（或 `a + double`）；
+//! - **四个 return 恰好各一**：`0` / `a % P` / `double` / `odd_add % P`；
+//! - **恰好三个分支**：入口 guard（`b` 自身 / `neq(b, 0)` / `eq(b, 0)`，前端在
+//!   强度削减前发出 `eq` 形态；`entry_b_use`）、基例 `eq(b, 1)`（`eq1_inst`）、
+//!   奇偶测试（`eq(and(b, mask), 1)`，mask 为 `0x80000001`（-2147483647）或 `1`；
+//!   或 `eq(rem(b, 2), 1)`；`parity_binaries`）；
+//! - **use 完整性**：`rec` / `double` / `a` / `b` 的每个 use 必须被上述形状解释
+//!   （`uses_are_exactly`），所有 Binary 必须属于形状（`explained` 集合）。
+//!
+//! ## 放弃（拒绝）条件
+//!
+//! 匹配器刻意严格（宁漏勿错）：上述任一条件不满足——多一条指令、多一个 use、
+//! 多一个分支、return 重复或形状不符——整个函数保持原样。此外 `run` 在改写前
+//! 检查程序里是否已有**用户定义**的 `soyo_mulmod`（同名且有函数体），有则整体
+//! 放弃本 pass，绝不把用户函数的名字让给 builtin。
+//!
+//! ## 正确性
+//!
+//! - 代数恒等：`a * b % P` 对 halving/doubling 递归成立（模运算分配律），
+//!   fast path 的 `(i64)a*b % P` 与之同值；
+//! - 负参数：`b < 0` 时递归返回 0，guard 路径也返回 0（测试
+//!   `guard_path_matches_negative_b_semantics` 对 `-1`、`-2`、`i32::MIN` 等验证）；
+//! - 后端展开：`smull` 对两个 32 位操作数给出**精确**的 64 位乘积（不会溢出），
+//!   64 位 `sdiv`/`msub` 算出截断余数，落在 `(-P, P)` 内，低 32 位即正确的 `i32`
+//!   返回值（`anon_armv8/src/lower/call.rs` 的 `lower_mulmod_builtin`）；
+//! - 改写要点：入口块指令先全部摘除、其余基本块全部删除，入口块参数（`a`、`b`）
+//!   保留；guard 的 `cond`（Binary）必须 `insert_inst` 进入口块 layout——否则
+//!   IPSCCP 从块 layout 建 worklist，孤儿值"从未被访问"，分支两个后继都不被跟随，
+//!   会静默丢掉调用方的循环与回边（无限循环误编译；回归测试
+//!   `guard_condition_lives_in_the_entry_layout`）。`zero` 是 Integer 内联操作数，
+//!   无需 layout；
+//! - 下游约定：`soyo_mulmod` 是无体声明，`pure_function.rs` 视其为纯函数，range
+//!   分析在 `a`、`b` 均非负时给出 `[0, P)`（见
+//!   `analysis_passes/return_summary.rs`）。
+//!
+//! ## 管线位置与门控
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，**initial 段**
+//!   （`register_initial`，跑在优化 fixpoint 之前且不参与迭代），`specialize` 之后、
+//!   `inline` 之前：`specialize` 跳过自递归候选（如 `multiply`），必须先跑；改写后
+//!   的函数只剩 guard + 一次调用，`inline` 随后把它内联进调用方。顺序：SSA →
+//!   Specialize → `mulmod_recognize` → Inline → …；
+//! - 门控：`config.target.enable_chain_to_switch`（AArch64-only）——RISC-V 保留原
+//!   递归；`soyo_mulmod` 声明只在 AArch64 运行里出现。
+//!
+//! ## 验证
+//!
+//! - 本文件 `mod tests`（614 行起）覆盖：形状识别
+//!   `recognizes_the_doubling_recursion`、改写 + helper 声明 + 幂等
+//!   `rewrites_to_guard_plus_builtin_and_declares_helper`、M60/Inline 交互回归
+//!   `guard_condition_lives_in_the_entry_layout`、多余指令拒绝
+//!   `refuses_a_function_with_a_stray_operation`，以及语义等价
+//!   `guard_path_matches_negative_b_semantics` / `fast_path_matches_recursion_for_positive_b`
+//!   （对照参考实现 `recursion_value`）；
+//! - 端到端：`make test ARGS="-O 2"` 差分比对（M60 落地时 fft0 QEMU
+//!   14.93s → ~0.5s，见 TODO.md）。
+//!
 use crate::{
     ir::{
         BinaryOp, Function, Inst, InstKind, Program, Type, arena::Arena, basic_block::BasicBlock,

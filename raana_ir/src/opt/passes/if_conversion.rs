@@ -1,3 +1,54 @@
+//! # IfConversion：分支转 select / 布尔折叠
+//!
+//! 把产生值的小分支结构转成无分支的 `select`，把 `&&`/`||` 分支三角折成
+//! 单条 `and`/`or`。消除分支（分支预测失败惩罚 + 后端分支指令），暴露更大
+//! 的基本块。四种规范形状见 `IfConversion` 的英文文档；中文要点如下。
+//!
+//! ## 四种形状（`candidate` 逐一识别）
+//!
+//! 1. **同目标分支**：`br c, M, args1, M, args2`——两臂同目标，条件只剩
+//!   选择实参的作用 → 目标块的参数用 `select(c, args1, args2)` 合并；
+//! 2. **空 diamond**：`br c, A, B`，A、B 都是空块且跳到同一 merge → merge
+//!   的参数用 `select(c, a, b)` 合并，A、B 删除；
+//! 3. **triangle 链**：一臂为空直达 merge、另一臂是"可投机执行的整数指令
+//!   链"（无副作用、可安全提前执行）→ 链上指令移到分支前，merge 参数用
+//!   select 合并；
+//! 4. **land/lor triangle**：`br c1, rhs, merge(0)` 且 `rhs: c2 = ...;
+//!   jump merge(c2)` → 折成 `c1 && c2`（`BinaryOp::And`，land）；对称形态
+//!   折 `Or`。
+//!
+//! 合并值（`MergedValue`）三种：两臂相同（`Common`）、select、布尔二元
+//! 运算（`BoolBinary`）。
+//!
+//! ## 触发 / 放弃条件
+//!
+//! - 分支条件必须 i32；目标块不得是 head 自身；
+//! - 空 diamond/triangle 要求臂块无参数、`exact_users` 校验（目标块只被
+//!   该分支使用，删除安全）、实参在 head 处可用（`available_at`，支配
+//!   检查）；
+//! - triangle 链只收可投机（无副作用）的整数指令；
+//! - 放弃：不可投机指令、目标块有其它前驱、条件非 i32。
+//!
+//! ## 正确性
+//!
+//! - select 语义 = 条件选择两值，与分支+Phi 等价（两臂值分别对应 true/
+//!   false）；
+//! - 投机执行只允许无副作用指令（异常/内存副作用会改变可观察行为）；
+//! - `apply` 只改写 head 及其后的块（贪婪按布局序扫描，从不删 head 之前的
+//!   块），布局序扫描可安全继续。
+//!
+//! ## 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `from_config`，fixpoint 段，`blocked_reduction`
+//!   之后、`tco`（第二次）之前；
+//! - 与 `boolean_simplify` 配合：后者先规范化布尔形态，本 pass 消费；
+//! - 无目标门控、无 config 开关。
+//!
+//! ## 验证
+//!
+//! - 本文件 `mod tests` 覆盖四种形状与拒绝路径；
+//! - 端到端：`make test` 差分比对。
+
 use crate::opt::prelude::*;
 
 /// Converts small, value-producing branches into `select`s, and folds

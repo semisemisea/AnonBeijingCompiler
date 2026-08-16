@@ -36,6 +36,59 @@
 //! rotated to countdown form by introducing a trip counter `t = bound - i0`
 //! carried in a new header parameter, guarded by a pre-header test `t > 0`
 //! that preserves the trip-zero semantics of the original head test.
+//!
+//! ---
+//!
+//! ## 补充说明（中文）
+//!
+//! 术语：latch / preheader / backedge / test-at-top 等见
+//! `docs/offline-handbook/glossary.md` 的"循环"分组。
+//!
+//! ### 两种旋转
+//!
+//! 1. **countdown 旋转**（`rotate_countdown`，上文示例）：测试值直接是
+//!    header 参数、且循环的每条非回边前驱都传**非零常量**的 countdown 循环
+//!    → 测试移到底部。除上文示例外还有三个拒绝条件：
+//!    - body / exit 块带参数（旋转要求它们无参数）；
+//!    - 非回边前驱超过一类：全部传非零常量（首测必过）或唯一回边，否则
+//!      首测可能失败，不能安全移除头部测试；
+//!    - `exit` 使用了被测计数器**以外**的 header 参数：旋转后 false 边从
+//!      latch 直跳 exit、绕过 header，exit 里看到的会是上一轮迭代的值。
+//! 2. **count-up 旋转**（`rotate_count_up`）：`while (i < bound) { body;
+//!    i += 1 }` 形态 → 引入 trip 计数器 `t = bound - i0` 作为新 header
+//!    参数；pre-header 里插入 guard `t0 > 0`（保持 trip = 0 时零次执行的
+//!    语义，guard 失败直跳 exit）；latch 里计算 `t' = t - 1` 并在底部测试
+//!    `t'`。要求：
+//!    - 比较必须是 `i < bound`（`BinaryOp::Lt`），`i` 是 header 参数，
+//!      `bound` 在循环前可用（全局 / 常量 / 外部块参数，且不是 header
+//!      参数——否则 trip 计数无法在 pre-header 计算）；
+//!    - 恰好一条 entry 边（带初值）+ 一条 back 边（带的 `i` 参数是
+//!      `i + 1` 更新），均为 `jump`；
+//!    - `exit` 及其后续可达区域（绕过循环的路径）不使用循环内产生的值：
+//!      guard 的 false 边从 pre-header 直入 exit，若该区域用了循环值，
+//!      其支配定义会丢失（SSA 合法性）。`exit` 本身读 header 参数是允许
+//!      的，会为其加 block 参数并重映射（要求 header 终结符是 exit 的
+//!      唯一前驱，保证所有入边同步传参）。
+//!
+//! ### 收益
+//!
+//! 旋转后 latch 形态是 `subs w8, w8, #1; b.ne header`——减法和测试融合成
+//! 一条指令，省掉独立的 compare。count-up 转 countdown 正是为了让 AArch64
+//! 后端能做这个融合（count-up 的 `i < bound` 比较无法与 `i += 1` 融合）。
+//!
+//! ### 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `from_config`，fixpoint 段，**`loop_unroll`
+//!   之后**、`zero_store_loop` 之前；
+//! - 与 `loop_unroll` 先后配合：`loop_unroll` 只吃 test-at-top 的精确
+//!   小循环，必须先跑；旋转把剩余循环转成 test-at-bottom 供后端融合；
+//!   `zero_store_loop` 识别零初始化循环需要 countdown 形态（旋转后的）。
+//! - 无目标门控、无 config 开关。
+//!
+//! ### 验证
+//!
+//! - 本文件 `mod tests`（500 行起）覆盖两种旋转的命中与各拒绝形态；
+//! - 端到端：`make test` 差分比对 + 汇编检查（countdown 融合形态）。
 
 use crate::opt::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};

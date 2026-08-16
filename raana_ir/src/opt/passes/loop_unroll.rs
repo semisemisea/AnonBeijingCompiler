@@ -1,3 +1,113 @@
+//! # LoopUnroll：精确小循环全展开
+//!
+//! 把**迭代次数在编译期可精确求出**的规范化小循环整体展开成直线代码，消除
+//! 循环测试与回边跳转的开销，并给后续 pass（GVN / DSE / 寄存器分配）暴露更大
+//! 的无分支基本块。典型受益对象是 stencil / 小矩阵类固定迭代内核。对应 CLI
+//! 开关 `--loop-unroll on|off|dry-run`。
+//!
+//! ## 变换形态（IR 示例）
+//!
+//! 一个 test-at-top 的规范化循环（测试在顶部、单 latch、计数向上）：
+//!
+//! ```text
+//! pre:        jump header(0)
+//! header(j):  br j < 3, body, exit     // 测试在顶部
+//! body:       a[j] = j * 2; j' = j + 1; jump header(j')
+//! exit:       ret
+//! ```
+//!
+//! `constant_trip_count` 从严格 exit（`j < 3` 且 `j` 是基本归纳变量）推出
+//! trip = 3。展开后：
+//!
+//! ```text
+//! pre:          jump header(0)
+//! header(j):    jump body              // 首测必过（trip>0），测试被删除
+//! body:         a[0] = 0*2; j1 = 1; jump header_1(j1)
+//! header_1(j):  jump body_1            // 克隆的 header：参数原样传递
+//! body_1:       a[1] = 1*2; j2 = 2; jump header_2(j2)
+//! header_2(j):  jump exit(2)           // 最后一次迭代：测试替换为直跳 exit
+//! exit:         ret
+//! ```
+//!
+//! 结构上：原 header 保留但终结符改为无条件进入第一次迭代；随后按 trip 数克隆
+//! header + 循环体（`clone_region`），最后一个克隆 header 直跳 exit。原 header
+//! 与克隆 header 共 trip+1 个、循环体共 trip 份——与大小预算公式一致。
+//!
+//! 循环外对 header 参数/指令值的引用会被重映射到最后一次迭代的对应值
+//! （`remap_external_header_uses`）：循环退出时这些值恰好等于最后一次迭代
+//! 的值，语义保持。
+//!
+//! ## 触发条件
+//!
+//! 候选循环必须同时满足：
+//!
+//! - **规范化形状**（`analyze_candidate` 逐项检查，任一不满足即拒绝）：
+//!   header 不是函数入口；循环体 ≥ 2 块；恰好 1 个 latch（latch ≠ header）；
+//!   无嵌套循环；header 恰好 2 条出边（1 条 continue 指向循环内、1 条 exit
+//!   指向循环外）；latch 的 backedge 唯一且指向 header；header 恰好 2 条入边
+//!   （1 条来自 preheader + 1 条 backedge）；各边参数个数与 header 参数个数
+//!   一致。
+//! - **可精确计数**：有基本归纳变量（`BasicInductionVariableAnalysis`）、有
+//!   严格 exit（`normalize_strict_exit`，测试形如 `iv < bound`）、
+//!   `constant_trip_count` 能求出**精确**迭代次数。
+//! - **大小预算**：trip_count ≤ `MAX_FULL_UNROLL_TRIPS`（8），且投影大小
+//!   （header 指令数 ×(trip+1) + 循环体指令数 ×trip，`projected_size`）
+//!   ≤ `MAX_UNROLLED_NON_TERMINATORS`（1536）。预算放宽到 1536 的理由
+//!   （见常量注释）：小的精确循环展开后常会暴露外层精确循环（例如 5×5 二维
+//!   模板内核的两层），预算要容纳这种连续展开；而 trip 上限挡住了长循环，
+//!   预算不会因此被滥用。
+//!
+//! ## 放弃（拒绝）条件
+//!
+//! 拒绝原因见
+//! [`LoopUnrollRejectReason`](crate::opt::stats::LoopUnrollRejectReason)
+//! （`--pass-stats` 可看到各原因的计数分布）：`HeaderIsEntry` /
+//! `UnsupportedLoopShape` / `NestedLoop` / `UnsupportedHeaderEdges` /
+//! `UnsupportedBackedge` / `NonCanonicalEntry` / `EdgeArgumentMismatch` /
+//! `NoBasicInductionVariable` / `NoSupportedStrictExit` /
+//! `NonConstantTripCount` / `TripCountTooLarge` / `ProjectedSizeTooLarge` /
+//! `ContainsAlloc` / `BodyValueEscapesLoop`。两个语义闸门：
+//!
+//! - `ContainsAlloc`：循环体含 `Alloc` 时拒绝——展开会把 `Alloc` 克隆成多份
+//!   栈分配，破坏"整个循环只分配一次"的语义（推断：代码未注释此原因，理由
+//!   从拒绝点位置推得）；
+//! - `BodyValueEscapesLoop`：循环体产生的值被循环外使用时拒绝——克隆会产生
+//!   多份定义，外部引用无法唯一对应。
+//!
+//! ## 正确性
+//!
+//! - trip 数是**精确**迭代次数（不是上界），来自严格 exit 的常量推导；
+//! - trip = 0：原 header 测试第一次就失败，直接把 header 终结符替换为直跳
+//!   `exit`（携带原 exit 参数），等价于零次迭代；
+//! - trip > 0：进入循环时测试必然通过（否则迭代数为 0），所以移除 header
+//!   测试、无条件进入第一次迭代是安全的——即"head test 只 gate 第一次迭代"
+//!   的论证（与 `rotate_loops` 的文档同款）；
+//! - 每次迭代的 header 参数通过 `remap_values` 按 SSA 值流重映射，克隆指令
+//!   引用本迭代的定义，不跨迭代串值。
+//!
+//! ## 管线位置与门控
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，fixpoint 段，
+//!   `config.loop_unroll != Disabled` 时挂载；运行在 `simplify_cfg` 之后、
+//!   `rotate_loops` **之前**——必须在循环仍是 test-at-top 形态时展开；
+//!   `rotate_loops` 会把测试移到 latch（countdown 形式），届时 IV / 严格
+//!   exit 分析无法再识别。
+//! - 模式：`LoopUnrollMode::Enabled`（默认，实际改写）/ `DryRun`（只跑候选
+//!   分析并输出统计，不改写 IR，配合 `--pass-stats` 做语料调查）/
+//!   `Disabled`。CLI：`--loop-unroll on|off|dry-run`，仅 `-O1`/`-O2` 接受，
+//!   `-O0` 拒绝（`soyo_compiler/src/cli.rs`）。
+//! - 统计：`stats.rs` 的 `LoopUnrollStats` 记录观察/接受/拒绝直方图；
+//!   本 pass 的 `observed` 表按 (函数, header) 去重，避免 fixpoint 多轮
+//!   迭代里同一循环被重复计数。
+//!
+//! ## 验证
+//!
+//! - 本文件 `mod tests`（917 行起）覆盖候选判定与展开重写；
+//! - 全量语料：`docs/Loop_unroll_corpus_report.md`（U1 报告）——214 例在
+//!   `on` 模式下 AArch64 / RISC-V QEMU 全过（214/214），展开后汇编增量
+//!   < 0.8%；⚠ 该报告的 `MAX_UNROLLED_NON_TERMINATORS = 64` 是旧值，
+//!   代码已放宽到 1536（为 5×5 stencil 内核），报告未同步。
+
 use std::sync::{Arc, Mutex};
 
 use rustc_hash::{FxHashMap, FxHashSet};

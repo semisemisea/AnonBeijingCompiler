@@ -1,3 +1,53 @@
+//! # SimplifyCFG：CFG 化简
+//!
+//! 三个互相独立的形状化简，循环执行直到没有变化：
+//!
+//! 1. **常数条件分支折叠**（`fold_const_condition_branch`）：条件已知的
+//!    `br` 退化为 `jump`。
+//! 2. **同目标分支折叠**（`fold_branch_same_target_and_args`）：两臂目标与
+//!    实参完全相同的 `br` 退化为 `jump`。
+//! 3. **平凡跳转块删除**（`remove_trivial_jump_block`）：删除"只有一条无参
+//!    `jump`、自身无参数"的块，前驱直接指向目标。
+//!
+//! ## 变换形态（IR 示例）
+//!
+//! ```text
+//! ① br 1, A, xs, B, ys        →   jump A, xs
+//!    br 0, A, xs, B, ys        →   jump B, ys
+//! ② br c, A, xs, A, xs        →   jump A, xs
+//! ③ pre:  jump mid            →   pre:  jump exit
+//!    mid:  jump exit           （mid 被删除）
+//! ```
+//!
+//! ③ 的跳转链会**一次解析到底**（`mid → exit` 若 exit 也是平凡块则继续追）：
+//! `pre → mid1 → mid2 → exit` 时 pre 直接指向 exit，中间块全部删除；链上出现
+//! 环（平凡块自环或互环）则整条链放弃。
+//!
+//! ## 触发 / 放弃条件
+//!
+//! - ①只认 `InstKind::Integer` 条件（非零 → 真臂）；非整型条件不动。
+//! - ②要求目标**和实参列表**都相同（`insts_equal`）。
+//! - ③的候选块必须：非 entry、只有一条指令（终结符）、是无参 `jump`、块
+//!   自身无参数、且不自跳（自跳块删除会让前驱指向不存在的块）。
+//! - 幂等：三种化简都不产生新的同类形状，循环必然收敛。
+//!
+//! ## 正确性
+//!
+//! - ①②是直接等价替换；③中平凡块无参数、无副作用，删掉只缩短路径；
+//! - 跳转链环检测保证不会删除形成环的块集（那会变成死循环或悬空前驱）。
+//!
+//! ## 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `from_config`，fixpoint 段，`ipsccp` 之后、
+//!   `loop_unroll` 之前；其它 pass 产生的死块/冗余分支由它在下一轮 fixpoint
+//!   迭代里清掉；
+//! - 无目标门控、无 config 开关。
+//!
+//! ## 验证
+//!
+//! - 本文件 `mod tests`（188 行起）覆盖三种化简及跳转链/自跳/entry 边界；
+//! - 端到端：`make test` 差分比对。
+
 use crate::opt::prelude::*;
 use crate::opt::utils::logical_edge::{LogicalEdgeRewriter, outgoing_edges};
 

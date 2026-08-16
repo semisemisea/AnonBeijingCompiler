@@ -35,6 +35,73 @@
 //! tree is entered only through the chain head's predecessors. A chain rooted
 //! at the function entry keeps the entry block as the tree root so the
 //! function parameters survive.
+//!
+//! ## 补充说明（中文）
+//!
+//! 术语：支配（dominate）/ block 参数（Phi）/ 边参数等见
+//! `docs/offline-handbook/glossary.md`。本 pass 与 AArch64 后端
+//! `anon_armv8/src/passes/chain_fusion.rs` 配套：IR 侧把相等链摆成树，
+//! 后端把每个 (check, split) 节点对融合成一次比较。
+//!
+//! ### 一句话定位与动机
+//!
+//! 把 C 里常见的 `if (x == 1) ...; if (x == 2) ...` 线性相等测试链改写为
+//! 平衡二叉判定树：最坏路径比较次数从 O(N)（N 条链）降到 ~log2(N)+1
+//! （8 个 case 时 4 次，与 clang `rotrN` 一致），平均 ~2.6 次。
+//!
+//! ### 变换形态
+//!
+//! 英文部分已画过每个树节点的形状，这里只补结构要点：链块按 case 常数
+//! `k` 升序排序（`convert_chain` 里 `sort_by_key`），`build_tree` 以中位数
+//! 切分递归建树；**链头块就地成为树根**（其 block 参数与入边原样保留），
+//! 其余链块删除；内部节点是 check + split 一对块，叶子只留 check、
+//! `lt` 侧直连 default。
+//!
+//! ### 触发 / 放弃条件
+//!
+//! `detect_chain` 从链头逐块扫描，**全部**满足才触发：
+//!
+//! - 每块恰好 `CHAIN_BLOCK_INSTS`（2）条指令：`Binary(Eq)` + 以它为条件
+//!   的 `Branch`（任一不满足即断链）；
+//! - 常数在 Eq 任一侧均可（`Integer` 常量），且所有链块测试**同一个**
+//!   值 `x`；
+//! - case 常数不重复（重复即拒绝）；
+//! - false 目标不能是当前块自身（拒绝自环），并沿 false 边接到下一链块；
+//! - 链长 ≥ `MIN_CHAIN_LEN`（4）——更短的链直接线性测试已足够便宜；
+//! - 除链头外的链块不得带 block 参数（树的各边不传参）；链头豁免：它
+//!   就地变树根，函数入口起链时函数参数借此保留。
+//!
+//! `run_on` 层面：无函数入口块直接返回 false；同一轮里被先前转换删除
+//! 的块跳过。
+//!
+//! ### 正确性要点
+//!
+//! - 只改写"整块内容 = 测试 + 终结符"的块，每个 handler 仍经同一条边、
+//!   携带同样的边参数到达（与变换前一致）；
+//! - 被测值 `x` 保持原定义块（链块只有 2 条指令，不可能定义它），且树
+//!   只能经链头的前驱进入，故 `x` 支配所有树块（SSA 合法性）；
+//! - 链头就地变树根：其 block 参数（函数入口即函数参数）与入边无需
+//!   重接线；
+//! - default（最后一条链的 false 目标及其边参数）原样复制到每个叶子 /
+//!   空子树位置。
+//!
+//! ### 管线位置与门控
+//!
+//! - 注册：`opt/pass.rs` 的 `from_config`，fixpoint 段，`rotate_loops`、
+//!   `zero_store_loop` 之后、`licm` 之前（先旋转 / 折叠循环，再做判定树）；
+//! - 门控：`config.target.enable_chain_to_switch`，仅 AArch64 挂载
+//!   （`config.rs`：aarch64 为 true、riscv 为 false）——RISC-V 分支把条件
+//!   物化进寄存器，判定树无法像 AArch64 那样把 (eq, lt) 两次比较融合，
+//!   因此不启用；无独立 CLI / config 开关；
+//! - 后端配套：`chain_fusion` 把 check + split 对融合成 `cmp; beq; blo; b`，
+//!   即 clang 的发射形态。
+//!
+//! ### 验证
+//!
+//! - 本文件 `mod tests`（400 行起）：`converts_an_equality_chain_into_a_balanced_tree`
+//!   （6 链：旧链块被删、entry 保留为树根、default 仍可达）与
+//!   `rejects_chains_shorter_than_four_links`（3 链拒绝、原块不动）；
+//! - 端到端：`make test`（AArch64 差分比对）。
 
 use crate::opt::prelude::*;
 

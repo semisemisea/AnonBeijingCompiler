@@ -22,7 +22,4 @@ mod memory;
 )
 
 #[cfg(test)]
-use inst_deps::preg;
-
-#[cfg(test)]
 mod tests;

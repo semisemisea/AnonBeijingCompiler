@@ -73,10 +73,10 @@ impl CFGInfo {
         ctx.backedge.resize(num_blocks * 2, 0);
         let (backedge_in, backedge_out) = ctx.backedge.split_at_mut(num_blocks);
 
-        for index in 0..num_blocks {
+        for (index, backedge_out) in backedge_out.iter_mut().enumerate().take(num_blocks) {
             let block = Block::new(index);
             let insns = function.block_insns(block);
-            if insns.len() == 0 {
+            if insns.is_empty() {
                 return Err(format!("CFG block {index} has no instructions"));
             }
             for inst in insns.iter() {
@@ -117,7 +117,7 @@ impl CFGInfo {
             for &succ in function.block_succs(block) {
                 if succ.index() <= index {
                     backedge_in[succ.index()] += 1;
-                    backedge_out[index] += 1;
+                    *backedge_out += 1;
                 }
             }
         }

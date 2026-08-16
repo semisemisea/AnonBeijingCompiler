@@ -21,10 +21,10 @@ fn merge_sets(
         }
         let rpo1 = block_to_rpo[node1.index()].unwrap();
         let rpo2 = block_to_rpo[node2.index()].unwrap();
-        if rpo1 > rpo2 {
-            node1 = idom[node1.index()];
-        } else if rpo2 > rpo1 {
-            node2 = idom[node2.index()];
+        match rpo1.cmp(&rpo2) {
+            core::cmp::Ordering::Greater => node1 = idom[node1.index()],
+            core::cmp::Ordering::Less => node2 = idom[node2.index()],
+            core::cmp::Ordering::Equal => {}
         }
     }
     node1

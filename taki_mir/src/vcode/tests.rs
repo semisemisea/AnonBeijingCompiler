@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     abi::{ABIMachineSpec, ArgPair, ArgSlot, CalleeABI, FrameLayout, StackAMode},
-    prelude::{ArenaContext, HirBasicBlock, HirFunctionData, HirInst, HirType},
+    prelude::{ArenaContext, HirFunctionData, HirInst, HirType},
     reg_alloc::reg::{MachineEnv, OperandVisitorImpl, PReg},
     register::{Reg, VRegAllocator, Writable},
     types::{I64, LoweredType, V4I32},

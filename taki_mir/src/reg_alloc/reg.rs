@@ -453,9 +453,9 @@ impl Output {
 
     pub fn block_insts_and_edits<'a, F: crate::reg_alloc::function::Function>(
         &'a self,
-        func: &'a F,
+        func: &F,
         block: crate::reg_alloc::index::Block,
-    ) -> OutputIter<'a, F> {
+    ) -> OutputIter<'a> {
         let inst_range = func.block_insns(block);
         let first_pp = ProgPoint::before(inst_range.first().raw_u32());
         let edit_start = self
@@ -470,7 +470,6 @@ impl Output {
             .unwrap_err();
         OutputIter {
             inst_range,
-            insts: func,
             edits: &self.edits[edit_start..],
         }
     }
@@ -481,19 +480,18 @@ pub enum InstOrEdit<'a> {
     Edit(&'a Edit),
 }
 
-pub struct OutputIter<'a, F: crate::reg_alloc::function::Function> {
+pub struct OutputIter<'a> {
     inst_range: crate::reg_alloc::index::InstRange,
-    insts: &'a F,
     edits: &'a [(ProgPoint, Edit)],
 }
 
-impl<'a, F: crate::reg_alloc::function::Function> Iterator for OutputIter<'a, F> {
+impl<'a> Iterator for OutputIter<'a> {
     type Item = InstOrEdit<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // There can't be any edits after the last instruction in a block, so
         // we don't need to worry about that case.
-        if self.inst_range.len() == 0 {
+        if self.inst_range.is_empty() {
             return None;
         }
         if let Some((first_edit, rest)) = self.edits.split_first() {
@@ -1022,7 +1020,6 @@ type Bits = u64;
 /// The set is `Copy` and is guaranteed to have constant, and small,
 /// size, as it is based on a bitset internally.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 pub struct PRegSet {
     bits: [Bits; Self::LEN],
 }
@@ -1089,14 +1086,18 @@ impl PRegSet {
 
     pub fn invert(&self) -> PRegSet {
         let mut set = self.bits;
-        for i in 0..self.bits.len() {
-            set[i] = !self.bits[i];
+        for (i, bit) in set.iter_mut().enumerate() {
+            *bit = !self.bits[i];
         }
         PRegSet { bits: set }
     }
 
-    pub fn is_empty(&self, regclass: RegClass) -> bool {
+    pub fn is_class_empty(&self, regclass: RegClass) -> bool {
         self.bits[regclass as usize] == 0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bits.iter().all(|&bits| bits == 0)
     }
 
     /// Returns the number of register in this set.
@@ -1265,21 +1266,21 @@ pub struct MachineEnv {
     pub fixed_stack_slots: Vec<PReg>,
 }
 
-/// A register class. Each register in the ISA has one class, and the
-/// classes are disjoint. Most modern ISAs will have just two classes:
-/// the integer/general-purpose registers (GPRs), and the float/vector
-/// registers (typically used for both).
-///
-/// Note that unlike some other compiler backend/register allocator
-/// designs, we do not allow for overlapping classes, i.e. registers
-/// that belong to more than one class, because doing so makes the
-/// allocation problem significantly more complex. Instead, when a
-/// register can be addressed under different names for different
-/// sizes (for example), the backend author should pick classes that
-/// denote some fundamental allocation unit that encompasses the whole
-/// register. For example, always allocate 128-bit vector registers
-/// `v0`..`vN`, even though `f32` and `f64` values may use only the
-/// low 32/64 bits of those registers and name them differently.
+// A register class. Each register in the ISA has one class, and the
+// classes are disjoint. Most modern ISAs will have just two classes:
+// the integer/general-purpose registers (GPRs), and the float/vector
+// registers (typically used for both).
+//
+// Note that unlike some other compiler backend/register allocator
+// designs, we do not allow for overlapping classes, i.e. registers
+// that belong to more than one class, because doing so makes the
+// allocation problem significantly more complex. Instead, when a
+// register can be addressed under different names for different
+// sizes (for example), the backend author should pick classes that
+// denote some fundamental allocation unit that encompasses the whole
+// register. For example, always allocate 128-bit vector registers
+// `v0`..`vN`, even though `f32` and `f64` values may use only the
+// low 32/64 bits of those registers and name them differently.
 // pub type RegClass = regalloc2::RegClass;
 
 /// An OperandCollector is a wrapper around a Vec of Operands

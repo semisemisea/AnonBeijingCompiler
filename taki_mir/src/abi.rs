@@ -3,7 +3,7 @@ use std::num::NonZeroU64;
 
 use rustc_hash::FxHashMap;
 use smallvec::{SmallVec, smallvec};
-use tomori_utils::{PrimaryMap, SecondaryMap, entity_impl};
+use tomori_utils::entity_impl;
 
 use crate::prelude::*;
 use crate::reg_alloc::reg::{MachineEnv, PReg, RegClass, SpillSlot};
@@ -104,20 +104,6 @@ impl<'a> ArgLayoutPlanner<'a> {
         }
 
         (slots, stack_offset)
-    }
-}
-
-impl StackAMode {
-    fn offset_by(&self, offset: u32) -> Self {
-        match self {
-            StackAMode::IncomingArg(off, size) => {
-                StackAMode::IncomingArg(off.checked_add(i64::from(offset)).unwrap(), *size)
-            }
-            StackAMode::Slot(off) => StackAMode::Slot(off.checked_add(i64::from(offset)).unwrap()),
-            StackAMode::OutgoingArg(off) => {
-                StackAMode::OutgoingArg(off.checked_add(i64::from(offset)).unwrap())
-            }
-        }
     }
 }
 
@@ -416,9 +402,6 @@ pub struct CalleeABI<M: ABIMachineSpec> {
     /// Await for filling.
     total_stackslots_size: u32,
 
-    /// Await for filling
-    stackslots_offsets: PrimaryMap<StackSlot, u32>,
-
     sized_stack_arg_size: u32,
 
     alloc_to_ss: FxHashMap<HirInst, u32>,
@@ -427,9 +410,6 @@ pub struct CalleeABI<M: ABIMachineSpec> {
     outgoing_arg_size: u32,
 
     has_calls: bool,
-
-    /// ?
-    stackslots_keys: SecondaryMap<StackSlot, Option<StackSlotUniqueKey>>,
 
     frame_layout: Option<FrameLayout>,
 
@@ -455,8 +435,6 @@ impl<M: ABIMachineSpec> CalleeABI<M> {
             sized_stack_arg_size,
             outgoing_arg_size: 0,
             has_calls: false,
-            stackslots_offsets: PrimaryMap::new(),
-            stackslots_keys: SecondaryMap::new(),
             alloc_to_ss: FxHashMap::default(),
             frame_layout: None,
             reg_args: Vec::new(),
@@ -681,8 +659,16 @@ pub struct StackSlotData {
 }
 
 #[derive(Debug, Clone)]
+#[allow(
+    dead_code,
+    reason = "opaque stack-slot identity key reserved for future ABI tracking"
+)]
 pub struct StackSlotUniqueKey(NonZeroU64);
 
+#[allow(
+    dead_code,
+    reason = "constructors for the reserved stack-slot identity key"
+)]
 impl StackSlotUniqueKey {
     fn new(id: u64) -> Self {
         Self(NonZeroU64::new(id).unwrap())

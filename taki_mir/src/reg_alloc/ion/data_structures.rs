@@ -295,23 +295,6 @@ pub struct BundleProperties {
     pub fixed: bool,
 }
 
-/// Calculate the maximum `N` inline capacity for a `SmallVec<[T; N]>` we can
-/// have without bloating its size to be larger than a `Vec<T>`.
-const fn no_bloat_capacity<T>() -> usize {
-    // `Vec<T>` is three words: `(pointer, capacity, length)`.
-    //
-    // A `SmallVec<[T; N]>` replaces the first two members with the following:
-    //
-    //     union {
-    //         Inline([T; N]),
-    //         Heap(pointer, capacity),
-    //     }
-    //
-    // So if `size_of([T; N]) == size_of(pointer) + size_of(capacity)` then we
-    // get the maximum inline capacity without bloat.
-    core::mem::size_of::<usize>() * 2 / core::mem::size_of::<T>()
-}
-
 #[derive(Clone, Debug)]
 pub struct SpillSet {
     pub slot: SpillSlotIndex,
@@ -499,7 +482,6 @@ pub struct Ctx {
     // For debug output only: a list of textual annotations at every
     // ProgPoint to insert into the final allocated program listing.
     pub(crate) debug_annotations: FxHashMap<ProgPoint, Vec<String>>,
-    pub(crate) annotations_enabled: bool,
 
     // Cached allocation for `try_to_allocate_bundle_to_reg` to avoid allocating
     // a new HashSet on every call.
@@ -544,7 +526,6 @@ impl Default for Ctx {
             multi_fixed_reg_fixups: Vec::new(),
             allocated_bundle_count: 0,
             debug_annotations: FxHashMap::default(),
-            annotations_enabled: false,
             conflict_set: FxHashSet::default(),
             output: Output::default(),
             scratch_conflicts: Vec::new(),
@@ -724,11 +705,6 @@ impl PrioQueue {
     }
 
     #[inline(always)]
-    pub fn is_empty(self) -> bool {
-        self.heap.is_empty()
-    }
-
-    #[inline(always)]
     pub fn pop(&mut self) -> Option<(LiveBundleIndex, PReg)> {
         self.heap.pop().map(|entry| (entry.bundle, entry.hint))
     }
@@ -874,40 +850,6 @@ impl PosWithPrio {
     pub fn key(self) -> u64 {
         u64_key(self.pos.to_index(), self.prio)
     }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Stats {
-    pub livein_blocks: usize,
-    pub livein_iterations: usize,
-    pub initial_liverange_count: usize,
-    pub merged_bundle_count: usize,
-    pub process_bundle_count: usize,
-    pub process_bundle_reg_probes_fixed: usize,
-    pub process_bundle_reg_success_fixed: usize,
-    pub process_bundle_bounding_range_probe_start_any: usize,
-    pub process_bundle_bounding_range_probes_any: usize,
-    pub process_bundle_bounding_range_success_any: usize,
-    pub process_bundle_reg_probe_start_any: usize,
-    pub process_bundle_reg_probes_any: usize,
-    pub process_bundle_reg_success_any: usize,
-    pub evict_bundle_event: usize,
-    pub evict_bundle_count: usize,
-    pub splits: usize,
-    pub splits_clobbers: usize,
-    pub splits_hot: usize,
-    pub splits_conflicts: usize,
-    pub splits_defs: usize,
-    pub splits_all: usize,
-    pub final_liverange_count: usize,
-    pub final_bundle_count: usize,
-    pub spill_bundle_count: usize,
-    pub spill_bundle_reg_probes: usize,
-    pub spill_bundle_reg_success: usize,
-    pub blockparam_ins_count: usize,
-    pub blockparam_outs_count: usize,
-    pub halfmoves_count: usize,
-    pub edits_count: usize,
 }
 
 // Helper function for generating sorting keys. The order of arguments is from

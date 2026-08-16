@@ -78,11 +78,11 @@ macro_rules! define_index {
 
     ($ix:ident) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        #[cfg_attr(
-            feature = "enable-serde",
-            derive(::serde::Serialize, ::serde::Deserialize)
-        )]
         pub struct $ix(pub u32);
+        #[allow(
+            dead_code,
+            reason = "macro-generated helpers; not every index uses every helper"
+        )]
         impl $ix {
             #[inline(always)]
             pub fn new(i: usize) -> Self {
@@ -137,10 +137,6 @@ define_index!(Inst);
 define_index!(Block);
 
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(
-    feature = "enable-serde",
-    derive(::serde::Serialize, ::serde::Deserialize)
-)]
 pub struct InstRange(Inst, Inst);
 
 impl InstRange {
@@ -152,25 +148,30 @@ impl InstRange {
 
     #[inline(always)]
     pub fn first(self) -> Inst {
-        debug_assert!(self.len() > 0);
+        debug_assert!(!self.is_empty());
         self.0
     }
 
     #[inline(always)]
     pub fn last(self) -> Inst {
-        debug_assert!(self.len() > 0);
+        debug_assert!(!self.is_empty());
         self.1.prev()
     }
 
     #[inline(always)]
     pub fn rest(self) -> InstRange {
-        debug_assert!(self.len() > 0);
+        debug_assert!(!self.is_empty());
         InstRange::new(self.0.next(), self.1)
     }
 
     #[inline(always)]
     pub fn len(self) -> usize {
         self.1.index() - self.0.index()
+    }
+
+    #[inline(always)]
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
     }
 
     #[inline(always)]

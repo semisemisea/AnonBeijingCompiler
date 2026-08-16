@@ -54,11 +54,12 @@ impl RedundantMoveEliminator {
             .copied()
             .unwrap_or(RedundantMoveState::None);
 
-        if from == to && to_vreg.is_some() {
-            self.clear_alloc(to);
-            self.allocs
-                .insert(to, RedundantMoveState::Orig(to_vreg.unwrap()));
-            return RedundantMoveAction { elide: true };
+        if from == to {
+            if let Some(to_vreg) = to_vreg {
+                self.clear_alloc(to);
+                self.allocs.insert(to, RedundantMoveState::Orig(to_vreg));
+                return RedundantMoveAction { elide: true };
+            }
         }
 
         let src_vreg = match from_state {

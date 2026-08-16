@@ -262,10 +262,6 @@ impl<F: Function> Env<'_, F> {
         }
 
         impl BlockparamDest {
-            fn key(&self) -> u64 {
-                u64_key(self.to_block.raw_u32(), self.from_block.raw_u32())
-            }
-
             fn source(&self) -> BlockparamSourceKey {
                 BlockparamSourceKey::new(self.from_block, self.to_vreg)
             }
@@ -707,10 +703,8 @@ impl<F: Function> Env<'_, F> {
                 }
                 // The dedicated scratch registers may be clobbered by any
                 // instruction.
-                for reg in this.env.scratch_by_class {
-                    if let Some(reg) = reg {
-                        redundant_moves.clear_alloc(Allocation::reg(reg));
-                    }
+                for reg in this.env.scratch_by_class.into_iter().flatten() {
+                    redundant_moves.clear_alloc(Allocation::reg(reg));
                 }
             }
         }

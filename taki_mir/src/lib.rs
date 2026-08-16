@@ -6,7 +6,6 @@ use crate::{
     block_order::BlockLoweringOrder,
     emit::AsmWriter,
     lower::{LowerBackend, LowerContext},
-    reg_alloc::function::Function,
     stats::{CodegenStats, FunctionCodegenStats},
     vcode::MachInstEmit,
 };

@@ -5,7 +5,6 @@ use smallvec::{SmallVec, smallvec};
 use crate::abi::{ABIMachineSpec, ArgSlot, CalleeABI};
 use crate::block_order::{BlockLoweringOrder, LoweredBlock, MirBlockIndex};
 use crate::prelude::*;
-use crate::reg_alloc::function::Function;
 use crate::reg_alloc::reg::PReg;
 use crate::register::{Reg, VRegAllocator, Writable};
 use crate::types::{F32, I32};

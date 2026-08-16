@@ -101,6 +101,7 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
     }
 
     /// Current slot index (the next instruction's position).
+    #[cfg(test)]
     fn cur_slot(&self) -> usize {
         self.slots.len()
     }

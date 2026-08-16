@@ -1,3 +1,118 @@
+//! # SysY 前端 AST 下降：AST → RaanaIR
+//!
+//! 本文件承载 SysY 前端的**下降（lowering）**：把解析器（`sysy.lalrpop` 生成的
+//! `CompUnitsParser`）产出的 AST 一棵一棵翻译成 `raana_ir` 的 SSA 中间表示
+//! （`Program` / `Function` / `BasicBlock` / `Inst`），供优化管线与后端使用。
+//! 注意：**AST 节点的类型定义不在本文件**，而在 `items.rs`；这里只有下降逻辑——
+//! 33 个 `ToRaanaIR` 的 `impl` 块，外加 4 个私有辅助函数，共 37 个顶层项，
+//! 即"每个 AST 节点如何变成 RaanaIR"的全部答案。
+//!
+//! ## 文件分工（`frontend/` 三件套）
+//!
+//! | 文件 | 职责 |
+//! |------|------|
+//! | `items.rs` | AST 节点**类型定义**（`CompUnits` / `Stmt` / `Exp` 等，带 EBNF 文法注释）；初始化器形状计算（`explicit_init_vals` / `init_val_shape` / `is_empty_init`）、`FuncFParam::ty_global`（数组形参降指针）、`parse_float_const`（浮点字面量解析，用 `strtof`） |
+//! | `ast.rs`（本文件） | `ToRaanaIR` 的全部实现：AST → RaanaIR 的下降 |
+//! | `utils.rs` | 下降基础设施：`ToRaanaIR` trait 定义、`AstGenContext`（持有 `Program`、值栈、符号表栈、当前基本块、循环栈等）、`Symbol` 符号表条目、`coerce_local` / `truthy_local` / `zero_*` 等辅助、库函数声明（`decl_library_functions`） |
+//! | `frontend.rs` | 模块装配：`mod ast;`（私有）、`pub mod items;`、`pub mod utils;` |
+//!
+//! ## AST 节点分类（定义在 `items.rs`）
+//!
+//! 按 SysY 文法自顶向下分四类：
+//!
+//! - **顶层**：`CompUnits`（根）→ `CompUnit` = `FuncDef` 函数定义 | `Decl` 全局声明；
+//! - **声明**：`Decl` = `ConstDecl` | `VarDecl` → `ConstDef` / `VarDef`（含 `arr_dim`
+//!   数组维度，元素是 `ConstExp`）→ `ConstInitVal` / `InitVal`（`Normal` 单个表达式
+//!   | `Array` 嵌套花括号列表）、`ConstExp` 常量表达式（要求编译期可求值）；
+//! - **语句**：`Stmt` 枚举——`Block` 复合块、`AssignStmt` 赋值、`ReturnStmt` 返回、
+//!   `IfStmt` 条件、`WhileStmt` 循环、`Break` / `Continue`、`Single(Option<Exp>)`
+//!   表达式语句；
+//! - **表达式**：按优先级从低到高逐层包装的经典链（每个复合层都是
+//!   `Comp(Box<Self>, 操作数, 右操作数)` 右递归形态，与 EBNF 一一对应）：
+//!   `Exp` → `LOrExp`（`\|\|`）→ `LAndExp`（`&&`）→ `EqExp`（`==` / `!=`）→
+//!   `RelExp`（`<` / `>` / `<=` / `>=`）→ `AddExp`（`+` / `-`）→ `MulExp`
+//!   （`*` / `/` / `%`）→ `UnaryExp`（一元 `+` / `-` / `!`，以及 `FuncCall`
+//!   函数调用）→ `PrimaryExp`（括号表达式 | `LVal` 左值 | `Number` 字面量）；
+//! - **其他**：`FuncFParam` 形参（`b_type` + 可选数组维度）、`UnaryOp` 一元操作符、
+//!   `Number` = `Int(i32)` | `Float(f32)`；`FuncType` / `BType` 是 `raana_ir` 的
+//!   `Type` 的类型别名。
+//!
+//! ## 下降流程（AST → RaanaIR，5 步）
+//!
+//! 入口在 `main.rs::run`（`-S` / `--emit ir` 主流程）与 `abi_matrix.rs`（ABI 矩阵
+//! 工具）：lalrpop 解析源码得到 `CompUnits` 后，`AstGenContext::new()` 建上下文，
+//! 调用 `ast.convert(&mut ctx)`：
+//!
+//! 1. **根下降**（`CompUnits::convert`）：先把 13 个 SysY 运行时库函数
+//!   （`getint` / `putint` / `getarray` / `_sysy_starttime` 等）声明进**全局**
+//!   符号表（`decl_library_functions`），再逐个下降 `CompUnit`——函数定义走
+//!   `convert`，全局声明走 `global_convert`；
+//! 2. **函数下降**（`FuncDef::convert`）：`program.new_function` 注册函数 →
+//!   `insert_func` / `push_func` 入栈 → 建 entry 基本块 → `add_scope` 开新作用域 →
+//!   形参逐个 `alloc` + `store` 并 `insert_var` 绑定到符号表 → 递归下降函数体 →
+//!   `del_scope`；末尾补一条默认 `ret`（`void` 无操作数，`int`/`float` 补 0/0.0），
+//!   保证最后一个基本块有终结符；
+//! 3. **节点递归**：语句把指令插进当前基本块（`push_inst`）；表达式把结果 `Inst`
+//!   压进 `AstGenContext` 的**值栈**（`push_val` / `pop_val`）——二元/一元操作符
+//!   从栈顶弹操作数（先弹右操作数，再弹左操作数），算完把结果压回；
+//! 4. **控制流**：`IfStmt` / `WhileStmt` / 短路 `&&` `||` 用 builder 新建基本块、
+//!   以 `branch` / `jump` 连接（`set_curr_bb` 切换当前块，块间用 SSA 块参数传值）；
+//!   `break` / `continue` 从循环栈（`loop_stack`）取 entry / end 块直接 `jump`；
+//! 5. **全局项**（`global_convert`）：全局变量/常量在 `Program` 的全局 arena 里
+//!   `global_alloc`，初始值必须是编译期常量（`coerce_global`，否则 `unreachable`）；
+//!   全局数组初始值用 `zero_init` / `aggregate` 按维度逐层拼成 `GlobalAlloc` 的
+//!   初始值。
+//!
+//! 下降产物即 `ctx.program`（`raana_ir::ir::Program`），随后交给
+//! `PassesManager::run_passes` 做 IR 层优化。
+//!
+//! ## 关键机制与正确性要点
+//!
+//! - **作用域**：符号表是 `Vec<SymbolTable>` 栈（第 0 层即全局作用域）；
+//!   `add_scope` / `del_scope` 配对；`get_symbol` 从内向外查（内层同名遮蔽外层）；
+//!   同一作用域重复定义变量/常量/函数直接 panic；函数只允许注册在全局作用域
+//!   （`insert_func` 的 `debug_assert`）；
+//! - **左值语义**：符号表里变量绑定到 `alloc` 的**指针**，读变量是 `load`、写变量
+//!   是 `store`；数组下标逐维 `get_elem_ptr`（GEP）寻址；数组形参类型本身降为指针，
+//!   实参传数组时先 `get_elem_ptr([0, 0])` 降一级再传；
+//! - **类型检查**：赋值时编译期断言 rhs 类型与 lhs 解引用类型一致
+//!   （`Type::get_pointer(rhs_ty) == lhs_ptr_ty`）；`%` / `&&` / `\|\|` / 位运算等
+//!   int-only 操作符遇 float 操作数 panic（`binary_requires_int`）；声明要求标量基
+//!   类型（`is_scalar` 断言）；`Symbol::Constant` 不可赋值、不可取地址修改；
+//! - **常量折叠**：二元/一元运算在操作数是 `Integer` / `Float` 字面量时直接算出
+//!   结果（`eval_i32_binary` / `eval_f32_binary`，除零/模零 panic；整数运算走
+//!   wrapping 语义，溢出回绕）；短路逻辑在两侧都是常量时删掉临时基本块直接求值；
+//! - **死代码跳过**：`is_complete_bb` 检测当前块已以 `br` / `jump` / `ret` 终结；
+//!   终结后 `push_inst` 丢弃孤儿指令，各 `convert` 开头也据此短路——`return` 之后
+//!   的语句、`break` / `continue` 之后的语句天然不会生成代码；
+//! - **终结符不变量**：`set_curr_bb` 离开一个未终结的块时自动补默认 `ret`，与函数
+//!   末尾的显式 `ret` 一起保证**每个基本块都以终结符结尾**（IR 层硬性不变量）；
+//! - **循环约束**：`break` / `continue` 不在循环内（`curr_loop` 为 `None`）时
+//!   panic；`while` 循环展开为 entry（条件测试）/ body / end 三块，条件经
+//!   `truthy_local` 归一化成 i32 布尔后 `branch`；
+//! - **宏特判**：`starttime()` / `stoptime()` 调用被改写为 `_sysy_starttime(0)` /
+//!   `_sysy_stoptime(0)`（性能计时用，行号参数以 0 代替）。
+//!
+//! ## 触发与使用场景
+//!
+//! - `soyo_compiler/src/main.rs`（`run`）：`-S` 汇编 / `--emit ir` 的编译主流程；
+//! - `soyo_compiler/src/abi_matrix.rs`：ABI 矩阵测试工具（同样 parse + convert）。
+//!
+//! ## 验证
+//!
+//! - 本文件无独立测试：AST/下降的单元测试在 `items.rs` 的 `mod tests`（解析 +
+//!   下降冒烟用例）与 `abi_matrix.rs` 的 `mod tests`；
+//! - IR 层回归：`cargo test -p raana_ir`；编译正确性靠 `make test`（Docker
+//!   harness，functional / h_functional / perf 语料，默认 `-O0`，优化验证加
+//!   `ARGS="-O 2"`）；改动本文件后至少跑 `cargo check -p soyo_compiler`。
+//!
+//! ## 相关背景
+//!
+//! `frontend/` 在 git commit 5921037（"\[Backend\] Migrate s2r code"）之后经 AI 大量
+//! 重构：本文件由 1498 行（33 个 pub 项）增至 1586 行（37 个 pub 项）。重构新增了
+//! 全局项下降（`global_convert` 体系）、短路逻辑的编译期折叠、`is_complete_bb`
+//! 死代码跳过与自动补 `ret` 等机制——读代码时以本模块文档为索引，逐 impl 对照
+//! `items.rs` 的节点定义与 `utils.rs` 的上下文辅助即可。
 use super::items;
 use crate::frontend::utils::{AstGenContext, Ident, Symbol, ToRaanaIR};
 use raana_ir::ir::{arena::Arena, builder_trait::*, *};

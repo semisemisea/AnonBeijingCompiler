@@ -196,7 +196,9 @@ impl TailRecursiveInline {
                 InstKind::TailCall(tc) => tc.args().to_vec(),
                 _ => unreachable!("cloner returned a non-tail-call instruction"),
             };
-            context.replace_inst_with(tail).jump(cloned.entry, tail_args);
+            context
+                .replace_inst_with(tail)
+                .jump(cloned.entry, tail_args);
         }
 
         if !context.inst_data(call_inst).ty().is_unit() {
@@ -262,9 +264,7 @@ mod tests {
 
             let half = data.new_local_inst().binary(BinaryOp::Div, n, two);
             let dep_plus = data.new_local_inst().binary(BinaryOp::Add, dep, one);
-            let tail = data
-                .new_local_inst()
-                .tail_call(fun, vec![half, dep_plus]);
+            let tail = data.new_local_inst().tail_call(fun, vec![half, dep_plus]);
             data.layout_mut().insert_inst(even_bb, tail);
         }
         fun
@@ -319,7 +319,10 @@ mod tests {
                 matches!(data.inst_data(inst).kind(), InstKind::Jump(j) if j.target() == header)
             })
         });
-        assert!(has_back_edge, "expected a loop back-edge jump to the header");
+        assert!(
+            has_back_edge,
+            "expected a loop back-edge jump to the header"
+        );
     }
 
     #[test]

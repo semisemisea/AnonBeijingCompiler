@@ -3,19 +3,19 @@
 use std::collections::HashSet;
 
 use raana_ir::ir::{
-    arena::Arena,
-    inst_kind::{MemZero, MemZeroLen},
     Binary, BinaryOp, Call, Cast, Fma, GetElemPtr, InstKind, Load, Return, Select, Store, TailCall,
     Type as HirType, TypeKind, VectorExtractElement, VectorInsertElement, VectorReduce,
     VectorReduceOp, VectorSplat,
+    arena::Arena,
+    inst_kind::{MemZero, MemZeroLen},
 };
 use taki_mir::{
     abi::{ABIMachineSpec, ArgSlot, CallArgPair, CallRetPair, RetPair, StackAMode},
     block_order::{LoweredBlock, MirBlockIndex},
-    div_magic::{signed_magic_i32, MagicCorrection},
+    div_magic::{MagicCorrection, signed_magic_i32},
     lower::{
-        analyze_gep, fold_gep_constant_offset, sink_gep_into_address, LowerBackend, LowerContext,
-        LoweredOutput,
+        LowerBackend, LowerContext, LoweredOutput, analyze_gep, fold_gep_constant_offset,
+        sink_gep_into_address,
     },
     prelude::{ArenaContext, HirFunction, HirFunctionData, HirInst},
     reg_alloc::reg::PReg,
@@ -26,9 +26,9 @@ use taki_mir::{
 use crate::{
     abi::AArch64Abi,
     instructions::{
-        invert_cond, AMode, AluOp, CCmpStep, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift,
-        MInst, MemoryType, SelectCmp, SelectValue, ShiftOp, VecArithOp, VecBitOp, VecCmpOp,
-        VecCvtOp, VecMinMaxOp, VecShape,
+        AMode, AluOp, CCmpStep, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift, MInst,
+        MemoryType, SelectCmp, SelectValue, ShiftOp, VecArithOp, VecBitOp, VecCmpOp, VecCvtOp,
+        VecMinMaxOp, VecShape, invert_cond,
     },
     labels::Label,
     regs::{self, OperandSize, RegOrZr},

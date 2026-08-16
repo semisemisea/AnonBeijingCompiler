@@ -361,9 +361,12 @@ impl RangeAnalysis {
             definitions.insert(inst, definition);
         }
 
-        let modmul_builtin = arena.program.function_layout().iter().copied().find(|&f| {
-            arena.program.func_data(f).name() == return_summary::MODMUL_BUILTIN
-        });
+        let modmul_builtin = arena
+            .program
+            .function_layout()
+            .iter()
+            .copied()
+            .find(|&f| arena.program.func_data(f).name() == return_summary::MODMUL_BUILTIN);
         let loop_headers = loops.loops().iter().map(Loop::header).collect();
         let mut analysis = Self {
             definitions,
@@ -859,7 +862,9 @@ impl RangeAnalysis {
             Some(ValueDef::BlockParameter) => {
                 self.ranges.get(&value).copied().unwrap_or(IntRange::full())
             }
-            Some(ValueDef::Call { callee, args }) => self.call_range(*callee, args, facts, visiting, depth),
+            Some(ValueDef::Call { callee, args }) => {
+                self.call_range(*callee, args, facts, visiting, depth)
+            }
             Some(ValueDef::Undef) | Some(ValueDef::Unknown) | None => IntRange::full(),
         }
     }

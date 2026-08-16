@@ -14,8 +14,7 @@ use crate::opt::{
         gep::gep_index_stride,
         logical_edge::{
             LogicalEdge, LogicalEdgeRewriter, forwarded_block_params, incoming_edges,
-            resolve_forwarded_params,
-            outgoing_edges,
+            outgoing_edges, resolve_forwarded_params,
         },
         pointer_strength_reduction_cost::estimate_aarch64_pointer_strength_reduction,
         preheader::{EnsurePreheader, ensure_preheader},
@@ -148,8 +147,7 @@ impl PointerStrengthReduction {
 
         let mut best = None;
         let header_params = data.bb_data(looop.header()).params().to_vec();
-        let forwarded_params =
-            resolve_forwarded_params(&forwarded_block_params(data, cfg));
+        let forwarded_params = resolve_forwarded_params(&forwarded_block_params(data, cfg));
         // A header block parameter that every backedge passes through unchanged
         // is loop-invariant: its value on the first entry equals its value in
         // every iteration, so the preheader edge argument can substitute for it
@@ -824,9 +822,7 @@ impl PointerStrengthReduction {
             // can only happen through a base-edge cycle that never reaches a
             // memory operation; reject it conservatively (this also bounds
             // the walk, alongside the depth cap).
-            if depth >= PointerStrengthReduction::MAX_TRANSITIVE_GEP_DEPTH
-                || !visited.insert(gep)
-            {
+            if depth >= PointerStrengthReduction::MAX_TRANSITIVE_GEP_DEPTH || !visited.insert(gep) {
                 return false;
             }
             let users = data.inst_data(gep).used_by();
@@ -3095,12 +3091,14 @@ mod tests {
             } else {
                 data.new_local_inst().get_elem_ptr(current, vec![zero])
             };
-            data.layout_mut().insert_before_terminator(fixture.header, gep);
+            data.layout_mut()
+                .insert_before_terminator(fixture.header, gep);
             outer.get_or_insert(gep);
             current = gep;
         }
         let load = data.new_local_inst().load(current);
-        data.layout_mut().insert_before_terminator(fixture.header, load);
+        data.layout_mut()
+            .insert_before_terminator(fixture.header, load);
         let (_cfg, _dom_tree, loops) = LoopAnalysis::new(data);
         (
             program,
@@ -3149,12 +3147,18 @@ mod tests {
             let outer = data.new_local_inst().get_elem_ptr(base, vec![zero]);
             let mem_zero = data.new_local_inst().mem_zero(outer, 4);
             for inst in [outer, mem_zero] {
-                data.layout_mut().insert_before_terminator(fixture.header, inst);
+                data.layout_mut()
+                    .insert_before_terminator(fixture.header, inst);
             }
             outer
         };
         let (_cfg, _dom_tree, loops) = LoopAnalysis::new(program.func_data(fixture.function));
-        assert!(memory_users_ok(&mut program, fixture.function, &loops, outer));
+        assert!(memory_users_ok(
+            &mut program,
+            fixture.function,
+            &loops,
+            outer
+        ));
     }
 
     #[test]
@@ -3172,13 +3176,24 @@ mod tests {
             let load = data.new_local_inst().load(inner);
             let store_as_data = data.new_local_inst().store(inner, base);
             for inst in [outer, inner, load, store_as_data] {
-                data.layout_mut().insert_before_terminator(fixture.header, inst);
+                data.layout_mut()
+                    .insert_before_terminator(fixture.header, inst);
             }
             (outer, inner)
         };
         let (_cfg, _dom_tree, loops) = LoopAnalysis::new(program.func_data(fixture.function));
-        assert!(!memory_users_ok(&mut program, fixture.function, &loops, outer));
-        assert!(!memory_users_ok(&mut program, fixture.function, &loops, inner));
+        assert!(!memory_users_ok(
+            &mut program,
+            fixture.function,
+            &loops,
+            outer
+        ));
+        assert!(!memory_users_ok(
+            &mut program,
+            fixture.function,
+            &loops,
+            inner
+        ));
 
         // The outer GEP itself stored as data is also rejected.
         let (mut program, fixture) = build_loop(BinaryOp::Lt, true);
@@ -3192,12 +3207,18 @@ mod tests {
             let load = data.new_local_inst().load(inner);
             let store_as_data = data.new_local_inst().store(outer, base);
             for inst in [outer, inner, load, store_as_data] {
-                data.layout_mut().insert_before_terminator(fixture.header, inst);
+                data.layout_mut()
+                    .insert_before_terminator(fixture.header, inst);
             }
             outer
         };
         let (_cfg, _dom_tree, loops) = LoopAnalysis::new(program.func_data(fixture.function));
-        assert!(!memory_users_ok(&mut program, fixture.function, &loops, outer));
+        assert!(!memory_users_ok(
+            &mut program,
+            fixture.function,
+            &loops,
+            outer
+        ));
     }
 
     #[test]
@@ -3223,8 +3244,10 @@ mod tests {
             let zero = data.new_local_inst().integer(0);
             let a = data.new_local_inst().get_elem_ptr(base, vec![iv]);
             let b = data.new_local_inst().get_elem_ptr(a, vec![zero]);
-            data.layout_mut().insert_before_terminator(fixture.header, a);
-            data.layout_mut().insert_before_terminator(fixture.header, b);
+            data.layout_mut()
+                .insert_before_terminator(fixture.header, a);
+            data.layout_mut()
+                .insert_before_terminator(fixture.header, b);
             // Rewire `a`'s base to `b`, forming the use cycle a -> b -> a.
             data.replace_inst_with(a).get_elem_ptr(b, vec![iv]);
             (a, b)

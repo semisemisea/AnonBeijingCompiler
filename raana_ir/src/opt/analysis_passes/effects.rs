@@ -280,20 +280,20 @@ impl EffectAnalysis {
         };
         fx.writes.iter().any(|w| match w {
             EffectObject::Global(g) => targets.contains(&AbstractObject::Global(*g)),
-            EffectObject::Alloc(cf, a) => targets
-                .contains(&AbstractObject::Alloc(*cf, *a)),
-            EffectObject::Param(j) => self
-                .points_to
-                .get(&(callee, *j))
-                .into_iter()
-                .flatten()
-                .any(|o| match o {
-                    AbstractObject::Global(g) => targets.contains(&AbstractObject::Global(*g)),
-                    AbstractObject::Alloc(cf, a) => {
-                        targets.contains(&AbstractObject::Alloc(*cf, *a))
-                    }
-                    AbstractObject::Unknown => true,
-                }),
+            EffectObject::Alloc(cf, a) => targets.contains(&AbstractObject::Alloc(*cf, *a)),
+            EffectObject::Param(j) => {
+                self.points_to
+                    .get(&(callee, *j))
+                    .into_iter()
+                    .flatten()
+                    .any(|o| match o {
+                        AbstractObject::Global(g) => targets.contains(&AbstractObject::Global(*g)),
+                        AbstractObject::Alloc(cf, a) => {
+                            targets.contains(&AbstractObject::Alloc(*cf, *a))
+                        }
+                        AbstractObject::Unknown => true,
+                    })
+            }
         })
     }
 
@@ -348,18 +348,19 @@ impl EffectAnalysis {
         fx.reads.iter().any(|r| match r {
             EffectObject::Global(g) => targets.contains(&AbstractObject::Global(*g)),
             EffectObject::Alloc(cf, a) => targets.contains(&AbstractObject::Alloc(*cf, *a)),
-            EffectObject::Param(j) => self
-                .points_to
-                .get(&(callee, *j))
-                .into_iter()
-                .flatten()
-                .any(|o| match o {
-                    AbstractObject::Global(g) => targets.contains(&AbstractObject::Global(*g)),
-                    AbstractObject::Alloc(cf, a) => {
-                        targets.contains(&AbstractObject::Alloc(*cf, *a))
-                    }
-                    AbstractObject::Unknown => true,
-                }),
+            EffectObject::Param(j) => {
+                self.points_to
+                    .get(&(callee, *j))
+                    .into_iter()
+                    .flatten()
+                    .any(|o| match o {
+                        AbstractObject::Global(g) => targets.contains(&AbstractObject::Global(*g)),
+                        AbstractObject::Alloc(cf, a) => {
+                            targets.contains(&AbstractObject::Alloc(*cf, *a))
+                        }
+                        AbstractObject::Unknown => true,
+                    })
+            }
         })
     }
 
@@ -615,7 +616,14 @@ fn direct_effects(program: &Program, func: Function) -> FunctionEffects {
         for &inst in bb_layout.insts() {
             match data.inst_data(inst).kind() {
                 InstKind::Load(load) => {
-                    add_address_effect(&mut fx.reads, &mut fx.reads_unknown, &env, &ctx, func, load.src());
+                    add_address_effect(
+                        &mut fx.reads,
+                        &mut fx.reads_unknown,
+                        &env,
+                        &ctx,
+                        func,
+                        load.src(),
+                    );
                 }
                 InstKind::Store(store) => {
                     add_address_effect(
@@ -687,7 +695,10 @@ fn classify_actual(
 mod tests {
     use super::*;
     use crate::{
-        ir::{Program, Type, builder_trait::{GlobalInstBuilder, LocalInstBuilder, ScalarInstBuilder}},
+        ir::{
+            Program, Type,
+            builder_trait::{GlobalInstBuilder, LocalInstBuilder, ScalarInstBuilder},
+        },
         opt::pass::{ArenaContext, ArenaContextMut},
     };
 
@@ -722,7 +733,10 @@ mod tests {
         let mut program = Program::new();
         let global = new_global(&mut program);
         let f = program.new_function(Type::get_unit(), "f".into(), vec![]);
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(f) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(f),
+        };
         let entry = data.add_entry_block();
         let one = data.new_local_value().integer(1);
         let store = data.new_local_value().store(one, global);
@@ -742,7 +756,10 @@ mod tests {
         let mut program = Program::new();
         let global = new_global(&mut program);
         let f = program.new_function(Type::get_unit(), "f".into(), vec![]);
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(f) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(f),
+        };
         let entry = data.add_entry_block();
         let load = data.new_local_value().load(global);
         data.layout_mut().insert_inst(entry, load);
@@ -761,7 +778,10 @@ mod tests {
         let mut program = Program::new();
         let global = new_global(&mut program);
         let writer = program.new_function(Type::get_unit(), "writer".into(), vec![]);
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(writer) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(writer),
+        };
         let entry = data.add_entry_block();
         let one = data.new_local_value().integer(1);
         let store = data.new_local_value().store(one, global);
@@ -770,7 +790,10 @@ mod tests {
         data.layout_mut().insert_inst(entry, ret);
 
         let caller = new_body(&mut program, "caller", vec![]);
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(caller) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(caller),
+        };
         let entry = data.layout().entry_bb().unwrap().bb();
         let call = data.new_local_value().call(writer, vec![]);
         data.layout_mut().insert_inst(entry, call);
@@ -792,7 +815,10 @@ mod tests {
             "g".into(),
             vec![Type::get_i32().reference()],
         );
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(g) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(g),
+        };
         let entry = data.add_entry_block();
         let param = data.params()[0];
         let one = data.new_local_value().integer(1);
@@ -802,7 +828,10 @@ mod tests {
         data.layout_mut().insert_inst(entry, ret);
 
         let f = new_body(&mut program, "f", vec![]);
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(f) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(f),
+        };
         let entry = data.layout().entry_bb().unwrap().bb();
         let call = data.new_local_value().call(g, vec![global]);
         data.layout_mut().insert_inst(entry, call);
@@ -818,7 +847,10 @@ mod tests {
         let mut program = Program::new();
         let getint = program.new_function(Type::get_i32(), "getint".into(), vec![]);
         let f = new_body(&mut program, "f", vec![]);
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(f) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(f),
+        };
         let entry = data.layout().entry_bb().unwrap().bb();
         let call = data.new_local_value().call(getint, vec![]);
         data.layout_mut().insert_inst(entry, call);
@@ -839,7 +871,10 @@ mod tests {
             "f".into(),
             vec![Type::get_i32().reference()],
         );
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(f) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(f),
+        };
         let entry = data.add_entry_block();
         let param = data.params()[0];
         let one = data.new_local_value().integer(1);
@@ -866,13 +901,19 @@ mod tests {
             "f".into(),
             vec![Type::get_i32().reference()],
         );
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(f) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(f),
+        };
         let entry = data.add_entry_block();
         let ret = data.new_local_value().ret(None);
         data.layout_mut().insert_inst(entry, ret);
         // main passes global_a to f.
         let main = new_body(&mut program, "main", vec![]);
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(main) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(main),
+        };
         let entry = data.layout().entry_bb().unwrap().bb();
         let call = data.new_local_value().call(f, vec![global_a]);
         data.layout_mut().insert_inst(entry, call);
@@ -887,11 +928,12 @@ mod tests {
         };
         let param = program.func_data(f).params()[0];
         // param vs global_a: MayAlias (a may be passed to it)
-        assert!(analysis
-            .alias(&ctx, f, param, global_a)
-            .may_alias());
+        assert!(analysis.alias(&ctx, f, param, global_a).may_alias());
         // param vs global_b: provably NoAlias
-        assert_eq!(analysis.alias(&ctx, f, param, global_b), AliasResult::NoAlias);
+        assert_eq!(
+            analysis.alias(&ctx, f, param, global_b),
+            AliasResult::NoAlias
+        );
     }
 
     #[test]
@@ -904,13 +946,19 @@ mod tests {
             "f".into(),
             vec![Type::get_i32().reference(), Type::get_i32().reference()],
         );
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(f) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(f),
+        };
         let entry = data.add_entry_block();
         let ret = data.new_local_value().ret(None);
         data.layout_mut().insert_inst(entry, ret);
 
         let main = new_body(&mut program, "main", vec![]);
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(main) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(main),
+        };
         let entry = data.layout().entry_bb().unwrap().bb();
         // Distinct globals: params can never alias.
         let call = data.new_local_value().call(f, vec![global_a, global_b]);
@@ -937,13 +985,19 @@ mod tests {
             "f".into(),
             vec![Type::get_i32().reference(), Type::get_i32().reference()],
         );
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(f) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(f),
+        };
         let entry = data.add_entry_block();
         let ret = data.new_local_value().ret(None);
         data.layout_mut().insert_inst(entry, ret);
 
         let main = new_body(&mut program, "main", vec![]);
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(main) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(main),
+        };
         let entry = data.layout().entry_bb().unwrap().bb();
         let call = data.new_local_value().call(f, vec![global_a, global_a]);
         data.layout_mut().insert_inst(entry, call);
@@ -969,9 +1023,14 @@ mod tests {
             vec![Type::get_i32().reference()],
         );
         let f = program.new_function(Type::get_unit(), "f".into(), vec![]);
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(f) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(f),
+        };
         let entry = data.add_entry_block();
-        let alloc = data.new_local_value().alloc(Type::get_array(Type::get_i32(), 4));
+        let alloc = data
+            .new_local_value()
+            .alloc(Type::get_array(Type::get_i32(), 4));
         data.layout_mut().insert_inst(entry, alloc);
         let call = data.new_local_value().call(getarray, vec![alloc]);
         data.layout_mut().insert_inst(entry, call);
@@ -994,7 +1053,10 @@ mod tests {
             "f".into(),
             vec![Type::get_i32().reference()],
         );
-        let mut data = ArenaContextMut { program: &mut program, curr_func: Some(f) };
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(f),
+        };
         let entry = data.add_entry_block();
         let alloc = data.new_local_value().alloc(Type::get_i32());
         data.layout_mut().insert_inst(entry, alloc);

@@ -41,11 +41,7 @@ impl Pass for DeadCodeElimination {
                 program,
                 curr_func: Some(func),
             };
-            changed |= DeadCodeElimination::run_on_func(
-                self,
-                &mut arena_context,
-                &removable_calls,
-            );
+            changed |= DeadCodeElimination::run_on_func(self, &mut arena_context, &removable_calls);
         }
         changed
     }
@@ -331,12 +327,13 @@ mod tests {
 
         assert!(!DeadCodeElimination.run(&mut program));
         let data = program.func_data(caller);
-        assert!(data
-            .layout()
-            .basicblock(entry)
-            .insts()
-            .iter()
-            .any(|&inst| inst == call));
+        assert!(
+            data.layout()
+                .basicblock(entry)
+                .insts()
+                .iter()
+                .any(|&inst| inst == call)
+        );
     }
 
     #[test]
@@ -369,12 +366,13 @@ mod tests {
 
         assert!(!DeadCodeElimination.run(&mut program));
         let data = program.func_data(caller);
-        assert!(data
-            .layout()
-            .basicblock(entry)
-            .insts()
-            .iter()
-            .any(|&inst| inst == call));
+        assert!(
+            data.layout()
+                .basicblock(entry)
+                .insts()
+                .iter()
+                .any(|&inst| inst == call)
+        );
     }
 
     #[test]
@@ -404,12 +402,13 @@ mod tests {
 
         assert!(!DeadCodeElimination.run(&mut program));
         let data = program.func_data(caller);
-        assert!(data
-            .layout()
-            .basicblock(entry)
-            .insts()
-            .iter()
-            .any(|&inst| inst == call));
+        assert!(
+            data.layout()
+                .basicblock(entry)
+                .insts()
+                .iter()
+                .any(|&inst| inst == call)
+        );
     }
 
     #[test]
@@ -683,40 +682,31 @@ mod dead_phi_tests {
         // A block whose *trailing* parameters are dead: the jump arguments
         // must drop the same positions, keeping earlier args aligned.
         let mut program = Program::new();
-        let function = program.new_function(
-            Type::get_unit(),
-            "dead_tail".into(),
-            vec![Type::get_i32()],
-        );
+        let function =
+            program.new_function(Type::get_unit(), "dead_tail".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
-        let merge = data
-            .new_basic_block()
-            .basic_block(
-                "merge".into(),
-                vec![
-                    Type::get_i32(),
-                    Type::get_i32(),
-                    Type::get_i32(),
-                    Type::get_i32(),
-                    Type::get_i32(),
-                    Type::get_i32(),
-                    Type::get_i32(),
-                    Type::get_i32(),
-                    Type::get_i32(),
-                ],
-                );
+        let merge = data.new_basic_block().basic_block(
+            "merge".into(),
+            vec![
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_i32(),
+            ],
+        );
         data.layout_mut().push_bb_back(merge);
         let cond = data.params()[0];
         let zero = data.new_local_inst().integer(0);
         let one = data.new_local_inst().integer(1);
-        let branch = data.new_local_inst().branch(
-            cond,
-            merge,
-            vec![one; 9],
-            merge,
-            vec![zero; 9],
-        );
+        let branch = data
+            .new_local_inst()
+            .branch(cond, merge, vec![one; 9], merge, vec![zero; 9]);
         data.layout_mut().insert_inst(entry, branch);
         // Only params 7 and 8 are unused; use the others so only the tail
         // two get removed.
@@ -754,12 +744,7 @@ mod dead_phi_tests {
         let b = program.new_function(Type::get_unit(), "b".into(), vec![]);
         let dead = program.new_function(Type::get_unit(), "dead".into(), vec![]);
 
-        for (func, calls) in [
-            (main, vec![a]),
-            (a, vec![b]),
-            (b, vec![]),
-            (dead, vec![]),
-        ] {
+        for (func, calls) in [(main, vec![a]), (a, vec![b]), (b, vec![]), (dead, vec![])] {
             let mut data = ArenaContextMut {
                 program: &mut program,
                 curr_func: Some(func),
@@ -854,7 +839,6 @@ mod dead_phi_tests {
         assert!(layout.contains(&main));
         assert!(layout.contains(&unused_decl));
     }
-
 }
 
 /// Remove functions that are unreachable from `main` through the call graph
@@ -888,7 +872,9 @@ impl Pass for DeadFunctionElimination {
             .function_layout()
             .iter()
             .copied()
-            .filter(|&func| !reachable.contains(&func) && !program.func_data(func).layout().is_decl())
+            .filter(|&func| {
+                !reachable.contains(&func) && !program.func_data(func).layout().is_decl()
+            })
             .collect::<Vec<_>>();
         if dead.is_empty() {
             return false;

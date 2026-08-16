@@ -306,9 +306,7 @@ impl LICM {
                 return true;
             }
             match data.layout().parent_bb(value) {
-                Some(block) => {
-                    !looop.contains(block) && dom_tree.dominates(block, looop.header())
-                }
+                Some(block) => !looop.contains(block) && dom_tree.dominates(block, looop.header()),
                 None => parameter_blocks.get(&value).is_some_and(|&block| {
                     !looop.contains(block) && dom_tree.dominates(block, looop.header())
                 }),
@@ -1486,9 +1484,7 @@ mod tests {
                 curr_func: Some(function),
             };
             let entry = data.add_entry_block();
-            let header = data
-                .new_basic_block()
-                .basic_block("header".into(), vec![]);
+            let header = data.new_basic_block().basic_block("header".into(), vec![]);
             let body = data.new_basic_block().basic_block("body".into(), vec![]);
             let forward1 = data
                 .new_basic_block()
@@ -1952,9 +1948,7 @@ mod tests {
 
         let forwarded = data.bb_data(forward).params()[0];
         let two = data.new_local_inst().integer(2);
-        let doubled = data
-            .new_local_inst()
-            .binary(BinaryOp::Mul, forwarded, two);
+        let doubled = data.new_local_inst().binary(BinaryOp::Mul, forwarded, two);
         let backedge = data.new_local_inst().jump(header, vec![header_param]);
         for inst in [two, doubled, backedge] {
             data.layout_mut().insert_inst(forward, inst);
@@ -2001,9 +1995,9 @@ mod tests {
 
         let seven = data.new_local_inst().integer(7);
         let condition = data.new_local_inst().integer(1);
-        let entry_branch = data
-            .new_local_inst()
-            .branch(condition, preheader, vec![seven], side, vec![]);
+        let entry_branch =
+            data.new_local_inst()
+                .branch(condition, preheader, vec![seven], side, vec![]);
         data.layout_mut().insert_inst(entry, entry_branch);
         let side_jump = data.new_local_inst().jump(exit, vec![]);
         data.layout_mut().insert_inst(side, side_jump);
@@ -2023,9 +2017,7 @@ mod tests {
 
         let forwarded = data.bb_data(forward).params()[0];
         let two = data.new_local_inst().integer(2);
-        let doubled = data
-            .new_local_inst()
-            .binary(BinaryOp::Mul, forwarded, two);
+        let doubled = data.new_local_inst().binary(BinaryOp::Mul, forwarded, two);
         let backedge = data.new_local_inst().jump(header, vec![header_param]);
         for inst in [two, doubled, backedge] {
             data.layout_mut().insert_inst(forward, inst);
@@ -2088,9 +2080,7 @@ mod tests {
 
         let forwarded = data.bb_data(forward).params()[0];
         let two = data.new_local_inst().integer(2);
-        let doubled = data
-            .new_local_inst()
-            .binary(BinaryOp::Mul, forwarded, two);
+        let doubled = data.new_local_inst().binary(BinaryOp::Mul, forwarded, two);
         let backedge = data.new_local_inst().jump(header, vec![header_param]);
         for inst in [two, doubled, backedge] {
             data.layout_mut().insert_inst(forward, inst);
@@ -2147,9 +2137,7 @@ mod tests {
 
         let forwarded = data.bb_data(forward).params()[0];
         let two = data.new_local_inst().integer(2);
-        let doubled = data
-            .new_local_inst()
-            .binary(BinaryOp::Mul, forwarded, two);
+        let doubled = data.new_local_inst().binary(BinaryOp::Mul, forwarded, two);
         let backedge = data.new_local_inst().jump(header, vec![step]);
         for inst in [two, doubled, backedge] {
             data.layout_mut().insert_inst(forward, inst);

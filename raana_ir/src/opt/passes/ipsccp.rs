@@ -163,9 +163,7 @@ impl MemState {
     fn cell_fold(&self, key: CellKey) -> Lattice {
         match self.cells.get(&key) {
             None => Lattice::Top,
-            Some(writers) => writers
-                .values()
-                .fold(Lattice::Top, |acc, &v| acc.merge(v)),
+            Some(writers) => writers.values().fold(Lattice::Top, |acc, &v| acc.merge(v)),
         }
     }
 
@@ -185,14 +183,11 @@ impl MemState {
             return cell;
         }
         let root = key.root();
-        let covered = self
-            .zero
-            .get(&root)
-            .is_some_and(|ranges| {
-                ranges
-                    .iter()
-                    .any(|&(from, to)| key.offset() >= from && key.offset() < to)
-            });
+        let covered = self.zero.get(&root).is_some_and(|ranges| {
+            ranges
+                .iter()
+                .any(|&(from, to)| key.offset() >= from && key.offset() < to)
+        });
         if covered {
             Lattice::Constant(0)
         } else {
@@ -213,16 +208,12 @@ impl MemState {
         let root = key.root();
         self.all_roots.insert(root);
         let writers = self.cells.entry(key).or_default();
-        let before = writers
-            .values()
-            .fold(Lattice::Top, |acc, &v| acc.merge(v));
+        let before = writers.values().fold(Lattice::Top, |acc, &v| acc.merge(v));
         if writers.is_empty() {
             self.root_cells.entry(root).or_default().push(key);
         }
         writers.insert(writer, contribution);
-        let after = writers
-            .values()
-            .fold(Lattice::Top, |acc, &v| acc.merge(v));
+        let after = writers.values().fold(Lattice::Top, |acc, &v| acc.merge(v));
         before != after
     }
 
@@ -666,8 +657,8 @@ impl Pass for IPSCCP {
                                 }
                             }
                             None => {
-                                let roots = state
-                                    .possible_targets(&analysis, func, store.dest(), &ctx);
+                                let roots =
+                                    state.possible_targets(&analysis, func, store.dest(), &ctx);
                                 for root in roots.unwrap_or_default() {
                                     if state.clear(root, true) {
                                         if let Some(loaders) = state.root_loaders.get(&root) {
@@ -707,8 +698,8 @@ impl Pass for IPSCCP {
                                 }
                             }
                             (None, _) => {
-                                let roots = state
-                                    .possible_targets(&analysis, func, mem_zero.dest(), &ctx);
+                                let roots =
+                                    state.possible_targets(&analysis, func, mem_zero.dest(), &ctx);
                                 for root in roots.unwrap_or_default() {
                                     if state.clear(root, true) {
                                         if let Some(loaders) = state.root_loaders.get(&root) {
@@ -760,13 +751,7 @@ impl Pass for IPSCCP {
                         }
                         // The tail callee may write memory; invalidate the
                         // cells it can reach.
-                        invalidate_call(
-                            &analysis,
-                            &mut state,
-                            callee,
-                            func,
-                            &mut mem_reschedule,
-                        );
+                        invalidate_call(&analysis, &mut state, callee, func, &mut mem_reschedule);
                     }
                     InstKind::Call(call) => {
                         let callee = call.callee();
@@ -785,13 +770,7 @@ impl Pass for IPSCCP {
                         }
                         // The callee may write memory; invalidate the cells
                         // it can reach (unknown writers clear everything).
-                        invalidate_call(
-                            &analysis,
-                            &mut state,
-                            callee,
-                            func,
-                            &mut mem_reschedule,
-                        );
+                        invalidate_call(&analysis, &mut state, callee, func, &mut mem_reschedule);
                     }
                     InstKind::Return(ret) => {
                         if let Some(ret_val) = ret.value() {
@@ -1033,9 +1012,7 @@ mod tests {
     use crate::{
         ir::{
             BinaryOp,
-            builder::{
-                BasicBlockBuilder, GlobalInstBuilder, LocalInstBuilder, ScalarInstBuilder,
-            },
+            builder::{BasicBlockBuilder, GlobalInstBuilder, LocalInstBuilder, ScalarInstBuilder},
         },
         llvm::LlvmWriter,
         opt::pass::ArenaContextMut,
@@ -1538,9 +1515,9 @@ mod tests {
             data.layout_mut().insert_inst(entry, store_one);
             let cond = data.new_local_value().load(gep);
             data.layout_mut().insert_inst(entry, cond);
-            let branch = data
-                .new_local_value()
-                .branch(cond, then_block, vec![], else_block, vec![]);
+            let branch =
+                data.new_local_value()
+                    .branch(cond, then_block, vec![], else_block, vec![]);
             data.layout_mut().insert_inst(entry, branch);
 
             let two = data.new_local_value().integer(2);

@@ -181,13 +181,7 @@ impl<'a> ValueNumbering<'a> {
                         true,
                     )
                 } else {
-                    (
-                        ValueKey::Identity {
-                            ty,
-                            value,
-                        },
-                        false,
-                    )
+                    (ValueKey::Identity { ty, value }, false)
                 }
             }
             InstKind::Load(..)
@@ -442,17 +436,15 @@ impl Pass for GlobalInstNumbering {
                         // read the stored location.
                         let func = data.curr_func.unwrap();
                         let targets = analysis.targets_of(data, func, store.dest());
-                        call_leaders.invalidate_matching(|c| {
-                            analysis.call_may_read(c, targets.as_ref())
-                        });
+                        call_leaders
+                            .invalidate_matching(|c| analysis.call_may_read(c, targets.as_ref()));
                     }
                     InstKind::MemZero(mem_zero) => {
                         load_leaders.record_store();
                         let func = data.curr_func.unwrap();
                         let targets = analysis.targets_of(data, func, mem_zero.dest());
-                        call_leaders.invalidate_matching(|c| {
-                            analysis.call_may_read(c, targets.as_ref())
-                        });
+                        call_leaders
+                            .invalidate_matching(|c| analysis.call_may_read(c, targets.as_ref()));
                     }
                     InstKind::Call(call) => {
                         // A call that writes no external memory (a read-only
@@ -470,9 +462,7 @@ impl Pass for GlobalInstNumbering {
                                     .iter()
                                     .map(|r| match r {
                                         WriteRoot::Global(g) => AbstractObject::Global(*g),
-                                        WriteRoot::Local(f, a) => {
-                                            AbstractObject::Alloc(*f, *a)
-                                        }
+                                        WriteRoot::Local(f, a) => AbstractObject::Alloc(*f, *a),
                                     })
                                     .collect::<FxHashSet<_>>();
                                 analysis.call_may_write(sibling, Some(&reads))
@@ -495,9 +485,7 @@ impl Pass for GlobalInstNumbering {
                                     .iter()
                                     .map(|r| match r {
                                         WriteRoot::Global(g) => AbstractObject::Global(*g),
-                                        WriteRoot::Local(f, a) => {
-                                            AbstractObject::Alloc(*f, *a)
-                                        }
+                                        WriteRoot::Local(f, a) => AbstractObject::Alloc(*f, *a),
                                     })
                                     .collect::<FxHashSet<_>>();
                                 analysis.call_may_write(sibling, Some(&reads))

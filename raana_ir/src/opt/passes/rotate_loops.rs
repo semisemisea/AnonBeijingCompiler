@@ -261,9 +261,9 @@ impl RotateLoops {
                 return false;
             }
             data.layout().basicblock(block).insts().iter().any(|&inst| {
-                data.inst_data(inst).inst_usage().any(|operand| {
-                    Self::is_loop_value(data, operand, &params, &loop_blocks)
-                })
+                data.inst_data(inst)
+                    .inst_usage()
+                    .any(|operand| Self::is_loop_value(data, operand, &params, &loop_blocks))
             })
         });
         if region_uses_loop_value {

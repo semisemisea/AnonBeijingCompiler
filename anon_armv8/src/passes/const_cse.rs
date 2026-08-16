@@ -424,7 +424,7 @@ fn find_loops(
 mod tests {
     use super::*;
     use crate::instructions::MoveWideConst;
-    use crate::regs::{int_reg, OperandSize};
+    use crate::regs::{OperandSize, int_reg};
     use taki_mir::register::Writable;
 
     #[test]

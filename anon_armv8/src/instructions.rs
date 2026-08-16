@@ -5,7 +5,7 @@ use taki_mir::{
     emit_buffer::LabelKind,
     reg_alloc::reg::{OperandVisitor, OperandVisitorImpl, PRegSet, RegClass},
     register::{Reg, Writable},
-    types::{LoweredType, F32, I32, I64, V2F64, V2I64, V4F32, V4I32},
+    types::{F32, I32, I64, LoweredType, V2F64, V2I64, V4F32, V4I32},
     vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
 };
 
@@ -2623,8 +2623,8 @@ mod tests {
         vcode::{EmitContext, MachInst, MachInstEmit, MachTerminator},
     };
 
-    use super::{call_clobbers, CCmpStep, Cond, Imm12, ImmLogic, MInst, SelectCmp, SelectValue};
-    use crate::regs::{float_reg, int_reg, OperandSize};
+    use super::{CCmpStep, Cond, Imm12, ImmLogic, MInst, SelectCmp, SelectValue, call_clobbers};
+    use crate::regs::{OperandSize, float_reg, int_reg};
 
     #[derive(Default)]
     struct TestEmitContext(String);

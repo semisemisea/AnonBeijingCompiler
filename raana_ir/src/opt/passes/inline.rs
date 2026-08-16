@@ -1,9 +1,7 @@
 use crate::{
     ir::arena::Arena,
     opt::{
-        analysis_passes::loop_analysis::LoopAnalysis,
-        prelude::*,
-        utils::body_clone::BodyClonePlan,
+        analysis_passes::loop_analysis::LoopAnalysis, prelude::*, utils::body_clone::BodyClonePlan,
     },
 };
 
@@ -231,7 +229,10 @@ impl Inline {
 mod tests {
     use super::Inline;
     use crate::{
-        ir::{BasicBlock, BinaryOp, Function, Inst, InstKind, Program, Type, arena::Arena, builder_trait::*},
+        ir::{
+            BasicBlock, BinaryOp, Function, Inst, InstKind, Program, Type, arena::Arena,
+            builder_trait::*,
+        },
         opt::pass::Pass,
     };
 
@@ -313,18 +314,10 @@ mod tests {
             let sum = data
                 .new_local_inst()
                 .binary(BinaryOp::Add, params[0], params[2]);
-            let sum = data
-                .new_local_inst()
-                .binary(BinaryOp::Add, sum, params[4]);
-            let sum = data
-                .new_local_inst()
-                .binary(BinaryOp::Add, sum, params[5]);
-            let sum = data
-                .new_local_inst()
-                .binary(BinaryOp::Add, sum, params[7]);
-            let sum = data
-                .new_local_inst()
-                .binary(BinaryOp::Add, sum, params[8]);
+            let sum = data.new_local_inst().binary(BinaryOp::Add, sum, params[4]);
+            let sum = data.new_local_inst().binary(BinaryOp::Add, sum, params[5]);
+            let sum = data.new_local_inst().binary(BinaryOp::Add, sum, params[7]);
+            let sum = data.new_local_inst().binary(BinaryOp::Add, sum, params[8]);
             data.layout_mut().insert_inst(entry, sum);
             let ret = data.new_local_inst().ret(Some(sum));
             data.layout_mut().insert_inst(entry, ret);
@@ -376,11 +369,7 @@ mod tests {
                     // values (1..=9), i.e. no shuffle by the cloner.
                     for (i, arg) in jump.args().iter().enumerate() {
                         if let InstKind::Integer(int) = data.inst_data(*arg).kind() {
-                            assert_eq!(
-                                int.value(),
-                                (i + 1) as i32,
-                                "argument {i} shuffled"
-                            );
+                            assert_eq!(int.value(), (i + 1) as i32, "argument {i} shuffled");
                         }
                     }
                     found = true;
@@ -568,7 +557,9 @@ mod tests {
 
         let i = data.bb_data(header).params()[0];
         let cond = data.new_local_inst().binary(BinaryOp::Lt, i, ten);
-        let branch = data.new_local_inst().branch(cond, body, vec![], exit, vec![]);
+        let branch = data
+            .new_local_inst()
+            .branch(cond, body, vec![], exit, vec![]);
         data.layout_mut().insert_inst(header, cond);
         data.layout_mut().insert_inst(header, branch);
 
@@ -617,10 +608,11 @@ mod tests {
         let mut program = Program::new();
         let callee = build_leaf(&mut program, "big_leaf", super::CALL_SIZE_LIMIT + 1);
         let (main, header, body) = build_loop_main(&mut program);
-        let call = program
-            .func_data_mut(main)
-            .new_local_inst()
-            .call_with_type(callee, vec![], Type::get_i32());
+        let call = program.func_data_mut(main).new_local_inst().call_with_type(
+            callee,
+            vec![],
+            Type::get_i32(),
+        );
         finish_loop_body(&mut program, main, header, body, &[call]);
 
         assert!(Inline.run(&mut program));

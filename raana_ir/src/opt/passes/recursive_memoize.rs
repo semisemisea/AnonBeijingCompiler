@@ -36,10 +36,7 @@
 //! preserved for every input).
 
 use crate::{
-    ir::{
-        BasicBlock, BinaryOp, Function, Inst, InstKind, Program, Type,
-        builder_trait::*,
-    },
+    ir::{BasicBlock, BinaryOp, Function, Inst, InstKind, Program, Type, builder_trait::*},
     opt::{
         analysis_passes::{
             induction_variable::{BasicInductionVariableAnalysis, InductionStep},
@@ -131,7 +128,14 @@ impl Pass for RecursiveMemoize {
             let Some(f_memo) = build_memoized(program, &memo) else {
                 continue;
             };
-            rewrite_callsite(program, &callsite, f_memo, memo.key_pos, memo.acc_pos, calloc);
+            rewrite_callsite(
+                program,
+                &callsite,
+                f_memo,
+                memo.key_pos,
+                memo.acc_pos,
+                calloc,
+            );
             changed = true;
         }
         changed
@@ -238,9 +242,11 @@ fn detect(program: &Program, f: Function) -> Option<MemoInfo> {
         if call_kind.args().len() != 2 || call_data.used_by().is_empty() {
             return None;
         }
-        if call_data.used_by().iter().any(|&user| {
-            !matches!(data.inst_data(user).kind(), InstKind::Return(_))
-        }) {
+        if call_data
+            .used_by()
+            .iter()
+            .any(|&user| !matches!(data.inst_data(user).kind(), InstKind::Return(_)))
+        {
             return None;
         }
     }
@@ -478,12 +484,8 @@ fn detect_callsite(
 fn classify_bound(data: &FunctionData, bound: Inst) -> Option<BoundKind> {
     match data.inst_data(bound).kind() {
         InstKind::Integer(integer) => Some(BoundKind::Const(integer.value())),
-        InstKind::Load(load) if load.src().is_global() => {
-            Some(BoundKind::GlobalLoad(load.src()))
-        }
-        InstKind::BlockArgRef(_) if data.params().contains(&bound) => {
-            Some(BoundKind::Param(bound))
-        }
+        InstKind::Load(load) if load.src().is_global() => Some(BoundKind::GlobalLoad(load.src())),
+        InstKind::BlockArgRef(_) if data.params().contains(&bound) => Some(BoundKind::Param(bound)),
         _ => None,
     }
 }
@@ -501,7 +503,12 @@ fn build_memoized(program: &mut Program, memo: &MemoInfo) -> Option<Function> {
     let f_memo = program.new_function(
         Type::get_i32(),
         format!("{name}_memo"),
-        vec![key_ty.clone(), acc_ty.clone(), cache_ty.clone(), Type::get_i32()],
+        vec![
+            key_ty.clone(),
+            acc_ty.clone(),
+            cache_ty.clone(),
+            Type::get_i32(),
+        ],
     );
 
     // Scope A: build the prologue (entry / in_bounds / hit / miss).
@@ -510,7 +517,12 @@ fn build_memoized(program: &mut Program, memo: &MemoInfo) -> Option<Function> {
             program,
             curr_func: Some(f_memo),
         };
-        let param_tys = vec![key_ty.clone(), acc_ty.clone(), cache_ty.clone(), Type::get_i32()];
+        let param_tys = vec![
+            key_ty.clone(),
+            acc_ty.clone(),
+            cache_ty.clone(),
+            Type::get_i32(),
+        ];
         let entry = builder
             .new_basic_block()
             .basic_block("entry".into(), param_tys.clone());
@@ -519,7 +531,14 @@ fn build_memoized(program: &mut Program, memo: &MemoInfo) -> Option<Function> {
             .basic_block("memo_in_bounds".into(), param_tys.clone());
         let hit_block = builder.new_basic_block().basic_block(
             "memo_hit".into(),
-            vec![key_ty, acc_ty, cache_ty.clone(), Type::get_i32(), Type::get_i32(), Type::get_i32()],
+            vec![
+                key_ty,
+                acc_ty,
+                cache_ty.clone(),
+                Type::get_i32(),
+                Type::get_i32(),
+                Type::get_i32(),
+            ],
         );
         let miss_block = builder
             .new_basic_block()
@@ -560,9 +579,13 @@ fn build_memoized(program: &mut Program, memo: &MemoInfo) -> Option<Function> {
             builder.bb_data(in_bounds_block).params()[3],
         );
         let three = builder.new_local_inst().integer(3);
-        let k_ptr = builder.new_local_inst().get_elem_ptr(ib_cache, vec![ib_key]);
+        let k_ptr = builder
+            .new_local_inst()
+            .get_elem_ptr(ib_cache, vec![ib_key]);
         let entry_val = builder.new_local_inst().load(k_ptr);
-        let tag = builder.new_local_inst().binary(BinaryOp::And, entry_val, three);
+        let tag = builder
+            .new_local_inst()
+            .binary(BinaryOp::And, entry_val, three);
         let zero = builder.new_local_inst().integer(0);
         let hit = builder.new_local_inst().binary(BinaryOp::NotEq, tag, zero);
         let ib_branch = builder.new_local_inst().branch(
@@ -612,9 +635,7 @@ fn build_memoized(program: &mut Program, memo: &MemoInfo) -> Option<Function> {
     let mut threaded: HashMap<BasicBlock, (Inst, Inst, Inst)> = HashMap::default();
     for &block in &cloned.blocks {
         let k_p = builder.new_basic_block().add_param(block, Type::get_i32());
-        let cache_p = builder
-            .new_basic_block()
-            .add_param(block, cache_ty.clone());
+        let cache_p = builder.new_basic_block().add_param(block, cache_ty.clone());
         let size_p = builder.new_basic_block().add_param(block, Type::get_i32());
         threaded.insert(block, (k_p, cache_p, size_p));
     }
@@ -627,10 +648,9 @@ fn build_memoized(program: &mut Program, memo: &MemoInfo) -> Option<Function> {
         builder.bb_data(miss_block).params()[2],
         builder.bb_data(miss_block).params()[3],
     );
-    let miss_jump = builder.new_local_inst().jump(
-        cloned.entry,
-        vec![m_key, m_acc, m_key, m_cache, m_size],
-    );
+    let miss_jump = builder
+        .new_local_inst()
+        .jump(cloned.entry, vec![m_key, m_acc, m_key, m_cache, m_size]);
     builder.layout_mut().insert_inst(miss_block, miss_jump);
 
     // Append (K, cache, size) to every outgoing logical edge.
@@ -735,22 +755,43 @@ fn build_memoized(program: &mut Program, memo: &MemoInfo) -> Option<Function> {
                 let child_ib = builder.new_local_inst().binary(BinaryOp::And, c_ge, c_lt);
                 let child_ptr = builder.new_local_inst().get_elem_ptr(cache_p, vec![child]);
                 let child_entry = builder.new_local_inst().load(child_ptr);
-                let child_ne0 =
-                    builder.new_local_inst().binary(BinaryOp::NotEq, child_entry, zero);
-                let child_tag = builder.new_local_inst().binary(BinaryOp::And, child_entry, three);
-                let child_val = builder.new_local_inst().binary(BinaryOp::Shr, child_entry, two);
+                let child_ne0 = builder
+                    .new_local_inst()
+                    .binary(BinaryOp::NotEq, child_entry, zero);
+                let child_tag = builder
+                    .new_local_inst()
+                    .binary(BinaryOp::And, child_entry, three);
+                let child_val = builder
+                    .new_local_inst()
+                    .binary(BinaryOp::Shr, child_entry, two);
                 // Increment: the non-`C` part of the recursion's accumulator
                 // argument `C' = C + inc`.
                 let inc = residual_of(&mut builder, acc_param, c_prime);
-                let is_leaf = builder.new_local_inst().binary(BinaryOp::Eq, child_tag, one_i);
-                let bumped = builder.new_local_inst().binary(BinaryOp::Add, child_val, inc);
+                let is_leaf = builder
+                    .new_local_inst()
+                    .binary(BinaryOp::Eq, child_tag, one_i);
+                let bumped = builder
+                    .new_local_inst()
+                    .binary(BinaryOp::Add, child_val, inc);
                 let newval = builder.new_local_inst().select(is_leaf, bumped, child_val);
-                let ok = builder.new_local_inst().binary(BinaryOp::And, child_ib, child_ne0);
+                let ok = builder
+                    .new_local_inst()
+                    .binary(BinaryOp::And, child_ib, child_ne0);
                 // `inc` may be a constant or an already-laid-out operand.
                 insert_fresh(&mut builder, block, inc);
                 for inst in [
-                    c_ge, c_lt, child_ib, child_ptr, child_entry, child_ne0, child_tag,
-                    child_val, is_leaf, bumped, newval, ok,
+                    c_ge,
+                    c_lt,
+                    child_ib,
+                    child_ptr,
+                    child_entry,
+                    child_ne0,
+                    child_tag,
+                    child_val,
+                    is_leaf,
+                    bumped,
+                    newval,
+                    ok,
                 ] {
                     builder.layout_mut().insert_before_terminator(block, inst);
                 }
@@ -877,11 +918,15 @@ fn rewrite_callsite(
     let one = builder.new_local_inst().integer(1);
     let four = builder.new_local_inst().integer(4);
     let size_raw = builder.new_local_inst().binary(BinaryOp::Add, bound, one);
-    let ge0 = builder.new_local_inst().binary(BinaryOp::Ge, size_raw, zero);
-    let size = builder.new_local_inst().select(ge0, size_raw, zero);
-    let calloc_call = builder
+    let ge0 = builder
         .new_local_inst()
-        .call_with_type(calloc, vec![size, four], Type::get_pointer(Type::get_i32()));
+        .binary(BinaryOp::Ge, size_raw, zero);
+    let size = builder.new_local_inst().select(ge0, size_raw, zero);
+    let calloc_call = builder.new_local_inst().call_with_type(
+        calloc,
+        vec![size, four],
+        Type::get_pointer(Type::get_i32()),
+    );
     // `bound` is a re-emitted global load (laid out) or an inline operand
     // (constant / block parameter); only lay out the former, and always before
     // the size arithmetic that reads it.
@@ -891,7 +936,9 @@ fn rewrite_callsite(
             .insert_before_terminator(callsite.preheader, bound);
     }
     for inst in [size_raw, ge0, size, calloc_call] {
-        builder.layout_mut().insert_before_terminator(callsite.preheader, inst);
+        builder
+            .layout_mut()
+            .insert_before_terminator(callsite.preheader, inst);
     }
 
     // Rewrite the callsite to pass the cache pointer and size.
@@ -900,9 +947,11 @@ fn rewrite_callsite(
     };
     let key_arg = call_kind.args()[key_pos];
     let acc_arg = call_kind.args()[acc_pos];
-    builder
-        .replace_inst_with(callsite.call)
-        .call_with_type(f_memo, vec![key_arg, acc_arg, calloc_call, size], Type::get_i32());
+    builder.replace_inst_with(callsite.call).call_with_type(
+        f_memo,
+        vec![key_arg, acc_arg, calloc_call, size],
+        Type::get_i32(),
+    );
 }
 
 #[cfg(test)]
@@ -929,9 +978,7 @@ mod tests {
             let (n, dep) = (data.params()[0], data.params()[1]);
             let one = data.new_local_inst().integer(1);
             let eq = data.new_local_inst().binary(BinaryOp::Eq, n, one);
-            let br = data
-                .new_local_inst()
-                .branch(eq, leaf, vec![], rec, vec![]);
+            let br = data.new_local_inst().branch(eq, leaf, vec![], rec, vec![]);
             data.layout_mut().insert_inst(entry, eq);
             data.layout_mut().insert_inst(entry, br);
 
@@ -955,15 +1002,13 @@ mod tests {
 
     /// Build `main(bound)`: a forward `i <= bound` loop calling `fun(i, 0)`.
     fn build_main(program: &mut Program, f: Function) {
-        let main = program.new_function(
-            Type::get_i32(),
-            "main".into(),
-            vec![Type::get_i32()],
-        );
+        let main = program.new_function(Type::get_i32(), "main".into(), vec![Type::get_i32()]);
         {
             let data = program.func_data_mut(main);
             let entry = data.add_entry_block();
-            let header = data.new_basic_block().basic_block("header".into(), vec![Type::get_i32()]);
+            let header = data
+                .new_basic_block()
+                .basic_block("header".into(), vec![Type::get_i32()]);
             let body = data.new_basic_block().basic_block("body".into(), vec![]);
             let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
             for block in [header, body, exit] {
@@ -976,9 +1021,7 @@ mod tests {
 
             let iv = data.bb_data(header).params()[0];
             let le = data.new_local_inst().binary(BinaryOp::Le, iv, bound);
-            let header_br = data
-                .new_local_inst()
-                .branch(le, body, vec![], exit, vec![]);
+            let header_br = data.new_local_inst().branch(le, body, vec![], exit, vec![]);
             data.layout_mut().insert_inst(header, le);
             data.layout_mut().insert_inst(header, header_br);
 
@@ -1040,9 +1083,7 @@ mod tests {
             // `dep < 0` compares the accumulator: not a pure accumulator.
             let zero = data.new_local_inst().integer(0);
             let cmp = data.new_local_inst().binary(BinaryOp::Lt, dep, zero);
-            let br = data
-                .new_local_inst()
-                .branch(cmp, leaf, vec![], rec, vec![]);
+            let br = data.new_local_inst().branch(cmp, leaf, vec![], rec, vec![]);
             data.layout_mut().insert_inst(entry, cmp);
             data.layout_mut().insert_inst(entry, br);
             let ret_dep = data.new_local_inst().ret(Some(dep));
@@ -1080,9 +1121,7 @@ mod tests {
             let (n, dep) = (data.params()[0], data.params()[1]);
             let one = data.new_local_inst().integer(1);
             let eq = data.new_local_inst().binary(BinaryOp::Eq, n, one);
-            let br = data
-                .new_local_inst()
-                .branch(eq, leaf, vec![], rec, vec![]);
+            let br = data.new_local_inst().branch(eq, leaf, vec![], rec, vec![]);
             data.layout_mut().insert_inst(entry, eq);
             data.layout_mut().insert_inst(entry, br);
             let ret_dep = data.new_local_inst().ret(Some(dep));

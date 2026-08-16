@@ -1,6 +1,6 @@
 use super::{
-    fold_mul_constant, nzcv_making_cond_false, nzcv_making_cond_true, signed_power_of_two,
-    MulConstForm,
+    MulConstForm, fold_mul_constant, nzcv_making_cond_false, nzcv_making_cond_true,
+    signed_power_of_two,
 };
 use crate::instructions::{Cond, ImmShift, MInst};
 use crate::regs::OperandSize;

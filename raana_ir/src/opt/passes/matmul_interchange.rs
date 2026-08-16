@@ -203,20 +203,18 @@ impl MatmulInterchange {
         };
         // The A side loads through the ptr parameter (`gep ptr, 0`); the C
         // side loads `Crow[k]` (`gep Crow, (0,k)`).
-        let (crow, a_gep_base) = match (
-            data.inst_data(c_load).kind(),
-            data.inst_data(a_load).kind(),
-        ) {
-            (InstKind::GetElemPtr(c_gep), InstKind::GetElemPtr(a_gep))
-                if a_gep.base() == ptr_param && a_gep.offsets().len() == 1 =>
-            {
-                if c_gep.offsets().len() != 2 || c_gep.offsets()[1] != k_iv {
-                    return None;
+        let (crow, a_gep_base) =
+            match (data.inst_data(c_load).kind(), data.inst_data(a_load).kind()) {
+                (InstKind::GetElemPtr(c_gep), InstKind::GetElemPtr(a_gep))
+                    if a_gep.base() == ptr_param && a_gep.offsets().len() == 1 =>
+                {
+                    if c_gep.offsets().len() != 2 || c_gep.offsets()[1] != k_iv {
+                        return None;
+                    }
+                    (c_gep.base(), a_gep.base())
                 }
-                (c_gep.base(), a_gep.base())
-            }
-            _ => return None,
-        };
+                _ => return None,
+            };
         let _ = a_gep_base;
 
         // body purity + acc used nowhere else inside the body.
@@ -269,19 +267,15 @@ impl MatmulInterchange {
         // The j-loop body builds the column pointer: it is the loop block
         // (not header/latch, not part of the inner k loop) whose terminator
         // jumps into the k loop.
-        let j_body = j_loop
-            .body()
-            .iter()
-            .copied()
-            .find(|&block| {
-                block != j_header
-                    && block != j_latch
-                    && !k_loop.contains(block)
-                    && matches!(
-                        data.inst_data(data.layout().basicblock(block).terminator()).kind(),
-                        InstKind::Jump(jump) if jump.target() == k_header
-                    )
-            })?;
+        let j_body = j_loop.body().iter().copied().find(|&block| {
+            block != j_header
+                && block != j_latch
+                && !k_loop.contains(block)
+                && matches!(
+                    data.inst_data(data.layout().basicblock(block).terminator()).kind(),
+                    InstKind::Jump(jump) if jump.target() == k_header
+                )
+        })?;
 
         // ---- outer i loop ----
         let jj_index = loop_analysis.loop_index(j_header)?;
@@ -382,8 +376,12 @@ impl MatmulInterchange {
         let k_header = data
             .new_basic_block()
             .basic_block("mm_k_header".into(), vec![i32_ty.clone()]);
-        let k_body = data.new_basic_block().basic_block("mm_k_body".into(), vec![]);
-        let k_exit = data.new_basic_block().basic_block("mm_k_exit".into(), vec![]);
+        let k_body = data
+            .new_basic_block()
+            .basic_block("mm_k_body".into(), vec![]);
+        let k_exit = data
+            .new_basic_block()
+            .basic_block("mm_k_exit".into(), vec![]);
         let j_header = data.new_basic_block().basic_block(
             "mm_j_header".into(),
             vec![
@@ -392,12 +390,18 @@ impl MatmulInterchange {
                 Type::get_pointer(buf_ty.clone()),
             ],
         );
-        let j_body = data.new_basic_block().basic_block("mm_j_body".into(), vec![]);
-        let j_latch = data.new_basic_block().basic_block("mm_j_latch".into(), vec![]);
+        let j_body = data
+            .new_basic_block()
+            .basic_block("mm_j_body".into(), vec![]);
+        let j_latch = data
+            .new_basic_block()
+            .basic_block("mm_j_latch".into(), vec![]);
         let wb_header = data
             .new_basic_block()
             .basic_block("mm_wb_header".into(), vec![i32_ty.clone()]);
-        let wb_body = data.new_basic_block().basic_block("mm_wb_body".into(), vec![]);
+        let wb_body = data
+            .new_basic_block()
+            .basic_block("mm_wb_body".into(), vec![]);
 
         // Insert them after the i-loop body (the block that computes Crow).
         let i_body = data.layout().parent_bb(cand.crow).expect("crow in a block");
@@ -426,10 +430,16 @@ impl MatmulInterchange {
         data.layout_mut().insert_inst(k_header, k_branch);
 
         // k_body: arow_k = gep Aroot (0,k); cik = load Crow[k]; jump j(0,cik,arow_k)
-        let arow_k = data.new_local_value().get_elem_ptr(cand.aroot, vec![zero, k]);
-        let cik_gep = data.new_local_value().get_elem_ptr(cand.crow, vec![zero, k]);
+        let arow_k = data
+            .new_local_value()
+            .get_elem_ptr(cand.aroot, vec![zero, k]);
+        let cik_gep = data
+            .new_local_value()
+            .get_elem_ptr(cand.crow, vec![zero, k]);
         let cik = data.new_local_value().load(cik_gep);
-        let j_init = data.new_local_value().jump(j_header, vec![zero, cik, arow_k]);
+        let j_init = data
+            .new_local_value()
+            .jump(j_header, vec![zero, cik, arow_k]);
         for inst in [arow_k, cik_gep, cik, j_init] {
             data.layout_mut().insert_inst(k_body, inst);
         }
@@ -459,10 +469,14 @@ impl MatmulInterchange {
             .new_local_value()
             .get_elem_ptr(buf, vec![zero, j_params[0]]);
         let b_val = data.new_local_value().load(b_gep);
-        let prod = data.new_local_value().binary(BinaryOp::Mul, j_params[1], a_val);
+        let prod = data
+            .new_local_value()
+            .binary(BinaryOp::Mul, j_params[1], a_val);
         let sum = data.new_local_value().binary(BinaryOp::Add, b_val, prod);
         let store = data.new_local_value().store(sum, b_gep);
-        let j_next = data.new_local_value().binary(BinaryOp::Add, j_params[0], one);
+        let j_next = data
+            .new_local_value()
+            .binary(BinaryOp::Add, j_params[0], one);
         let j_back = data
             .new_local_value()
             .jump(j_header, vec![j_next, j_params[1], j_params[2]]);
@@ -479,17 +493,17 @@ impl MatmulInterchange {
         // ---- writeback loop ----
         // wb_header(j): br j < T, wb_body, i_latch
         let wb_j = data.bb_data(wb_header).params()[0];
-        let wb_cond = data.new_local_value().binary(BinaryOp::Lt, wb_j, cand.bound);
-        let wb_branch = data
+        let wb_cond = data
             .new_local_value()
-            .branch(wb_cond, wb_body, vec![], cand.i_latch, vec![]);
+            .binary(BinaryOp::Lt, wb_j, cand.bound);
+        let wb_branch =
+            data.new_local_value()
+                .branch(wb_cond, wb_body, vec![], cand.i_latch, vec![]);
         data.layout_mut().insert_inst(wb_header, wb_cond);
         data.layout_mut().insert_inst(wb_header, wb_branch);
 
         // wb_body: A[i][j] = buf[j]
-        let src_gep = data
-            .new_local_value()
-            .get_elem_ptr(buf, vec![zero, wb_j]);
+        let src_gep = data.new_local_value().get_elem_ptr(buf, vec![zero, wb_j]);
         let src_val = data.new_local_value().load(src_gep);
         let dst_gep = data
             .new_local_value()
@@ -503,10 +517,17 @@ impl MatmulInterchange {
 
         // ---- redirect the i-loop body to the new k loop ----
         let i_body_term = data.layout().basicblock(i_body).terminator();
-        data.replace_inst_with(i_body_term).jump(k_header, vec![zero]);
+        data.replace_inst_with(i_body_term)
+            .jump(k_header, vec![zero]);
 
         // ---- remove the old j/k-loop blocks (now unreachable) ----
-        for block in [cand.j_header, cand.j_body, cand.j_latch, cand.k_header, cand.k_body] {
+        for block in [
+            cand.j_header,
+            cand.j_body,
+            cand.j_latch,
+            cand.k_header,
+            cand.k_body,
+        ] {
             data.remove_layout_basicblock(block);
         }
 
@@ -589,11 +610,7 @@ fn row_length(data: &ArenaContextMut<'_>, row_ptr: Inst) -> Option<usize> {
 /// The bound of a forward `iv < bound` header exit. Unlike BIV-based
 /// normalization this matches on the header branch's compare directly, so it
 /// also works when the back edge threads the IV through a `BlockArgRef`.
-fn forward_strict_bound(
-    data: &ArenaContextMut<'_>,
-    looop: &Loop,
-    iv: Inst,
-) -> Option<Inst> {
+fn forward_strict_bound(data: &ArenaContextMut<'_>, looop: &Loop, iv: Inst) -> Option<Inst> {
     let terminator = data.layout().basicblock(looop.header()).terminator();
     let InstKind::Branch(branch) = data.inst_data(terminator).kind() else {
         return None;
@@ -668,7 +685,8 @@ mod tests {
         let a_root = program.new_value().global_alloc(a_init);
         let c_init = program.new_value().zero_init(c_ty);
         let c_root = program.new_value().global_alloc(c_init);
-        let function = program.new_function(Type::get_unit(), "matmul".into(), vec![Type::get_i32()]);
+        let function =
+            program.new_function(Type::get_unit(), "matmul".into(), vec![Type::get_i32()]);
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
         let n = data.params()[0];
@@ -721,9 +739,15 @@ mod tests {
         // i body: a_base = gep A (0,0); crow = gep C (0,i); arow = gep A (0,i).
         // The i value is threaded through the j header (like the real
         // benchmark): `jump j_header(0, i)`.
-        let a_base = context.new_local_value().get_elem_ptr(a_root, vec![zero, zero]);
-        let crow = context.new_local_value().get_elem_ptr(c_root, vec![zero, i_iv]);
-        let arow = context.new_local_value().get_elem_ptr(a_root, vec![zero, i_iv]);
+        let a_base = context
+            .new_local_value()
+            .get_elem_ptr(a_root, vec![zero, zero]);
+        let crow = context
+            .new_local_value()
+            .get_elem_ptr(c_root, vec![zero, i_iv]);
+        let arow = context
+            .new_local_value()
+            .get_elem_ptr(a_root, vec![zero, i_iv]);
         let data = context.curr_func_data_mut();
         let i_body_jump = data.new_local_inst().jump(j_header, vec![zero, i_iv]);
         for inst in [a_base, crow, arow, i_body_jump] {
@@ -773,7 +797,9 @@ mod tests {
         let ptr2 = data.new_local_inst().get_elem_ptr(ptr, vec![stride]);
         let k2 = data.new_local_inst().binary(BinaryOp::Add, k_iv, one);
         let k_back = data.new_local_inst().jump(k_header, vec![k2, acc2, ptr2]);
-        for inst in [cik_gep, cik, ptr0, a_val, prod, acc2, stride, ptr2, k2, k_back] {
+        for inst in [
+            cik_gep, cik, ptr0, a_val, prod, acc2, stride, ptr2, k2, k_back,
+        ] {
             data.layout_mut().insert_inst(k_body, inst);
         }
 

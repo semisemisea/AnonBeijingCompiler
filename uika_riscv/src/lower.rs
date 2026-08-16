@@ -495,9 +495,8 @@ fn fold_mul_constant_riscv(
     x: Reg,
     value: i32,
 ) -> Option<()> {
-    let pow2_shift = |v: u32| -> Option<ShiftImm> {
-        ShiftImm::new(u8::try_from(v.trailing_zeros()).ok()?)
-    };
+    let pow2_shift =
+        |v: u32| -> Option<ShiftImm> { ShiftImm::new(u8::try_from(v.trailing_zeros()).ok()?) };
     if value > 1 && (value as u32).is_power_of_two() {
         ctx.emit(MInst::AluRRImmShift {
             op: AluRRImmShiftOP::SlliW,

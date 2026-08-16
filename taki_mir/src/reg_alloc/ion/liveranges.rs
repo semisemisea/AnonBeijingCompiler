@@ -104,7 +104,7 @@ fn slot_idx(i: usize) -> Result<u16, String> {
     u16::try_from(i).map_err(|_| "too many instruction operands".to_owned())
 }
 
-impl<'a, F: Function> Env<'a, F> {
+impl<F: Function> Env<'_, F> {
     pub fn create_pregs_and_vregs(&mut self) {
         // Create PRegs from the env.
         self.pregs.resize(
@@ -340,11 +340,11 @@ impl<'a, F: Function> Env<'a, F> {
             }
 
             for &pred in self.func.block_preds(block) {
-                if self.ctx.liveouts[pred.index()].union_with(&live) {
-                    if !workqueue_set.contains(&pred) {
-                        workqueue_set.insert(pred);
-                        workqueue.push_back(pred);
-                    }
+                if self.ctx.liveouts[pred.index()].union_with(&live)
+                    && !workqueue_set.contains(&pred)
+                {
+                    workqueue_set.insert(pred);
+                    workqueue.push_back(pred);
                 }
             }
 
@@ -487,11 +487,10 @@ impl<'a, F: Function> Env<'a, F> {
                 let mut late_def_fixed: SmallVec<[PReg; 8]> = smallvec![];
                 for &operand in self.func.inst_operands(inst) {
                     if let OperandConstraint::FixedReg(preg) = operand.constraint() {
-                        match (operand.pos(), operand.kind()) {
-                            (OperandPos::Late, OperandKind::Def) => {
-                                late_def_fixed.push(preg);
-                            }
-                            _ => {}
+                        if let (OperandPos::Late, OperandKind::Def) =
+                            (operand.pos(), operand.kind())
+                        {
+                            late_def_fixed.push(preg);
                         }
                     }
                 }

@@ -334,7 +334,7 @@ fn invalidate_call(
             .collect(),
         None => state.all_roots.iter().copied().collect(),
     };
-    let unknown = matches!(analysis.call_write_roots(callee, func), None);
+    let unknown = analysis.call_write_roots(callee, func).is_none();
     for root in roots {
         if state.clear(root, unknown) {
             if let Some(loaders) = state.root_loaders.get(&root) {
@@ -1003,7 +1003,8 @@ pub(super) fn fold_f32_to_i32(value: f32) -> Option<i32> {
     // The target conversions truncate toward zero for representable values.
     // Keep non-finite and out-of-range values as runtime casts because Rust's
     // saturating `as` conversion does not match the target instructions there.
-    (value.is_finite() && value >= i32::MIN as f32 && value < i32::MAX as f32).then(|| value as i32)
+    (value.is_finite() && value >= i32::MIN as f32 && value < i32::MAX as f32)
+        .then_some(value as i32)
 }
 
 #[cfg(test)]

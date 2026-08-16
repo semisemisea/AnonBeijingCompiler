@@ -89,7 +89,7 @@ impl Reg {
 
     /// Get the class of this register.
     pub fn class(self) -> RegClass {
-        assert!(!self.to_spillslot().is_some());
+        assert!(self.to_spillslot().is_none());
         VReg::from(self.0).class()
     }
 
@@ -116,10 +116,10 @@ impl core::fmt::Debug for Reg {
         } else if let Some(spillslot) = self.to_spillslot() {
             write!(f, "{spillslot}")
         } else if let Some(rreg) = self.to_real_reg() {
-            let preg: PReg = rreg.into();
+            let preg: PReg = rreg;
             write!(f, "{preg}")
         } else if let Some(vreg) = self.to_virtual_reg() {
-            let vreg: VReg = vreg.into();
+            let vreg: VReg = vreg;
             write!(f, "{vreg}")
         } else {
             unreachable!()

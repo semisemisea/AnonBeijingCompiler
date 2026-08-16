@@ -1032,7 +1032,7 @@ impl PRegSet {
     const BITS: usize = core::mem::size_of::<Bits>() * 8;
 
     /// Length of the internal bit array.
-    const LEN: usize = (PReg::NUM_INDEX + Self::BITS - 1) / Self::BITS;
+    const LEN: usize = PReg::NUM_INDEX.div_ceil(Self::BITS);
 
     /// Create an empty set.
     pub const fn empty() -> Self {
@@ -1400,15 +1400,15 @@ pub trait OperandVisitorImpl: OperandVisitor {
     fn reg_fixed(&mut self, reg: &mut Reg, rreg: Reg, kind: OperandKind, pos: OperandPos) {
         debug_assert!(reg.is_virtual());
         let rreg = rreg.to_real_reg().expect("fixed reg is not a RealReg");
-        self.debug_assert_is_allocatable_preg(rreg.into(), true);
-        let constraint = OperandConstraint::FixedReg(rreg.into());
+        self.debug_assert_is_allocatable_preg(rreg, true);
+        let constraint = OperandConstraint::FixedReg(rreg);
         self.add_operand(reg, constraint, kind, pos);
     }
 
     /// Add an operand which might already be a physical register.
     fn reg_maybe_fixed(&mut self, reg: &mut Reg, kind: OperandKind, pos: OperandPos) {
         if let Some(rreg) = reg.to_real_reg() {
-            self.reg_fixed_nonallocatable(rreg.into());
+            self.reg_fixed_nonallocatable(rreg);
         } else {
             debug_assert!(reg.is_virtual());
             self.add_operand(reg, OperandConstraint::Reg, kind, pos);
@@ -1425,7 +1425,7 @@ pub trait OperandVisitorImpl: OperandVisitor {
             // constraint. We assume the creator knows what they're doing
             // here, though we do also require that the real register be a
             // fixed-nonallocatable register.
-            self.reg_fixed_nonallocatable(rreg.into());
+            self.reg_fixed_nonallocatable(rreg);
         } else {
             debug_assert!(reg.is_virtual());
             // The operand we're reusing must not be fixed-nonallocatable, as
@@ -1439,7 +1439,7 @@ pub trait OperandVisitorImpl: OperandVisitor {
     /// Add a tied definition held directly in an instruction register field.
     fn reg_reuse_def_reg(&mut self, reg: &mut Reg, idx: usize) {
         if let Some(rreg) = reg.to_real_reg() {
-            self.reg_fixed_nonallocatable(rreg.into());
+            self.reg_fixed_nonallocatable(rreg);
         } else {
             debug_assert!(reg.is_virtual());
             self.add_operand(
@@ -1478,7 +1478,7 @@ pub trait OperandVisitorImpl: OperandVisitor {
 
 impl<T: OperandVisitor> OperandVisitorImpl for T {}
 
-impl<'a, F: Fn(VReg) -> VReg> OperandVisitor for OperandCollector<'a, F> {
+impl<F: Fn(VReg) -> VReg> OperandVisitor for OperandCollector<'_, F> {
     fn add_operand(
         &mut self,
         reg: &mut Reg,
@@ -1487,7 +1487,7 @@ impl<'a, F: Fn(VReg) -> VReg> OperandVisitor for OperandCollector<'a, F> {
         pos: OperandPos,
     ) {
         debug_assert!(!reg.is_spillslot());
-        reg.0 = (self.renamer)(VReg::from(reg.0)).repr() as u32;
+        reg.0 = (self.renamer)(VReg::from(reg.0)).repr();
         self.operands
             .push(Operand::new(VReg::from(reg.0), constraint, kind, pos));
     }

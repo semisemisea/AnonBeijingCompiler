@@ -200,8 +200,8 @@ impl Type {
     /// Return i32/f32 based on array type.
     pub fn array_base_scalar_type(&self) -> Type {
         match self.0.as_ref() {
-            TypeKind::Array(ty, _len) => return ty.array_base_scalar_type(),
-            TypeKind::Int32 | TypeKind::Float32 => return self.clone(),
+            TypeKind::Array(ty, _len) => ty.array_base_scalar_type(),
+            TypeKind::Int32 | TypeKind::Float32 => self.clone(),
             _ => panic!("{self} is not an array"),
         }
     }

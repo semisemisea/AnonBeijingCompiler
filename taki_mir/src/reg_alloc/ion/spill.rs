@@ -26,7 +26,7 @@ use crate::reg_alloc::{
 };
 use log::trace;
 
-impl<'a, F: Function> Env<'a, F> {
+impl<F: Function> Env<'_, F> {
     pub fn try_allocating_regs_for_spilled_bundles(&mut self) {
         trace!("allocating regs for spilled bundles");
         let mut scratch = core::mem::take(&mut self.ctx.scratch_conflicts);

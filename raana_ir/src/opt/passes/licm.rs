@@ -274,7 +274,7 @@ impl LICM {
         }
         while !deferred.is_empty() {
             let mut progress = false;
-            let mut still_deferred = Vec::with_capacity(deferred.len());
+            let still_deferred = Vec::with_capacity(deferred.len());
             for (parameter, arg) in deferred.drain(..) {
                 if let Some(&value) = param_resolutions.get(&arg) {
                     param_resolutions.insert(parameter, value);

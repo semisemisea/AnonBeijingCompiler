@@ -98,9 +98,7 @@ impl Requirement {
             (FixedStack(a), FixedStack(b)) if a == b => Ok(self),
             // Limit a 'Register|FixedReg`.
             (Limit(a), Register) | (Register, Limit(a)) => Ok(Limit(a)),
-            (Limit(a), FixedReg(b)) | (FixedReg(b), Limit(a)) if usize::from(a) > b.hw_enc() => {
-                Ok(FixedReg(b))
-            }
+            (Limit(a), FixedReg(b)) | (FixedReg(b), Limit(a)) if a > b.hw_enc() => Ok(FixedReg(b)),
             // Constrain `Register|Stack` to `Fixed{Reg|Stack}`.
             (Register, FixedReg(preg)) | (FixedReg(preg), Register) => Ok(FixedReg(preg)),
             (Stack, FixedStack(preg)) | (FixedStack(preg), Stack) => Ok(FixedStack(preg)),
@@ -128,7 +126,7 @@ impl Requirement {
     }
 }
 
-impl<'a, F: Function> Env<'a, F> {
+impl<F: Function> Env<'_, F> {
     #[inline(always)]
     pub fn requirement_from_operand(&self, op: Operand) -> Requirement {
         match op.constraint() {

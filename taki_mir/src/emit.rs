@@ -59,7 +59,7 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
             EmitBuffer::<B>::new(self.program, name.to_owned(), block_labels, self.branch_opt);
 
         for inst in &vcode.abi.gen_prologue() {
-            emit_legalized::<B::MInst, B>(&frame, inst, &mut buffer);
+            emit_legalized::<B::MInst, B>(frame, inst, &mut buffer);
         }
 
         for (bi, _lb) in vcode.block_order().lowered_order().iter().enumerate() {
@@ -67,7 +67,7 @@ impl<B: LowerBackend> AsmWriter<'_, B> {
             for inst in vcode.block_insts(bi) {
                 if inst.needs_epilogue() {
                     for epi in &vcode.abi.gen_epilogue() {
-                        emit_legalized::<B::MInst, B>(&frame, epi, &mut buffer);
+                        emit_legalized::<B::MInst, B>(frame, epi, &mut buffer);
                     }
                 }
                 inst.emit(&mut buffer).unwrap();

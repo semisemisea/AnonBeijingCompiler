@@ -40,7 +40,7 @@ use smallvec::{SmallVec, smallvec};
 use std::collections::hash_map::Entry;
 use std::vec::Vec;
 
-impl<'a, F: Function> Env<'a, F> {
+impl<F: Function> Env<'_, F> {
     pub fn is_start_of_block(&self, pos: ProgPoint) -> bool {
         let block = self.ctx.cfginfo.insn_block[pos.inst() as usize];
         pos == self.ctx.cfginfo.block_entry[block.index()]
@@ -177,8 +177,8 @@ impl<'a, F: Function> Env<'a, F> {
         // - Otherwise, there must be at most one in-edge to `to`,
         //   and moves go at start of `to`.
         #[inline(always)]
-        fn choose_move_location<'a, F: Function>(
-            env: &Env<'a, F>,
+        fn choose_move_location<F: Function>(
+            env: &Env<'_, F>,
             from: Block,
             to: Block,
         ) -> (ProgPoint, InsertMovePrio) {
@@ -558,7 +558,7 @@ impl<'a, F: Function> Env<'a, F> {
         }
 
         // Handle multi-fixed-reg constraints by copying.
-        for fixup in core::mem::replace(&mut self.multi_fixed_reg_fixups, vec![]) {
+        for fixup in std::mem::take(&mut self.multi_fixed_reg_fixups) {
             let from_alloc = self.get_alloc(
                 Inst::new(fixup.pos.inst() as usize),
                 fixup.from_slot as usize,
@@ -670,8 +670,8 @@ impl<'a, F: Function> Env<'a, F> {
         // Redundant-move elimination state tracker.
         let mut redundant_moves = RedundantMoveEliminator::default();
 
-        fn redundant_move_process_side_effects<'a, F: Function>(
-            this: &Env<'a, F>,
+        fn redundant_move_process_side_effects<F: Function>(
+            this: &Env<'_, F>,
             redundant_moves: &mut RedundantMoveEliminator,
             from: ProgPoint,
             to: ProgPoint,
@@ -697,12 +697,9 @@ impl<'a, F: Function> Env<'a, F> {
             for inst in start_inst..end_inst {
                 let inst = Inst::new(inst as usize);
                 for (i, op) in this.func.inst_operands(inst).iter().enumerate() {
-                    match op.kind() {
-                        OperandKind::Def => {
-                            let alloc = this.get_alloc(inst, i);
-                            redundant_moves.clear_alloc(alloc);
-                        }
-                        _ => {}
+                    if op.kind() == OperandKind::Def {
+                        let alloc = this.get_alloc(inst, i);
+                        redundant_moves.clear_alloc(alloc);
                     }
                 }
                 for reg in this.func.inst_clobbers(inst) {
@@ -790,7 +787,7 @@ impl<'a, F: Function> Env<'a, F> {
                     if let Some(reg) = dedicated_scratch.take() {
                         return Some(Allocation::reg(reg));
                     }
-                    while let Some(preg) = scratch_iter.next() {
+                    for preg in scratch_iter.by_ref() {
                         if !self.pregs[preg.index()]
                             .allocations
                             .btree

@@ -311,9 +311,7 @@ fn recognize(program: &Program, f: Function) -> Option<Modulus> {
     let mut ret_odd_rem = None;
     let mut ret_odd_inst = None;
     for (ret_inst, value_opt) in &returns {
-        let Some(value) = *value_opt else {
-            return None;
-        };
+        let value = (*value_opt)?;
         if const_i32(data, value) == Some(0) {
             if ret0_inst.is_some() {
                 return None;

@@ -28,7 +28,7 @@ use crate::reg_alloc::{
 use core::convert::TryFrom;
 use log::trace;
 
-impl<'a, F: Function> Env<'a, F> {
+impl<F: Function> Env<'_, F> {
     fn merge_bundle_properties(&mut self, from: LiveBundleIndex, to: LiveBundleIndex) {
         if self.bundles[from].cached_fixed() {
             self.bundles[to].set_cached_fixed();
@@ -140,17 +140,16 @@ impl<'a, F: Function> Env<'a, F> {
         }
 
         // Check for a requirements conflict.
-        if self.bundles[from].cached_stack()
+        if (self.bundles[from].cached_stack()
             || self.bundles[from].cached_fixed()
             || self.bundles[from].limit.is_some()
             || self.bundles[to].cached_stack()
             || self.bundles[to].cached_fixed()
-            || self.bundles[to].limit.is_some()
+            || self.bundles[to].limit.is_some())
+            && self.merge_bundle_requirements(from, to).is_err()
         {
-            if self.merge_bundle_requirements(from, to).is_err() {
-                trace!(" -> conflicting requirements; aborting merge");
-                return false;
-            }
+            trace!(" -> conflicting requirements; aborting merge");
+            return false;
         }
 
         trace!(" -> committing to merge");

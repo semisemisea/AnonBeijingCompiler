@@ -63,8 +63,8 @@ impl Pass for ModFold {
                 program: &*data.program,
                 curr_func: data.curr_func,
             };
-            let nonneg = return_summary::nonneg_preserving_functions(&data.program);
-            let all_params = return_summary::always_nonneg_params(&data.program, &nonneg);
+            let nonneg = return_summary::nonneg_preserving_functions(data.program);
+            let all_params = return_summary::always_nonneg_params(data.program, &nonneg);
             let self_params = all_params
                 .get(&data.curr_func.expect("run_on always sets curr_func"))
                 .cloned()

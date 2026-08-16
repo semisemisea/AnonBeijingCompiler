@@ -175,8 +175,8 @@ impl BlockLoweringOrder {
         let mut lowered_succ_indices = Vec::new();
         let lowered_succ_ranges = Vec::from_iter(lowered_order.iter().map(|lb| {
             let start = lowered_succ_indices.len();
-            let opt_inst = match lb {
-                &LoweredBlock::Orig { block } => {
+            let opt_inst = match *lb {
+                LoweredBlock::Orig { block } => {
                     let range = block_succ_range[&block].clone();
                     lowered_succ_indices
                         .extend(block_succ[range].iter().map(|lb| lb_index_map[lb]));
@@ -190,7 +190,7 @@ impl BlockLoweringOrder {
 
                     arena.is_branch(last).then_some(last)
                 }
-                &LoweredBlock::Edge { succ, .. } => {
+                LoweredBlock::Edge { succ, .. } => {
                     let succ_index = lb_index_map[&LoweredBlock::Orig { block: succ }];
                     lowered_succ_indices.push(succ_index);
                     None

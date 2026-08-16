@@ -259,7 +259,7 @@ impl<'a> LlvmWriter<'a> {
             .value()
             .first()
             .map(|&v| self.arena.inst_data(v).ty().clone())
-            .unwrap_or_else(|| Type::get_i32());
+            .unwrap_or_else(Type::get_i32);
         let mut s = String::from("[");
         for (i, &v) in agg.value().iter().enumerate() {
             if i > 0 {
@@ -416,9 +416,8 @@ impl<'a> LlvmWriter<'a> {
         // Pass 2: block params then non-alloca insts (block order)
         for (_, bb_params, insts) in &all_bbs_and_insts {
             for &param in bb_params {
-                if !self.local_names.contains_key(&param) {
-                    self.local_names
-                        .insert(param, format!("%{}", self.name_counter));
+                if let Vacant(entry) = self.local_names.entry(param) {
+                    entry.insert(format!("%{}", self.name_counter));
                     self.name_counter += 1;
                 }
             }
@@ -620,8 +619,6 @@ impl<'a> LlvmWriter<'a> {
 
         if !is_mulmod && !ty.is_unit() && !is_cmp && !is_select {
             write!(self.buffer, "  {} = ", get_name!(self, inst))?;
-        } else if !is_mulmod && !ty.is_unit() {
-            write!(self.buffer, "  ")?;
         } else if !is_mulmod {
             write!(self.buffer, "  ")?;
         }
@@ -657,7 +654,7 @@ impl<'a> LlvmWriter<'a> {
                     bb_label!(self, branch.f_target())
                 )?;
                 writeln!(self.buffer)?;
-                return Ok(());
+                Ok(())
             }
             InstKind::Cast(cast) => self.visit_cast(cast, &ty),
             InstKind::Call(call) => self.visit_call(inst, call, &ty),
@@ -791,7 +788,7 @@ impl<'a> LlvmWriter<'a> {
                         return Ok(());
                     }
                     self.emit_aggregate_store(&agg, store.dest(), &src_ty, &[])?;
-                    return Ok(());
+                    Ok(())
                 } else {
                     let src_data = self.arena.inst_data(store.src());
                     writeln!(
@@ -887,7 +884,7 @@ impl<'a> LlvmWriter<'a> {
                         self.buffer,
                         "{} = {} {} {}, {}",
                         cmp_name,
-                        format!("icmp {}", cmp_op),
+                        format_args!("icmp {}", cmp_op),
                         llvm_ty,
                         lhs,
                         rhs
@@ -1293,8 +1290,8 @@ impl<'a> LlvmWriter<'a> {
         match ty.kind() {
             TypeKind::Int32 | TypeKind::Float32 => 4,
             TypeKind::Pointer(_) | TypeKind::String => 8,
-            TypeKind::Array(elem, len) => (*len as usize) * self.type_size_bytes(elem),
-            TypeKind::Vector(elem, lanes) => (*lanes as usize) * self.type_size_bytes(elem),
+            TypeKind::Array(elem, len) => *len * self.type_size_bytes(elem),
+            TypeKind::Vector(elem, lanes) => *lanes * self.type_size_bytes(elem),
             _ => 0,
         }
     }

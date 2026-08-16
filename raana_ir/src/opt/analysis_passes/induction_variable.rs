@@ -174,16 +174,16 @@ impl DerivedInductionVariable {
 
     pub fn removable_chain_cost(&self, data: &FunctionData, consumer: Inst) -> usize {
         let chain = self.chain.iter().copied().collect::<FxHashSet<_>>();
-        self.chain
-            .iter()
-            .all(|&inst| {
-                data.inst_data(inst)
-                    .used_by()
-                    .iter()
-                    .all(|user| *user == consumer || chain.contains(user))
-            })
-            .then_some(self.chain.len())
-            .unwrap_or(0)
+        if self.chain.iter().all(|&inst| {
+            data.inst_data(inst)
+                .used_by()
+                .iter()
+                .all(|user| *user == consumer || chain.contains(user))
+        }) {
+            self.chain.len()
+        } else {
+            0
+        }
     }
 }
 

@@ -566,7 +566,7 @@ pub struct Env<'a, F: Function> {
     pub ctx: &'a mut Ctx,
 }
 
-impl<'a, F: Function> Deref for Env<'a, F> {
+impl<F: Function> Deref for Env<'_, F> {
     type Target = Ctx;
 
     fn deref(&self) -> &Self::Target {
@@ -574,13 +574,13 @@ impl<'a, F: Function> Deref for Env<'a, F> {
     }
 }
 
-impl<'a, F: Function> DerefMut for Env<'a, F> {
+impl<F: Function> DerefMut for Env<'_, F> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.ctx
     }
 }
 
-impl<'a, F: Function> Env<'a, F> {
+impl<F: Function> Env<'_, F> {
     /// Get the VReg (with bundled RegClass) from a vreg index.
     #[inline]
     pub fn vreg(&self, index: VRegIndex) -> VReg {
@@ -596,7 +596,7 @@ impl<'a, F: Function> Env<'a, F> {
         let old_class = self.vregs[vreg].class.replace(vreg.class());
         // We should never observe two different classes for two
         // mentions of a VReg in the source program.
-        debug_assert!(old_class == None || old_class == Some(vreg.class()));
+        debug_assert!(old_class.is_none() || old_class == Some(vreg.class()));
     }
 
     /// Is this vreg actually used in the source program?
@@ -706,7 +706,7 @@ impl core::cmp::Ord for LiveRangeKey {
 pub struct PrioQueueComparator<'a> {
     pub prios: &'a [usize],
 }
-impl<'a> ContainerComparator for PrioQueueComparator<'a> {
+impl ContainerComparator for PrioQueueComparator<'_> {
     type Ix = LiveBundleIndex;
     fn compare(&self, a: Self::Ix, b: Self::Ix) -> core::cmp::Ordering {
         self.prios[a.index()].cmp(&self.prios[b.index()])
@@ -917,9 +917,9 @@ pub struct Stats {
 // they can be loaded with a single u64 load on little-endian machines.
 #[inline(always)]
 pub fn u64_key(b: u32, a: u32) -> u64 {
-    a as u64 | (b as u64) << 32
+    a as u64 | ((b as u64) << 32)
 }
 #[inline(always)]
 pub fn u128_key(d: u32, c: u32, b: u32, a: u32) -> u128 {
-    a as u128 | (b as u128) << 32 | (c as u128) << 64 | (d as u128) << 96
+    a as u128 | ((b as u128) << 32) | ((c as u128) << 64) | ((d as u128) << 96)
 }

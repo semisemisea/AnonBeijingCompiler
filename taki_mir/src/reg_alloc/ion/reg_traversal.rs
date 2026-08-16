@@ -44,7 +44,7 @@ impl RegTraversalIter {
             mask.add_up_to(PReg::new(offset % PReg::MAX, class));
             let mut regs: Vec<_> = (set & mask.invert())
                 .into_iter()
-                .chain((set & mask).into_iter())
+                .chain(set & mask)
                 .filter(|&reg| accept(reg))
                 .collect();
             regs.shrink_to_fit();

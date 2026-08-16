@@ -1104,7 +1104,7 @@ impl Pass for PointerStrengthReduction {
                 curr_func: data.curr_func,
             };
             let nonneg = crate::opt::analysis_passes::return_summary::nonneg_preserving_functions(
-                &data.program,
+                data.program,
             );
             let no_params = FxHashSet::default();
             let ranges = RangeAnalysis::new(&range_arena, &cfg, &loops, &ivs, &nonneg, &no_params);

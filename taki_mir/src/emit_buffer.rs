@@ -562,7 +562,7 @@ impl<'a, B: LowerBackend> EmitBuffer<'a, B> {
 
         let mut out = String::new();
         let mut label_cursor = 0;
-        let mut emit_labels = |out: &mut String, at: usize, label_cursor: &mut usize| {
+        let emit_labels = |out: &mut String, at: usize, label_cursor: &mut usize| {
             while *label_cursor < label_events.len() && label_events[*label_cursor].0 == at {
                 out.push_str(&self.block_labels[label_events[*label_cursor].1]);
                 out.push_str(":\n");

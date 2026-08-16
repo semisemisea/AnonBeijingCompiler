@@ -8,7 +8,7 @@
 > **milestone 1（matmul1 掩码内核 j/k interchange 解锁）已完成（2026-08-10）**：
 > matmul1 掩码内核完整向量化（-O2 语义 PASS、functional + h_functional 152/152、
 > RISC-V 无新回归）。
-> **milestone 2（P0）：conv2d 计算内核多臂 if 掩码向量化**（进行中）——2026-08-10
+> **milestone 2（P0）：conv2d 计算内核多臂 if 掩码向量化（已完成 2026-08-16）**——2026-08-10
 > 深入收益分析确认：conv2d-1 的 5×5 卷积内核占 83.3% 权重（N_eff=521 → 6.78M
 > 乘加），是唯一高收益目标（向量化 3-4 倍 → 整体 ~60% 静态加速）。详细计划见
 > §3.3。其余候选已实证低收益或受阻：checksum（3.3% 权重）需 load bound 提升但
@@ -23,13 +23,23 @@
 > 死参数/多臂 acc 识别，analyze 全通、apply 安全拒绝（修固定点死循环）。
 > **阶段 3a（apply 常量 trip 向量化核心）已完成（2026-08-11，4e57d90）**：合成
 > 5 点卷积内核真正向量化（单测 +1），后端 SSA 安全（iv_vec/vzero 定义位置修复）。
-> **阶段 3b 阻塞中（2026-08-11 起）**：runtime bound 的主循环 In 行基址被 lowering
-> 成 `rr*4`（应 `rr*N_eff`）读错行 → checksum 错误；标量 tail 骨架已建但未启用，
-> runtime 保守拒绝（行为零变化 835 指令，152/152）。定位进展：已排除 const_cse 与
-> 全部 MIR pass，锁定 lowering 层双动态 GEP offset（`Add(Mul,Sub)`）index 求值错
-> （详见 §3.3 阶段 3b）。已制定 MIR 级精确定位计划（env gate 放行 + MIR trace +
-> 根因修复 + 全量验证），见 §3.3。
-> 待做：§5 主计划 E 剩余项（M51 指针槽/SROA、M55、M56）与 §6 后续候选。
+> **阶段 3b（runtime-bound 多臂向量化，默认启用）已完成（2026-08-16）**：移除
+> `M44_ALLOW_RUNTIME` env gate，runtime-bound 循环默认走多臂向量化路径；每单元
+> 标量守卫放宽为"任意 lane 在界"（§2.5 修复首个向量迭代丢高 lane）；标量 tail
+> 的 acc 种子改为每列独立归零。conv2d 计算内核默认向量化（checksum
+> `-985110360` 正确），functional + h_functional -O2 **152/152**，conv2d-1/2/3
+> 全 PASS。**遗留**（已由 3c 修复）：conv2d 函数静态指令膨胀（2067 整文件 /
+> 内核 1690）。
+> **阶段 3c（代码膨胀修复）已完成（2026-08-16）**：GVN 结构性 CSE `VectorSplat`
+> （新增 `ValueKey::VectorSplat`，164 个 splat 在 LICM 提升后合并，单测 +2）+ apply
+> 共享 splat 缓存（`zero`/`bound` 在公共支配点只 splat 一次）。conv2d 整文件
+> 2067 → **1358**、conv2d 内核 1690 → **979**；01_mm1/matmul1/transpose 等向量化
+> 用例同步下降，perf 语料无回归（huffman 的 ± 是既有编译器非确定性噪声，见 §4）。
+> **milestone 2（P0，conv2d 计算内核多臂 if 掩码向量化）整体验收达成（2026-08-16）**：
+> conv2d 计算内核默认向量化且正确（checksum `-985110360`），-O2 152/152、
+> conv2d-1/2/3 PASS、静态计数从 2067 降到 1358。
+> 待做：§5 主计划 E 剩余项（M51 指针槽/SROA、M55、M56）与 §6 后续候选
+> （conv2d 每 tap 守卫共享、CHOPPER 寄存器压力预算等）。
 
 ## 已完成里程碑摘要
 
@@ -144,13 +154,13 @@ TCO, TailRecursiveInline, BooleanSimplification, GVNPRE, DeadPhiElim, DCE。
 | 01_mm1 | 14 | mm 内核 8 元素/轮（M70），验收达成 |
 | matmul1 | 掩码内核向量化 | 掩码内核 j/k interchange 解锁 + 完整向量化（内层 j：ldr q ×3 + dup ×2 + mul/and/cmeq/eor/orr + add v + str q），sum + 清零循环也向量化 |
 | h-10-01 | 9 | f32 循环 |
-| conv2d-1 | 21 | 清零/零初始化 + row_reduce + nonlinear + sum 循环向量化；**5×5 计算内核（83.3% 权重）仍标量**（里程碑 2 目标） |
+| conv2d-1 | 21+内核 | 清零/零初始化 + row_reduce + nonlinear + sum 循环向量化；**5×5 计算内核默认向量化**（阶段 3b，checksum 正确）且**代码膨胀已收敛**（阶段 3c：整文件 2067 → 1358，内核 1690 → 979） |
 | crypto-1 | 2 | 既有向量化循环 |
 
-### 1.4 当前拒绝分布（2026-08-10 复扫，M44_TRACE=1，dedup top）
+### 1.4 当前拒绝分布（2026-08-16 复扫，M44_TRACE=1，dedup top）
 
-- conv2d-1 计算内核（5 点卷积，while_entry_7）：`shape_body_not_2_blocks`（多臂
-  if，需多臂 if 掩码合并）；其余 `shape_header_multi_inst` 多为已向量化循环的
+- conv2d-1 计算内核（5×5 卷积，多臂 if）：**已向量化**（阶段 3b 默认启用），不再
+  报 `shape_body_not_2_blocks`；`shape_header_multi_inst` 多为已向量化循环的
   固定点噪声（init_kernel/row_reduce/nonlinear 等已向量化）。
 - checksum 循环（`sum += Out[i]`）：bound=`N_eff²` 在 header 计算，需 load bound
   提升，但触发 LoopUnroll 对 runtime bound 循环的展开 bug（见 §3.3）。
@@ -161,8 +171,11 @@ TCO, TailRecursiveInline, BooleanSimplification, GVNPRE, DeadPhiElim, DCE。
 ### 1.5 方法论约束（AGENTS.md）
 
 - 真正的质量门禁是 Docker 测试 harness + 与 clang/gcc -O2 的静态代码量对比；
-- 静态指令计数（`scripts/perf_compare.sh`）为确定性回归代理；gem5 A53 SE 为动态
-  验证；QEMU 仅语义差分；
+- 静态指令计数（`scripts/perf_compare.sh`）为回归代理，但**同一二进制多次编译
+  .s 非确定**（RA/调度受随机哈希影响，同源同二进制计数可差 ~8，huffman-02 实测
+  550-558）：比较两版编译器时须同二进制多次采样取中位/区间，单次差值 ≤ ~10 视为
+  噪声（见 §4）；
+- gem5 A53 SE 为动态验证；QEMU 仅语义差分；
 - 未获得 XCZU15EG 实机数据前，只声称"静态模型改进"，不声称实机收益；
 - 任何 AArch64 改动必须同时验证 RISC-V 不回归（`make test-riscv`）；
 - 不允许针对测试用例的优化（`docs/Illegal_optimization.md`）。
@@ -220,7 +233,7 @@ stale used_by 清理。结果：内层 j 循环 `ldr q ×3 + dup ×2 + mul/and/c
 add v + str q`，-O2 语义 PASS、152/152、RISC-V 无新回归。历史设计与细节以 Git
 提交记录为准。
 
-### 3.3 里程碑 2（P0）：conv2d 计算内核多臂 if 掩码向量化
+### 3.3 里程碑 2（P0）：conv2d 计算内核多臂 if 掩码向量化（已完成 2026-08-16）
 
 **论文依据**：SuperVectorization（循环 co-iteration / 跨控制流打包：外层 IV 以
 passthrough 线程化进内层）+ Parsimony（uniform/varying 分类：uniform 分支/值用
@@ -230,7 +243,7 @@ passthrough 线程化进内层）+ Parsimony（uniform/varying 分类：uniform 
 - conv2d-1 输入 state=4561、repeat_factor=1 → N_eff=521。各循环迭代权重：
   | 循环 | 迭代次数 | 权重 | 现状 |
   |---|---|---|---|
-  | **conv2d 计算内核（5×5 卷积）** | 6.78M 乘加 | **83.3%** | 标量，未向量化 |
+  | **conv2d 计算内核（5×5 卷积）** | 6.78M 乘加 | **83.3%** | **已向量化（阶段 3b）**，膨胀已收敛（阶段 3c） |
   | row_reduce | 542K | 6.7% | 已向量化 |
   | checksum | 271K | 3.3% | 标量，未向量化（需修 LoopUnroll） |
   | nonlinear | 271K | 3.3% | 已向量化 |
@@ -242,7 +255,7 @@ passthrough 线程化进内层）+ Parsimony（uniform/varying 分类：uniform 
   vs 向量 1 轮 ≈ 40 条（25 掩码乘加 + 边界掩码 + Out store）→ 约 5 倍乘加密集
   区加速，保守估 3-4 倍。
 
-**目标形态（conv2d 计算内核，c 循环向量化）**：
+**目标形态（conv2d 计算内核，c 循环向量化）——已达成（阶段 3b）**：
 - c 循环 `while_entry_7`（`c < N_eff`，test-at-top，IV 步进 1）body 有 **52 个
   基本块**：25 次乘加（5×5 卷积，kr/kc 全展开）+ 25 个边界检查
   （`cc=c+kc-2` 的 `ge/lt/and/neq` 链）。
@@ -261,9 +274,10 @@ passthrough 线程化进内层）+ Parsimony（uniform/varying 分类：uniform 
 - In/Out 为 16B 对齐全局数组 ✓；c 循环访问连续 ✓；现有 B1 掩码基础设施
   （`tn/fo/sel` 组合 + `vector_operand` splat）可作扩展起点。
 
-**现状根因（2026-08-10 代码实证）**：
-- conv2d 计算内核被 `shape_body_not_2_blocks` 拦截——**多臂 if**（land_merge_10
-  /then_23/end_12 的边界检查链，5 kc × 5 kr 全展开，52 个基本块）。
+**现状根因（2026-08-10 代码实证，历史；识别/向量化已随阶段 1-3b 完成）**：
+- conv2d 计算内核曾因 `shape_body_not_2_blocks` 被拦——**多臂 if**（land_merge_10
+  /then_23/end_12 的边界检查链，5 kc × 5 kr 全展开，52 个基本块）；阶段 1 起
+  放行识别，阶段 3b 默认向量化。
 - conv2d-1 的 `shape_header_multi_inst`（26）**大多是已向量化循环的固定点噪声**
   （init_kernel/row_reduce/nonlinear 等已向量化）。
 - **checksum 循环**（`sum += Out[i]`，bound=`N_eff²` 在 header 计算）：shape_header
@@ -298,7 +312,7 @@ passthrough 线程化进内层）+ Parsimony（uniform/varying 分类：uniform 
 6. acc 识别（M42 Reducible）+ exit 分类（IvFinal/Acc/Passthrough）通过（conv2d
    exit `while_end_8` 传 iv、acc、%62、%9）。
 
-*阶段 3 —— 掩码乘加核心 + sum_v 累加 + Out store（apply）—— 阶段 3a 已完成*
+*阶段 3 —— 掩码乘加核心 + sum_v 累加 + Out store（apply）—— 阶段 3a/3b/3c 已完成*
 
 *阶段 3a —— 常量 trip 向量化核心 —— 已完成 2026-08-11（68ae13d + 4e57d90）*
 7. apply_multi_arm：常量 trip（% VF == 0）多臂掩码累加向量化：
@@ -311,138 +325,145 @@ passthrough 线程化进内层）+ Parsimony（uniform/varying 分类：uniform 
    - M42 依赖分析修复：loop 内 Integer 常量索引系数 0
    - 单测 vectorizes_multi_arm_masked_kernel（const trip 64）+1，raana_ir 425 全绿
 
-*阶段 3b —— runtime bound / trip%VF 残留（阻塞中，下述为待执行计划）*
+*阶段 3b —— runtime bound / trip%VF 残留 —— 已完成 2026-08-16*
 
-**现象（2026-08-11 实证）**：conv2d 计算内核（N_eff=521，runtime bound）在
-`apply_multi_arm` 放行后，主循环 In 行基址被 lowering 成 `rr*4`（应 `rr*N_eff`），
-cc 也错为 11 → 读错行 → checksum 错误（Out[r][c] 逐行线性递增）。当前
-`multi_arm_runtime_unsupported` 保守拒绝，conv2d 行为零变化（835 指令）。
+**完成摘要**：runtime-bound 多臂向量化路径默认启用（移除 `M44_ALLOW_RUNTIME`
+env gate）。三处改动（`loop_vectorize.rs`）：
+1. **移除 gate**：`apply_multi_arm` 拒绝条件 `(runtime_trip && !runtime_ok) ||
+   trip % step != 0` → `trip % step != 0`。runtime-bound 循环默认进入向量化，
+   `trip & 3` 残留由标量 tail（`vec_tail_ma`）覆盖。
+2. **§2.5 守卫放宽**：每单元标量分支守卫从"lane 0 在界"放宽为"任意 lane 在界"
+   （`cc + VF - 1 >= 0`），修复首个向量迭代（iv=0）丢 `kc_off < 0` 单元高 lane
+   的问题。
+3. **tail acc 归零**：tail 种子与回边 acc 从"reduce 和"改为 `zero`——每列和独立
+   （向量轮不喂给 tail），`build_multi_arm_tail` 的 acc 在 entry 边重播种、每个
+   回边重置。
 
-**已完成的排查与修复（2026-08-15 深入定位）**：
-- **修复 1 —— lane_off insert 链**：`apply_multi_arm` 的 lane_off 构建用了
-  `let lane_off =`（循环内 shadowing），导致每个 `VectorInsertElement` 都以最初的
-  `splat(0)` 为 vector 输入（而非前一个 insert），lane 偏移丢失 → cc_vec 无
-  lane 偏移。改为 `lane_off =`（赋值更新）后链式正确。
-- **修复 2 —— rr_ok 掩码**：`unit.rr_ok` 是标量 0/1（`neq(...,0)` 结果），
-  `VectorSplat` 后为 `{0|1}`，与全 1 的 cc 边界 mask `and` 后只保留最低位 →
-  `mul & mask` 每 lane 只留 bit0。改为 `rr != 0` 重新推导全 1 掩码。
-- **效果**：conv2d checksum 从 `-1669526304` → `-983874320`（期望
-  `-985110360`，差 1236040 ≈ 0.13%）。
-- **剩余问题（未解决）**：IR/MIR/pre-RA/post-RA/汇编各层单元级均正确
-  （K 绑定 `K[0..24]`、row_off、cc、mask、In 读取、mul 均验证正确），但运行时
-  Out[0] lane0 正确（-512）、lane1-3 错误（{65022,-766,32256} vs 期望
-  {106756,-81416,48631}）。gdb（qemu-gdbstub）寄存器观察不可靠，`ni` 确认
-  单单元（如 K[12]）In/K/mul 正确。疑点：acc 链（v14）lane 混叠、Out store
-  lane 顺序、或 RA 运行时值错误。
-- **已排除**：const_cse、全部 MIR pass、PSR/GVN/LICM（禁用仍错）。
+**修复过程（压缩）**：阶段 3b 卡在"IR/MIR/汇编静态单元级均正确但运行时
+Out[0] lane1-3 错"。最终根因正是上述 2/3 两点（守卫 lane-0 语义 + tail acc 交叉
+累加），非 lowering/RA 层。早先 71c9fc8（lane_off insert 链、rr_ok 标量 splat）
+已把 checksum 从 `-1669526304` 拉到 `-983874320`；本次修正后到达 `-985110360`
+（期望值）。验证：`cargo test -p raana_ir` 425 全绿；functional + h_functional
+-O2 **152/152**、0 CE/RE/TLE；conv2d-1/2/3 全 PASS。
 
-**目标**：修复主循环 Out lane1-3 累加错误，使 conv2d 计算内核（83.3% 权重）
-正确向量化，静态指令从 835 显著下降。
+**遗留（已由 3c 修复，见下）**：conv2d 函数静态指令 **2067 vs 标量 461**
+（~4.5× 膨胀），向量主循环本身未被 LoopUnroll 再次展开（25 个向量 mul = 25 tap，
+单份拷贝），膨胀来自 25-tap 内核每 tap 的常数/掩码/守卫重复物化。
 
-**Step 1 —— 临时放行 runtime（仅调试，不提交生产语义）**
-- 在 `apply_multi_arm` 的 `multi_arm_runtime_unsupported` 拒绝处加 env gate：
-  仅当 `std::env::var("M44_ALLOW_RUNTIME").is_ok()` 时放行 runtime_trip，否则
-  维持保守拒绝。默认行为不变（conv2d 仍 835 指令）。
-- 目的：让 conv2d 走向量化路径复现 bug，同时保证正常构建/测试不受影响。
+*阶段 3c —— 多臂向量化代码膨胀修复 —— 已完成 2026-08-16*
 
-**Step 2 —— MIR 级精确定位（核心）**
-- 用现成 MIR trace（无需新代码）：`taki_mir::lower` 的 `trace!`（lower.rs:1397
-  每 HIR inst 打印选中 MInst）：
-  ```
-  M44_ALLOW_RUNTIME=1 RUST_LOG=taki_mir::lower=trace \
-    target/debug/compiler -S -O 2 --target aarch64 -o /tmp/cv3.s \
-    tests/perf/conv2d-1.sy
-  ```
-- 同时 `--emit ir,asm` 输出 `/tmp/cv3/{conv2d-1.ir, conv2d-1.s}` 对照。
-- 主循环（`land_merge_13` / `while_entry_8` 区域）In load 期望 MIR 链：
-  `load N_eff → sub r,2 → mul rr,N_eff → sub iv,2 → add → add base, idx<<2`。
-- 逐条比对 trace 实际选中的 MInst，定位差异点（哪一步操作数/指令/寄存器错）。
-  trace 过大时用 `grep 'conv2d'` + `Load|Mul|AluRRR|AluRRRExtend|Sxtw` 过滤。
+**现象（2026-08-16 实证）**：3b 完成后 conv2d 计算内核默认向量化，但 conv2d
+整文件静态指令 2067（内核 1690）vs 标量 461（~4.5×）。**关键事实：向量主循环
+未被再次展开**，循环体内恰好 25 个向量 mul（25 tap，单份拷贝）；膨胀来自
+25-tap 内核每 tap 的常数/掩码/守卫重复物化。
 
-**Step 3 —— 根因修复（按概率排序的方向）**
-1. **acc 链（v14）lane 混叠**：主循环 25 单元累加 `add v14 = v14 + v0`，
-   lane0 正确但 lane1-3 错 → 检查 acc 链在单元间是否 lane 错位。
-2. **Out store lane 顺序**：`str q14, [x5]` 的 lane 与 Out[c] 对应关系。
-3. **RA 运行时值**：gdb 不可靠，用 QEMU `-d` 或编译器内部 dump 验证。
-4. **`lower_get_elem_ptr` / `fold_mul_add_sub` / `fold_mul_constant`**：对
-   `Add(Mul,Sub)` 的折叠路径。
-5. **block 参数错位**：主循环 header 的 passthrough / iv 参数位置与
-   `BlockArgRef` 不一致（AGENTS.md 强调的 params() 切片约定）。
+**膨胀构成（conv2d 整文件，2067 条）**：
 
-**Step 4 —— 验证门禁**
-- `cargo test -p raana_ir`（425 测试全绿）。
-- `make test functional h_functional ARGS="-O 2"`（152/152）。
-- `make test-riscv ARGS="-O 2"`（AArch64 改动必须双 target 验证）。
-- conv2d 专项：编译 + 链接 + `make run-elf` 验证 checksum `-985110360`
-  （输入 `4561\n1`）。
-- `scripts/perf_compare.sh conv2d-1 conv2d-2 conv2d-3`：静态指令数应从 835
-  大幅下降（目标 ≥2 倍）。
+| 区块 | 指令数 | 内容 |
+|---|---|---|
+| prologue | 563 | 128 `dup` + 125 `str q`（常量物化+压栈） |
+| 循环体 | 1127 | 25 tap + 守卫 + **274 ldr/str q 常量重载** + 84 标量 spill |
+| 标量 tail | 271 | `trip&3` 余数列（2 列展开标量 epilogue） |
 
-**Step 5 —— 收尾**
-- 移除 `M44_ALLOW_RUNTIME` 临时 gate，正式启用 runtime 路径（更新
-  `multi_arm_runtime_unsupported` 注释为已接线）。
-- 更新 TODO.md：阶段 3b 完成，里程碑 2 收敛。
-- 提交风格：`[Opt(IR)]: 里程碑 2 阶段 3b —— runtime-bound 多臂向量化（M??）`。
+**根因（实施前确定，压缩）**：
+1. **GVN 不 CSE `VectorSplat`**（主因）：`gvn.rs` 把 `InstKind::VectorSplat(..)`
+   归入 `(ValueKey::Identity, false)`（非 eliminable）→ 164 个 splat 全部幸存，
+   但只有 ~40 个不同值（`splat(0)`×60、`splat(N_eff)`×26、`splat(rr_ok)` 25 份、
+   `splat(kc_off)` 25 份、`splat(K[k])` 25 份真不同）；LICM 提升到 entry → prologue
+   128 dup + 125 str q，循环体每 tap 从栈重载 → 274 ldr/str q。
+2. **apply 每次调用 `vector_operand` 都传全新空 map**：同一 `zero`/`bound`/`rr`
+   操作数在 IR 源头被反复重复 splat。
+3. （记录，未修）每 tap 标量守卫重复计算（循环体 91 条标量守卫），留作后续。
 
-**回退方案**：若 `Add(Mul,Sub)` 双动态 offset 在 lowering 层难以通用支持，改为
-在 apply 侧把 offset 拆成**行基址 GEP + cc 偏移 GEP 两步**（row_off 外提到
-header，cc 单独作 dynamic term），从源头避免双动态项。
+**修复与实现（压缩）**：
+- **Fix 1 —— GVN 结构性 CSE `VectorSplat`**：`ValueKey` 新增
+  `VectorSplat { result_ty, src }` 变体，`number()` 中拆出独立匹配臂
+  `(ValueKey::VectorSplat { result_ty: ty, src: self.number(data, splat.src()).number }, true)`
+  （`eliminable=true`）。splat 是纯操作，src 已按值编号（Integer）或按 inst 身份
+  编号（Load，本就不可 eliminable），跨 store 不会误合并；leader 按支配树作用域
+  跟踪，非支配块间不合并。新增 2 单测：相同 splat 合并（`merges_identical_vector_splats`）、
+  store 分隔的 load 的 splat 不合并（`does_not_merge_splats_of_loads_split_by_store`）。
+- **Fix 2 —— apply 共享 splat 缓存（源头清理）**：unit 循环外建 `shared_splats`
+  map，预置 `{zero: vzero}`（vzero 定义于 preheader，支配全体）与
+  `{bound: bound_splat}`（bound_splat 插在链公共支配点 `body_br0_term` 之前）；
+  7 处 `vector_operand` 调用统一传 `&mut shared_splats`。**关键正确性点**：unit 的
+  `then` 块互不支配（经 mask 假边互相可达），共享 splat 必须定义在公共支配点
+  （body_br0 或 preheader），否则会被非支配块误用——不能只换一个共享 map。
 
-*阶段 4 —— 验证与回归*
-11. `cargo test -p raana_ir`（新增多臂掩码向量化单测）。
-12. `make test functional h_functional ARGS="-O 2"`（152 用例）。
-13. `make test-riscv ARGS="-O 2"`。
-14. perf 静态指令数对比：conv2d-1 计算内核指令数应大幅下降（`scripts/perf_compare.sh`）。
+**验证结果（2026-08-16）**：
+- `cargo test -p raana_ir`：**427/427**（425 + 2 新增 GVN 单测）。
+- `make test functional h_functional ARGS="-O 2"`：**152/152**，0 CE/RE/TLE。
+- conv2d-1/2/3 全 PASS；checksum `-985110360` 正确（输入 `4561\n1`）。
+- 静态计数（`scripts/perf_compare.sh` awk 法，整文件）：conv2d-1/2/3 **2067 → 1358**
+  （内核 1690 → 979，符合并优于预期 ~1000-1200）；01_mm1/2/3 395→386（-9）、
+  matmul1/2/3 228→226（-2）、many_mat_cal -1、transpose -5；其余用例持平。
+- 无回归确认：huffman-01/02/03 的 ±（-7/+13/+4）为**既有编译器非确定性噪声**
+  （同二进制多次编译 RA/调度随机，huffman-02 实测计数 550-558 摆动；huffman IR
+  无任何 splat，GVN 改动对其零影响），见 §1.5/§4。
+- RISC-V：`make test-riscv functional h_functional ARGS="-O 2"` 实测 151/152——唯一
+  失败 `h_functional/30_many_dimensions`（SIGSEGV）经回退验证为 **HEAD(71c9fc8)
+  既存失败**（其 RISC-V IR 无任何向量指令，纯标量路径，与里程碑 2 及 3c 均无关），
+  见 §4。计划中"按用户指示跳过 RISC-V"维持，本次属额外保险。
 
-*阶段 5 —— 3b 修复后的后续接线（3b 完成后）*
+**涉及文件（3c）**：
+- `raana_ir/src/opt/passes/gvn.rs`（Fix 1：ValueKey + number 匹配臂 + 2 单测）
+- `raana_ir/src/opt/passes/loop_vectorize.rs`（Fix 2：shared_splats 缓存 + 7 处调用点）
+
+**风险落地情况**：
+- GVN splat CSE 误合并——未发生（单测兜底；conv2d 语义 + 152/152 全绿）。
+- NEON 寄存器压力——40 个常量已足够小，conv2d 内核无新增 spill 迹象（循环体
+  常量重载 274 ldr/str q 已消失）；后续若仍紧张走根因 3 或 CHOPPER（§6 F）。
+- 根因 3 守卫共享——保留为后续候选（§6）。
+
+**提交风格**：`[Opt(IR)]: 里程碑 2 阶段 3c —— GVN VectorSplat CSE + apply 共享
+splat 缓存（conv2d 2067 → 1358）`。
+
+*阶段 4 —— 验证与回归（已随 3b/3c 分步执行）*
+11. `cargo test -p raana_ir`（新增多臂掩码向量化单测）。✓
+12. `make test functional h_functional ARGS="-O 2"`（152 用例）。✓（3b 152/152、
+    3c 152/152）
+13. `make test-riscv ARGS="-O 2"`。计划按用户指示跳过；实际额外跑了：3c 版
+    151/152，唯一失败 `h_functional/30_many_dimensions` 为 **HEAD 既存**（回退
+    验证），与 3c 无关（见 §4）。
+14. perf 静态指令数对比：conv2d 整文件 2067 → 1358（内核 1690 → 979）。✓
+
+*阶段 5 —— 3b 修复后的后续接线（已完成/伴随 3b）*
 15. 掩码乘加 lowering：复用现有 `VecMla` + `and` + 向量比较（VecCmp 已支持
-    Ge/Lt，mvn 反相）——无需新 MInst（评估确认）。
-16. runtime bound（N_eff）→ 标量 tail：`build_multi_arm_tail` 骨架已建但未启用，
-   3b 修复后接线（`trip & 3` 残差的标量 epilogue）。
-17. `trip % VF != 0` 常量残留同样走标量 tail 路径（与 runtime tail 复用）。
+    Ge/Lt，mvn 反相）——无需新 MInst（评估确认）。✓
+16. runtime bound（N_eff）→ 标量 tail：`build_multi_arm_tail` **已接线并默认
+    生效**（`loop_vectorize.rs:4954`），`trip & 3` 残差的标量 epilogue 已随 3b
+    验证（conv2d-1 N_eff=521，trip&3=1）。✓
+17. `trip % VF != 0` 常量残留同样走标量 tail 路径（与 runtime tail 复用）。✓
 
-**涉及文件**：
+**涉及文件（阶段 3b 已用，供 3c 参考）**：
 - `raana_ir/src/opt/passes/loop_vectorize.rs`（多臂掩码识别 + apply，核心）
 - `raana_ir/src/opt/analysis_passes/dependence.rs`（多臂 if 的依赖/别名判定）
 - `anon_armv8/src/lower.rs` + `instructions.rs`（向量掩码乘加 / 向量比较 lowering，
-  若现有 `VecMla`+`and` 组合不够；阶段 3b 重点：`lower_get_elem_ptr` /
-  `try_fold_dynamic_gep_amode` / `fold_mul_add_sub` / `fold_mul_constant`）
-- `taki_mir/src/lower.rs` + `reg_alloc/`（阶段 3b 重点：`analyze_gep` 单 dynamic
-  term 的 index 求值 + RA spill/reload 跨 block 循环不变量）
-- `anon_armv8/src/sched/dag.rs`（新向量指令的调度内存边，若新增 MInst）
+  复用 `VecMla`+`and`，未新增 MInst）
+- `taki_mir/src/lower.rs` + `reg_alloc/`（阶段 3b 曾重点排查，最终非根因）
 
-**验收**：
-- （阶段 1 已达成）conv2d-1 `M44_TRACE=1` 复扫不再报 `shape_body_not_2_blocks`
-  / `shape_header_multi_inst`，25 单元识别成功。
-- （待阶段 3-4）conv2d-1 计算内核出 `ldr q ×N + dup v + mla v ×25 + and v ×25
-  + add v + str q`。
-- conv2d-1 -O2 语义 PASS；`cargo test -p raana_ir`；`make test ARGS="-O 2"`
-  functional + h_functional 无回归；`make test-riscv ARGS="-O 2"` 无回归；
-  `scripts/perf_compare.sh` conv2d-1 静态计数显著下降（目标 ≥2 倍）。
-- **禁止针对测试用例的优化**：多臂掩码识别须基于通用 IR 结构（边界检查 +
-  串行累加），不得匹配 conv2d 函数名/常量。
+**验收（里程碑 2 整体）——已全部达成**：
+- conv2d-1 计算内核默认出 `ldr q ×N + dup v + mul v ×25 + and v ×25 + add v +
+  str q` ✓（3b）。
+- conv2d-1 -O2 语义 PASS ✓；`cargo test -p raana_ir` 427 全绿 ✓；`make test
+  ARGS="-O 2"` functional + h_functional 152/152 无回归 ✓；`scripts/perf_compare.sh`
+  conv2d-1 静态计数 2067 → 1358（内核 1690 → 979）✓（3c）。
+- **禁止针对测试用例的优化**：多臂掩码识别基于通用 IR 形状门控（边界检查 +
+  串行累加），splat CSE 基于值编号——均不匹配函数名/常量。✓
 
-**风险**：
-- 向量掩码边界语义错误（`cc` 在向量内部分满足）——高：保守掩码 + on/off 差分 +
-  语义 PASS。
-- 25 次累加链 use-def / 指令环（GVN 递归，参考里程碑 1 的 3e5f5ee 教训）——高：
-  严格依赖判定 + 后端 SSA 验证。
-- In/Out 对齐（16B）——中：全局数组已验证对齐；若参数指针需 IPA 对齐证明。
-- IR 复杂度（52 基本块 → 向量化）——中：阶段 1 先小 VF/子集验证，再全量。
-- 掩码乘加 lowering 缺 VecCmp——中：复用 `cmeq/eor/and` 组合或新增。
-- **lowering 双动态 GEP offset（`Add(Mul,Sub)`）index 求值错（阶段 3b 现状）**——
-  高：主循环 In 行基址被算成 `rr*4`（应 `rr*N_eff`），cc 错为 11，checksum 错。
-  已排除 const_cse / 全部 MIR pass / PSR / GVN / LICM，锁定 lowering 层
-  （`analyze_gep` 单 dynamic term + `lower_get_elem_ptr` 完整地址计算 + RA
-  spill/reload）。当前 runtime 保守拒绝兜底（行为零变化）；修复流程见阶段 3b。
-- **RA spill/reload 跨 block 循环不变量（row_off）**——中：row_off 每 r 算一次、
-  主循环多次用，spill 到 `[sp,#1312]`；定位时重点核对槽位分配与重载时机。
+**风险（里程碑 2 落地情况）**：
+- GVN splat CSE 误合并——未发生（单测兜底 + 全量语义 PASS）。
+- NEON 寄存器压力——40 个常量，无新增 spill 迹象；后续若紧张走根因 3 或
+  CHOPPER（§6 F）。
+- 根因 3 守卫重复计算——保留为后续候选（§6）。
 
 **已完成的子项（压缩）**：
 - **A3 test-at-top 多参数 passthrough（2026-08-09，2caf984）**：正确性改进
   （消除对 loop-invariant 常量 back-arg 的误拒），无 perf 收益。
 - **01_mm1 mm 内核（M70）**：已完全向量化（`ldp q×2 + mla×2 + stp q`，8 元素/轮），
   验收达成。
+- **阶段 3b/3c（2026-08-16）**：多臂向量化默认启用 + 代码膨胀收敛，里程碑 2 整体
+  验收达成（详见本节目录内各阶段摘要）。
 
 ### 3.4 里程碑 3（P1）：标量 min/max ISel + select→min/max 模式匹配
 
@@ -541,12 +562,14 @@ SLP 现成输入；conv2d `init_matrix`/`row_reduce`、01_mm/matmul 内层展开
 
 ```
 里程碑 1（matmul1 掩码内核，P0，rotated 多参数 B1）——已完成 2026-08-10
-  → 里程碑 2（conv2d 计算内核多臂 if 掩码向量化，P0，大工程）——进行中
+  → 里程碑 2（conv2d 计算内核多臂 if 掩码向量化，P0，大工程）——已完成 2026-08-16
      阶段 1 识别+gate+单测 已完成 2026-08-11（a96d8c9）
      阶段 2 analyze 完整支持 已完成 2026-08-11（068abe9）
      阶段 3a 常量 trip apply 向量化核心 已完成 2026-08-11（68ae13d + 4e57d90）
-     阶段 3b runtime bound lowering 修复 阻塞中（计划见 §3.3，MIR 级定位）
-     阶段 4-5 验证 + tail 接线
+     阶段 3b runtime-bound 默认启用 已完成 2026-08-16（守卫放宽 + tail acc 归零）
+     阶段 3c 膨胀修复（GVN VectorSplat CSE + apply 共享 splat 缓存）已完成 2026-08-16（conv2d 2067 → 1358）
+     阶段 4-5 验证 + tail 接线 已完成（随 3b/3c）
+  → 里程碑 2 整体验收达成 2026-08-16（conv2d 内核默认向量化 + 膨胀收敛，见 §3.3）
   → 里程碑 3（标量 min/max ISel，P1，最小，IR 无实例低价值，暂缓）
   → 里程碑 5（内联向量零初始化，P1，最小）——已完成 2026-08-09
   → 里程碑 4（M45 SLP，P1，最大）
@@ -564,15 +587,23 @@ SLP 现成输入；conv2d `init_matrix`/`row_reduce`、01_mm/matmul 内层展开
 
 ---
 
-## 4. 已知边界与遗留（2026-08-10 更新）
+## 4. 已知边界与遗留（2026-08-16 更新）
 
+- **RISC-V -O2 `h_functional/30_many_dimensions` SIGSEGV（HEAD 71c9fc8 既存，
+  未修）**：`make test-riscv functional h_functional ARGS="-O 2"` 151/152。回退到
+  71c9fc8 仍失败（多次复现、非抖动）；该用例 RISC-V IR 无任何向量指令，纯标量
+  路径，与里程碑 2 / 3c 均无关。**任何 RISC-V -O2 相关改动前必须先定位**（首查
+  lowering/RA 标量路径；case 为多维数组访问，可能涉及 GEP/栈寻址）。
+- **编译器 .s 输出非确定（既存）**：同一二进制多次编译同源，RA/调度受随机哈希
+  影响，指令布局/寄存器选择会摆动（huffman-02 实测整文件计数 550-558）。`make
+  test` 语义门禁不受影响；`scripts/perf_compare.sh` 做回归比较时须同二进制多次
+  采样取中位/区间，单次差值 ≤ ~10 视为噪声（见 §1.5）。
 - **LoopUnroll 对 runtime-bound 循环的展开 bug（2026-08-10 发现，未修）**：
   conv2d checksum 循环（bound=`N_eff²` 在 header）需 load bound 提升才能向量化，
   但提升后 LoopUnroll 会把 runtime-bound 的 arrCopy 循环（85_long_code）全展开成
   错误常量 store（基线是标量循环）。bound load 源在循环内不被写（依赖分析确认），
   展开仍出错——LoopUnroll 的 `constant_trip_count` 对 runtime trip 处理有误。
-  **修复它是解锁 checksum（+3 向量指令，~2.5% 整体收益）的前提**；优先级低于
-  conv2d 计算内核（83.3%）。
+  **修复它是解锁 checksum（+3 向量指令，~2.5% 整体收益）的前提**。
 - **test-at-top + B1 单臂 if 归约 = 保守拒绝**（`b1_arm_test_at_top_unsupported`，
   commit 238812e）：union_find 的 `if(parent[i]==i) clusters += 1` 形态（arm
   jump 带 binary 更新但 latch back arg 是 select phi）在 apply 侧未接线，GVN
@@ -582,6 +613,10 @@ SLP 现成输入；conv2d `init_matrix`/`row_reduce`、01_mm/matmul 内层展开
   按 hermes 新接口移植（`opt/pass.rs` + `analysis_passes/dependence.rs`）。
 - **f32 向量化残余**：`f32_scalars_do_not_alias_live_vector_results` 测试适配
   GPR 常量 splat 路径后保留；h-10 系列已收敛（h-10-01 9 条向量指令）。
+- **conv2d 每 tap 标量守卫重复计算（3c 根因 3，候选）**：§2.5 守卫
+  `cc+VF-1>=0 && cc<bound && rr_ok` 每 tap 重算（循环体 ~91 条标量守卫），
+  `cc` 只依赖 kc_off（5 值）、`rr_ok` 只依赖 kr（5 值），可共享成 5+5。中等
+  复杂度 CFG 重构，留作 §6 候选。
 
 ---
 
@@ -611,8 +646,8 @@ SLP 现成输入；conv2d `init_matrix`/`row_reduce`、01_mm/matmul 内层展开
 | D. non_unit_step 步长归一化 | Autovesk | A5，45 例 |
 | G. 回边 blockparam mov 消除（`_and/_xor/_or` 回边 3 mov） | Diospyros/Isaria | M35 遗留 |
 | H. 调度验证器闭环（verify_sched_deps） | Minotaur | §5.2 P2 |
+| conv2d 多臂每 tap 守卫共享（3c 根因 3） | — | 阶段 3c 记录：`cc` 5 值 + `rr_ok` 5 值，25 份守卫重算可共享成 5+5；中等 CFG 重构 |
 | 外层循环向量化（not_innermost） | SuperVectorization | 跨块，大改 |
-| VecCsel/bsl、向量比较 lowering | SuperVectorization | 随里程碑 2 伴生（掩码乘加，若 `VecMla`+`and`/`cmeq/eor` 组合不够才新增） |
 | 批量 int↔float 转换 | — | 排除（perf 无实证） |
 | ld2/ld3/ld4 交错存取（AoS→SoA） | — | 排除（perf 无交错布局） |
 

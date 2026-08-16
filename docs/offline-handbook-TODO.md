@@ -293,3 +293,54 @@ register/passes）不动。
 4. const_prop.rs 死代码：删/标注/照补？
 5. 执行顺序 G11→G12→G13→G14→G15 是否接受。
 
+## 第二轮执行记录（G11-G15 + 基础设施批次，已完成）
+
+### 用户决策（覆盖上述待确认项）
+- ① s2r 空仓库 → 对比基准用 git 5921037 ✅；② C 档全量中文化 ✅；
+  ③ taki_mir 英文薄文档纳入 G14 ✅；④ const_prop.rs 未注册管线，文档如实
+  标注"未注册、被 ipsccp 取代"，代码未删（留待用户定）✅；⑤ 顺序接受 ✅。
+- 流程变更：用户先抽查人工示例（loop_unroll/sr/rotate_loops/specialize），
+  认可后改为 **subagent 批量生产 + 主 agent 质检**；批次上限先 3 后 5/7，
+  最终放开全量（每批 ≤10 并行）。术语表独立成 `docs/offline-handbook/glossary.md`；
+  英文 doc 一律保留（C 档=英文块后追加中文，B 档=struct 英文 /// 原位保留）。
+
+### 完成情况
+
+| 任务 | 范围 | 方式 | 文档量 | 结论 |
+|------|------|------|--------|------|
+| 示例批 | loop_unroll / sr / specialize / rotate_loops（4 文件，人工） | 主 agent | ~320 行 | ✅ 用户认可，确立六要素+术语表引用风格 |
+| G11 | raana_ir A 档 8 文件 + PSR 3 子模块 | 主 agent + subagent×2（candidate/rewrite 供用户审查） | ~640 行 | ✅ 用户审查 subagent 产出合格，批准大批量 |
+| G12 | raana_ir B 档 11 文件（licm/if_conversion/boolean_simplify/tco 主 agent，余 7 subagent） | 混合 | ~1,040 行 | ✅ |
+| G13 | raana_ir C 档 12 文件（rotate_loops 已在示例批） | subagent×11 | ~1,050 行 | ✅ |
+| G14 | taki_mir 9 文件（lib crate 级 + abi/lower/inst_predicate/libcall + block_order/stats/types/div_magic） | subagent×9 | ~674 行 | ✅ |
+| G15 | soyo_compiler frontend 3 文件（ast/items/utils，AI 重构部分） | subagent×3 | ~384 行 | ✅ |
+| 基础设施批次 | analysis_passes 6 文件（call_graph/cfg/dom_tree/induction_variable/loop_analysis/pure_function） | subagent×6 | ~986 行 | ✅ |
+
+commit（docs/offline-handbook 分支，未 push）：
+`0a8d228` passes A/B/C 档（34 文件）→ `299067b` 计划+术语表 → `3845138` taki_mir（9 文件）→
+`4be4b65` soyo_compiler frontend（3 文件）→ `ca6ac97` analysis_passes（6 文件）
+
+### 第二轮评级记录（subagent 批量路线）
+
+- **subagent 效果审查**（用户主导）：candidate.rs/rewrite.rs 两篇抽查全文，
+  六要素齐全、英文保留、术语指向 glossary、符号引用零编造（17 个函数/常量
+  逐一 grep 核实，MAX_TRANSITIVE_GEP_DEPTH=8 与 2^20 上限均属实）→ 结论：
+  **合格**，批准后续全量 subagent 生产。
+- **质检流程**（每批主 agent 执行）：① 读文档全文抽查；② 符号引用批量
+  grep 核实（累计 200+ 符号，零 MISSING）；③ cargo check 0 error；
+  ④ cargo doc 无新增 warning（抓出并修复 3 处 `[Backend]` 被 rustdoc 误判
+  intra-doc link 的转义问题）。
+- **subagent 实证纠错**（按代码核实、非照抄任务假设）：gvn 注册点实为
+  licm 后 dse 前；dce 文件含 5 个 pass（补 JumpOnlyElimination）；rotate_loops
+  不消费 LoopAnalysis/IV 分析；pure_function 直接使用方仅 return_summary
+  （LICM/DCE 用 effects.rs）；UnreachableBasicBlock 不在主管线。
+- **遗留待用户定**：const_prop.rs 死代码去留；analysis_passes 剩余
+  effects/icfg/memory/range/return_summary 5 文件仅有英文薄文档（未覆盖）。
+
+### 汇总
+
+第二轮共 48 个文件获得中文文档（raana_ir passes 31+3、taki_mir 9、
+soyo_compiler frontend 3、analysis_passes 6、术语表 1 个 md），约 5,100 行
+中文；`cargo doc` 三 crate 均无新增 warning；纯注释改动，零逻辑变更。
+
+

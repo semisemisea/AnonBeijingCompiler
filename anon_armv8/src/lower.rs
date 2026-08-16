@@ -232,6 +232,5 @@ impl LowerBackend for AArch64Backend {
     }
 }
 
-)
 #[cfg(test)]
 mod tests;

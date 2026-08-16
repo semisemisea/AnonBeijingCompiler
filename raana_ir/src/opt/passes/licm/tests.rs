@@ -753,8 +753,8 @@ fn hoisted_pure_call_gets_argument_substituted() {
         data.layout_mut().insert_inst(entry, ret);
     }
     let function = program.new_function(Type::get_unit(), "licm_call_arg".into(), vec![]);
-    let mut call = None;
-    let mut outside = None;
+    let call;
+    let outside;
     {
         let mut data = ArenaContextMut {
             program: &mut program,
@@ -840,7 +840,6 @@ fn make_global_reader(program: &mut Program, name: &str, gv: Inst) -> Function {
     let func = program.new_function(Type::get_i32(), name.into(), vec![]);
     let data = program.func_data_mut(func);
     data.add_entry_block();
-    drop(data);
     let mut ctx = ArenaContextMut {
         program,
         curr_func: Some(func),

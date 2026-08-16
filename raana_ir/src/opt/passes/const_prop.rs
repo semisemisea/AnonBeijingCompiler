@@ -32,11 +32,6 @@ impl VariableStatus {
     fn new_variable() -> VariableStatus {
         VariableStatus::Bottom
     }
-
-    fn new_top() -> VariableStatus {
-        VariableStatus::Top
-    }
-
     #[must_use]
     fn update(&mut self, status: VariableStatus) -> bool {
         match (*self, status) {

@@ -233,6 +233,10 @@ impl<'a> LlvmWriter<'a> {
 
     // ─── Type ───
 
+    #[allow(
+        clippy::only_used_in_recursion,
+        reason = "the receiver is used by non-recursive call sites"
+    )]
     fn type_to_llvm(&self, ty: &Type) -> String {
         match ty.kind() {
             TypeKind::Unit => "void".into(),
@@ -1286,6 +1290,10 @@ impl<'a> LlvmWriter<'a> {
         )
     }
 
+    #[allow(
+        clippy::only_used_in_recursion,
+        reason = "the receiver is used by non-recursive call sites"
+    )]
     fn type_size_bytes(&self, ty: &Type) -> usize {
         match ty.kind() {
             TypeKind::Int32 | TypeKind::Float32 => 4,
@@ -1400,7 +1408,7 @@ impl<'a> LlvmWriter<'a> {
 mod tests {
     use crate::ir::{
         Program, Type,
-        builder_trait::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
+        builder_trait::{LocalInstBuilder, ScalarInstBuilder},
     };
 
     use super::LlvmWriter;

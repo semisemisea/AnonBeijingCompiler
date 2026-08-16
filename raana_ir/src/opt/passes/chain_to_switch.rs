@@ -432,7 +432,7 @@ mod tests {
             InstKind::Binary(b) if b.op() == BinaryOp::Eq
         ));
         // The default block is still reachable from the tree.
-        assert!(data.bb_data(exit).used_by().len() >= 1);
+        assert!(!data.bb_data(exit).used_by().is_empty());
     }
 
     #[test]

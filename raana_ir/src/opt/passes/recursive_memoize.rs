@@ -955,8 +955,7 @@ fn rewrite_callsite(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{Program, Type, builder_trait::*};
-    use crate::opt::pass::Pass as _;
+    use crate::ir::{Program, Type};
 
     /// Build the h-1-shaped recursion `fun(n, dep)`:
     /// `n == 1 -> dep`, otherwise `fun(n / 2, dep + 1)`.

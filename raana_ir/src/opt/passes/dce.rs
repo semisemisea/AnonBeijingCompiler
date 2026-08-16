@@ -19,6 +19,10 @@ pub struct JumpOnlyElimination;
 /// Function (call to function)
 /// Branches and Return
 impl Pass for DeadCodeElimination {
+    #[allow(
+        clippy::unnecessary_to_owned,
+        reason = "to_vec snapshots the layout so the loop can mutate program"
+    )]
     fn run(&mut self, program: &mut Program) -> bool {
         // Whole-program purity analysis lets the mark phase drop calls to
         // effect-free callees whose result is unused (getint and friends
@@ -737,6 +741,7 @@ mod dead_phi_tests {
         assert!(found);
     }
 
+    #[test]
     fn removes_an_unreferenced_function() {
         let mut program = Program::new();
         let main = program.new_function(Type::get_unit(), "main".into(), vec![]);

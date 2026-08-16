@@ -765,10 +765,7 @@ impl<F: Fn(BasicBlock) -> bool> EntityMapper for BlockLaneMapper<'_, '_, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ir::{Function, Program, Type, builder_trait::*},
-        opt::pass::Pass as _,
-    };
+    use crate::ir::{Function, Program, Type, builder_trait::*};
 
     /// Build the countdown msub reduction loop:
     /// `acc = acc - A[k] * B[k]` for `ctr` steps, with a column pointer that

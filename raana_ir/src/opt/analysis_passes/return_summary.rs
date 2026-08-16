@@ -380,7 +380,7 @@ fn halving_base(data: &crate::ir::FunctionData, value: Inst) -> Option<Inst> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{Program, Type, arena::Arena, builder_trait::*};
+    use crate::ir::{Program, Type, builder_trait::*};
 
     const P: i32 = 998244353;
 

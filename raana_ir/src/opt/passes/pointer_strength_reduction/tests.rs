@@ -652,7 +652,6 @@ fn rejects_affine_wrap_on_the_final_header_visit() {
     let range = constant_induction_range(&context, iv, exit).unwrap();
     assert_eq!(range.min(), 0);
     assert_eq!(range.max(), 2);
-    drop(context);
     assert!(!run(&mut program, fixture.function));
     assert!(
         !program

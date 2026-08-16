@@ -141,10 +141,7 @@ fn foldable(range: IntRange, p: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ir::{Program, Type, builder_trait::*},
-        opt::pass::Pass as _,
-    };
+    use crate::ir::{Program, Type, builder_trait::*};
 
     /// Builds `target(x)`: `t = x & mask; rem = t % divisor; ret rem`. The
     /// `and` transfer gives `t` the range `[0, mask]`, so `rem` folds whenever

@@ -1037,7 +1037,7 @@ mod tests {
             .find(|layout| data.bb_data(layout.bb()).params().len() == UNROLL_FACTOR + 3)
             .map(|layout| layout.bb())
             .expect("main header carries acc_in + 4 lanes + jm + ptr");
-        let main_body = data
+        let _main_body = data
             .layout()
             .basicblocks()
             .iter()
@@ -1072,7 +1072,7 @@ mod tests {
                 }
             }
         }
-        let expected = vec![0, 1024, 2048, 3072, 4096];
+        let expected = [0, 1024, 2048, 3072, 4096];
         assert!(
             expected.iter().all(|off| lane_offsets.contains(off)),
             "lane loads must cover ptr + {{0,1024,2048,3072}} and the back-edge +4096, got {lane_offsets:?}"

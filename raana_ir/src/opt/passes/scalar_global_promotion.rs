@@ -25,6 +25,10 @@ use crate::opt::prelude::*;
 pub struct ScalarGlobalPromotion;
 
 impl Pass for ScalarGlobalPromotion {
+    #[allow(
+        clippy::unnecessary_to_owned,
+        reason = "to_vec snapshots the layout so the loop can mutate program"
+    )]
     fn run(&mut self, program: &mut Program) -> bool {
         let may_touch = call_analysis(program);
         let eligible = eligible_globals(program);

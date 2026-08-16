@@ -32,6 +32,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 pub struct DSE;
 
 impl Pass for DSE {
+    #[allow(
+        clippy::unnecessary_to_owned,
+        reason = "to_vec snapshots the layout so the loop can mutate program"
+    )]
     fn run(&mut self, program: &mut Program) -> bool {
         let analysis = EffectAnalysis::new(program);
         let mut changed = false;
@@ -456,11 +460,6 @@ mod tests {
         program.new_value().global_alloc(init)
     }
 
-    #[test]
-    fn smoke() {
-        assert!(true);
-    }
-
     /// `load global; store v, global` with no other write: the store is a
     /// GSP-style redundant write-back and must be removed.
     #[test]
@@ -468,7 +467,7 @@ mod tests {
         let mut program = Program::new();
         let global = new_global(&mut program);
         let function = program.new_function(Type::get_unit(), "f".into(), vec![]);
-        let (load, store, ret) = {
+        let (load, _store, ret) = {
             let mut data = ArenaContextMut {
                 program: &mut program,
                 curr_func: Some(function),
@@ -557,7 +556,7 @@ mod tests {
         let mut program = Program::new();
         let global = new_global(&mut program);
         let function = program.new_function(Type::get_unit(), "f".into(), vec![]);
-        let (first, second, ret) = {
+        let (_first, second, ret) = {
             let mut data = ArenaContextMut {
                 program: &mut program,
                 curr_func: Some(function),
@@ -642,7 +641,7 @@ mod tests {
         let mut program = Program::new();
         let global = new_global(&mut program);
         let function = program.new_function(Type::get_unit(), "f".into(), vec![Type::get_i32()]);
-        let (first, second, ret) = {
+        let (_first, _second, ret) = {
             let mut data = ArenaContextMut {
                 program: &mut program,
                 curr_func: Some(function),
@@ -687,7 +686,7 @@ mod tests {
     fn memzero_barrier_stops_forwarding_and_removal() {
         let mut program = Program::new();
         let function = program.new_function(Type::get_unit(), "f".into(), vec![]);
-        let (first, second, load, ret) = {
+        let (_first, _second, load, ret) = {
             let mut data = ArenaContextMut {
                 program: &mut program,
                 curr_func: Some(function),

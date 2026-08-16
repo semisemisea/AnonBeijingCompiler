@@ -665,7 +665,7 @@ mod tests {
     #[test]
     fn rotates_count_up_loop_into_guarded_countdown() {
         let mut program = Program::new();
-        let (func, entry, header, body, exit, entry_jump) =
+        let (func, _entry, header, body, exit, entry_jump) =
             build_count_up(&mut program, "rot_up", 0);
         let mut data = ArenaContextMut {
             program: &mut program,
@@ -722,7 +722,7 @@ mod tests {
             "rot_up_exit_region".to_owned(),
             vec![Type::get_i32()],
         );
-        let (entry, header, body, exit, downstream, _entry_jump) = {
+        let (_entry, header, _body, _exit, _downstream, _entry_jump) = {
             let data = program.func_data_mut(func);
             let entry = data.add_entry_block();
             let header = data
@@ -796,7 +796,7 @@ mod tests {
             "rot_up_exit_iv".to_owned(),
             vec![Type::get_i32()],
         );
-        let (entry, header, body, exit, entry_jump) = {
+        let (_entry, _header, body, exit, entry_jump) = {
             let data = program.func_data_mut(func);
             let entry = data.add_entry_block();
             let header = data

@@ -401,7 +401,7 @@ mod tests {
         let func =
             program.new_function(Type::get_unit(), "promote".to_owned(), vec![ptr_ty.clone()]);
 
-        let _ = (|| {
+        {
             let data = program.func_data_mut(func);
             let entry = data
                 .new_basic_block()
@@ -429,7 +429,7 @@ mod tests {
             data.layout_mut().insert_inst(mid, elem);
             data.layout_mut().insert_inst(mid, store2);
             data.layout_mut().insert_inst(mid, ret);
-        })();
+        }
 
         let mut data = ArenaContextMut {
             program: &mut program,

@@ -54,11 +54,6 @@ pub fn build_dominance_tree(idom_map: &IDomMap, rpo_len: usize) -> DomTree {
     ret
 }
 
-pub struct DominanceTree {
-    old_id_alloc: BIDAlloc,
-    idom_edges: Vec<BasicBlock>,
-}
-
 pub mod v2 {
     use rustc_hash::FxHashMap;
     use smallvec::SmallVec;

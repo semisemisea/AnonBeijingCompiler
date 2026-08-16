@@ -57,7 +57,6 @@ struct OuterCandidate {
     latch: BasicBlock,
     entry: BasicBlock,
     r_idx: usize,
-    acc: Inst,
     acc_idx: usize,
     /// The value the nest produces for the accumulator slot (latch back edge).
     final_acc: Inst,
@@ -179,7 +178,7 @@ impl InvariantReductionHoisting {
                 return None;
             }
         }
-        let (acc, acc_idx, final_acc) = match acc_candidate {
+        let (_, acc_idx, final_acc) = match acc_candidate {
             Some(value) => value,
             None => {
                 eprintln!(
@@ -216,7 +215,6 @@ impl InvariantReductionHoisting {
             latch,
             entry,
             r_idx,
-            acc,
             acc_idx,
             final_acc,
             orig_back_args,

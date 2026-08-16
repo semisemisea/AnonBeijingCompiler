@@ -1286,10 +1286,7 @@ mod tests {
         data.layout_mut().insert_inst(merge, ret);
         let analysis = analyze(&program, function);
         let edges = outgoing_edges(program.func_data(function), entry);
-        assert_eq!(
-            analysis.range_on_edge(edges[0], condition).excludes_zero(),
-            true
-        );
+        assert!(analysis.range_on_edge(edges[0], condition).excludes_zero());
         assert_eq!(
             analysis.range_on_edge(edges[1], condition),
             IntRange::constant(0)

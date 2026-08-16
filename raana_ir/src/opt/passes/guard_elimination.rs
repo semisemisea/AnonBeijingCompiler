@@ -82,10 +82,7 @@ fn binary_of(data: &crate::ir::FunctionData, inst: Inst) -> Option<(BinaryOp, In
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ir::{Program, Type, arena::Arena, builder_trait::*},
-        opt::pass::Pass as _,
-    };
+    use crate::ir::{Program, Type, arena::Arena, builder_trait::*};
 
     /// `g(x)`: `br (x < 0), neg, nonneg; neg: ret 0; nonneg: ret x`.
     fn build_guard(program: &mut Program, name: &str, use_param: bool) -> (Function, Inst) {

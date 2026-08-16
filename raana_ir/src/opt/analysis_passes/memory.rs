@@ -648,7 +648,7 @@ mod tests {
 
         let (env, ctx) = env_of(&program, function);
         assert_eq!(env.constant_offset(&ctx, alloc), Some(0));
-        assert_eq!(env.constant_offset(&ctx, gep), Some(1 * 20 + 2 * 4));
+        assert_eq!(env.constant_offset(&ctx, gep), Some(20 + 2 * 4));
     }
 
     #[test]

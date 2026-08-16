@@ -528,7 +528,7 @@ mod tests {
 
         // main() -> i32 — calls f(42)
         let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
-        let (call_f, main_cont) = {
+        let (_call_f, main_cont) = {
             let data = program.func_data_mut(main);
             let entry = data.add_entry_block();
             let val = data.new_local_inst().integer(42);

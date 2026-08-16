@@ -1,0 +1,287 @@
+//! Affine index-evolution and range analysis for pointer strength reduction.
+
+use super::*;
+
+impl PointerStrengthReduction {
+    pub(super) fn classify_index_evolution(
+        data: &ArenaContextMut<'_>,
+        ranges: &RangeAnalysis,
+        looop: &Loop,
+        iv: Inst,
+        iv_range: Option<ConstantInductionRange>,
+        forwarded_params: &FxHashMap<Inst, Inst>,
+        gep: Inst,
+        value: Inst,
+    ) -> Option<IndexEvolution> {
+        let value = forwarded_params.get(&value).copied().unwrap_or(value);
+        if value == iv {
+            return Some(IndexEvolution::Direct);
+        }
+        if value.is_global()
+            || data.inst_data(value).kind().is_const()
+            || data
+                .layout()
+                .parent_bb(value)
+                .is_none_or(|block| !looop.contains(block))
+        {
+            return Some(IndexEvolution::Invariant);
+        }
+
+        fn classify(
+            data: &ArenaContextMut<'_>,
+            ranges: &RangeAnalysis,
+            looop: &Loop,
+            iv: Inst,
+            iv_range: Option<ConstantInductionRange>,
+            forwarded_params: &FxHashMap<Inst, Inst>,
+            gep: Inst,
+            value: Inst,
+        ) -> Option<AffineI32Expr> {
+            let value = forwarded_params.get(&value).copied().unwrap_or(value);
+            if value == iv {
+                return Some(AffineI32Expr {
+                    value,
+                    coefficient: 1,
+                    offset_range: I64Range { min: 0, max: 0 },
+                    chain: SmallVec::new(),
+                    invariants: SmallVec::new(),
+                });
+            }
+            if value.is_global()
+                || data.inst_data(value).kind().is_const()
+                || data
+                    .layout()
+                    .parent_bb(value)
+                    .is_none_or(|block| !looop.contains(block))
+            {
+                return Some(AffineI32Expr {
+                    value,
+                    coefficient: 0,
+                    offset_range: I64Range::from_i32(ranges.range_before(gep, value))?,
+                    chain: SmallVec::new(),
+                    invariants: if data.inst_data(value).kind().is_const() {
+                        SmallVec::new()
+                    } else {
+                        SmallVec::from_slice(&[value])
+                    },
+                });
+            }
+            if !data.inst_data(value).ty().is_i32() {
+                return None;
+            }
+            let InstKind::Binary(binary) = data.inst_data(value).kind() else {
+                return None;
+            };
+            let lhs = classify(
+                data,
+                ranges,
+                looop,
+                iv,
+                iv_range,
+                forwarded_params,
+                gep,
+                binary.lhs(),
+            )?;
+            let rhs = classify(
+                data,
+                ranges,
+                looop,
+                iv,
+                iv_range,
+                forwarded_params,
+                gep,
+                binary.rhs(),
+            )?;
+            let (coefficient, offset_range) = match binary.op() {
+                BinaryOp::Add => (
+                    lhs.coefficient.checked_add(rhs.coefficient)?,
+                    lhs.offset_range.add(rhs.offset_range)?,
+                ),
+                BinaryOp::Sub => (
+                    lhs.coefficient.checked_sub(rhs.coefficient)?,
+                    lhs.offset_range.sub(rhs.offset_range)?,
+                ),
+                // A product of two loop-invariant values is itself an
+                // invariant offset. Keep the product in the affine chain so
+                // `clone_affine_initial` moves it to the preheader. This is
+                // the common flattened-row form `row * runtime_width + iv`.
+                BinaryOp::Mul if lhs.coefficient == 0 && rhs.coefficient == 0 => {
+                    (0, lhs.offset_range.mul(rhs.offset_range)?)
+                }
+                BinaryOp::Mul if lhs.coefficient == 0 => {
+                    let factor = PointerStrengthReduction::integer_constant(data, binary.lhs())?;
+                    (
+                        rhs.coefficient.checked_mul(i64::from(factor))?,
+                        rhs.offset_range.mul(I64Range {
+                            min: i64::from(factor),
+                            max: i64::from(factor),
+                        })?,
+                    )
+                }
+                BinaryOp::Mul if rhs.coefficient == 0 => {
+                    let factor = PointerStrengthReduction::integer_constant(data, binary.rhs())?;
+                    (
+                        lhs.coefficient.checked_mul(i64::from(factor))?,
+                        lhs.offset_range.mul(I64Range {
+                            min: i64::from(factor),
+                            max: i64::from(factor),
+                        })?,
+                    )
+                }
+                BinaryOp::Shl if rhs.coefficient == 0 => {
+                    let shift = PointerStrengthReduction::integer_constant(data, binary.rhs())?;
+                    let factor = 1_i64.checked_shl(u32::try_from(shift).ok()?)?;
+                    (
+                        lhs.coefficient.checked_mul(factor)?,
+                        lhs.offset_range.mul(I64Range {
+                            min: factor,
+                            max: factor,
+                        })?,
+                    )
+                }
+                _ => return None,
+            };
+            let depends_on_iv = lhs.coefficient != 0 || rhs.coefficient != 0;
+            // With a constant induction range, both the intermediate wrap
+            // proof and the i32 range fit keep the 32-bit offset arithmetic
+            // sound. With a runtime bound (iv_range unknown) both checks are
+            // skipped: the incremental scheme replaces that arithmetic with
+            // 64-bit pointer adds, and the valid-input domain excludes i32
+            // wraparound, so the incremental address sequence matches the
+            // original linear one.
+            if depends_on_iv
+                && iv_range.is_some_and(|range| {
+                    !ranges.proves_binary_no_signed_wrap(
+                        binary.op(),
+                        binary.lhs(),
+                        binary.rhs(),
+                        RangeContext::Before(gep),
+                    ) || !PointerStrengthReduction::affine_range_fits_i32(
+                        coefficient,
+                        offset_range,
+                        range,
+                    )
+                })
+            {
+                return None;
+            }
+            let mut chain = lhs.chain;
+            for inst in rhs.chain {
+                if !chain.contains(&inst) {
+                    chain.push(inst);
+                }
+            }
+            if !chain.contains(&value) {
+                chain.push(value);
+            }
+            let mut invariants = lhs.invariants;
+            for invariant in rhs.invariants {
+                if !invariants.contains(&invariant) {
+                    invariants.push(invariant);
+                }
+            }
+            Some(AffineI32Expr {
+                value,
+                coefficient,
+                offset_range,
+                chain,
+                invariants,
+            })
+        }
+
+        let affine = classify(
+            data,
+            ranges,
+            looop,
+            iv,
+            iv_range,
+            forwarded_params,
+            gep,
+            value,
+        )?;
+        (affine.coefficient != 0).then_some(IndexEvolution::Affine(affine))
+    }
+
+    pub(super) fn affine_range_fits_i32(
+        coefficient: i64,
+        offset: I64Range,
+        iv: ConstantInductionRange,
+    ) -> bool {
+        let iv_min = i64::from(iv.min());
+        let iv_max = i64::from(iv.max());
+        let (scaled_min, scaled_max) = if coefficient >= 0 {
+            (
+                coefficient.checked_mul(iv_min),
+                coefficient.checked_mul(iv_max),
+            )
+        } else {
+            (
+                coefficient.checked_mul(iv_max),
+                coefficient.checked_mul(iv_min),
+            )
+        };
+        let (Some(scaled_min), Some(scaled_max)) = (scaled_min, scaled_max) else {
+            return false;
+        };
+        let Some(min) = scaled_min.checked_add(offset.min) else {
+            return false;
+        };
+        let Some(max) = scaled_max.checked_add(offset.max) else {
+            return false;
+        };
+        min >= i64::from(i32::MIN) && max <= i64::from(i32::MAX)
+    }
+
+    pub(super) fn integer_constant(data: &ArenaContextMut<'_>, value: Inst) -> Option<i32> {
+        match data.inst_data(value).kind() {
+            InstKind::Integer(integer) => Some(integer.value()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn evaluate_affine_initial(
+        data: &ArenaContextMut<'_>,
+        affine: &AffineI32Expr,
+        iv: Inst,
+        initial_iv: i32,
+        forwarded_params: &FxHashMap<Inst, Inst>,
+    ) -> Option<i32> {
+        fn evaluate(
+            data: &ArenaContextMut<'_>,
+            chain: &[Inst],
+            iv: Inst,
+            initial_iv: i32,
+            forwarded_params: &FxHashMap<Inst, Inst>,
+            value: Inst,
+        ) -> Option<i32> {
+            let value = forwarded_params.get(&value).copied().unwrap_or(value);
+            if value == iv {
+                return Some(initial_iv);
+            }
+            if !chain.contains(&value) {
+                return PointerStrengthReduction::integer_constant(data, value);
+            }
+            let InstKind::Binary(binary) = data.inst_data(value).kind() else {
+                return None;
+            };
+            let lhs = evaluate(data, chain, iv, initial_iv, forwarded_params, binary.lhs())?;
+            let rhs = evaluate(data, chain, iv, initial_iv, forwarded_params, binary.rhs())?;
+            Some(match binary.op() {
+                BinaryOp::Add => lhs.wrapping_add(rhs),
+                BinaryOp::Sub => lhs.wrapping_sub(rhs),
+                BinaryOp::Mul => lhs.wrapping_mul(rhs),
+                BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
+                _ => return None,
+            })
+        }
+
+        evaluate(
+            data,
+            &affine.chain,
+            iv,
+            initial_iv,
+            forwarded_params,
+            affine.value,
+        )
+    }
+}

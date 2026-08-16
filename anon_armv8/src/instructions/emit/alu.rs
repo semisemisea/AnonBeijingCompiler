@@ -10,7 +10,7 @@ use super::super::{
     extend_source_size, shift_name,
 };
 
-pub(super) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result {
+pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result {
     match inst {
         MInst::AluRRR {
             op,

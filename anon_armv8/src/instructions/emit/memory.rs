@@ -4,7 +4,7 @@ use taki_mir::vcode::EmitContext;
 
 use super::super::{MInst, emit_amode, emit_data_reg, emit_pair_amode};
 
-pub(super) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result {
+pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result {
     match inst {
         MInst::Load { ty, dst, addr } => {
             write!(ctx, "ldr ")?;

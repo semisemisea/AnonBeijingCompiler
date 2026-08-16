@@ -218,3 +218,78 @@ G1 → G2 → G3 → G4 → G6 → G5 → G7 → G8 → G9 → G10
 
 额外发现（未改，待用户确认）：AGENTS.md "CI 用 -O0" 说法过时（实际 -O 2 全量）；
 taki_mir/src/passes.rs 顶部注释的 post-RA 阶段描述过时（实际在 finalize 之后）。
+
+## 第二轮：pass 级文档补全（G11-G15，待用户确认范围后开工）
+
+> 术语：本文件第一轮的 "Goal" 沿用历史写法；第二轮起统一称"任务/单元"，
+> 与 Hermes Agent 的 goal（agent 运行环境/任务提示词）区分，避免混淆。
+
+### 触发背景
+G1-G10 覆盖了 crate 级/模块级/方法论。遗留缺口：**pass 文件自身的模块级描述**——
+调试时定位到 `raana_ir/src/opt/passes/loop_unroll.rs`（1181 行）的问题，但该文件完全无
+`//!`/`///` 描述。全量盘点后范围扩至三个 crate。
+
+### 评价标准（六要素，面向中等编译知识大二本科生）
+每个 pass/模块的 `//!` 至少覆盖：
+1. **一句话定位**：做什么 + 动机（哪个 benchmark 热点、什么 IR 形状触发）；
+2. **IR 变换形态**：before/after 示例（参考 rotate_loops.rs 现有英文文档写法，中文呈现）；
+3. **触发/放弃条件**：匹配什么 pattern、何时拒绝（trip count 未知/副作用等）；
+4. **正确性要点**：为什么安全（如 rotate_loops 的 "head test 只 gate 第一次迭代" 论证）；
+5. **管线位置**：注册点（initial/fixpoint）、前后依赖、门控（AArch64-only/config 开关）；
+6. **验证**：单测位置/验证方式。
+
+素材来源：`raana_ir/src/opt/pass.rs` 的 `from_config`（177-365 行）里每个 pass 注册处
+的英文一行备注；各 pass 现有英文 `//!`/`///`（翻译+补全）。
+
+### 对比基准（重要）
+本地 `~/Documents/Programs/rust/s2r` 是**空仓库**（无 commit，仅 10 行 stub main.rs）。
+soyo_compiler 的 migrate 基准用 AnonBeijingCompiler git 历史 **commit 5921037
+（"[Backend] Migrate s2r code"）**：migrate 时 `frontend/ast.rs`(1498 行)/`utils.rs`(909 行)
+已存在；此后 AI 修改：新增 `items.rs`(618)、`ast.rs` 改 1526 行至 1586、`utils.rs` 重构至
+556、`mod.rs`→`frontend.rs`。文档只覆盖 AI 修改后的现状（用户对原生部分理解充分）。
+
+### 范围清单
+
+**G11 — raana_ir passes A 档（完全无描述，8 文件）**
+`loop_unroll.rs`(1181)、`specialize.rs`、`simplify_cfg.rs`、`sr.rs`、`gvn_pre.rs`、
+`pointer_strength_reduction.rs`(+子目录 analysis/candidate/rewrite 各仅 1 行英文标题)、
+`column_major.rs`、`const_prop.rs`（⚠ 未注册进管线=死代码，先定去留再决定补不补）。
+
+**G12 — raana_ir passes B 档（无模块级 `//!`，仅散落英文 `///`，11 文件）**
+`ssa.rs`(5)、`inline.rs`(17)、`tco.rs`(11)、`tail_recursive_inline.rs`(26)、`licm.rs`(12)、
+`gvn.rs`(10)、`dce.rs`(16，含 DPE/DCE/DFE 三个 pass)、`if_conversion.rs`(7)、
+`boolean_simplify.rs`(3)、`mulmod_recognize.rs`(57 行均 internal)、`ipsccp.rs`（`//!` 仅一行
+英文标题，有壳无肉）。
+
+**G13 — raana_ir passes C 档（有 `//!` 但全英文，12 文件）**
+`blocked_reduction`、`chain_to_switch`、`dse`、`guard_elimination`、
+`invariant_reduction_hoisting`、`matmul_interchange`、`mod_fold`、`recursive_memoize`、
+`reduction_unroll`、`rotate_loops`、`scalar_global_promotion`、`zero_store_loop`——
+内容质量好，按六要素中文化（工作量最大的一档）。
+
+**G14 — taki_mir 无文档/英文薄文档（6 文件）**
+无 moddoc：`lib.rs`(352，crate 级文档缺失)、`abi.rs`(694)、`lower.rs`(1403)、
+`inst_predicate.rs`(25)、`libcall.rs`(12)；英文薄文档：`block_order.rs`(1 行)、`stats.rs`(1 行)、
+`types.rs`(1 行)、`div_magic.rs`(10 行)。已中文的（G1-G4：vcode/reg_alloc/emit/emit_buffer/
+register/passes）不动。
+
+**G15 — soyo_compiler frontend（AI 修改部分，3+1 文件）**
+`frontend/ast.rs`(1586)、`frontend/items.rs`(618)、`frontend/utils.rs`(556)、
+`frontend.rs`(3 行 mod 声明)。对比 5921037 的旧版理解 AI 改动，文档写当前状态。
+`abi_matrix.rs` 已有英文 moddoc、`cli.rs`/`main.rs` 用户自述理解充分——默认不动，除非用户
+要求。
+
+### 流程（沿用第一轮硬性规则）
+- 每任务独立 commit，中文 message，`[Docs]:` 前缀，原子可验证；
+- 每任务至少两轮 turns：初稿 → 子代理评级（两维度 1-5）→ 修正 → 复评；
+- 纯文档任务：不碰代码逻辑（不改 .rs 行为）、不 push；
+- 验收：`cargo doc -p raana_ir` / `-p taki_mir` / `-p soyo_compiler` 无 warning；
+  评级维度 1（小白上手）终评 ≥4 分。
+
+### 待用户确认
+1. s2r 本地为空仓库，migrate 基准改用 git 5921037 —— 是否 OK？
+2. C 档（G13）是否中文化（工作量最大）；还是只做 A+B？
+3. taki_mir 英文薄文档（block_order/stats/types/div_magic）是否纳入 G14；
+4. const_prop.rs 死代码：删/标注/照补？
+5. 执行顺序 G11→G12→G13→G14→G15 是否接受。
+

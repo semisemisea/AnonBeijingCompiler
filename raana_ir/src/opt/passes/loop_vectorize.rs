@@ -4712,6 +4712,26 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     );
     data.layout_mut().insert_inst_before(body_br0_term, iv_vec);
 
+    // Shared splat cache (milestone 2 stage 3c, Fix 2): the scalar operands
+    // common to every unit (`zero`, `bound`) are splatted exactly once, each
+    // in a block that dominates every unit's `then` block (`vzero` sits in
+    // the preheader, `bound_splat` before the chain's common-dominator
+    // terminator `body_br0_term`). Reusing one map across all units removes
+    // the ~60 duplicate `splat(0)` / `splat(bound)` created by the per-unit
+    // `&mut FxHashMap::default()` calls. This is only sound because the
+    // seeded splats dominate every unit: the units' `then` blocks do *not*
+    // dominate each other (they are reachable around each other via the
+    // mask's false edge), so a splat anchored in one `then` could not be
+    // reused by another — the cache must never return a non-dominating def.
+    let mut shared_splats: FxHashMap<Inst, Inst> = FxHashMap::default();
+    shared_splats.insert(zero, vzero);
+    let bound_splat = alloc_inst(
+        data,
+        VectorSplat::new_data(multi.units[0].bound, vector_ty.clone()),
+    );
+    data.layout_mut().insert_inst_before(body_br0_term, bound_splat);
+    shared_splats.insert(multi.units[0].bound, bound_splat);
+
     for unit in &multi.units {
         // load_in: contiguous vector load (address stays scalar).
         let load_src = match data.inst_data(unit.load_in).kind() {
@@ -4724,7 +4744,7 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         // mul (anchor on the mul itself, not the later add).
         let vl = vector_operand(
             data,
-            &mut FxHashMap::default(),
+            &mut shared_splats,
             unit.load_in,
             &payload,
             &classes,
@@ -4733,7 +4753,7 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         );
         let vr = vector_operand(
             data,
-            &mut FxHashMap::default(),
+            &mut shared_splats,
             unit.load_k,
             &payload,
             &classes,
@@ -4754,7 +4774,7 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         data.layout_mut().insert_inst_before(unit.add, cc_vec);
         let vzero_cmp = vector_operand(
             data,
-            &mut FxHashMap::default(),
+            &mut shared_splats,
             zero,
             &payload,
             &classes,
@@ -4768,7 +4788,7 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         data.layout_mut().insert_inst_before(unit.add, ge0);
         let bound_splat = vector_operand(
             data,
-            &mut FxHashMap::default(),
+            &mut shared_splats,
             unit.bound,
             &payload,
             &classes,
@@ -4788,7 +4808,7 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         if let Some(rr) = unit.rr_ok {
             let rr_splat = vector_operand(
                 data,
-                &mut FxHashMap::default(),
+                &mut shared_splats,
                 rr,
                 &payload,
                 &classes,
@@ -4801,7 +4821,7 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             // the boolean as an all-ones mask on the vector lanes.
             let zero_splat = vector_operand(
                 data,
-                &mut FxHashMap::default(),
+                &mut shared_splats,
                 zero,
                 &payload,
                 &classes,
@@ -4827,7 +4847,7 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         data.layout_mut().insert_inst_before(unit.add, mul_masked);
         let acc_v = vector_operand(
             data,
-            &mut FxHashMap::default(),
+            &mut shared_splats,
             unit.acc_in,
             &payload,
             &classes,

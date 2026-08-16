@@ -811,11 +811,7 @@ pub(super) fn is_mul(arena: ArenaContext<'_>, inst: HirInst) -> bool {
     )
 }
 
-pub(super) fn fusion_types_match(
-    arena: ArenaContext<'_>,
-    size: OperandSize,
-    types: FusionTypes,
-) -> bool {
+fn fusion_types_match(arena: ArenaContext<'_>, size: OperandSize, types: FusionTypes) -> bool {
     let FusionTypes {
         consumer,
         lhs,

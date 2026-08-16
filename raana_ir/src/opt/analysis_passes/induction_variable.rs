@@ -1,3 +1,289 @@
+//! # 基本归纳变量分析与循环 trip count（`induction_variable`）
+//!
+//! 本模块是循环优化的**基础设施分析**：给定循环结构（`LoopAnalysis`）与 CFG，
+//! 识别循环中每轮按固定步长变化的**基本归纳变量**（basic induction variable,
+//! BIV），把 header 处的分支 exit 规范化为 `iv < bound` / `iv > bound` 的**严格
+//! 形式**，并在此之上推导**迭代次数（trip count）**、**归纳变量的常量取值区间**
+//! 与**派生线性表达式**。它不修改 IR，只产出供其他 pass 消费的分析结果，是
+//! `loop_unroll`、`pointer_strength_reduction`、`column_major` 等循环优化共用的
+//! 底座。
+//!
+//! 典型消费链：`BasicInductionVariableAnalysis::new` 识别 IV →
+//! `normalize_strict_exit` 确认循环以"严格比较 + 常量步长"退出 →
+//! `constant_trip_count` / `induction_trip_count` 求迭代次数（全展开、循环互换、
+//! 访问重排的前提）→ `constant_induction_range` / `classify_derived_induction_variable`
+//! 求 IV 及其线性组合的取值区间（强度削减、列主序变换的前提）。
+//!
+//! ## 术语速查
+//!
+//! - **基本归纳变量（BIV）**：`i32` 值、每轮按同一常量（或循环不变量）步长变化、
+//!   初值来自循环外的变量。本例中它**一定是循环 header 的一个 block 参数**
+//!   （Phi）：从外部入口边取初值、从回边（latch）取更新值；
+//! - **严格 exit**：header 终结分支的条件形如 `iv < bound`（递增）或
+//!   `iv > bound`（递减），且边界不含等号。`<=` / `>=` 只有在能取补集化为严格
+//!   形式时才接受（见 `normalize_strict_exit`）；
+//! - **trip count**：循环总执行轮数。已知初值、边界、步长与方向时，
+//!   轮数 = `ceil(|bound - initial| / |step|)`（见 `constant_trip_count`）；
+//! - **规范化（normalize）**：把方向、比较符号、IV 在比较式左右的位置统一成
+//!   一种标准形态，下游 pass 只需处理一种模式；
+//! - **派生（线性）归纳变量**：IV 的仿射组合 `coefficient * iv + offset`，如
+//!   数组下标 `i * 4 + base`（见 `classify_derived_induction_variable`）。
+//!
+//! ## 核心 API 详解
+//!
+//! ### 分析入口：`BasicInductionVariableAnalysis`
+//!
+//! 整个分析的一等公民：一次构造、按 header 索引的全部 BIV 集合。
+//!
+//! ```rust,ignore
+//! pub fn new(data: &FunctionData, cfg: &CFG, loops: &LoopAnalysis) -> Self
+//! ```
+//!
+//! **语义**：快照分析。遍历 `loops.loops()`，对每个循环收集 header 的所有 block
+//! 参数，逐一调用内部 `analyze_parameter` 判定是否为 BIV，结果存入
+//! `by_header: FxHashMap<BasicBlock, Vec<BasicInductionVariable>>`（以 header 块为
+//! 键）。**注意**：这是纯只读快照，任何 IR 修改都会使其失效，pass 必须先做完
+//! 分析再改 IR（与 CFG / 支配 / 循环分析同约定）。构造输入恰好是
+//! `LoopAnalysis::new(data)` 的三元组，三者配套使用。
+//!
+//! ```rust,ignore
+//! pub fn for_loop(&self, looop: &Loop) -> &[BasicInductionVariable]
+//! ```
+//!
+//! **语义**：返回 `looop` 的 header 上识别出的全部 BIV（无则空切片）。**使用方**：
+//! `column_major`（枚举每个循环的 IV 做访问 delta 与执行次数分析）、`range`
+//! 分析（`add_induction_caps` 给循环携带值加封顶）。
+//!
+//! ```rust,ignore
+//! pub fn find(&self, looop: &Loop, parameter: Inst) -> Option<&BasicInductionVariable>
+//! ```
+//!
+//! **语义**：按 header 参数精确查找某个 IV，是 `for_loop` 的线性查找版。
+//! **使用方**：`recursive_memoize`（确认 memo 键参数是前向步进的 IV）、
+//! `loop_unroll` / `reduction_unroll` / `pointer_strength_reduction`（锁定
+//! "那一个"循环变量）、本模块测试。
+//!
+//! ### 基本归纳变量：`BasicInductionVariable`
+//!
+//! ```rust,ignore
+//! pub fn parameter(&self) -> Inst              // header 里的 block 参数（Phi）
+//! pub fn initial_values(&self) -> &[Inst]      // 外部入口边传入的初值（≥1 个）
+//! pub fn update_values(&self) -> &[Inst]       // 回边传入的更新值（≥1 个）
+//! pub fn step(&self) -> InductionStep          // 归一化后的更新形态 Add/Sub
+//! ```
+//!
+//! **语义**：一个 BIV 由四件事刻画——它是哪个 header 参数（`parameter`）、从哪些
+//! 初值起步（`initial_values`）、每轮由哪些更新值推进（`update_values`）、更新是
+//! 加还是减（`step`）。`initial_values` 与 `update_values` 都是 `SmallVec`：自然
+//! 循环里各 1 个，但多入口 / 多 latch 时可以有多个。**使用方**：一切消费 IV 的
+//! pass（下方各 API 均以它为第一参数）；`range` 分析读 `step()` 判断方向。
+//!
+//! ### 更新形态与方向：`InductionStep` / `InductionDirection`
+//!
+//! ```rust,ignore
+//! pub enum InductionStep { Add(Inst), Sub(Inst) }   // value() 取步长指令
+//! pub enum InductionDirection { Forward, Backward }
+//! ```
+//!
+//! **语义**：`InductionStep` 是 BIV 更新的**归一化形态**——识别时把
+//! `Add(param, step)`、`Add(step, param)`（交换律）统一为 `Add`，把
+//! `Sub(param, step)` 记为 `Sub`，步长指令本身在 `value()`。`InductionDirection`
+//! 描述 IV 随迭代增大（`Forward`）还是减小（`Backward`），由步长常量符号决定。
+//! **使用方**：`recursive_memoize` 只接受 `Add` 步进；`column_major` 按方向计算
+//! 访问 delta；`normalize_strict_exit` 产出方向，trip count / range 推导消费之。
+//!
+//! ### 严格 exit 规范化：`normalize_strict_exit` / `NormalizedInductionExit`
+//!
+//! ```rust,ignore
+//! pub fn normalize_strict_exit(
+//!     data: &ArenaContextMut<'_>, looop: &Loop, iv: &BasicInductionVariable,
+//! ) -> Option<NormalizedInductionExit>
+//! ```
+//!
+//! **语义**：检查 `looop` 是否以"严格比较 + 常量步长"退出，是就产出规范形态
+//! `NormalizedInductionExit { direction, signed_step: i32, bound: Inst }`（访问器
+//! `direction()` / `signed_step()` / `bound()`）。具体把 header 终结分支重写成两种
+//! 标准模式之一：
+//!
+//! - `Forward`（`signed_step > 0`）：留在循环内的条件是 `iv < bound`；
+//! - `Backward`（`signed_step < 0`）：留在循环内的条件是 `iv > bound`。
+//!
+//! IV 在比较式左右任一侧均可，分支"真臂在循环内 / 假臂在循环内"两种情况通过
+//! 取补集（`complement_integer_compare`）与交换操作数（`swap_compare_args`）统一。
+//! **非单位步长**（`|signed_step| != 1`）额外要求 bound 是常量且能证明最后一次
+//! 更新不会让 `i32` 回绕（前向要求 `bound + step - 1 <= i32::MAX`，反向要求
+//! `bound + step + 1 >= i32::MIN`）——步长不是 ±1 时最后一次"继续迭代的更新"可能
+//! 越过 `i32` 边界，必须显式排除。失败（`None`）情形见"正确性与边界情况"。
+//! **使用方**：几乎所有循环 pass——`loop_unroll`、`reduction_unroll`、
+//! `pointer_strength_reduction`、`column_major`、`matmul_interchange` 都在拿它
+//! 确认"这个循环我们能数清楚"。
+//!
+//! ### trip count 推导：`constant_trip_count` / `induction_trip_count` /
+//! ### `ConstantTripCount` / `TripCountEstimate`
+//!
+//! ```rust,ignore
+//! pub fn constant_trip_count(
+//!     data: &ArenaContextMut<'_>, iv: &BasicInductionVariable, exit: NormalizedInductionExit,
+//! ) -> Option<ConstantTripCount>
+//! pub fn induction_trip_count(
+//!     data: &ArenaContextMut<'_>, iv: &BasicInductionVariable, exit: NormalizedInductionExit,
+//! ) -> Option<TripCountEstimate>
+//! ```
+//!
+//! **语义**：两者都要求初值与 bound 是**整数常量**，从
+//! `ceil(|bound - initial| / |step|)` 求迭代次数（`distance.div_ceil(step)`，全程
+//! `i64` checked 算术；初值已越过边界时为 0；方向与步长符号矛盾时为 `None`）。
+//! 区别在初值个数：
+//!
+//! - `constant_trip_count` 要求**恰好一个**初值（`let [initial] = ...`），产出
+//!   `ConstantTripCount { iterations: usize, initial: i32, bound: i32,
+//!   signed_step: i32 }`（访问器同名）——`iterations()` 是精确值；
+//! - `induction_trip_count` 允许**多个**初值（多入口），逐初值求轮数后取最大：
+//!   全部相同 → `TripCountEstimate::Exact(n)`，否则保守地给
+//!   `TripCountEstimate::UpperBound(n)`。`exact()` 只在 `Exact` 时返回
+//!   `Some(n)`，`upper_bound()` 恒返回轮数上限——消费方想证明"恰好 N 轮"必须
+//!   `exact()` 成功。
+//!
+//! **使用方**：`loop_unroll` 用 `constant_trip_count` 的 `iterations()` 决定能否
+//! 精确全展开；`column_major` 用 `induction_trip_count` 求循环嵌套执行次数
+//! （`loop_nest_executions`，逐层乘 trip count 得访问总执行量，只把 `UpperBound`
+//! 当上限用）。
+//!
+//! ### 常量归纳范围：`constant_induction_range` / `ConstantInductionRange`
+//!
+//! ```rust,ignore
+//! pub fn constant_induction_range(
+//!     data: &ArenaContextMut<'_>, iv: &BasicInductionVariable, exit: NormalizedInductionExit,
+//! ) -> Option<ConstantInductionRange>
+//! ```
+//!
+//! **语义**：IV 在循环存活期内取值的**闭区间** `ConstantInductionRange { min: i32,
+//! max: i32 }`（访问器 `min()` / `max()`）。要求 bound 与全部初值都是整数常量；
+//! 区间 = 所有初值的 min/max，再与**末轮终值**取并：前向时末轮最大值为
+//! `bound - 1 + step`（最后一次更新后的值，未越界是 `normalize_strict_exit`
+//! 保证的），反向时末轮最小值为 `bound + 1 + step`。**使用方**：
+//! `pointer_strength_reduction`（证明指针每轮偏移在范围内、可安全转为下标算术）、
+//! `column_major`（把访问下标归一到 `[min, max]` 上计算 delta，见
+//! `classify_access_delta` / `index_coefficient`）。
+//!
+//! ### 派生（线性）归纳变量：`classify_derived_induction_variable` /
+//! ### `DerivedInductionVariable`
+//!
+//! ```rust,ignore
+//! pub fn classify_derived_induction_variable(
+//!     data: &ArenaContextMut<'_>, looop: &Loop, base: Inst, value: Inst,
+//!     range: ConstantInductionRange,
+//! ) -> Option<DerivedInductionVariable>
+//! ```
+//!
+//! **语义**：判定 `value` 是否为 `base`（通常是 IV 的 `parameter()`）的**仿射
+//! 组合**，即 `value == coefficient * base + offset`。成功产出
+//! `DerivedInductionVariable { value, base, coefficient: i64, offset: i64, chain }`：
+//! `coefficient()` / `offset()` 是仿射系数，`chain` 是参与计算的指令链。递归
+//! 分类规则：`value == base` → `(1, 0)`；整数常量 → `(0, c)`；`Add` / `Sub` →
+//! 系数与偏移逐项加减；`Mul` 其中一侧为常量 → 整体缩放；`Shl` 常量移位
+//! （0..32）→ 乘 `2^shift`。每次组合后做 `range_fits` 检查：系数 × 区间端点 +
+//! 偏移必须仍落在 `i32` 内（保证在循环任何一轮都不溢出）；要求 `value` 定义在
+//! 循环内、`i32` 类型、最终 `coefficient != 0`。辅助方法：
+//!
+//! - `evaluate(base_value: i32) -> Option<i32>`：代入 `base_value` 求具体值
+//!   （checked 算术，溢出返回 `None`）；
+//! - `removable_chain_cost(&self, data: &FunctionData, consumer: Inst) -> usize`：
+//!   若 `chain` 中每条指令都只被 `consumer` 或链内指令使用，返回链长（把派生
+//!   计算内联进消费点后可删除的指令数），否则 0——供调用方评估改写是否划算。
+//!
+//! **使用方**：`column_major` 经 `classify_derived_induction_variable` 把数组访问
+//! 的地址表达式写成 `coefficient * iv + offset` 形式（`index_coefficient`），
+//! 再据此算跨迭代的访问 delta 以决定列主序改写。
+//!
+//! ## 算法：五步从循环头到 trip count
+//!
+//! 1. **收集候选**：对每个循环取 header 的全部 block 参数，只保留 `i32` 类型者；
+//!    经 `incoming_edges`（结构边 → 逻辑边）收集 header 的所有入边，按参数位置
+//!    对齐每条边传入的值（`header_incoming`）。
+//! 2. **区分初值与更新**：入边按源块是否在循环内分类——源块在循环外的边是
+//!    入口边，其值进入 `initial_values`；源块在循环内的边是回边（latch），其值
+//!    进入 `update_values`（`analyze_parameter`）。
+//! 3. **匹配更新形态**：对每个更新值调 `match_update`，必须是
+//!    `Add(param, step)`、`Add(step, param)` 或 `Sub(param, step)`；`step` 还得
+//!    非零（字面量 0 拒绝）且循环不变量（`is_loop_invariant_step`：全局值 / 常量
+//!    / 定义在循环外的指令）。所有回边的步长必须一致（`same_step`，常量按值
+//!    比较，允许全局常量）。初值 ≥ 1 且更新 ≥ 1 才成 IV——纯直通（passthrough）
+//!    不算。
+//! 4. **规范化严格 exit**：`normalize_strict_exit` 从步长常量得 `signed_step` 与
+//!    方向；要求 header 终结是指向"一臂在循环内、一臂在循环外"的分支、条件是
+//!    `i32` 二元比较且一边是 IV；经补集 / 交换统一为 `iv < bound`（前向）或
+//!    `iv > bound`（反向）；非单位步长补 no-wrap 证明。
+//! 5. **推导 trip count / 范围**：`constant_trip_count` /
+//!    `induction_trip_count` 按 `ceil(distance / |step|)` 求轮数（多初值取
+//!    max、同则 Exact）；`constant_induction_range` 用初值与末轮终值并出闭区间；
+//!    `classify_derived_induction_variable` 在区间上做仿射分类并验证不溢出。
+//!
+//! ## 使用方清单（grep 全仓库确认）
+//!
+//! | 使用方 | 使用的 API | 用途 |
+//! |--------|-----------|------|
+//! | `passes/loop_unroll.rs` | `new` + `normalize_strict_exit` + `constant_trip_count` | 求精确迭代次数，可精确计数才做全展开 |
+//! | `passes/reduction_unroll.rs` | `new` + `normalize_strict_exit` | 要求恰好 1 个 BIV、步长 +1、严格前向 exit，才做规约展开 |
+//! | `passes/pointer_strength_reduction.rs`（含 `candidate.rs`） | `new` + `normalize_strict_exit` + `constant_induction_range` | 指针→下标强度削减：证明无回绕并取得常量范围 |
+//! | `passes/column_major.rs` | `new` + `for_loop` + `normalize_strict_exit` + `constant_induction_range` + `induction_trip_count` + `classify_derived_induction_variable` | 访问 delta 分析、循环嵌套执行次数、列主序改写（最大用户） |
+//! | `passes/matmul_interchange.rs` | `new` + `normalize_strict_exit` | 检查 k / j 循环 exit 形态，判定循环互换合法性 |
+//! | `analysis_passes/range.rs`（`RangeAnalysis`） | `for_loop` + `step()` | `add_induction_caps` 给循环携带值加取值封顶 |
+//! | `passes/recursive_memoize.rs` | `new` + `find` + `InductionStep` | 证明 memo 键参数是前向 `Add` 步进的 IV 才安全 |
+//! | `passes/mod_fold.rs` | `new`（转交 `RangeAnalysis`） | `%` 折叠所需的范围证据 |
+//!
+//! 注：`rotate_loops` 与 `blocked_reduction` 经 grep 确认**不**消费本分析（其测试
+//! 里"induction variable"只是泛指循环变量）。
+//!
+//! ## 正确性与边界情况
+//!
+//! - **非严格 exit**：`Le` / `Ge` 且"留在循环内的臂"对应等号（无法补成严格
+//!   比较）、或分支两臂同在/同不在循环内、或终结不是分支——一律 `None`。
+//!   理由：`iv <= bound` 的精确轮数依赖步长整除关系，保守起见本模块只认严格
+//!   形式（`Le`/`Ge` 在"假臂在循环内"时可经补集化为严格形式，这是允许的）；
+//! - **非常量步长**：识别阶段只收 `Add`/`Sub` 且步长循环不变量；
+//!   `normalize_strict_exit` 进一步要求步长是整数常量（否则 `signed_step` 无从
+//!   谈起）；符号不定的步长、方向与步长符号矛盾（如前向 exit 配负步长）→ `None`；
+//! - **多 latch / 多入口**：多回边允许，但所有更新步长必须一致（
+//!   `rejects_inconsistent_same_target_backedge_arms` 覆盖不一致场景）；多入口
+//!   产生多个初值——`constant_trip_count` 要求恰好一个，`induction_trip_count`
+//!   取最大并降级为 `UpperBound`；
+//! - **回绕（wrap）**：全部距离 / 步长运算走 `i64` checked 算术；
+//!   非单位步长的 exit 必须满足 no-wrap 不等式（`bound + step ∓ 1` 仍在 `i32`
+//!   内）；派生 IV 的仿射组合经 `range_fits` 验证不溢出——任何一步溢出都返回
+//!   `None`，宁可保守；
+//! - **形态拒绝**：零步长 / 直通更新、浮点或非 `i32` 循环参数、更新是其他二元
+//!   运算（`Mul`、`Shl` 等直接作用于参数）都不算 BIV——派生组合只发生在
+//!   `classify_derived_induction_variable` 里；
+//! - **快照语义**：分析结果与 CFG / 循环分析同为快照，IR 一旦修改必须整体重建
+//!   （见 `docs/Convention.md`）。
+//!
+//! ## 验证
+//!
+//! 本模块 `#[cfg(test)] mod tests` 含 16 个单元测试（`cargo test -p raana_ir`）：
+//!
+//! - trip count：`computes_exact_constant_trip_counts`（含 `i32` 极值边界与方向/
+//!   步长矛盾）、`computes_exact_forward_backward_non_unit_and_zero_trip_counts`、
+//!   `estimates_multiple_initial_values_conservatively`（多初值 → `UpperBound`）；
+//! - exit 规范化：`normalizes_forward_and_backward_strict_unit_exits`、
+//!   `normalizes_non_unit_steps_with_a_constant_no_wrap_bound`（含 `i32::MAX-1`
+//!   边界）、`rejects_non_unit_steps_without_a_no_wrap_proof`、
+//!   `rejects_non_strict_mismatched_and_non_unit_exits`、
+//!   `normalizes_an_exit_with_a_global_unit_step`（全局常量步长）；
+//! - IV 识别：`recognizes_add_sub_and_commuted_add`（含交换律）、
+//!   `accepts_symbolic_outer_value_as_inner_loop_step`、
+//!   `preserves_multiple_entry_and_same_target_backedge_arms`、
+//!   `accepts_consistent_multiple_latches`、
+//!   `rejects_passthrough_zero_variant_and_non_affine_updates`、
+//!   `rejects_inconsistent_same_target_backedge_arms`、
+//!   `rejects_float_recurrence`、`rejects_entry_header_without_an_outside_initial_value`
+//!   （缺外部初值 → 非 IV）。
+//!
+//! 集成层面：`loop_unroll`、`pointer_strength_reduction`、`column_major`、
+//! `reduction_unroll` 的 pass 测试都构造真实循环再消费本分析（如 PSR 的
+//! `tests.rs` 直接调 `normalize_strict_exit` + `constant_induction_range` 验证
+//! 改写后的范围正确性）。
+//!
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 

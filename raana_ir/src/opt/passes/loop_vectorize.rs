@@ -4517,14 +4517,11 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     if !test_at_top {
         return false;
     }
-    // Phase 3a only: a compile-time trip that is a multiple of VF. A scalar
-    // epilogue for remainders is not wired, and the runtime-bound tail loop
-    // lowering (spilled row offsets) is not yet correct — such loops stay
-    // scalar (conservative) until the apply side handles them soundly.
-    // M44_ALLOW_RUNTIME=1 temporarily bypasses the guard for MIR-level
-    // debugging of the runtime-bound lowering path (stage 3b).
-    let runtime_ok = runtime_trip && std::env::var("M44_ALLOW_RUNTIME").is_ok();
-    if (runtime_trip && !runtime_ok) || trip % step != 0 {
+    // A compile-time trip that is a multiple of VF, or a runtime-bound trip
+    // whose `trip & (VF-1)` remainder is covered by the scalar tail loop
+    // (`vec_tail_ma`) built in step 6. A runtime-bound loop whose remainder
+    // is covered stays vectorized; anything else stays scalar (conservative).
+    if trip % step != 0 {
         if std::env::var("M44_TRACE").is_ok() {
             eprintln!("[M44] func={} header={header:?} reject=multi_arm_runtime_unsupported",
                 data.name());
@@ -4638,6 +4635,54 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             data.replace_inst_with(branch)
                 .branch(cond, t_target, t_args, f_target, f_args);
         }
+    }
+
+    // ---- 2.5 Widen each unit's scalar branch guard from "lane 0 in
+    //      bounds" to "any lane in bounds". The guard's lower test is
+    //      `ge(cc, 0)` with `cc = iv + kc_off` (lane 0's column). A vector
+    //      round covers columns `cc .. cc+VF-1`: when `cc < 0` the first
+    //      lanes are masked off but higher lanes may still be in bounds, so
+    //      the guard must pass when the *highest* lane is non-negative
+    //      (`cc + VF - 1 >= 0`) — the per-lane vector mask inside `then`
+    //      keeps each masked lane's contribution zero. The upper test
+    //      (`cc < bound`) is unchanged: it is the lowest lane's bound, so
+    //      any in-bounds lane implies it. Without this the first vector
+    //      iteration (iv = 0) drops the kc_off < 0 units' higher lanes.
+    for unit in &multi.units {
+        let body_term = data.layout().basicblock(unit.body_br).terminator();
+        let (t_target, t_args, f_target, f_args) = {
+            match data.inst_data(body_term).kind() {
+                InstKind::Branch(b) => (
+                    b.t_target(),
+                    b.t_args().to_vec(),
+                    b.f_target(),
+                    b.f_args().to_vec(),
+                ),
+                _ => unreachable!("multi-arm body blocks end in a branch"),
+            }
+        };
+        let vf_m1 = data.new_local_inst().integer(VF as i32 - 1);
+        let cc_hi = alloc_inst(
+            data,
+            Binary::new_data(unit.cc, vf_m1, BinaryOp::Add, i32.clone()),
+        );
+        let ge_hi = alloc_inst(data, Binary::new_data(cc_hi, zero, BinaryOp::Ge, i32.clone()));
+        let lt_b = alloc_inst(
+            data,
+            Binary::new_data(unit.cc, unit.bound, BinaryOp::Lt, i32.clone()),
+        );
+        let inner = alloc_inst(data, Binary::new_data(ge_hi, lt_b, BinaryOp::And, i32.clone()));
+        let mut cond = inner;
+        if let Some(rr) = unit.rr_ok {
+            cond = alloc_inst(data, Binary::new_data(cond, rr, BinaryOp::And, i32.clone()));
+        }
+        data.layout_mut().insert_inst_before(body_term, cc_hi);
+        data.layout_mut().insert_inst_before(body_term, ge_hi);
+        data.layout_mut().insert_inst_before(body_term, lt_b);
+        data.layout_mut().insert_inst_before(body_term, inner);
+        data.layout_mut().insert_inst_before(body_term, cond);
+        data.replace_inst_with(body_term)
+            .branch(cond, t_target, t_args, f_target, f_args);
     }
 
     // ---- 3. Body vectorization.
@@ -4915,9 +4960,10 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     // the tail loop is built; used to rewrite the exit terminator's reads.
     let mut tail_acc: Option<Inst> = None;
     let (reduce_target, reduce_args): (BasicBlock, Vec<Inst>) = if runtime_trip {
-        // Build the scalar tail loop (below) and enter it at `iv0` with the
-        // reduced sum as the accumulator seed. The tail's Out writes mirror
-        // the latch's Out store (base + iv-t-indexed offsets).
+        // Build the scalar tail loop (below) and enter it at `iv0` with a
+        // zero accumulator seed — each remainder column's sum is independent
+        // (the vector rounds do not feed the tail). The tail's Out writes
+        // mirror the latch's Out store (base + iv-t-indexed offsets).
         // The tail's Out write mirrors the latch's Out store: `base +
         // (invariant_row_off + iv_t)`.
         let (out_base, out_row_off) = {
@@ -4966,7 +5012,7 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             has_iv_final,
             n_passthrough,
         );
-        let mut fwd = vec![iv0, acc_scalar];
+        let mut fwd = vec![iv0, zero];
         fwd.extend(passthrough_args.iter().copied());
         tail_acc = Some(data.bb_data(tail_h).params()[1]);
         (tail_h, fwd)
@@ -5106,7 +5152,9 @@ fn promote_body_invariant(
 }
 
 /// Build the scalar tail loop for a multi-arm kernel over the `trip & 3`
-/// remainder (`while (iv < bound) { acc op= mask·In·K; Out[iv] = acc; iv++ }`).
+/// remainder (`while (iv < bound) { acc = 0; acc op= mask·In·K; Out[iv] =
+/// acc; iv++ }`). Each column's sum starts fresh from 0 — the accumulator
+/// is re-seeded on the entry edge and reset on every back edge.
 /// The tail's Out write mirrors the latch's store at `base + (row_off +
 /// iv_t)`. Returns the tail header.
 #[allow(clippy::too_many_arguments)]
@@ -5244,7 +5292,7 @@ fn build_multi_arm_tail(
     insts.push(out_store);
     let iv_t_next = alloc_inst(data, Binary::new_data(iv_t, one, BinaryOp::Add, i32.clone()));
     insts.push(iv_t_next);
-    let mut back_args: Vec<Inst> = vec![iv_t_next, acc_cur];
+    let mut back_args: Vec<Inst> = vec![iv_t_next, zero];
     back_args.extend(passthrough_args.iter().copied());
     insts.push(data.new_local_inst().jump(tail_h, back_args));
     for inst in insts {

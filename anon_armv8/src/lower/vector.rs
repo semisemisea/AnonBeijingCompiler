@@ -1,5 +1,6 @@
 //! NEON vector lowering helpers.
 
+use super::arith::operand_size;
 use super::*;
 /// Select a vector binary operation onto the NEON instruction set.
 ///

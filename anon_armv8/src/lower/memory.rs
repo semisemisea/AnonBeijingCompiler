@@ -1,5 +1,7 @@
 //! Allocation, addressing, load/store, and memory-zeroing helpers.
 
+use super::arith::add_sub_immediate;
+use super::vector::vector_shape;
 use super::*;
 pub(super) fn lower_alloc(
     ctx: &mut LowerContext<'_, MInst>,

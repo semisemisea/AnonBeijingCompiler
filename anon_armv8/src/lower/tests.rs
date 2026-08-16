@@ -1,7 +1,5 @@
-use super::{
-    MulConstForm, fold_mul_constant, nzcv_making_cond_false, nzcv_making_cond_true,
-    signed_power_of_two,
-};
+use super::arith::{MulConstForm, fold_mul_constant, signed_power_of_two};
+use super::branch::{nzcv_making_cond_false, nzcv_making_cond_true};
 use crate::instructions::{Cond, ImmShift, MInst};
 use crate::regs::OperandSize;
 use raana_ir::ir::{BinaryOp, Program, Type};

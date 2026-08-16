@@ -69,6 +69,9 @@ enum ScanPregError {
 }
 
 impl<F: Function> Env<'_, F> {
+    /// 分配主循环（Ion 回溯分配器核心）：不断从优先级队列取出 bundle，
+    /// 尝试分配寄存器；冲突则按 SpillWeight 博弈——驱逐权重更低的 occupant
+    /// 并把它重新入队（被驱逐者可能再分裂/溢出）。队列清空即分配完成。
     pub fn process_bundles(&mut self) -> Result<(), String> {
         while let Some((bundle, hint)) = self.ctx.allocation_queue.pop() {
             self.process_bundle(bundle, hint)?;
@@ -99,6 +102,9 @@ impl<F: Function> Env<'_, F> {
         conflicts: &mut LiveBundleVec,
         aliased_scan: bool,
     ) -> Result<Option<ProgPoint>, ScanPregError> {
+        // 两段有序区间流同时推进（bundle 的 range 列表与 PReg 的 BTreeMap
+        // 均有序）：先跳到 >= 当前 bundle range 的位置，再判断是否重叠。
+        // 每 16 次跳过就重定位迭代器，避免 BTree 遍历退化。
         // Traverse the BTreeMap in order by requesting the whole
         // range spanned by the bundle and iterating over that
         // concurrently with our ranges. Because our ranges are in
@@ -382,6 +388,9 @@ impl<F: Function> Env<'_, F> {
     /// Local equivalent of regalloc2's priority computation. taki_mir does
     /// not keep the upstream per-bundle priority cache, so use total covered
     /// instruction extent and retain a nonzero denominator for spill weights.
+    /// bundle 优先级 = 其所有 LiveRange 的指令跨度之和（max(1) 防除零）。
+    /// 优先级决定处理顺序：跨度大的 bundle 先分配（贪心：难分配的先用
+    /// 最好的寄存器池），同时是驱逐博弈的权重基数。
     fn compute_bundle_prio(&self, bundle: LiveBundleIndex) -> u32 {
         self.ctx.bundles[bundle]
             .ranges
@@ -407,6 +416,15 @@ impl<F: Function> Env<'_, F> {
     pub fn recompute_bundle_properties(&mut self, bundle: LiveBundleIndex) {
         trace!("recompute bundle properties: bundle {:?}", bundle);
 
+        // 驱逐/分裂后重新推导 bundle 的属性：优先级、寄存器编码上限
+        // （limit，来自 OperandConstraint::Limit 的最小值）、是否 fixed
+        // （含 fixed def）、是否 Stack 约束、是否 minimal。
+        // minimal = 单 LiveRange 且至多一个 use、区间不超出"该 use 的
+        // 最小区间"（用 contains 而非 exact：比最小还小的区间如死 def
+        // 也合法，避免对"小于最小"的区间活锁）。
+        // spill weight 分层：minimal 用固定小权重（fixed/limited/普通三档），
+        // 非 minimal 累加各 range 的 uses_spill_weight——权重决定驱逐博弈
+        // 与 spill 排序，不决定处理顺序（顺序看 prio）。
         let minimal;
         let mut fixed = false;
         let mut fixed_def = false;
@@ -589,6 +607,11 @@ impl<F: Function> Env<'_, F> {
         // spill bundle?
         mut trim_ends_into_spill_bundle: bool,
     ) {
+        // 分裂与重新入队：被驱逐后无处可去的 bundle 在此处"瘦身"——
+        // 在 split_at 处把区间切开，产生更小（更易分配）的子 bundle 并
+        // 重新入队。分裂计数有上限（MAX_SPLITS_PER_SPILLSET），超限或
+        // 区间只跨一条指令时退化为"全拆成 minimal bundle + 共享 spill
+        // bundle"（split_into_minimal_bundles），保证终止不活锁。
         trace!(
             "split bundle {bundle:?} at {split_at:?} and requeue with reg hint (for first part) {hint:?}"
         );

@@ -3,6 +3,211 @@
 //! The abstract domain is one closed interval with an optional hole at zero.
 //! Arithmetic that may wrap for a non-singleton input is deliberately mapped
 //! to `full`; singleton operations use RaanaIR's wrapping integer semantics.
+//!
+//! ---
+//!
+//! ## 补充说明（中文）
+//!
+//! 术语：区间 / 抽象域 / 数据流分析（不动点）/ 回边 / 归纳变量（IV）/ 强度削减
+//! （SR）/ PSR 等见 `docs/offline-handbook/glossary.md` 的「IR 与 SSA 基础」
+//! 「循环」「强度削减」分组；「结构边 vs 逻辑边」「Block 参数（Phi）」见
+//! 「IR 与 SSA 基础」分组。
+//!
+//! ### 定位
+//!
+//! 本模块是**函数内**（intra-procedural）的 i32 区间分析基础设施：对当前函数里
+//! 每条 i32 值，计算它在各个程序点（函数级 / 块入口 / 逻辑边 / 指令前）可能取到
+//! 的取值区间，供改写 pass 做「这个运算不会回绕」「这个值非负」「这个值落在
+//! `[0, 2P)`」这类证明。结果是**保守上近似**：证明不了的值一律给最宽区间
+//! （`full`），宁漏勿错。
+//!
+//! 与 `cfg` / `dom_tree` / `loop_analysis` / `induction_variable` 等分析一致，
+//! 它是**快照**：`RangeAnalysis::new` 一次性建好（构造时已跑完全部迭代），之后
+//! 只读查询；任何 IR 修改（增删 / 改写指令）都会让结果过期，使用方必须重建。
+//!
+//! ### 抽象域：闭区间 + 零点空洞
+//!
+//! `IntRange` 是带 bottom / top 的三值格（bottom < 具体区间 < top）：
+//!
+//! - `Empty`：空集（bottom），表示「该程序点不可达」或「假设自相矛盾」；
+//! - `Bounded { min, max, contains_zero }`：闭区间 `[min, max]`，外加布尔标记
+//!   `contains_zero`。**零点空洞**：`contains_zero == false` 表示区间**排除 0**
+//!   （如 `assume_ne(0)` 之后），而 `min <= 0 <= max` 只表示「数值上覆盖 0 这个
+//!   点」。这样「除 0 外的区间」不必拆成两段，代价是表达能力弱于「两个闭区间的
+//!   并」——这是本设计的取舍：够用，且 join / intersect 都是 O(1)。
+//!
+//! `impl IntRange` 上的方法：
+//!
+//! - `empty()` / `full()` / `constant(value)` / `bounded(min, max)`：四种构造
+//!   （`bounded` 按 `min <= 0 <= max` 自动决定 `contains_zero`，`min > max`
+//!   时归一化为 `Empty`）；
+//! - `min()` / `max()` / `singleton()`：`Empty` 时返回 `None`；`singleton` 在
+//!   `min == max` 时返回唯一确定值；
+//! - `contains(value)` / `contains_zero()` / `excludes_zero()`：成员查询，
+//!   `contains` 同时检查闭区间与零点空洞（`value == 0` 时要求 `contains_zero`）；
+//! - `join`（并，取上确界）/ `intersect`（交，取下确界）/ `is_subset_of`
+//!   （子集判定，别名 `subset`）：格运算；
+//! - `assume_eq` / `assume_ne` / `assume_lt` / `assume_le` / `assume_gt` /
+//!   `assume_ge`：在「该条件为真」的假设下收紧自身——`assume_eq` 就是
+//!   `intersect`；`assume_ne(0)` 只清掉零点空洞（对单点 `{0}` 给 `Empty`）；
+//!   大小比较与对应半边区间求交，边界处 `checked_add` / `checked_sub` 溢出
+//!   视为 `Empty`（如 `assume_lt` 对 `other.max() == i32::MIN` 的情形）；
+//! - `widen(next)`：**宽化算子**（见「算法」第 4 步）：`next` 越过自身边界时
+//!   直接把该侧放宽到 `i32::MIN` / `i32::MAX`，保证循环迭代收敛。
+//!
+//! ### wrap 处理：单点走包装语义，非常量走数学区间
+//!
+//! 编译器里 `+` / `-` / `*` 等是 **i32 包装运算**（RaanaIR 语义，见英文文档）。
+//! `transfer_binary` 的策略：
+//!
+//! - 两个操作数都是**单点**：用 `fold_binary` 按包装语义精确折叠（如
+//!   `i32::MAX + 1` → `i32::MIN`，与运行时一致）；除 / 余除数为 0 时例外 →
+//!   `full`；
+//! - 操作数不全是单点：用 `mathematical_binary` 在 **i64 上**做端点运算
+//!   （加 / 减 / 乘 / 常量移位 / `min` / `max`），结果能落回 i32 才给区间；端点
+//!   越出 i32 范围（可能回绕）时返回 `None` → `full`。**非常量操作数的算术要么
+//!   给精确区间、要么给 `full`，绝不给出会漏掉回绕值的假区间**；
+//! - 比较指令：`comparison_range` 证明恒真 / 恒假时给 `1` / `0`，否则给
+//!   `[0, 1]`；
+//! - 按位与：单点掩码 ≥ 0 时给 `[0, mask]`；`Or` / `Xor` 一边为 0 时给另一边；
+//!   逻辑右移 `Shr` 给 `[0, i32::MAX]`；算术右移 `Sar` 在移位量为单点且
+//!   `[0, 32)` 时按端点移位给区间；
+//! - 除 / 余只对**单点除数**精化：除数为 0、或 `i32::MIN / -1`（回绕）→
+//!   `full`；`transfer_rem` 在**被除数可证非负**时把余数压到 `[0, |divisor|-1]`
+//!   （截断余数符号跟随被除数，见测试 `remainder_of_non_negative_dividend_
+//!   is_non_negative`），否则给 `[-m, m]`（`m = |divisor|-1` 封顶，防
+//!   `i32::MIN` 的绝对值溢出）——这是 `mod_fold` 链式 `%` 折叠能继续的前提；
+//! - `Select`：条件恒 0 / 恒非 0 时只算对应分支，否则两分支 `join`；`Cast`：
+//!   源是常量 `f32`（有限且在 i32 范围内，`fold_f32_to_i32`）时精确折叠，源是
+//!   整型常量时返回源区间，其余 `full`；
+//! - 调用（`call_range`）：`soyo_mulmod(a, b, p)`（`return_summary::MODMUL_
+//!   BUILTIN`）在 `a`、`b` 都可证非负时给 `[0, p-1]`（`p` 为正常量）否则
+//!   `[0, i32::MAX]`；`return_summary::nonneg_preserving_functions` 里的纯函数
+//!   在**所有实参**都可证非负时给 `[0, i32::MAX]`；其余调用一律 `full`。
+//!
+//! ### 核心 API（`impl RangeAnalysis`）
+//!
+//! 构造：`new(&ArenaContext, &CFG, &LoopAnalysis, &BasicInductionVariableAnalysis,
+//! &nonneg_preserving, &nonneg_params) -> Self`。后两个 `FxHashSet` 来自
+//! `return_summary`（跨过程非负摘要，见「算法」）。构造时跑完整轮前向数据流
+//! （必要时重解一遍），之后的查询全是只读。
+//!
+//! 查询（`&self`，统一经 `range_in_context(value, context)` 分发）：
+//!
+//! - `range_of(value)`：函数级区间——所有上下文 join 后的整体范围，最粗；
+//! - `range_at_block_entry(block, value)`：`block` 入口处（各入边状态 join 后）
+//!   的区间；无记录时回退 `base_range`；
+//! - `range_on_edge(edge, value)`：沿某条**逻辑边**的区间——分支条件沿该边的
+//!   假设已精化（true 臂上 `cond != 0`，false 臂上 `cond == 0`）；该边不可达
+//!   （状态缺失）时返回 `empty`；
+//! - `range_before(instruction, value)`：**指令前**程序点的区间——当前块内
+//!   该指令之前所有已定值事实（含此前分支精化）。`mod_fold` / `pointer_strength_
+//!   reduction` 的核心查询；
+//! - `loop_header_range(header, parameter)`：循环头块参数的入口区间
+//!   （`range_at_block_entry` 的别名），测试里查 IV 范围用；
+//! - `range_of_fresh(value)`：忽略 `solve` 记录在 `ranges` 里的该值自身区间，
+//!   沿 def-use 链**重推**一遍。动机：`solve` 处理某块时就把块内指令的区间记进
+//!   `ranges`，而入口参数的传播值要到 worklist 收尾才 join 进来，所以「两个入口
+//!   参数的运算结果」这类值在 `ranges` 里可能是过期的 `full`。注释点名给
+//!   return summary / guard folding 类调用方用稳定答案；目前仓库内无外部调用点
+//!   （见「使用方清单」）；
+//! - `proves_binary_no_signed_wrap(op, lhs, rhs, context) -> bool`：证明 `Add` /
+//!   `Sub` / `Mul` / `Shl` 在给定程序点**不发生有符号回绕**——对两个操作数在
+//!   `context` 下求区间后跑 `mathematical_binary`（i64 端点运算不越界即无回绕）。
+//!   PSR 用它保证仿射地址算术的健全性。
+//!
+//! `RangeContext` 是查询上下文枚举，四个变体 `Function` / `BlockEntry(block)` /
+//! `Edge(edge)` / `Before(inst)` 与上述查询一一对应。
+//!
+//! ### 算法：带分支精化的前向数据流（worklist 不动点）
+//!
+//! 1. **定义收集**：`new` 先扫全函数指令，把每条 i32 值登记成 `ValueDef`
+//!    （`Integer` / `ZeroInit` / `Undef` / `Binary(op, lhs, rhs)` / `Select` /
+//!    `Cast` / `Call(callee, args)` / `BlockParameter` / `Unknown`；非 i32 一律
+//!    `Unknown`，查询得 `full`）；
+//! 2. **入口初始化**：入口块参数给 `full`；`return_summary::always_nonneg_params`
+//!    里本函数的参数给 `[0, i32::MAX]`；
+//! 3. **worklist 迭代**（`solve`）：块出队后按指令顺序求值。回边携带的值是旧
+//!    观察：处理块内每条 i32 指令前先从状态里删掉它（SSA 定义先于使用），把
+//!    当前状态存入 `before[inst]`，算出区间后写回状态并 `join` 进函数级
+//!    `ranges`。块尾沿每条出边克隆状态，`refine_edge` 用分支条件精化（见上；
+//!    条件是整数比较时再对两个操作数做 `refine_comparison` 双向 `assume_*`；
+//!    精化结果为空 → 该边不可达，整条边跳过）。边状态变化就把它 `join` 进目标
+//!    块的 `block_entries`，变化则重新入队；`join_incoming` 只对目标**块参数**
+//!    求各入边实参的区间（其余值靠 `evaluate_contextual` 沿 def-use 链惰性重推，
+//!    避免 O(入边 × 状态) 的拷贝开销）；
+//! 4. **循环头宽化**：循环头参数每次经回边变化时计数，变化 ≥ `WIDEN_AFTER`(3)
+//!    次后改用 `widen` 直接放宽到边界方向——保证含未知递推（如 `x *= 2`）的
+//!    循环也能收敛（见测试 `unrecognized_loop_recurrence_widens_to_terminate`）；
+//! 5. **归纳变量封顶**（`add_induction_caps`，消费 `loop_analysis` +
+//!    `induction_variable`）：对形如 `iv < bound`（步长 > 0）或 `iv > bound`
+//!    （步长 < 0）的**严格 exit** 测试，若步长为常量且不会回绕（`|step| ≠ 1`
+//!    时用 i64 检查终端值不越界），按初值 `join` 终端值给 IV 算出封顶区间
+//!    `loop_caps`；只要产生过 cap 就**清空全部状态重解一遍**，让封顶参与后续
+//!    迭代（测试 `loop_cap_includes_failing_header_visit`）；
+//! 6. **按需求值**（`evaluate_contextual` / `evaluate_def`）：查询时若当前 `facts`
+//!    里没有该值，沿 `ValueDef` 递归重推（深度上限 `CONTEXT_DEPTH_LIMIT`(32) +
+//!    visiting 集合防深链 / 环上爆炸），兜底 `base_range`。
+//!
+//! ### 使用方清单（`raana_ir/src` grep 确认）
+//!
+//! - `opt/passes/mod_fold.rs`（`ModFold`）：`RangeAnalysis::new` 建分析，对每个
+//!   「除数为非 2 幂正整数常量」的 `Rem` 候选调 `range_before(inst, dividend)`，
+//!   `foldable` 证明被除数在 `rem` 处满足 `0 <= x < 2P` 后把 `x % P` 折成
+//!   `select(x >= P, x - P, x)`（一条 `sub; cmp; csel`）。喂给分析的 `nonneg`
+//!   集合来自 `return_summary`（含本函数恒非负入口参数）。管线位置：fixpoint
+//!   段 `guard_elimination` 之后、`sr` 之前（pass.rs 287–292 行）。
+//! - `opt/passes/pointer_strength_reduction.rs`（`PointerStrengthReduction`）：
+//!   `RangeAnalysis::new` 建分析（非负参数集合传空）后把 `&ranges` 传进
+//!   `find_candidate`（经 `pointer_strength_reduction/candidate.rs` 到
+//!   `analysis.rs`）：`range_before(gep, value)` 求仿射表达式里循环不变量偏移的
+//!   区间（`I64Range::from_i32`），`proves_binary_no_signed_wrap(..., RangeContext::
+//!   Before(gep))` 证明循环依赖的 add / sub / mul / shl 在 GEP 处不回绕——回绕
+//!   或区间越出 i32 就放弃该候选。管线位置：fixpoint 段 `dse` 之后、
+//!   `guard_elimination` 之前（pass.rs 279–285 行）。
+//! - 间接上游（被消费的依赖，不是使用方）：`opt/analysis_passes/return_summary.rs`
+//!   提供 `nonneg_preserving_functions` / `always_nonneg_params` / `MODMUL_BUILTIN`
+//!   （`soyo_mulmod`）；`loop_analysis` / `induction_variable` 提供循环与 IV
+//!   结构（`add_induction_caps` 消费，见 `induction_variable.rs` 文档的依赖表）。
+//! - 管线邻居（不直接调用本模块）：`opt/passes/guard_elimination.rs` 用
+//!   `return_summary` 的摘要折叠 modmul 的 `br (x < 0)` 守卫，注册在 `mod_fold`
+//!   **之前**（pass.rs 282–285 行）——守卫折完后 range 事实稳定，`mod_fold`
+//!   才做区间证明（见 `guard_elimination.rs` 文档 81–82 行与 pass.rs 注册注释）。
+//! - `range_of_fresh` / `loop_header_range` 目前只在测试里出现，仓库内无其他
+//!   外部调用点。
+//!
+//! ### 正确性 / 边界
+//!
+//! - **保守上近似**：证明不了 → `full`（`base_range` 兜底），宁漏勿错；除 / 余
+//!   对非常量除数直接 `full`；
+//! - **包装语义**：单点运算按 i32 包装折叠（`fold_binary`），非单点只在 i64
+//!   端点运算不越界时给区间，越界 → `full`——不会声称「不回绕」而实际回绕；
+//! - **零点空洞**：`contains_zero` 是区间形状的一部分，`join` / `intersect` /
+//!   `is_subset_of` 都参与比较；`assume_ne(0)` 只清空洞、不拆区间（表达力取舍：
+//!   无法表示「`[−4, 8]` 里排除 0 之外某点」这类形状，此类查询退化为两侧并集
+//!   的近似）；
+//! - **快照**：任何 IR 修改都会使结果过期，使用方改写前必须重建；
+//! - **函数内**：不做跨函数区间——调用结果除 mulmod 与非负保持纯函数两个特例
+//!   外一律 `full`；`BlockParameter` 的求值回退到函数级 `ranges`；
+//! - **不可达边**：`refine_edge` 证明某臂不可达时该边没有状态，`range_on_edge`
+//!   返回 `empty`；
+//! - **循环**：无法识别的递推靠宽化收敛为 `full`（正确但丢精度），宽度上限
+//!   3 次变化（`WIDEN_AFTER`）。
+//!
+//! ### 验证
+//!
+//! 本文件内联 `#[cfg(test)] mod tests`（1117 行起，共 10 个用例）：
+//! `lattice_and_assumptions`（格运算与 assume 族）、`wrapping_singletons_and_
+//! interval_overflow`（单点包装 / 区间越界 → full）、`remainder_of_non_negative_
+//! dividend_is_non_negative`（非负被除数余数）、`diamond_refines_branch_condition_
+//! and_parameter_join`（分支精化 + 参数 join）、`same_target_arms_keep_distinct_
+//! arguments`（同目标双臂实参区分）、`float_comparison_does_not_refine_float_
+//! operands_as_integers`（浮点比较不按整数精化）、`joins_block_parameters_from_
+//! distinct_predecessors`（多前驱参数 join）、`loop_cap_includes_failing_header_
+//! visit`（IV 封顶）、`unrecognized_loop_recurrence_widens_to_terminate`（未知
+//! 递推宽化收敛）、`proves_no_signed_wrap_in_context`（无回绕证明）。端到端由
+//! 使用方 pass 的测试（`mod_fold.rs` / `pointer_strength_reduction` 的 `mod
+//! tests`）与 `cargo test -p raana_ir` 全量回归覆盖。
 
 use rustc_hash::{FxHashMap, FxHashSet};
 

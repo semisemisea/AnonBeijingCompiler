@@ -38,6 +38,11 @@ pub(super) fn calculate<'a, PredFn: Fn(Block) -> &'a [Block]>(
     out: &mut Vec<Block>,
     start: Block,
 ) {
+    // 立即支配者（idom）迭代算法：RPO 序下，每个节点的 idom 是其
+    // 前驱中 RPO 最靠前者的 idom 链合并（merge_sets 沿 idom 链爬升取
+    // 两个前驱的共同祖先）。反复迭代直到不动点——标准数据流算法，
+    // 图规模小（后端基本块数有限）时收敛快。
+    // 结果存 out（idom 表，entry 的 idom 置 invalid 表示无前驱）。
     block_to_rpo.clear();
     block_to_rpo.resize(num_blocks, None);
     for (index, &block) in postorder.iter().rev().enumerate() {

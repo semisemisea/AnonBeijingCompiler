@@ -32,6 +32,9 @@ use crate::reg_alloc::{
 use log::trace;
 
 impl<F: Function> Env<'_, F> {
+    /// 第二次机会分配：主循环结束后，被 spill 的 bundle 再试一次能不能
+    /// 挤进寄存器（sort 按溢出权重降序，热者优先挑）；仍失败的才真正
+    /// 落栈（spillset 标记 required，稍后 allocate_spillslots 分配栈槽）。
     pub fn try_allocating_regs_for_spilled_bundles(&mut self) {
         trace!("allocating regs for spilled bundles");
         let mut scratch = core::mem::take(&mut self.ctx.scratch_conflicts);
@@ -116,6 +119,10 @@ impl<F: Function> Env<'_, F> {
     pub fn allocate_spillslots(&mut self) {
         const MAX_ATTEMPTS: usize = 10;
 
+        // 栈槽分配：对每个 required spillset，先在同类的既有槽里探测
+        // （区间不重叠即可复用同一栈槽，probe_start 轮转做粗略负载均衡，
+        // 上限 10 次或槽数），找不到再开新槽。最后统一把每个 spillslot
+        // 分配栈帧偏移（allocate_spillslot，按 size 对齐）。
         for spillset in 0..self.ctx.spillsets.len() {
             trace!("allocate spillslot: {}", spillset);
             let spillset = SpillSetIndex::new(spillset);

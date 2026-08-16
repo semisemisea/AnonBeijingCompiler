@@ -212,6 +212,10 @@ pub enum AllocationKind {
     Stack = 2,
 }
 
+/// 分配结果的紧凑表示：高 3 位是种类（None/Reg/Stack），低 28 位是
+/// 物理寄存器下标或栈槽号。32 位打包使 Allocation 可 Copy + Ord
+/// （ParallelMoves 的排序/去重/比较都依赖它），bits()/from_bits()
+/// 提供透传（客户端需要原样保存/恢复分配结果时用）。
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Allocation {
     bits: u32,
@@ -314,6 +318,9 @@ pub enum InstPosition {
     After = 1,
 }
 
+/// 程序点：指令号 + 指令前/后位置，打包为 u32（inst<<1 | pos）。
+/// 活跃区间 CodeRange 的端点与 move 插入位置都用它；next()/prev()
+/// 在相邻程序点间移动（活跃区间端点对齐）。
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProgPoint {
     bits: u32,

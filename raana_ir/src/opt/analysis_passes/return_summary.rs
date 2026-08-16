@@ -25,7 +25,126 @@
 //! non-negative operands, or a call to a non-negativity preserving function
 //! with all non-negative arguments. Block parameters are the meet over their
 //! incoming edges.
-
+//!
+//! ---
+//!
+//! ## 补充说明（中文）
+//!
+//! 本模块是**过程间非负性摘要**：回答两类跨函数问题——「哪些纯函数只要所有
+//! `i32` 实参 `>= 0`，返回值就必然 `>= 0`」（返回摘要），以及「每个函数哪些
+//! `i32` 形参在所有调用点都可证 `>= 0`」（参数摘要）。两个事实都是函数级
+//! 摘要，一次算出、跨函数共享，主要喂给 M61 `guard_elimination`（守卫消除）
+//! 把 `cmp; b.lt 0` 这类非负守卫折成无条件跳转。摘要都是**条件式**的：调用方
+//! 喂入「输入派生值」（如可能为负的数组元素 load）时证明不了非负，就保守地
+//! 不纳入——这是整个分析的保守边界。
+//!
+//! ## API 逐方法
+//!
+//! - `MODMUL_BUILTIN`（`pub const &str`）：内置取模乘法 `soyo_mulmod` 的名字，
+//!   由 M60 `mulmod_recognize` pass 引入。`(i64)a * b % p` 在 `a >= 0` 且
+//!   `b >= 0` 时非负（非负被除数截断取余不会变负），是返回摘要的基例。
+//! - `nonneg_preserving_functions(&Program) -> FxHashSet<Function>`：返回摘要。
+//!   求「纯函数且结果恒非负」的函数集合（算法见下）。调用方据此判定「调用
+//!   `f(...)` 的结果是否可证 `>= 0`」。
+//! - `always_nonneg_params(&Program, &FxHashSet<Function>) -> FxHashMap<Function,
+//!   FxHashSet<Inst>>`：参数摘要。对每个有函数体的函数，给出在所有调用点都
+//!   可证 `>= 0` 的形参集合（只考虑 `i32` 形参）；map 中每个函数都有键，值
+//!   可能是空集。
+//! - `nonneg_in_function(&Program, Function, &FxHashSet<Inst>, &FxHashSet<Function>)
+//!   -> FxHashSet<Inst>`：函数内非负值集合。给定「已证明 `>= 0` 的入口参数」
+//!   与「保非负函数集合」，在 SSA 值图上做前向数据流，求出该函数内所有可证
+//!   `>= 0` 的值。它是前两个摘要共用的底层引擎，也是 `guard_elimination`
+//!   判定守卫条件是否非负的唯一依据。
+//!
+//! 私有辅助：`returns_are_nonneg`（`f` 的所有 `ret` 值是否都可证 `>= 0`）、
+//! `param_provable_at_all_sites`（`f` 第 `position` 个实参在**每个**调用点是否
+//! 都可证 `>= 0`）、`value_is_nonneg`（单条值的规则表，见「正确性 / 边界」）、
+//! `halving_base`（识别前端 `x / 2` 的 `sar(add(x, shr(x, 31)), 1)` 形态）。
+//!
+//! ## 算法
+//!
+//! 三个 fixpoint，自底向上：
+//!
+//! 1. `nonneg_in_function`（底层引擎）：以 `nonneg_params` 为种子，先扫本地
+//!    指令把非负常量（`Integer >= 0`、`ZeroInit`）入集；然后反复迭代到不再
+//!    变化——(a) **block 参数汇合**：非入口、可达的块参数，当且仅当**每条**
+//!    入边传入的实参都可证非负时才标记。入口块参数必须排除：入口没有入边，
+//!    空汇合（vacuous meet）会把所有入口参数误标为非负，它们只能由
+//!    `always_nonneg_params` 的种子喂入；不可达块在 CFG 里没有边，跳过；
+//!    (b) **沿定义传播**：对每个可达块按程序序逐条指令跑 `value_is_nonneg`
+//!    规则表。集合单调增长，收敛即固定点。
+//! 2. `nonneg_preserving_functions`：**co-inductive（最小）fixpoint**。候选集
+//!    来自 `pure_function::pure_functions`（非纯函数直接排除；无函数体的声明
+//!    也排除）。每轮对每个尚未入集的纯函数，**先假设它自己已在集合里**再
+//!    检查——co-induction 的关键：自递归函数（如 NTT 的 `power` 调用自己）
+//!    可以从自己的递归调用点证明非负，只要基例已成立。检查方式是
+//!    `returns_are_nonneg`：把全部形参当作非负种子跑函数内分析，所有 `ret`
+//!    值都可证非负才入集；有新增就再来一轮，直到不再变化。
+//! 3. `always_nonneg_params`：**greatest fixpoint**。先把每个有函数体的函数的
+//!    全部 `i32` 形参都当作候选，再反复淘汰：对每个形参扫描**全程序**所有
+//!    调用方里的 `Call`/`TailCall` 指令（`param_provable_at_all_sites`），用
+//!    调用方当前的参数摘要作种子跑函数内分析，只要存在一个调用点的实参证明
+//!    不了非负就把该形参删掉；直到一轮内没有任何删除为止。
+//!
+//! 复杂度未刻意优化：`always_nonneg_params` 每轮对每个调用方重跑
+//! `nonneg_in_function`；实际函数规模小、收敛快。
+//!
+//! ## 使用方清单
+//!
+//! - `opt/passes/guard_elimination.rs`（M61 `GuardElimination::run`，约 110 行）：
+//!   三个公开 API 全用。每个 `run` 先算一遍程序级摘要（`nonneg_preserving_
+//!   functions` → `always_nonneg_params`）跨函数共享，再逐函数用
+//!   `nonneg_in_function` 求事实集；块的 `Branch` 终结符守卫条件在事实集里就
+//!   折成 `Jump`。事实集里没有 `x` ⟹ 证明不了 ⟹ 守卫保留。
+//! - `opt/analysis_passes/range.rs`（`RangeAnalysis`，约 311-318、364-369 行）：
+//!   把 `nonneg_preserving_functions` 的结果存入 `nonneg_preserving` 字段、
+//!   `always_nonneg_params` 的当前函数子集存入 `nonneg_params` 字段，作为值
+//!   区间分析的下界种子；并用 `MODMUL_BUILTIN` 按名字定位 `soyo_mulmod`
+//!   声明。
+//! - `opt/passes/mod_fold.rs`（约 159-167 行）：调用 `nonneg_preserving_
+//!   functions` + `always_nonneg_params`，把**本函数**的恒非负形参喂给 range
+//!   分析，使被除数的下界推导能利用跨过程信息（如 `f(x)` 返回值包装中间值
+//!   的场景）。
+//! - `opt/passes/pointer_strength_reduction.rs`（约 248 行）：调用
+//!   `nonneg_preserving_functions` 收紧仿射索引的取值区间，帮助
+//!   `affine_range_fits_i32` 通过 i32 中间范围证明。
+//! - `opt/analysis_passes/pure_function.rs`（约 186 行）：用 `MODMUL_BUILTIN`
+//!   把 `soyo_mulmod` 判为纯函数——它是本模块的**上游**：
+//!   `nonneg_preserving_functions` 的候选集正来自 `pure_functions`。
+//!
+//! 依赖链：`pure_function` → `return_summary` → `guard_elimination` / `range` /
+//! `mod_fold` / `pointer_strength_reduction`。
+//!
+//! ## 正确性 / 边界
+//!
+//! - **i32 环绕语义下逐条规则 sound**：`x + y` / `x * y` **不**认作非负——两个
+//!   大非负操作数相加/相乘会环绕成负值；`Rem`/`Shr` 保持符号；`Sar` 对非负值
+//!   保持符号位为 0，且前端 `x / 2` 的 `sar(add(x, shr(x, 31)), 1)`（等于
+//!   `floor(x / 2)`）经 `halving_base` 识别后对非负 `x` 成立；`Div` 只认**正
+//!   的常量**除数（负除数翻转符号，变量除数可能为 0）；`And` 要求两操作数都
+//!   非负；`Select` 要求两个分支值都非负。
+//! - **条件式 / 保守**：两个程序级摘要都只对「所有 `i32` 实参 `>= 0`」作
+//!   承诺；调用方喂输入派生值时证明不了非负，摘要不适用。`always_nonneg_params`
+//!   要求**每个**调用点（含 `TailCall`）都可证，漏一个就淘汰该形参。
+//! - **`soyo_mulmod` 基例**：要求恰好 3 个实参且前两个可证非负；模数 `p` 本身
+//!   不参与判定（`(i64)a * b % p` 的符号只由被除数决定）。
+//! - **快照**：与 `call_graph` 等分析一致，本模块是快照分析（见 `opt.rs` 模块
+//!   文档）——结果只反映计算时的 IR；任何 pass 修改 IR 后必须重算
+//!   （`guard_elimination` 每个 `run` 重算一次即是此约定）。
+//! - **声明函数**：无函数体的声明（`is_decl`）既不会成为保非负候选，也不在
+//!   `always_nonneg_params` 的结果里。
+//!
+//! ## 验证
+//!
+//! 本文件 `mod tests`（380 行起）4 个用例：`multiply_is_nonneg_preserving`
+//! （`soyo_mulmod` 基例成立）、`pure_function_that_can_return_negative_is_not_
+//! preserving`（`0 - x` 不得入集，负向用例）、`power_inherits_nonneg_preserving_
+//! from_multiply`（`multiply` → 自递归 `power` 继承，co-induction 生效）、
+//! `always_nonneg_params_requires_every_call_site`（`main` 用数组 load 喂参，
+//! 形参不得入集）。使用方测试间接覆盖（如 `guard_elimination.rs` `mod tests`
+//! 的 `folds_guard_on_constant_nonneg_and_keeps_param_guard`），全量
+//! `cargo test -p raana_ir` 回归。
+//!
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 

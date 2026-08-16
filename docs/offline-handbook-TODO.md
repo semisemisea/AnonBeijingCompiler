@@ -404,4 +404,25 @@ soyo_compiler frontend 3、analysis_passes 6、术语表 1 个 md），约 5,100
   5 文件中文模块文档（effects/icfg/memory/range/return_summary）subagent 批
   未派（与 reg_alloc 一并处理）。
 
+### 第三轮执行记录（2026-08-17，第二波完成）
+
+- **analysis_passes 5 文件中文模块文档**（subagent 重派成功，首批发连接
+  错误全挂后重派）：effects +190 / icfg +198 / memory +191 / range +205 /
+  return_summary +120 行，C 档形态（保留英文 + 追加中文补充块）；
+- **reg_alloc 模块内部注释**（subagent 10 文件批首挂后重派 8 文件成功 +
+  主 agent 补 3 个未动文件 + 核心算法文件）：reg_alloc.rs +17 / function.rs
+  +32 / indexset.rs +44 / postorder.rs +38 / redundant_moves.rs +116 /
+  reg_traversal.rs +26 / requirement.rs +63（subagent）；cfg.rs / domtree.rs /
+  moves.rs（顶层 ParallelMoves）主 agent 补；核心 process.rs（process_bundles
+  / try_to_allocate / prio / recompute / split）、liveranges.rs（spill weight
+  公式 / add_liverange O(1) 合并不变量）、merge.rs（merge_bundles 前置检查）、
+  spill.rs（二次机会分配 / 栈槽分配）、data_structures.rs（CodeRange 重叠序 /
+  权重分层 / SpillSet）、ion/moves.rs（move resolution 流程）、reg.rs
+  （Allocation / ProgPoint 打包）主 agent 亲自补；
+- **质检**：全部 diff 零逻辑改动（唯一例外 process.rs trace! 宏 rustfmt
+  排版重排，语义不变）；中文注释符号引用 raana_ir 700 + reg_alloc 169 个
+  全局 grep 零 MISSING；cargo check -p raana_ir / -p taki_mir 均 0 error；
+- **遗留**：无（25 pass + analysis_passes 5 + reg_alloc 全模块本轮完成）。
+  第三轮总计 ≈25 个 pass +5 个分析 +20 个 reg_alloc 文件注释。
+
 

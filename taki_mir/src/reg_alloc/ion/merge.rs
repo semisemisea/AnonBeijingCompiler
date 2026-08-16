@@ -53,6 +53,14 @@ impl<F: Function> Env<'_, F> {
     }
 
     pub fn merge_bundles(&mut self, from: LiveBundleIndex, to: LiveBundleIndex) -> bool {
+        // bundle 合并（merge 阶段）：把 from 的区间并入 to。前置检查：
+        // 寄存器类一致、双方都未分配（pinned 已分配的不可合并）、
+        // 区间不重叠（overlap 即冲突，逐对扫描，200 对上限防退化）、
+        // 约束不冲突（stack/fixed/limit 需求合并失败即拒绝）。
+        // fixed def 的区间起点取整到指令头再判重叠（early use + late def
+        // 同指令情形，避免合并出无法分裂的 minimal bundle）。
+        // 合并动作：单区间用二分插入（rustc 1.81 排序变更后更优），
+        // 多区间拼接排序；属性（fixed/fixed_def/stack/limit）取并集。
         if from == to {
             // Merge bundle into self -- trivial merge.
             return true;

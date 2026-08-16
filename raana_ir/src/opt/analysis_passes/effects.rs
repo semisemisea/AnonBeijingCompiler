@@ -24,7 +24,198 @@
 //! explicitly: scalar I/O reads stdin / writes stdout; `getarray`/`putarray`
 //! read/write their array argument; timing functions touch neither program
 //! memory nor program-visible state beyond I/O.
-
+//!
+//! ---
+//!
+//! ## 补充说明（中文）
+//!
+//! 一句话定位：这是 raana_ir 的**过程间纯度 / 副作用分析**——给定整个 `Program`，
+//! 回答「一个函数能不能被移动 / 复制 / 删除 / 当作内存屏障」。它是 LICM 外提纯调用、
+//! DCE 删无用调用、GVN 跨调用 CSE、DSE 删死存储、IPSCCP 跨调用失效的公共地基
+//! （见「使用方清单」）。文中术语（固定点、pass、SSA 等）见
+//! `docs/offline-handbook/glossary.md`。
+//!
+//! 与姊妹分析的定位区分：`pure_function.rs` 是早期、函数粒度的保守纯度判定；
+//! 本模块输出**效果摘要**（读写对象集合 + points-to + stdin/stdout 标志），粒度更
+//! 细、更精确，实际 pass 用的是 `EffectAnalysis`。过程内部分（基址 + 常量偏移解析、
+//! pointer-slot 模式）来自 `memory.rs` 的 `BaseEnv`，本模块在其上叠加过程间信息。
+//!
+//! ## 数据结构
+//!
+//! 三个「内存对象」枚举，对应三种视角：
+//!
+//! - `AbstractObject`：**具体对象**（points-to 集合的元素，全局视角）。`Global(Inst)`
+//!   是全局对象（`GlobalAlloc` 指令）；`Alloc(Function, Inst)` 是某函数的栈对象
+//!   （`Alloc` 指令，带定义函数，因为不同函数的局部指令下标会重复）；`Unknown`
+//!   表示未知来源——可能是任何东西。注意集合**只含具体对象、不含符号化别名**，
+//!   这正是递归 / 循环调用图能收敛的关键（见「算法」）。
+//! - `EffectObject`：**函数视角的效应目标**（摘要的元素）。`Global(Inst)`、
+//!   `Alloc(Function, Inst)`（该函数自己的栈帧时就是摘要的 owner）、
+//!   `Param(usize)`（本函数第 `index` 个参数）。
+//! - `WriteRoot`：**调用者视角的写根**（被调函数可能写到、且调用者看得见的东西）。
+//!   `Global(Inst)` 或 `Local(Function, Inst)`（调用者 `func` 的栈对象）。被调函数
+//!   自己的栈帧对调用者不可见，不会出现在这里。
+//!
+//! `FunctionEffects` 是单个函数的效应摘要：`reads` / `writes` 是可能读 / 写的
+//! `EffectObject` 集合；`reads_unknown` / `writes_unknown` 表示经未知来源地址读 /
+//! 写（`Unknown` provenance 出现过的痕迹）；`reads_io` / `writes_io` 表示读 stdin /
+//! 写 stdout——I/O 是可观察行为，与内存读写不同，不能自由删除。
+//!
+//! `EffectAnalysis` 是分析结果本体，一次 `Pass::run` 构建一份、之后只读，内部三张
+//! 表：`envs`（每函数的 `BaseEnv`）、`effects`（每函数的 `FunctionEffects`）、
+//! `points_to`（`(函数, 参数下标) → 具体对象集合`）。
+//!
+//! ## API 详解
+//!
+//! ### 构造
+//!
+//! - `new(program: &Program) -> EffectAnalysis`：全程序构建。对每个函数：声明函数
+//!   （`is_decl()`，无 body）直接查 `decl_effects` 拿固定摘要，查不到就按最坏情况
+//!   （读写 unknown + 读写 I/O）；有 body 的函数建 `BaseEnv`、扫一遍 `Load` /
+//!   `Store` / `MemZero` 得到直接效应（`direct_effects`），并把每条 `Call` /
+//!   `TailCall` 登记成调用点 `CallSiteInfo`（caller、callee、实参）。最后依次跑
+//!   两个不动点：`propagate_points_to`（top-down）→ `propagate_effects`
+//!   （bottom-up）。
+//!
+//! ### 查询 API（全部 `&self` 只读）
+//!
+//! - `env_of(&self, func) -> &BaseEnv`：取出 `func` 的过程内基址环境，供 pass 复用
+//!   （DSE / IPSCCP 直接用它做基址 + 常量偏移解析）。
+//! - `effects_of(&self, func) -> &FunctionEffects`：`func` 的最终效应摘要（含所有
+//!   传递进来的被调函数效应）。
+//! - `is_pure(&self, func) -> bool`：摘要层面「不写内存、不写 I/O」——函数可以被
+//!   自由移动、复制，结果未使用时可删除（读内存不在此列：读是纯的）。
+//! - `is_removable(&self, func) -> bool`：`is_pure` 且不读 stdin——没有任何可观察
+//!   效应，结果未使用时可删除。这是 DCE / LICM 判「这个 call 能不能删」的唯一
+//!   依据。
+//! - `points_to_of(&self, func, index) -> Option<&HashSet<AbstractObject>>`：`func`
+//!   第 `index` 个参数的 points-to 集合；没有任何调用点贡献对象时返回 `None`
+//!   （此时按空集处理）。
+//! - `targets_of<A: Arena + ?Sized>(&self, arena, func, addr) -> Option<HashSet<AbstractObject>>`：
+//!   `func` 内地址 `addr`（一条指令）指向的具体对象集合。`None` 表示未知来源
+//!   （可能指向任何东西）。实现：先 `base_of` 求基址——`Alloc` / `Global` 直接返回
+//!   单例集合；`Param(i)` 查 points-to 表，含 `Unknown` 则返回 `None`；`Unknown`
+//!   返回 `None`。
+//! - `alias<A: Arena + ?Sized>(&self, arena, func, a, b) -> AliasResult`：过程间
+//!   别名判定，用 points-to 精化 `memory.rs` 的过程内规则。参数 vs 参数（下标
+//!   不同）：两集合互不相交且都不含 `Unknown` → `NoAlias`（集合缺省视为空），否则
+//!   `MayAlias`；参数 vs 全局 / 栈对象：集合不含 `Unknown` 且不含该对象 →
+//!   `NoAlias`，否则 `MayAlias`；其余组合回退 `env.alias_with_bases`（过程内规则）。
+//! - `call_may_write(&self, callee, targets: Option<&HashSet<AbstractObject>>) -> bool`：
+//!   调用 `callee` 是否可能写 `targets` 里的任何对象。`targets == None` 表示被问的
+//!   地址可能是任何东西（此时退化为 `may_write_memory`）。内部把 callee 的
+//!   `writes` 逐项与 `targets` 比对，`Param(j)` 用 callee 的 points-to 展开，任何
+//!   一步遇到 `Unknown` 一律回答「会写」。
+//! - `call_may_read(&self, callee, targets: Option<&HashSet<AbstractObject>>) -> bool`：
+//!   同上的读版本。
+//! - `call_write_roots(&self, callee, func) -> Option<Vec<WriteRoot>>`：调用
+//!   `callee` 可能写到的、`func` 视角下的根集合。`None` 表示 callee 可能写任何
+//!   东西（`writes_unknown` 为真，或参数展开遇到 `Unknown`）。callee 自己栈帧上的
+//!   对象对 `func` 不可见，省略。
+//! - `call_read_roots(&self, callee, func) -> Option<Vec<WriteRoot>>`：同上的读
+//!   版本。
+//!
+//! ### 私有部件（了解即可）
+//!
+//! - `decl_effects(name: &str) -> Option<FunctionEffects>`：sysylib 声明的固定摘要
+//!   （见「正确性 / 边界」），未知声明返回 `None`。
+//! - `direct_effects(program, func)`：函数体内**不含调用**的直接效应——只认 `Load`
+//!   （读）、`Store` / `MemZero`（写），地址经 `base_of` 分类成 `EffectObject` 或
+//!   unknown。
+//! - `classify_actual(env, ctx, points_to, func, arg)`：把调用点实参 `arg` 分类成
+//!   具体对象集合（调用方语境）。实参是 `Param(i)` 时查**调用方自己**的 points-to
+//!   表——这就是 points-to 沿调用图传递的通道。
+//! - `apply_effect_object(obj, callee, points_to, out, out_unknown)`：把 callee 的
+//!   一个效应对象代入 caller 语境：全局照抄；callee 自己的栈帧丢弃；`Param(j)`
+//!   按 callee 的 points-to 展开成具体对象。
+//! - `merge_effects(dst, delta) -> bool`：把 delta 并进 dst，返回是否有新增内容。
+//!
+//! ## 算法：两个不动点如何协作
+//!
+//! `new` 里按固定顺序跑两个不动点，各自循环到「一轮没有任何变化」为止：
+//!
+//! 1. **top-down points-to**（`propagate_points_to`）：从调用点实参出发，把
+//!    `(callee, 参数下标) → 对象` 逐层传递。每个调用点对每个实参调
+//!    `classify_actual`（实参是 `Param` 时读调用方当前积累的集合），结果加入被调方
+//!    的集合。每轮**先收集全部 additions 再统一写入**——分类读的是本轮已有的
+//!    集合，写入发生在收集之后，避免同一轮内读写顺序造成的不一致。任一集合插入了
+//!    新对象就 `changed = true`，继续下一轮。
+//! 2. **bottom-up effects**（`propagate_effects`）：把被调方的摘要沿调用边向上汇总
+//!    进调用方。每个调用点：克隆 callee 摘要，对其 `reads` / `writes` 逐项
+//!    `apply_effect_object`（参数按**已经稳定**的 points-to 展开成具体对象），再
+//!    OR 上 unknown / I/O 标志，得到 delta；全部调用点算完后用 `merge_effects`
+//!    把 delta 并进各调用方，有变化就再来一轮。
+//!
+//! **协作关系**：points-to 先跑（它的信息只来自实参与调用方自身，不依赖摘要），
+//! 跑稳之后 effects 才能把 `Param(j)` 翻译成具体对象——顺序不能反。
+//!
+//! **收敛条件**：两个不动点的数据流方向都是「集合单调增长 + 有界」。points-to 的
+//! 元素是具体对象（`Global` / `Alloc` / `Unknown`），最多是整个程序里的对象总数，
+//! 传播不会产生新对象；effects 的元素同理（`EffectObject` 有限），外加四个 bool
+//! 标志。单调 + 有限 ⇒ 最多迭代「对象总数」轮必然到达不动点，不会振荡。
+//!
+//! ## 使用方清单
+//!
+//! （以下为 `raana_ir/src` 内 grep 实证的使用点；行号随版本漂移，仅供参考。）
+//!
+//! - `opt/passes/licm.rs`：每次 `Pass::run` 重建 `EffectAnalysis`（fixpoint 每轮
+//!   重建，约 780-807 行）。三处核心用法：① 纯调用外提——`is_removable` 判定
+//!   callee 可外提（434 行）；② store / MemZero 冲突——`targets_of` 求写目标后问
+//!   `call_may_read`（441-446 行）；③ 兄弟 call 冲突——`call_read_roots` 取读根
+//!   集合，再问 `call_may_write`（450-463 行，读根未知时退化为
+//!   `may_write_memory`）。load 外提安全性（`load_hoist_safe`，738-769 行）：
+//!   `alias` 判 store 冲突，`targets_of` + `call_may_write` 判 call 冲突。
+//! - `opt/passes/dce.rs`：`EffectAnalysis::new`（239 行），对结果未使用的 `Call`
+//!   用 `is_removable(call.callee())` 决定是否删除（247 行）。
+//! - `opt/passes/gvn.rs`：每个 `run_on` 构建一次（459 行）。call 的 CSE 用
+//!   `is_removable`（258 行）；store / MemZero 后按 `targets_of` + `call_may_read`
+//!   淘汰可能读到该目标的 callee（527-536 行）；`effects_of(c).may_write_memory()`
+//!   作跨调用写屏障（542 行）；兄弟 call 用 `call_read_roots` + `call_may_write`
+//!   保持执行顺序（548-580 行，`WriteRoot` ↔ `AbstractObject` 手工换算）。
+//! - `opt/passes/dse.rs`：`EffectAnalysis::new`（116 行）；`env_of` 复用基址解析
+//!   （163 行）；`call_write_roots(...).is_some()` 判定调用是否为写屏障（203 行）；
+//!   删死存储时用 `call_write_roots` / `call_read_roots` / `call_may_read` 保守保留
+//!   可能被调用读 / 写的 cell（251、415-440 行）。
+//! - `opt/passes/ipsccp.rs`：`targets_of` 判定 load 的地址是否为已知全局，是则直接
+//!   取值（370 行）；调用后用 `call_write_roots` 失效被写的对象（427、437 行）；
+//!   `env_of` 复用基址解析（623、745、773 行）。
+//! - `opt/analysis_passes/pure_function.rs`：姊妹分析（函数粒度、保守），文档互相
+//!   引用，不直接调用本模块。
+//!
+//! ## 正确性 / 边界
+//!
+//! - **递归 / 循环调用图**：两个不动点都单调有界（见「算法」），自递归、互递归、
+//!   循环调用都会收敛；`recursion_converges_conservatively` 测试直接验证。
+//! - **Unknown provenance**：地址 `base_of` 不到任何对象（如经指针槽二次取址后的
+//!   值）时，效应记为 `reads_unknown` / `writes_unknown`；`is_pure` /
+//!   `is_removable` 立即为假；`call_may_write` / `call_may_read` 恒答「可能」；
+//!   `targets_of` / `call_write_roots` / `call_read_roots` 返回 `None`——全部保守。
+//! - **sysylib 边界**（`soyo_compiler/src/frontend/utils.rs` 注入的声明）：
+//!   `getint` / `getch` / `getfloat` 只读 stdin；`getarray` / `getfarray` 读 stdin
+//!   并写参数 0；`putint` / `putch` / `putfloat` / `putf` 只写 stdout；
+//!   `putarray` / `putfarray` 写 stdout 并读参数 0；`_sysy_starttime` /
+//!   `_sysy_stoptime` 读写 I/O（计时可观察，但不碰程序内存）；其余未知声明按最坏
+//!   情况处理。注意这些固定摘要在 `decl_effects` 里**按名字匹配**，与调用点无关。
+//! - **callee 私有栈帧**：被调函数自己 `Alloc` 的对象对调用者不可见——效应传播
+//!   （`apply_effect_object`）与根查询（`call_write_roots` / `call_read_roots`）都
+//!   会丢弃，避免把函数私有内存误算成调用者的效应。
+//! - **快照语义**：`EffectAnalysis` 是一次性构建、之后只读的快照，反映构建时 IR
+//!   的调用关系与内存操作；任何 pass 增删调用 / 存储指令后都必须重建（LICM 在
+//!   fixpoint 每轮重建即是此意）。
+//! - **声明函数**：无 body 的函数（`is_decl()`）没有直接效应，只有固定摘要或最坏
+//!   假设；它们没有 body 可扫，也不会产生调用点。
+//! - **尾调用**：`TailCall` 与 `Call` 同等对待——都登记调用点、都参与传播。
+//!
+//! ## 验证
+//!
+//! 本文件 `mod tests` 共 12 个单元测试，覆盖：无内存操作纯函数（`is_pure` +
+//! `is_removable`）、写全局不纯、读全局仍纯、callee 效应传递到 caller、参数写在
+//! 调用点替换成实参对象、`getint` 的 I/O 与不可删除、递归自调用收敛、points-to
+//! 精化参数 vs 全局别名、不相交参数不别名、同一对象传两次仍可别名、`getarray` 写
+//! 实参数组、局部栈对象永不与参数别名。各使用方 pass 的测试（licm / dce / gvn /
+//! dse / ipsccp 的 `mod tests`）从行为上间接回归本分析；全量
+//! `cargo test -p raana_ir` 是最终门禁。
+//!
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
 

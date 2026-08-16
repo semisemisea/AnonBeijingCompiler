@@ -48,6 +48,10 @@ pub struct CodeRange {
 }
 
 impl CodeRange {
+    // 代码区间 [from, to)：半开区间，是活跃区间分析的基本单位。
+    // Ord 实现按"重叠即相等"比较（见下方 cmp）：任何重叠的两个区间
+    // 排序相等——这正是 PReg 分配表（BTreeMap<CodeRange, _>）能直接
+    // 按区间查询冲突的基础：range 查询命中即冲突。
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.from >= self.to
@@ -236,6 +240,15 @@ pub struct LiveBundle {
     pub limit: Option<u8>,
 }
 
+/// 溢出权重等级常量：bundle 的 cached spill weight 用低 28 位存储，
+/// 高 4 位是 minimal/fixed/fixed_def/stack 四个布尔属性（见
+/// set_cached_spill_weight_and_props）。权重分层：
+///   fixed minimal bundle 权重最高（几乎不可驱逐——固定寄存器约束）；
+///   limited minimal（有编码上限）次之；
+///   普通 minimal 再次；
+///   非 minimal（正常）bundle 的权重必须低于所有 minimal 档
+///   （BUNDLE_MAX_NORMAL_SPILL_WEIGHT），保证"最小的可驱逐者"总是
+///   普通 bundle，minimal bundle 在驱逐博弈中天然占优。
 pub const BUNDLE_MAX_SPILL_WEIGHT: u32 = (1 << 28) - 1;
 pub const MINIMAL_FIXED_BUNDLE_SPILL_WEIGHT: u32 = BUNDLE_MAX_SPILL_WEIGHT;
 pub const MINIMAL_LIMITED_BUNDLE_SPILL_WEIGHT: u32 = BUNDLE_MAX_SPILL_WEIGHT - 1;
@@ -339,6 +352,12 @@ pub struct SpillSet {
     /// or dense this yields similar results to tracking individual live ranges.
     pub range: CodeRange,
 }
+
+// 一个 spillset = 一个栈槽分配单元：被溢出（或分裂后无处可去）的
+// bundle 共享同一个栈槽（spill_bundle 收集被裁剪的部分）。splits
+// 记录该 spillset 的分裂次数（上限 MAX_SPLITS_PER_SPILLSET，超限
+// 退化为 minimal 拆分，保证终止）。range 是所有相关 LiveRange 的
+// 并集——一个 spillset 尽量只占一个栈槽（保守但简单）。
 
 pub(crate) const MAX_SPLITS_PER_SPILLSET: u8 = 2;
 

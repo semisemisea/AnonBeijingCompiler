@@ -44,6 +44,10 @@ impl<T: Clone + Copy + Default + PartialEq> ParallelMoves<T> {
         false
     }
 
+    /// 解析并行移动：把 (src, dst) 的移动集展开为可顺序执行的指令序列。
+    /// 关键难点是**循环依赖**（如 a→b 且 b→a：直接执行会互相覆盖）——
+    /// 通过"先存临时寄存器、后回填"（Scratch）破环。返回值区分是否用了
+    /// 临时寄存器（Scratch 变体，调用方需提供 scratch alloc）。
     pub fn resolve(mut self) -> MoveVecWithScratch<T> {
         if self.parallel_moves.len() <= 1 {
             return MoveVecWithScratch::NoScratch(self.parallel_moves);
@@ -64,8 +68,15 @@ impl<T: Clone + Copy + Default + PartialEq> ParallelMoves<T> {
             }
         }
 
+        // 去掉源=目的的自移动（无操作）。
         self.parallel_moves.retain(|&mut (src, dst, _)| src != dst);
 
+        // 无源-目的重叠（无循环依赖）时直接按序执行即可：把每个 move
+        // 的"必须先行者"（must_come_before：src 同时是某 move 的 dst 时
+        // 那个 move）建成依赖图。DFS 拓扑排序；遇到环（state == Pending
+        // 再遇 = 环），用 scratch 临时槽破环：
+        //   环中某 move 先存 scratch → 执行其余 → scratch 回填。
+        // 排序后逆序输出（依赖序）。
         if !self.sources_overlap_dests() {
             return MoveVecWithScratch::NoScratch(self.parallel_moves);
         }

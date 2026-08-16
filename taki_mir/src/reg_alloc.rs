@@ -39,10 +39,22 @@
 //! 主调用点在 `taki_mir/src/lib.rs`（`compile` 流程）：
 //! `ion::run(&vcode, machine_env)`。详见 [`ion`] 模块文档。
 
-pub mod function;
-pub mod index;
-pub mod ion;
-pub mod moves;
-pub mod reg;
+// ===========================================================================
+// 入口说明（何时用、怎么用）
+// ===========================================================================
+// 本子系统的生产路径只有一条：后端把指令流构造成实现了 function::Function
+// 的 VCode 后，调用 ion::run 即可得到分配结果 Output；其余子模块都是这条
+// 路径的支撑件。日常消费方（VCode 回写 / emit 阶段）只需接触 Output 与
+// reg 中的类型；只有调试分配过程、自定义 liveness / move 解析时才需深入
+// 各子模块内部。下面每个 pub 项一句话说明（细节见各子模块自身文档）：
 
+pub mod function; // 客户端契约：VCode 实现它，分配器只通过它读取函数体（含 block 参数）
+pub mod index;    // 稠密下标句柄（Inst/Block/InstRange 等）：全子系统共享的索引类型
+pub mod ion;      // ION 回溯分配器：算法本体，唯一对外入口 ion::run
+pub mod moves;    // ParallelMoves 并行移动工具：分配后回写阶段的跨块数据搬运
+pub mod reg;      // 寄存器模型（RegClass/PReg/VReg/MachineEnv）与分配结果 Output
+
+// Output 是分配流程的最终产物；re-export 到模块顶层后，调用方直接写
+// reg_alloc::Output 即可拿到每个 VReg 的分配结论（PReg 或栈槽）与需要
+// 插入的 move 编辑，不必关心它定义在 reg 子模块里。
 pub use reg::Output;

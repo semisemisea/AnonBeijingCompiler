@@ -1,3 +1,61 @@
+//! # taki_mir：机器级中间表示（VCode）与代码生成管线
+//!
+//! 定位链：SysY 源码 → RaanaIR（平台无关 SSA，`raana_ir` crate）→ **VCode**
+//! （机器指令级，本 crate）→ 汇编文本。taki_mir 是**后端共享**的机器级 MIR：
+//! 夹在 `raana_ir`（平台无关 SSA IR）与目标汇编之间，AArch64（`anon_armv8`）
+//! 与 RISC-V（`uika_riscv`）两个后端复用同一套 VCode 容器、寄存器分配器与
+//! 发射基础设施，只需各自提供机器指令类型与 lower/emit 细节。
+//!
+//! ## 数据流
+//!
+//! ```text
+//! RaanaIR（HirProgram，平台无关 SSA）
+//!   → lower：指令选择，逐条把 RaanaIR 指令降成机器指令（操作数为虚拟寄存器）
+//!   → VCode：机器指令级 IR（VCodeBuilder 构建，VCodeContainer 持有）
+//!   → reg_alloc：虚拟寄存器 → 物理寄存器 / 栈槽（ion::run，ION 回溯分配器）
+//!   → 回写 + finalize_for_emission（物化分配器 move、展开伪寻址）
+//!   → emit：AsmWriter 组织，逐条 MachInstEmit::emit 打印汇编文本
+//! ```
+//!
+//! MIR pass 挂在分配前后两个时点：**pre-RA**（lower 之后、reg_alloc 之前，
+//! 操作对象仍是虚拟寄存器）与 **post-RA**（回写之后、发射之前，操作对象是
+//! 物理寄存器与栈槽）。
+//!
+//! 顶层入口就在本文件：`compile` / `compile_with_config` 泛型于
+//! `LowerBackend`，一次编译一个 `HirProgram`，产出 `CompileOutput`（汇编文本
+//! + 编译统计）。
+//!
+//! ## 模块地图
+//!
+//! | 模块 | 职责 |
+//! |------|------|
+//! | `abi` | 调用约定（ABI）：参数/返回值的寄存器与栈排布、栈帧布局（frame layout）、序言/尾声生成 |
+//! | `block_order` | 按支配树 RPO 决定基本块的下降顺序（`BlockLoweringOrder`，含为边生成的块） |
+//! | `div_magic` | 常数除法魔法数：Granlund–Montgomery 算法（Hacker's Delight 形式），后端共享的数论部分 |
+//! | `emit` | 汇编文本发射：`AsmWriter` 组织函数头/块标签/序言尾声，顶层入口 `emit_vcode_assembly` |
+//! | `emit_buffer` | 文本级发射缓冲（仿 Cranelift MachBuffer）：text 槽 + 符号化 Branch 槽，O(1) 分支优化 |
+//! | `inst_predicate` | 下降时的 HIR 指令谓词：副作用 / 终结符 / 分支判定 |
+//! | `libcall` | 运行时库调用（libcall）的枚举与符号名（目前仅 `memset`） |
+//! | `lower` | 指令选择：`LowerContext` 驱动，后端实现 `LowerBackend` 逐条翻译 RaanaIR → VCode |
+//! | `passes` | MIR 级 pass 基础设施：pre-RA / post-RA 两阶段管线，结构仿 `raana_ir::opt::pass` |
+//! | `reg_alloc` | 寄存器分配：VReg → PReg / 栈槽，ION 回溯分配器（移植自 regalloc2） |
+//! | `register` | 寄存器句柄：`Reg`（vreg/preg 双含义）、`Writable`（区分 def/use）、`VRegAllocator` |
+//! | `stats` | 结构化编译统计（`CodegenStats` / `FunctionCodegenStats`） |
+//! | `types` | 机器级类型系统：i32 / f32 / u64（地址）/ SIMD 向量，整数无符号语义 |
+//! | `vcode` | VCode 容器与 trait 体系：`VCodeBuilder` / `VCodeContainer` / `MachInst` / `MachInstEmit` |
+//!
+//! ## 后端如何接入
+//!
+//! 后端（`anon_armv8` / `uika_riscv`）实现 `LowerBackend` trait：提供机器指令
+//! 类型 `MInst`（实现 `MachInst` + `MachInstEmit`）、逐条 RaanaIR 指令的 lower
+//! 规则、汇编伪指令与寄存器命名，并用 `mir_pipeline` 注册自己的 MIR pass；
+//! 之后调用 `compile::<B>` 即可驱动完整流程。
+//!
+//! ## 详细文档
+//!
+//! - 寄存器分配子系统：见 `taki_mir/src/reg_alloc.rs`（G2/G3 中文文档）；
+//! - VCode 容器与 trait 体系：见 `taki_mir/src/vcode.rs`（G2/G3 中文文档）。
+//!
 use core::fmt::Write;
 use std::time::Instant;
 

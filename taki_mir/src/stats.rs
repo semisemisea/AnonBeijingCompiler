@@ -1,4 +1,89 @@
 //! Structured statistics produced by MIR passes and code generation.
+//!
+//! ---
+//!
+//! ## 中文说明：`CodegenStats`——MIR pass 与代码生成的统计输出
+//!
+//! 定位链：SysY 源码 → RaanaIR（平台无关 SSA，`raana_ir`）→ MIR pass、寄存器
+//! 分配与汇编发射（`taki_mir` + `anon_armv8` / `uika_riscv` 后端）。本文件只
+//! 定义**统计输出的数据结构**：后端编译每个函数时，把各 pass 的命中次数、ABI
+//! 参数绑定方式、寄存器分配代价、调度器行为写进 `FunctionCodegenStats`，最终
+//! 由 `CodegenStats::aggregate` 汇总成整个编译单元的统计，随 `CompileOutput`
+//! 的 `stats` 字段返回给调用方。统计本身不影响生成的代码，只用于观测与验证。
+//!
+//! ### 统计了什么
+//!
+//! `CodegenStats` 顶层只有两个字段：`functions: Vec<FunctionCodegenStats>`
+//! （逐函数记录）+ `total: FunctionCodegenStats`（`aggregate` 把各函数计数
+//! 逐项累加出的总和，`total.function` 为空字符串）。每个函数一份的
+//! `FunctionCodegenStats` 按阶段分组：
+//!
+//! - **pass 是否运行/是否改动**：`DceStats` / `PeepholeStats` /
+//!   `PairCombineStats` / `SchedulerStats` / `BranchOptStats` 都带 `ran` 与
+//!   `changed` 两个布尔位；`ChainFusionStats` 只有 `changed`。
+//! - **pass 命中计数**：`DceStats::instructions_removed`；`PeepholeStats` 的
+//!   `mac_pairs_formed` / `flag_fusions_formed`；`ChainFusionStats::fusions`；
+//!   `PairCombineStats` 的 `load_pairs_formed` / `store_pairs_formed` /
+//!   `tombstone_removed_created`；`BranchOptStats` 五类：`fallthrough_removed`
+//!   （R1）、`labels_threaded`（R2）、`dead_jumps_removed`（R3）、
+//!   `branches_inverted`（R4）、`veneers_inserted`（M27 长跳转 veneer）。
+//! - **ABI 参数绑定**：`AbiArgStats` 的 `register_args_bound`（经 entry `Args`
+//!   伪指令绑定）、`unused_register_args_skipped`（从未用到而跳过）、
+//!   `incoming_stack_args_loaded`（incoming-arg load 物化栈参数）。
+//! - **寄存器分配**：`RegallocStats` 的 `spill_slots`（单位 `spill_size`）与
+//!   `reg_to_reg_edits` / `reg_to_stack_edits` / `stack_to_reg_edits`（分配器
+//!   编辑次数，来自 `lib.rs` 对分配输出 `edits` 的分类计数）。
+//! - **调度器**：`SchedulerStats` 的块级覆盖（`blocks_total` /
+//!   `blocks_checked` / `blocks_skipped_short`）、`identity_schedules` /
+//!   `estimator_rejections`、`fallbacks`（回退原因
+//!   `SchedulerFallbackReason::StallBudgetExhausted`，带块号）；周期估算
+//!   `original` / `scheduled` 各一份 `CycleEstimateStats`
+//!   （`completion_cycles` / `stall_cycles` / `single_issue_cycles` /
+//!   `dual_issue_cycles` / `idle_cycles`，外加 `ResourceUseStats` 的 `lsu` /
+//!   `alu` / `mac_div` / `fp_other` / `branch`）；DAG 形态 `DagStats`
+//!   （`nodes` / `edges` / `edges_by_kind: BTreeMap<String, u64>` /
+//!   `max_block_nodes`，以及 `MemoryDagStats` 的 `known_root_accesses` /
+//!   `unknown_root_accesses` / `disjoint_comparisons` / `may_alias_comparisons`
+//!   / `max_history_len`）。
+//! - **观测计时**：`SchedulerTimings` 的 `dag_build_ns` / `schedule_ns` /
+//!   `estimate_ns`。注意它是**非确定性**的（每次运行可能不同），不能用于
+//!   逐字节对比的报告，见其字段注释。
+//!
+//! ### 谁在写、谁在读
+//!
+//! - **写入方**：`taki_mir/src/passes.rs` 把 `&mut FunctionCodegenStats` 传给
+//!   各 MIR pass；`anon_armv8/src/passes/` 下的 dce、peephole_combine、
+//!   chain_fusion、pair_combine、list_scheduler 逐个填数；
+//!   `taki_mir/src/lib.rs` 的 `compile_with_config` 填 `AbiArgStats`
+//!   （`vcode.abi.arg_stats()`）与 `RegallocStats`；`taki_mir/src/emit.rs` 的
+//!   `AsmWriter` 在发射时填 `BranchOptStats`（EmitBuffer 分支优化规则）。
+//! - **读取方**：`CodegenStats` 经 `CompileOutput` 的 `stats` 字段随汇编文本
+//!   一起返回，`soyo_compiler/src/abi_matrix.rs` 的测试从中取
+//!   `FunctionCodegenStats` 验证 ABI 绑定行为。注意 CLI 的 `--pass-stats`
+//!   开关只打印 **raana_ir 层**的统计（`PassesRunStats`），不包含本文件的
+//!   MIR 层数据；MIR 层统计目前主要供测试与程序化分析使用。
+//!
+//! ### 与 `raana_ir/src/opt/stats.rs` 的区别
+//!
+//! - **层**：`raana_ir` 统计平台无关 SSA IR 上的优化 pass（如
+//!   `LoopUnrollStats` 的观察/接受/拒绝计数、`reject_reasons` 直方图与
+//!   `events` 事件流）；本文件统计 MIR/代码生成阶段（lower 后的 VCode 上跑的
+//!   pass、寄存器分配、发射）。
+//! - **组织**：raana_ir 是"每 pass 一份结构 + 直方图 + 事件日志"；本文件是
+//!   "每函数一份、按阶段嵌套，`accumulate` 逐项合并出 `total`"。
+//! - **输出**：raana_ir 由 `--pass-stats` 打到 stderr 做语料调查；MIR 层随
+//!   `CompileOutput` 的 `stats` 字段返回。
+//!
+//! ### 验证
+//!
+//! - `soyo_compiler/src/abi_matrix.rs` 的测试读编译输出的
+//!   `FunctionCodegenStats` 断言寄存器/栈参数绑定计数；
+//!   `anon_armv8/src/sched/dag/tests.rs` 等断言 `DagStats` 的 `nodes` /
+//!   `edges` 等字段；
+//! - 汇总正确性由 `accumulate` 实现保证：布尔位 `|=` 合并、计数 `+=`、最大值
+//!   字段（`max_block_nodes` / `max_history_len`）取 `max`；`SchedulerTimings`
+//!   除外，不做确定性保证。
+//!
 
 use std::collections::BTreeMap;
 

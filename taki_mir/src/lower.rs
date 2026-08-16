@@ -1,3 +1,95 @@
+//! # lower：指令选择（RaanaIR → 机器指令）
+//!
+//! 定位链：SysY 源码 → RaanaIR（平台无关 SSA，`raana_ir` crate）→ **VCode**
+//! （机器指令级，`taki_mir`）→ 汇编。**lower** 是其中的指令选择阶段：把
+//! RaanaIR 指令（`HirInst`）翻译成目标机器的指令（`MachInst`，即后端
+//! `LowerBackend::MInst`），连同 ABI 实参绑定、块参数搬运、常量物化一起
+//! 写入 `VCodeBuilder`，最终产出 `VCodeContainer` 交给寄存器分配与发射。
+//!
+//! 本模块是**与目标无关**的框架：块遍历顺序、虚拟寄存器预分配、指令缓冲
+//! 与反转、块参数/实参绑定、副作用着色、常量共享都在这里；目标相关的
+//! 指令选择由各后端实现 `LowerBackend` 提供——AArch64 在
+//! `anon_armv8/src/lower.rs`（`AArch64Backend`），RISC-V 在
+//! `uika_riscv/src/lower.rs`（`Riscv64Backend`）。接入点相同，框架与
+//! 寄存器分配/发射完全复用。
+//!
+//! ## 核心 trait 与类型
+//!
+//! | 名称 | 职责 |
+//! |------|------|
+//! | `LowerBackend` | 目标相关部分：`MInst` 关联类型、单条 HIR 指令的 `lower`、终结符 `lower_branch`、段/数据伪指令、`preg_name`、`mir_pipeline` 等 |
+//! | `LowerContext` | 单个函数的 lowering 上下文：`arena`（读 HIR）、`vcode`（写 VCode）、预分配 vreg 的 `reg_map`、指令缓冲 `ir_inst` 等 |
+//! | `LoweredOutput` | 一条 HIR 指令的 lower 结果：`None`（无结果）或 `Value(Reg)`（结果寄存器） |
+//! | GEP 辅助 | `analyze_gep` / `fold_gep_constant_offset` / `sink_gep_into_address`：把 `GetElemPtr` 分解成 `GepAddress`（基址 + 常量偏移 + 动态项），供 load/store 折叠进寻址模式 |
+//!
+//! ## 入口流程（函数级）
+//!
+//! 框架调用点在 `taki_mir/src/lib.rs`：`LowerContext::new` →
+//! `lower::<B>` →（pre-RA MIR pass）→ `reg_alloc::ion::run` →
+//! `write_back_allocs` →（post-RA MIR pass）→ 帧布局 → 汇编发射。
+//!
+//! 1. **`LowerContext::new`：预分配与预处理。** 为每个函数参数、块参数和
+//!    非 unit 指令按 HIR 类型各分配一个虚拟寄存器（`reg_map` 此后固定为
+//!    每指令一 vreg），计算副作用颜色（`inst_color`），快照循环分析
+//!    （供循环级常量共享）。
+//! 2. **`lower::<B>`：按 lowered 块顺序逆序遍历。** 块顺序来自
+//!    `BlockLoweringOrder`（支配树 RPO，edge 块退化为 `emit_long_jump` +
+//!    参数搬运）；VCode 是反向构建的，所以块与块内指令都逆序处理。每块
+//!    先 lower 终结符：`B::lower_branch` 生成跳转，随后
+//!    `lower_branch_blockparam_args_move` 为各后继块登记参数值（phi 的
+//!    搬运点）。
+//! 3. **`lower_block`：块内逐条 lower。** 逆序扫描指令，跳过已 sunk 的
+//!    指令与已处理的终结符；无副作用且结果无人使用的指令在 lower 时直接
+//!    丢弃。其余指令调 `B::lower` 选出机器指令，结果经
+//!    `bind_lowered_output` 绑定到预分配的结果寄存器。
+//! 4. **指令缓冲与反转。** 后端按**逻辑顺序**经 `ctx.emit` 把选出的指令
+//!    推入 `ir_inst` 缓冲（一条 HIR 指令可展开成多条，如 `cmp` + `br`），
+//!    `finish_ir_inst` 反向推入 `VCodeBuilder`；整个流在 `build` 的
+//!    `reverse_and_finalize` 里一次翻正。
+//! 5. **块尾收束。** 非入口块参数经 `process_block_param` 登记为 live-in
+//!    块参数；块/循环级共享常量的物化链延迟到块首/前导块发射；入口块
+//!    （index 0）最后做 `gen_arg_setup`：为栈实参生成加载，并把寄存器实参
+//!    打包成入口 `Args` 伪指令——反转后它落在块首，先于一切普通指令。
+//!    最后 `vcode.build` 收集操作数表，产出 `VCodeContainer`。
+//!
+//! ## 与 vcode / abi / reg_alloc 的衔接
+//!
+//! - **产出**：`VCodeContainer`（`vcode.rs`）——机器指令级 IR，操作数是
+//!   虚拟/物理寄存器、立即数、内存地址；MIR pass、寄存器分配、发射都作用
+//!   于其上。
+//! - **ABI 绑定**：`CalleeABI` + `ABIMachineSpec`（`abi.rs`）在 lower 前
+//!   已算好每个形参的位置（`ArgSlot`：寄存器或栈）；lower 阶段据此把实参
+//!   搬运到形参 vreg（栈实参 `gen_copy_arg_to_reg` + 入口 `Args` 伪指令），
+//!   并把 outgoing 参数区大小写进 ABI。
+//! - **寄存器分配在后**：lower 只产生虚拟寄存器操作，物理寄存器分配由
+//!   `reg_alloc::ion::run` 完成，`write_back_allocs` 回写物理寄存器。lower
+//!   阶段不需要关心物理寄存器压力——唯一的例外是常量共享用它做闸门
+//!   （仅 ≥2 次使用的常量才共享，避免把活范围拉到块首）。
+//!
+//! ## 正确性要点
+//!
+//! - **类型匹配**：vreg 按 HIR 类型预分配（类型→寄存器类映射见
+//!   `MachInst::rc_for_type`）；`bind_lowered_output` 断言 unit 指令必须
+//!   返回 `LoweredOutput::None`、非 unit 指令必须返回 `Value(reg)`，后端
+//!   选用的结果寄存器与预分配不一致时经 `set_reg_alias` 合并；unit 指令
+//!   没有结果寄存器（`result_reg` 会断言）。
+//! - **MachInst 形态约束**：一条 HIR 指令可展开为多条机器指令，但必须经
+//!   `ctx.emit` 进入缓冲由框架统一反转，不能直接写 `vcode`；被 sunk 的
+//!   指令（GEP 折进寻址模式）不得再 `put_value_in_reg`（有断言兜底），
+//!   折叠失败路径必须先于下沉返回，调用方才能安全回退。
+//! - **块参数纪律**：入口块参数由 `gen_arg_setup` 物化，不得登记为
+//!   live-in 块参数（寄存器分配禁止入口块参数）；非入口块的 phi 值在各
+//!   分支点登记为后继参数，并行拷贝由分配器解决。
+//! - **顺序与副作用**：块内指令逆序 lower、常量链在块首物化，副作用着色
+//!   （`inst_color`）保证这类重排不越过副作用边界。
+//!
+//! ## 验证
+//!
+//! - 本文件底部 `mod tests`（1359 行起）覆盖 GEP 分解与折叠分析；
+//! - `cargo test -p taki_mir` 跑 crate 单测；全量质量门禁是 `make test`
+//!   （Docker harness 跑 functional / h_functional / perf 语料，AArch64
+//!   与 RISC-V 分别 `make test` / `make test-riscv`）。
+//!
 use log::{debug, trace};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};

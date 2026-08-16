@@ -1,3 +1,108 @@
+//! # ABI：跨目标的调用约定与栈帧抽象
+//!
+//! 定位链：SysY 源码 → RaanaIR（平台无关 SSA，`raana_ir` crate）→ VCode（机器指令
+//! 级，`taki_mir`）→ **ABI**（本模块：函数参数/返回值/栈帧的约定层）→ 汇编。同一份
+//! 函数在 AArch64 上要遵守 AAPCS64、在 RISC-V 上要遵守其 psABI：前几个参数进物理
+//! 寄存器、其余进调用方帧的 outgoing 区；返回值走约定寄存器；callee-saved 寄存器
+//! 由被调方保存、caller-saved 由调用方保存；栈帧按 `stack_align` 对齐。这些规则因
+//! 目标而异，本模块把它们抽象成泛型 ABI 层：**参数/返回值位置计算、栈帧布局、
+//! 序言/尾声生成**对所有目标共用，只有目标特有策略由后端实现。
+//!
+//! ## 核心数据结构
+//!
+//! - `ABIMachineSpec` trait：目标 ABI 策略的完整清单——字长（`word_bits`）、栈
+//!   对齐（`stack_align`）、溢出单位（`spillslot_size`/`spill_unit_bytes`）、
+//!   callee-saved 判定（`is_callee_saved`）、物理寄存器环境（`get_machine_env`
+//!   → `MachineEnv`）、栈加载/存储/常量/地址指令生成（`gen_load_stack`/
+//!   `gen_store_stack`/`gen_load_imm`/`gen_load_addr`/`gen_move`）、参数位置计算
+//!   （`compute_arg_loc`/`compute_call_arg_loc`）、帧建立/恢复与 clobber 保存
+//!   （`gen_prologue_frame_setup`/`gen_epilogue_frame_restore`/
+//!   `gen_clobber_save`/`gen_clobber_restore`）、帧相关寻址的发射前展开
+//!   （`legalize_inst`）以及入口参数绑定伪指令（`gen_args`）。后端实现它即可
+//!   接入全部共享流程。
+//! - `CalleeABI`：**单个函数的 ABI 状态**，构造时只算参数位置，其余字段在
+//!   lowering 过程中逐步填充。持有 `args`（每个参数的寄存器/栈位置）、栈槽分配
+//!   （`allocate_stackslot`/`alloc_stackslot_or_get`）、outgoing 区尺寸
+//!   （`set_outgoing_arg_size`）、是否含调用（`set_has_calls`）、入参绑定
+//!   （`gen_copy_arg_to_reg`/`take_args`）、帧布局（`compute_frame_layout`/
+//!   `frame_layout`）与序言/尾声（`gen_prologue`/`gen_epilogue`）。
+//! - `ArgSlot`/`ArgRegBank`/`ArgLayoutPlanner`：参数位置规划。`ArgSlot` 表示一个
+//!   参数落在寄存器还是入参栈区；`ArgLayoutPlanner::compute` 用分类闭包把标量
+//!   参数分到 Int/Float/Vector 三个独立寄存器 bank（`ArgRegBank`），各组独立
+//!   计数，寄存器用尽后溢出到栈，栈槽大小由 `stack_slot_size` 闭包决定——类型
+//!   分类与槽大小是目标策略，溢出规划是共享逻辑。
+//! - `StackAMode`：栈寻址三语义——`IncomingArg`（本帧参数区，即调用方帧的
+//!   outgoing 区）、`Slot`（本帧栈对象区）、`OutgoingArg`（被调方帧的参数区，
+//!   调用方写入实参用）。
+//! - `FrameLayout`：帧布局求解结果：`callee_saved` 列表与
+//!   `setup_area_size`/`clobber_size`/`spill_size`/`stackslots_size`/
+//!   `outgoing_args_size`/`total_size` 各分区尺寸；spill 区位于 outgoing 区与
+//!   栈对象区之后（`spill_base_bytes`/`spill_slot_offset`/`spill_region_end`）。
+//! - 绑定对：`ArgPair`（入参 vreg ← 物理寄存器）、`CallArgPair`（调用实参）、
+//!   `CallRetPair`（调用返回值）、`RetPair`（函数返回值）——lower 与后端指令
+//!   之间传递"虚拟寄存器 ↔ 物理寄存器"的配对。
+//!
+//! ## 触发与使用场景
+//!
+//! - `taki_mir/src/lower.rs`：函数 lowering 开始时 `CalleeABI::new`（经
+//!   `compute_arg_loc` 读函数签名算参数位置）；入口块 `gen_arg_setup` 逐参数调
+//!   `gen_copy_arg_to_reg`——寄存器参数只记入 `ArgPair`（不发指令），栈参数发
+//!   入参加载指令，值未被使用的参数调 `note_unused_register_arg` 跳过；最后
+//!   `take_args` 打包成入口 `Args` 伪指令。调用点 lowering 经 `compute_call_arg_loc`
+//!   计算实参位置与 outgoing 区尺寸（`precompute_outgoing_arg_size` 取全函数
+//!   最大值）；**尾调用 lowering 经 `arg_slot` 把每个实参放到被调方会读取的
+//!   位置**（AArch64：`anon_armv8/src/lower/call.rs`；RISC-V：`uika_riscv/src/
+//!   lower.rs`）。
+//! - `taki_mir/src/lib.rs`：寄存器分配结束后 `compute_frame_layout(spill_size,
+//!   &output)` 由分配结果推导 callee-saved 集合并求解完整帧布局。
+//! - `taki_mir/src/emit.rs`：发射阶段 `gen_prologue()`/`gen_epilogue()` 生成帧
+//!   建立/恢复与 callee-saved 保存/恢复指令。
+//!
+//! ## 正确性要点
+//!
+//! - **callee-saved 集合必须含 allocator 编辑的两端**：`compute_frame_layout`
+//!   除 `output.allocs` 外还收集 `output.edits` 中每条 `Move` 的 `from`/`to`——
+//!   分配器处理 live-range 分裂时可能用 callee-saved 寄存器做寄存器间移动，该
+//!   寄存器未必是任何指令的操作数；漏掉会让函数静默破坏调用方保存的寄存器。
+//! - **寄存器参数零机器码绑定**：`Args` 伪指令在入口块把 vreg 定义为固定 ABI
+//!   物理寄存器，不发射机器码，由寄存器分配解析固定定义——替代旧的"无条件存
+//!   home slot 再加载"往返。
+//! - **栈对象相对栈对象区寻址**：`allocate_stackslot` 的偏移相对栈对象区而非
+//!   分配时刻的 outgoing 区（调用在 lowering 中陆续发现，折叠当时尺寸会让早期
+//!   对象与后来的最大 outgoing 区重叠），帧布局统一在 `compute_frame_layout`
+//!   求解。
+//! - **溢出区位置与对齐**：spill 区在 outgoing 区与栈对象区之后；128 位向量占
+//!   2 个 8 字节溢出单位，16 字节槽在 clobber 区内按 16 对齐，保证
+//!   `str/ldr q` 不遇到未对齐地址。
+//! - **setup 区**：只要函数含调用/入参栈参数/栈对象/callee-saved/spill 任一，
+//!   就预留 `2 * word_bytes` 的 setup 区。
+//! - 所有尺寸运算为 checked 算术，溢出以 `Result` 或带函数名与阶段的 panic
+//!   暴露；入参统计（`crate::stats::AbiArgStats`）记录寄存器参数绑定/跳过/栈
+//!   参数加载次数。
+//!
+//! ## 与后端及前端的衔接
+//!
+//! - 后端：`anon_armv8/src/abi.rs` 的 `AArch64Abi`（AAPCS64，整型 `x0-x7`、
+//!   浮点 `d0-d7`、向量 `v0-v7`，见 `anon_armv8/src/regs.rs` 的 `INT_ARG_REGS`/
+//!   `FLOAT_ARG_REGS`/`VECTOR_ARG_REGS`）与 `uika_riscv/src/abi.rs` 的
+//!   `Riscv64ABI`（`a0-a7`/`fa0-fa7`，见 `uika_riscv/src/regs.rs` 的
+//!   `ARG_REG`/`FARG_REG`）都实现 `ABIMachineSpec`；调用/返回/尾调用 lowering
+//!   分别产出 `CallArgPair`/`CallRetPair`/`RetPair`/`TailCall` 指令。
+//! - 前端：`CalleeABI::new` 经 `compute_arg_loc` 读 `ArenaContext` 中 RaanaIR
+//!   函数 `params()` 的类型序列（`inst_data(param).ty()` → `HirType`），即
+//!   raana_ir 函数签名 → ABI 参数位置的入口；返回值类型同样来自 `HirType`。
+//! - 尾调用：TCO 保证调用者与被调者签名一致，故尾调用可复用本函数的入参槽
+//!   （`arg_slot`）；发射端把尾声（帧恢复）拼接到 `TailCall` 前，跳转不链接。
+//!
+//! ## 验证
+//!
+//! - 本文件 `mod tests`：独立寄存器 bank 布局（int/float 各自计数、溢出栈偏移
+//!   与总尺寸）、目标栈槽尺寸策略、spill 区跟随 outgoing 与栈对象、越界 spill
+//!   槽拒绝（`should_panic`）。
+//! - `taki_mir/src/vcode/tests.rs` 的 `TestABI` 覆盖 `CalleeABI` 生命周期。
+//! - 全量门禁：`cargo test -p taki_mir` 与 Docker harness（`make test` /
+//!   `make test-riscv`，`-O 2`，见 `AGENTS.md`）。
+
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 

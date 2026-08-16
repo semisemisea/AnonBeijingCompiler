@@ -1,4 +1,79 @@
 //! The order of traversing basic blocks uses RPO of the dominance tree.
+//!
+//! ## 中文文档
+//!
+//! `BlockLoweringOrder` 决定一个函数的**块发射/遍历顺序**：把 RaanaIR
+//! （HLIR）函数的 CFG 折叠成一列 `LoweredBlock`（原块 + 边块），后续的
+//! lower、汇编发射都按这个顺序处理基本块；vcode 容器的块编号
+//! （`MirBlockIndex`，即 `crate::reg_alloc::index::Block`）就是该序列的
+//! 下标。
+//!
+//! ### 算法：支配树的 RPO 前序
+//!
+//! `BlockLoweringOrder::new` 的步骤（CFG/支配分析全部复用 `raana_ir`）：
+//!
+//! 1. `cfg::build_cfg_both` 从函数数据构建 CFG，返回两个图：`graph`
+//!    （后继边）与 `prece`（前驱/反向边）；块用 `IDAllocator` 编号为
+//!    `BId`。`cfg::rpo_path(&graph)` 求出普通 CFG 的 RPO（`plain_rpo`）；
+//! 2. `dom_tree::idom(&prece, &plain_rpo)` 计算立即支配者，
+//!    `dom_tree::build_dominance_tree` 把 idom 关系展开成支配树的孩子列表；
+//! 3. 对支配树做**前序 DFS**（`domtree_dfs`，从入口 `BId` 0 开始），每个
+//!    节点的孩子按各自在 CFG RPO 中的下标排序（`rpo_index`），得到
+//!    `domtree_rpo`——这正是英文首行说的 "RPO of the dominance tree"；
+//! 4. 把 `BId` 经 `bb_id.search_id` 映回 `HirBasicBlock`，得到块的发射
+//!    顺序 `rpo`；
+//! 5. 按 `rpo` 顺序把每个原块作为 `LoweredBlock::Orig` 压入
+//!    `lowered_order`，并建立 `hlir_block_map`（`HirBasicBlock` → 原块
+//!    下标）。对出度 > 1 的块（多路终结符），逐条后继检查
+//!    `in_degree > 1 || 边带实参 || 目标块带参数`，命中则为该边追加一个
+//!    `LoweredBlock::Edge { pred, succ, succ_idx }`，紧跟在原块之后；
+//! 6. 最后构建 `lowered_succ_indices` / `lowered_succ_ranges`：每个
+//!    lowered 块的后继下标表。`Orig` 块的条目额外附带其终结符
+//!    `Option<HirInst>`（只有 `Branch` 才是 `Some`，`Jump`/`Return` 为
+//!    `None`）；`Edge` 块固定单后继（指向目标原块）且不带终结符。
+//!
+//! `outgoing_block_args` 负责从 `Branch`（按 `succ_idx` 取 true/false 边）
+//! 或 `Jump` 终结符中取出目标块参数对应的实参，并断言实参数量、类型与
+//! 目标块 `params()` 一致。
+//!
+//! ### 为什么是这个顺序（正确性）
+//!
+//! - **RPO 性质**：CFG 上除回边外每条边都从 RPO 中较早的块指向较晚的
+//!   块；支配树前序进一步保证每个块的立即支配者先于它出现。于是发射/
+//!   lower 一个块时，它的所有支配者及其定义的值必然已经处理完毕；
+//! - **循环友好**：循环头支配循环体，故 header 先于 body/回边块发射，
+//!   回边跳转指向已经布局好的标签；兄弟分支按 CFG RPO 排序，布局确定、
+//!   可预测；
+//! - **边分裂**：多路终结符不能承担"边专属"的传参工作。临界边（目标
+//!   有多个前驱）与带值边（`args`/`params` 非空）被拆成独立 `Edge` 块，
+//!   参数搬运落到边块；`succ_idx` 保留原始后继下标，两条指向同一目标的
+//!   不同边仍然可区分（见测试
+//!   `keeps_distinct_branch_edges_to_the_same_parameterized_target`）。
+//!
+//! ### 谁在用
+//!
+//! - `VCodeBuilder::new(abi, block_order)`（`vcode/builder.rs`）：lower
+//!   以本顺序构建 vcode 容器；
+//! - `LowerBackend`（`taki_mir/src/lower.rs`）：按 `lowered_order()` 逐块
+//!   lower，经 `succ_indices(block)` 解析后继，
+//!   `collect_outgoing_block_args` / `lower_branch_blockparam_args_move`
+//!   搬运边参数并用 `add_succ` 登记，对 `Edge` 块调用 `emit_long_jump`
+//!   发射长跳转；`lowered_index_for_block` 用于定位入口块；
+//! - `AsmWriter`（`taki_mir/src/emit.rs`）：按 `lowered_order()` 顺序
+//!   `bind_label` 并逐条输出指令（即最终汇编的块布局）；
+//! - 寄存器分配不直接读本模块：它消费的 vcode 容器在构建时已按本顺序
+//!   编号（`MirBlockIndex` 就是 lowered order 的下标）。
+//!
+//! ### 验证
+//!
+//! 本文件 `mod tests` 用 `ArenaContext` 手工构造程序，检查
+//! `lowered_order()` / `succ_indices()` 的输出：
+//! - `keeps_distinct_branch_edges_to_the_same_parameterized_target`：
+//!   diamond 的两条分支边指向同一带参 merge，两条边保持独立 `Edge` 块；
+//! - `keeps_return_out_of_branch_metadata`：return 不是 CFG 分支，终结符
+//!   位为 `None`、无后继；
+//! - `preserves_loop_continue_break_and_critical_edges`：循环 continue 的
+//!   参数经边块传递，break 临界边与 header→exit 临界边各有专属 `Edge` 块。
 use std::ops::Range;
 
 use raana_ir::opt::prelude::{IDAllocator, cfg, dom_tree};

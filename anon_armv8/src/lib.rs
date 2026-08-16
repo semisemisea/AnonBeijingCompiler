@@ -45,7 +45,7 @@
 //! | [`constants`] | 整数常量物化规划：MOVZ/MOVN/MOVK/logical immediate 的选择 |
 //! | [`instructions`] | 类型化指令形式 [`instructions::MInst`] 与编码合法操作数（ALU/内存/向量/分支） |
 //! | [`labels`] | 汇编标签：block/函数/全局量/内嵌符号 |
-//! | [`lower`] | 指令选择：Raana HIR → VCode，入口 [`AArch64Backend`] |
+//! | [`lower`] | 指令选择：Raana HIR → VCode，入口 [`AArch64Backend`]（`lower.rs` 是 facade，实现在 `lower/` 子目录：arith/vector/branch/call/memory） |
 //! | [`passes`] | 目标相关 MIR pass：DCE、peephole（指令融合）、chain fusion（链式 compare 折叠）、const CSE（常量物化去重+循环外提）为 **Pre-RA**；pair combine（load/store 合成 LDP/STP）、list scheduler（A53 顺序调度）为 **Post-RA** |
 //! | [`regs`] | AArch64 物理寄存器与分配策略：Gpr/Vector 类、scratch 寄存器、FP/LR |
 //! | [`runtime`] | 内嵌汇编符号（memset/calloc，`.S` 经 `include_str!` 编译期嵌入；calloc 供递归记忆化 IR pass（M68）分配缓存用） |
@@ -77,14 +77,16 @@
 //! emit 输出         add w0, w1, #1
 //! ```
 //!
-//! 读懂 lower 的路径：先看 `lower.rs` 的 `lower`（按 `InstKind` 分派）→
-//! 进入 `lower_binary`（标量/向量分派）→ 找到 `add_sub_immediate`
-//! （`AluRRImm12` 的 emit 在 `instructions.rs`）。
+//! 读懂 lower 的路径：`lower.rs` 是 **facade**——`AArch64Backend::lower` 按
+//! `InstKind` 分派后，标量运算在 `lower/arith.rs`（`lower_binary` →
+//! `add_sub_immediate` 构造 `AluRRImm12`），向量运算在 `lower/vector.rs`，
+//! select 在 `lower/branch.rs`（`AluRRImm12` 的 emit 在 `instructions.rs`）。
 //!
 //! ## 扩展指引
 //!
-//! - 加一条新指令：在 [`instructions`] 定义类型化形式 → 在 [`lower`] 的
-//!   `lower`/`lower_branch` 里选择它 → 实现 `MachInstEmit`（打印汇编）→ 如需
+//! - 加一条新指令：在 [`instructions`]（`MInst` 枚举；指令拆到
+//!   `instructions/` 子目录的 emit 模块）定义类型化形式 → 在 [`lower`]
+//!   的 `lower`/`lower_branch` 里选择它 → 实现 `MachInstEmit`（打印汇编）→ 如需
 //!   调度信息更新 [`sched`] 的延迟表。**验证**：`cargo test -p anon_armv8`
 //!   （emit 单测在 instructions.rs 内联）+ `target/debug/compiler -S -O 2
 //!   --target aarch64 -o /tmp/out.s tests/perf/xxx.sy` 目检 `.s`。

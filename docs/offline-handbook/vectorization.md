@@ -13,12 +13,14 @@ IR 层（raana_ir）：
   / VectorReduce（归约）/ Fma（乘加）
   向量类型：V4I32 / V4F32 / V2F64 / V2I64 等（raana_ir::ir::types）
 
-lower 层（anon_armv8::lower）：
-  lower_vector_binary     Binary 向量运算 → VecArithRRR / VecBitwise / VecCmp
-  lower_vector_splat      VectorSplat → VecDup
-  lower_vector_extract_element / lower_vector_insert_element → VecExtractLane / 插入
-  lower_vector_reduce     VectorReduce → VecAddv（+ 标量提取）
-  lower_fma               Fma → VecFmla
+lower 层（anon_armv8::lower/，lower.rs 是 facade）：
+  lower/vector.rs   lower_vector_binary → VecArithRRR / VecBitwise / VecCmp
+                    lower_vector_splat → VecDup
+                    lower_vector_extract_element → VecExtractLane
+                    lower_vector_insert_element → VecInsertLane
+                    lower_vector_reduce → VecAddv
+                    lower_fma → VecFmla
+  lower/branch.rs   lower_select（向量 → VecBsl）
 ```
 
 ## 2. 已支持指令矩阵（instructions.rs，MInst Vec* 变体）
@@ -49,10 +51,10 @@ lower 层（anon_armv8::lower）：
 ### M1. fmls：浮点向量乘减（f32 a - b\*c）【高性价比】
 - **原理**：NEON `fmls vd, vn, vm` = `vd - vn*vm`（乘减，AArch64 一条指令）。
 - **改哪层**：① `instructions.rs`：`VecFmla` 加 `neg: bool` 字段或新增
-  `VecFmls` 变体（emit 打印 `fmls`）；② `lower.rs` `lower_fma`：当前实现
-  （1416 行起）对 `Fma` 无脑 emit `VecFmla`（acc 是显式 SSA 读，Fma 本身
-  无 neg 字段）——需要先识别 `acc - mul(lhs,rhs)` 形态（IR 层 Fma 折叠或
-  lower 时看 lhs 是否来自 Sub），或在 `peephole_combine` 里把
+  `VecFmls` 变体（emit 打印 `fmls`）；② `lower/vector.rs` `lower_fma`
+  （133 行起）：当前实现对 `Fma` 无脑 emit `VecFmla`（acc 是显式 SSA 读，
+  Fma 本身无 neg 字段）——需要先识别 `acc - mul(lhs,rhs)` 形态（IR 层 Fma
+  折叠或 lower 时看 lhs 是否来自 Sub），或在 `peephole_combine` 里把
   `VecSub + VecMul` 融合成 fmls。
 - **IR 形态**：`fma(sub(a, ...), ...)` 或 `sub(x, mul(y, z))`。
 - **验证**：`cargo test -p taki_mir -p anon_armv8` + `make test
@@ -61,10 +63,10 @@ lower 层（anon_armv8::lower）：
 
 ### M2. 整数 mla：v.4s 整数乘加【高性价比】
 - **原理**：NEON `mla vd.4s, vn.4s, vm.4s`（整数乘加）或 `mls`（乘减）。
-- **现状坑（先修这个）**：`Fma`（`raana_ir` fma.rs）和 `lower_fma` 目前都
-  **不检查类型**——V4I32 的 Fma 一旦出现会**静默生成错误的 fmla 汇编**
-  而不是 panic。第一步应在 `lower_fma` 加类型分派：整数 emit `mla`/`mls`、
-  浮点 emit `fmla`/`fmls`（或先 panic 兜底）。
+- **现状坑（先修这个）**：`Fma`（`raana_ir` fma.rs）和 `lower/vector.rs`
+  `lower_fma` 目前都**不检查类型**——V4I32 的 Fma 一旦出现会**静默生成错误
+  的 fmla 汇编**而不是 panic。第一步应在 `lower_fma` 加类型分派：整数 emit
+  `mla`/`mls`、浮点 emit `fmla`/`fmls`（或先 panic 兜底）。
 - **解锁**：h-5 类 i32 内积循环（clang 用 mla 的核心位置）。
 
 ### M3. 向量 MAC 融合（VecMul + VecSub/VecAdd → fmls/fmla）【中】
@@ -79,8 +81,9 @@ lower 层（anon_armv8::lower）：
 ### M4. 浮点向量比较（fcmgt / fcmeq）【中】
 - **原理**：NEON `fcmgt vd.4s, vn.4s, vm.4s` 等浮点比较。
 - **改哪层**：`instructions.rs` `VecCmpOp` 加 `Fgt`/`Feq`/`Fge`…；
-  `lower.rs` `lower_vector_binary` 去掉 f32 panic 分支，按 `is_float` 选 op；
-  **顺带修 V2F64 比较的静默隐患**（`is_float` 只匹配 f32）。
+  `lower/vector.rs` `lower_vector_binary` 去掉 f32 panic 分支（58 行起），
+  按 `is_float`（20 行）选 op；**顺带修 V2F64 比较的静默隐患**
+  （`is_float` 只匹配 f32）。
 - **解锁**：浮点掩码/条件路径（如浮点循环的边界掩码向量化）。
 
 ### M5. .2d 乘法（V2F64/V2I64 mul）【中低】
@@ -92,8 +95,8 @@ lower 层（anon_armv8::lower）：
 - **解锁**：64 位向量算术循环（此类循环应极少，先验证有用例）。
 
 ### M6. 逐 lane 掩码 select（VecBsl v3）【✅ 已完成，勿重复实现】
-- **现状**：`lower_select` 对向量类型**已直接 emit `VecBsl`**
-  （lower.rs:690-706，注释 "select(mask, if_true, if_false) over vectors:
+- **现状**：`lower/branch.rs` 的 `lower_select`（15-23 行）对向量类型**已
+  直接 emit `VecBsl`**（注释 "select(mask, if_true, if_false) over vectors:
   bit-select"）。真正缺的只是 M4 的浮点比较掩码（比较产生 mask 的路径）。
 
 ### M7. 归约扩展（smaxv / sminv / fmaxv）【低】

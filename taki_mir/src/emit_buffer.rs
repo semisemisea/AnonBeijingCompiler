@@ -33,10 +33,10 @@
 //!    `LabelKind` 可达范围的分支插入 veneer 跳板），[`finish`](EmitBuffer::finish)
 //!    把全部槽渲染成最终汇编字符串。
 //!
-//! [`Slot`] 是缓冲区的核心，枚举成员只有三类：`Text`（普通指令文本）、
-//! `Branch`（符号化分支）、`Veneer`（跳板）——**没有独立的 Label 槽**，
-//! 标签位置由 `bind_label` 记录在单独的结构里（branch 的簿记记录持有
-//! `labels_at_this_branch`）。
+//! [`Slot`] 是缓冲区的核心（定义在 `emit_buffer/label.rs`），枚举成员只有
+//! 三类：`Text`（普通指令文本）、`Branch`（符号化分支）、`Veneer`（跳板）——
+//! **没有独立的 Label 槽**，标签位置由 `bind_label` 记录在单独的结构里
+//! （branch 的簿记记录持有 `labels_at_this_branch`）。
 
 use core::fmt::Write as _;
 use std::marker::PhantomData;

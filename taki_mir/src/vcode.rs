@@ -31,7 +31,8 @@
 //!
 //! ## 容器与构建器
 //!
-//! - [`VCodeBuilder`]：**写**入口。lower 阶段逐块 push 指令、声明 block 参数
+//! - [`VCodeBuilder`]（实现在 `vcode/builder.rs`，`vcode.rs` 重新导出）：**写**
+//!   入口。lower 阶段逐块 push 指令、声明 block 参数
 //!   （[`add_block_param`](VCodeBuilder::add_block_param)）、登记后继与参数值
 //!   （[`add_succ`](VCodeBuilder::add_succ)），最后 [`build`](VCodeBuilder::build)
 //!   收集操作数表并产出容器。

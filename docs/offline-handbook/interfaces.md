@@ -20,12 +20,13 @@ SysY2026 源码
   │    emit.rs / emit_buffer.rs   汇编发射
   │    abi.rs     ABI trait（ABIMachineSpec，后端实现）
   ├─ anon_armv8（AArch64 后端）：
-  │    lower.rs   指令选择（AArch64Backend: LowerBackend）
-  │    instructions.rs  指令形式（MInst 枚举）
+  │    lower.rs   指令选择入口（AArch64Backend: LowerBackend；facade，
+  │               实现在 lower/ 子目录：arith/vector/branch/call/memory）
+  │    instructions.rs  指令形式（MInst 枚举；emit 在 instructions/ 子目录）
   │    abi.rs     AAPCS64 实现（AArch64Abi）
   │    regs.rs    物理寄存器策略
   │    passes/    目标相关 MIR pass（build_pipeline）
-  │    sched/     Cortex-A53 调度模型
+  │    sched/     Cortex-A53 调度模型（aarch53.rs 延迟表 + dag/ 依赖图）
   └─ uika_riscv（RISC-V 后端）：只有 abi/instructions/labels/lib/lower/regs
        六个文件——**没有 passes/、sched/、config.rs、constants.rs**（RISC-V
        当前无 MIR pass 层与调度模型）
@@ -76,13 +77,14 @@ trait、后端实现；要接入"IR 优化管线"的东西，就在 raana_ir 实
 │
 ├─ Q4: 需要新的 HIR→机器指令映射（新 IR 指令/新 lowering）？
 │    → anon_armv8/src/lower.rs：AArch64Backend::lower / lower_branch
-│    │    的 match 里加分支
+│    │    的 match 里加分支（实现在 lower/ 子目录：标量 arith.rs、
+│    │    向量 vector.rs、select/branch branch.rs、call.rs、memory.rs）
 │    └─ 若两个后端都需要 → 考虑 taki_mir/src/lower.rs 公共 lowering 工具
 │
 ├─ Q5: 需要新机器指令（新汇编指令/新寻址模式）？
 │    → anon_armv8/src/instructions.rs：MInst 枚举加变体 + 操作数类型
 │    → 实现 MachInst（get_operands/is_move/is_term/rc_for_type/gen_jump）
-│    → 实现 MachInstEmit（打印汇编）
+│    → 实现 MachInstEmit（打印汇编；emit 实现拆在 instructions/ 子目录）
 │    → lower.rs 里选择它
 │    → 需要调度 → sched/ 延迟表
 │
@@ -113,10 +115,11 @@ trait、后端实现；要接入"IR 优化管线"的东西，就在 raana_ir 实
    `is_move`→None；`is_term`→None；`rc_for_type`→Vector 类；`gen_jump`
    →unreachable；
 3. 实现 `MachInstEmit`：`emit` 里写 `fmls v{d}, v{n}, v{m}`；
-4. `lower.rs`：在 `lower_binary`/`lower_fma` 的 match 里，当 op 匹配且目标
-   f32 向量时产出 `VecFmls` 而不是 `VecFmla`+`Neg`；
-5. `sched/`：`dag.rs` 加 `Fmls` 分支（定 SchedClass），`aarch53.rs` 的
-   `instr_profile` 设延迟（数值表在这里，`dag.rs` 只按 SchedClass 建边）；
+4. `lower/` 子目录：标量在 `lower/arith.rs`（`lower_binary`），向量在
+   `lower/vector.rs`（`lower_fma`），当 op 匹配且目标 f32 向量时产出
+   `VecFmls` 而不是 `VecFmla`+`Neg`；
+5. `sched/`：`sched/dag/` 加 `Fmls` 分支（定 SchedClass），`aarch53.rs` 的
+   `instr_profile` 设延迟（数值表在这里，dag 只按 SchedClass 建边）；
 6. 验证：`cargo test -p taki_mir -p anon_armv8` + 单 case 差分
    （`make test functional/xxx.sy ARGS="-O 2"`）。
 

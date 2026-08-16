@@ -102,41 +102,63 @@ use crate::{
     },
 };
 
+// 空标记类型：自身不携带状态，仅作为 `Pass` trait 的实现载体。
 pub struct ModFold;
 
 impl Pass for ModFold {
+    // 主入口，流程分三步：① 廉价预扫描收集 `Rem` 候选；② 构建 range 分析
+    // 证明被除数落在 `[0, 2P)`；③ 逐个把 `rem` 改写为条件减法。
+    // 返回 `true` 表示函数体发生过改写。
     fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
+        // 声明（无函数体）没有可折叠的指令，直接跳过。
         if data.layout().is_decl() {
             return false;
         }
         // Cheap pre-scan: only build the (comparatively expensive) range
         // analysis when the function actually has a `Rem` by a positive
         // non-power-of-two constant divisor — the only shape this pass folds.
+        //
+        // 预扫描只做指令形态匹配，不进入任何分析：逐条检查"`Rem` 且除数为
+        // 正整数非 2 幂常量"——这是本 pass 唯一会折叠的形状。真实函数里这类
+        // 形态很少见，绝大多数函数在这里就提前返回，省去 CFG / 循环 / range
+        // 分析整套昂贵构建。被除数此时不检查，留到 range 分析就绪后再判定。
         let candidates: Vec<Inst> = data
             .layout()
             .basicblocks()
             .iter()
             .flat_map(|layout| layout.insts().iter().copied())
             .filter(|&inst| {
+                // 判定链：`rem_of` 认出 `Rem` 并取出 `(被除数, 除数)`；
+                // `positive_constant` 要求除数是常量 `Integer` 且值 > 0；
+                // `is_power_of_two` 排除 2 的幂（`1` 也是 2 的幂，一并跳过）。
                 rem_of(data, inst).is_some_and(|(_, divisor)| {
                     positive_constant(data, divisor).is_some_and(|p| p > 0 && !is_power_of_two(p))
                 })
             })
             .collect();
+        // 没有候选：函数未改变，直接返回 `false`。
         if candidates.is_empty() {
             return false;
         }
 
+        // —— 第二步：range 分析证明 —— 只有存在候选时才走到这里。
+        // CFG 构建失败（结构不可用）时放弃折叠，保持函数原样。
         let folds: Vec<(Inst, Inst)> = {
             let Some(cfg) = CFG::new(data) else {
                 return false;
             };
+            // range 分析依赖循环结构（跨回边的不动点迭代）与基本归纳变量
+            // （`phi(x, x+1)` 这类递增量的范围推导），因此先建这两者；
+            // 支配树本轮用不上，直接丢弃。
             let (cfg, _dom_tree, loops) = LoopAnalysis::from_cfg(cfg);
             let ivs = BasicInductionVariableAnalysis::new(data, &cfg, &loops);
             let range_arena = ArenaContext {
                 program: &*data.program,
                 curr_func: data.curr_func,
             };
+            // 跨过程事实：`return_summary` 给出"保值非负"的函数集合与"恒非负"
+            // 的参数集合。本函数自己的恒非负参数喂给 range 分析，使被除数的
+            // 下界推导能利用跨过程信息（如 `f(x)` 返回值包装中间值的场景）。
             let nonneg = return_summary::nonneg_preserving_functions(data.program);
             let all_params = return_summary::always_nonneg_params(data.program, &nonneg);
             let self_params = all_params
@@ -147,6 +169,14 @@ impl Pass for ModFold {
                 RangeAnalysis::new(&range_arena, &cfg, &loops, &ivs, &nonneg, &self_params);
 
             let mut folds = Vec::new();
+            // 逐个候选做证明：`range_before(inst, dividend)` 取 range 分析在
+            // `rem` 位置前算好的状态（不动点迭代结果）对被除数求值，`foldable`
+            // 再检查 `0 <= x < 2P`。此处重取 `(被除数, 除数)` 只是防御性匹配，
+            // 预扫描已保证形状成立。
+            //
+            // 非负被除数感知：range 分析的 `Rem` transfer（`transfer_rem`）在
+            // 被除数已知非负时把结果压到 `[0, |P|-1]`；配合 select 的分支合并，
+            // 折叠后的 select 结果范围仍被界定在 `[0, P)`，链式 `%` 可继续折叠。
             for inst in candidates {
                 let Some((dividend, divisor)) = rem_of(data, inst) else {
                     continue;
@@ -160,13 +190,24 @@ impl Pass for ModFold {
             }
             folds
         };
+        // 没有任何被除数被证明落在 `[0, 2P)`：保持原样（宁漏勿错）。
         if folds.is_empty() {
             return false;
         }
+        // —— 第三步：改写 ——
+        // 每个候选插入两条指令再替换：
+        //   sub  = dividend - P   （先算好折叠分支的值）
+        //   cond = dividend >= P  （比较条件）
+        // 最后把 `rem` 原地替换为 `select(cond, sub, dividend)`。`sub` / `cond`
+        // 必须插在 `rem` 之前，因为 select 的操作数要支配使用点（SSA 定义先于
+        // 使用）；`replace_inst_with` 自动把 `rem` 的全部使用点重定向到新 select，
+        // 无需手工修补。
         for (inst, dividend) in folds {
             let InstKind::Binary(binary) = data.inst_data(inst).kind() else {
                 continue;
             };
+            // 折叠列表只存了 `(inst, dividend)`，除数操作数在此从指令中重取
+            // （预扫描已保证它是正整数非 2 幂常量，走到这里必然命中）。
             let divisor = binary.rhs();
             let sub = data
                 .new_local_inst()
@@ -178,10 +219,12 @@ impl Pass for ModFold {
             data.layout_mut().insert_inst_before(inst, cond);
             data.replace_inst_with(inst).select(cond, sub, dividend);
         }
+        // 至少改写了一条指令，返回 `true` 表示函数发生改变。
         true
     }
 }
 
+// 识别 `BinaryOp::Rem`：命中返回 `(被除数, 除数)` 两个操作数，否则 `None`。
 fn rem_of(data: &FunctionData, inst: Inst) -> Option<(Inst, Inst)> {
     match data.inst_data(inst).kind() {
         InstKind::Binary(binary) if binary.op() == BinaryOp::Rem => {
@@ -191,6 +234,8 @@ fn rem_of(data: &FunctionData, inst: Inst) -> Option<(Inst, Inst)> {
     }
 }
 
+// 提取正整数常量除数的值：仅接受 `InstKind::Integer` 且值 > 0，其余（负数、
+// 0、非常量操作数）一律返回 `None`——截断余数对非正除数不满足折叠恒等式。
 fn positive_constant(data: &FunctionData, inst: Inst) -> Option<i32> {
     match data.inst_data(inst).kind() {
         InstKind::Integer(integer) if integer.value() > 0 => Some(integer.value()),
@@ -198,10 +243,17 @@ fn positive_constant(data: &FunctionData, inst: Inst) -> Option<i32> {
     }
 }
 
+// 2 的幂判定（`1` 也算）：这类除数后端用一条 `and` 掩码实现更省，
+// 留给 `sr` 处理，本 pass 不碰。
 fn is_power_of_two(p: i32) -> bool {
     p > 0 && (p & (p - 1)) == 0
 }
 
+// 折叠判定核心。`range` 是被除数在 `rem` 处的值范围，须同时满足：
+//   1. 有下界且 `min >= 0`——负数被除数的截断余数不满足恒等式，永不折叠；
+//   2. 有上界且 `max < 2P`——商至多为 1，`x - P` 才等于 `x % P`。
+// 任一条件不满足即返回 `false`（宁漏勿错）。边界比较用 i64 运算，
+// 防止 `P` 接近 `i32::MAX` 时 `2 * P` 溢出。
 fn foldable(range: IntRange, p: i32) -> bool {
     let Some(min) = range.min() else {
         return false;

@@ -214,6 +214,10 @@ impl CandidateRejection {
 
 impl Pass for LoopUnroll {
     fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
+        // 主循环：反复"分析 → 展开一个循环 → 重跑"直到无可展开项。
+        // 每次展开都会改变 CFG（快照失效），所以每轮都重建 CFG/循环分析/
+        // IV 分析；一次只展开一个候选，保证分析结果绝不跨改写复用。
+        // DryRun 模式只统计不改写（用于调参与 A/B 对比）。
         if data.layout().is_decl() {
             return false;
         }
@@ -433,6 +437,11 @@ fn analyze_candidate(
     ivs: &BasicInductionVariableAnalysis,
     looop: &Loop,
 ) -> Result<UnrollCandidate, CandidateRejection> {
+    // 候选筛选：逐条拒绝条件检查，任何一条不满足都以带原因的错误返回
+    // （统计拒绝原因，供调参）。硬性形状要求：非 entry 循环、至少两块、
+    // 唯一 latch、无嵌套循环、header 恰两条出边（一条进循环一条出循环）、
+    // latch 恰一条回边、header 恰两条入边（entry + backedge）且来自
+    // preheader。这些保证展开后的边重连是规范形态。
     let header = looop.header();
     if Some(header) == data.layout().entry_bb().map(|block| block.bb()) {
         return Err(CandidateRejection::new(
@@ -537,6 +546,11 @@ fn analyze_candidate(
         ));
     }
 
+    // 展开收益/代价判定：trip count 必须编译期精确可知（constant_trip_count，
+    // 从严格 exit 推导），且 ≤ MAX_FULL_UNROLL_TRIPS；展开后总指令数
+    // （header×(T+1) + body×T）须 ≤ MAX_UNROLLED_NON_TERMINATORS（为
+    // 二维 stencil 留空间，又防长循环失控）；含 Alloc 的循环不展开
+    // （克隆会复制分配）。这些上限是纯结构策略，不匹配具体基准。
     let variables = ivs.for_loop(looop);
     if variables.is_empty() {
         return Err(CandidateRejection {
@@ -712,6 +726,13 @@ fn body_size(data: &FunctionData, candidate: &UnrollCandidate) -> usize {
 }
 
 fn apply_candidate(data: &mut ArenaContextMut<'_>, candidate: &UnrollCandidate) {
+    // 展开执行：把循环体按 trip_count 份克隆成直线代码。
+    // 核心机制是"值重映射"（remap_values + 每轮维护 current_values）：
+    // 第 n 轮的 header/body 值映射为第 n 份克隆体里的新值，回边实参按
+    // 映射改写为下一份 header 的进入实参；最后一轮不克隆回边，而是把
+    // exit 实参按最终映射接回原 exit 块。
+    // trip_count == 0 的退化情形：header 直接变 jump 到 exit（循环体
+    // 永不执行），exit 实参按 header 自身值重映射。
     let header_source = non_terminators(data, candidate.header);
     let header_params = data.bb_data(candidate.header).params().to_vec();
     let backedge_args = candidate.backedge.args(data).to_vec();

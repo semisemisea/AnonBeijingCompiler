@@ -179,6 +179,11 @@ impl MatmulInterchange {
         loop_analysis: &LoopAnalysis,
         k_loop: &Loop,
     ) -> Option<Candidate> {
+        // 形态识别（M58）：三层嵌套 i-j-k 的 GEMM。自内向外逐层验证——
+        // 先识别内层 k 循环（指针携带的归约：acc += C[k]*A[k]，ptr 按常量
+        // 步长推进），再确认中层 j 循环（body 构建列指针跳入 k 循环），
+        // 最后是外层 i 循环（C 行/A 行的 (0,i) 偏移，三者共享同一 bound）。
+        // 全部命中才改写（宁漏勿错），把 i-j-k 交换为 i-k-j + 行缓冲。
         // ---- inner k loop: a pointer-carrying reduction ----
         let k_header = k_loop.header();
         if k_loop.body().len() != 2 || k_loop.latches().len() != 1 {
@@ -463,6 +468,13 @@ impl MatmulInterchange {
     }
 
     fn apply(data: &mut ArenaContextMut<'_>, cand: &Candidate) -> bool {
+        // 改写（M58）：生成新嵌套 i → (k 循环 → j 循环) → wb 写回循环。
+        // 结构：i_body 里 alloc+mem_zero 行缓冲 → 跳 k_header；k_header(k)
+        // 读 C[k] 与 A 行指针 arow_k 后跳 j_header；j_header(j) 内层做
+        // buf[j] += cik * A[k][j]；j_latch 推进 k；k_exit 跳 wb_header；
+        // wb 循环把 buf 整行写回 A[i][j]；最后删掉旧 j/k 块并修复 i-latch
+        // 的悬空参数。关键正确性：行缓冲写回发生在 k 循环结束后（见模块
+        // 文档的 k<i / k==i / k>i 逐项论证，Mout==M2 别名场景）。
         let i32_ty = Type::get_i32();
         let zero = data.new_local_value().integer(0);
         let one = data.new_local_value().integer(1);
@@ -510,6 +522,10 @@ impl MatmulInterchange {
         }
 
         // ---- the row buffer (zeroed once per i) ----
+        // 每轮 i 分配一个零初始化的栈行缓冲（A 的一行），k 循环把部分和
+        // 累加进缓冲而不是直接写 A[i][j]：改写后 A[i][j] 在 k 循环结束前
+        // 保持旧值，k==i 项（C[i][i]*A[i][j]）与 k>i 的旧行读才能拿到
+        // 原语义的值。k 循环结束后整行一次写回（wb 循环）。
         let buf = data.new_local_value().alloc(buf_ty);
         let mz = data.new_local_value().mem_zero(buf, cand.row_len * 4);
         data.layout_mut().insert_before_terminator(i_body, buf);

@@ -84,6 +84,11 @@ impl Pass for IfConversion {
         // blocks that appear before the head, so the scan can resume after the
         // applied head instead of restarting from entry. The initial block list
         // stays valid because the pass only removes blocks (never adds them).
+        //
+        // 主循环总览：先建支配树快照——`candidate` 里的 `available_at` /
+        // `dominates` 判定都基于它；随后按布局序贪心：找候选 → `apply` →
+        // 继续，直到扫完入口处拍下的块列表。列表是快照、`apply` 只删块
+        // 不增块，所以这份列表从头到尾有效。
         let mut changed = false;
         let Some(tree) = dom_tree::v2::DominanceTree::new(data) else {
             return false;
@@ -100,6 +105,7 @@ impl Pass for IfConversion {
             while cursor < initial_blocks.len() {
                 let head = initial_blocks[cursor];
                 cursor += 1;
+                // 被前面候选删除的块在快照列表里仍然存在，用 contains_bb 跳过。
                 if !data.layout().contains_bb(head) {
                     continue;
                 }
@@ -124,14 +130,23 @@ impl IfConversion {
         head: BasicBlock,
         tree: &dom_tree::v2::DominanceTree,
     ) -> Option<Candidate> {
+        // 候选识别入口：只处理"终结符是条件分支"的块，逐一匹配四种规范
+        // 形状（同目标分支 / 空 diamond / triangle 链 / land-lor 折叠）。
         let terminator = *data.layout().basicblock(head).insts().get_last()?;
         let InstKind::Branch(branch) = data.inst_data(terminator).kind() else {
             return None;
         };
+        // 条件必须是 i32：select 的语义就是按 i32 条件二选一，非 i32
+        // 条件（如 unit）无法用 select 表达。
         if !data.inst_data(branch.cond()).ty().is_i32() {
             return None;
         }
 
+        // 形状一：同目标分支——两臂指向同一块，分支不再决定去向，只决定
+        // 目标块的实参取哪一份，故可用 `select(cond, t_args, f_args)` 合并。
+        // 拒绝条件：目标块是 head 自身；目标块前驱不只本分支（`exact_users`，
+        // 否则删除分支会丢掉其它前驱喂的参数）；任一实参在 head 处不可用
+        // （`available_at`——select 在 head 求值，操作数必须在此可见）。
         if branch.t_target() == branch.f_target() {
             if branch.t_target() == head
                 || !self.exact_users(data, branch.t_target(), &[terminator])
@@ -159,14 +174,22 @@ impl IfConversion {
 
         let t = branch.t_target();
         let f = branch.f_target();
+        // 两臂都不能指向 head 自身：自环分支没有"另一条边"可合并，无法转 select。
         if t == head || f == head {
             return None;
         }
 
         // Full diamond: both arms are empty and jump to the same merge.
+        //
+        // 形状二：空 diamond——两臂都是"只有一条 jump 的空块"且跳到同一
+        // merge。分支 + 两个空块 + merge 参数等价于一条 select。
         if let (Some((tj, tm, ta)), Some((fj, fm, fa))) =
             (self.empty_arm(data, t), self.empty_arm(data, f))
         {
+            // 全部条件：merge 非 head/两臂本身；两臂无参数、分支也不带实参
+            // （臂块不传值，值只来自两臂跳向 merge 的实参）；臂块只被本分支
+            // 使用、merge 只被两条臂使用（`exact_users`，删除臂块安全）；实参
+            // 在 head 处可用。
             if tm == fm
                 && tm != head
                 && tm != t
@@ -202,6 +225,11 @@ impl IfConversion {
         // unique arm with a chain of safe integer operations. Prefer the
         // true-edge-arm shape; when the merge itself is jump-terminated (a
         // loop latch), `arm(f)` would still match and must not shadow the arm.
+        //
+        // 形状三/四：triangle——一臂直达 merge，另一臂经过唯一臂块。此处解析
+        // 出"臂块 / merge / 直达边实参 / 直达边是否为 true 臂"四元组。优先
+        // 把 true 臂当臂块；merge 本身以 jump 终结（循环 latch）时，对 f 调
+        // `arm` 也会命中，必须让 true 臂优先，避免把臂块认错。
         let (arm, merge, direct_args, direct_is_true) = if let Some((_, m, _)) = self.arm(data, t) {
             if m == f {
                 (t, f, branch.f_args(), false)
@@ -228,6 +256,8 @@ impl IfConversion {
         } else {
             branch.f_args()
         };
+        // 臂块必须干净：merge 不与 head/臂块重合；臂块无参数、分支不向臂块
+        // 传实参、臂块只被本分支使用——这样删除臂块并把指令外提到 head 才安全。
         if merge == head
             || merge == arm
             || !data.bb_data(arm).params().is_empty()
@@ -237,6 +267,8 @@ impl IfConversion {
             return None;
         }
         let (arm_jump, _, arm_args) = self.arm(data, arm)?;
+        // merge 的前驱必须恰好是 head 分支与臂块 jump 两条边：多一个前驱
+        // 就意味着还有别的路径给 merge 传参，select 合并会漏掉那条路径的值。
         if !self.exact_users(data, merge, &[terminator, arm_jump]) {
             return None;
         }
@@ -246,6 +278,8 @@ impl IfConversion {
         // instruction must be single-use, feed the next link or the jump, and
         // have operands available at `head` (either dominating values or
         // earlier chain results that are hoisted together).
+        //
+        // 链 = 臂块内除结尾 jump 外的全部指令，将整体投机外提到 head。
         let insts = data
             .layout()
             .basicblock(arm)
@@ -258,6 +292,10 @@ impl IfConversion {
         // Every link must be single-use, feeding the next link (or the jump
         // for the last link), with operands available at `head` or from an
         // earlier link that is hoisted along with it.
+        // 逐条验证链上指令：必须可投机（`safe_arm_binary`：纯整数、无
+        // div/rem、操作数可用）、单 use、且使用者是下一条链指令（中间链）
+        // 或臂块 jump（末条）。任何一条不满足就整体放弃——投机外提必须
+        // 一次成功，不能留下半截链。
         let mut move_insts = Vec::new();
         if insts.len() > 1 {
             let chain_len = insts.len() - 1;
@@ -283,6 +321,8 @@ impl IfConversion {
                 move_insts.push((arm, inst));
             }
         }
+        // 可用性收尾：臂块传给 merge 的实参，要么来自链内被外提的指令，
+        // 要么在 head 处可用；直达边的实参同理。
         if arm_args.iter().any(|&value| {
             !move_insts.iter().any(|&(_, inst)| inst == value)
                 && !self.available_at(data, value, head, tree)
@@ -332,9 +372,15 @@ impl IfConversion {
         // `reaches(merge, head)` rejection blocked every loop-carried
         // accumulator (`if (bit_a==1 && bit_b==1) result += power`), which is
         // exactly the profitable case; dominance is the right precondition.
+        //
+        // 收尾校验：把识别结果固化成 `Candidate`。支配检查 head 必须支配
+        // merge——这比旧的"merge 不能到达 head"更宽松也更正确：循环累积器
+        // （merge 经回边可达 head）正是最该转换的形态，支配条件放行它。
         if merge == head || !self.dominates(tree, head, merge) {
             return None;
         }
+        // 参数逐对校验：merge 参数个数必须与两臂实参数一致；两臂值的类型
+        // 必须与参数类型相同，且不能是 unit（select 只对有值类型有意义）。
         let params = data.bb_data(merge).params();
         if params.len() != true_args.len() || params.len() != false_args.len() {
             return None;
@@ -348,6 +394,8 @@ impl IfConversion {
             {
                 return None;
             }
+            // 每个参数归入三种合并形态：两臂同值 → `Common` 直接复用（不产生
+            // 新指令）；`0/1` 布尔形态 → `BoolBinary` 折叠成 and/or；其余 → select。
             values.push(if if_true == if_false {
                 MergedValue::Common(if_true)
             } else if let Some((op, lhs, rhs)) = self.fold_land_lor(data, cond, if_true, if_false) {
@@ -356,6 +404,8 @@ impl IfConversion {
                 MergedValue::Select { if_true, if_false }
             });
         }
+        // 若所有参数都是 `Common`（两臂值完全相同），转换没有任何收益，
+        // 不值得为它改写 CFG，放弃。
         if !values.iter().any(|value| {
             matches!(
                 value,
@@ -385,6 +435,9 @@ impl IfConversion {
         if_true: Inst,
         if_false: Inst,
     ) -> Option<(BinaryOp, Inst, Inst)> {
+        // 布尔折叠：`c1 ? c2 : 0` ⇔ `c1 && c2`，`c1 ? c1 : c2` ⇔ `c1 || c2`。
+        // 前提是 c1/c2 都保证取 0/1（比较结果或 0/1 常量），否则按位运算的
+        // 结果不一定是布尔值，不能与 select 等价。
         // `c1 ? c2 : 0` with c1, c2 in {0,1} == `c1 && c2`.
         if self.zero_one(data, cond)
             && self.zero_one(data, if_true)
@@ -452,6 +505,9 @@ impl IfConversion {
         chain: &[Inst],
         tree: &dom_tree::v2::DominanceTree,
     ) -> bool {
+        // 可投机性判定：只收纯 i32 整数二元运算——排除 div/rem（除零会
+        // trap，投机执行会凭空引入原程序没有的异常，破坏可观察行为），
+        // 且操作数在 head 处可用或由链内先前指令产生（随链一起外提）。
         let InstKind::Binary(binary) = data.inst_data(inst).kind() else {
             return false;
         };
@@ -472,6 +528,9 @@ impl IfConversion {
         head: BasicBlock,
         tree: &dom_tree::v2::DominanceTree,
     ) -> bool {
+        // 可用性判定：一个值能否在 head 处被安全引用。全局值、常量、head
+        // 自己的参数天然可用；其余值要求定义块支配 head，或定义就在 head
+        // 内且不是终结符（终结符在 select 之后才执行，不能被它引用）。
         if value.is_global()
             || data.inst_data(value).is_const()
             || data.bb_data(head).params().contains(&value)
@@ -539,6 +598,9 @@ impl IfConversion {
     }
 
     fn exact_users(&self, data: &ArenaContextMut<'_>, bb: BasicBlock, expected: &[Inst]) -> bool {
+        // 前驱精确匹配：块的使用者（前驱边）集合必须恰好等于 expected。
+        // 这是删除/改写安全性的基石——多一条前驱就多一条传参路径，
+        // 遗漏它会导致合并后的值语义错误。
         let users = data
             .bb_data(bb)
             .used_by()
@@ -550,17 +612,29 @@ impl IfConversion {
     }
 
     fn apply(&self, data: &mut ArenaContextMut<'_>, candidate: Candidate) {
+        // 改写执行：把 head 的 `branch` 换成对 merge 的无参 `jump`，merge 的
+        // 每个参数用 select / and-or 取代。步骤：删旧终结符 → 外提链上指令
+        // → 逐个生成替换值 → 统一替换参数引用 → 清参数删孤儿 → 插新 jump
+        // → 删空臂块。全程保持指令身份不变，只改布局与引用。
         let params = data.bb_data(candidate.merge).params().clone();
 
         // Remove the old terminator first so newly inserted values naturally
         // precede the replacement jump in layout order.
+        //
+        // 先删终结符：之后插入的 select 会排在 jump 之前（布局序），head 的
+        // 指令顺序自然变成"…select…jump"。
         data.remove_layout_inst(candidate.head, candidate.terminator);
+        // 外提链上指令：整条 move 而非克隆，指令身份与 def-use 链不变，
+        // 其它指令对链上结果的引用自动跟随新位置。
         for (arm, inst) in &candidate.move_insts {
             // Moving preserves the instruction identity and all use-def links.
             data.layout_mut().remove_inst(*arm, *inst);
             data.layout_mut().insert_inst(candidate.head, *inst);
         }
 
+        // 生成替换值：`Common` 直接复用原指令；`Select` 造 `select(cond, t, f)`
+        // ——与原分支+Phi 语义等价（true 边取 t、false 边取 f），只是把控制流
+        // 依赖换成数据依赖；`BoolBinary` 造 and/or 布尔指令。新指令都插在 head。
         let mut replacements = Vec::with_capacity(params.len());
         for value in candidate.values {
             let replacement = match value {
@@ -583,6 +657,9 @@ impl IfConversion {
 
         // Validate every parameter before this point and rewrite all of them as
         // one transaction; never leave a partially converted merge signature.
+        //
+        // 原子替换：把 merge 参数的每个使用点一次性换成新值，随后清空参数
+        // 列表并删除成为孤儿的参数指令——不留下"半转换"的 merge 签名。
         for (&param, &replacement) in params.iter().zip(&replacements) {
             utils::visit_and_replace(data, param, replacement);
             assert!(data.inst_data(param).used_by().is_empty());
@@ -591,6 +668,7 @@ impl IfConversion {
         for param in params {
             data.remove_orphan_inst(param);
         }
+        // 新 jump 不带实参（参数已被 select/and-or 取代），最后删掉空臂块。
         let jump = data.new_local_inst().jump(candidate.merge, vec![]);
         data.layout_mut().insert_inst(candidate.head, jump);
         for bb in candidate.remove_blocks {

@@ -143,8 +143,11 @@ use crate::{
 pub struct Inline;
 
 /// Per-callsite clone budget (estimated instructions of the callee body).
+/// 单个调用点的克隆体大小上限：函数体超过它说明"太肥"，展开不划算。
 const CALL_SIZE_LIMIT: usize = 40;
 /// Total budget for one callee across all of its callsites.
+/// 一个被调函数在所有调用点上的克隆总量上限：防止"多调用点的叶子函数"把程序
+/// 撑爆——单个调用点再小，调用点一多总量也会失控。
 const TOTAL_SIZE_LIMIT: usize = 100;
 /// Per-callsite clone budget when at least one callsite sits inside a
 /// natural loop of its caller: the removed call overhead is paid once per
@@ -153,12 +156,18 @@ const TOTAL_SIZE_LIMIT: usize = 100;
 /// Calibrated on real data: a loop-resident callee may itself grow through
 /// chained in-loop inlining of its own helpers (`read_bits` 141 + `rotlN` 34
 /// = 175), so the budget must cover the post-chain size, not the bare body.
+/// 循环内放宽后的单调用点上限：循环内的调用开销每轮迭代都要付一次，一次性
+/// 更大的克隆动态上更划算（放宽理由与校准数据见上方英文注释）。
 const CALL_SIZE_LIMIT_LOOP: usize = 200;
 /// Total budget across the callsites of an in-loop callee.
+/// 循环内放宽后的总量上限。
 const TOTAL_SIZE_LIMIT_LOOP: usize = 300;
 
 impl Pass for Inline {
     fn run(&mut self, program: &mut Program) -> bool {
+        // 主循环入口：反复调用 `once`，每轮只内联一个调用点，直到找不到候选。
+        // 每次只改一处，保证下一轮 `find_candidate` 看到的调用图与 CFG 都是
+        // 最新快照；终止性由递归环守卫、调用点可达性守卫与成本预算共同保证。
         let mut changed = false;
         while Self::once(program) {
             changed = true;
@@ -170,6 +179,8 @@ impl Pass for Inline {
 /// Estimated clone size: ordinary instructions plus a small constant for the
 /// block-argument routing the inliner has to splice around each edge.
 fn estimate_size(data: &FunctionData) -> usize {
+    // 实现：把被调函数每个基本块的指令数直接相加，得到"克隆一份函数体"的
+    // 指令量估计。不区分指令种类，也不含加权系数，只做粗略的代码量度量。
     data.layout()
         .basicblocks()
         .iter()
@@ -177,6 +188,9 @@ fn estimate_size(data: &FunctionData) -> usize {
         .sum()
 }
 
+/// 一个待内联调用点的完整描述：调用方、调用指令与所在基本块、实参列表、
+/// 返回类型，以及 `find_candidate` 阶段预检好的克隆预案（`BodyClonePlan`）。
+/// `once` 拿到它即可直接改写，无需再做任何检查。
 struct Candidate {
     caller: Function,
     call_inst: Inst,
@@ -187,7 +201,11 @@ struct Candidate {
 }
 
 impl Inline {
+    /// 单次内联：取出 `find_candidate` 找到的一个候选调用点，完成
+    /// "切续体 → 克隆函数体 → 重写返回 → 替换使用点并接跳转"四步改写。
+    /// 返回 `true` 表示发生了内联；`run` 循环调用它直至返回 `false`。
     fn once(program: &mut Program) -> bool {
+        // 没有候选即无事可做，主循环收敛。
         let Some(candidate) = Self::find_candidate(program) else {
             return false;
         };
@@ -201,6 +219,10 @@ impl Inline {
             plan,
         } = candidate;
 
+        // 第一步（切续体）：把含 call 的块在 call 之后切成两半，后半成为
+        // 续体块 `{块名}_inline_cont`，带一个返回类型参数。所有克隆返回路径
+        // 最终都汇入这里，块参数即"返回值"——多条返回路径由此合并（Phi 形态）；
+        // unit 返回无需携带值，参数列表为空。
         let continuation = {
             let data = program.func_data_mut(caller);
             let block_name = data.bb_data(call_block).name().to_owned();
@@ -212,9 +234,14 @@ impl Inline {
             data.split_block_after(call_inst, format!("{block_name}_inline_cont"), params)
         };
 
+        // 第二步（克隆）：把被调函数全部基本块克隆到 call 块之后，克隆块命名
+        // `{原块名}_{被调函数名}_inline`。克隆体自洽：局部值（含块参数）由
+        // `CloneMapper` 重映射为全新指令，全局值原样共享；`cloned.returns` /
+        // `cloned.tail_calls` 分别收集克隆体内的返回与尾调用指令。
         let cloned = plan
             .clone_into(program, caller, call_block)
             .expect("preflighted function body must clone successfully");
+        // 候选筛选已排除含尾调用的函数体，且 `capture` 预检过结构，可安全断言。
         debug_assert!(cloned.tail_calls.is_empty());
         debug_assert!(!cloned.blocks.is_empty());
 
@@ -222,6 +249,9 @@ impl Inline {
             program,
             curr_func: Some(caller),
         };
+        // 第三步（重写返回）：克隆体内的 `ret` 不能原样保留——它本意是结束
+        // 被调函数，留在调用方里会错误地结束整个调用方函数。把每条克隆 `ret`
+        // 改写为携带返回值的 `jump` 汇入续体，多条返回路径在此合并。
         for return_inst in cloned.returns {
             let return_value = match context.inst_data(return_inst).kind() {
                 InstKind::Return(ret) => ret.value(),
@@ -233,21 +263,33 @@ impl Inline {
                 .jump(continuation, jump_args);
         }
 
+        // 第四步：先把 call 的所有使用点替换为续体参数（`visit_and_replace`
+        // 遍历 call 的全部使用者改写引用）；unit 型 call 没有使用者，无需替换。
         if !context.inst_data(call_inst).ty().is_unit() {
             let continuation_result = context.bb_data(continuation).params()[0];
             utils::visit_and_replace(&mut context, call_inst, continuation_result);
         }
+        // 使用点清空后 call 成为死指令：删除前断言无使用者，防止悬空引用。
         assert!(
             context.inst_data(call_inst).used_by().is_empty(),
             "call must have no users before removal"
         );
+        // 收尾：删除原 call，并在其位置插入进入克隆入口的 jump。实参列表即原
+        // call 的实参，按位置对应克隆入口形参（不重排——多参数用例的回归测试
+        // 专门盯着这一点）。
         context.remove_layout_inst(call_block, call_inst);
         let entry_jump = context.new_local_value().jump(cloned.entry, args);
         context.layout_mut().insert_inst(call_block, entry_jump);
         true
     }
 
+    /// 遍历程序全部函数，返回第一个满足全部条件的调用点候选（含克隆预案）。
+    /// 筛选顺序：函数级守卫（有函数体、不在递归环、有调用点）→ 成本预算 →
+    /// 调用点级守卫（调用方可达性）→ 类型匹配 → 克隆预检；任一不满足即放弃
+    /// 该被调函数。`None` 表示没有可内联的调用点，主循环收敛。
     fn find_candidate(program: &Program) -> Option<Candidate> {
+        // 调用图是一次性快照：本轮 `once` 尚未改写任何代码，用它做可达性
+        // 与调用点查询是有效的；内联一旦发生，下一轮会重建。
         let call_graph = call_graph::CallGraph::new(program);
         for &callee in program.function_layout() {
             if program.func_data(callee).layout().is_decl() {
@@ -259,10 +301,16 @@ impl Inline {
             // pass would keep inlining the cycle forever. The conservative
             // cranelift rule (`does_not_inline_across_a_recursive_call_cycle`)
             // is to leave cyclic callees as calls.
+            // 中文注：这正是防无限增长的第一个守卫——对环上函数一律保持调用。
+            // 关键在"克隆一次后"：环内调用点会搬进调用方内部，下一轮可达性
+            // 守卫不再排除它，于是会无限内联下去，所以必须在入口处直接拒绝。
             if call_graph.reaches(callee, callee) {
                 continue;
             }
             let callee_data = program.func_data(callee);
+            // 调用点收集：`incoming_callsites_of` 枚举 callee 的全部静态调用点
+            // （调用指令 + 所在函数）。没有调用点的函数（孤立 / 外部入口）没有
+            // 可展开的位置，直接跳过。
             let callsites: Vec<_> = call_graph.incoming_callsites_of(callee).collect();
             if callsites.is_empty() {
                 continue;
@@ -274,6 +322,10 @@ impl Inline {
             // sits inside a natural loop removes its call overhead once per
             // iteration, so the strict budget is relaxed for it (see
             // `any_callsite_in_loop`).
+            // 成本模型（防增长守卫之二，对应上方英文注释）：`size` 是单份克隆
+            // 的指令数，`total` 是所有调用点克隆的总量——用 `saturating_mul`
+            // 防极端情况下溢出。超预算时仅当存在位于自然循环内的调用点才放宽
+            // （`any_callsite_in_loop`），否则放弃该 callee。
             let size = estimate_size(callee_data);
             let total = size.saturating_mul(callsites.len());
             if size > CALL_SIZE_LIMIT || total > TOTAL_SIZE_LIMIT {
@@ -282,6 +334,11 @@ impl Inline {
                     continue;
                 }
             }
+            // 调用点级守卫（防增长守卫之三）：跳过 callee 对自身的调用点，并
+            // 排除"调用方可从 callee 到达"的调用点——若被调函数能（直接或
+            // 间接）调用到调用方，把该调用点内联进去会让被调函数体再次出现在
+            // 它自己能到达的函数里，形成调用图层面的爆炸式增长。`find` 取首个
+            // 通过守卫的调用点作为本轮候选。
             let Some(&callsite) = callsites.iter().find(|callsite| {
                 callsite.func != callee && !call_graph.reaches(callee, callsite.func)
             }) else {
@@ -298,6 +355,9 @@ impl Inline {
                 continue;
             }
 
+            // 类型匹配（在克隆前完成）：结果类型 == 返回类型、实参数 == 形参数、
+            // 且每个实参类型 == 对应形参类型。克隆是按位置把实参绑到形参的，
+            // 类型错位会在 IR 里留下类型非法的块参数，所以先在这里挡掉。
             if caller_data.inst_data(callsite.inst).ty() != callee_data.ret_ty()
                 || call.args().len() != callee_data.params_ty().len()
                 || call
@@ -308,12 +368,18 @@ impl Inline {
             {
                 continue;
             }
+            // unit 型 call 不允许有使用者：unit 值没有类型，被使用说明 IR 里
+            // 有非法引用（或残留坏值），此时放弃该候选。
             if caller_data.inst_data(callsite.inst).ty().is_unit()
                 && !caller_data.inst_data(callsite.inst).used_by().is_empty()
             {
                 continue;
             }
 
+            // 克隆预检：`capture` 在克隆前把函数体扫描一遍（结构合法性、控制流
+            // 目标不逃逸、无 `GlobalAlloc` 等，失败原因见模块文档），失败即放弃；
+            // 含尾调用的函数体也排除——尾调用由 fixpoint 里的 `tail_recursive_inline`
+            // 专门处理，不在此内联。
             let Ok(plan) = BodyClonePlan::capture(program, callee) else {
                 continue;
             };
@@ -337,6 +403,9 @@ impl Inline {
     /// analysis is a snapshot of the current CFG, which is valid because
     /// `find_candidate` runs before any mutation in `once`.
     fn any_callsite_in_loop(program: &Program, callsites: &[Node]) -> bool {
+        // 循环分析是当前 CFG 的快照且有一定代价，同一调用方下的多个调用点
+        // 共用一次分析（按调用方缓存）。任一调用点所在基本块被某个自然循环
+        // 包含（`min_loop_contain` 命中）即返回 `true`。
         let mut loops_by_caller: HashMap<Function, LoopAnalysis> = HashMap::default();
         callsites.iter().any(|callsite| {
             let analysis = loops_by_caller.entry(callsite.func).or_insert_with(|| {

@@ -229,6 +229,16 @@ impl ReductionUnroll {
         loop_analysis: &LoopAnalysis,
         looop: &Loop,
     ) -> Option<Candidate> {
+        // 形态识别（M47）：两块循环（header+body）的纯归约环，header 参数
+        // = 累加器 acc + trip IV j（+ 可选指针），j 是步长 +1 的严格
+        // `j < bound` 前向 IV。识别步骤 (a)-(g) 全过才改写，宁漏勿错：
+        //   (a) 两块循环，body 无块参数；
+        //   (b) 2-3 个 header 参数（acc / j / 可选 ptr）；
+        //   (c) 恰一个 BIV，步长 +1，严格 exit，bound 支配循环入口；
+        //   (d) header 分支：真入 body、假出循环；
+        //   (e) body 以 jump 回 header，回边实参携带 acc/j/ptr 更新；
+        //   (f) trip 初值为 0（车道与 j mod 4 对齐）；
+        //   (g) acc 更新匹配 acc ± E / select 模式，body 内无副作用。
         // (a) A two-block loop: header plus a single pure body block (the latch).
         if looop.body().len() != 2 || looop.latches().len() != 1 {
             return None;
@@ -428,6 +438,12 @@ impl ReductionUnroll {
 
     /// Rewrite one reduction loop. Returns true when the function changed.
     fn apply(data: &mut ArenaContextMut<'_>, cfg: &CFG, looop: &Loop, cand: &Candidate) -> bool {
+        // 改写（M47）：版本化守卫 + 4 路主循环 + 标量 epilogue 尾随原循环。
+        // 结构：preheader → version（T>=4 守卫）→ main_header/body/exit →
+        // 以 (T & ~3) 为 j 起点跳回原 header 跑余数。主循环每轮克隆 4 份
+        // body（j 偏移 0..3），4 路 acc 并行累加，j 步进 4——打破 acc 的
+        // 串行依赖链（scalar multi-accumulator），这是收益来源。
+        // 守卫失败或 T<4 时整趟走原标量循环（运行时路径选择，恒安全）。
         // A dedicated preheader anchors the versioning block. If the pass has
         // to create one, the caller re-runs everything from scratch.
         let Some(preheader) = ensure_preheader(data, cfg, looop) else {

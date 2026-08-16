@@ -343,4 +343,65 @@ commit（docs/offline-handbook 分支，未 push）：
 soyo_compiler frontend 3、analysis_passes 6、术语表 1 个 md），约 5,100 行
 中文；`cargo doc` 三 crate 均无新增 warning；纯注释改动，零逻辑变更。
 
+## 第三轮：AI 生成代码的内部注释（进行中）
+
+### 用户决策（2026-08-16）
+
+- 模块级文档已充分（前两轮），本轮补**代码内部叙述注释**：行内 `//` +
+  关键函数/算法步骤说明（补"为什么这么写"），模块文档之外的叙事层。
+- 分工：analysis_passes 剩余 5 文件（effects/icfg/memory/range/return_summary）
+  中文模块文档 → **subagent**；raana_ir **AI 生成的 pass**（25 个）+
+  taki_mir **reg_alloc 模块** → 主 agent 主导，较独立的 pass 可 subagent
+  编写，主 agent 质量验证后独立 commit。
+- AI pass 判定（用户确认）：s2r 迁移批次（const_prop/dce/gvn/sr/ssa，
+  eb0c667）+ ipsccp（用户手写）排除；其余 25 个 pass（07-23 之后引入）
+  为 AI 生成。loop_vectorize.rs 在 feat/loop-vectorize-hermes 分支，不涉及。
+
+### 范围与规模（25 pass + reg_alloc）
+
+- AI pass 25 个（行数含模块文档）：if_conversion 1037 / gvn_pre 1128 /
+  loop_unroll 1291 / reduction_unroll 1215 / recursive_memoize 1295 /
+  invariant_reduction_hoisting 1125 / blocked_reduction 1004 / rotate_loops
+  928 / column_major 968 / matmul_interchange 976 / dse 979 / licm 778 /
+  scalar_global_promotion 716 / chain_to_switch 519 / inline 824 /
+  mulmod_recognize 834 / tail_recursive_inline 465 / specialize 449 /
+  boolean_simplify 458 / tco 359 / simplify_cfg 376 / mod_fold 300 /
+  guard_elimination 240 / pointer_strength_reduction 252 / zero_store_loop 562。
+- reg_alloc 8814 行（ion 17 文件 + 顶层 5 文件），从 regalloc2 0.15.1 移植。
+- 现状：模块文档齐全；行内注释严重不足（mod_fold 282 代码行仅 9 条 `//`）。
+
+### 写作规范（第三轮）
+
+1. 中文，面向修过中等编译课程的大二本科生；术语指向 glossary.md。
+2. 聚焦代码内部叙述：关键算法步骤与"为什么"、数据结构/不变量含义、
+   边界与触发/放弃条件的代码落点；不重复顶部模块文档内容。
+3. 原有英文注释一律保留，中文注释追加在其旁/后。
+4. 只加注释，零逻辑改动；不用 intra-doc link 指向私有项。
+5. 验收：cargo check 0 error；主 agent 质检（读全文 + 符号 grep）。
+
+### 执行记录（占位）
+
+- subagent 批（独立 pass）→ 主 agent 质检 → 独立 commit；
+- 主 agent 亲自（复杂/设计背景深的 pass + reg_alloc）。
+
+### 第三轮执行记录（2026-08-16，已完成第一波）
+
+- **subagent 批 1**（10 个独立 pass）：boolean_simplify / simplify_cfg /
+  tco / specialize / pointer_strength_reduction / chain_to_switch /
+  column_major / guard_elimination / mod_fold / zero_store_loop；
+- **subagent 批 2**（7 个中等）：if_conversion / rotate_loops / dse /
+  scalar_global_promotion / inline / licm / tail_recursive_inline；
+- **主 agent 亲自**（8 个 M 系列核心）：mulmod_recognize (M60) /
+  recursive_memoize (M68) / blocked_reduction (M67) / matmul_interchange
+  (M58) / reduction_unroll (M47) / invariant_reduction_hoisting (M48) /
+  gvn_pre / loop_unroll；
+- 合计 25 个 pass +1,357 行中文内部注释，纯注释改动零逻辑变更；
+- **质检**：① diff 逐行核查非注释行仅行尾追加（零逻辑改动）；② 中文
+  注释符号引用 1,081 个全局 grep 零 MISSING；③ cargo check -p raana_ir
+  0 error；④ cargo doc 4 个 warning 全部来自未改动文件（icfg.rs 英文
+  注释 `Vec<Edge>` HTML 误判等既有项），本轮零新增；
+- **遗留**：reg_alloc 模块（8,814 行）内部注释未做（下一波）；analysis_passes
+  5 文件中文模块文档（effects/icfg/memory/range/return_summary）subagent 批
+  未派（与 reg_alloc 一并处理）。
+
 

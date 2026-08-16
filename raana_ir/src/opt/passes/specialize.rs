@@ -60,10 +60,18 @@ use crate::opt::{prelude::*, utils::body_clone::BodyClonePlan};
 #[derive(Default)]
 pub struct Specialize {
     /// If you have (candidate, [(1, const_1), (2, const_2), ...]) more the once, then reuse the function.
+    ///
+    /// 克隆缓存：键 = (原函数, 常量实参组合)，`(usize, Const)` 记录“第几个
+    /// 参数是常量、值是多少”。同一常量组合的多个调用点复用同一克隆，避免重复克隆。
     specialized: FxHashMap<(Function, Vec<(usize, Const)>), Function>,
+    /// 已创建过的克隆函数集合：新一轮扫描命中即跳过，防止“克隆体又被克隆”
+    /// 造成的无限递归（见下方 TODO 注释）。
     created: FxHashSet<Function>,
 }
 
+/// 参与克隆缓存键的“常量实参”抽象。浮点常量按位模式（`u32`）保存：
+/// `f32` 不实现 `Eq`/`Hash`，无法直接进哈希表；位模式不同即视为不同常量
+/// 组合（如 ±0.0 编码不同会各得一个克隆）——多克隆无害，误合并才可能出错。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Const {
     Int(i32),
@@ -71,8 +79,12 @@ enum Const {
 }
 
 impl Specialize {
+    /// 一轮特化：重建调用图 → 枚举候选函数 → 对每个候选收集带常量实参的
+    /// 调用点，克隆函数体并改写调用目标。返回本轮是否发生了特化。
     fn run_on_one(&mut self, program: &mut Program) -> bool {
+        // 每轮重建调用图：特化会新增函数、改写调用点，旧图快照已经失效。
         let call_graph = call_graph::CallGraph::new(program);
+        // 候选 = 调用图中所有“被调用过”的函数；没人调用的函数克隆了也无收益。
         for candidate in call_graph.callees() {
             // TODO: Very rough way to prevent infinite recursion.
             // Maybe introduce attribute system to solve it.
@@ -80,14 +92,23 @@ impl Specialize {
             {
                 continue;
             }
+            // 跳过条件（命中任一即放弃该候选）：
+            // - `created` 已含它：说明是上一轮产生的克隆体，不再对克隆体特化，
+            //   否则“克隆体的常量调用点 → 下一代克隆”会无限递归（上方 TODO）；
+            // - `is_decl()`：声明只有签名没有函数体，无内容可克隆。
             // A self-recursive candidate is never usefully specialized: the
             // clone keeps its recursion pointing at the original, so it is a
             // byte-for-byte duplicate that only adds a call indirection. The
             // self-tail-recursive loop case is handled by the
             // `tail_recursive_inline` pass instead.
+            // 中文注：克隆只复制函数体、不重定向体内的调用目标，所以克隆里
+            // 的递归调用仍指向原函数——克隆体与原件字节级相同，纯属浪费；
+            // 自尾递归的循环形态交给 `tail_recursive_inline` pass。
             if call_graph.reaches(candidate, candidate) {
                 continue;
             }
+            // 枚举该候选的全部调用点（每个元素是一个 (调用方函数, 调用指令)
+            // 对）。特化只改写这些调用点的目标，候选函数体本身不动。
             let callsites = call_graph.incoming_callsites_of(candidate);
             let mut specialize_count = 0;
             for Node { func, inst } in callsites {
@@ -97,6 +118,10 @@ impl Specialize {
                     // TODO: Skip tailcall for now.
                     continue;
                 };
+                // 只有普通 `Call` 参与特化；`TailCall` 等其它指令形态落入
+                // `else` 分支跳过（代码留有 TODO：暂不处理尾调用）。
+                // 扫描实参，收集其中的编译期常量，记成 (实参下标, 常量值) 对：
+                // 下标区分“哪个参数被固定”，常量值决定该调用点归属哪个克隆。
                 let mut const_args = vec![];
                 for (i, &arg) in call.args().iter().enumerate() {
                     let arg_data = data.inst_data(arg);
@@ -110,9 +135,13 @@ impl Specialize {
                         _ => {}
                     }
                 }
+                // 没有任何常量实参的调用点：特化对它没有收益，保持原调用。
                 if const_args.is_empty() {
                     continue;
                 }
+                // 缓存命中：该 (候选, 常量组合) 此前已克隆过，直接把本调用点
+                // 改指已有克隆（`replace_inst_with` 原地替换该指令，实参不变），
+                // 不再重复克隆。
                 if let Some(&created) = self.specialized.get(&(candidate, const_args.clone())) {
                     let args = call.args().to_vec();
                     let mut ctx = ArenaContextMut {
@@ -122,9 +151,15 @@ impl Specialize {
                     ctx.replace_inst_with(inst).call(created, args);
                     continue;
                 };
+                // 首次遇到该常量组合：用 `BodyClonePlan` 捕获候选的完整函数体
+                // （克隆工具见 `opt/utils/body_clone.rs`）；捕获失败则放弃该候选。
                 let Ok(clone_plan) = BodyClonePlan::capture(program, candidate) else {
                     continue;
                 };
+                // 新建克隆函数：签名（返回类型 + 形参类型）与原函数完全一致，
+                // 名字为 `{原函数名}_specialized_{序号}`。注意形参仍是普通参数、
+                // 并不替换成常量——收益来自“每个常量组合一个专用副本”的形态，
+                // 由后续 `inline` 内联 + 常量传播/折叠兑现（见模块文档）。
                 let args = call.args().to_vec();
                 let candidate_data = program.func_data(candidate);
                 let ret_ty = candidate_data.ret_ty().clone();
@@ -135,7 +170,16 @@ impl Specialize {
                     format!("{name}_specialized_{specialize_count}"),
                     params_ty,
                 );
+                // 先登记缓存再组装克隆体：同一轮内后续相同的常量组合直接复用，
+                // 不会重复克隆。
                 self.specialized.insert((candidate, const_args), new_func);
+                // 组装克隆体骨架（新函数含两个基本块）：
+                // 1. `entry_bb` 是新函数的入口块，其 block 参数即函数形参；
+                // 2. `clone_into` 把原函数体整体搬进新函数（插在入口块之后），
+                //    返回克隆体的入口块；
+                // 3. 入口块末尾补一条 `jump` 到克隆体入口，把 entry 的 block
+                //    参数原样转发——block 参数即本项目的 Phi，随边传参完成
+                //    形参接线，克隆体内部无需任何修改。
                 let entry_bb = program.func_data_mut(new_func).add_entry_block();
 
                 let clone_body = clone_plan
@@ -158,14 +202,21 @@ impl Specialize {
                     .layout_mut()
                     .insert_inst(entry_bb, jump_inst);
 
+                // 调用点改写：把原 `call candidate` 原地替换为 `call new_func`。
+                // 实参仍传原值——克隆体形参不是常量，常量性由“该克隆只服务
+                // 这一组常量调用点”保证，内联代入后即可折叠。
                 let mut ctx = ArenaContextMut {
                     program,
                     curr_func: Some(func),
                 };
                 ctx.replace_inst_with(inst).call(new_func, args);
+                // 累计本候选的克隆个数（决定命名序号），并把克隆体登记进
+                // `created`，防止下一轮再对它特化。
                 specialize_count += 1;
                 self.created.insert(new_func);
             }
+            // 该候选至少特化出一个克隆：提前结束本轮（外层 fixpoint 会重建
+            // 调用图重扫，覆盖其余尚未处理的候选）。
             if specialize_count > 0 {
                 return true;
             }
@@ -175,6 +226,10 @@ impl Specialize {
 }
 
 impl Pass for Specialize {
+    // fixpoint 外层：反复执行 `run_on_one` 直到一整轮没有任何特化发生。
+    // `run_on_one` 一旦特化成功就提前返回，未处理的候选留到下一轮；每轮
+    // 重建调用图，让改写后的调用点与新增克隆都被重新审视。克隆体被
+    // `created` 集合拦截，循环必然终止。`changed_once` 汇总是否发生过改动。
     fn run(&mut self, program: &mut Program) -> bool {
         let mut changed_once = false;
         loop {

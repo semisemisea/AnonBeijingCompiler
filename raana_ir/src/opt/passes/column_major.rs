@@ -93,12 +93,15 @@ use crate::{
     },
 };
 
+// 候选根的来源：局部 Alloc（属于某个函数）或全局 GlobalAlloc（附带初始化器）。
 #[derive(Debug, Clone, Copy)]
 enum RootKind {
     Local(Function),
     Global { init: Inst },
 }
 
+// 一个待转置的二维数组候选：root 是分配指令，rows/columns 是逻辑行列数，
+// accesses 收集所有通过验证的访问点，供后续逐函数收益评估。
 #[derive(Debug, Clone)]
 struct Candidate {
     root: Inst,
@@ -109,6 +112,8 @@ struct Candidate {
     accesses: Vec<Access>,
 }
 
+// 单个访问点：三维 GEP（base, 0, row, column）。row/column 是下标 SSA 值，
+// memory_user_count 是该 GEP 的 load/store 使用者数，用作收益加权。
 #[derive(Debug, Clone, Copy)]
 struct Access {
     function: Function,
@@ -122,6 +127,8 @@ pub struct ColumnMajor;
 
 impl Pass for ColumnMajor {
     fn run(&mut self, program: &mut Program) -> bool {
+        // 三段式流水：收集候选 → 按成本模型过滤出值得转置的 → 逐个重写。
+        // 返回 true 表示程序被修改（调用方据此标记 pass 生效）。
         let candidates = collect_candidates(program)
             .into_iter()
             .filter(|candidate| candidate_is_profitable(program, candidate))
@@ -134,6 +141,8 @@ impl Pass for ColumnMajor {
     }
 }
 
+// 形状识别：期望 *[rows][columns] 的两层数组指针，元素必须为标量。
+// 返回 (元素类型, rows, columns)；checked_mul 防维度乘积与总字节数溢出。
 fn matrix_type(ty: &Type) -> Option<(Type, usize, usize)> {
     let TypeKind::Pointer(outer) = ty.kind() else {
         return None;
@@ -144,6 +153,7 @@ fn matrix_type(ty: &Type) -> Option<(Type, usize, usize)> {
     let TypeKind::Array(element, columns) = inner.kind() else {
         return None;
     };
+    // 元素须为标量：转置只交换两层下标，元素若仍是数组则"二维"前提不成立。
     if !element.is_scalar() || matches!(element.kind(), TypeKind::Array(..)) {
         return None;
     }
@@ -152,11 +162,14 @@ fn matrix_type(ty: &Type) -> Option<(Type, usize, usize)> {
     Some((element.clone(), *rows, *columns))
 }
 
+// 全程序扫描两类分配点：函数内 Alloc 与全局 GlobalAlloc，
+// 形状匹配 matrix_type 的进入候选池，最后统一用 collect_uses 验证使用者。
 fn collect_candidates(program: &Program) -> Vec<Candidate> {
     let mut roots = Vec::new();
     for &function in program.function_layout() {
         let data = program.func_data(function);
         for (&inst, inst_data) in data.local_arena().inst_arena().datas() {
+            // 第一遍：函数内的局部 Alloc（栈上数组）。
             if matches!(inst_data.kind(), InstKind::Alloc) {
                 if let Some((element_ty, rows, columns)) = matrix_type(inst_data.ty()) {
                     roots.push(Candidate {
@@ -172,6 +185,7 @@ fn collect_candidates(program: &Program) -> Vec<Candidate> {
         }
     }
     for &root in program.global_inst_layout() {
+        // 第二遍：全局 GlobalAlloc（静态数组），需记录初始化器供后续转置。
         let InstKind::GlobalAlloc(global) = program.inst_data(root).kind() else {
             continue;
         };
@@ -195,6 +209,8 @@ fn collect_candidates(program: &Program) -> Vec<Candidate> {
         .collect()
 }
 
+// 验证候选的全部使用者都是可重写的访问，并把它们收集进 candidate.accesses。
+// 返回 false 表示存在无法处理的用法——整个候选放弃（宁可保守也不漏改）。
 fn collect_uses(program: &Program, candidate: &mut Candidate) -> bool {
     if candidate.root.is_global()
         && program
@@ -203,6 +219,8 @@ fn collect_uses(program: &Program, candidate: &mut Candidate) -> bool {
             .iter()
             .any(|user| user.is_global())
     {
+        // 全局数组被其它全局指令（如另一个全局的初始化器）引用 → 放弃：
+        // 我们只能重写本数组的初始化器，无法同步别的全局里对它的引用。
         return false;
     }
     let mut saw_access = false;
@@ -223,6 +241,8 @@ fn collect_uses(program: &Program, candidate: &mut Candidate) -> bool {
                 InstKind::GetElemPtr(gep)
                     if gep.base() == candidate.root && gep.offsets().len() == 3 =>
                 {
+                    // 唯一允许的访问形态：三维偏移 GEP（[0, row, column]），
+                    // 且它只被 load/store 使用。转置时只需交换 offsets[1]↔offsets[2]。
                     let offsets = gep.offsets();
                     let Some(memory_user_count) = collect_gep_memory_users(data, inst) else {
                         return false;
@@ -238,14 +258,18 @@ fn collect_uses(program: &Program, candidate: &mut Candidate) -> bool {
                     saw_access = true;
                 }
                 InstKind::MemZero(mem_zero) if mem_zero.dest() == candidate.root => {
+                    // MemZero 整块清零与布局无关，允许但不计入 Access（无步长收益可评）。
                     recognized_users.insert(inst);
                 }
+                // 其它任何用法（地址拷贝、作为函数实参等）都无法安全重写 → 放弃。
                 _ => return false,
             }
         }
     }
     let all_local_uses_recognized = match candidate.kind {
         RootKind::Local(function) => {
+            // 局部候选要求"识别集 == 全部使用者"：used_by() 是反向使用集合，
+            // 漏掉任何一个访问点都会在转置后留下错误寻址——这是严格的原因。
             recognized_users
                 == *program
                     .func_data(function)
@@ -260,6 +284,8 @@ fn collect_uses(program: &Program, candidate: &mut Candidate) -> bool {
     saw_access && all_local_uses_recognized && valid_initializer(program, candidate)
 }
 
+// GEP 的使用者必须全部是 Load(gep) / Store(gep)（无其它用途），
+// 返回使用者个数：一个 GEP 被多个 load/store 共享时访问更热，用于收益加权。
 fn collect_gep_memory_users(data: &FunctionData, gep: Inst) -> Option<usize> {
     let users = data.inst_data(gep).used_by();
     (!users.is_empty()
@@ -271,6 +297,8 @@ fn collect_gep_memory_users(data: &FunctionData, gep: Inst) -> Option<usize> {
     .then_some(users.len())
 }
 
+// 全局初始化器必须可转置：ZeroInit 天然对称；Aggregate 要求展平后的
+// 元素数恰好等于 rows*columns，否则重排无法对齐新旧布局。
 fn valid_initializer(program: &Program, candidate: &Candidate) -> bool {
     let RootKind::Global { init } = candidate.kind else {
         return true;
@@ -285,6 +313,9 @@ fn valid_initializer(program: &Program, candidate: &Candidate) -> bool {
     }
 }
 
+// 收益判定主流程：访问按函数分组，逐个函数构建 CFG/循环/IV 分析，
+// 对每个访问估计"当前布局步长 vs 转置后步长"的代价，汇总成 AccessCost
+// 列表后交给 column_major_cost::is_profitable 做最终裁决。
 fn candidate_is_profitable(program: &mut Program, candidate: &Candidate) -> bool {
     let mut by_function: FxHashMap<Function, Vec<Access>> = FxHashMap::default();
     for &access in &candidate.accesses {
@@ -300,6 +331,8 @@ fn candidate_is_profitable(program: &mut Program, candidate: &Candidate) -> bool
         let Some(cfg) = CFG::new(&context) else {
             return false;
         };
+        // 三个快照分析：CFG、循环巢（LoopAnalysis）、基本归纳变量（IV）。
+        // 均为只读快照——收益评估阶段绝不修改程序。
         let (cfg, dominance, loops) = LoopAnalysis::from_cfg(cfg);
         let induction = BasicInductionVariableAnalysis::new(&context, &cfg, &loops);
 
@@ -322,6 +355,8 @@ fn candidate_is_profitable(program: &mut Program, candidate: &Candidate) -> bool
                 access.column,
                 candidate.columns,
             ) {
+                // 安全前提：行/列下标必须可证明在各自维度内。转置不改变
+                // 语义的前提是访问范围合法，证明不了就放弃候选。
                 return false;
             }
             let Some(looop) = loops.min_loop_contain(block) else {
@@ -332,6 +367,8 @@ fn candidate_is_profitable(program: &mut Program, candidate: &Candidate) -> bool
                 .iter()
                 .all(|&latch| dominance.dominates(block, latch))
             {
+                // 访问块须支配循环的所有 latch：保证每次迭代都执行到该 GEP，
+                // 步长估计（每迭代增量 × 迭代次数）才成立。
                 return false;
             }
             let Some((row_delta, column_delta)) =
@@ -339,6 +376,7 @@ fn candidate_is_profitable(program: &mut Program, candidate: &Candidate) -> bool
             else {
                 return false;
             };
+            // (row_delta, column_delta) 是每迭代行/列下标的增量，步长的原材料。
             let element_size = candidate.element_ty.size();
             let Some(current_stride) =
                 byte_stride(row_delta, column_delta, candidate.columns, element_size)
@@ -350,13 +388,18 @@ fn candidate_is_profitable(program: &mut Program, candidate: &Candidate) -> bool
             else {
                 return false;
             };
+            // 行主序步长 = |row_delta*columns + column_delta| * elem_size；
+            // 转置后列主序步长 = |column_delta*rows + row_delta| * elem_size。
             if current_stride == 0 && transposed_stride == 0 {
+                // 两个步长都为零：访问地址不随迭代变化（对标量），布局无关，跳过。
                 continue;
             }
             let Some(executions) = loop_nest_executions(&context, &loops, &induction, block) else {
                 return false;
             };
             let weight = executions.saturating_mul(access.memory_user_count as u128);
+            // 权重 = 循环巢总执行次数 × 该 GEP 的 load/store 数：按真实访存
+            // 频率加权，冷访问的劣化不会淹没热访问的收益。
             costs.push(AccessCost {
                 current_stride,
                 transposed_stride,
@@ -368,6 +411,10 @@ fn candidate_is_profitable(program: &mut Program, candidate: &Candidate) -> bool
     is_profitable(&costs, candidate.element_ty.size())
 }
 
+// 求最内层循环中行/列下标的每迭代增量 (row_delta, column_delta)：
+// 遍历循环的每个 IV，若下标随它线性变化（index_coefficient 求系数），
+// 增量 = 系数 × IV 步长。恰好一个 IV 驱动下标 → 返回增量；
+// 多个 IV 都驱动 → 步长不唯一无法建模，返回 None（放弃）。
 fn classify_access_delta(
     data: &ArenaContextMut<'_>,
     looop: &loop_analysis::Loop,
@@ -386,6 +433,7 @@ fn classify_access_delta(
         let column_coefficient = index_coefficient(data, looop, iv, column, range)?;
         if row_coefficient != 0 || column_coefficient != 0 {
             if result.is_some() {
+                // 第二个 IV 也影响下标：增量不唯一，无法评估，放弃。
                 return None;
             }
             let step = i64::from(exit.signed_step());
@@ -395,12 +443,17 @@ fn classify_access_delta(
             ));
         }
     }
+    // 没有 IV 驱动下标：若行/列都是循环不变量则增量恒为 (0, 0)
+    //（每次迭代访问同一元素）；否则下标来源不明 → None。
     result.or_else(|| {
         (is_loop_invariant(data, looop, row) && is_loop_invariant(data, looop, column))
             .then_some((0, 0))
     })
 }
 
+// 求 value 相对循环 IV 的线性系数：IV 自身 = 1，循环不变量 = 0，
+// 其余交给 classify_derived_induction_variable 识别派生 IV（如 k*2 之类
+// 的线性表达式）并取其系数。
 fn index_coefficient(
     data: &ArenaContextMut<'_>,
     looop: &loop_analysis::Loop,
@@ -424,6 +477,8 @@ fn index_coefficient(
     .map(|derived| derived.coefficient())
 }
 
+// 循环不变量判定：全局/常量/函数参数天然不变；BlockArgRef 必须来自循环外
+// 的块（循环内块的参数每迭代都会换新值）；普通指令看定义块是否在循环外。
 fn is_loop_invariant(data: &ArenaContextMut<'_>, looop: &loop_analysis::Loop, value: Inst) -> bool {
     if value.is_global()
         || integer_constant(data, value).is_some()
@@ -444,6 +499,9 @@ fn is_loop_invariant(data: &ArenaContextMut<'_>, looop: &loop_analysis::Loop, va
         .is_some_and(|block| !looop.contains(block))
 }
 
+// 估计块所在循环巢的总执行次数：包含它的每个循环的 trip count 相乘
+//（saturating_mul 防溢出；UpperBound 估算同样接受）。次数不可知 → None，
+// 调用方将放弃该候选（无法加权）。
 fn loop_nest_executions(
     data: &ArenaContextMut<'_>,
     loops: &LoopAnalysis,
@@ -464,6 +522,9 @@ fn loop_nest_executions(
     Some(executions)
 }
 
+// 布局地址步长公式：|major_delta * minor_len + minor_delta| 个元素 × 元素大小。
+// major/minor 对应行/列增量，minor_len 是内层维度长度；i128 中间运算防溢出，
+// unsigned_abs 保证步长非负。
 fn byte_stride(
     major_delta: i64,
     minor_delta: i64,
@@ -479,6 +540,9 @@ fn byte_stride(
     usize::try_from(bytes).ok()
 }
 
+// 证明下标 value 的取值恒在 [0, dimension-1] 内：常量直接比对；
+// IV 驱动的下标用迭代上下界（iteration_value_bounds）推出值域再比对。
+// 证明不了 → false，调用方放弃候选（越界访问转置后语义会变）。
 fn index_in_bounds(
     data: &ArenaContextMut<'_>,
     loops: &LoopAnalysis,
@@ -494,6 +558,7 @@ fn index_in_bounds(
         return false;
     };
     if let Some(value) = integer_constant(data, value) {
+        // 常量下标：直接区间判断。
         return (0..=maximum).contains(&i64::from(value));
     }
     for looop in loops.containing_loops(block) {
@@ -508,6 +573,8 @@ fn index_in_bounds(
             else {
                 continue;
             };
+            // IV 驱动的下标：用首末迭代推出值域。若下标就是 IV 参数，
+            // 值域即迭代范围；否则把 IV 的线性变换作用到迭代两端求 min/max。
             let bounds = if value == iv.parameter() {
                 Some((iteration_min, iteration_max))
             } else {
@@ -538,6 +605,8 @@ fn index_in_bounds(
     false
 }
 
+// IV 在整个循环中的取值下界/上界：初始值集合取 min/max；正向循环上界含
+// bound-1（退出条件为严格小于），反向循环下界含 bound+1。
 fn iteration_value_bounds(
     data: &ArenaContextMut<'_>,
     iv: &BasicInductionVariable,
@@ -557,11 +626,16 @@ fn iteration_value_bounds(
     }
 }
 
+// 重写步骤：1) 根分配换成转置类型 [columns][rows]（全局连同初始化器一起
+// 转置）；2) 每个访问 GEP 的 offsets[1]↔offsets[2] 对调；3) debug 构建下
+// 用 verify_rewrite 断言重写结果。
 fn rewrite_candidate(program: &mut Program, candidate: &Candidate) {
     let new_matrix_ty = Type::get_array(
         Type::get_array(candidate.element_ty.clone(), candidate.rows),
         candidate.columns,
     );
+    // 新类型 [columns][rows]：外层长度变为 columns（列主序），
+    // 下标 [i][j] 在新布局中的地址 = base + j*rows + i。
     let old_name = match candidate.kind {
         RootKind::Local(function) => program
             .func_data(function)
@@ -573,6 +647,7 @@ fn rewrite_candidate(program: &mut Program, candidate: &Candidate) {
 
     match candidate.kind {
         RootKind::Local(function) => {
+            // 局部数组：在同一指令槽重建 Alloc，只改类型。
             let mut context = ArenaContextMut {
                 program,
                 curr_func: Some(function),
@@ -584,6 +659,8 @@ fn rewrite_candidate(program: &mut Program, candidate: &Candidate) {
         }
         RootKind::Global { init } => {
             let new_init = transpose_initializer(program, init, candidate, &new_matrix_ty);
+            // 全局数组：先转置初始化器，再重建 GlobalAlloc 指向新初始化器。
+            // 借用某个访问所在函数构造上下文——全局指令不属于任何函数的 arena。
             let function = candidate.accesses[0].function;
             let mut context = ArenaContextMut {
                 program,
@@ -600,6 +677,8 @@ fn rewrite_candidate(program: &mut Program, candidate: &Candidate) {
     }
 
     for &access in &candidate.accesses {
+        // 逐访问点重写 GEP：偏移由 [0, row, column] 变为 [0, column, row]，
+        // 与新的 [columns][rows] 布局严格对应——这就是转置的语义映射。
         let mut context = ArenaContextMut {
             program,
             curr_func: Some(access.function),
@@ -621,6 +700,9 @@ fn rewrite_candidate(program: &mut Program, candidate: &Candidate) {
 
 #[cfg(debug_assertions)]
 fn verify_rewrite(program: &Program, candidate: &Candidate, new_matrix_ty: &Type) {
+    // 仅 debug 构建生效的完整性检查：根类型、每个 GEP 的 base 与偏移、
+    // 以及 GEP 使用者集合（数量与形态）都必须与预期一致——把"漏改/错改"
+    // 变成显式崩溃而不是静默的寻址错误。
     let expected_root_ty = Type::get_pointer(new_matrix_ty.clone());
     match candidate.kind {
         RootKind::Local(function) => {
@@ -663,7 +745,10 @@ fn transpose_initializer(
     candidate: &Candidate,
     new_matrix_ty: &Type,
 ) -> Inst {
+    // 初始化器转置：ZeroInit 无需改动；Aggregate 先展平成一维元素序列，
+    // 按转置公式重排，再按新内层长度 rows 重新分组回嵌套 Aggregate。
     match program.inst_data(init).kind() {
+        // 全零初始化转置后仍是全零：换类型重建即可。
         InstKind::ZeroInit => program.new_value().zero_init(new_matrix_ty.clone()),
         InstKind::Aggregate(aggregate) => {
             let old = aggregate.flatten(program);
@@ -674,10 +759,13 @@ fn transpose_initializer(
                         old[row * candidate.columns + column];
                 }
             }
+            // 核心重排：元素 (row, column) 在新布局的展平下标是
+            // column*rows + row（新内层长度是 rows，即转置的索引公式）。
             let mut rows = Vec::with_capacity(candidate.columns);
             for values in transposed.chunks(candidate.rows) {
                 rows.push(program.new_value().aggregate(values.to_vec()));
             }
+            // 按新内层维度 rows 切成 columns 个子数组，构成 [columns][rows]。
             program
                 .new_value()
                 .raw(Aggregate::new_data(new_matrix_ty.clone(), rows))
@@ -687,6 +775,8 @@ fn transpose_initializer(
 }
 
 fn restore_name(data: &mut ArenaContextMut<'_>, inst: Inst, name: Option<String>) {
+    // replace_inst_with 重建指令时会清掉名字，这里把旧名贴回去，
+    // 保持 IR dump 中指令可读（调试与差分比对都依赖名字）。
     if let Some(name) = name {
         data.inst_data_mut(inst).set_name(name);
     }

@@ -113,6 +113,9 @@ const CHAIN_BLOCK_INSTS: usize = 2;
 /// A chain shorter than this is already as cheap as a tree.
 const MIN_CHAIN_LEN: usize = 4;
 
+// 一条链节 = 一个 `if (x == k) goto handler; goto next`：记下块、case
+// 常数、true/false 两个目标以及两侧边参数。树建成后这些目标与参数
+// 要原样重建。
 struct Link {
     block: BasicBlock,
     k: i32,
@@ -125,9 +128,13 @@ struct Link {
 
 impl Pass for ChainToSwitch {
     fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
+        // 门控落点：本 pass 自身不查目标架构——是否注册由管线 `opt/pass.rs`
+        // 按 `config.target.enable_chain_to_switch` 决定（仅 AArch64 挂载）。
         if data.layout().entry_bb().is_none() {
+            // 没有函数入口块则无处安放树根，直接放弃。
             return false;
         }
+        // 先快照块列表再遍历：转换会新建/删除块，不能在迭代 layout 的同时改写它。
         let blocks: Vec<BasicBlock> = data
             .layout()
             .basicblocks()
@@ -137,6 +144,7 @@ impl Pass for ChainToSwitch {
         let mut changed = false;
         for head in blocks {
             // An earlier conversion may have removed this block.
+            // 前一个链的转换可能已把该块当作链中块删掉：layout 里已不存在就跳过。
             if !data
                 .layout()
                 .basicblocks()
@@ -156,16 +164,22 @@ impl Pass for ChainToSwitch {
 impl ChainToSwitch {
     /// Try to turn the equality chain starting at `head` into a decision tree.
     fn convert_chain(data: &mut ArenaContextMut<'_>, head: BasicBlock) -> bool {
+        // 改写四步：识别链 → 按 case 常数排序 → 递归建树（根落在链头）→
+        // 删除被取代的旧指令与链块。识别失败则本函数什么都不做。
         let Some((x, links, default, default_args)) = Self::detect_chain(data, head) else {
             return false;
         };
         let mut sorted = links;
+        // 按 case 常数 k 升序：树靠中位数切分分叉，必须保证左子树全 < k <
+        // 右子树，才能用一次 `x < k` 比较把搜索范围减半。
         sorted.sort_by_key(|link| link.k);
 
         // The chain head becomes the tree root in place, so it keeps its
         // block parameters (function parameters for an entry-rooted chain,
         // inlined arguments for an inlined chain) and its incoming edges
         // need no rewiring.
+        // 快照链头的旧指令：链头原地变树根，树建成后要删掉这两条旧指令，
+        // 由 build_tree 在相同位置重建根检查。
         let old_head_insts: Vec<Inst> = data
             .layout()
             .basicblock(head)
@@ -188,6 +202,8 @@ impl ChainToSwitch {
 
         // Drop the head's original test; the rest of the chain is replaced
         // by the tree.
+        // 链头只删指令不删块（它现在是树根）；其余链块连同指令整体移除，
+        // handler / default 是外部块，不受影响。
         for inst in old_head_insts {
             data.remove_layout_inst(head, inst);
         }
@@ -205,15 +221,22 @@ impl ChainToSwitch {
         data: &ArenaContextMut<'_>,
         head: BasicBlock,
     ) -> Option<(Inst, Vec<Link>, BasicBlock, Vec<Inst>)> {
+        // 沿 false 边逐块前进做形态匹配：每块必须恰好是「Eq 测试 + 以它为
+        // 条件的分支」，任一条件不满足立即断链返回 None。全部通过后还要
+        // 过链长与 block 参数两关。
         let mut x: Option<Inst> = None;
         let mut links: Vec<Link> = Vec::new();
         let mut cur = head;
         loop {
             let layout = data.layout().basicblock(cur);
+            // 整块必须恰好 2 条指令：多了说明块里还有别的计算（x 可能被重新
+            // 定义），树无法安全重建，断链。
             if layout.insts().len() != CHAIN_BLOCK_INSTS {
                 break;
             }
             let insts: Vec<Inst> = layout.insts().iter().copied().collect();
+            // 指令 0 必须是 Eq 比较、指令 1 必须是分支且条件正是指令 0：
+            // 这正是 `if (x == k) goto handler; goto next` 的 IR 形态。
             let InstKind::Binary(binary) = data.inst_data(insts[0]).kind() else {
                 break;
             };
@@ -225,6 +248,7 @@ impl ChainToSwitch {
             }
             // The tested value and the case constant (either side may carry
             // the constant).
+            // case 常数可写在 Eq 任一侧（`x == k` 或 `k == x`），另一侧即被测值 x。
             let (lhs, rhs) = (binary.lhs(), binary.rhs());
             let (value, k) = match data.inst_data(rhs).kind() {
                 InstKind::Integer(i) => (lhs, i.value()),
@@ -233,6 +257,8 @@ impl ChainToSwitch {
                     _ => break,
                 },
             };
+            // 全部链节必须测试同一个 x：树是对 x 建索引的，若某节换测别的值，
+            // 中位数切分就不再是按同一变量的数值分界。
             if let Some(expected) = x {
                 if expected != value {
                     break;
@@ -240,13 +266,17 @@ impl ChainToSwitch {
             } else {
                 x = Some(value);
             }
+            // case 常数重复即拒绝：两个链节命中同一个 k，树里无法区分。
             if links.iter().any(|link| link.k == k) {
                 break;
             }
             let next = branch.f_target();
+            // false 目标指向自身（自环）不可能是普通相等链的写法，断链。
             if next == cur {
                 break;
             }
+            // 记下链节并沿 false 边前进到下一链节；两侧边参数一并保存，
+            // 建树时要原样重建这些边。
             links.push(Link {
                 block: cur,
                 k,
@@ -257,6 +287,8 @@ impl ChainToSwitch {
             });
             cur = next;
         }
+        // 收益判定：链长 ≥ 4 才改写。线性链最坏 N 次比较、平均 N/2；树最坏
+        // ~log2(N)+1 次。太短的链省下的比较不抵新建块的开销。
         if links.len() < MIN_CHAIN_LEN {
             return None;
         }
@@ -268,6 +300,8 @@ impl ChainToSwitch {
         // the tree's edges feed them no arguments. The head keeps its
         // parameters (it survives as the tree root), so its parameters stay
         // valid without any edge rewiring.
+        // 除链头外，链块不得带 block 参数：树新建的各边都不传参，带参数的
+        // 块无法重接；链头豁免——它保留为树根，参数随原入边继续有效。
         if links
             .iter()
             .skip(1)
@@ -275,6 +309,8 @@ impl ChainToSwitch {
         {
             return None;
         }
+        // 最后一条链的 false 目标就是 default：它要连同边参数复制到树的每个
+        // 叶子 / 空子树位置。
         let last = links.last().unwrap();
         let (default, default_args) = (last.next, last.next_args.clone());
         Some((x.unwrap(), links, default, default_args))
@@ -295,7 +331,11 @@ impl ChainToSwitch {
         hi: usize,
         into_block: BasicBlock,
     ) -> BasicBlock {
+        // 递归建树：区间 [lo, hi) 内以中位数切分。内部节点 = check + split
+        // 一对块，叶子只留 check、false 边直连 default。返回子树入口块。
         if hi - lo == 1 {
+            // 叶子：只剩一个 case，无需 split——`x == k` 命中即进 handler，
+            // 否则落 default。顶层叶子原地复用链头（into_block）。
             let link = &links[lo];
             let check = if lo == 0 && hi == links.len() {
                 into_block
@@ -320,6 +360,8 @@ impl ChainToSwitch {
             return check;
         }
 
+        // 中位数切分：左 [lo, mid)、根 mid、右 (mid, hi)；哪一侧为空就直接
+        // 用 default 兜底（该方向上没有 case 可命中）。
         let mid = lo + (hi - lo) / 2;
         let key = links[mid].k;
         let (left_target, left_args) = if lo < mid {
@@ -357,6 +399,8 @@ impl ChainToSwitch {
             (default, default_args.clone())
         };
 
+        // into_block（链头）只在顶层生效：递归调用也原样传入它，但 lo/hi
+        // 已不是全区间，条件不成立，子树照常新建块。
         let check = if lo == 0 && hi == links.len() {
             into_block
         } else {
@@ -370,6 +414,9 @@ impl ChainToSwitch {
         let eq = data.new_local_inst().binary(BinaryOp::Eq, x, key_inst);
         data.layout_mut().insert_inst(check, eq);
 
+        // 内部节点两段式：check 先测 `x == key`（命中即进 handler），未命中
+        // 落到 split 再测 `x < key` 分左右。这对 (eq, lt) 正是后端
+        // `chain_fusion` 融合成一次 `cmp; beq; blo` 的目标形态。
         let split = {
             let bb = data
                 .new_basic_block()

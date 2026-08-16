@@ -57,8 +57,14 @@ pub struct BooleanSimplification;
 
 impl Pass for BooleanSimplification {
     fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
+        // 固定点循环：只要某一轮扫描化简了任何指令就再来一轮。规则②③④会"剥掉"
+        // 一层比较包装，可能暴露出新的化简机会（如 select(c,1,0)→c 之后，c 若是
+        // (a<b)!=0，下一轮再由规则②剥掉），所以必须跑到不再变化为止。
         let mut changed = false;
         loop {
+            // 每轮先收集全部指令的快照再遍历：simplify_inst 会改写/删除指令，
+            // 在快照上迭代既避免借用冲突，也避免处理已被删除的指令；
+            // 本轮新产生的指令会在下一轮的快照里被看到。
             let insts = data
                 .layout()
                 .basicblocks()
@@ -68,6 +74,9 @@ impl Pass for BooleanSimplification {
             if !insts.into_iter().any(|inst| self.simplify_inst(data, inst)) {
                 return changed;
             }
+            // 终止性：每个规则要么删除一条指令（replace_value），要么把条件上的
+            // "与 0/1 比较"包装剥掉一层（比较嵌套深度严格下降），不会来回震荡。
+            // changed 记录整个 pass 是否改过任何东西，供上层判断是否值得继续后续 pass。
             changed = true;
         }
     }
@@ -75,6 +84,9 @@ impl Pass for BooleanSimplification {
 
 impl BooleanSimplification {
     fn simplify_inst(&self, data: &mut ArenaContextMut<'_>, inst: Inst) -> bool {
+        // 按指令种类分发：只有 Binary / Branch / Select 可能携带"布尔测试"形态，
+        // 其余指令（调用、load、store 等）一律不处理。kind() 返回借用，这里 clone
+        // 出所有权，才能把 binary/branch/select 传进需要 &mut data 的改写函数。
         match data.inst_data(inst).kind().clone() {
             InstKind::Binary(binary) => self.simplify_binary(data, inst, binary),
             InstKind::Branch(branch) => self.simplify_branch(data, inst, branch),
@@ -84,10 +96,14 @@ impl BooleanSimplification {
     }
 
     fn simplify_binary(&self, data: &mut ArenaContextMut<'_>, inst: Inst, binary: Binary) -> bool {
+        // 规则①：同一操作数自比较。只对 i32 做——i32 无 NaN，x==x / x>=x 恒真、
+        // x!=x 恒假；浮点下 x==x 遇 NaN 为假、x>=x 亦为假，故必须保守放弃。
         if binary.op().is_compare()
             && data.inst_data(binary.lhs()).ty().is_i32()
             && binary.lhs() == binary.rhs()
         {
+            // 相等类比较（Eq/Ge/Le）恒为 1，不等类（NotEq/Gt/Lt）恒为 0。
+            // is_compare() 已把分支限定在这 6 个操作符上，unreachable!() 只是兜底。
             let value = match binary.op() {
                 BinaryOp::Eq | BinaryOp::Ge | BinaryOp::Le => 1,
                 BinaryOp::NotEq | BinaryOp::Gt | BinaryOp::Lt => 0,
@@ -98,27 +114,37 @@ impl BooleanSimplification {
             return true;
         }
 
+        // 规则②：剥掉比较结果的 truthiness 包装。boolean_comparison 识别
+        // `value == 0/1` / `value != 0/1`（常数在左或在右均可），返回 (value, 常数)。
         let Some((value, expected)) = self.boolean_comparison(data, &binary) else {
             return false;
         };
+        // 安全闸门：value 必须是规范布尔（常量 0/1、比较结果、或两臂皆规范布尔的
+        // select）。否则 value 可能是任意真值（如 2），直接替换会改变程序语义。
         if !self.is_canonical_bool(data, value, &mut HashSet::default()) {
             return false;
         }
 
         match (binary.op(), expected) {
+            // value != 0 或 value == 1：等价于"value 为真"，直接剥掉包装用 value 本身。
             (BinaryOp::NotEq, 0) | (BinaryOp::Eq, 1) => {
                 self.replace_value(data, inst, value);
             }
+            // value == 0 或 value != 1：相当于对 value 取反。value 必须是 i32 比较
+            // 指令才能用补比较就地改写；浮点比较取补在 NaN 上不等价（a==b 与 a!=b
+            // 对 NaN 都为 0），所以先查操作数类型，再试 complement_integer_compare。
             (BinaryOp::Eq, 0) | (BinaryOp::NotEq, 1) => {
                 let InstKind::Binary(inner) = data.inst_data(value).kind().clone() else {
                     return false;
                 };
+                // 比较指令两操作数类型相同（builder 强制），查 lhs 一个即可。
                 if !inner.op().is_compare() || !data.inst_data(inner.lhs()).ty().is_i32() {
                     return false;
                 }
                 let Some(op) = inner.op().complement_integer_compare() else {
                     return false;
                 };
+                // 就地改写：(a<b)==0 → a>=b，消除布尔包装且不新增指令。
                 data.replace_inst_with(inst)
                     .binary(op, inner.lhs(), inner.rhs());
             }
@@ -128,13 +154,18 @@ impl BooleanSimplification {
     }
 
     fn simplify_branch(&self, data: &mut ArenaContextMut<'_>, inst: Inst, branch: Branch) -> bool {
+        // 规则③：剥掉条件上的零测试。注意这里只要求 value 是 i32、不要求规范布尔——
+        // branch 的语义就是"非零即真"：value != 0 为真 ⇔ value 非零，对任意 i32 恒成立。
         let Some((value, expected)) = self.zero_comparison(data, branch.cond()) else {
             return false;
         };
+        // 只处理标量 i32 条件；向量掩码分支不在此 pass 的职责内。
         if !data.inst_data(value).ty().is_i32() {
             return false;
         }
         if expected {
+            // cond 是 value == 0：value==0 时走原真目标，等价于交换两臂后以 value
+            // 本身做条件（branch(value, F, T)）。
             data.replace_inst_with(inst).branch(
                 value,
                 branch.f_target(),
@@ -143,6 +174,7 @@ impl BooleanSimplification {
                 branch.t_args().to_vec(),
             );
         } else {
+            // cond 是 value != 0：两臂原样保留，仅把条件换成 value。
             data.replace_inst_with(inst).branch(
                 value,
                 branch.t_target(),
@@ -155,21 +187,32 @@ impl BooleanSimplification {
     }
 
     fn simplify_select(&self, data: &mut ArenaContextMut<'_>, inst: Inst, select: Select) -> bool {
+        // 规则④，按"代价从低到高"依次尝试：先做纯语法检查，最后才递归
+        // is_canonical_bool；任何一个分支成功改写就立即返回。
+        // 两臂相同：条件无关，select 退化为该臂。对任意类型、任意条件恒成立。
         if select.if_true() == select.if_false() {
             self.replace_value(data, inst, select.if_true());
             return true;
         }
+        // select(c, c, 0) → c：条件为真得 c、为假得 0 也等于 c，两路都收敛到 c。
+        // 该模式对任意 i32 c 成立（无需 c 是规范布尔），是最便宜的改写。
         if select.if_true() == select.cond() && self.is_zero(data, select.if_false()) {
             self.replace_value(data, inst, select.cond());
             return true;
         }
 
+        // 条件本身是零测试 `value == 0` / `value != 0`：剥掉一层并相应交换两臂。
+        // select(value==0, a, b) = value 非零 ? b : a = select(value, b, a)。
+        // 与规则③同理，"非零即真"下对任意 i32 value 恒等价，无需规范布尔。
         if let Some((value, is_eq)) = self.zero_comparison(data, select.cond()) {
+            // 只处理标量 i32；向量掩码条件不在此 pass 范围内。
             if data.inst_data(value).ty().is_i32() {
                 if is_eq {
+                    // value == 0 为真 ⇔ value 非零：交换两臂，value 非零时取原 if_false 臂。
                     data.replace_inst_with(inst)
                         .select(value, select.if_false(), select.if_true());
                 } else {
+                    // value != 0：两臂不变，仅把条件换成 value。
                     data.replace_inst_with(inst)
                         .select(value, select.if_true(), select.if_false());
                 }
@@ -177,16 +220,22 @@ impl BooleanSimplification {
             }
         }
 
+        // 兜底路径——"规范布尔投影"：select(c, 1, 0) → c、select(c, 0, 1) → c == 0。
+        // 结果要么替换成 c、要么替换成 c==0，都要求 c 是规范布尔：若 c 是任意真值
+        // （如 2），select(c,1,0) 得 1 ≠ 2，直接替换会破坏语义。
+        // 结果类型闸门：只有 i32 结果才做投影（c 与 c==0 都是 i32）。
         if !data.inst_data(inst).ty().is_i32()
             || !self.is_canonical_bool(data, select.cond(), &mut HashSet::default())
         {
             return false;
         }
         if self.is_one(data, select.if_true()) && self.is_zero(data, select.if_false()) {
+            // select(c, 1, 0)：条件为真得 1、为假得 0，恰是 c 的规范值本身。
             self.replace_value(data, inst, select.cond());
             return true;
         }
         if self.is_zero(data, select.if_true()) && self.is_one(data, select.if_false()) {
+            // select(c, 0, 1) = (c == 0)：把"取反的布尔值"编译成一次 i32 比较。
             let zero = data.new_local_inst().integer(0);
             data.replace_inst_with(inst)
                 .binary(BinaryOp::Eq, select.cond(), zero);
@@ -200,11 +249,13 @@ impl BooleanSimplification {
         let InstKind::Binary(binary) = data.inst_data(inst).kind() else {
             return None;
         };
+        // 只认 Eq / NotEq 两种"零测试"形态；Gt/Lt 等比较不是 truthiness 测试。
         let is_eq = match binary.op() {
             BinaryOp::Eq => true,
             BinaryOp::NotEq => false,
             _ => return None,
         };
+        // 常数 0 可能在左也可能在右（0 == x 与 x == 0 等价），两种情况都识别。
         if self.is_zero(data, binary.lhs()) {
             Some((binary.rhs(), is_eq))
         } else if self.is_zero(data, binary.rhs()) {
@@ -221,9 +272,11 @@ impl BooleanSimplification {
         data: &ArenaContextMut<'_>,
         binary: &Binary,
     ) -> Option<(Inst, i32)> {
+        // 只识别"与 0/1 比较"的 Eq/NotEq；与 2、-1 等常数比较不是布尔测试形态。
         if !matches!(binary.op(), BinaryOp::Eq | BinaryOp::NotEq) {
             return None;
         }
+        // 常数在左或在右都识别（1 == x 与 x == 1 等价），返回另一侧操作数。
         if let Some(value) = self.integer_constant(data, binary.lhs()) {
             if matches!(value, 0 | 1) {
                 return Some((binary.rhs(), value));
@@ -243,6 +296,12 @@ impl BooleanSimplification {
         value: Inst,
         visiting: &mut HashSet<Inst>,
     ) -> bool {
+        // 递归判定 value 是否保证取值 0/1（规范布尔）：常量 0/1、比较指令的结果
+        // （比较产生规范 0/1）、或两臂都是规范布尔的 select。只有通过此检查，
+        // 调用方才敢把 value 当作布尔值直接替换。
+        // visiting 是"当前路径"集合而非全局已访问集合：同一值可能从不同路径被多次
+        // 检查，所以查完必须 remove 归还；SSA 下 def-use 天然无环，防环只是防御性
+        // 措施（防止未来 IR 改动引入环导致无限递归）。
         if !visiting.insert(value) {
             return false;
         }
@@ -271,7 +330,10 @@ impl BooleanSimplification {
     }
 
     fn replace_value(&self, data: &mut ArenaContextMut<'_>, inst: Inst, replacement: Inst) {
+        // 把 inst 的全部使用点改写为 replacement，之后 inst 不再被任何人使用。
         utils::visit_and_replace(data, inst, replacement);
+        // 不变量：改写后 inst 必须已无使用者，才能安全地从布局中删除；
+        // 断言把"漏改某处使用点"的 bug 提前暴露在开发期。
         assert!(data.inst_data(inst).used_by().is_empty());
         let bb = data.layout().parent_bb(inst).unwrap();
         data.remove_layout_inst(bb, inst);
@@ -301,6 +363,7 @@ mod tests {
 
     #[test]
     fn removes_compare_truthiness_wrapper() {
+        // 规则②：(a<b)!=0 剥成 a<b，返回值指令直接变成内层比较。
         let mut program = Program::new();
         let function =
             program.new_function(Type::get_i32(), "truthy".into(), vec![Type::get_i32()]);
@@ -321,6 +384,7 @@ mod tests {
 
     #[test]
     fn complements_integer_compare_against_zero() {
+        // 规则② 的取补路径：(a<b)==0 就地改写为 a>=b。
         let mut program = Program::new();
         let function =
             program.new_function(Type::get_i32(), "inverse".into(), vec![Type::get_i32()]);
@@ -347,6 +411,7 @@ mod tests {
 
     #[test]
     fn retains_float_relational_complement() {
+        // 规则② 的保守路径：浮点比较不取补——NaN 下 a==b 与 a!=b 都为 0，取补不等价。
         let mut program = Program::new();
         let function = program.new_function(Type::get_i32(), "float".into(), vec![Type::get_f32()]);
         let data = program.func_data_mut(function);
@@ -374,6 +439,7 @@ mod tests {
 
     #[test]
     fn strips_branch_truthiness_and_swaps_zero_test_edges() {
+        // 规则③：br(x==0) 剥掉零测试并交换两臂。
         let mut program = Program::new();
         let function =
             program.new_function(Type::get_unit(), "branch".into(), vec![Type::get_i32()]);
@@ -405,6 +471,8 @@ mod tests {
 
     #[test]
     fn simplifies_select_truthiness_without_substituting_arbitrary_truthy_value() {
+        // 规则④ 的闸门：select(x!=0, 1, 0) 只把条件剥成 x，但不把整个 select
+        // 替换成 x——x 不是规范布尔，任意真值（如 2）会破坏 0/1 结果。
         let mut program = Program::new();
         let function =
             program.new_function(Type::get_i32(), "select".into(), vec![Type::get_i32()]);
@@ -431,6 +499,7 @@ mod tests {
 
     #[test]
     fn swaps_select_arms_for_zero_test() {
+        // 规则④ 的零测试换臂：select(x==0, a, b) → select(x, b, a)。
         let mut program = Program::new();
         let function =
             program.new_function(Type::get_i32(), "select_zero".into(), vec![Type::get_i32()]);

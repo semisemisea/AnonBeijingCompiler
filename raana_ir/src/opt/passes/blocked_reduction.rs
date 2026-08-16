@@ -217,6 +217,19 @@ impl BlockedReduction {
         _loop_analysis: &LoopAnalysis,
         looop: &Loop,
     ) -> Option<Candidate> {
+        // 形态识别（M67）：目标是被 rotate_loops/PSR 预处理过的"倒数式
+        // countdown 归约环"——test-at-bottom、ctr 递减、acc 累加
+        // row*col 乘积。识别分 8 步 (a)-(h)，全部命中才改写（宁漏勿错）：
+        //   (a) 两块循环：header + 唯一 body（latch）；
+        //   (b) header 直落 body，body 以 countdown 计数器分支回退/退出；
+        //   (c) header 参数按回边实参分类：k(+1) / acc(-mul) / ctr(-1) /
+        //       ptr(GEP) / 纯 pass-through；
+        //   (d) 分支条件 = ctr 的更新；
+        //   (e) acc 更新是 acc - mul(row_load(k), col_load(ptr))；
+        //   (f) 列指针步长是编译期常量；
+        //   (g) body 无 store/call；
+        //   (g2) 退出实参必须可重建（pass-through / k_back / acc_back）；
+        //   (h) trip bound 是 ctr 初值且支配循环入口（守卫可读）。
         // (a) A two-block loop: header plus a single pure body block (latch).
         if looop.body().len() != 2 || looop.latches().len() != 1 {
             return None;
@@ -400,6 +413,8 @@ impl BlockedReduction {
 
         // (h) The trip bound is `ctr`'s initializer and must dominate the loop
         // entry so the versioning guard in the preheader can read it.
+        // 守卫必须在 preheader 里读 bound 做版本化（bound>=4 才进主循环），
+        // 所以 bound 必须支配循环入口；否则（如 bound 是循环内算的）保守拒绝。
         let bound = init_arg(data, cfg, looop, header, ctr_param)?;
         if !dominates_loop_entry(data, dom_tree, looop, bound) {
             return None;
@@ -462,6 +477,9 @@ impl BlockedReduction {
         let ptr_in = orig_args[ptr_idx];
 
         let pt_count = cand.passthroughs.len();
+        // 主循环参数布局：4 路 acc + k_m + ctr_m + 4 路列指针 + pass-through。
+        // 用 4 路累加器打破 acc -= row*col 的串行依赖链（每轮 4 个乘积可
+        // 并行），这是 M67 收益的核心（h-5-01 -37%）。
         let main_arg_count = UNROLL_FACTOR * 2 + 2 + pt_count;
         let main_types = main_block_types(data, cand);
         let version = data
@@ -489,6 +507,10 @@ impl BlockedReduction {
         let pt_start = UNROLL_FACTOR * 2 + 2;
 
         // ---- versioning block: guard bound >= 4 ----
+        // 版本化：bound >= 4 走 4 路主循环，否则（bound < 4）原样进原循环
+        // 头。主循环的 ctr 从 bound & ~3 起步（4 的倍数），列指针按 stride
+        // 错开 4 路（lane 0 用原始 ptr_in，其余加 lane*stride 偏移），
+        // 保证 4 路各自读不同的列。
         let zero = data.new_local_value().integer(0);
         let four = data.new_local_value().integer(4);
         let neg_four = data.new_local_value().integer(-4);
@@ -618,6 +640,11 @@ impl BlockedReduction {
         // jump straight to the original exit (the original loop is test-at-
         // bottom, so re-entering the header with a zero counter would run one
         // extra iteration). ----
+        // 主循环出口：把 4 路 acc 相加（两两相加成树形）再加上 acc_in 得
+        // 最终值。余数 ctr_final = bound & 3：非零则余数分支重新进入原
+        // header（跑完剩余 1-3 轮）；为零则直接跳原 exit——原循环是
+        // test-at-bottom（do-while），ctr 归零再进 header 会多跑一轮。
+        // 这是 M67 修复过的 off-by-one 正确性要点。
         let s01 = data.new_local_value().binary(
             BinaryOp::Add,
             exit_params[acc_start],

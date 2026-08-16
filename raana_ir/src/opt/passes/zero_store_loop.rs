@@ -106,6 +106,9 @@ pub struct ZeroStoreLoop;
 
 impl Pass for ZeroStoreLoop {
     fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
+        // 入口：把除 entry 外的每个基本块都当作候选循环头跑一次识别。
+        // 先快照全部块再遍历 —— 折叠成功后 header/body 会从 layout 中消失，
+        // 边遍历边改会破坏迭代。
         if data.layout().entry_bb().is_none() {
             return false;
         }
@@ -118,9 +121,11 @@ impl Pass for ZeroStoreLoop {
         let entry = data.layout().entry_bb().unwrap().bb();
         let mut changed = false;
         for header in headers {
+            // entry 是函数入口、没有前驱，不可能成为被折叠循环的 header，跳过。
             if header == entry {
                 continue;
             }
+            // 任一候选折叠成功即置位，通知外层 fixpoint 继续迭代直到不动点。
             if Self::convert_zero_loop(data, header) {
                 changed = true;
             }
@@ -131,11 +136,16 @@ impl Pass for ZeroStoreLoop {
 
 impl ZeroStoreLoop {
     fn convert_zero_loop(data: &mut ArenaContextMut<'_>, header: BasicBlock) -> bool {
+        // 识别 + 改写一体：`header` 是候选循环头，任一形态检查不通过就返回
+        // false（放弃，IR 保持不变）。
+        //
         // Rotated countdown header: `jump body`.
         let terminator = data.layout().basicblock(header).terminator();
         let InstKind::Jump(jump) = data.inst_data(terminator).kind() else {
             return false;
         };
+        // 旋转后的 countdown 形态：header 以无参数 `jump body` 收尾，循环变量
+        // （IV `j`、计数 `t`）以 block 参数挂在 header 上，每轮由回边重新传入。
         if !jump.args().is_empty() {
             return false;
         }
@@ -143,6 +153,10 @@ impl ZeroStoreLoop {
 
         // Latch: `br (t - 1), header(args), exit`, false edge to a param-less
         // exit that reads no header parameter.
+        //
+        // latch 形态检查：真边回 header 进入下一轮迭代，假边（t 递减到 0）
+        // 落向 exit；exit 侧不能带参数，exit 自身也不能有参数 —— 折叠后这些
+        // 参数会随循环一起消失，若 exit 仍引用它们值流会悬空。
         let body_terminator = data.layout().basicblock(body).terminator();
         let InstKind::Branch(latch) = data.inst_data(body_terminator).kind() else {
             return false;
@@ -165,10 +179,14 @@ impl ZeroStoreLoop {
         {
             return false;
         }
+        // 递减对象 `t`（`t - 1` 的 lhs）必须是 header 参数：每轮减常量 1，
+        // 循环恰好在 t0 轮后终止，t0 就是 trip count。记下 `t_pos`，稍后从
+        // entry 边实参取出初值 t0 来计算 MemZero 长度。
         let params = data.bb_data(header).params().to_vec();
         let Some(t_pos) = params.iter().position(|&p| p == countdown.lhs()) else {
             return false;
         };
+        // exit 不得读任何 header 参数：改写后 header/body 连同参数一起被删除。
         if data.layout().basicblock(exit).insts().iter().any(|&inst| {
             data.inst_data(inst)
                 .inst_usage()
@@ -180,6 +198,11 @@ impl ZeroStoreLoop {
         // The body must hold exactly one store of a constant zero into a
         // contiguous GEP range indexed by a header parameter as its last
         // offset, plus the IV/countdown updates.
+        //
+        // 体内容检查（核心形态）：body 必须恰好含**一条**“写常量 0”的 store，
+        // 目标 GEP 的最后一个偏移是 header 参数（IV `j`）。相邻两轮迭代的写
+        // 地址只差一个元素大小、整段连续，才能等价为一次 MemZero。IV 递增、
+        // 计数递减、GEP 计算等其余指令不碰内存，放行。
         let body_insts: Vec<Inst> = data
             .layout()
             .basicblock(body)
@@ -191,6 +214,9 @@ impl ZeroStoreLoop {
         for &inst in &body_insts {
             match data.inst_data(inst).kind() {
                 InstKind::Store(store) => {
+                    // store 源必须是常量 0（`Integer(0)` 或 `ZeroInit`）。源不是
+                    // 0、或 body 里已出现过另一条 store（无论值是否为零）都放弃
+                    // —— “写 0”必须是 body 唯一的写内存操作。
                     let is_zero =
                         matches!(
                             data.inst_data(store.src()).kind(),
@@ -206,11 +232,15 @@ impl ZeroStoreLoop {
                     else {
                         return false;
                     };
+                    // 最后一个偏移必须是 header 参数（IV `j`）；`last_pos` 记为
+                    // IV 在 offsets 中的下标，稍后用它在 offsets 里切出前导行偏移。
                     if !params.contains(&last_offset) {
                         return false;
                     }
                     zero_store = Some((store.dest(), gep.base(), last_pos));
                 }
+                // body 出现其它副作用（调用、读内存、已有 MemZero）一律放弃：
+                // 折叠后这些指令会随 body 一起被删除，不能有任何语义丢失。
                 InstKind::Call(..)
                 | InstKind::TailCall(..)
                 | InstKind::Load(..)
@@ -219,12 +249,16 @@ impl ZeroStoreLoop {
                 _ => {}
             }
         }
+        // 扫完整个 body 仍未找到零 store（例如 body 为空），放弃。
         let Some((store_gep, base, j_offset_pos)) = zero_store else {
             return false;
         };
         let InstKind::GetElemPtr(store_gep_data) = data.inst_data(store_gep).kind() else {
             unreachable!()
         };
+        // 取出 IV `j` 并定位它在 header 参数表中的位置 `j_pos`。`j` 与计数 `t`
+        // 必须是**不同**的参数：若是同一个，地址随计数递减反向移动，写出的
+        // 不是一段连续正向区间，无法等价为一次 MemZero。
         let j = store_gep_data.offsets()[j_offset_pos];
         let Some(j_pos) = params.iter().position(|&p| p == j) else {
             return false;
@@ -232,6 +266,9 @@ impl ZeroStoreLoop {
         if j_pos == t_pos {
             return false;
         }
+        // `row_offsets` 是 GEP 中排在 IV 之前的“行偏移”（如二维数组
+        // `gep(base, row, j)` 里的 row），整轮循环恒定不变。它们和 `base` 必须
+        // 都能在循环前求值：改写后行首地址要在 entry 里提前算好。
         let row_offsets = store_gep_data
             .offsets()
             .iter()
@@ -247,6 +284,11 @@ impl ZeroStoreLoop {
         }
 
         // The single entry edge: a jump into the header from a pre-loop block.
+        //
+        // header 的入边应恰好两条：latch 回边 + 一条 entry jump。entry jump
+        // 的实参个数必须与 header 参数个数一致（按位提供 j0、t0 初值）。出现
+        // 第二条 entry 边说明循环头有多个调用点/多组初值，无法确定唯一的 t0，
+        // 放弃。
         let preds: Vec<Inst> = data.bb_data(header).used_by().iter().copied().collect();
         let mut entry_edge = None;
         for &pred in &preds {
@@ -268,6 +310,9 @@ impl ZeroStoreLoop {
             return false;
         };
 
+        // 元素大小 = store 目标指针 deref 后的类型大小（每轮迭代恰好写一个
+        // 元素）。`elem_size == 0` 时 `t0 * 0` 恒为 0 字节，memset 无意义，
+        // 拒绝；`MemZero` 长度是 i32 量（`MemZeroLen::Value`），超界也拒绝。
         let elem_ty = data.inst_data(store_gep).ty().derefernce();
         let elem_size = elem_ty.size();
         if elem_size == 0 || elem_size > i32::MAX as usize {
@@ -276,11 +321,20 @@ impl ZeroStoreLoop {
         let elem_size = elem_size as i32;
 
         // Replace the loop with a runtime-length MemZero in the entry block.
+        //
+        // 改写开始：全部新指令插到 entry 终结符之前。旋转已把 guard `t0 > 0`
+        // 放进 pre-header，折叠代码只会在 guard 真路径上执行，trip = 0 时
+        // “循环体零次执行”的语义不变。`byte_len = t0 * elem_size`：`t0` 取自
+        // entry 边实参、是运行时值，所以 MemZero 是运行时长度
+        // （`MemZeroLen::Value`），而非常量长度。
         let entry_block = data.layout().parent_bb(entry_edge_inst).unwrap();
         let size = data.new_local_value().integer(elem_size);
         let byte_len = data
             .new_local_value()
             .binary(BinaryOp::Mul, entry_args[t_pos], size);
+        // 行首地址：flat 数组（store GEP 只有 IV 一个偏移）时 `base` 本身就是
+        // 元素指针，直接复用、不新建 GEP（少一条指令）；否则用前导行偏移现算
+        // 一个 GEP。
         let (row_start, row_start_is_new) = if row_offsets.is_empty() {
             (base, false)
         } else {
@@ -288,6 +342,7 @@ impl ZeroStoreLoop {
             (gep, true)
         };
         let clear = data.new_local_value().mem_zero_dynamic(row_start, byte_len);
+        // 按数据依赖顺序插入：byte_len → row_start（如需）→ MemZero。
         data.layout_mut()
             .insert_before_terminator(entry_block, byte_len);
         if row_start_is_new {
@@ -296,6 +351,9 @@ impl ZeroStoreLoop {
         }
         data.layout_mut()
             .insert_before_terminator(entry_block, clear);
+        // 最后把 entry 的 jump 目标从 header 改写为 exit：header/body 自此
+        // 不可达，成为死代码，由后续 fixpoint 轮里的 `simplify_cfg` / `dce`
+        // 清理（本 pass 不自己做 CFG 清理）。
         data.replace_inst_with(entry_edge_inst).jump(exit, vec![]);
 
         true
@@ -303,6 +361,12 @@ impl ZeroStoreLoop {
 
     /// A value is available before the loop when it is a constant/global, a
     /// function parameter, or is defined in a block outside the loop body.
+    //
+    // 循环前可用性检查：MemZero 的行首地址必须在 entry 里可求值。
+    // - 常量 / 全局 / 函数参数天然可用；
+    // - header 参数（`params`）与 body 内定义的指令会随循环一起消失，不可用；
+    // - 定义在其它块（如 entry 或更早的块）里的指令可用；
+    // - `parent_bb` 为 None 的值只允许是 `BlockArgRef`（对函数参数的引用）。
     fn available_before_loop(
         data: &FunctionData,
         header: BasicBlock,

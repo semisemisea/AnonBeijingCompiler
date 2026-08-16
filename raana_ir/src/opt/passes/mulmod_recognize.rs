@@ -314,6 +314,11 @@ fn is_same_inst(a: Inst, b: Inst) -> bool {
 type Modulus = i32;
 
 fn recognize(program: &Program, f: Function) -> Option<Modulus> {
+    // 识别主流程（M60）：在函数内逐指令扫描，验证它恰好是"倍增线性递归"
+    // 的标准形态（b==0 返回 0 / b==1 返回 a%P / 自调用 f(a, b/2) 后加倍取模 /
+    // 按 b 奇偶返回 (cur+a)%P 或 cur），全部吻合才返回模数 P。
+    // 任何一条指令无法解释（多余的自调用、带参数的跳转、TailCall 等）都
+    // 直接拒绝——宁漏勿错，保证改写前后语义逐输入等价。
     let data = program.func_data(f);
     if data.layout().entry_bb().is_none() || !data.ret_ty().is_i32() {
         return None;
@@ -327,6 +332,10 @@ fn recognize(program: &Program, f: Function) -> Option<Modulus> {
         return None;
     }
 
+    // 第一遍扫描：把函数里所有指令按种类归类。只有四类允许出现——
+    // 自调用（恰一个）、Return、无块参数的 Branch、无参数的 Jump、
+    // Binary 和常量/块参数引用。任何其他指令（TailCall、Store、调用其他
+    // 函数等）都说明函数不是纯倍增递归，直接拒绝。
     let mut self_call = None;
     let mut returns = Vec::new();
     let mut branches = Vec::new();
@@ -370,6 +379,8 @@ fn recognize(program: &Program, f: Function) -> Option<Modulus> {
         InstKind::Call(call) => call.args().to_vec(),
         _ => unreachable!(),
     };
+    // 自调用的实参必须是 (a, b/2)：第一个参数原样传 a（倍增递归里 a 是
+    // 乘数不变），第二个参数是 b 的某种"减半"形态（见 half_binaries）。
     if call_args.len() != 2 || !is_same_inst(call_args[0], a) {
         return None;
     }
@@ -378,6 +389,8 @@ fn recognize(program: &Program, f: Function) -> Option<Modulus> {
     let rec = self_call;
 
     // double_add = add(rec, rec);  double = rem(double_add, P).
+    // 递归结果翻倍再取模：(cur + cur) % P 是"乘 2"步，倍增算法的核心。
+    // 从已收集的 Binary 指令里精确找 add(rec, rec) 与 rem(_, P)，P 必须为正。
     let mut double_add = None;
     for &inst in &binaries {
         if let Some((BinaryOp::Add, l, r)) = binary_of(data, inst) {
@@ -414,7 +427,11 @@ fn recognize(program: &Program, f: Function) -> Option<Modulus> {
     }
     let odd_add = odd_add?;
 
-    // Classify the four returns: ret 0, ret a%P, ret double, ret (double+a)%P.
+    // 对四个返回值逐一分类（每种恰好一个，重复或形态不符即拒绝）：
+    //   ret 0            —— b==0 分支（递归基）；
+    //   ret a%P          —— b==1 分支（基例：1*a % P）；
+    //   ret double       —— b 偶数的结果 (cur+cur)%P；
+    //   ret (double+a)%P —— b 奇数的结果，在翻倍基础上再加一个 a。
     let mut ret0_inst = None;
     let mut ret1_rem = None;
     let mut ret1_inst = None;
@@ -457,7 +474,10 @@ fn recognize(program: &Program, f: Function) -> Option<Modulus> {
         (ret0_inst?, ret1_inst?, ret_even_inst?, ret_odd_inst?);
     let (ret1_rem, ret_odd_rem) = (ret1_rem?, ret_odd_rem?);
 
-    // The three branch conditions must be exactly: b/neq(b,0), eq(b,1), parity(b).
+    // 三个分支条件必须恰好是：入口 b/neq(b,0) 守卫、eq(b,1) 基例测试、
+    // 奇偶测试（b&0x80000001 == 1 或 b%2 == 1）。多一个少一个都拒绝。
+    // 每个分支必须是无块参数的（前面已检查），且条件能按这三种形态之一
+    // 解释，否则说明控制流与倍增递归形状不符。
     if branches.len() != 3 {
         return None;
     }
@@ -489,18 +509,25 @@ fn recognize(program: &Program, f: Function) -> Option<Modulus> {
     let (entry_branch, eq1, parity_branch) = (entry_branch?, eq1?, parity_branch?);
     let (parity_use, parity_eq) = parity_branch;
 
-    // Every use of the key SSA values must be explained by the shape above.
+    // 关键 SSA 值的每个使用点都必须被上述形状解释——这是"宁漏勿错"的
+    // 核心防线：若 rec/double/a/b 还有形状之外的消费者（比如被别的分支
+    // 使用、被多余指令引用），函数就不只是倍增递归，拒绝改写。
+    // 对 rec：唯一消费者是 double_add 的加数。
     if !uses_are_exactly(data, rec, &[double_add]) {
         return None;
     }
+    // 对 double：被偶数返回与奇数路径的 odd_add 使用。
     let double_users = [ret_even_inst, odd_add];
     if !uses_are_exactly(data, double, &double_users) {
         return None;
     }
+    // 对 a：被自调用、基例 rem(a,P)、odd_add 使用。
     let a_users = [self_call, ret1_rem, odd_add];
     if !uses_are_exactly(data, a, &a_users) {
         return None;
     }
+    // 对 b：被减半链、入口守卫、eq1、奇偶测试使用（数量随形态变化，
+    // 用收集到的列表精确比对）。
     let mut b_users = half_b_users;
     if let Some(neq0) = entry_b_use_inst {
         b_users.push(neq0);
@@ -513,7 +540,9 @@ fn recognize(program: &Program, f: Function) -> Option<Modulus> {
         return None;
     }
 
-    // Every binary instruction must belong to the shape.
+    // 最后防线：所有 Binary 指令都必须属于形状（减半链、翻倍、奇偶、
+    // 基例 rem、eq/neq 条件）。任何一条"解释不了"的 Binary 都说明函数
+    // 里还有形状之外的计算，整体拒绝。
     let mut explained = HashSet::default();
     for inst in half_bins {
         explained.insert(inst);
@@ -549,6 +578,11 @@ fn rewrite(program: &mut Program, f: Function, helper: Function, modulus: i32) {
     let data = program.func_data_mut(f);
     let entry = data.layout().entry_bb().unwrap().bb();
 
+    // 改写流程：清空整个函数体（保留 entry 的块参数 = 函数的 a/b），
+    // 换成 `if (b < 0) return 0; else return soyo_mulmod(a, b, P);`。
+    // 之所以要 guard b<0：soyo_mulmod 的语义是 (i64)a*b % P（截断余数），
+    // 而原递归对 b<0 恒返回 0（减半链终止于 -1/0，奇偶测试永不成立），
+    // 两者在 b<0 时不等价，必须显式 guard 住。
     // Detach the entry's instructions first (their branches point at the
     // blocks about to be removed), then drop every other block. The entry's
     // block parameters (the function's `a`, `b`) are kept.
@@ -590,6 +624,13 @@ fn rewrite(program: &mut Program, f: Function, helper: Function, modulus: i32) {
     let branch = data
         .new_local_inst()
         .branch(cond, then_zero, vec![], then_fast, vec![]);
+    // M60/Inline 交互 bug 的教训（有专门回归测试 guard_condition_lives_in_
+    // the_entry_layout）：guard 的 cond（一个 Binary）必须插入 entry 块的
+    // layout 里，不能成为孤儿值——基于块 layout 建 worklist 的 pass
+    // （IPSCCP）只会访问躺在块内的值；孤儿的分支条件永远"未被访问"，
+    // IPSCCP 就不会跟进任一个后继，静默丢掉调用方循环的循环体与回边
+    // （死循环 miscompile）。zero 常量是内联操作数（Integer 从不进
+    // layout），无需插入。
     // The guard's `cond` (a Binary) must live in the entry's layout, not as an
     // orphan value: passes that build a worklist from the block layout (IPSCCP)
     // only visit values that sit inside a block, and an orphaned branch

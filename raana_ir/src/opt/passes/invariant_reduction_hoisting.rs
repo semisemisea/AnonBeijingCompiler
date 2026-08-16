@@ -178,6 +178,18 @@ struct OuterCandidate {
 
 impl InvariantReductionHoisting {
     fn find_outer(data: &ArenaContextMut<'_>, looop: &Loop) -> Option<OuterCandidate> {
+        // 识别（M48）：外层 trip 循环包着一个"循环不变归约巢"——巢对 trip
+        // 计数器 r 不变、纯（无副作用）、累加器在巢内只做加法。识别分 7 步：
+        //   (1) header 分支：真进巢、假出循环；
+        //   (2) exit 测试用 header 参数 r 对 bound（r < bound / r > bound 形态，
+        //       结构性识别，不走 BIV——r 经嵌套 header 穿线后 BIV 看不见）；
+        //   (3) 唯一 latch，巢非平凡（≥2 块）；
+        //   (4) 巢纯 + 只引用 header/巢内块，r 不被任何计算使用（trace_invariant）；
+        //   (5) latch 以 jump 回 header；
+        //   (6) 恰一个"加性累加"的 header 参数 acc（trace_accumulator）；
+        //   (7) 巢不引用 header 局部计算值（只有参数，克隆可替换）。
+        // 改写的核心洞见：巢对 r 不变 → 整巢 R 次执行 = 跑一次乘 R——
+        // 克隆巢一次算出 D_total = acc 的增量，循环体降级为 acc += D_total。
         let header = looop.header();
         let params = data.bb_data(header).params().to_vec();
 
@@ -340,6 +352,13 @@ impl InvariantReductionHoisting {
         looop: &Loop,
         cand: &OuterCandidate,
     ) -> bool {
+        // 改写（M48）：克隆整巢跑一次算 D_total，原循环降级为
+        // `acc += D_total; r += step` 的裸 trip 循环。
+        // 具体：preheader 重定向进克隆巢（acc 种子 0、r 种子进入值）；
+        // 巢出口把 D_total 经新 header 参数 carrier 带回降级循环；
+        // 新建 irh_latch 只接触可达值（acc + carrier、r + step）；
+        // 原 header 分支改为直接跳降级 latch（不再进巢）；
+        // 原 latch 因引用巢内值不可复用（不可达后悬空），必须新建。
         let Some(preheader) = ensure_preheader(data, cfg, looop) else {
             return false;
         };

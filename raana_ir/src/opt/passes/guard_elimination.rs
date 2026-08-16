@@ -108,51 +108,78 @@ pub struct GuardElimination;
 
 impl Pass for GuardElimination {
     fn run(&mut self, program: &mut Program) -> bool {
+        // 程序级摘要每个 run 只算一遍、跨函数共享（实现见 `return_summary.rs`）：
+        // 先求"非负保持函数"集合（co-inductive fixpoint），
         let nonneg = nonneg_preserving_functions(program);
+        // 再求"每个调用点实参都可证 >= 0"的入口参数（greatest fixpoint）。
+        // 两者都是条件式摘要：某调用点喂入输入派生值（如数组元素 load）时证明
+        // 不了非负，就保守地不纳入——这是本 pass 的保守边界。
         let params = always_nonneg_params(program, &nonneg);
 
         let mut changed = false;
+        // 先把函数列表快照出来：后面要对 `program` 取 &mut 改写终结符，
+        // 不能继续持有对 `function_layout` 的借用。
         let funcs: Vec<Function> = program.function_layout().to_vec();
         for &f in &funcs {
             let data = program.func_data(f);
+            // 声明（无函数体）里没有可折的守卫，直接跳过。
             if data.layout().is_decl() {
                 continue;
             }
+            // 本函数"每个调用点都 >= 0"的入口参数作为种子……
             let self_params = params.get(&f).cloned().unwrap_or_default();
+            // ……跑一遍函数内前向数据流，得到本函数所有可证 >= 0 的值（facts）。
+            // 这是守卫判定的唯一依据：`facts` 里没有 x ⟹ 证明不了 ⟹ 守卫保留。
             let facts = nonneg_in_function(program, f, &self_params, &nonneg);
 
+            // 第一阶段只读扫描，收集要折的守卫；改写统一放到第二阶段，
+            // 避免在持有 `facts`/`data` 只读借用时对 `program` 取 &mut。
             let mut folds: Vec<(Inst, BasicBlock, Vec<Inst>)> = Vec::new();
             for layout in data.layout().basicblocks() {
+                // 守卫是块的终结符（最后一条指令），只需检查它。
                 let terminator = *layout.insts().get_last().unwrap();
                 let InstKind::Branch(branch) = data.inst_data(terminator).kind() else {
                     continue;
                 };
                 let cond = branch.cond();
+                // 形状闸门 1：条件必须是 `x < 0`（`BinaryOp::Lt`），
+                // `x <= -1` 等语义等价但形态不同的比较一律不匹配。
                 let Some((BinaryOp::Lt, x, zero)) = binary_of(data, cond) else {
                     continue;
                 };
+                // 形状闸门 2：右操作数必须是整型常量 0。
                 if !matches!(
                     data.inst_data(zero).kind(),
                     InstKind::Integer(int) if int.value() == 0
                 ) {
                     continue;
                 }
+                // 非负性闸门（核心判定）：`x` 在 facts 里 ⟹ `x >= 0` 恒真 ⟹
+                // `x < 0` 恒假，分支必然走 false 边；记下"折成对 false 边目标
+                // 的无条件 jump、携带原 false 边 block 参数"的改写。
                 if facts.contains(&x) {
                     // `x < 0` is false: always take the false edge.
+                    // （保留英文）三元组 = (终结符, 目标块, 随边参数)。
                     folds.push((terminator, branch.f_target(), branch.f_args().to_vec()));
                 }
             }
 
+            // 第二阶段：把收集到的分支替换成 `jump B`（携带原 false 边的参数）。
+            // `replace_inst_with` 只换终结符，`x < 0` 的比较指令随即成为死代码，
+            // 由管线后续的 DCE 清理；折掉的守卫不会再生，fixpoint 重跑幂等。
             let data = program.func_data_mut(f);
             for (inst, target, args) in folds {
                 data.replace_inst_with(inst).jump(target, args);
                 changed = true;
             }
         }
+        // 返回"是否改动了 IR"，供 fixpoint 框架判断是否收敛；改过才会再跑一轮。
         changed
     }
 }
 
+/// 把指令解包成 (二元运算, 左操作数, 右操作数)；非二元指令返回 `None`。
+/// 本 pass 用它做守卫条件的形状匹配（只认 `Lt` 比较）。
 fn binary_of(data: &crate::ir::FunctionData, inst: Inst) -> Option<(BinaryOp, Inst, Inst)> {
     match data.inst_data(inst).kind() {
         InstKind::Binary(binary) => Some((binary.op(), binary.lhs(), binary.rhs())),

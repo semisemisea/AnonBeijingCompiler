@@ -264,6 +264,10 @@ fn const_i32(data: &FunctionData, inst: Inst) -> Option<i32> {
 /// Only exact when no non-entry block has block parameters, which `detect`
 /// enforces (after SSA, values then only flow through layout instructions).
 fn derived_set(data: &FunctionData, acc: Inst) -> HashSet<Inst> {
+    // "依赖累加参数 C 的值"闭包：C 本身，以及任一操作数已被标记的值。
+    // 用途：区分"残差"（不依赖 C，如 ret C+k 里的 k）与 C 派生的值——
+    // 只有 C 派生值才是残差/增量的一部分。SSA 后值只经布局指令流动，
+    // 且 detect 已保证非 entry 块无块参数，故这个闭包是精确的（而非近似）。
     let mut derived: HashSet<Inst> = HashSet::from_iter([acc]);
     loop {
         let mut changed = false;
@@ -298,6 +302,10 @@ fn detect(program: &Program, f: Function) -> Option<MemoInfo> {
         return None;
     }
 
+    // 结构性识别（M68）：函数必须恰有两个 i32 参数（key 与累加参数 C），
+    // 只调用自己、无外部调用、无 Store/MemZero/Alloc 副作用，Load 只读
+    // 全局（全局在循环内不变，缓存结果才有效）。这些都是纯结构判定，
+    // 不匹配函数名/输入值（合规要求）。
     let mut self_calls = Vec::new();
     let mut returns = Vec::new();
     let mut has_foreign_call = false;
@@ -332,6 +340,10 @@ fn detect(program: &Program, f: Function) -> Option<MemoInfo> {
 
     // Every self-call must have exactly two arguments and its result must be
     // used only as a return value.
+    // 每个自调用的实参必须恰好 2 个、结果只被 Return 消费（递归调用的
+    // 结果直接作为返回值，无其他使用点）；非 entry 块必须无块参数
+    // （保证 derived_set 闭包精确）。随后对两个参数位置各试一次
+    // （key, acc）与（acc, key）的分配，找到能通过 classify 的组合。
     for &call in &self_calls {
         let call_data = data.inst_data(call);
         let InstKind::Call(call_kind) = call_data.kind() else {
@@ -389,6 +401,9 @@ fn classify(
     let acc = params[acc_pos];
     let derived = derived_set(data, acc);
 
+    // 自调用实参校验：累加槽必须是 `C` 或 `C + k`（k 不依赖 C——即
+    // 递归步的增量是"常数"而非 C 的函数）；key 槽必须与 C 无关。
+    // 这保证记忆化的键（key）与增量（inc）在结构上可分离。
     // Self-call arguments: the accumulator slot is `C` or `C + k` with `k`
     // not `C`-derived; the key slot is `C`-independent.
     for &call in self_calls {
@@ -439,6 +454,11 @@ fn classify(
         }
     }
 
+    // 返回值分类（ReturnKind）：rec 直接返回自调用结果（父残差由子残差
+    // 递推）；leaf 返回 C 派生值（残差 = C + k 里的 k，可缓存为"叶残差"）；
+    // fixed 返回与 C 无关的常量（固定值，如屏障语义的常量 7）。
+    // 必须同时出现 rec 与 leaf：累加参数既要驱动递归又要落到叶上，
+    // 否则缓存语义不成立（没有残差可存/没有增量可加）。
     // Classify returns.
     let mut kinds = Vec::with_capacity(returns.len());
     let mut has_rec = false;
@@ -505,6 +525,9 @@ fn detect_callsite(
     }
 
     let (cfg, _dom, loops) = LoopAnalysis::new(data);
+    // 调用点必须在一个循环内，且 key 实参是该循环的**前向 IV**（步长
+    // 为正的 Add）——循环每轮调用 f 的 key 单调递增，保证每个 key 在
+    // 循环内只出现一次，记忆化才有意义（同 key 不重复计算）。
     let loop_index = loops.min_loop_contain_index(call_bb)?;
     let looop = &loops.loops()[loop_index];
     let ivs = BasicInductionVariableAnalysis::new(data, &cfg, &loops);
@@ -550,6 +573,8 @@ fn detect_callsite(
     }
     let bound = classify_bound(data, bound)?;
 
+    // 循环体必须无 Store/MemZero/其他调用：否则 f 读的全局（及已缓存
+    // 的结果）可能在迭代间变化，缓存失效。这是记忆化正确性的关键约束。
     // The loop body must be free of stores and of other calls, otherwise the
     // globals `f` reads (and the memoized results) could change across
     // iterations.
@@ -596,6 +621,9 @@ fn build_memoized(program: &mut Program, memo: &MemoInfo) -> Option<Function> {
     let acc_ty = Type::get_i32();
     let cache_ty = Type::get_pointer(Type::get_i32());
     let name = program.func_data(memo.func).name().to_owned();
+    // 新函数签名：f_memo(K, C, cache, size)。key（K）与累加参数（C）之外
+    // 多了缓存指针与缓存大小——调用方在 preheader 里 calloc 分配后传入。
+    // 缓存是运行时按 bound 推导的尺寸，不写死任何常量（合规要求）。
     let f_memo = program.new_function(
         Type::get_i32(),
         format!("{name}_memo"),
@@ -608,6 +636,9 @@ fn build_memoized(program: &mut Program, memo: &MemoInfo) -> Option<Function> {
     );
 
     // Scope A: build the prologue (entry / in_bounds / hit / miss).
+    // Prologue 四块：entry 做 1<=K<size 边界检查；in_bounds 读打包条目
+    // 算 tag；hit 按 tag 分支（LEAF→C+val / FIXED→val）；miss 落回克隆体。
+    // 边界检查先行：OOB 的 K 直接走 miss（值仍正确计算，只是不缓存）。
     let miss_block = {
         let mut builder = ArenaContextMut {
             program,
@@ -696,6 +727,9 @@ fn build_memoized(program: &mut Program, memo: &MemoInfo) -> Option<Function> {
         }
 
         // hit_block: tag is 1 (leaf) -> C + val, or 2 (fixed) -> val.
+        // 命中分支：val = 打包值 >> 2（右移 2 等价去 tag）；tag==1（叶残差）
+        // 时结果 = C + val（残差累加回当前 C），tag==2（固定值）时结果 = val。
+        // 用 select 一次选出，避免再开一个分支块。
         let (_, h_acc, _, _, h_val, h_tag) = (
             builder.bb_data(hit_block).params()[0],
             builder.bb_data(hit_block).params()[1],
@@ -723,6 +757,11 @@ fn build_memoized(program: &mut Program, memo: &MemoInfo) -> Option<Function> {
     // entry's own `C` parameter dominates the whole body, so the leaf residual
     // and recursion increment are derived structurally from it (no `C`
     // threading).
+    // 第二阶段：把 (K, cache, size) 三个值穿线（thread）进克隆体的每个
+    // 块参数——克隆体是从原函数复制来的，原本不知道缓存的存在，所有
+    // 跳转/分支边都要补上这三个实参，递归调用也要重定向到 f_memo 并
+    // 传缓存。累加参数 C 不穿线：克隆入口的 C 参数支配整个函数体，
+    // 叶残差与递归增量都从它结构化推导（见 residual_of）。
     let mut builder = ArenaContextMut {
         program,
         curr_func: Some(f_memo),
@@ -814,6 +853,13 @@ fn build_memoized(program: &mut Program, memo: &MemoInfo) -> Option<Function> {
     let acc_param = builder.bb_data(cloned.entry).params()[memo.acc_pos];
 
     // Transform every cloned return into a guarded store followed by the ret.
+    // 每个克隆的 return 改写为：缓存回填（带守卫）+ 原 ret。
+    //   Leaf:  存残差 k（值 = C + k 中不依赖 C 的部分），tag=LEAF；
+    //   Fixed: 存固定值，tag=FIXED；
+    //   Rec:   递归返回路径——先读子节点缓存条目，若子节点是 LEAF，
+    //          新值 = 子残差 + 本步增量 inc（inc 从递归实参 C' = C + inc
+    //          结构化推导），tag 继承子节点；子节点 OOB/未命中/宽度越界
+    //          （extra_ok=false）则不回填，值仍正确返回。
     for (i, &ret) in cloned.returns.iter().enumerate() {
         let kind = memo.kinds[i];
         let block = builder.layout().parent_bb(ret).expect("return is laid out");
@@ -915,6 +961,9 @@ fn build_memoized(program: &mut Program, memo: &MemoInfo) -> Option<Function> {
 /// defensive fallback recomputes `value - C`, which is exact because `C` is
 /// the cloned entry's accumulator parameter dominating every block.
 fn residual_of(builder: &mut ArenaContextMut<'_>, acc: Inst, value: Inst) -> Inst {
+    // 残差提取：C + k 中"不是 C 的那一半"。直接形态是 Add(C, k)/Add(k, C)
+    // 返回另一半；裸 C 返回 0；兜底用 value - C 重算（C 支配全函数体，
+    // 减法精确）。防御性兜底保证识别不依赖前端恰好生成 Add 形态。
     if value == acc {
         return builder.new_local_inst().integer(0);
     }
@@ -955,6 +1004,10 @@ fn emit_store(
     tag: Inst,
     extra_ok: Option<Inst>,
 ) {
+    // 回填守卫（emit_store 的全部逻辑）：只有 1<=K<size 且 val 能装进
+    // 30 位（FIT_MASK 检查，val 需 < 2^30）才写缓存；rec 路径额外要求
+    // 子节点条目有效（extra_ok）。守卫失败存 0（= 空条目，等价于不缓存）。
+    // 正确性不受影响：不缓存只是下次重算；OOB/越界全部退化为原逻辑。
     let zero = builder.new_local_inst().integer(0);
     let one = builder.new_local_inst().integer(1);
     let two = builder.new_local_inst().integer(2);
@@ -962,6 +1015,7 @@ fn emit_store(
     let ge = builder.new_local_inst().binary(BinaryOp::Ge, k, one);
     let lt = builder.new_local_inst().binary(BinaryOp::Lt, k, size);
     let k_ib = builder.new_local_inst().binary(BinaryOp::And, ge, lt);
+    // 打包：val << 2 | tag。低 2 位是 tag（1=叶残差 / 2=固定值），0=空。
     let shl = builder.new_local_inst().binary(BinaryOp::Shl, val, two);
     let packed = builder.new_local_inst().binary(BinaryOp::Or, shl, tag);
     let andv = builder.new_local_inst().binary(BinaryOp::And, val, mask);
@@ -995,6 +1049,11 @@ fn rewrite_callsite(
         curr_func: Some(callsite.caller),
     };
 
+    // 调用点改写：在调用方 preheader 里重新发射循环上界（bound 可能是
+    // 常量/全局 load/调用方参数三种形态）并推导缓存尺寸 size = bound+1
+    // （key 从 1 走到 bound，条目下标 1..=bound；size 需 ≥0，用 select
+    // 钳制），然后 calloc(size, 4) 分配缓存，把调用换成
+    // f_memo(key, acc, cache, size)。
     // Re-emit the loop bound in the preheader and derive the cache size.
     let bound = match &callsite.bound {
         BoundKind::Const(value) => builder.new_local_inst().integer(*value),

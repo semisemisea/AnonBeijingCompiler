@@ -188,6 +188,10 @@ impl ValueNumbers {
         }
     }
 
+    /// 值编号（VN）：把每个值映射到同余类的编号。整数按 (类型, 值) 编号，
+    /// Binary 表达式按操作数编号（递归求）编号，其余值按身份编号。
+    /// 同余的两个表达式得到同一编号——这是 PRE 判断"边上前导可复用"的
+    /// 基础。
     fn number(&mut self, data: &ArenaContextMut<'_>, value: Inst) -> ValueNumber {
         if let Some(&number) = self.values.get(&value) {
             return number;
@@ -210,6 +214,9 @@ impl ValueNumbers {
         number
     }
 
+    /// 规范化表达式键：把操作数编号化并做交换律排序（加/乘/与/或/异或/
+    /// 相等比较交换操作数，顺序比较换成对称形式），使 `a+b` 与 `b+a`
+    /// 同键。非 i32 或不支持的操作返回 None（保持身份编号，宁漏勿错）。
     fn expr(
         &mut self,
         data: &ArenaContextMut<'_>,
@@ -536,6 +543,16 @@ impl GVNPRE {
 
 impl Pass for GVNPRE {
     fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
+        // 主流程：一次 run_on 只消除/插入一个表达式（返回 true 让 fixpoint
+        // 重跑），保证任何分析结果都不会在 CFG 改写后被复用——CFG/支配树
+        // 是快照，改写后立即失效。
+        // 三步：① 对每个多入边块（≥2 条 incoming），把块内 Binary 表达式的
+        // 操作数沿各条入边做 phi 翻译（translated_operand），收集"请求"的
+        // 表达式集合；② 沿支配树前序 DFS 维护作用域化 leader 表，算出每个
+        // 请求表达式在各前驱块里可用的 leader（requested_leaders）；③ 逐
+        // 候选判定：全可用 → 直接替换为块参数（完全 PRE）；恰一条边缺 →
+        // 缺的那条边插入计算（部分 PRE）；缺多条 → 放弃（保持单缺失边
+        // 的保守设计）。
         let Some(cfg) = CFG::new(data.curr_func_data()) else {
             return false;
         };

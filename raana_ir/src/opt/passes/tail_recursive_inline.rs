@@ -133,6 +133,9 @@ pub struct TailRecursiveInline;
 /// matching the general inline pass.
 const CALL_SIZE_LIMIT: usize = 40;
 
+/// 静态大小估算：被调用者全部基本块指令数之和，作为"按调用点克隆"的成本预算。
+/// 每内联一个调用点，F 的函数体就被复制一份进调用者，代码量随之翻倍，
+/// 所以必须限制被克隆体的规模（上限见 `CALL_SIZE_LIMIT`）。
 fn estimate_size(data: &FunctionData) -> usize {
     data.layout()
         .basicblocks()
@@ -145,6 +148,7 @@ fn estimate_size(data: &FunctionData) -> usize {
 /// itself, all such calls are `TailCall`, and there is at least one.
 fn is_self_tail_recursive_loop(program: &Program, f: Function) -> bool {
     let data = program.func_data(f);
+    // 没有入口块（声明函数 / 外部函数）没有可克隆的循环入口，直接拒绝。
     if data.layout().entry_bb().is_none() {
         return false;
     }
@@ -153,6 +157,8 @@ fn is_self_tail_recursive_loop(program: &Program, f: Function) -> bool {
         for &inst in bb.insts() {
             match data.inst_data(inst).kind() {
                 InstKind::TailCall(tc) => {
+                    // 自尾调用形态：`TailCall` 的目标必须是 F 自身；
+                    // 一旦指向别的函数，就不再是"自尾递归"，放弃。
                     if tc.callee() != f {
                         return false;
                     }
@@ -162,15 +168,24 @@ fn is_self_tail_recursive_loop(program: &Program, f: Function) -> bool {
                     // A non-tail self call (or any call to another function)
                     // disqualifies the pure-loop shape.
                     let _ = c;
+                    // 出现任何非尾 `Call`（无论调 F 自己还是别的函数）立即拒绝：
+                    // 这是"纯自循环"的保证——克隆体内不残留对 F 的调用，自尾调用
+                    // 全部变成回边，内联必然终止；克隆副本除自身参数派生的 load 外
+                    // 无副作用，复制进调用者才安全。
                     return false;
                 }
                 _ => {}
             }
         }
     }
+    // 至少存在一个自尾调用，才是"尾递归"而非普通递归。
+    // 刻意内联而非退化：TCO 只把尾调用降成帧复用跳转 `b F`，热循环里每次迭代
+    // 仍有一次调用开销；内联后调用点消失、循环留在调用者内，与 clang 的做法一致。
     has_self_tail_call
 }
 
+/// 一个可内联调用点的快照：调用者、`call` 指令、所在基本块、实参、返回类型，
+/// 以及预检通过后的克隆计划。`find_candidate` 一次采集，`apply` 直接消费。
 struct Candidate {
     caller: Function,
     call_inst: Inst,
@@ -181,6 +196,10 @@ struct Candidate {
 }
 
 impl Pass for TailRecursiveInline {
+    /// 固定点驱动：反复"找第一个候选 → 改写"，直到无候选为止。
+    /// 一轮内联可能暴露新的可内联调用点（被内联进调用者的代码里可能又出现对
+    /// 另一个自尾递归函数的 `call`），所以循环到无候选；无候选返回 false，
+    /// 保证幂等（测试断言第二轮 run 为 false）。
     fn run(&mut self, program: &mut Program) -> bool {
         let mut changed = false;
         while let Some(candidate) = Self::find_candidate(program) {
@@ -192,10 +211,13 @@ impl Pass for TailRecursiveInline {
 }
 
 impl TailRecursiveInline {
+    /// 扫描所有函数的所有基本块，返回第一个满足全部守则的调用点。
+    /// 守则"宁漏勿错"：任一条件不满足就保留原 `call`，只内联确定安全的情形。
     fn find_candidate(program: &Program) -> Option<Candidate> {
         let funcs: Vec<Function> = program.function_layout().to_vec();
         for &caller in &funcs {
             let caller_data = program.func_data(caller);
+            // 声明函数没有可插入代码的入口块，跳过。
             if caller_data.layout().entry_bb().is_none() {
                 continue;
             }
@@ -206,13 +228,19 @@ impl TailRecursiveInline {
                         continue;
                     };
                     let callee = call.callee();
+                    // 自调用直接跳过：F 体内对 F 的普通 `call` 若被内联会无限展开。
                     if callee == caller {
                         continue;
                     }
+                    // 守则一：被调用者必须是纯自尾递归循环（见 `is_self_tail_recursive_loop`）。
                     if !is_self_tail_recursive_loop(program, callee) {
                         continue;
                     }
                     let callee_data = program.func_data(callee);
+                    // 守则二（类型匹配）：call 结果类型 == F 返回类型，实参数目与
+                    // 类型逐一等于形参。克隆入口的块参数直接接管这些实参，类型
+                    // 不一致会让 SSA 块参数（Phi）错乱；注意这里只做值级重定向——
+                    // 不生成新符号、不改参数传递约定，本 pass 与函数签名 / ABI 无关。
                     if *caller_data.inst_data(inst).ty() != *callee_data.ret_ty()
                         || call.args().len() != callee_data.params_ty().len()
                         || call
@@ -223,20 +251,28 @@ impl TailRecursiveInline {
                     {
                         continue;
                     }
+                    // 守则三：unit 结果必须无人使用——返回值靠 continuation 的块参数
+                    // 回传，unit 没有值可传；结果若被使用只能放弃这个候选。
                     if caller_data.inst_data(inst).ty().is_unit()
                         && !caller_data.inst_data(inst).used_by().is_empty()
                     {
                         continue;
                     }
+                    // 守则四：克隆规模预算，防止按调用点复制导致代码爆炸。
                     if estimate_size(callee_data) > CALL_SIZE_LIMIT {
                         continue;
                     }
+                    // 守则五：克隆预检。`capture` 校验入口存在、终结器位置合法、
+                    // 无空块等，失败说明形态不可克隆；`contains_tail_call` 再确认
+                    // 体内确有尾调用，排除 TCO 之前的普通递归形态混入。
                     let Ok(plan) = BodyClonePlan::capture(program, callee) else {
                         continue;
                     };
                     if !plan.contains_tail_call() {
                         continue;
                     }
+                    // 返回第一个候选；实参、返回类型、克隆计划在此采集为快照，
+                    // `apply` 修改 program 时不再依赖扫描期间的借用。
                     return Some(Candidate {
                         caller,
                         call_inst: inst,
@@ -251,6 +287,13 @@ impl TailRecursiveInline {
         None
     }
 
+    /// 改写核心：把候选调用点就地变成循环，分四步——
+    ///   1. 在 call 之后切出 continuation（承接返回值与后续指令）；
+    ///   2. 把 F 的函数体克隆到调用点之后；
+    ///   3. 克隆体内的 `ret` → 跳 continuation、自 `tail_call` → 跳回克隆入口（回边）；
+    ///   4. 删除原 `call`，call 块末尾改为跳进克隆入口（携带第一次迭代的实参）。
+    /// 全程只在调用者函数的 CFG 内做跳转重写，不新建函数符号、不改调用约定，
+    /// 因此与签名 / ABI 无关。
     fn apply(program: &mut Program, candidate: Candidate) {
         let Candidate {
             caller,
@@ -261,6 +304,9 @@ impl TailRecursiveInline {
             plan,
         } = candidate;
 
+        // 第 1 步：在 call 之后切出 continuation。call 之后的指令（含同一块内的）
+        // 全部移入；非 unit 结果时给它一个与返回类型同型的块参数——块参数即 Phi，
+        // 克隆体的 `ret` 会把返回值填进这个参数，值流唯一。
         let continuation = {
             let data = program.func_data_mut(caller);
             let block_name = data.bb_data(call_block).name().to_owned();
@@ -272,6 +318,8 @@ impl TailRecursiveInline {
             data.split_block_after(call_inst, format!("{block_name}_tailrec_cont"), params)
         };
 
+        // 第 2 步：克隆 F 的函数体，接到 call 块之后。
+        // `capture` 已预检过形态，这里必然成功（expect 不触发）。
         let cloned = plan
             .clone_into(program, caller, call_block)
             .expect("preflighted self-tail-recursive body must clone successfully");
@@ -281,6 +329,8 @@ impl TailRecursiveInline {
             curr_func: Some(caller),
         };
 
+        // 第 3a 步：克隆的 `ret v` → `jump continuation(v)`——返回路径重定向：
+        // 原 call 之后的指令都留在 continuation 里，返回值经其块参数送达。
         for return_inst in cloned.returns {
             let return_value = match context.inst_data(return_inst).kind() {
                 InstKind::Return(ret) => ret.value(),
@@ -293,6 +343,9 @@ impl TailRecursiveInline {
         }
 
         // Self tail-calls become back-edges to the inlined loop entry.
+        // 第 3b 步（尾调用转循环的关键）：克隆的自 `tail_call F(args)` →
+        // `jump cloned.entry(args)`。实参原样重定向给克隆入口的块参数，每次
+        // 迭代都在更新循环头的 Phi；自尾调用从此变成回边，调用开销归零。
         for tail in cloned.tail_calls {
             let tail_args = match context.inst_data(tail).kind() {
                 InstKind::TailCall(tc) => tc.args().to_vec(),
@@ -303,6 +356,9 @@ impl TailRecursiveInline {
                 .jump(cloned.entry, tail_args);
         }
 
+        // 第 3c 步：原 call 的所有使用者换成 continuation 的参数。SSA 中每个值
+        // 只有唯一定义点，替换后 call 的结果不再被引用（unit 情形在守则三已
+        // 保证无人使用，下面的 assert 兜底）。
         if !context.inst_data(call_inst).ty().is_unit() {
             let continuation_result = context.bb_data(continuation).params()[0];
             utils::visit_and_replace(&mut context, call_inst, continuation_result);
@@ -312,6 +368,8 @@ impl TailRecursiveInline {
             "call must have no users before removal"
         );
         context.remove_layout_inst(call_block, call_inst);
+        // 第 4 步：原调用点变成 `jump cloned.entry(args)`——跳进克隆的循环入口，
+        // 实参原样传入，即循环的第一次迭代。
         let entry_jump = context.new_local_value().jump(cloned.entry, args);
         context.layout_mut().insert_inst(call_block, entry_jump);
     }

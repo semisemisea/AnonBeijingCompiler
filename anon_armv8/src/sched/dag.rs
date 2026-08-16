@@ -5,7 +5,7 @@
 //! which skips physical-register operands post-RA) to build RAW / WAW / WAR
 //! edges plus conservative memory-dependency edges.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use taki_mir::reg_alloc::reg::PReg;
 use taki_mir::register::Reg;
@@ -193,8 +193,8 @@ impl DepGraph {
         };
 
         // Per-register last writer and all readers since that write.
-        let mut last_def: HashMap<PReg, usize> = HashMap::new();
-        let mut pending_uses: HashMap<PReg, Vec<usize>> = HashMap::new();
+        let mut last_def: FxHashMap<PReg, usize> = FxHashMap::default();
+        let mut pending_uses: FxHashMap<PReg, Vec<usize>> = FxHashMap::default();
 
         // NZCV is implicit architectural state and needs the same dependency
         // treatment as a physical register.
@@ -457,8 +457,8 @@ fn annotate_memory_accesses(insts: &[MInst], deps: &mut [InstDeps]) {
     }
 }
 
-fn base_provenance() -> HashMap<PReg, Provenance> {
-    HashMap::from([
+fn base_provenance() -> FxHashMap<PReg, Provenance> {
+    FxHashMap::from_iter([
         (
             stack_preg(),
             Provenance {
@@ -478,7 +478,7 @@ fn base_provenance() -> HashMap<PReg, Provenance> {
 
 fn propagated_provenance(
     inst: &MInst,
-    provenance: &HashMap<PReg, Provenance>,
+    provenance: &FxHashMap<PReg, Provenance>,
 ) -> Option<(PReg, Provenance)> {
     match inst {
         MInst::Mov { size, dst, src } | MInst::MovPhys { size, dst, src }
@@ -520,7 +520,7 @@ fn propagated_provenance(
     }
 }
 
-fn memory_access(inst: &MInst, provenance: &HashMap<PReg, Provenance>) -> Option<MemAccess> {
+fn memory_access(inst: &MInst, provenance: &FxHashMap<PReg, Provenance>) -> Option<MemAccess> {
     let (kind, ty, address, pair) = match inst {
         MInst::Load { ty, addr, .. } => (MemKind::Load, *ty, Some(addr), None),
         MInst::Store { ty, addr, .. } => (MemKind::Store, *ty, Some(addr), None),
@@ -544,7 +544,7 @@ fn memory_access(inst: &MInst, provenance: &HashMap<PReg, Provenance>) -> Option
     })
 }
 
-fn amode_location(addr: &AMode, provenance: &HashMap<PReg, Provenance>) -> Option<Provenance> {
+fn amode_location(addr: &AMode, provenance: &FxHashMap<PReg, Provenance>) -> Option<Provenance> {
     let (mut value, displacement) = match addr {
         AMode::Reg { base } => (reg_provenance(*base, provenance)?, 0),
         AMode::UnsignedOffset { base, offset } => (
@@ -579,7 +579,7 @@ fn amode_location(addr: &AMode, provenance: &HashMap<PReg, Provenance>) -> Optio
 
 fn pair_amode_location(
     addr: &PairAMode,
-    provenance: &HashMap<PReg, Provenance>,
+    provenance: &FxHashMap<PReg, Provenance>,
 ) -> Option<Provenance> {
     let PairAMode::SignedOffset { base, offset } = addr else {
         return None;
@@ -603,7 +603,7 @@ fn preg_one(reg: Reg) -> Option<PReg> {
     reg.to_physical_reg()
 }
 
-fn reg_provenance(reg: Reg, known: &HashMap<PReg, Provenance>) -> Option<Provenance> {
+fn reg_provenance(reg: Reg, known: &FxHashMap<PReg, Provenance>) -> Option<Provenance> {
     known.get(&preg_one(reg)?).copied()
 }
 

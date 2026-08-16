@@ -4,7 +4,7 @@
 //! hand-written ISel missed (or that were introduced by earlier IR passes)
 //! into single AArch64 fused-form instructions.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use taki_mir::{
     block_order::MirBlockIndex,
@@ -60,8 +60,8 @@ impl MIRPass<MInst> for PeepholeCombine {
 /// Count how many times each virtual register appears as a `Use` operand
 /// across the entire function. A register with a count of 1 is a candidate
 /// for fusion — its producer can be absorbed into the sole consumer.
-fn build_vreg_use_counts(vcode: &mut VCodeContainer<MInst>) -> HashMap<Reg, u32> {
-    let mut counts: HashMap<Reg, u32> = HashMap::new();
+fn build_vreg_use_counts(vcode: &mut VCodeContainer<MInst>) -> FxHashMap<Reg, u32> {
+    let mut counts: FxHashMap<Reg, u32> = FxHashMap::default();
     for i in 0..vcode.num_insts() {
         let inst = vcode.inst_mut(i);
         inst.get_operands(&mut |reg: &mut Reg, _constraint, kind, _pos| {
@@ -77,7 +77,7 @@ fn build_vreg_use_counts(vcode: &mut VCodeContainer<MInst>) -> HashMap<Reg, u32>
 fn combine_mac_in_block(
     vcode: &mut VCodeContainer<MInst>,
     range: core::ops::Range<usize>,
-    use_counts: &HashMap<Reg, u32>,
+    use_counts: &FxHashMap<Reg, u32>,
 ) -> u64 {
     let mut fused_count = 0;
     let mut i = range.start;
@@ -215,7 +215,7 @@ fn fuse_flag_triple(
     first: &MInst,
     second: &MInst,
     third: &MInst,
-    use_counts: &HashMap<Reg, u32>,
+    use_counts: &FxHashMap<Reg, u32>,
 ) -> Option<MInst> {
     match (first, second, third) {
         (
@@ -291,7 +291,7 @@ fn fuse_flag_triple(
 /// - `and r, r, #imm; cmp r, #0; b.cc`  → `ands` (result live) or
 ///   `tst r, #imm` (result dead) + `b.cc`
 /// - latch: `sub r, r, #imm; b T` + `T: cmp r, #0; b.cc` → `T: subs r, r, #imm; b.cc`
-fn combine_flag_fusion(vcode: &mut VCodeContainer<MInst>, use_counts: &HashMap<Reg, u32>) -> u64 {
+fn combine_flag_fusion(vcode: &mut VCodeContainer<MInst>, use_counts: &FxHashMap<Reg, u32>) -> u64 {
     let mut fused_count = 0;
 
     // In-block adjacency rules.
@@ -449,8 +449,8 @@ mod tests {
         }
     }
 
-    fn no_uses() -> HashMap<Reg, u32> {
-        HashMap::new()
+    fn no_uses() -> FxHashMap<Reg, u32> {
+        FxHashMap::default()
     }
 
     #[test]
@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn fuses_live_and_into_ands_and_dead_and_into_tst() {
-        let mut uses = HashMap::new();
+        let mut uses = FxHashMap::default();
         uses.insert(vreg(0), 2);
         let fused = fuse_flag_triple(
             &and_imm(0, 1, 0x8000_0001),
@@ -498,7 +498,7 @@ mod tests {
         );
         assert!(matches!(fused, Some(MInst::AndsRRImmLogic { .. })));
 
-        let mut uses = HashMap::new();
+        let mut uses = FxHashMap::default();
         uses.insert(vreg(0), 1);
         let fused = fuse_flag_triple(
             &and_imm(0, 1, 0x8000_0001),

@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 raana_ir = { path = "../raana_ir/" }
 taki_mir = { path = "../taki_mir/" }
+rustc-hash = "2.1.3"
 smallvec = "1.15.2"

@@ -16,6 +16,7 @@ name = "anon_armv8"
 version = "0.1.0"
 dependencies = [
  "raana_ir",
+ "rustc-hash",
  "smallvec",
  "taki_mir",
 ]

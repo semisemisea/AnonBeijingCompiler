@@ -15,7 +15,7 @@
 //! long as that def dominates the uses, which the preheader guarantees.
 //! Branch block arguments live in the CFG side table and are rewritten too.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use taki_mir::{
     passes::MIRPass,
@@ -167,7 +167,7 @@ fn plan_const_cse(vcode: &VCodeContainer<MInst>) -> Option<Plan> {
     // Group surviving materializations by (target preheader, constant). The
     // first occurrence is the leader (moved); the rest are eliminated and
     // their uses redirected to the leader.
-    let mut groups: HashMap<(Block, u8, u64), Vec<usize>> = HashMap::new();
+    let mut groups: FxHashMap<(Block, u8, u64), Vec<usize>> = FxHashMap::default();
     for (block, target) in hoist_target.iter().enumerate() {
         let Some(target) = *target else {
             continue;
@@ -187,7 +187,12 @@ fn plan_const_cse(vcode: &VCodeContainer<MInst>) -> Option<Plan> {
         movers: Vec::new(),
         redirects: Vec::new(),
     };
-    for ((target, _size, _value), group) in groups {
+    // Iterate groups in a canonical (target block, size, value) order instead
+    // of HashMap iteration order, which is randomized per process and makes
+    // codegen nondeterministic.
+    let mut ordered_groups: Vec<_> = groups.into_iter().collect();
+    ordered_groups.sort_unstable_by_key(|(key, _)| *key);
+    for ((target, _size, _value), group) in ordered_groups {
         let leader = group[0];
         plan.movers.push((leader, target));
         let leader_reg = def_reg(vcode.inst(leader));
@@ -248,7 +253,7 @@ fn apply_const_cse(vcode: &mut VCodeContainer<MInst>, plan: &Plan) -> bool {
     //    of their target preheader, just before the terminator.
     let blocks = vcode.num_blocks();
     let mut mover_target: Vec<Option<Block>> = vec![None; vcode.num_insts()];
-    let mut moved: HashMap<Block, Vec<usize>> = HashMap::new();
+    let mut moved: FxHashMap<Block, Vec<usize>> = FxHashMap::default();
     for &(i, target) in &plan.movers {
         mover_target[i] = Some(target);
         moved.entry(target).or_default().push(i);
@@ -368,7 +373,7 @@ fn find_loops(
     };
 
     // Union the reach sets of every backedge that targets the same header.
-    let mut header_reach: HashMap<Block, Vec<bool>> = HashMap::new();
+    let mut header_reach: FxHashMap<Block, Vec<bool>> = FxHashMap::default();
     for u in 0..blocks {
         let u = Block::new(u);
         for &v in vcode.block_succs(u) {
@@ -390,7 +395,11 @@ fn find_loops(
     }
 
     let mut loops = Vec::new();
-    for (header, reach) in header_reach {
+    // Same canonical-ordering rationale as the `groups` loop above: header
+    // blocks are visited in block-number order so the loop list is stable.
+    let mut ordered_headers: Vec<_> = header_reach.into_iter().collect();
+    ordered_headers.sort_unstable_by_key(|(header, _)| *header);
+    for (header, reach) in ordered_headers {
         let mut loop_blocks = vec![header];
         for w in 0..blocks {
             if w != header.index() && reach[w] && dominates[w][header.index()] {

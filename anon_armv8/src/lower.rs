@@ -1,6 +1,6 @@
 //! AArch64 selection from Raana HIR into generic VCode.
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use raana_ir::ir::{
     Binary, BinaryOp, Call, Cast, Fma, GetElemPtr, InstKind, Load, Return, Select, Store, TailCall,
@@ -1947,7 +1947,7 @@ fn emit_and_comparison_tree(
         user: HirInst,
         comparisons: &mut Vec<HirInst>,
         edges: &mut Vec<(HirInst, HirInst)>,
-        visited: &mut HashSet<HirInst>,
+        visited: &mut FxHashSet<HirInst>,
     ) -> bool {
         if !visited.insert(node) || !has_only_user(ctx, node, user) {
             return false;
@@ -1982,7 +1982,7 @@ fn emit_and_comparison_tree(
 
     let mut comparisons = Vec::new();
     let mut edges = Vec::new();
-    let mut visited = HashSet::new();
+    let mut visited = FxHashSet::default();
     if !collect(
         ctx,
         arena,

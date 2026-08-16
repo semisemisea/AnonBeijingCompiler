@@ -17,7 +17,7 @@
 //!   removed. Physical defs (e.g. pinned ABI registers) are not tracked by
 //!   the use counts, so treating them as dead would be unsound.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use taki_mir::{
     passes::MIRPass,
@@ -70,7 +70,7 @@ impl InstInfo {
     /// least one definition (instructions without defs are skipped so that
     /// flag writers such as `CmpRR` are never touched), every definition is
     /// virtual, and every defined virtual register has zero remaining uses.
-    fn is_dead(&self, use_counts: &HashMap<Reg, u32>) -> bool {
+    fn is_dead(&self, use_counts: &FxHashMap<Reg, u32>) -> bool {
         self.removable
             && !self.defs.is_empty()
             && !self.has_non_virtual_def
@@ -149,7 +149,7 @@ fn is_dce_removable(inst: &MInst) -> bool {
 /// eliminated instructions. `extra_uses` are virtual-register uses that do
 /// not appear in any instruction operand list (branch block arguments).
 fn eliminate_dead_insts(insts: &mut [MInst], extra_uses: &[Reg]) -> u64 {
-    let mut use_counts: HashMap<Reg, u32> = HashMap::new();
+    let mut use_counts: FxHashMap<Reg, u32> = FxHashMap::default();
     for &reg in extra_uses {
         if reg.is_virtual() {
             *use_counts.entry(reg).or_insert(0) += 1;
@@ -157,7 +157,7 @@ fn eliminate_dead_insts(insts: &mut [MInst], extra_uses: &[Reg]) -> u64 {
     }
 
     let mut infos: Vec<InstInfo> = Vec::with_capacity(insts.len());
-    let mut def_site: HashMap<Reg, usize> = HashMap::new();
+    let mut def_site: FxHashMap<Reg, usize> = FxHashMap::default();
     for (i, inst) in insts.iter_mut().enumerate() {
         let mut info = InstInfo {
             removable: is_dce_removable(inst),

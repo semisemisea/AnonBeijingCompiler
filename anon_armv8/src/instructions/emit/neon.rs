@@ -10,7 +10,7 @@ use super::super::{
     vec_cvt_name, vec_minmax_name,
 };
 
-pub(super) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result {
+pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result {
     match inst {
         MInst::FMov { dst, src } => emit_fmov(ctx, dst.to_reg(), src),
         MInst::VecMov { dst, src } => {

@@ -9,7 +9,7 @@ use super::super::{
     emit_reg, emit_select_cmp, invert_cond,
 };
 
-pub(super) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result {
+pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result {
     match inst {
         MInst::BCond { cond, label } => {
             let target = label

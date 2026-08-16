@@ -137,8 +137,3 @@ impl Ranges {
         self.reverse_index();
     }
 }
-
-pub struct RangesWith<T> {
-    with: Vec<T>,
-    ranges: Ranges,
-}

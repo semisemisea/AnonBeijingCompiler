@@ -433,10 +433,8 @@ mod tests {
         m.push(12);
         m.push(33);
 
-        let mut i = 0;
-        for key in m.keys() {
+        for (i, key) in m.keys().enumerate() {
             assert_eq!(key.index(), i);
-            i += 1;
         }
     }
 

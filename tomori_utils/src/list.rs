@@ -253,7 +253,7 @@ impl<T: EntityRef + ReservedValue> ListPool<T> {
 
         if elems_to_copy > 0 {
             let (old, new) = self.mut_slices(block, new_block);
-            (&mut new[0..elems_to_copy]).copy_from_slice(&old[0..elems_to_copy]);
+            new[0..elems_to_copy].copy_from_slice(&old[0..elems_to_copy]);
         }
 
         self.free(block, from_sclass);
@@ -300,7 +300,7 @@ impl<T: EntityRef + ReservedValue> EntityList<T> {
     /// Returns `true` if the list is valid
     pub fn is_valid(&self, pool: &ListPool<T>) -> bool {
         // We consider an empty list to be valid
-        self.is_empty() || pool.len_of(self) != None
+        self.is_empty() || pool.len_of(self).is_some()
     }
 
     /// Get the list as a slice.
@@ -343,7 +343,7 @@ impl<T: EntityRef + ReservedValue> EntityList<T> {
     /// Create a deep clone of the list, which does not alias the original list.
     pub fn deep_clone(&self, pool: &mut ListPool<T>) -> Self {
         match pool.len_of(self) {
-            None => return Self::new(),
+            None => Self::new(),
             Some(len) => {
                 let src = self.index as usize;
                 let block = pool.alloc(sclass_for_length(len));
@@ -375,7 +375,7 @@ impl<T: EntityRef + ReservedValue> EntityList<T> {
     ///
     /// This is the equivalent of `Option::take()`.
     pub fn take(&mut self) -> Self {
-        mem::replace(self, Default::default())
+        mem::take(self)
     }
 
     /// Appends an element to the back of the list.
@@ -598,7 +598,7 @@ impl<T: EntityRef + ReservedValue> EntityList<T> {
         }
 
         match pool.len_of(self) {
-            None => return,
+            None => (),
             Some(len) => {
                 if len <= new_len {
                     return;
@@ -657,7 +657,7 @@ mod tests {
         assert_eq!(sclass_for_length(8), 2);
         assert_eq!(sclass_size(1), 8);
         for l in 0..300 {
-            assert!(sclass_size(sclass_for_length(l)) >= l + 1);
+            assert!(sclass_size(sclass_for_length(l)) > l);
         }
     }
 

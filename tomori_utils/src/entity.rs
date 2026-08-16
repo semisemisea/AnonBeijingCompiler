@@ -11,7 +11,7 @@ macro_rules! entity_impl {
         impl $crate::EntityRef for $entity {
             #[inline]
             fn new(index: usize) -> Self {
-                debug_assert!(index < (::core::u32::MAX as usize));
+                debug_assert!(index < (u32::MAX as usize));
                 $entity(index as u32)
             }
 
@@ -24,12 +24,12 @@ macro_rules! entity_impl {
         impl $crate::packed_option::ReservedValue for $entity {
             #[inline]
             fn reserved_value() -> $entity {
-                $entity(::core::u32::MAX)
+                $entity(u32::MAX)
             }
 
             #[inline]
             fn is_reserved_value(&self) -> bool {
-                self.0 == ::core::u32::MAX
+                self.0 == u32::MAX
             }
         }
 
@@ -38,7 +38,7 @@ macro_rules! entity_impl {
             #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn from_u32(x: u32) -> Self {
-                debug_assert!(x < ::core::u32::MAX);
+                debug_assert!(x < u32::MAX);
                 $entity(x)
             }
 
@@ -88,7 +88,7 @@ macro_rules! entity_impl {
         impl $crate::EntityRef for $entity {
             #[inline]
             fn new(index: usize) -> Self {
-                debug_assert!(index < (::core::u32::MAX as usize));
+                debug_assert!(index < (u32::MAX as usize));
                 let $arg = index as u32;
                 $to_expr
             }
@@ -103,12 +103,12 @@ macro_rules! entity_impl {
         impl $crate::packed_option::ReservedValue for $entity {
             #[inline]
             fn reserved_value() -> $entity {
-                $entity::from_u32(::core::u32::MAX)
+                $entity::from_u32(u32::MAX)
             }
 
             #[inline]
             fn is_reserved_value(&self) -> bool {
-                self.as_u32() == ::core::u32::MAX
+                self.as_u32() == u32::MAX
             }
         }
 
@@ -117,7 +117,7 @@ macro_rules! entity_impl {
             #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn from_u32(x: u32) -> Self {
-                debug_assert!(x < ::core::u32::MAX);
+                debug_assert!(x < u32::MAX);
                 let $arg = x;
                 $to_expr
             }

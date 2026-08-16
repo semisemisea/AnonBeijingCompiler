@@ -44,11 +44,14 @@ mod call;
 mod memory;
 mod vector;
 
-use arith::*;
-use branch::*;
-use call::*;
-use memory::*;
-use vector::*;
+use arith::{lower_binary, lower_cast};
+use branch::{lower_select, select_branch_condition};
+use call::{lower_call, lower_return, lower_tail_call};
+use memory::{lower_alloc, lower_get_elem_ptr, lower_load, lower_mem_zero, lower_store};
+use vector::{
+    lower_fma, lower_vector_extract_element, lower_vector_insert_element, lower_vector_reduce,
+    lower_vector_splat,
+};
 
 impl LowerBackend for AArch64Backend {
     type MInst = MInst;
@@ -65,18 +68,23 @@ impl LowerBackend for AArch64Backend {
             | InstKind::Float(..) => {
                 unreachable!("constants and argument references are rematerialized by LowerContext")
             }
+            // Scalar arithmetic and casts.
             InstKind::Binary(binary) => lower_binary(ctx, arena, inst, binary),
-            InstKind::Select(select) => lower_select(ctx, arena, inst, select),
             InstKind::Cast(cast) => lower_cast(ctx, arena, inst, cast),
+            // Select and condition-chain lowering.
+            InstKind::Select(select) => lower_select(ctx, arena, inst, select),
+            // Memory addressing, loads, stores, and zeroing.
             InstKind::Alloc => lower_alloc(ctx, arena, inst),
             InstKind::GetElemPtr(gep) => lower_get_elem_ptr(ctx, arena, inst, gep),
             InstKind::Load(load) => lower_load(ctx, arena, inst, load),
             InstKind::Store(store) => lower_store(ctx, arena, inst, store),
             InstKind::MemZero(mem_zero) => lower_mem_zero(ctx, arena, mem_zero),
             InstKind::ZeroInit => unreachable!("zero initialization is lowered by its store"),
+            // Calls, tail calls, and returns.
             InstKind::Call(call) => lower_call(ctx, arena, inst, call),
             InstKind::TailCall(tail_call) => lower_tail_call(ctx, arena, tail_call),
             InstKind::Return(ret) => lower_return(ctx, arena, ret),
+            // NEON vector lowering.
             InstKind::Fma(fma) => lower_fma(ctx, arena, inst, fma),
             InstKind::VectorSplat(splat) => lower_vector_splat(ctx, arena, inst, splat),
             InstKind::VectorExtractElement(extract) => {

@@ -1,5 +1,6 @@
 //! Integer, pointer, and floating-point arithmetic lowering helpers.
 
+use super::vector::{lower_vector_binary, vector_shape};
 use super::*;
 pub(super) fn lower_binary(
     ctx: &mut LowerContext<'_, MInst>,

@@ -1,5 +1,6 @@
 //! Call, tail-call, return, and builtin-expansion helpers.
 
+use super::memory::memory_type;
 use super::*;
 /// The compiler-provided modular-multiplication builtin recognized by the
 /// `mulmod_recognize` IR pass (AArch64 only). It has no body and is never

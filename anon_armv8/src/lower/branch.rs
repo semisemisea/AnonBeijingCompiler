@@ -1,5 +1,8 @@
 //! Branch and select condition lowering helpers.
 
+use super::arith::{
+    comparison_cond, float_comparison_cond, integer_constant, operand_size, positive_imm12,
+};
 use super::*;
 pub(super) fn lower_select(
     ctx: &mut LowerContext<'_, MInst>,

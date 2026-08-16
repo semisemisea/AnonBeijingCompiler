@@ -649,8 +649,8 @@ impl ToRaanaIR for items::Stmt {
                     exp.convert(ctx);
                 }
             }
-            items::Stmt::IfStmt(if_stmt) => if_stmt.convert(ctx),
-            items::Stmt::WhileStmt(while_stmt) => while_stmt.convert(ctx),
+            items::Stmt::If(if_stmt) => if_stmt.convert(ctx),
+            items::Stmt::While(while_stmt) => while_stmt.convert(ctx),
             items::Stmt::Break(break_stmt) => break_stmt.convert(ctx),
             items::Stmt::Continue(continue_stmt) => continue_stmt.convert(ctx),
         }

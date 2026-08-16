@@ -373,8 +373,8 @@ pub enum Stmt {
     Block(Block),
     Single(Option<Exp>),
     Return(ReturnStmt),
-    IfStmt(IfStmt),
-    WhileStmt(WhileStmt),
+    If(IfStmt),
+    While(WhileStmt),
     Break(Break),
     Continue(Continue),
 }

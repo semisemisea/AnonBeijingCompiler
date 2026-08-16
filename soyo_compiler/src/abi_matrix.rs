@@ -85,14 +85,6 @@ fn compile_sy(source: &str, target: Target, opt_level: u8) -> String {
     compile_sy_with(source, target, opt_level, true)
 }
 
-/// Like `compile_sy`, but with a pipeline that keeps dead functions (no
-/// dead-function elimination). ABI observation tests assert on the parameter
-/// binding of optimized-but-unreachable helpers, which the real pipeline
-/// correctly removes.
-fn compile_sy_without_dfe(source: &str, target: Target, opt_level: u8) -> String {
-    compile_sy_with(source, target, opt_level, false)
-}
-
 fn compile_sy_with(source: &str, target: Target, opt_level: u8, use_dfe: bool) -> String {
     let ast = crate::sysy::CompUnitsParser::new()
         .parse(source)

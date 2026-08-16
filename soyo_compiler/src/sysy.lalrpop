@@ -172,18 +172,18 @@ MatchedStmt: Stmt = {
 
     <continue_stmt: Continue> => Stmt::Continue(continue_stmt),
 
-    <while_stmt: WhileStmt> => Stmt::WhileStmt(while_stmt),
+    <while_stmt: WhileStmt> => Stmt::While(while_stmt),
 
     "if" "(" <cond: Exp> ")" <then_branch: MatchedStmt> "else" <else_branch: MatchedStmt> => 
-        Stmt::IfStmt(IfStmt {cond, then_branch: Box::new(then_branch), else_branch: Some(Box::new(else_branch))}),
+        Stmt::If(IfStmt {cond, then_branch: Box::new(then_branch), else_branch: Some(Box::new(else_branch))}),
     
     <return_stmt: ReturnStmt> => Stmt::Return(return_stmt),
 };
 
 OpenStmt: Stmt = {
-    "if" "(" <cond: Exp> ")" <then_branch: Stmt> => Stmt::IfStmt(IfStmt{cond, then_branch: Box::new(then_branch), else_branch: None}),
+    "if" "(" <cond: Exp> ")" <then_branch: Stmt> => Stmt::If(IfStmt{cond, then_branch: Box::new(then_branch), else_branch: None}),
     "if" "(" <cond: Exp> ")" <then_branch: MatchedStmt> "else" <else_branch: OpenStmt> => 
-        Stmt::IfStmt (IfStmt{cond, then_branch: Box::new(then_branch), else_branch: Some(Box::new(else_branch))}),
+        Stmt::If (IfStmt{cond, then_branch: Box::new(then_branch), else_branch: Some(Box::new(else_branch))}),
 }
 
 LVal: LVal = <ident: Ident> <index: ("[" <Exp> "]")*> => LVal {ident, index};

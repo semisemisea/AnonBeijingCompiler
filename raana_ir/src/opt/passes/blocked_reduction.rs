@@ -109,7 +109,7 @@ impl BlockedReduction {
         data: &ArenaContextMut<'_>,
         cfg: &CFG,
         dom_tree: &DominanceTree,
-        loop_analysis: &LoopAnalysis,
+        _loop_analysis: &LoopAnalysis,
         looop: &Loop,
     ) -> Option<Candidate> {
         // (a) A two-block loop: header plus a single pure body block (latch).
@@ -198,14 +198,14 @@ impl BlockedReduction {
                     }
                     _ => {}
                 }
-            } else if ty.is_pointer() {
-                if matches!(
+            } else if ty.is_pointer()
+                && matches!(
                     data.inst_data(back_arg).kind(),
                     InstKind::GetElemPtr(gep) if gep.base() == param
-                ) {
-                    ptr_param = Some(param);
-                    continue;
-                }
+                )
+            {
+                ptr_param = Some(param);
+                continue;
             }
             if back_arg == param {
                 passthroughs.push((param, index));
@@ -333,7 +333,7 @@ impl BlockedReduction {
             return false;
         };
         let orig_args = jump.args().to_vec();
-        let k_idx = cand
+        let _k_idx = cand
             .header_params
             .iter()
             .position(|&p| p == cand.k_param)
@@ -343,7 +343,7 @@ impl BlockedReduction {
             .iter()
             .position(|&p| p == cand.acc_param)
             .unwrap();
-        let ctr_idx = cand
+        let _ctr_idx = cand
             .header_params
             .iter()
             .position(|&p| p == cand.ctr_param)

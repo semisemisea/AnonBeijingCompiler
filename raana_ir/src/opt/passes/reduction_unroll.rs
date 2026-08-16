@@ -192,8 +192,6 @@ impl ReductionUnroll {
         };
         let exit_block = if branch.t_target() == body {
             branch.f_target()
-        } else if branch.f_target() == body {
-            return None;
         } else {
             return None;
         };

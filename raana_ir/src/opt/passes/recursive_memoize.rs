@@ -346,9 +346,7 @@ fn classify(
     let mut has_rec = false;
     let mut uses_acc = false;
     for (_, value) in returns {
-        let Some(value) = *value else {
-            return None;
-        };
+        let value = (*value)?;
         if matches!(
             data.inst_data(value).kind(),
             InstKind::Call(call) if call.callee() == f

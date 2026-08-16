@@ -42,7 +42,7 @@ pub enum AllocRegResult<'a> {
     ConflictHighCost,
 }
 
-impl<'a, F: Function> Env<'a, F> {
+impl<F: Function> Env<'_, F> {
     pub fn process_bundles(&mut self) -> Result<(), String> {
         while let Some((bundle, hint)) = self.ctx.allocation_queue.pop() {
             self.process_bundle(bundle, hint)?;
@@ -190,7 +190,7 @@ impl<'a, F: Function> Env<'a, F> {
             }
         }
 
-        if conflicts.len() > 0 {
+        if !conflicts.is_empty() {
             return AllocRegResult::Conflict(conflicts, first_conflict.unwrap());
         }
 
@@ -402,7 +402,7 @@ impl<'a, F: Function> Env<'a, F> {
             trace!("range{}: use {:?}", range.index(), u);
         }
         rangedata.set_uses_spill_weight(w);
-        if rangedata.uses.len() > 0 && rangedata.uses[0].operand.kind() == OperandKind::Def {
+        if !rangedata.uses.is_empty() && rangedata.uses[0].operand.kind() == OperandKind::Def {
             // Note that we *set* the flag here, but we never *clear*
             // it: it may be set by a progmove as well (which does not
             // create an explicit use or def), and we want to preserve
@@ -791,14 +791,14 @@ impl<'a, F: Function> Env<'a, F> {
             }
         }
 
-        if self.ctx.bundles[bundle].ranges.len() > 0 {
+        if !self.ctx.bundles[bundle].ranges.is_empty() {
             self.recompute_bundle_properties(bundle);
             let prio = self.ctx.bundles[bundle].prio;
             self.ctx
                 .allocation_queue
                 .insert(bundle, prio as usize, hint);
         }
-        if self.ctx.bundles[new_bundle].ranges.len() > 0 {
+        if !self.ctx.bundles[new_bundle].ranges.is_empty() {
             self.recompute_bundle_properties(new_bundle);
             let prio = self.ctx.bundles[new_bundle].prio;
             self.ctx
@@ -933,7 +933,7 @@ impl<'a, F: Function> Env<'a, F> {
                 let spill_lr = self.ctx.ranges.add(spill_range);
                 self.ctx.ranges[spill_lr].vreg = vreg;
                 self.ctx.ranges[spill_lr].bundle = spill;
-                self.ctx.ranges[spill_lr].uses.extend(spill_uses.drain(..));
+                self.ctx.ranges[spill_lr].uses.append(&mut spill_uses);
                 new_lrs.push((vreg, spill_lr));
 
                 if spill_starts_def {
@@ -972,7 +972,7 @@ impl<'a, F: Function> Env<'a, F> {
         // Recompute bundle properties for all new bundles and enqueue
         // them.
         for bundle in new_bundles {
-            if self.ctx.bundles[bundle].ranges.len() > 0 {
+            if !self.ctx.bundles[bundle].ranges.is_empty() {
                 self.recompute_bundle_properties(bundle);
                 let prio = self.ctx.bundles[bundle].prio;
                 self.ctx
@@ -1239,7 +1239,7 @@ impl<'a, F: Function> Env<'a, F> {
                         // We also need to discard any registers that do not fit
                         // under the limit--we cannot allocate to them.
                         if let Requirement::Limit(limit) = req {
-                            if preg.hw_enc() >= limit as usize {
+                            if preg.hw_enc() >= limit {
                                 continue;
                             }
                         }
@@ -1326,7 +1326,7 @@ impl<'a, F: Function> Env<'a, F> {
 
         self.ctx.scratch_conflicts = scratch;
         self.ctx.scratch_bundle = lowest_cost_evict_conflict_set;
-        return Ok(());
+        Ok(())
     }
 }
 

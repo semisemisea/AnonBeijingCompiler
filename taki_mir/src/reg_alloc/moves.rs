@@ -14,6 +14,12 @@ pub struct ParallelMoves<T: Clone + Copy + Default> {
     parallel_moves: MoveVec<T>,
 }
 
+impl<T: Clone + Copy + Default + PartialEq> Default for ParallelMoves<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Clone + Copy + Default + PartialEq> ParallelMoves<T> {
     pub fn new() -> Self {
         Self {
@@ -283,7 +289,7 @@ where
 
 #[inline(always)]
 fn u64_key(b: u32, a: u32) -> u64 {
-    a as u64 | (b as u64) << 32
+    a as u64 | ((b as u64) << 32)
 }
 
 #[cfg(test)]

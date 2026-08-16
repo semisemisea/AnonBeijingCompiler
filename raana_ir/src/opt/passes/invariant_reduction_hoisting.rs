@@ -173,10 +173,10 @@ impl InvariantReductionHoisting {
             let Some(final_acc) = trace_accumulator(data, &region, header, exit, p) else {
                 continue;
             };
-            if orig_back_args[idx] == final_acc {
-                if acc_candidate.replace((p, idx, final_acc)).is_some() {
-                    return None;
-                }
+            if orig_back_args[idx] == final_acc
+                && acc_candidate.replace((p, idx, final_acc)).is_some()
+            {
+                return None;
             }
         }
         let (acc, acc_idx, final_acc) = match acc_candidate {
@@ -331,7 +331,6 @@ impl InvariantReductionHoisting {
             .new_local_value()
             .jump(compute_done, vec![final_clone]);
         mapper.data.layout_mut().insert_inst(latch_clone, done_jump);
-        drop(mapper);
 
         // `compute_done`: carry `D_total` back into the (degraded) loop via a
         // fresh loop-carried header parameter. Add the carrier first so the

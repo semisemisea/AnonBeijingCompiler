@@ -298,7 +298,7 @@ impl RotateLoops {
                 return false;
             }
         }
-        let exit_params: Vec<Inst> = if exit_reads_header {
+        let _exit_params: Vec<Inst> = if exit_reads_header {
             let exit_params = params
                 .iter()
                 .map(|&parameter| {

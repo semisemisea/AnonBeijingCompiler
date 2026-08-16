@@ -28,4 +28,8 @@ impl CallSiteTable {
     pub fn len(&self) -> usize {
         self.calls.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
 }

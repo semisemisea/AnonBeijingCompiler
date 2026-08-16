@@ -122,7 +122,7 @@ macro_rules! define_index {
             }
         }
 
-        impl crate::reg_alloc::index::ContainerIndex for $ix {}
+        impl $crate::reg_alloc::index::ContainerIndex for $ix {}
     };
 }
 
@@ -175,7 +175,7 @@ impl InstRange {
 
     #[inline(always)]
     pub fn iter(self) -> impl DoubleEndedIterator<Item = Inst> {
-        (self.0.index()..self.1.index()).map(|i| Inst::new(i))
+        (self.0.index()..self.1.index()).map(Inst::new)
     }
 }
 

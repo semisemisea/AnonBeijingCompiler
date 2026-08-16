@@ -1109,7 +1109,8 @@ fn fold_binary(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
 }
 
 fn fold_f32_to_i32(value: f32) -> Option<i32> {
-    (value.is_finite() && value >= i32::MIN as f32 && value < i32::MAX as f32).then(|| value as i32)
+    (value.is_finite() && value >= i32::MIN as f32 && value < i32::MAX as f32)
+        .then_some(value as i32)
 }
 
 #[cfg(test)]

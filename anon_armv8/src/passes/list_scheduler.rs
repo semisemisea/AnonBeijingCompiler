@@ -9,7 +9,7 @@
 //! Priority = critical-path length. A node becomes ready when all its
 //! predecessors have been issued for at least their latency duration.
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use taki_mir::{
     passes::MIRPass,
@@ -213,7 +213,7 @@ fn schedule(dag: &DepGraph) -> (Vec<usize>, Option<SchedulerFallbackReason>) {
         }
         if stall_budget == 0 {
             // Safety fallback: emit remaining nodes in original order.
-            let scheduled: HashSet<usize> = order.iter().copied().collect();
+            let scheduled: FxHashSet<usize> = order.iter().copied().collect();
             for i in 0..n {
                 if !scheduled.contains(&i) {
                     order.push(i);

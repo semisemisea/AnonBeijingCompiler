@@ -761,7 +761,14 @@ pub(super) fn fold_mul_add_sub(
         || !fusion_types_match(
             arena,
             size,
-            [consumer, lhs, rhs, mul_inst, mul.lhs(), mul.rhs()],
+            FusionTypes {
+                consumer,
+                lhs,
+                rhs,
+                mul_inst,
+                mul_lhs: mul.lhs(),
+                mul_rhs: mul.rhs(),
+            },
         )
         // Only fuse within one block. A multiplication hoisted by LICM to a
         // preheader (or any other dominator) executes less often than the
@@ -784,6 +791,18 @@ pub(super) fn fold_mul_add_sub(
     ))
 }
 
+/// The six instructions whose types must agree before a multiply-add can be
+/// fused: the consuming add/sub and its operands, plus the multiplication and
+/// its two operands.
+struct FusionTypes {
+    consumer: HirInst,
+    lhs: HirInst,
+    rhs: HirInst,
+    mul_inst: HirInst,
+    mul_lhs: HirInst,
+    mul_rhs: HirInst,
+}
+
 pub(super) fn is_mul(arena: ArenaContext<'_>, inst: HirInst) -> bool {
     matches!(
         arena.inst_data(inst).kind(),
@@ -794,12 +813,22 @@ pub(super) fn is_mul(arena: ArenaContext<'_>, inst: HirInst) -> bool {
 pub(super) fn fusion_types_match(
     arena: ArenaContext<'_>,
     size: OperandSize,
-    insts: [HirInst; 6],
+    types: FusionTypes,
 ) -> bool {
-    insts.into_iter().all(|inst| {
-        let ty = arena.inst_data(inst).ty().kind();
-        matches!(ty, TypeKind::Int32 | TypeKind::Pointer(_)) && operand_size(ty) == size
-    })
+    let FusionTypes {
+        consumer,
+        lhs,
+        rhs,
+        mul_inst,
+        mul_lhs,
+        mul_rhs,
+    } = types;
+    [consumer, lhs, rhs, mul_inst, mul_lhs, mul_rhs]
+        .into_iter()
+        .all(|inst| {
+            let ty = arena.inst_data(inst).ty().kind();
+            matches!(ty, TypeKind::Int32 | TypeKind::Pointer(_)) && operand_size(ty) == size
+        })
 }
 
 /// Fold `rhs = input <<const shift` (or its logical/arithmetic right-shift

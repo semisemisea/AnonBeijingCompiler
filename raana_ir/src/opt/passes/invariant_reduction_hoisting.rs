@@ -932,7 +932,12 @@ mod tests {
         // DeadPhiElimination walks them to trim arguments, so a stale edge
         // with a short argument list would panic it (many_mat_cal regression).
         let data = program.func_data(function);
-        let stale_edges = data.bb_data(outer).used_by().iter().copied().collect::<Vec<_>>();
+        let stale_edges = data
+            .bb_data(outer)
+            .used_by()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
         assert!(
             stale_edges.len() >= 3,
             "compute_done + degraded latch + original latch must target the header"
@@ -940,7 +945,11 @@ mod tests {
         for &inst in &stale_edges {
             match data.inst_data(inst).kind() {
                 InstKind::Jump(jump) => {
-                    assert_eq!(jump.args().len(), 3, "stale jump edge must carry the carrier");
+                    assert_eq!(
+                        jump.args().len(),
+                        3,
+                        "stale jump edge must carry the carrier"
+                    );
                 }
                 InstKind::Branch(branch) => {
                     if branch.t_target() == outer {

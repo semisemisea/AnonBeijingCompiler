@@ -7,7 +7,7 @@ use crate::ir::arena::Arena;
 use crate::ir::{
     Function, InstKind, Program, Type, TypeKind,
     inst_kind::{
-        Binary, BinaryOp, Cast, Call, Fma, GetElemPtr, VectorExtractElement, VectorInsertElement,
+        Binary, BinaryOp, Call, Cast, Fma, GetElemPtr, VectorExtractElement, VectorInsertElement,
         VectorReduce, VectorSplat,
     },
     instruction::Inst,
@@ -316,7 +316,11 @@ impl<'a> LlvmWriter<'a> {
         writeln!(self.buffer, "entry:")?;
         writeln!(self.buffer, "  {} = zext i32 %count to i64", c)?;
         writeln!(self.buffer, "  {} = zext i32 %size to i64", s)?;
-        writeln!(self.buffer, "  {} = call ptr @calloc(i64 {}, i64 {})", p, c, s)?;
+        writeln!(
+            self.buffer,
+            "  {} = call ptr @calloc(i64 {}, i64 {})",
+            p, c, s
+        )?;
         writeln!(self.buffer, "  ret ptr {}", p)?;
         writeln!(self.buffer, "}}")
     }
@@ -1547,11 +1551,8 @@ mod tests {
             super::CALLOO_NAME.into(),
             vec![],
         );
-        let function = program.new_function(
-            Type::get_pointer(Type::get_i32()),
-            "caller".into(),
-            vec![],
-        );
+        let function =
+            program.new_function(Type::get_pointer(Type::get_i32()), "caller".into(), vec![]);
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
         let count = data.new_local_inst().integer(4);
@@ -1568,7 +1569,10 @@ mod tests {
         let mut writer = LlvmWriter::new(&program);
         writer.write().unwrap();
         let llvm = writer.finish();
-        assert!(llvm.contains("define ptr @soyo_calloc(i32 %count, i32 %size)"), "{llvm}");
+        assert!(
+            llvm.contains("define ptr @soyo_calloc(i32 %count, i32 %size)"),
+            "{llvm}"
+        );
         assert!(llvm.contains("call ptr @calloc(i64"), "{llvm}");
         assert!(llvm.contains("declare ptr @calloc(i64, i64)"), "{llvm}");
         assert!(!llvm.contains("declare ptr @soyo_calloc"), "{llvm}");

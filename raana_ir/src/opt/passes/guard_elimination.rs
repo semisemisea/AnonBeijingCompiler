@@ -107,9 +107,7 @@ mod tests {
             };
             let zero = data.new_local_inst().integer(0);
             let cond = data.new_local_inst().binary(BinaryOp::Lt, guard, zero);
-            let branch = data
-                .new_local_inst()
-                .branch(cond, neg, vec![], pos, vec![]);
+            let branch = data.new_local_inst().branch(cond, neg, vec![], pos, vec![]);
             data.layout_mut().insert_inst(entry, cond);
             data.layout_mut().insert_inst(entry, branch);
             let ret_zero = data.new_local_inst().ret(Some(zero));
@@ -135,9 +133,9 @@ mod tests {
             let entry = data.add_entry_block();
             let ptr = data.new_local_inst().alloc(Type::get_i32());
             let load = data.new_local_inst().load(ptr);
-            let call = data
-                .new_local_inst()
-                .call_with_type(param_guard, vec![load], Type::get_i32());
+            let call =
+                data.new_local_inst()
+                    .call_with_type(param_guard, vec![load], Type::get_i32());
             let ret = data.new_local_inst().ret(None);
             data.layout_mut().insert_inst(entry, load);
             data.layout_mut().insert_inst(entry, call);
@@ -149,18 +147,12 @@ mod tests {
 
         let data = program.func_data(constant_guard);
         assert!(
-            matches!(
-                data.inst_data(const_branch).kind(),
-                InstKind::Jump(_)
-            ),
+            matches!(data.inst_data(const_branch).kind(), InstKind::Jump(_)),
             "constant guard must fold to a jump"
         );
         let data = program.func_data(param_guard);
         assert!(
-            matches!(
-                data.inst_data(param_branch).kind(),
-                InstKind::Branch(_)
-            ),
+            matches!(data.inst_data(param_branch).kind(), InstKind::Branch(_)),
             "input-derived guard must stay a branch"
         );
     }

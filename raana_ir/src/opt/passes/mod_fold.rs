@@ -45,8 +45,7 @@ impl Pass for ModFold {
             .flat_map(|layout| layout.insts().iter().copied())
             .filter(|&inst| {
                 rem_of(data, inst).is_some_and(|(_, divisor)| {
-                    positive_constant(data, divisor)
-                        .is_some_and(|p| p > 0 && !is_power_of_two(p))
+                    positive_constant(data, divisor).is_some_and(|p| p > 0 && !is_power_of_two(p))
                 })
             })
             .collect();
@@ -150,11 +149,7 @@ mod tests {
     /// Builds `target(x)`: `t = x & mask; rem = t % divisor; ret rem`. The
     /// `and` transfer gives `t` the range `[0, mask]`, so `rem` folds whenever
     /// `mask < 2 * divisor` and `divisor` is not a power of two.
-    fn build_and_rem(
-        program: &mut Program,
-        mask: i32,
-        divisor: i32,
-    ) -> (Function, Inst, Inst) {
+    fn build_and_rem(program: &mut Program, mask: i32, divisor: i32) -> (Function, Inst, Inst) {
         let f = program.new_function(Type::get_i32(), "target".into(), vec![Type::get_i32()]);
         let rem = {
             let data = program.func_data_mut(f);

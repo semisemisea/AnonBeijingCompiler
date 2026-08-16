@@ -105,12 +105,11 @@ fn compile_sy_with(source: &str, target: Target, opt_level: u8, use_dfe: bool) -
         Target::Aarch64 => raana_ir::opt::config::TargetPolicy::aarch64(),
         Target::Riscv64 => raana_ir::opt::config::TargetPolicy::riscv64(),
     };
-    let mut pass_manager = raana_ir::opt::pass::PassesManager::from_config(
-        raana_ir::opt::config::PassesConfig {
+    let mut pass_manager =
+        raana_ir::opt::pass::PassesManager::from_config(raana_ir::opt::config::PassesConfig {
             dead_function_elimination: use_dfe,
             ..raana_ir::opt::config::PassesConfig::new(ir_opt_level, target_policy)
-        },
-    );
+        });
     pass_manager.run_passes(&mut program);
     let aarch64_config = match opt_level {
         0 => anon_armv8::AArch64CodegenConfig {
@@ -296,15 +295,14 @@ mod tests {
         let mut ctx = AstGenContext::new();
         ast.convert(&mut ctx);
         let mut program = ctx.program;
-        let mut pass_manager = raana_ir::opt::pass::PassesManager::from_config(
-            raana_ir::opt::config::PassesConfig {
+        let mut pass_manager =
+            raana_ir::opt::pass::PassesManager::from_config(raana_ir::opt::config::PassesConfig {
                 dead_function_elimination: false,
                 ..raana_ir::opt::config::PassesConfig::new(
                     raana_ir::opt::config::OptimizationLevel::O2,
                     raana_ir::opt::config::TargetPolicy::aarch64(),
                 )
-            },
-        );
+            });
         pass_manager.run_passes(&mut program);
         let config = AArch64CodegenConfig {
             dce: true,
@@ -345,15 +343,14 @@ mod tests {
         let mut ctx = AstGenContext::new();
         ast.convert(&mut ctx);
         let mut program = ctx.program;
-        let mut pass_manager = raana_ir::opt::pass::PassesManager::from_config(
-            raana_ir::opt::config::PassesConfig {
+        let mut pass_manager =
+            raana_ir::opt::pass::PassesManager::from_config(raana_ir::opt::config::PassesConfig {
                 dead_function_elimination: false,
                 ..raana_ir::opt::config::PassesConfig::new(
                     raana_ir::opt::config::OptimizationLevel::O2,
                     raana_ir::opt::config::TargetPolicy::aarch64(),
                 )
-            },
-        );
+            });
         pass_manager.run_passes(&mut program);
         let config = AArch64CodegenConfig {
             dce: true,
@@ -388,15 +385,14 @@ mod tests {
         let mut ctx = AstGenContext::new();
         ast.convert(&mut ctx);
         let mut program = ctx.program;
-        let mut pass_manager = raana_ir::opt::pass::PassesManager::from_config(
-            raana_ir::opt::config::PassesConfig {
+        let mut pass_manager =
+            raana_ir::opt::pass::PassesManager::from_config(raana_ir::opt::config::PassesConfig {
                 dead_function_elimination: false,
                 ..raana_ir::opt::config::PassesConfig::new(
                     raana_ir::opt::config::OptimizationLevel::O2,
                     raana_ir::opt::config::TargetPolicy::aarch64(),
                 )
-            },
-        );
+            });
         pass_manager.run_passes(&mut program);
         let config = AArch64CodegenConfig {
             dce: true,

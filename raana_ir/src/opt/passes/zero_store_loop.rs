@@ -392,9 +392,9 @@ mod tests {
             let one = data.new_local_inst().integer(1);
             let next_j = data.new_local_inst().binary(BinaryOp::Add, j, one);
             let next_t = data.new_local_inst().binary(BinaryOp::Sub, t, one);
-            let latch = data
-                .new_local_inst()
-                .branch(next_t, header, vec![next_j, next_t], exit, vec![]);
+            let latch =
+                data.new_local_inst()
+                    .branch(next_t, header, vec![next_j, next_t], exit, vec![]);
             for inst in [gep, store, next_j, next_t, latch] {
                 data.layout_mut().insert_inst(body, inst);
             }
@@ -422,15 +422,12 @@ mod tests {
         // not be a fresh GEP (and the block's instruction list must not
         // contain a block-arg reference).
         assert_eq!(mem_zero.dest(), data.params()[0]);
-        assert!(
-            data.layout()
-                .basicblocks()
+        assert!(data.layout().basicblocks().iter().all(|layout| {
+            layout
+                .insts()
                 .iter()
-                .all(|layout| layout
-                    .insts()
-                    .iter()
-                    .all(|&inst| !matches!(data.inst_data(inst).kind(), InstKind::BlockArgRef(..))))
-        );
+                .all(|&inst| !matches!(data.inst_data(inst).kind(), InstKind::BlockArgRef(..)))
+        }));
     }
 
     #[test]

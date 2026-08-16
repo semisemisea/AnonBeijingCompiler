@@ -58,9 +58,7 @@ type Cell = (MemObject, i64);
 fn resolve_cell(env: &BaseEnv, ctx: &ArenaContext<'_>, addr: Inst) -> Option<Cell> {
     let off = env.constant_offset(ctx, addr)?;
     match env.base_of(ctx, addr) {
-        MemObject::Alloc(_) | MemObject::Global(_) => {
-            Some((env.base_of(ctx, addr), off))
-        }
+        MemObject::Alloc(_) | MemObject::Global(_) => Some((env.base_of(ctx, addr), off)),
         _ => None,
     }
 }
@@ -205,9 +203,7 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
             match data.inst_data(inst).kind() {
                 InstKind::Store(store) => match resolve(store.dest()) {
                     Some(cell) => {
-                        if let Some((prev, _)) =
-                            pending.insert(cell, (inst, store.src()))
-                        {
+                        if let Some((prev, _)) = pending.insert(cell, (inst, store.src())) {
                             covered_removals.push(prev);
                         }
                         // Each byte of the stored value overwrites any live
@@ -262,8 +258,7 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                         }
                         // A load of any byte in a live MemZero's range
                         // observes the zeroing: the MemZero must stay.
-                        live_memzeros
-                            .retain(|m| !cell_in_range(&cell, m.root, m.off, m.len));
+                        live_memzeros.retain(|m| !cell_in_range(&cell, m.root, m.off, m.len));
                     }
                     None => {
                         pending.clear();
@@ -280,26 +275,21 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                         Some(write_roots) => {
                             let read_roots = analysis.call_read_roots(callee, func);
                             pending.retain(|cell, _| {
-                                let written = write_roots
-                                    .iter()
-                                    .any(|root| cell_matches_root(cell, root));
+                                let written =
+                                    write_roots.iter().any(|root| cell_matches_root(cell, root));
                                 if written {
                                     return false;
                                 }
                                 match &read_roots {
                                     None => false, // may read anything
                                     Some(roots) => {
-                                        if roots
-                                            .iter()
-                                            .any(|root| cell_matches_root(cell, root))
-                                        {
+                                        if roots.iter().any(|root| cell_matches_root(cell, root)) {
                                             return false;
                                         }
                                         // The call may also read through a
                                         // target set we cannot express as
                                         // roots; be conservative.
-                                        let mut targets =
-                                            rustc_hash::FxHashSet::default();
+                                        let mut targets = rustc_hash::FxHashSet::default();
                                         let obj = cell_to_object(cell, func);
                                         targets.insert(obj);
                                         !analysis.call_may_read(callee, Some(&targets))
@@ -315,13 +305,12 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                             MemZeroLen::Const(n) => *n as i64,
                             MemZeroLen::Value(_) => i64::MAX,
                         };
-                        pending.retain(|cell, _| {
-                            !cell_in_range(cell, root, off, len)
-                        });
+                        pending.retain(|cell, _| !cell_in_range(cell, root, off, len));
                         // A following MemZero zeroes overlapping bytes again:
                         // no coverage can be proven for those live candidates.
-                        live_memzeros
-                            .retain(|m| m.root != root || m.off >= off + len || off >= m.off + m.len);
+                        live_memzeros.retain(|m| {
+                            m.root != root || m.off >= off + len || off >= m.off + m.len
+                        });
                         // Register as a removal candidate. A runtime-length
                         // MemZero (unbounded range) can never be proven fully
                         // covered by stores, so it is not tracked.
@@ -363,12 +352,13 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
 }
 
 /// Convert a cell to the abstract object used by the effects analysis.
-fn cell_to_object(cell: &Cell, func: Function) -> crate::opt::analysis_passes::effects::AbstractObject {
+fn cell_to_object(
+    cell: &Cell,
+    func: Function,
+) -> crate::opt::analysis_passes::effects::AbstractObject {
     match cell.0 {
         MemObject::Global(g) => crate::opt::analysis_passes::effects::AbstractObject::Global(g),
-        MemObject::Alloc(a) => {
-            crate::opt::analysis_passes::effects::AbstractObject::Alloc(func, a)
-        }
+        MemObject::Alloc(a) => crate::opt::analysis_passes::effects::AbstractObject::Alloc(func, a),
         _ => crate::opt::analysis_passes::effects::AbstractObject::Unknown,
     }
 }
@@ -545,10 +535,10 @@ mod tests {
             "load must be forwarded (no remaining users)"
         );
         // The write-back store (of the modified value) must survive.
-        assert!(matches!(
-            data.inst_data(store).kind(),
-            InstKind::Store(..)
-        ), "write-back after a real write must survive");
+        assert!(
+            matches!(data.inst_data(store).kind(), InstKind::Store(..)),
+            "write-back after a real write must survive"
+        );
         let mut stores = Vec::new();
         for block in data.layout().basicblocks() {
             for &inst in block.insts() {
@@ -684,7 +674,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(stores.len(), 3, "no store may be dropped across an unknown write");
+        assert_eq!(
+            stores.len(),
+            3,
+            "no store may be dropped across an unknown write"
+        );
     }
 
     /// A MemZero covering the cell is a read/write barrier: the pending
@@ -782,10 +776,7 @@ mod tests {
                 }
             }
         }
-        assert!(
-            memzeros.is_empty(),
-            "fully covered memzero must be removed"
-        );
+        assert!(memzeros.is_empty(), "fully covered memzero must be removed");
         assert_eq!(stores, 4, "covering stores must survive");
         let _ = memzero;
     }
@@ -836,11 +827,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(
-            memzeros.len(),
-            1,
-            "partially covered memzero must survive"
-        );
+        assert_eq!(memzeros.len(), 1, "partially covered memzero must survive");
         let _ = memzero;
     }
 

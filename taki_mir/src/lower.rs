@@ -942,10 +942,11 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     /// two or more operands are the sharing candidates for this block.
     fn scan_block_const_uses(&mut self, block: HirBasicBlock) -> FxHashSet<i64> {
         let mut counts: FxHashMap<i64, usize> = FxHashMap::default();
-        let func = self
-            .arena
-            .program
-            .func_data(self.arena.curr_func.expect("function is set during lowering"));
+        let func = self.arena.program.func_data(
+            self.arena
+                .curr_func
+                .expect("function is set during lowering"),
+        );
         let insts = func.layout().basicblock(block).insts().to_vec();
         for inst in insts {
             for operand in self.arena.inst_data(*inst).inst_usage() {
@@ -983,10 +984,11 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
     /// loop-level sharing candidates.
     fn scan_loop_const_uses(&mut self) -> FxHashSet<(usize, i64)> {
         let mut counts: FxHashMap<(usize, i64), usize> = FxHashMap::default();
-        let func = self
-            .arena
-            .program
-            .func_data(self.arena.curr_func.expect("function is set during lowering"));
+        let func = self.arena.program.func_data(
+            self.arena
+                .curr_func
+                .expect("function is set during lowering"),
+        );
         for (index, loop_info) in self.loop_analysis.loops().iter().enumerate() {
             let mut blocks: Vec<HirBasicBlock> = loop_info.body().iter().copied().collect();
             blocks.push(loop_info.header());
@@ -1027,8 +1029,7 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         if let Some(&shared) = self.loop_const_shared.get(&(loop_index, value)) {
             return Some(shared);
         }
-        let preheader = self.loop_analysis.loops()[loop_index]
-            .get_preheader(&self.loop_cfg)?;
+        let preheader = self.loop_analysis.loops()[loop_index].get_preheader(&self.loop_cfg)?;
         let shared = self.alloc_tmp(HirType::get_i32());
         self.loop_const_shared.insert((loop_index, value), shared);
         self.loop_emissions
@@ -1156,12 +1157,9 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
         edges: &[(HirInst, HirInst)],
         root: HirInst,
     ) -> bool {
-        if edges
-            .iter()
-            .any(|&(producer, consumer)| {
-                !self.can_sink_pure_single_use_producer(producer, consumer, root)
-            })
-        {
+        if edges.iter().any(|&(producer, consumer)| {
+            !self.can_sink_pure_single_use_producer(producer, consumer, root)
+        }) {
             return false;
         }
         for &(producer, _) in edges {

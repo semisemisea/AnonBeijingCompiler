@@ -66,7 +66,8 @@ impl Pass for BlockedReduction {
         }
         let (cfg, dom_tree, loop_analysis) = LoopAnalysis::from_cfg(cfg);
         for looop in loop_analysis.loops() {
-            let Some(candidate) = Self::find_candidate(data, &cfg, &dom_tree, &loop_analysis, looop)
+            let Some(candidate) =
+                Self::find_candidate(data, &cfg, &dom_tree, &loop_analysis, looop)
             else {
                 continue;
             };
@@ -248,7 +249,11 @@ impl BlockedReduction {
             return None;
         }
         let row_base = row_gep.base();
-        if data.layout().parent_bb(row_base).is_some_and(|b| looop.contains(b)) {
+        if data
+            .layout()
+            .parent_bb(row_base)
+            .is_some_and(|b| looop.contains(b))
+        {
             return None;
         }
         if !row_gep.offsets().iter().any(|&offset| offset == k_param) {
@@ -316,12 +321,7 @@ impl BlockedReduction {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn apply(
-        data: &mut ArenaContextMut<'_>,
-        cfg: &CFG,
-        looop: &Loop,
-        cand: &Candidate,
-    ) -> bool {
+    fn apply(data: &mut ArenaContextMut<'_>, cfg: &CFG, looop: &Loop, cand: &Candidate) -> bool {
         // A dedicated preheader anchors the versioning block.
         let Some(preheader) = ensure_preheader(data, cfg, looop) else {
             return false;
@@ -333,17 +333,35 @@ impl BlockedReduction {
             return false;
         };
         let orig_args = jump.args().to_vec();
-        let k_idx = cand.header_params.iter().position(|&p| p == cand.k_param).unwrap();
-        let acc_idx = cand.header_params.iter().position(|&p| p == cand.acc_param).unwrap();
-        let ctr_idx = cand.header_params.iter().position(|&p| p == cand.ctr_param).unwrap();
-        let ptr_idx = cand.header_params.iter().position(|&p| p == cand.ptr_param).unwrap();
+        let k_idx = cand
+            .header_params
+            .iter()
+            .position(|&p| p == cand.k_param)
+            .unwrap();
+        let acc_idx = cand
+            .header_params
+            .iter()
+            .position(|&p| p == cand.acc_param)
+            .unwrap();
+        let ctr_idx = cand
+            .header_params
+            .iter()
+            .position(|&p| p == cand.ctr_param)
+            .unwrap();
+        let ptr_idx = cand
+            .header_params
+            .iter()
+            .position(|&p| p == cand.ptr_param)
+            .unwrap();
         let acc_in = orig_args[acc_idx];
         let ptr_in = orig_args[ptr_idx];
 
         let pt_count = cand.passthroughs.len();
         let main_arg_count = UNROLL_FACTOR * 2 + 2 + pt_count;
         let main_types = main_block_types(data, cand);
-        let version = data.new_basic_block().basic_block("blocked_guard".into(), vec![]);
+        let version = data
+            .new_basic_block()
+            .basic_block("blocked_guard".into(), vec![]);
         let main_header = data
             .new_basic_block()
             .basic_block("blocked_main_header".into(), main_types.clone());
@@ -361,7 +379,8 @@ impl BlockedReduction {
         let main_params = data.bb_data(main_header).params().to_vec();
         let body_params = data.bb_data(main_body).params().to_vec();
         let exit_params = data.bb_data(main_exit).params().to_vec();
-        let (acc_start, k_mi, ctr_mi, ptr_start) = (0usize, UNROLL_FACTOR, UNROLL_FACTOR + 1, UNROLL_FACTOR + 2);
+        let (acc_start, k_mi, ctr_mi, ptr_start) =
+            (0usize, UNROLL_FACTOR, UNROLL_FACTOR + 1, UNROLL_FACTOR + 2);
         let pt_start = UNROLL_FACTOR * 2 + 2;
 
         // ---- versioning block: guard bound >= 4 ----
@@ -384,7 +403,9 @@ impl BlockedReduction {
             if lane == 0 {
                 main_init.push(ptr_in);
             } else {
-                let off = data.new_local_value().integer((lane as i64 * cand.stride) as i32);
+                let off = data
+                    .new_local_value()
+                    .integer((lane as i64 * cand.stride) as i32);
                 let p = data.new_local_value().get_elem_ptr(ptr_in, vec![off]);
                 data.layout_mut().insert_inst(version, p);
                 main_init.push(p);
@@ -393,13 +414,9 @@ impl BlockedReduction {
         for (_, idx) in &cand.passthroughs {
             main_init.push(orig_args[*idx]);
         }
-        let guard_branch = data.new_local_value().branch(
-            guard,
-            main_header,
-            main_init,
-            cand.header,
-            orig_args,
-        );
+        let guard_branch =
+            data.new_local_value()
+                .branch(guard, main_header, main_init, cand.header, orig_args);
         for inst in [guard, masked, guard_branch] {
             data.layout_mut().insert_inst(version, inst);
         }
@@ -472,7 +489,14 @@ impl BlockedReduction {
             back_args.push(p);
         }
         for (_, idx) in &cand.passthroughs {
-            back_args.push(main_params[pt_start + cand.passthroughs.iter().position(|(_, i)| i == idx).unwrap()]);
+            back_args.push(
+                main_params[pt_start
+                    + cand
+                        .passthroughs
+                        .iter()
+                        .position(|(_, i)| i == idx)
+                        .unwrap()],
+            );
         }
         let back = data.new_local_value().branch(
             ctrm_next,
@@ -489,12 +513,16 @@ impl BlockedReduction {
         // jump straight to the original exit (the original loop is test-at-
         // bottom, so re-entering the header with a zero counter would run one
         // extra iteration). ----
-        let s01 = data
-            .new_local_value()
-            .binary(BinaryOp::Add, exit_params[acc_start], exit_params[acc_start + 1]);
-        let s23 = data
-            .new_local_value()
-            .binary(BinaryOp::Add, exit_params[acc_start + 2], exit_params[acc_start + 3]);
+        let s01 = data.new_local_value().binary(
+            BinaryOp::Add,
+            exit_params[acc_start],
+            exit_params[acc_start + 1],
+        );
+        let s23 = data.new_local_value().binary(
+            BinaryOp::Add,
+            exit_params[acc_start + 2],
+            exit_params[acc_start + 3],
+        );
         let total = data.new_local_value().binary(BinaryOp::Add, s01, s23);
         let acc_final = data.new_local_value().binary(BinaryOp::Add, acc_in, total);
         // exit_params[k_mi] = bound & ~3 (the iterations the main loop ran).
@@ -512,7 +540,11 @@ impl BlockedReduction {
             } else if param == cand.ptr_param {
                 tail_args.push(exit_params[ptr_start]);
             } else {
-                let pt = cand.passthroughs.iter().position(|(_, i)| *i == index).unwrap();
+                let pt = cand
+                    .passthroughs
+                    .iter()
+                    .position(|(_, i)| *i == index)
+                    .unwrap();
                 tail_args.push(exit_params[pt_start + pt]);
             }
         }
@@ -530,13 +562,9 @@ impl BlockedReduction {
                 unreachable!("exit arguments were verified in find_candidate");
             }
         }
-        let tail = data.new_local_value().branch(
-            ctr_final,
-            cand.header,
-            tail_args,
-            cand.exit,
-            exit_args,
-        );
+        let tail =
+            data.new_local_value()
+                .branch(ctr_final, cand.header, tail_args, cand.exit, exit_args);
         for inst in [s01, s23, total, acc_final, ctr_final, tail] {
             data.layout_mut().insert_inst(main_exit, inst);
         }
@@ -610,7 +638,11 @@ fn init_arg(
         if found.is_some() {
             return None; // multiple entries
         }
-        let idx = data.bb_data(header).params().iter().position(|&p| p == param)?;
+        let idx = data
+            .bb_data(header)
+            .params()
+            .iter()
+            .position(|&p| p == param)?;
         found = edge.args(data).get(idx).copied();
     }
     found
@@ -779,7 +811,9 @@ mod tests {
 
         let zero = data.new_local_inst().integer(0);
         let bound_inst = data.new_local_inst().integer(bound);
-        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero, bound_inst, col_base]);
+        let entry_jump = data
+            .new_local_inst()
+            .jump(header, vec![zero, zero, bound_inst, col_base]);
         data.layout_mut().insert_inst(entry, entry_jump);
 
         let one = data.new_local_inst().integer(1);
@@ -787,15 +821,16 @@ mod tests {
         let row_load = data.new_local_inst().load(row_gep);
         let col_gep = data.new_local_inst().get_elem_ptr(ptr, vec![zero]);
         let col_load = data.new_local_inst().load(col_gep);
-        let mul = data.new_local_inst().binary(BinaryOp::Mul, row_load, col_load);
+        let mul = data
+            .new_local_inst()
+            .binary(BinaryOp::Mul, row_load, col_load);
         let acc_update = data.new_local_inst().binary(BinaryOp::Sub, acc, mul);
         let k_update = data.new_local_inst().binary(BinaryOp::Add, k, one);
         let ctr_update = data.new_local_inst().binary(BinaryOp::Sub, ctr, one);
         let stride_inst = data.new_local_inst().integer(stride);
         let ptr_update = data.new_local_inst().get_elem_ptr(ptr, vec![stride_inst]);
         for inst in [
-            row_gep, row_load, col_gep, col_load, mul, acc_update, k_update, ctr_update,
-            ptr_update,
+            row_gep, row_load, col_gep, col_load, mul, acc_update, k_update, ctr_update, ptr_update,
         ] {
             data.layout_mut().insert_inst(body, inst);
         }

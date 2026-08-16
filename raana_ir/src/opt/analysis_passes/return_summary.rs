@@ -33,10 +33,7 @@ use crate::{
     ir::{BasicBlock, BinaryOp, Function, Inst, InstKind, Program, arena::Arena},
     opt::{
         analysis_passes::pure_function::pure_functions,
-        utils::{
-            cfg::CFG,
-            logical_edge::incoming_edges,
-        },
+        utils::{cfg::CFG, logical_edge::incoming_edges},
     },
 };
 
@@ -56,9 +53,7 @@ pub fn nonneg_preserving_functions(program: &Program) -> FxHashSet<Function> {
     loop {
         let mut changed = false;
         for &f in program.function_layout() {
-            if pure.contains(&f)
-                && !nonneg.contains(&f)
-                && !program.func_data(f).layout().is_decl()
+            if pure.contains(&f) && !nonneg.contains(&f) && !program.func_data(f).layout().is_decl()
             {
                 let mut assumed = nonneg.clone();
                 assumed.insert(f);
@@ -147,7 +142,9 @@ fn param_provable_at_all_sites(
         for layout in caller_data.layout().basicblocks() {
             for &inst in layout.insts() {
                 let args: SmallVec<[Inst; 8]> = match caller_data.inst_data(inst).kind() {
-                    InstKind::Call(call) if call.callee() == f => call.args().iter().copied().collect(),
+                    InstKind::Call(call) if call.callee() == f => {
+                        call.args().iter().copied().collect()
+                    }
                     InstKind::TailCall(tail) if tail.callee() == f => {
                         tail.args().iter().copied().collect()
                     }
@@ -357,9 +354,7 @@ fn value_is_nonneg(
 /// for non-negative `x`.
 fn halving_base(data: &crate::ir::FunctionData, value: Inst) -> Option<Inst> {
     let (lhs, rhs) = match data.inst_data(value).kind() {
-        InstKind::Binary(binary) if binary.op() == BinaryOp::Add => {
-            (binary.lhs(), binary.rhs())
-        }
+        InstKind::Binary(binary) if binary.op() == BinaryOp::Add => (binary.lhs(), binary.rhs()),
         _ => return None,
     };
     let shr_is = |inst: Inst| -> bool {
@@ -385,9 +380,7 @@ fn halving_base(data: &crate::ir::FunctionData, value: Inst) -> Option<Inst> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ir::{Program, Type, arena::Arena, builder_trait::*},
-    };
+    use crate::ir::{Program, Type, arena::Arena, builder_trait::*};
 
     const P: i32 = 998244353;
 
@@ -418,7 +411,9 @@ mod tests {
             let b = data.params()[1];
             let zero = data.new_local_inst().integer(0);
             let cond = data.new_local_inst().binary(BinaryOp::Lt, b, zero);
-            let branch = data.new_local_inst().branch(cond, zero_block, vec![], fast, vec![]);
+            let branch = data
+                .new_local_inst()
+                .branch(cond, zero_block, vec![], fast, vec![]);
             data.layout_mut().insert_inst(entry, cond);
             data.layout_mut().insert_inst(entry, branch);
             let ret_zero = data.new_local_inst().ret(Some(zero));
@@ -440,7 +435,11 @@ mod tests {
         let modmul = declare_modmul(&mut program);
         build_multiply(&mut program, modmul);
         let set = nonneg_preserving_functions(&program);
-        assert_eq!(set.len(), 1, "only multiply should preserve non-negativity: {set:?}");
+        assert_eq!(
+            set.len(),
+            1,
+            "only multiply should preserve non-negativity: {set:?}"
+        );
     }
 
     #[test]
@@ -460,10 +459,7 @@ mod tests {
             data.layout_mut().insert_inst(entry, ret);
         }
         let set = nonneg_preserving_functions(&program);
-        assert!(
-            !set.contains(&f),
-            "f(x) = -x must not be preserving"
-        );
+        assert!(!set.contains(&f), "f(x) = -x must not be preserving");
     }
 
     /// `power(a, b)` with the M60-inlined multiply: returns `soyo_mulmod` of the
@@ -496,9 +492,9 @@ mod tests {
                 .new_local_inst()
                 .call_with_type(f, vec![a, half], Type::get_i32());
             // cur = soyo_mulmod(rec, rec, P)
-            let cur = data
-                .new_local_inst()
-                .call_with_type(modmul, vec![rec, rec, p], Type::get_i32());
+            let cur =
+                data.new_local_inst()
+                    .call_with_type(modmul, vec![rec, rec, p], Type::get_i32());
             // b & 0x80000001 == 1 ? soyo_mulmod(cur, a, P) : cur
             let mask = data.new_local_inst().integer(-2147483647);
             let and = data.new_local_inst().binary(BinaryOp::And, b, mask);
@@ -509,9 +505,9 @@ mod tests {
             }
             let ret_even = data.new_local_inst().ret(Some(cur));
             data.layout_mut().insert_inst(even, ret_even);
-            let odd_call = data
-                .new_local_inst()
-                .call_with_type(modmul, vec![cur, a, p], Type::get_i32());
+            let odd_call =
+                data.new_local_inst()
+                    .call_with_type(modmul, vec![cur, a, p], Type::get_i32());
             let ret_odd = data.new_local_inst().ret(Some(odd_call));
             data.layout_mut().insert_inst(odd, odd_call);
             data.layout_mut().insert_inst(odd, ret_odd);
@@ -534,11 +530,7 @@ mod tests {
         let mut program = Program::new();
         let modmul = declare_modmul(&mut program);
         build_multiply(&mut program, modmul);
-        let f = program.new_function(
-            Type::get_i32(),
-            "f".into(),
-            vec![Type::get_i32()],
-        );
+        let f = program.new_function(Type::get_i32(), "f".into(), vec![Type::get_i32()]);
         {
             let data = program.func_data_mut(f);
             let entry = data.add_entry_block();

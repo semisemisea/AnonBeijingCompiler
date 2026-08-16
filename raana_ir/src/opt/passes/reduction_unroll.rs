@@ -356,18 +356,15 @@ impl ReductionUnroll {
         let version = data
             .new_basic_block()
             .basic_block("reduction_guard".into(), vec![]);
-        let main_header = data.new_basic_block().basic_block(
-            "reduction_main_header".into(),
-            main_tys.clone(),
-        );
-        let main_body = data.new_basic_block().basic_block(
-            "reduction_main_body".into(),
-            main_tys.clone(),
-        );
-        let main_exit = data.new_basic_block().basic_block(
-            "reduction_main_exit".into(),
-            main_tys,
-        );
+        let main_header = data
+            .new_basic_block()
+            .basic_block("reduction_main_header".into(), main_tys.clone());
+        let main_body = data
+            .new_basic_block()
+            .basic_block("reduction_main_body".into(), main_tys.clone());
+        let main_exit = data
+            .new_basic_block()
+            .basic_block("reduction_main_exit".into(), main_tys);
         data.layout_mut().insert_bb_after(preheader, version);
         data.layout_mut().insert_bb_after(version, main_header);
         data.layout_mut().insert_bb_after(main_header, main_body);
@@ -435,10 +432,9 @@ impl ReductionUnroll {
                     let lane_off = data
                         .new_local_value()
                         .integer((lane as i64 * ptr.stride) as i32);
-                    let lane_ptr = data.new_local_value().get_elem_ptr(
-                        main_params[UNROLL_FACTOR + 2],
-                        vec![lane_off],
-                    );
+                    let lane_ptr = data
+                        .new_local_value()
+                        .get_elem_ptr(main_params[UNROLL_FACTOR + 2], vec![lane_off]);
                     data.layout_mut().insert_inst(main_body, lane_ptr);
                     Some(lane_ptr)
                 }
@@ -457,8 +453,7 @@ impl ReductionUnroll {
                 block: main_body,
             };
             for &inst in &body_insts[..body_insts.len() - 1] {
-                if inst == cand.j_back
-                    || cand.ptr.as_ref().is_some_and(|ptr| inst == ptr.ptr_back)
+                if inst == cand.j_back || cand.ptr.as_ref().is_some_and(|ptr| inst == ptr.ptr_back)
                 {
                     continue;
                 }
@@ -484,13 +479,10 @@ impl ReductionUnroll {
             jm_next,
         ];
         if let Some(ptr) = &cand.ptr {
-            let four_stride = data
+            let four_stride = data.new_local_value().integer((4 * ptr.stride) as i32);
+            let ptr_next = data
                 .new_local_value()
-                .integer((4 * ptr.stride) as i32);
-            let ptr_next = data.new_local_value().get_elem_ptr(
-                main_params[UNROLL_FACTOR + 2],
-                vec![four_stride],
-            );
+                .get_elem_ptr(main_params[UNROLL_FACTOR + 2], vec![four_stride]);
             data.layout_mut().insert_inst(main_body, ptr_next);
             back_args.push(ptr_next);
         }
@@ -986,9 +978,7 @@ mod tests {
         }
 
         let zero = data.new_local_inst().integer(0);
-        let entry_jump = data
-            .new_local_inst()
-            .jump(header, vec![zero, zero, base]);
+        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero, base]);
         data.layout_mut().insert_inst(entry, entry_jump);
 
         let (j, acc, ptr) = {
@@ -998,9 +988,7 @@ mod tests {
         let one = data.new_local_inst().integer(1);
 
         let zero_off = data.new_local_inst().integer(0);
-        let c_gep = data
-            .new_local_inst()
-            .get_elem_ptr(c, vec![zero_off, j]);
+        let c_gep = data.new_local_inst().get_elem_ptr(c, vec![zero_off, j]);
         let c_val = data.new_local_inst().load(c_gep);
         let a_gep = data.new_local_inst().get_elem_ptr(ptr, vec![zero_off]);
         let a_val = data.new_local_inst().load(a_gep);
@@ -1009,7 +997,9 @@ mod tests {
         let j2 = data.new_local_inst().binary(BinaryOp::Add, j, one);
         let stride = data.new_local_inst().integer(1024);
         let ptr2 = data.new_local_inst().get_elem_ptr(ptr, vec![stride]);
-        for inst in [c_gep, c_val, zero_off, a_gep, a_val, mul, acc2, j2, stride, ptr2] {
+        for inst in [
+            c_gep, c_val, zero_off, a_gep, a_val, mul, acc2, j2, stride, ptr2,
+        ] {
             data.layout_mut().insert_inst(body, inst);
         }
         let back = data.new_local_inst().jump(header, vec![j2, acc2, ptr2]);
@@ -1086,9 +1076,7 @@ mod tests {
         }
         let expected = vec![0, 1024, 2048, 3072, 4096];
         assert!(
-            expected
-                .iter()
-                .all(|off| lane_offsets.contains(off)),
+            expected.iter().all(|off| lane_offsets.contains(off)),
             "lane loads must cover ptr + {{0,1024,2048,3072}} and the back-edge +4096, got {lane_offsets:?}"
         );
 

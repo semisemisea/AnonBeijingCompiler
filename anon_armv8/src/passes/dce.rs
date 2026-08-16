@@ -218,7 +218,7 @@ mod tests {
 
     use super::*;
     use crate::instructions::{AluOp, MemoryType, PairAMode, SImm7Scaled};
-    use crate::regs::{int_reg, OperandSize, RegOrZr};
+    use crate::regs::{OperandSize, RegOrZr, int_reg};
 
     fn vreg(index: u32) -> Reg {
         // The first 192 vregs are pinned to physical registers; allocate

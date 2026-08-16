@@ -108,7 +108,9 @@ impl BaseEnv {
                 match data.inst_data(inst).kind() {
                     InstKind::Store(store) => {
                         let dest = store.dest();
-                        if !dest.is_global() && matches!(data.inst_data(dest).kind(), InstKind::Alloc) {
+                        if !dest.is_global()
+                            && matches!(data.inst_data(dest).kind(), InstKind::Alloc)
+                        {
                             if ambiguous.contains(&dest) {
                                 continue;
                             }
@@ -120,7 +122,9 @@ impl BaseEnv {
                     }
                     InstKind::MemZero(mem_zero) => {
                         let dest = mem_zero.dest();
-                        if !dest.is_global() && matches!(data.inst_data(dest).kind(), InstKind::Alloc) {
+                        if !dest.is_global()
+                            && matches!(data.inst_data(dest).kind(), InstKind::Alloc)
+                        {
                             stored.remove(&dest);
                             ambiguous.insert(dest);
                         }
@@ -231,7 +235,10 @@ impl BaseEnv {
             InstKind::Alloc => Some(MemObject::Alloc(ptr)),
             InstKind::GlobalAlloc(..) => Some(MemObject::Global(ptr)),
             InstKind::GetElemPtr(gep) => {
-                if matches!(arena.inst_data(gep.base()).kind(), InstKind::GlobalAlloc(..)) {
+                if matches!(
+                    arena.inst_data(gep.base()).kind(),
+                    InstKind::GlobalAlloc(..)
+                ) {
                     return Some(MemObject::Global(gep.base()));
                 }
                 work.get(&gep.base()).copied().flatten()
@@ -349,11 +356,7 @@ impl BaseEnv {
                         Some(None) => all_set = false,
                     }
                 }
-                if all_set {
-                    Some(result)
-                } else {
-                    None
-                }
+                if all_set { Some(result) } else { None }
             }
             InstKind::GetElemPtr(gep) => {
                 let base_off = if matches!(
@@ -365,7 +368,7 @@ impl BaseEnv {
                     work.get(&gep.base()).copied().flatten()
                 };
                 let mut off = match base_off {
-                    None => return None,          // base pending
+                    None => return None, // base pending
                     Some(None) => return Some(None),
                     Some(Some(o)) => o,
                 };
@@ -454,9 +457,10 @@ impl BaseEnv {
     /// NoAlias (disjoint byte intervals) or MustAlias (same start offset);
     /// anything else stays MayAlias.
     fn offset_alias<A: Arena + ?Sized>(&self, arena: &A, a: Inst, b: Inst) -> AliasResult {
-        let (Some(off_a), Some(off_b)) =
-            (self.constant_offset(arena, a), self.constant_offset(arena, b))
-        else {
+        let (Some(off_a), Some(off_b)) = (
+            self.constant_offset(arena, a),
+            self.constant_offset(arena, b),
+        ) else {
             return AliasResult::MayAlias;
         };
         let size_a = access_size(arena, a);
@@ -530,8 +534,11 @@ mod tests {
     #[test]
     fn base_of_gep_walks_to_base() {
         let mut program = Program::new();
-        let function =
-            program.new_function(Type::get_unit(), "f".into(), vec![Type::get_i32().reference()]);
+        let function = program.new_function(
+            Type::get_unit(),
+            "f".into(),
+            vec![Type::get_i32().reference()],
+        );
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
         let param = data.params()[0];
@@ -559,7 +566,9 @@ mod tests {
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
         let param = data.params()[0];
-        let slot = data.new_local_inst().alloc(Type::get_i32().reference().reference());
+        let slot = data
+            .new_local_inst()
+            .alloc(Type::get_i32().reference().reference());
         data.layout_mut().insert_inst(entry, slot);
         let store = data.new_local_inst().store(param, slot);
         data.layout_mut().insert_inst(entry, store);
@@ -703,7 +712,9 @@ mod tests {
         let data = program.func_data_mut(function);
         let entry = data.add_entry_block();
         // A local i32 array base; offsets 0, 4, 8 are pairwise disjoint.
-        let alloc = data.new_local_inst().alloc(Type::get_array(Type::get_i32(), 4));
+        let alloc = data
+            .new_local_inst()
+            .alloc(Type::get_array(Type::get_i32(), 4));
         data.layout_mut().insert_inst(entry, alloc);
         let zero = data.new_local_inst().integer(0);
         let one = data.new_local_inst().integer(1);

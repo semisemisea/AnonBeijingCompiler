@@ -1,8 +1,6 @@
 use crate::{
     ir::{
-        BinaryOp, Function, Inst, InstKind, Program, Type,
-        arena::Arena,
-        basic_block::BasicBlock,
+        BinaryOp, Function, Inst, InstKind, Program, Type, arena::Arena, basic_block::BasicBlock,
     },
     opt::{pass::Pass, prelude::*},
 };
@@ -445,7 +443,13 @@ fn rewrite(program: &mut Program, f: Function, helper: Function, modulus: i32) {
     // Detach the entry's instructions first (their branches point at the
     // blocks about to be removed), then drop every other block. The entry's
     // block parameters (the function's `a`, `b`) are kept.
-    let entry_insts: Vec<Inst> = data.layout().basicblock(entry).insts().iter().copied().collect();
+    let entry_insts: Vec<Inst> = data
+        .layout()
+        .basicblock(entry)
+        .insts()
+        .iter()
+        .copied()
+        .collect();
     for inst in entry_insts {
         data.remove_layout_inst(entry, inst);
     }
@@ -465,8 +469,12 @@ fn rewrite(program: &mut Program, f: Function, helper: Function, modulus: i32) {
 
     let zero = data.new_local_inst().integer(0);
     let cond = data.new_local_inst().binary(BinaryOp::Lt, b, zero);
-    let then_zero = data.new_basic_block().basic_block("mulmod_zero".into(), vec![]);
-    let then_fast = data.new_basic_block().basic_block("mulmod_fast".into(), vec![]);
+    let then_zero = data
+        .new_basic_block()
+        .basic_block("mulmod_zero".into(), vec![]);
+    let then_fast = data
+        .new_basic_block()
+        .basic_block("mulmod_fast".into(), vec![]);
     data.layout_mut().push_bb_back(then_zero);
     data.layout_mut().push_bb_back(then_fast);
 
@@ -529,13 +537,17 @@ mod tests {
             let one = data.new_local_inst().integer(1);
             let mod_const = data.new_local_inst().integer(MOD);
 
-            let entry_br = data.new_local_inst().branch(b, end_2, vec![], then_1, vec![]);
+            let entry_br = data
+                .new_local_inst()
+                .branch(b, end_2, vec![], then_1, vec![]);
             data.layout_mut().insert_inst(entry, entry_br);
             let ret_0 = data.new_local_inst().ret(Some(zero));
             data.layout_mut().insert_inst(then_1, ret_0);
 
             let eq1 = data.new_local_inst().binary(BinaryOp::Eq, b, one);
-            let br2 = data.new_local_inst().branch(eq1, then_3, vec![], end_4, vec![]);
+            let br2 = data
+                .new_local_inst()
+                .branch(eq1, then_3, vec![], end_4, vec![]);
             data.layout_mut().insert_inst(end_2, br2);
 
             let rem_a = data.new_local_inst().binary(BinaryOp::Rem, a, mod_const);
@@ -550,17 +562,23 @@ mod tests {
                 .new_local_inst()
                 .call_with_type(f, vec![a, sar], Type::get_i32());
             let rec_add = data.new_local_inst().binary(BinaryOp::Add, call, call);
-            let double = data.new_local_inst().binary(BinaryOp::Rem, rec_add, mod_const);
+            let double = data
+                .new_local_inst()
+                .binary(BinaryOp::Rem, rec_add, mod_const);
             let mask = data.new_local_inst().integer(-2147483647);
             let and = data.new_local_inst().binary(BinaryOp::And, b, mask);
             let eq_par = data.new_local_inst().binary(BinaryOp::Eq, and, one);
-            let br3 = data.new_local_inst().branch(eq_par, then_5, vec![], else_6, vec![]);
+            let br3 = data
+                .new_local_inst()
+                .branch(eq_par, then_5, vec![], else_6, vec![]);
             for inst in [shr, add_b, sar, call, rec_add, double, and, eq_par, br3] {
                 data.layout_mut().insert_inst(end_4, inst);
             }
 
             let odd_add = data.new_local_inst().binary(BinaryOp::Add, double, a);
-            let odd_rem = data.new_local_inst().binary(BinaryOp::Rem, odd_add, mod_const);
+            let odd_rem = data
+                .new_local_inst()
+                .binary(BinaryOp::Rem, odd_add, mod_const);
             let ret_odd = data.new_local_inst().ret(Some(odd_rem));
             data.layout_mut().insert_inst(then_5, odd_add);
             data.layout_mut().insert_inst(then_5, odd_rem);
@@ -604,9 +622,12 @@ mod tests {
                 if program.func_data(c.callee()).name() == MULMOD_HELPER)
         }));
         // The helper is declared in the program.
-        assert!(program.function_layout().iter().any(|&g| {
-            program.func_data(g).name() == MULMOD_HELPER
-        }));
+        assert!(
+            program
+                .function_layout()
+                .iter()
+                .any(|&g| { program.func_data(g).name() == MULMOD_HELPER })
+        );
     }
 
     #[test]

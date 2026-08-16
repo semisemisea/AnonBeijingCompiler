@@ -1672,7 +1672,7 @@ mod tests {
     use super::*;
     use raana_ir::ir::{
         Program,
-        builder_trait::{BasicBlockBuilder, LocalInstBuilder, ScalarInstBuilder},
+        builder_trait::{LocalInstBuilder, ScalarInstBuilder},
     };
 
     #[test]

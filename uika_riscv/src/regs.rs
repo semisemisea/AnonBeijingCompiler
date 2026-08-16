@@ -34,7 +34,6 @@ pub fn writable_a1() -> Writable<Reg> {
     Writable::from_reg(a1())
 }
 #[inline]
-#[expect(dead_code, reason = "here if needed in the future")]
 pub fn writable_a2() -> Writable<Reg> {
     Writable::from_reg(a2())
 }
@@ -48,7 +47,6 @@ pub fn writable_fa0() -> Writable<Reg> {
     Writable::from_reg(fa0())
 }
 #[inline]
-#[expect(dead_code, reason = "here if needed in the future")]
 pub fn writable_fa1() -> Writable<Reg> {
     Writable::from_reg(fa1())
 }

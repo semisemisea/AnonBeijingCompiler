@@ -386,108 +386,6 @@ fn reg_add_imm(insts: &mut SmallVec<[MInst; 16]>, rd: Writable<Reg>, rs: Reg, am
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        instructions::{AMode, LoadOP, MInst, StoreOP},
-        regs::{ARG_REG, FARG_REG, px_reg},
-    };
-    use raana_ir::ir::Type as HirType;
-    use taki_mir::reg_alloc::reg::PRegSet;
-    use taki_mir::types::I32;
-
-    #[test]
-    fn i32_negative_immediates_are_sign_extended() {
-        let inst = Riscv64ABI::gen_load_imm(
-            Writable::from_reg(Reg::from_physical_reg(px_reg(5))),
-            (-1_i32) as u32 as u64,
-            I32,
-        );
-
-        let MInst::LoadImm { value, .. } = inst else {
-            panic!("expected an immediate load");
-        };
-        assert_eq!(value, u64::MAX);
-    }
-
-    #[test]
-    fn stack_to_stack_spill_move_uses_the_reserved_scratch_register() {
-        let insts = Riscv64ABI::gen_stack_to_stack_move(16, 24);
-
-        assert_eq!(insts.len(), 2);
-        assert!(matches!(
-            insts[0],
-            MInst::LoadWord {
-                rd,
-                op: LoadOP::Ld,
-                addr: AMode::SPOffset(16),
-            } if rd.to_reg() == spilltmp_reg()
-        ));
-        assert!(matches!(
-            insts[1],
-            MInst::StoreWord {
-                rs,
-                op: StoreOP::Sd,
-                addr: AMode::SPOffset(24),
-            } if rs == spilltmp_reg()
-        ));
-    }
-
-    #[test]
-    fn machine_environment_reserves_abi_and_frame_offset_scratch_registers() {
-        let env = create_reg_environment();
-        let allocatable = PRegSet::from(&env);
-
-        for preg in [px_reg(1), px_reg(2), px_reg(8), px_reg(30), px_reg(31)] {
-            assert!(!allocatable.contains(preg), "{preg:?} must be reserved");
-        }
-        assert_eq!(env.scratch_by_class[0], Some(px_reg(31)));
-        assert_eq!(
-            env.post_ra_scratch_by_class[0],
-            vec![px_reg(30), px_reg(31)]
-        );
-    }
-
-    #[test]
-    fn argument_layout_uses_independent_register_banks() {
-        let types = vec![HirType::get_i32(); 8]
-            .into_iter()
-            .chain(vec![HirType::get_f32(); 8])
-            .collect::<Vec<_>>();
-        let (locations, stack_size) = Riscv64ABI::compute_call_arg_loc(&types);
-
-        assert_eq!(stack_size, 0);
-        assert!(matches!(
-            locations[7],
-            ArgSlot::Reg { reg, .. } if reg == ARG_REG[7].to_physical_reg().unwrap()
-        ));
-        assert!(matches!(
-            locations[15],
-            ArgSlot::Reg { reg, .. } if reg == FARG_REG[7].to_physical_reg().unwrap()
-        ));
-    }
-
-    #[test]
-    fn argument_layout_uses_fixed_eight_byte_stack_slots() {
-        let mut types = vec![HirType::get_pointer(HirType::get_i32()); 9];
-        types.extend(vec![HirType::get_i32(); 1]);
-        types.extend(vec![HirType::get_f32(); 9]);
-        types.extend(vec![HirType::get_pointer(HirType::get_i32()); 1]);
-        let (locations, stack_size) = Riscv64ABI::compute_call_arg_loc(&types);
-        let stack_offsets: Vec<_> = locations
-            .iter()
-            .filter_map(|location| match location {
-                ArgSlot::Stack { offset, .. } => Some(*offset),
-                ArgSlot::Reg { .. } => None,
-            })
-            .collect();
-
-        assert_eq!(stack_offsets, vec![0, 8, 16, 24]);
-        assert_eq!(stack_size, 32);
-    }
-}
-
 fn store_stack_imm12(insts: &mut SmallVec<[MInst; 16]>, rs: Reg, op: StoreOP, sp_offset: i64) {
     let (addr, extras) = AMode::SPOffset(sp_offset).normalize_imm12();
     for inst in extras {
@@ -708,5 +606,107 @@ fn create_reg_environment() -> MachineEnv {
         fixed_stack_slots: vec![],
         scratch_by_class: [Some(px_reg(31)), None, None],
         post_ra_scratch_by_class: [vec![px_reg(30), px_reg(31)], vec![], vec![]],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        instructions::{AMode, LoadOP, MInst, StoreOP},
+        regs::{ARG_REG, FARG_REG, px_reg},
+    };
+    use raana_ir::ir::Type as HirType;
+    use taki_mir::reg_alloc::reg::PRegSet;
+    use taki_mir::types::I32;
+
+    #[test]
+    fn i32_negative_immediates_are_sign_extended() {
+        let inst = Riscv64ABI::gen_load_imm(
+            Writable::from_reg(Reg::from_physical_reg(px_reg(5))),
+            (-1_i32) as u32 as u64,
+            I32,
+        );
+
+        let MInst::LoadImm { value, .. } = inst else {
+            panic!("expected an immediate load");
+        };
+        assert_eq!(value, u64::MAX);
+    }
+
+    #[test]
+    fn stack_to_stack_spill_move_uses_the_reserved_scratch_register() {
+        let insts = Riscv64ABI::gen_stack_to_stack_move(16, 24);
+
+        assert_eq!(insts.len(), 2);
+        assert!(matches!(
+            insts[0],
+            MInst::LoadWord {
+                rd,
+                op: LoadOP::Ld,
+                addr: AMode::SPOffset(16),
+            } if rd.to_reg() == spilltmp_reg()
+        ));
+        assert!(matches!(
+            insts[1],
+            MInst::StoreWord {
+                rs,
+                op: StoreOP::Sd,
+                addr: AMode::SPOffset(24),
+            } if rs == spilltmp_reg()
+        ));
+    }
+
+    #[test]
+    fn machine_environment_reserves_abi_and_frame_offset_scratch_registers() {
+        let env = create_reg_environment();
+        let allocatable = PRegSet::from(&env);
+
+        for preg in [px_reg(1), px_reg(2), px_reg(8), px_reg(30), px_reg(31)] {
+            assert!(!allocatable.contains(preg), "{preg:?} must be reserved");
+        }
+        assert_eq!(env.scratch_by_class[0], Some(px_reg(31)));
+        assert_eq!(
+            env.post_ra_scratch_by_class[0],
+            vec![px_reg(30), px_reg(31)]
+        );
+    }
+
+    #[test]
+    fn argument_layout_uses_independent_register_banks() {
+        let types = vec![HirType::get_i32(); 8]
+            .into_iter()
+            .chain(vec![HirType::get_f32(); 8])
+            .collect::<Vec<_>>();
+        let (locations, stack_size) = Riscv64ABI::compute_call_arg_loc(&types);
+
+        assert_eq!(stack_size, 0);
+        assert!(matches!(
+            locations[7],
+            ArgSlot::Reg { reg, .. } if reg == ARG_REG[7].to_physical_reg().unwrap()
+        ));
+        assert!(matches!(
+            locations[15],
+            ArgSlot::Reg { reg, .. } if reg == FARG_REG[7].to_physical_reg().unwrap()
+        ));
+    }
+
+    #[test]
+    fn argument_layout_uses_fixed_eight_byte_stack_slots() {
+        let mut types = vec![HirType::get_pointer(HirType::get_i32()); 9];
+        types.extend(vec![HirType::get_i32(); 1]);
+        types.extend(vec![HirType::get_f32(); 9]);
+        types.extend(vec![HirType::get_pointer(HirType::get_i32()); 1]);
+        let (locations, stack_size) = Riscv64ABI::compute_call_arg_loc(&types);
+        let stack_offsets: Vec<_> = locations
+            .iter()
+            .filter_map(|location| match location {
+                ArgSlot::Stack { offset, .. } => Some(*offset),
+                ArgSlot::Reg { .. } => None,
+            })
+            .collect();
+
+        assert_eq!(stack_offsets, vec![0, 8, 16, 24]);
+        assert_eq!(stack_size, 32);
     }
 }

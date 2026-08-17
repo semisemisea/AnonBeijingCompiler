@@ -420,7 +420,7 @@ def run_test(
             "-fsingle-precision-constant",
             "-Wno-incompatible-pointer-types",
         ]
-        if opt_level:
+        if opt_level is not None:
             compile_args.append(f"-O{opt_level}")
         compile_args += [
             f"--target={arch_config['clang_target']}",
@@ -435,7 +435,7 @@ def run_test(
     else:
         # 正常路径：调本项目编译器，参数与 CLI 一一对应
         compile_args = [str(compiler)]
-        if opt_level:
+        if opt_level is not None:
             compile_args.append(f"-O{opt_level}")
         compile_args += ["--target", target]
         if loop_unroll:
@@ -491,7 +491,7 @@ def run_test(
         # 非 baseline 时额外跑一次 --emit ir，产出 .raana 中间表示快照，
         # 供调试优化 pass 用；失败同样判 CE
         ir_args = [str(compiler)]
-        if opt_level:
+        if opt_level is not None:
             ir_args.append(f"-O{opt_level}")
         ir_args += ["--target", target]
         if loop_unroll:
@@ -713,7 +713,7 @@ def parse_args(argv):
         help=f"parallel tests (default: half CPU cores, {default_jobs})",
     )
     parser.add_argument(
-        "-O", "--opt-level", type=int, default=0, help="compiler optimization level"
+        "-O", "--opt-level", type=int, default=None, help="compiler optimization level"
     )
     parser.add_argument(
         "--backend",
@@ -772,7 +772,7 @@ def parse_args(argv):
     args = parser.parse_args(argv)
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
-    if args.opt_level < 0:
+    if args.opt_level is not None and args.opt_level < 0:
         parser.error("--opt-level must be non-negative")
     if args.baseline and args.backend != "asm":
         parser.error("--baseline only supports the asm backend")

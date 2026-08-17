@@ -67,6 +67,8 @@ def main():
     ap.add_argument("--tag", default=None)
     ap.add_argument("--keep", action="store_true", help="保留生成用例与 findings")
     ap.add_argument("--max-loop", type=int, default=50)
+    ap.add_argument("--max-depth", type=int, default=3, help="sysy_gen 最大嵌套深度")
+    ap.add_argument("--max-funcs", type=int, default=3, help="sysy_gen 最大辅助函数数")
     args = ap.parse_args()
 
     tag = args.tag or f"sd{args.seed}_{int(time.time())}"
@@ -84,7 +86,9 @@ def main():
     subprocess.run(
         [sys.executable, str(FUZZ / "sysy_gen.py"), "--count", str(args.count),
          "--seed", str(args.seed), "--outdir", str(gen_dir),
-         "--max-loop", str(args.max_loop)],
+         "--max-loop", str(args.max_loop),
+         "--max-depth", str(args.max_depth),
+         "--max-funcs", str(args.max_funcs)],
         check=True,
     )
     cases = sorted(gen_dir.glob("*.sy"))

@@ -474,6 +474,35 @@ impl Pass for GlobalInstNumbering {
         // Function-level effects do not change while this pass runs (GVN
         // only replaces values), so analyze once per invocation.
         let analysis = EffectAnalysis::new(data.program);
+        // A write on any predecessor path of a join is invisible to the
+        // dominance-tree DFS until the sibling arm is processed (children
+        // are pushed in reverse, so the join is visited before the arm that
+        // holds the store). A load in the join could then CSE with a
+        // pre-join leader across the store. Precompute "some predecessor
+        // path contains a write" in RPO (predecessors before successors)
+        // and invalidate load leaders on entry of such blocks
+        // (fuzz: case_0086/0025/0005).
+        let bb_has_write = |data: &ArenaContextMut<'_>, bb: usize| -> bool {
+            data.layout()
+                .basicblock(bb_alloc.search_id(bb))
+                .insts()
+                .iter()
+                .any(|&inst| match data.inst_data(inst).kind() {
+                    InstKind::Store(..) | InstKind::MemZero(..) => true,
+                    InstKind::Call(call) => analysis.effects_of(call.callee()).may_write_memory(),
+                    _ => false,
+                })
+        };
+        let mut pred_path_has_store = FxHashMap::default();
+        for &b in &rpo {
+            let has = predecessors.get(&b).is_some_and(|preds| {
+                preds.iter().any(|&p| {
+                    pred_path_has_store.get(&p).copied().unwrap_or(false)
+                        || bb_has_write(data, p)
+                })
+            });
+            pred_path_has_store.insert(b, has);
+        }
         let mut numbers = ValueNumbering::new(&analysis);
         let mut leaders = ScopedLeaders::new();
 
@@ -510,6 +539,13 @@ impl Pass for GlobalInstNumbering {
                     .any(|&p| rpo_pos.get(&p).is_some_and(|&pi| pi > rpo_pos[&bb_id]))
             });
             if is_loop_header {
+                load_leaders.record_store();
+            }
+            // A write on any predecessor path of this join block invalidates
+            // load leaders: the store may sit between the leader and this
+            // block on some path, but the DFS visits this block before the
+            // store-holding sibling arm (fuzz: case_0086/0025/0005).
+            if pred_path_has_store.get(&bb_id).copied().unwrap_or(false) {
                 load_leaders.record_store();
             }
             let values = data
@@ -1108,6 +1144,53 @@ mod tests {
             binary_operands(data, sum),
             (load_a, load_b),
             "the store between the loads must prevent CSE"
+        );
+    }
+
+    #[test]
+    fn no_load_cse_across_a_store_in_a_sibling_branch() {
+        // Regression: the dominance-tree DFS pushes children in reverse, so
+        // the join block is visited before the store-holding sibling arm; a
+        // load in the join must not CSE with a pre-join leader across the
+        // store (fuzz: case_0086/0025/0005).
+        let mut program = Program::new();
+        let function =
+            program.new_function(Type::get_i32(), "join_store".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let arm_a = data.new_basic_block().basic_block("arm_a".into(), vec![]);
+        let arm_b = data.new_basic_block().basic_block("arm_b".into(), vec![]);
+        let join = data.new_basic_block().basic_block("join".into(), vec![]);
+        for bb in [arm_a, arm_b, join] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let cond = data.params()[0];
+        let alloc = data.new_local_inst().alloc(Type::get_i32());
+        let load_a = data.new_local_inst().load(alloc);
+        let branch = data.new_local_inst().branch(cond, arm_a, vec![], arm_b, vec![]);
+        for value in [alloc, load_a, branch] {
+            data.layout_mut().insert_inst(entry, value);
+        }
+        let five = data.new_local_inst().integer(5);
+        let store = data.new_local_inst().store(five, alloc);
+        let arm_a_jump = data.new_local_inst().jump(join, vec![]);
+        for value in [five, store, arm_a_jump] {
+            data.layout_mut().insert_inst(arm_a, value);
+        }
+        let arm_b_jump = data.new_local_inst().jump(join, vec![]);
+        data.layout_mut().insert_inst(arm_b, arm_b_jump);
+        let load_b = data.new_local_inst().load(alloc);
+        let ret = data.new_local_inst().ret(Some(load_b));
+        for value in [load_b, ret] {
+            data.layout_mut().insert_inst(join, value);
+        }
+
+        assert!(!GlobalInstNumbering.run(&mut program));
+        let data = program.func_data(function);
+        assert_eq!(
+            return_value(data, join),
+            load_b,
+            "the store in a sibling arm must prevent CSE in the join"
         );
     }
 

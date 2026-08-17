@@ -570,7 +570,28 @@ impl<'a> OrderInfo<'a> {
             // store 在 load 之后（case_0019 形态）对 load 不可见。
             let sp = self.inst_pos[&load.func][&writer];
             let lp = self.inst_pos[&load.func][&load.inst];
-            return if sp < lp { 2 } else { 0 };
+            if sp < lp {
+                return 2;
+            }
+            // store 在 load 之后但块在循环内（自环边或后继可达回本块）：
+            // 回边使 store 在后续迭代先于 load 执行——循环携带 cell 的
+            // 值不是初始值，折叠初始 0 会固化首轮值（fuzz: case_0030
+            // `a309[1] = 1 - a309[1]` 跨外层轮次 0/1 交替）。按
+            // maybe-prior 处理，配合 Top 防御使这类 load 不折叠。
+            let in_loop = self
+                .cfgs
+                .get(&load.func)
+                .is_some_and(|cfg| {
+                    let succs = cfg.successors_of(store_bb);
+                    succs.contains(&store_bb)
+                        || succs
+                            .iter()
+                            .any(|&s| s != store_bb && self.reach[&load.func][&s].contains(&store_bb))
+                });
+            if in_loop {
+                return 1;
+            }
+            return 0;
         }
         let Some(tree) = self.dom_trees.get(&load.func) else {
             return 0;
@@ -811,6 +832,47 @@ fn resolve_cell(
             Some((key, key.root()))
         }
         _ => None,
+    }
+}
+
+/// Does `inst`'s operand chain (transitively through pure operands) read
+/// the same cell `key`? A store whose source reads the very cell it writes
+/// is loop-carried: its value is the loop's fixed point, not a compile-time
+/// constant. Folding it would pin the first iteration's value for every
+/// iteration (fuzz: case_0030, `a309[1] = 1 - a309[1]` alternating 0/1
+/// across the outer loop; case_0150's `a1536[3] = -12 + a1536[3]`).
+/// Self-referential writers contribute Bottom.
+fn src_reads_cell(
+    program: &Program,
+    env: &BaseEnv,
+    func: Function,
+    inst: Inst,
+    key: CellKey,
+    visited: &mut FxHashSet<Inst>,
+) -> bool {
+    if !visited.insert(inst) {
+        return false;
+    }
+    let data = program.func_data(func);
+    match data.inst_data(inst).kind() {
+        InstKind::Load(load) => {
+            let ctx = ArenaContext {
+                program,
+                curr_func: Some(func),
+            };
+            resolve_cell(env, &ctx, func, load.src()).is_some_and(|(k, _)| k == key)
+        }
+        InstKind::Binary(binary) => {
+            src_reads_cell(program, env, func, binary.lhs(), key, visited)
+                || src_reads_cell(program, env, func, binary.rhs(), key, visited)
+        }
+        InstKind::Select(select) => {
+            src_reads_cell(program, env, func, select.cond(), key, visited)
+                || src_reads_cell(program, env, func, select.if_true(), key, visited)
+                || src_reads_cell(program, env, func, select.if_false(), key, visited)
+        }
+        InstKind::Cast(cast) => src_reads_cell(program, env, func, cast.src(), key, visited),
+        _ => false,
     }
 }
 
@@ -1109,6 +1171,19 @@ impl Pass for IPSCCP {
                         let value = lattice_map.get(Node::new(func, store.src()));
                         match resolve_cell(env, &ctx, func, store.dest()) {
                             Some((key, root)) => {
+                                // A store whose source reads the same cell is
+                                // loop-carried (fixed point), never a constant:
+                                // fold its contribution as unknown so loads do
+                                // not pin the first iteration's value across
+                                // outer iterations (fuzz: case_0030).
+                                let mut visited = FxHashSet::default();
+                                let value =
+                                    if src_reads_cell(program, env, func, store.src(), key, &mut visited)
+                                    {
+                                        Lattice::Bottom
+                                    } else {
+                                        value
+                                    };
                                 if state.write(key, func, inst, value) {
                                     if let Some(loaders) = state.root_loaders.get(&root) {
                                         mem_reschedule.extend(loaders.iter().copied());

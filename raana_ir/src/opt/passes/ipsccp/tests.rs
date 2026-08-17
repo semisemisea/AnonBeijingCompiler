@@ -574,6 +574,67 @@ fn load_before_store_in_same_block_stays_zero() {
     ));
 }
 
+/// 循环携带 cell（fuzz: case_0030 形态）：同块内 load 先于 store，但块在
+/// 循环内（回边）——下一轮迭代 store 先于 load 执行，cell 的值是固定点
+/// （`g = 1 - g` 跨轮次 0/1 交替），不是初始 0。load 不得折叠成 0。
+#[test]
+fn loop_carried_cell_load_not_folded_to_init() {
+    let mut program = Program::new();
+    let global = new_global(&mut program);
+    let main = program.new_function(Type::get_i32(), "main".into(), vec![Type::get_i32()]);
+    let (load, _ret) = {
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(main),
+        };
+        let entry = data.add_entry_block();
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        data.layout_mut().push_bb_back(header);
+        data.layout_mut().push_bb_back(body);
+        data.layout_mut().push_bb_back(exit);
+        let bound = data.params()[0];
+        let zero = data.new_local_value().integer(0);
+        let gep = data.new_local_value().get_elem_ptr(global, vec![zero]);
+        data.layout_mut().insert_inst(entry, gep);
+        let entry_jump = data.new_local_value().jump(header, vec![zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+
+        let r = data.bb_data(header).params()[0];
+        let test = data.new_local_value().binary(BinaryOp::Lt, r, bound);
+        let branch = data
+            .new_local_value()
+            .branch(test, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(header, test);
+        data.layout_mut().insert_inst(header, branch);
+
+        // body：load g；store (1 - g)；r += 1；回边。
+        let load = data.new_local_value().load(gep);
+        data.layout_mut().insert_inst(body, load);
+        let one = data.new_local_value().integer(1);
+        let sub = data.new_local_value().binary(BinaryOp::Sub, one, load);
+        data.layout_mut().insert_inst(body, sub);
+        let store = data.new_local_value().store(sub, gep);
+        data.layout_mut().insert_inst(body, store);
+        let r2 = data.new_local_value().binary(BinaryOp::Add, r, one);
+        data.layout_mut().insert_inst(body, r2);
+        let back = data.new_local_value().jump(header, vec![r2]);
+        data.layout_mut().insert_inst(body, back);
+
+        let ret = data.new_local_value().ret(Some(load));
+        data.layout_mut().insert_inst(exit, ret);
+        (load, ret)
+    };
+
+    let _ = IPSCCP.run(&mut program);
+    let data = program.func_data(main);
+    // 循环内 load：回边使 store 先于下一轮的 load——不得折叠为初始 0。
+    assert!(matches!(data.inst_data(load).kind(), InstKind::Load(..)));
+}
+
 /// 洞 2：分支合并点的 load 只被一条臂的 store 写（`if (c) { g = 7; }`，
 /// else 路径直通）。store 块不支配 merge 块且初始 0 可达：meet(7, 0) =
 /// Bottom，load 保持为 load，不得折叠成 7。

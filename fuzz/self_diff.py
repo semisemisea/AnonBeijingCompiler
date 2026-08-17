@@ -21,7 +21,9 @@
 
 import argparse
 import os
+import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -37,7 +39,7 @@ IMAGE = "soyo-test-tools"
 COMPILER_IN = "/work/target/aarch64-unknown-linux-musl/release/compiler"
 
 
-def docker_run(opt, gen_tag):
+def docker_run(opt, gen_tag, baseline=False):
     # -j 2：容器内 test.py 默认半核并发，大用例（max-depth 5 等激进参数）
     # 并发编译内存峰值高，宿主内存紧张时编译器被 OOM kill → 假 CE
     # （Error 137 jetsam 同款）。限 2 并发换取稳定。
@@ -48,8 +50,13 @@ def docker_run(opt, gen_tag):
         "-v", f"{ROOT}/tests:/work/tests:ro",
         "-v", f"{ROOT}/sysylib:/work/sysylib:ro",
         "-v", f"{RESULTS}:/work/results:rw",
-        IMAGE, "-j", "2", "-O", str(opt), f"gen_{gen_tag}",
+        IMAGE, "-j", "2",
     ]
+    if baseline:
+        # --baseline：容器内 clang 交叉编译（参考实现，抓绝对错误——
+        # 自差分只抓 O0/O2 相对差异，两档同错时漏网）
+        cmd.append("--baseline")
+    cmd += ["-O", str(opt), f"gen_{gen_tag}"]
     # test.py 退出码 1 = 有 FAIL/CE/RE/TLE 用例，属正常现象（正是要找的），不抛异常
     subprocess.run(cmd, check=False)
 
@@ -72,16 +79,17 @@ def save_runtime(dst: Path):
         shutil.copy2(p, target)
 
 
-def run_opt(opt: int, gen_tag: str, expected: int, tmp: Path) -> bool:
+def run_opt(opt: int, gen_tag: str, expected: int, tmp: Path,
+            baseline: bool = False) -> bool:
     """跑一档（容器编译运行 + 拷产物），产物数不足则重跑（Docker Desktop
     bind mount 并发写入偶发丢失）。返回产物是否齐全。"""
     for attempt in range(3):
         if RESULTS.exists():
             shutil.rmtree(RESULTS)
         RESULTS.mkdir(parents=True)
-        print(f"[{'2' if opt == 0 else '3'}/5] running -O {opt} in container "
-              f"(attempt {attempt + 1}) ...")
-        docker_run(opt, gen_tag)
+        kind = "clang baseline" if baseline else f"-O {opt}"
+        print(f"      running {kind} in container (attempt {attempt + 1}) ...")
+        docker_run(opt, gen_tag, baseline=baseline)
         save_runtime(tmp)
         got = sum(1 for _ in tmp.rglob("*.runtime.stdout"))
         if got >= expected:
@@ -90,6 +98,69 @@ def run_opt(opt: int, gen_tag: str, expected: int, tmp: Path) -> bool:
               f"attempt {attempt + 1}, retrying ...")
         shutil.rmtree(tmp, ignore_errors=True)
     return False
+
+
+FLOAT_RE = re.compile(rb"0x[0-9a-f.]+p[+-]?\d+")
+
+
+# putfloat 的 %a 输出与紧随的 putint 数字无分隔（如 `0x1.c428f4p+5`+`0`
+# → `0x1.c428f4p+50`）。f32 合法指数上限 127 太宽——粘连指数（p+5→p+50）
+# 在 127 内不截断。生成器 float 值域：字面量 ±100 × 乘法链（深度 5）≈
+# 1e10（指数 ≤ 34），嵌套循环累加不超 2^40 量级——真 float 指数 ≤ 45；
+# 粘连必然 ≥ 50。阈值 45 两者安全分离。
+MAX_F32_EXP = 45
+
+
+def split_float_tokens(seq: bytes) -> list:
+    """切分 hex float token（putfloat 的 %a 输出）。指数超过生成器值域
+    上限（MAX_F32_EXP）时截断：说明末尾数字属于粘连的后续 int，归还给
+    普通文本段。"""
+    out = []
+    i = 0
+    while i < len(seq):
+        m = FLOAT_RE.match(seq, i)
+        if not m:
+            out.append(seq[i:i + 1])
+            i += 1
+            continue
+        tok = m.group()
+        pm = re.search(rb"p([+-]?\d+)$", tok)
+        exp = int(pm.group(1))
+        while abs(exp) > MAX_F32_EXP:
+            tok = tok[:-1]
+            pm = re.search(rb"p([+-]?\d+)$", tok)
+            exp = int(pm.group(1))
+        out.append(tok)
+        i = m.start() + len(tok)
+    return out
+
+
+def tolerant_compare(a: bytes, b: bytes) -> bool:
+    """baseline 比对：float token 容忍 1 ulp 差，其余逐字节一致。
+
+    clang 编译期折叠 float 表达式（含可常量推导的变量参与）用 double
+    精度，而 SysY 规范要求 f32 逐运算舍入（我们正确，case_0005 实证：
+    86.264f + -73.39f 逐步 = 0x1.9bf7dp+3，clang double 折叠 = ...cep+3）。
+    f32 位模式差 ≤ 4 的 float 输出视为一致——1 ulp 是 clang 折叠假阳性
+    （差 1），粘连场景（putfloat 后紧跟 putint/putfloat，`0x1.xxxp+5`+`0`
+    → `p+50`）使解析后的位差膨胀到 ≤ 4（差 4）。int 输出/结构/长度/
+    退出码仍严格比对——真 bug（顺序错、缺输出、逻辑错）差异远大于 4 ulp，
+    不会漏。"""
+    parts_a = split_float_tokens(a)
+    parts_b = split_float_tokens(b)
+    if len(parts_a) != len(parts_b):
+        return False
+    for sa, sb in zip(parts_a, parts_b):
+        if sa == sb:
+            continue
+        if (re.fullmatch(rb"0x[0-9a-f.]+p[+-]?\d+", sa)
+                and re.fullmatch(rb"0x[0-9a-f.]+p[+-]?\d+", sb)):
+            na = struct.unpack("I", struct.pack("f", float.fromhex(sa.decode())))[0]
+            nb = struct.unpack("I", struct.pack("f", float.fromhex(sb.decode())))[0]
+            if abs(na - nb) <= 4:
+                continue
+        return False
+    return True
 
 
 def main():
@@ -101,15 +172,24 @@ def main():
     ap.add_argument("--max-loop", type=int, default=50)
     ap.add_argument("--max-depth", type=int, default=3, help="sysy_gen 最大嵌套深度")
     ap.add_argument("--max-funcs", type=int, default=3, help="sysy_gen 最大辅助函数数")
+    ap.add_argument("--baseline", action="store_true",
+                    help="clang baseline 差分：我们 -O2 vs clang -O2，"
+                         "抓绝对错误（自差分只抓 O0/O2 相对差异，两档同错漏网）")
     args = ap.parse_args()
 
     tag = args.tag or f"sd{args.seed}_{int(time.time())}"
     gen_dir = TESTS / f"gen_{tag}"
-    tmp_o0 = Path("/tmp") / f"sd_{tag}_O0"
-    tmp_o2 = Path("/tmp") / f"sd_{tag}_O2"
+    if args.baseline:
+        tmp_ours = Path("/tmp") / f"sd_{tag}_OURS"
+        tmp_base = Path("/tmp") / f"sd_{tag}_BASE"
+        tmp_dirs = [tmp_ours, tmp_base]
+    else:
+        tmp_o0 = Path("/tmp") / f"sd_{tag}_O0"
+        tmp_o2 = Path("/tmp") / f"sd_{tag}_O2"
+        tmp_dirs = [tmp_o0, tmp_o2]
     findings_dir = FINDINGS / tag
 
-    for d in (gen_dir, tmp_o0, tmp_o2, findings_dir):
+    for d in [gen_dir, *tmp_dirs, findings_dir]:
         if d.exists():
             shutil.rmtree(d)
     findings_dir.mkdir(parents=True, exist_ok=True)
@@ -126,8 +206,67 @@ def main():
     cases = sorted(gen_dir.glob("*.sy"))
     print(f"[1/5] generated {len(cases)} cases -> {gen_dir}")
 
-    # 2/3. -O0 / -O2（带产物完整性重跑）
+    # 2/3. 跑档（带产物完整性重跑）
+    if args.baseline:
+        print("[2/5] running ours -O 2 ...")
+        ok_ours = run_opt(2, tag, len(cases), tmp_ours)
+        print("[3/5] running clang baseline -O 2 ...")
+        ok_base = run_opt(2, tag, len(cases), tmp_base, baseline=True)
+        if not (ok_ours and ok_base):
+            print("FATAL: failed to collect full runtime outputs after "
+                  "retries — rerun later")
+            return 1
+        # 4. 比对：我们 vs clang（clang 为权威——抓两档同错的绝对错误）
+        print("[4/5] comparing (ours vs clang baseline) ...")
+        ok, mismatch, our_ce, gen_bad = [], [], [], []
+        for sy in cases:
+            stem = sy.stem
+            so = tmp_ours / f"gen_{tag}" / f"{stem}.runtime.stdout"
+            ro = tmp_ours / f"gen_{tag}" / f"{stem}.runtime.return"
+            sb = tmp_base / f"gen_{tag}" / f"{stem}.runtime.stdout"
+            rb = tmp_base / f"gen_{tag}" / f"{stem}.runtime.return"
+            o_ok, b_ok = so.exists(), sb.exists()
+            if o_ok and b_ok:
+                if (tolerant_compare(so.read_bytes(), sb.read_bytes())
+                        and ro.read_bytes() == rb.read_bytes()):
+                    ok.append(sy)
+                else:
+                    mismatch.append(sy)   # 绝对 bug 候选
+            elif not o_ok and b_ok:
+                our_ce.append(sy)          # 我们漏编译合法程序 → bug
+            else:
+                gen_bad.append(sy)         # clang 拒收（或两边都 CE）= 生成器违约
+        # 5. 报告
+        print("[5/5] report")
+        print(f"  total      : {len(cases)}")
+        print(f"  OK         : {len(ok)}")
+        print(f"  MISMATCH   : {len(mismatch)}   <- 绝对 bug（输出/退出码不同）")
+        print(f"  OUR_CE     : {len(our_ce)}   <- 我们漏编译合法程序（bug）")
+        print(f"  GEN_BAD    : {len(gen_bad)}   <- 生成器违约（clang 拒收/两边都 CE）")
+        if mismatch or our_ce:
+            for sy in [*mismatch, *our_ce]:
+                shutil.copy2(sy, findings_dir / sy.name)
+            print(f"  candidates saved -> {findings_dir}")
+            for sy in mismatch[:10]:
+                print(f"    MISMATCH: {sy.name}")
+            for sy in our_ce[:10]:
+                print(f"    OUR_CE  : {sy.name}")
+        if gen_bad:
+            for sy in gen_bad[:10]:
+                print(f"    GEN_BAD : {sy.name}")
+        if not args.keep:
+            shutil.rmtree(gen_dir, ignore_errors=True)
+            for d in tmp_dirs:
+                shutil.rmtree(d, ignore_errors=True)
+            print("  cleaned temp dirs (use --keep to retain)")
+        else:
+            print(f"  kept: {gen_dir}, {findings_dir}, /tmp/sd_{tag}_OURS,BASE")
+        return 1 if (mismatch or our_ce) else 0
+
+    # 自差分路径：-O0 / -O2 两档对比（抓相对差异）
+    print("[2/5] running -O 0 ...")
     ok0 = run_opt(0, tag, len(cases), tmp_o0)
+    print("[3/5] running -O 2 ...")
     ok2 = run_opt(2, tag, len(cases), tmp_o2)
     if not (ok0 and ok2):
         print("FATAL: failed to collect full runtime outputs for both "
@@ -136,7 +275,7 @@ def main():
 
     # 4. 比对：两档都有 .runtime.* 产物（=都编译成功）的用例，逐字节比 stdout+退出码。
     #    CE 用例不会产 runtime 文件，由下面的产物集合差集统计。
-    print(f"[4/5] comparing ...")
+    print("[4/5] comparing ...")
     ok, mismatch = [], []
     for sy in cases:
         stem = sy.stem
@@ -182,7 +321,7 @@ def main():
 
     if not args.keep:
         shutil.rmtree(gen_dir, ignore_errors=True)
-        for d in (tmp_o0, tmp_o2):
+        for d in tmp_dirs:
             shutil.rmtree(d, ignore_errors=True)
         print(f"  cleaned temp dirs (use --keep to retain)")
     else:

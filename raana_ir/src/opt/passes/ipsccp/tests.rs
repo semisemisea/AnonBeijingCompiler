@@ -405,6 +405,56 @@ fn call_to_writer_invalidates_global_cell() {
 }
 
 #[test]
+fn caller_store_blocks_zero_merge_in_callee() {
+    // main 存 getint 结果到全局、helper 读：caller 侧 store 在跨函数时序
+    // 上无法排除先于本 load——折叠初始 0 会把 getint() 结果固化
+    // （fuzz: functional/70_dijkstra 的 gv_n 折叠成 0，Dijkstra 循环全死，
+    // 输出全零）。有跨函数 writer 的 cell 禁止 zero-merge。
+    let mut program = Program::new();
+    let global = new_global(&mut program);
+    let getint = program.new_function(Type::get_i32(), "getint".into(), vec![]);
+    let helper = program.new_function(Type::get_i32(), "helper".into(), vec![]);
+    let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+    let load = {
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(helper),
+        };
+        let entry = data.add_entry_block();
+        let zero = data.new_local_value().integer(0);
+        let gep = data.new_local_value().get_elem_ptr(global, vec![zero]);
+        data.layout_mut().insert_inst(entry, gep);
+        let load = data.new_local_value().load(gep);
+        data.layout_mut().insert_inst(entry, load);
+        let ret = data.new_local_value().ret(Some(load));
+        data.layout_mut().insert_inst(entry, ret);
+        load
+    };
+    {
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(main),
+        };
+        let entry = data.add_entry_block();
+        let zero = data.new_local_value().integer(0);
+        let gep = data.new_local_value().get_elem_ptr(global, vec![zero]);
+        data.layout_mut().insert_inst(entry, gep);
+        let input = data.new_local_value().call(getint, vec![]);
+        data.layout_mut().insert_inst(entry, input);
+        let store = data.new_local_value().store(input, gep);
+        data.layout_mut().insert_inst(entry, store);
+        let call = data.new_local_value().call(helper, vec![]);
+        data.layout_mut().insert_inst(entry, call);
+        let ret = data.new_local_value().ret(Some(call));
+        data.layout_mut().insert_inst(entry, ret);
+    }
+
+    let _ = IPSCCP.run(&mut program);
+    let data = program.func_data(helper);
+    assert!(matches!(data.inst_data(load).kind(), InstKind::Load(..)));
+}
+
+#[test]
 fn call_to_deterministic_writer_folds_load() {
     let mut program = Program::new();
     let global = new_global(&mut program);

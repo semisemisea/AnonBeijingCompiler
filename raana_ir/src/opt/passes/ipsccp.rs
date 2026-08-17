@@ -328,7 +328,21 @@ impl MemState {
                 .any(|&(from, to)| key.offset() >= from && key.offset() < to)
         });
         let load_ty = ord.program.func_data(load.func).inst_data(load.inst).ty();
-        if zero_covered && load_ty.is_i32() && ord.init_reachable(load, &prior) {
+        // 跨函数 writer（caller 写全局、callee 读）：writer_relation 给
+        // 不出确定序（callee 可能被其它调用点调用），writer 被过滤出
+        // `prior`——但初始 0 仍可能已被改写，zero-merge 折叠 0 会把
+        // getint() 等调用结果固化（fuzz: functional/70_dijkstra 的
+        // `n = getint(); ... Dijkstra() 读 gv_n` 被折叠成 0，整个算法
+        // 的循环全死）。有跨函数 writer 的 cell 禁止 zero-merge。
+        let has_cross_func_writer = self
+            .cells
+            .get(&key)
+            .is_some_and(|writers| writers.keys().any(|&(wf, _)| wf != load.func));
+        if zero_covered
+            && load_ty.is_i32()
+            && !has_cross_func_writer
+            && ord.init_reachable(load, &prior)
+        {
             folded = folded.merge(Lattice::Constant(0));
         }
         let result = if folded != Lattice::Top {

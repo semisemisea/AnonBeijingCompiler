@@ -531,3 +531,210 @@ fn divergent_stores_merge_to_bottom() {
     // load is not folded to either.
     assert!(matches!(data.inst_data(load).kind(), InstKind::Load(..)));
 }
+
+// --- 位置感知 read（docs/ipsccp_memory_order_fix.md §4）：load 只折叠
+// 程序序上先于它的 writer，绝不允许读到更晚写入的值 ---
+
+/// 洞 1（case_0019 最小形态）：同块内 load 先于 store。store 在程序序上
+/// 位于 load 之后，对 load 不可见——load 折叠为初始 0，而不是 5。
+#[test]
+fn load_before_store_in_same_block_stays_zero() {
+    let mut program = Program::new();
+    let global = new_global(&mut program);
+    let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+    let (load, _ret) = {
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(main),
+        };
+        let entry = data.add_entry_block();
+        let zero = data.new_local_value().integer(0);
+        let gep = data.new_local_value().get_elem_ptr(global, vec![zero]);
+        data.layout_mut().insert_inst(entry, gep);
+        let load = data.new_local_value().load(gep);
+        data.layout_mut().insert_inst(entry, load);
+        let five = data.new_local_value().integer(5);
+        let store = data.new_local_value().store(five, gep);
+        data.layout_mut().insert_inst(entry, store);
+        let ret = data.new_local_value().ret(Some(load));
+        data.layout_mut().insert_inst(entry, ret);
+        (load, ret)
+    };
+
+    assert!(IPSCCP.run(&mut program));
+    let data = program.func_data(main);
+    // load 先执行：必须读到初始 0（store 的重调度不得把 5 灌给它）。
+    assert!(matches!(
+        data.inst_data(load).kind(),
+        InstKind::Integer(integer) if integer.value() == 0
+    ));
+}
+
+/// 洞 2：分支合并点的 load 只被一条臂的 store 写（`if (c) { g = 7; }`，
+/// else 路径直通）。store 块不支配 merge 块且初始 0 可达：meet(7, 0) =
+/// Bottom，load 保持为 load，不得折叠成 7。
+#[test]
+fn single_writer_on_one_branch_keeps_load() {
+    let mut program = Program::new();
+    let global = new_global(&mut program);
+    let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+    let (load, _ret) = {
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(main),
+        };
+        let entry = data.add_entry_block();
+        let then_block = data.new_basic_block().basic_block("then".into(), vec![]);
+        let merge = data.new_basic_block().basic_block("merge".into(), vec![]);
+        data.layout_mut().push_bb_back(then_block);
+        data.layout_mut().push_bb_back(merge);
+
+        let zero = data.new_local_value().integer(0);
+        let gep = data.new_local_value().get_elem_ptr(global, vec![zero]);
+        data.layout_mut().insert_inst(entry, gep);
+        // 条件用未初始化局部对象的 load（Bottom，不折叠）：两臂都必须可
+        // 达，且不触发 unknown-write 失效（否则 cleared_roots 会掩盖洞 2）。
+        let alloc = data.new_local_value().alloc(Type::get_i32());
+        data.layout_mut().insert_inst(entry, alloc);
+        let cond = data.new_local_value().load(alloc);
+        data.layout_mut().insert_inst(entry, cond);
+        let branch = data
+            .new_local_value()
+            .branch(cond, then_block, vec![], merge, vec![]);
+        data.layout_mut().insert_inst(entry, branch);
+
+        let seven = data.new_local_value().integer(7);
+        let store = data.new_local_value().store(seven, gep);
+        data.layout_mut().insert_inst(then_block, store);
+        let jump = data.new_local_value().jump(merge, vec![]);
+        data.layout_mut().insert_inst(then_block, jump);
+
+        let load = data.new_local_value().load(gep);
+        data.layout_mut().insert_inst(merge, load);
+        let ret = data.new_local_value().ret(Some(load));
+        data.layout_mut().insert_inst(merge, ret);
+        (load, ret)
+    };
+
+    let _ = IPSCCP.run(&mut program);
+    let data = program.func_data(main);
+    // else 路径读到 0、then 路径读到 7：值分歧，保持 load。
+    assert!(matches!(data.inst_data(load).kind(), InstKind::Load(..)));
+}
+
+/// 洞 2 的补集：双分支都写同一常量（`if (c) { g = 5; } else { g = 5; }`），
+/// 必经其一且初始 0 不可达——meet(5, 5) = 5，load 正常折叠（不误伤）。
+#[test]
+fn identical_writers_on_both_branches_fold() {
+    let mut program = Program::new();
+    let global = new_global(&mut program);
+    let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+    let (load, _ret) = {
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(main),
+        };
+        let entry = data.add_entry_block();
+        let then_block = data.new_basic_block().basic_block("then".into(), vec![]);
+        let else_block = data.new_basic_block().basic_block("else".into(), vec![]);
+        let merge = data.new_basic_block().basic_block("merge".into(), vec![]);
+        for block in [then_block, else_block, merge] {
+            data.layout_mut().push_bb_back(block);
+        }
+
+        let zero = data.new_local_value().integer(0);
+        let gep = data.new_local_value().get_elem_ptr(global, vec![zero]);
+        data.layout_mut().insert_inst(entry, gep);
+        let alloc = data.new_local_value().alloc(Type::get_i32());
+        data.layout_mut().insert_inst(entry, alloc);
+        let cond = data.new_local_value().load(alloc);
+        data.layout_mut().insert_inst(entry, cond);
+        let branch = data
+            .new_local_value()
+            .branch(cond, then_block, vec![], else_block, vec![]);
+        data.layout_mut().insert_inst(entry, branch);
+
+        let five = data.new_local_value().integer(5);
+        let store_t = data.new_local_value().store(five, gep);
+        data.layout_mut().insert_inst(then_block, store_t);
+        let jump_t = data.new_local_value().jump(merge, vec![]);
+        data.layout_mut().insert_inst(then_block, jump_t);
+        let five2 = data.new_local_value().integer(5);
+        let store_e = data.new_local_value().store(five2, gep);
+        data.layout_mut().insert_inst(else_block, store_e);
+        let jump_e = data.new_local_value().jump(merge, vec![]);
+        data.layout_mut().insert_inst(else_block, jump_e);
+
+        let load = data.new_local_value().load(gep);
+        data.layout_mut().insert_inst(merge, load);
+        let ret = data.new_local_value().ret(Some(load));
+        data.layout_mut().insert_inst(merge, ret);
+        (load, ret)
+    };
+
+    assert!(IPSCCP.run(&mut program));
+    let data = program.func_data(main);
+    // 两臂同写 5：无条件读 5，折叠（0 被"必经 store"排除）。
+    assert!(matches!(
+        data.inst_data(load).kind(),
+        InstKind::Integer(integer) if integer.value() == 5
+    ));
+}
+
+/// 洞 3：caller 内 load 先于对 writer(callee) 的 call。callee 的 store 在
+/// 程序序上位于 load 之后（call 块与 load 同块且 call 在 load 之后）——
+/// reschedule 链不得把 callee 的值灌给 call 之前的 load。
+///
+/// 断言放宽为"不得折叠成 callee 的 store 值（1）"：invalidate_call 会把
+/// 该 root 的 zero 区间一并清掉（call 可能写 root 任意位置），load 重读
+/// 时初始值已不可知——保持 Load 或折叠初始 0 都正确；"零区间带位置"让
+/// call 前 load 精确折叠 0 是 `docs/ipsccp_memory_order_fix.md` §7 的后续
+/// 工作。
+#[test]
+fn load_before_call_to_writer_stays_zero() {
+    let mut program = Program::new();
+    let global = new_global(&mut program);
+    // The writer stores a compile-time constant into the global.
+    let writer = program.new_function(Type::get_unit(), "writer".into(), vec![]);
+    {
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(writer),
+        };
+        let entry = data.add_entry_block();
+        let one = data.new_local_value().integer(1);
+        let store = data.new_local_value().store(one, global);
+        data.layout_mut().insert_inst(entry, store);
+        let ret = data.new_local_value().ret(None);
+        data.layout_mut().insert_inst(entry, ret);
+    }
+    let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+    let (load, _ret) = {
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(main),
+        };
+        let entry = data.add_entry_block();
+        let zero = data.new_local_value().integer(0);
+        let gep = data.new_local_value().get_elem_ptr(global, vec![zero]);
+        data.layout_mut().insert_inst(entry, gep);
+        let load = data.new_local_value().load(gep);
+        data.layout_mut().insert_inst(entry, load);
+        let call = data.new_local_value().call(writer, vec![]);
+        data.layout_mut().insert_inst(entry, call);
+        let ret = data.new_local_value().ret(Some(load));
+        data.layout_mut().insert_inst(entry, ret);
+        (load, ret)
+    };
+
+    let _ = IPSCCP.run(&mut program);
+    let data = program.func_data(main);
+    let kind = data.inst_data(load).kind();
+    // 洞 3 的病根是 load 读到 callee 的 store 值（1）——位置感知 read 后
+    // 只可能是"保持 load"或"折叠初始 0"。
+    assert!(
+        matches!(kind, InstKind::Load(..))
+            || matches!(kind, InstKind::Integer(integer) if integer.value() == 0),
+        "load after a later call must not fold to the callee's value, got {kind:?}"
+    );
+}

@@ -104,12 +104,13 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::ir::inst_kind::mem_zero::MemZeroLen;
 use crate::opt::{
     analysis_passes::{
+        dom_tree::v2::DominanceTree,
         effects::{EffectAnalysis, WriteRoot},
-        icfg::{Edge, EdgeType},
+        icfg::{Edge, EdgeType, ICFG},
         memory::{BaseEnv, MemObject},
     },
     prelude::*,
-    utils::visit_and_replace,
+    utils::{cfg::CFG, visit_and_replace},
 };
 
 pub struct IPSCCP;
@@ -240,8 +241,11 @@ impl CellKey {
 /// writers. Zero ranges model `MemZero` and zero-initialized globals.
 #[derive(Default)]
 struct MemState {
-    /// cell -> writer store instruction -> contribution lattice.
-    cells: FxHashMap<CellKey, FxHashMap<Inst, Lattice>>,
+    /// cell -> (writer 函数, writer store 指令) -> contribution lattice.
+    /// writer 必须带函数：`Inst` 的 id 是**每函数独立 arena** 分配的
+    /// （`ir/instruction.rs`，本地从 1 起），跨函数会撞 id——裸 `Inst`
+    /// 不足以定位一条 store。
+    cells: FxHashMap<CellKey, FxHashMap<(Function, Inst), Lattice>>,
     /// root -> merged zero byte intervals [from, to).
     zero: FxHashMap<RootKey, Vec<(i64, i64)>>,
     /// root -> cells currently tracked (for MemZero range removal).
@@ -259,17 +263,39 @@ struct MemState {
 }
 
 impl MemState {
-    /// Folded value of a cell: meet of the writer contributions.
-    fn cell_fold(&self, key: CellKey) -> Lattice {
-        match self.cells.get(&key) {
-            None => Lattice::Top,
-            Some(writers) => writers.values().fold(Lattice::Top, |acc, &v| acc.merge(v)),
+    /// Folded value of a cell **at load `load`'s program point**: the meet
+    /// of the writer contributions whose store may precede the load
+    /// (D∪R, see `docs/ipsccp_memory_order_fix.md` §4.1), plus the list of
+    /// those writers `(function, block)` for `init_reachable`. Writers that
+    /// execute *after* the load in program order (same-block later
+    /// position, or disjoint paths) are excluded — a load must never read
+    /// a value written later, which is exactly the bug class of case_0019
+    /// (洞 1/2/3 share this single root cause).
+    fn cell_fold(
+        &self,
+        key: CellKey,
+        load: Node,
+        ord: &OrderInfo,
+    ) -> (Lattice, Vec<(Function, BasicBlock)>) {
+        let mut folded = Lattice::Top;
+        let mut prior = Vec::new();
+        let Some(writers) = self.cells.get(&key) else {
+            return (folded, prior);
+        };
+        for (&(wfunc, writer), &v) in writers {
+            if ord.writer_relation(writer, wfunc, load) != 0 {
+                folded = folded.merge(v);
+                prior.push((wfunc, ord.block_of(wfunc, writer)));
+            }
         }
+        (folded, prior)
     }
 
-    /// The value a load of `key` reads: the cell if any store wrote it,
-    /// else a zero-range value if covered, else Bottom (unknown).
-    fn read(&self, key: CellKey) -> Lattice {
+    /// The value a load of `key` reads at its own program point: the cell
+    /// contribution of the writers that precede it, merged with the initial
+    /// zero when a store-free path to the load exists; else Bottom
+    /// (unknown). Roots invalidated by an unknown write never fold again.
+    fn read(&self, key: CellKey, load: Node, ord: &OrderInfo) -> Lattice {
         // A root invalidated by an unknown write (dynamic-index store,
         // may-write call) never folds again: the write may sit between
         // any store and any load of the root, and re-scheduled loads
@@ -278,28 +304,32 @@ impl MemState {
         if self.cleared_roots.contains(&key.root()) {
             return Lattice::Bottom;
         }
-        let cell = self.cell_fold(key);
-        if cell != Lattice::Top {
-            return cell;
-        }
+        let (mut folded, prior) = self.cell_fold(key, load, ord);
+        // Initial value: a zero-range covered cell answers 0 when a path
+        // from the entry avoids every store preceding the load — otherwise
+        // the load necessarily reads a stored value and folding 0 in would
+        // be unsound (洞 2: single writer on one branch must not fold).
         let root = key.root();
-        let covered = self.zero.get(&root).is_some_and(|ranges| {
+        let zero_covered = self.zero.get(&root).is_some_and(|ranges| {
             ranges
                 .iter()
                 .any(|&(from, to)| key.offset() >= from && key.offset() < to)
         });
-        if covered {
-            Lattice::Constant(0)
+        if zero_covered && ord.init_reachable(load, &prior) {
+            folded = folded.merge(Lattice::Constant(0));
+        }
+        if folded != Lattice::Top {
+            folded
         } else {
             Lattice::Bottom
         }
     }
 
-    /// Record a store `writer` of `value` into `key`. A Top source writes
-    /// an unknown value (Bottom contribution) but may recover when the
-    /// source refines and the writer is re-visited. Returns whether the
-    /// folded cell value changed.
-    fn write(&mut self, key: CellKey, writer: Inst, value: Lattice) -> bool {
+    /// Record a store `writer` (in function `func`) of `value` into `key`.
+    /// A Top source writes an unknown value (Bottom contribution) but may
+    /// recover when the source refines and the writer is re-visited. Returns
+    /// whether the folded cell value changed.
+    fn write(&mut self, key: CellKey, func: Function, writer: Inst, value: Lattice) -> bool {
         let contribution = if value == Lattice::Top {
             Lattice::Bottom
         } else {
@@ -312,7 +342,7 @@ impl MemState {
         if writers.is_empty() {
             self.root_cells.entry(root).or_default().push(key);
         }
-        writers.insert(writer, contribution);
+        writers.insert((func, writer), contribution);
         let after = writers.values().fold(Lattice::Top, |acc, &v| acc.merge(v));
         before != after
     }
@@ -391,6 +421,304 @@ impl MemState {
             // Unresolvable address: conservatively everything modeled.
             Some(self.all_roots.iter().copied().collect())
         })
+    }
+}
+
+/// 静态程序位置信息：一次构建，供 `MemState::read` 判定"writer（store 指令）
+/// 相对 load 的程序顺序"。所有量只依赖指令位置与块结构（支配树、块可达闭包、
+/// 块内 layout 序），不依赖 lattice 值，因此可以在 worklist 之外构建一次复用。
+///
+/// 位置分类（见 `docs/ipsccp_memory_order_fix.md` §4.1）：
+/// - **D**（确定先于）：每条到 load 的执行路径都执行该 store——同函数
+///   store 块支配 load 块（同块则 store 指令先于 load）；跨函数 caller 内
+///   call 块支配 load 块（同块则 call 先于 load）且 callee 内 store 块
+///   支配 callee 全部 return 块（callee 每次被调用必执行该 store）。
+/// - **R**（可能先于）：部分路径执行该 store——同函数 store 块可达 load
+///   块但非支配；跨函数 callee 内 store 块可达某 return 块且 caller 内
+///   该 call 的 continuation 可达 load 块（同块则 continuation 先于 load）。
+///
+/// 其余 writer（store 在 load 之后执行、或与 load 路径不相交）对 load 不可
+/// 见：load 绝不允许读到程序序上更晚写入的值——这正是 case_0019 的缺陷类
+/// （洞 1/2/3 的同一个病根）。
+struct OrderInfo<'a> {
+    program: &'a Program,
+    icfg: &'a ICFG,
+    /// 每函数支配树（仅定义函数；声明函数无 CFG，不收录）。
+    dom_trees: FxHashMap<Function, DominanceTree>,
+    /// 每函数块级 CFG（可达块及其后继，终结符已解析）。
+    cfgs: FxHashMap<Function, CFG>,
+    /// 每函数块可达闭包：src 块 -> 可达块集合（含自身）。
+    reach: FxHashMap<Function, FxHashMap<BasicBlock, FxHashSet<BasicBlock>>>,
+    /// 每函数块内指令位置：inst -> layout 序 index。
+    inst_pos: FxHashMap<Function, FxHashMap<Inst, usize>>,
+    /// 每函数 return 块集合（终结符为 Return 的块）。
+    return_blocks: FxHashMap<Function, FxHashSet<BasicBlock>>,
+    /// 每函数 entry 块。
+    entry_blocks: FxHashMap<Function, BasicBlock>,
+}
+
+impl<'a> OrderInfo<'a> {
+    fn new(program: &'a Program, icfg: &'a ICFG) -> Self {
+        let mut dom_trees = FxHashMap::default();
+        let mut cfgs = FxHashMap::default();
+        let mut reach = FxHashMap::default();
+        let mut inst_pos = FxHashMap::default();
+        let mut return_blocks: FxHashMap<Function, FxHashSet<BasicBlock>> = FxHashMap::default();
+        let mut entry_blocks = FxHashMap::default();
+        for &func in program.function_layout() {
+            let data = program.func_data(func);
+            if data.layout().is_decl() {
+                continue;
+            }
+            let mut pos_map = FxHashMap::default();
+            for bb_layout in data.layout().basicblocks() {
+                let bb = bb_layout.bb();
+                let terminator = *bb_layout.insts().get_last().unwrap();
+                for (idx, &inst) in bb_layout.insts().iter().enumerate() {
+                    pos_map.insert(inst, idx);
+                }
+                if matches!(data.inst_data(terminator).kind(), InstKind::Return(..)) {
+                    return_blocks.entry(func).or_default().insert(bb);
+                }
+            }
+            inst_pos.insert(func, pos_map);
+            entry_blocks.insert(func, data.layout().entry_bb().unwrap().bb());
+            let Some(cfg) = CFG::new(data) else {
+                continue;
+            };
+            // 块可达闭包：逐块 BFS（函数块数小，BFS 足够）。
+            let mut fn_reach: FxHashMap<BasicBlock, FxHashSet<BasicBlock>> = FxHashMap::default();
+            for &src in cfg.blocks() {
+                let mut visited = FxHashSet::default();
+                let mut stack = vec![src];
+                while let Some(bb) = stack.pop() {
+                    if !visited.insert(bb) {
+                        continue;
+                    }
+                    for &succ in cfg.successors_of(bb) {
+                        stack.push(succ);
+                    }
+                }
+                fn_reach.insert(src, visited);
+            }
+            reach.insert(func, fn_reach);
+            dom_trees.insert(func, DominanceTree::from_cfg(&cfg));
+            cfgs.insert(func, cfg);
+        }
+        Self {
+            program,
+            icfg,
+            dom_trees,
+            cfgs,
+            reach,
+            inst_pos,
+            return_blocks,
+            entry_blocks,
+        }
+    }
+
+    fn block_of(&self, func: Function, inst: Inst) -> BasicBlock {
+        self.program
+            .func_data(func)
+            .layout()
+            .parent_bb(inst)
+            .unwrap()
+    }
+
+    /// writer S 相对 load L 的程序顺序：
+    /// `2` = 确定先于（D）；`1` = 可能先于（R）；`0` = 不可见（S 在 L 之后
+    /// 执行，或与 L 的路径不相交）。
+    fn writer_relation(&self, writer: Inst, writer_func: Function, load: Node) -> u8 {
+        let load_bb = self.block_of(load.func, load.inst);
+        let store_bb = self.block_of(writer_func, writer);
+        if writer_func == load.func {
+            self.same_func_relation(writer, store_bb, load, load_bb)
+        } else {
+            self.cross_func_relation(writer_func, store_bb, load, load_bb)
+        }
+    }
+
+    fn same_func_relation(
+        &self,
+        writer: Inst,
+        store_bb: BasicBlock,
+        load: Node,
+        load_bb: BasicBlock,
+    ) -> u8 {
+        if store_bb == load_bb {
+            // 同块：只有 layout 序上 store 先于 load 才算确定先于；
+            // store 在 load 之后（case_0019 形态）对 load 不可见。
+            let sp = self.inst_pos[&load.func][&writer];
+            let lp = self.inst_pos[&load.func][&load.inst];
+            return if sp < lp { 2 } else { 0 };
+        }
+        let Some(tree) = self.dom_trees.get(&load.func) else {
+            return 0;
+        };
+        // CFG/支配树只含可达块：不可达块上的 store 永不执行，不参与。
+        if !tree.contains(store_bb) || !tree.contains(load_bb) {
+            return 0;
+        }
+        if tree.dominates(store_bb, load_bb) {
+            return 2;
+        }
+        if self.reach[&load.func][&store_bb].contains(&load_bb) {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn cross_func_relation(
+        &self,
+        callee: Function,
+        store_bb: BasicBlock,
+        load: Node,
+        load_bb: BasicBlock,
+    ) -> u8 {
+        let Some(callee_tree) = self.dom_trees.get(&callee) else {
+            return 0;
+        };
+        if !callee_tree.contains(store_bb) {
+            return 0;
+        }
+        let Some(caller_tree) = self.dom_trees.get(&load.func) else {
+            return 0;
+        };
+        if !caller_tree.contains(load_bb) {
+            return 0;
+        }
+        // S 支配 callee 全部 return 块：callee 每次被调用必执行 S。
+        let store_dominates_all_returns = self
+            .return_blocks
+            .get(&callee)
+            .is_some_and(|rbs| rbs.iter().all(|&rb| callee_tree.dominates(store_bb, rb)));
+        // S 可达 callee 某 return 块：部分调用路径执行 S。
+        let store_reaches_return = self.return_blocks.get(&callee).is_some_and(|rbs| {
+            rbs.iter()
+                .any(|&rb| self.reach[&callee][&store_bb].contains(&rb))
+        });
+        let mut dominates = false;
+        let mut reaches = false;
+        // `call_sites_of` 按 **caller** 索引：遍历 load 所在函数的所有调用点，
+        // 筛出调用 `callee` 的。
+        for cs in self.icfg.call_sites_of(load.func) {
+            if cs.callee != callee {
+                continue;
+            }
+            let call_bb = self.block_of(load.func, cs.call);
+            if !caller_tree.contains(call_bb) {
+                continue;
+            }
+            // caller 侧"必经"：call 块支配 load 块（同块则 call 指令先于 load）。
+            let call_before_load = if call_bb == load_bb {
+                self.inst_pos[&load.func][&cs.call] < self.inst_pos[&load.func][&load.inst]
+            } else {
+                caller_tree.dominates(call_bb, load_bb)
+            };
+            if call_before_load && store_dominates_all_returns {
+                dominates = true;
+            }
+            // caller 侧"可达"：call 的 continuation 可达 load 块（同块则
+            // continuation 先于 load）。
+            if store_reaches_return {
+                let cont_bb = self.block_of(load.func, cs.continuation);
+                let cont_reaches_load = if cont_bb == load_bb {
+                    self.inst_pos[&load.func][&cs.continuation]
+                        < self.inst_pos[&load.func][&load.inst]
+                } else {
+                    self.reach[&load.func][&cont_bb].contains(&load_bb)
+                };
+                if cont_reaches_load {
+                    reaches = true;
+                }
+            }
+        }
+        if dominates {
+            2
+        } else if reaches {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// 是否存在从程序入口到 load、避开全部 `prior` writer 块的真实路径：
+    /// 有则初始值（零区间）可能被读到；无则必经某个先于 load 的 store，
+    /// 初始值不可达。同函数 writer 避开其所在块；跨函数 writer 拦截
+    /// "必经 callee store"的 call 块（callee 内 entry→return 全路径都经过
+    /// store 块时，调用该 callee 必然执行 store）。
+    fn init_reachable(&self, load: Node, prior: &[(Function, BasicBlock)]) -> bool {
+        let func = load.func;
+        let load_bb = self.block_of(func, load.inst);
+        let mut same_writer_blocks = FxHashSet::default();
+        let mut cross_writers: FxHashMap<Function, FxHashSet<BasicBlock>> = FxHashMap::default();
+        for &(f, bb) in prior {
+            if f == func {
+                same_writer_blocks.insert(bb);
+            } else {
+                cross_writers.entry(f).or_default().insert(bb);
+            }
+        }
+        // 跨函数 writer：callee 内不存在避开其全部 store 块的 entry→return
+        // 路径时，该 callee 的调用点视作路径拦截点。
+        let mut blocked_calls = FxHashSet::default();
+        for (callee, store_bbs) in &cross_writers {
+            if self.callee_avoids(*callee, store_bbs) {
+                continue;
+            }
+            // `call_sites_of` 按 caller 索引：筛出本函数内调用 `callee` 的。
+            for cs in self.icfg.call_sites_of(func) {
+                if cs.callee == *callee {
+                    blocked_calls.insert(self.block_of(func, cs.call));
+                }
+            }
+        }
+        let entry = self.entry_blocks[&func];
+        let mut stack = vec![entry];
+        let mut visited = FxHashSet::default();
+        while let Some(bb) = stack.pop() {
+            if same_writer_blocks.contains(&bb) || blocked_calls.contains(&bb) {
+                continue;
+            }
+            if bb == load_bb {
+                return true;
+            }
+            for &succ in self.cfgs[&func].successors_of(bb) {
+                if visited.insert(succ) {
+                    stack.push(succ);
+                }
+            }
+        }
+        false
+    }
+
+    /// callee 内是否存在避开 `avoid` 全部块的 entry → 任一 return 块路径。
+    fn callee_avoids(&self, callee: Function, avoid: &FxHashSet<BasicBlock>) -> bool {
+        let Some(cfg) = self.cfgs.get(&callee) else {
+            return false;
+        };
+        let entry = self.entry_blocks[&callee];
+        let mut stack = vec![entry];
+        let mut visited = FxHashSet::default();
+        while let Some(bb) = stack.pop() {
+            if avoid.contains(&bb) {
+                continue;
+            }
+            if self
+                .return_blocks
+                .get(&callee)
+                .is_some_and(|rbs| rbs.contains(&bb))
+            {
+                return true;
+            }
+            for &succ in cfg.successors_of(bb) {
+                if visited.insert(succ) {
+                    stack.push(succ);
+                }
+            }
+        }
+        false
     }
 }
 
@@ -525,6 +853,9 @@ impl Pass for IPSCCP {
         // Stage 0.2
         // Build ICFG. Ready to start the worklist algorithm.
         let icfg = icfg::ICFG::new(program);
+        // 静态位置信息（支配树/块可达闭包/块内序/inst 属主）——worklist 阶段
+        // 的 MemState::read 用它过滤"程序序上先于 load"的 writer。
+        let ord = OrderInfo::new(program, &icfg);
         let main_func = program.get_main_function();
         let entry_bb_layout = program.func_data(main_func).layout().entry_bb().unwrap();
         let first_inst = *entry_bb_layout.insts().get_first().unwrap();
@@ -627,7 +958,8 @@ impl Pass for IPSCCP {
                         };
                         match resolve_cell(env, &ctx, func, load.src()) {
                             Some((key, root)) => {
-                                let value = state.read(key);
+                                // 位置感知读：只折叠程序序上先于本 load 的 writer。
+                                let value = state.read(key, node, &ord);
                                 // Overwrite: the load mirrors the current
                                 // memory snapshot, not a meet of historical
                                 // snapshots.
@@ -757,7 +1089,7 @@ impl Pass for IPSCCP {
                         let value = lattice_map.get(Node::new(func, store.src()));
                         match resolve_cell(env, &ctx, func, store.dest()) {
                             Some((key, root)) => {
-                                if state.write(key, inst, value) {
+                                if state.write(key, func, inst, value) {
                                     if let Some(loaders) = state.root_loaders.get(&root) {
                                         mem_reschedule.extend(loaders.iter().copied());
                                     }

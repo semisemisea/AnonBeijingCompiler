@@ -38,6 +38,9 @@ COMPILER_IN = "/work/target/aarch64-unknown-linux-musl/release/compiler"
 
 
 def docker_run(opt, gen_tag):
+    # -j 2：容器内 test.py 默认半核并发，大用例（max-depth 5 等激进参数）
+    # 并发编译内存峰值高，宿主内存紧张时编译器被 OOM kill → 假 CE
+    # （Error 137 jetsam 同款）。限 2 并发换取稳定。
     cmd = [
         "docker", "run", "--rm", "-t", "--network", "none",
         "-e", f"SOYO_COMPILER={COMPILER_IN}",
@@ -45,19 +48,48 @@ def docker_run(opt, gen_tag):
         "-v", f"{ROOT}/tests:/work/tests:ro",
         "-v", f"{ROOT}/sysylib:/work/sysylib:ro",
         "-v", f"{RESULTS}:/work/results:rw",
-        IMAGE, "-O", str(opt), f"gen_{gen_tag}",
+        IMAGE, "-j", "2", "-O", str(opt), f"gen_{gen_tag}",
     ]
     # test.py 退出码 1 = 有 FAIL/CE/RE/TLE 用例，属正常现象（正是要找的），不抛异常
     subprocess.run(cmd, check=False)
 
 
 def save_runtime(dst: Path):
+    """拷容器产物到 tmp 目录。Docker Desktop（macOS）的 VirtioFS 对
+    bind mount 写入偶发同步延迟/丢失（容器内已写完、宿主侧暂不可见），
+    等待+重试 3 次；仍不足则该档重跑（由调用方判定）。"""
     dst.mkdir(parents=True, exist_ok=True)
+    for _ in range(3):
+        files = list(RESULTS.rglob("*.runtime.*"))
+        if files:
+            break
+        print("      (waiting for container output sync ...)")
+        time.sleep(3)
     for p in RESULTS.rglob("*.runtime.*"):
         rel = p.relative_to(RESULTS)
         target = dst / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(p, target)
+
+
+def run_opt(opt: int, gen_tag: str, expected: int, tmp: Path) -> bool:
+    """跑一档（容器编译运行 + 拷产物），产物数不足则重跑（Docker Desktop
+    bind mount 并发写入偶发丢失）。返回产物是否齐全。"""
+    for attempt in range(3):
+        if RESULTS.exists():
+            shutil.rmtree(RESULTS)
+        RESULTS.mkdir(parents=True)
+        print(f"[{'2' if opt == 0 else '3'}/5] running -O {opt} in container "
+              f"(attempt {attempt + 1}) ...")
+        docker_run(opt, gen_tag)
+        save_runtime(tmp)
+        got = sum(1 for _ in tmp.rglob("*.runtime.stdout"))
+        if got >= expected:
+            return True
+        print(f"      WARN: only {got}/{expected} runtime outputs after "
+              f"attempt {attempt + 1}, retrying ...")
+        shutil.rmtree(tmp, ignore_errors=True)
+    return False
 
 
 def main():
@@ -94,22 +126,13 @@ def main():
     cases = sorted(gen_dir.glob("*.sy"))
     print(f"[1/5] generated {len(cases)} cases -> {gen_dir}")
 
-    # 2. -O0
-    if RESULTS.exists():
-        shutil.rmtree(RESULTS)
-    RESULTS.mkdir(parents=True)
-    print(f"[2/5] running -O 0 in container ...")
-    docker_run(0, tag)
-    save_runtime(tmp_o0)
-    print(f"      saved {sum(1 for _ in tmp_o0.rglob('*.runtime.*'))} runtime files")
-
-    # 3. -O2
-    if RESULTS.exists():
-        shutil.rmtree(RESULTS)
-    RESULTS.mkdir(parents=True)
-    print(f"[3/5] running -O 2 in container ...")
-    docker_run(2, tag)
-    save_runtime(tmp_o2)
+    # 2/3. -O0 / -O2（带产物完整性重跑）
+    ok0 = run_opt(0, tag, len(cases), tmp_o0)
+    ok2 = run_opt(2, tag, len(cases), tmp_o2)
+    if not (ok0 and ok2):
+        print("FATAL: failed to collect full runtime outputs for both "
+              "opt levels after retries — rerun later")
+        return 1
 
     # 4. 比对：两档都有 .runtime.* 产物（=都编译成功）的用例，逐字节比 stdout+退出码。
     #    CE 用例不会产 runtime 文件，由下面的产物集合差集统计。

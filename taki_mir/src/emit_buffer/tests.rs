@@ -91,6 +91,7 @@ impl crate::abi::ABIMachineSpec for TestAbi {
                 scratch_by_class: [None; 3],
                 post_ra_scratch_by_class: [vec![], vec![], vec![]],
                 fixed_stack_slots: vec![],
+                aliased_banks: &[],
             });
         &ENV
     }

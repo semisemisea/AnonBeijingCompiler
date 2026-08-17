@@ -1263,6 +1263,16 @@ pub struct MachineEnv {
     /// `PReg`s in this list cannot be used as an allocatable or scratch
     /// register.
     pub fixed_stack_slots: Vec<PReg>,
+
+    /// Register classes whose physical registers of the same `hw_enc` alias
+    /// each other in the target ISA. On AArch64 the float register `sN` is the
+    /// low 32 bits of the vector register `vN`, so any write to `vN` clobbers
+    /// `sN` (and vice versa). Even though the allocator keeps such classes
+    /// distinct, it must treat them as interfering on a shared `hw_enc`, or a
+    /// value held in one class can be silently corrupted by a concurrent
+    /// write through the other (see the h-10 trsm vectorization miscompile).
+    /// Each pair is unordered; targets with no aliasing pass `&[]`.
+    pub aliased_banks: &'static [(RegClass, RegClass)],
 }
 
 /// A register class. Each register in the ISA has one class, and the

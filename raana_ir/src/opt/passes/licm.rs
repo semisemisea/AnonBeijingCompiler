@@ -113,6 +113,11 @@ fn substitute_header_params(
             let args = tail.args().iter().map(|&arg| substitute(arg)).collect();
             data.replace_inst_with(inst).tail_call(callee, args);
         }
+        InstKind::VectorSplat(splat) => {
+            let src = substitute(splat.src());
+            let ty = data.inst_data(inst).ty().clone();
+            data.replace_inst_with(inst).vector_splat(src, ty);
+        }
         _ => {}
     }
 }
@@ -149,6 +154,7 @@ impl LICM {
                     | InstKind::GetElemPtr(..)
                     | InstKind::Select(..)
                     | InstKind::Load(..)
+                    | InstKind::VectorSplat(..)
             ) || (matches!(kind, InstKind::Call(..)) && hoistable_calls.contains(&inst))
         }
 
@@ -721,3 +727,4 @@ impl Pass for LICM {
 
 #[cfg(test)]
 mod tests;
+

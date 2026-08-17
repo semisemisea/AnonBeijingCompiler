@@ -264,12 +264,12 @@ mod tests {
         assert!(
             fact.lines().any(|line| {
                 let line = line.trim();
-                line.starts_with("b .L_fact_") && line.contains("entry")
+                line.starts_with("b .L_main_") && line.contains("entry")
             }),
             "self tail call must branch to the local entry block:\n{fact}"
         );
         assert!(
-            !fact.contains("b fact"),
+            !fact.contains("b main"),
             "self tail call must not re-enter through the function symbol:\n{fact}"
         );
         assert_eq!(

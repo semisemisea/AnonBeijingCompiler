@@ -616,8 +616,19 @@ impl<'a> LlvmWriter<'a> {
         // which emits its own intermediate SSA names, so no shared `%r = ...`
         // prefix is written for them.
         let is_mulmod = matches!(&kind, InstKind::Call(call) if self.is_mulmod_callee(call));
+        // Vector fma/splat/extract/insert/reduce visitors assign the inst name
+        // themselves (and may emit extra intermediate SSA names), so no shared
+        // `%r = ...` prefix is written for them.
+        let is_self_named = matches!(
+            &kind,
+            InstKind::Fma(..)
+                | InstKind::VectorSplat(..)
+                | InstKind::VectorExtractElement(..)
+                | InstKind::VectorInsertElement(..)
+                | InstKind::VectorReduce(..)
+        );
 
-        if !is_mulmod && !ty.is_unit() && !is_cmp && !is_select {
+        if !is_mulmod && !ty.is_unit() && !is_cmp && !is_select && !is_self_named {
             write!(self.buffer, "  {} = ", get_name!(self, inst))?;
         } else if !is_mulmod {
             write!(self.buffer, "  ")?;
@@ -830,7 +841,14 @@ impl<'a> LlvmWriter<'a> {
         let llvm_ty = self.type_to_llvm(ty);
         // For comparisons, the result type is always i32, but operands may be float.
         // Use the lhs operand type to determine int vs float dispatch.
-        let is_float = self.arena.inst_data(binary.lhs()).ty().is_f32();
+        let is_float = {
+            let lhs_ty = self.arena.inst_data(binary.lhs()).ty();
+            match lhs_ty.kind() {
+                TypeKind::Float32 => true,
+                TypeKind::Vector(elem, _) => elem.is_f32(),
+                _ => false,
+            }
+        };
         let is_vector = self.arena.inst_data(binary.lhs()).ty().is_vector();
 
         if is_vector {
@@ -851,9 +869,20 @@ impl<'a> LlvmWriter<'a> {
                     writeln!(self.buffer, "fmul {} {}, {}", llvm_ty, lhs, rhs)
                 }
                 BinaryOp::Mul => writeln!(self.buffer, "mul {} {}, {}", llvm_ty, lhs, rhs),
+                BinaryOp::Div if is_float => {
+                    writeln!(self.buffer, "fdiv {} {}, {}", llvm_ty, lhs, rhs)
+                }
+                BinaryOp::Div => writeln!(self.buffer, "sdiv {} {}, {}", llvm_ty, lhs, rhs),
+                BinaryOp::Rem if is_float => {
+                    writeln!(self.buffer, "frem {} {}, {}", llvm_ty, lhs, rhs)
+                }
+                BinaryOp::Rem => writeln!(self.buffer, "srem {} {}, {}", llvm_ty, lhs, rhs),
                 BinaryOp::And => writeln!(self.buffer, "and {} {}, {}", llvm_ty, lhs, rhs),
                 BinaryOp::Or => writeln!(self.buffer, "or {} {}, {}", llvm_ty, lhs, rhs),
                 BinaryOp::Xor => writeln!(self.buffer, "xor {} {}, {}", llvm_ty, lhs, rhs),
+                BinaryOp::Shl => writeln!(self.buffer, "shl {} {}, {}", llvm_ty, lhs, rhs),
+                BinaryOp::Shr => writeln!(self.buffer, "lshr {} {}, {}", llvm_ty, lhs, rhs),
+                BinaryOp::Sar => writeln!(self.buffer, "ashr {} {}, {}", llvm_ty, lhs, rhs),
                 BinaryOp::Min if is_float => {
                     writeln!(self.buffer, "fmin {} {}, {}", llvm_ty, lhs, rhs)
                 }
@@ -862,21 +891,34 @@ impl<'a> LlvmWriter<'a> {
                 }
                 BinaryOp::Min => writeln!(self.buffer, "smin {} {}, {}", llvm_ty, lhs, rhs),
                 BinaryOp::Max => writeln!(self.buffer, "smax {} {}, {}", llvm_ty, lhs, rhs),
-                BinaryOp::Eq | BinaryOp::Gt => {
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Gt
+                | BinaryOp::Lt
+                | BinaryOp::Ge
+                | BinaryOp::Le => {
                     // LLVM vector compares produce `<N x i1>`; RaanaIR masks are
                     // all-ones lanes of the operand type. Sign-extend to match.
                     let cmp_name = format!("%vcmp{}", self.name_counter);
                     self.name_counter += 1;
-                    let cmp_op = if is_float {
+                    let (cmp_kind, cmp_op) = if is_float {
                         match binary.op() {
-                            BinaryOp::Eq => "oeq",
-                            BinaryOp::Gt => "ogt",
+                            BinaryOp::Eq => ("fcmp", "oeq"),
+                            BinaryOp::NotEq => ("fcmp", "une"),
+                            BinaryOp::Gt => ("fcmp", "ogt"),
+                            BinaryOp::Lt => ("fcmp", "olt"),
+                            BinaryOp::Ge => ("fcmp", "oge"),
+                            BinaryOp::Le => ("fcmp", "ole"),
                             _ => unreachable!(),
                         }
                     } else {
                         match binary.op() {
-                            BinaryOp::Eq => "eq",
-                            BinaryOp::Gt => "sgt",
+                            BinaryOp::Eq => ("icmp", "eq"),
+                            BinaryOp::NotEq => ("icmp", "ne"),
+                            BinaryOp::Gt => ("icmp", "sgt"),
+                            BinaryOp::Lt => ("icmp", "slt"),
+                            BinaryOp::Ge => ("icmp", "sge"),
+                            BinaryOp::Le => ("icmp", "sle"),
                             _ => unreachable!(),
                         }
                     };
@@ -884,7 +926,7 @@ impl<'a> LlvmWriter<'a> {
                         self.buffer,
                         "{} = {} {} {}, {}",
                         cmp_name,
-                        format_args!("icmp {}", cmp_op),
+                        format_args!("{} {}", cmp_kind, cmp_op),
                         llvm_ty,
                         lhs,
                         rhs

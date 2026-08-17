@@ -1426,3 +1426,90 @@ fn keeps_body_param_resolving_to_loop_variant_variant() {
     let data = program.func_data(function);
     assert_eq!(data.layout().parent_bb(doubled), Some(forward));
 }
+
+/// A `vector_splat` with an invariant source (a constant or a value computed
+/// outside the loop) hoists to the preheader (NEON vector loops splat the
+/// loaded scalar).
+#[test]
+fn hoists_vector_splat_with_invariant_source() {
+    let mut program = Program::new();
+    let function = program.new_function(Type::get_unit(), "licm_splat".into(), vec![]);
+    let data = program.func_data_mut(function);
+    let entry = data.add_entry_block();
+    let header = data.new_basic_block().basic_block("header".into(), vec![]);
+    let body = data.new_basic_block().basic_block("body".into(), vec![]);
+    let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+    for block in [header, body, exit] {
+        data.layout_mut().push_bb_back(block);
+    }
+
+    let entry_jump = data.new_local_inst().jump(header, vec![]);
+    data.layout_mut().insert_inst(entry, entry_jump);
+
+    let scalar = data.new_local_inst().integer(7);
+    let vector_ty = Type::get_vector(Type::get_i32(), 4);
+    let splat = data.new_local_inst().vector_splat(scalar, vector_ty.clone());
+    for inst in [scalar, splat] {
+        data.layout_mut().insert_inst(header, inst);
+    }
+    let condition = data.new_local_inst().integer(1);
+    let branch = data
+        .new_local_inst()
+        .branch(condition, body, vec![], exit, vec![]);
+    data.layout_mut().insert_inst(header, branch);
+    let backedge = data.new_local_inst().jump(header, vec![]);
+    data.layout_mut().insert_inst(body, backedge);
+    let ret = data.new_local_inst().ret(None);
+    data.layout_mut().insert_inst(exit, ret);
+
+    let result = run(&mut program, function);
+    let data = program.func_data(function);
+    assert!(result);
+    assert_eq!(
+        data.layout().parent_bb(splat),
+        Some(data.layout().entry_bb().unwrap().bb())
+    );
+    assert_eq!(data.layout().parent_bb(scalar), Some(header));
+}
+
+/// A `vector_splat` whose source is loop-carried stays in the loop.
+#[test]
+fn keeps_vector_splat_with_variant_source_in_loop() {
+    let mut program = Program::new();
+    let function = program.new_function(Type::get_unit(), "licm_splat_variant".into(), vec![]);
+    let data = program.func_data_mut(function);
+    let entry = data.add_entry_block();
+    let header = data
+        .new_basic_block()
+        .basic_block("header".into(), vec![Type::get_i32()]);
+    let body = data.new_basic_block().basic_block("body".into(), vec![]);
+    let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+    for block in [header, body, exit] {
+        data.layout_mut().push_bb_back(block);
+    }
+
+    let zero = data.new_local_inst().integer(0);
+    let entry_jump = data.new_local_inst().jump(header, vec![zero]);
+    data.layout_mut().insert_inst(entry, entry_jump);
+
+    let induction = data.bb_data(header).params()[0];
+    let vector_ty = Type::get_vector(Type::get_i32(), 4);
+    let splat = data.new_local_inst().vector_splat(induction, vector_ty);
+    data.layout_mut().insert_inst(header, splat);
+    let one = data.new_local_inst().integer(1);
+    let next = data.new_local_inst().binary(BinaryOp::Add, induction, one);
+    data.layout_mut().insert_inst(header, next);
+    let condition = data.new_local_inst().integer(1);
+    let branch = data
+        .new_local_inst()
+        .branch(condition, body, vec![], exit, vec![]);
+    data.layout_mut().insert_inst(header, branch);
+    let backedge = data.new_local_inst().jump(header, vec![next]);
+    data.layout_mut().insert_inst(body, backedge);
+    let ret = data.new_local_inst().ret(None);
+    data.layout_mut().insert_inst(exit, ret);
+
+    assert!(!run(&mut program, function));
+    let data = program.func_data(function);
+    assert_eq!(data.layout().parent_bb(splat), Some(header));
+}

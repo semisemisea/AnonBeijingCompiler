@@ -10,6 +10,7 @@ import statistics
 import subprocess
 import sys
 import time
+from datetime import datetime
 
 ROOT = Path("/work")
 TESTS_ROOT = ROOT / "tests"
@@ -715,6 +716,32 @@ def run_tests(args):
         return 1
 
     total = len(files)
+
+    logs_dir = RESULTS_ROOT / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / (
+        datetime.now().isoformat(timespec="seconds").replace(":", "-") + ".log"
+    )
+    logf = log_path.open("w", encoding="utf-8")
+    logf.write(
+        f"soyo_compiler test run @ {datetime.now().isoformat(timespec='seconds')}\n"
+    )
+    logf.write("command: " + " ".join(sys.argv[1:]) + "\n")
+    logf.write("options:\n")
+    logf.write(
+        f"  jobs={args.jobs} opt_level={args.opt_level} backend={args.backend} "
+        f"target={args.target} baseline={args.baseline} runner={args.runner}\n"
+    )
+    logf.write(
+        f"  compiler={compiler} loop_unroll={args.loop_unroll} "
+        f"pass_stats={args.pass_stats} compile_only={args.compile_only} "
+        f"verbose={args.verbose}\n"
+    )
+    logf.write("cases:\n")
+    for f in files:
+        logf.write(f"  {rel_test(f)}\n")
+    logf.write("=" * 60 + "\n")
+
     print(
         f"{paint('Running', 'yellow')} tests "
         f"{paint(str(total), 'bold')} cases, {paint(str(args.jobs), 'bold')} jobs"
@@ -790,6 +817,25 @@ def run_tests(args):
                 timings.append((run_elapsed, path))
             counts[status] += 1
 
+            c_ms = (
+                f"{compile_elapsed * 1000:8.2f}ms"
+                if compile_elapsed is not None
+                else "     n/a"
+            )
+            r_ms = (
+                f"{run_elapsed * 1000:8.2f}ms"
+                if run_elapsed is not None
+                else "     n/a"
+            )
+            logf.write(f"[{status.strip():^4}] {path}  compile {c_ms}  run {r_ms}\n")
+            if gem5_summary:
+                for line in gem5_summary.splitlines():
+                    logf.write(f"    {line}\n")
+            if msg:
+                for line in msg.splitlines():
+                    logf.write(f"    {line}\n")
+            logf.flush()
+
             running = next(
                 (rel_test(futures[item]) for item in futures if not item.done()), None
             )
@@ -820,6 +866,9 @@ def run_tests(args):
         for future in futures:
             future.cancel()
         print()
+        logf.write("=" * 60 + "\n")
+        logf.write("interrupted by user\n")
+        logf.close()
         return 130
     finally:
         pool.shutdown(wait=True, cancel_futures=interrupted)
@@ -840,6 +889,14 @@ def run_tests(args):
     )
     print_timing_summary("compiles", "compile", compile_timings)
     print_timing_summary("runs", "runtime", timings)
+
+    logf.write("=" * 60 + "\n")
+    logf.write("summary:\n")
+    for status in STATUSES:
+        logf.write(f"  {status.strip()}: {counts[status]}\n")
+    logf.write(f"  TOTAL: {total}\n")
+    logf.write(f"finished: {datetime.now().isoformat(timespec='seconds')}\n")
+    logf.close()
     return 0 if failed == 0 else 1
 
 

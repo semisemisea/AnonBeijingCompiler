@@ -377,6 +377,26 @@ pub enum VecArithOp {
     Add,
     Sub,
     Mul,
+    /// Floating-point vector arithmetic (`fadd`/`fsub`/`fmul`): `<4 x f32>`
+    /// lanes. The plain forms above are the integer NEON ops and must not be
+    /// used on float vectors.
+    Fadd,
+    Fsub,
+    Fmul,
+}
+
+/// Vector shift operations. Immediate forms use `shl`/`ushr`/`sshr`;
+/// register (variable-amount) forms use `sshl`/`ushl`, with the amount
+/// vector pre-negated for right shifts (NEON has no register-form right
+/// shift; `sshl`/`ushl` with a negative amount shift right).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecShiftOp {
+    /// Logical left shift.
+    Shl,
+    /// Logical right shift (`ushr`/`ushl`).
+    Shr,
+    /// Arithmetic right shift (`sshr`/`sshl`).
+    Sar,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -406,6 +426,13 @@ pub enum VecMinMaxOp {
     Umax,
     Fmin,
     Fmax,
+}
+
+/// Integer vector multiply-accumulate/negate-accumulate (`mla`/`mls`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecMlaOp {
+    Mla,
+    Mls,
 }
 
 /// The flag-producing half of an atomic conditional-select pseudo.
@@ -725,6 +752,8 @@ pub enum MInst {
         src: Reg,
     },
     /// Vector add/sub/mul: `{op} v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>`.
+    /// Float vectors use the `Fadd`/`Fsub`/`Fmul` variants (the integer
+    /// `add v.4s` on float bit patterns is wrong).
     VecArithRRR {
         op: VecArithOp,
         shape: VecShape,
@@ -813,6 +842,67 @@ pub enum MInst {
         dst: WritableReg,
         lhs: Reg,
         rhs: Reg,
+    },
+    /// Vector shift: immediate form `shl/ushr/sshr v{d}.<shape>, v{lhs}.<shape>, #imm`;
+    /// register form `sshl/ushl v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>` with the
+    /// amount vector pre-negated for right shifts (`neg` emitted separately).
+    VecShift {
+        op: VecShiftOp,
+        shape: VecShape,
+        dst: WritableReg,
+        lhs: Reg,
+        rhs: Reg,
+        imm: Option<u8>,
+    },
+    /// Vector float divide: `fdiv v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>`.
+    /// (NEON has no integer vector divide; i32 Div/Rem with a constant splat
+    /// divisor is rewritten to a multiply-high magic sequence instead.)
+    VecDiv {
+        shape: VecShape,
+        dst: WritableReg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    /// Vector negation: `neg v{d}.<shape>, v{src}.<shape>`.
+    VecNeg {
+        shape: VecShape,
+        dst: WritableReg,
+        src: Reg,
+    },
+    /// Vector bitwise not: `mvn v{d}.16b, v{s}.16b`.
+    VecBitwiseNot {
+        dst: WritableReg,
+        src: Reg,
+    },
+    /// Integer vector multiply-accumulate / negate-accumulate. Read-modify-write
+    /// on `acc`; the accumulator is copied in first:
+    /// `mov v{d}.16b, v{acc}.16b; mla/mls v{d}.<shape>, v{lhs}.<shape>, v{rhs}.<shape>`.
+    VecMla {
+        op: VecMlaOp,
+        shape: VecShape,
+        dst: WritableReg,
+        acc: Reg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    /// Signed widening multiply: `smull v{d}.2d, v{lhs}.2s, v{rhs}.2s` (low
+    /// half) or `smull2 v{d}.2d, v{lhs}.4s, v{rhs}.4s` (high half).
+    VecSMull {
+        high: bool,
+        dst: WritableReg,
+        lhs: Reg,
+        rhs: Reg,
+    },
+    /// Narrowing shift right: `xtn v{d}.4s, v{s}.2d` (low half) or
+    /// `xtn2 v{d}.4s, v{s}.2d` (high half). `xtn2` preserves the destination's
+    /// low 64 bits, so `high=true` is a read-modify-write on `dst`; the
+    /// partial result is copied in first: `mov v{d}.16b, v{acc}.16b;
+    /// xtn2 v{d}.4s, v{s}.2d`. For `high=false` `acc` is ignored.
+    VecNarrow {
+        high: bool,
+        dst: WritableReg,
+        acc: Reg,
+        src: Reg,
     },
     FMovFromZero {
         dst: WritableReg,
@@ -1019,6 +1109,7 @@ impl MachInst for MInst {
             | Self::VecDup { dst, src, .. }
             | Self::VecCvt { dst, src, .. }
             | Self::VecAddv { dst, src }
+            | Self::VecNeg { dst, src, .. }
             | Self::Scvtf { dst, src }
             | Self::Fcvtzs { dst, src } => {
                 collector.reg_use(src);
@@ -1035,10 +1126,47 @@ impl MachInst for MInst {
             Self::VecArithRRR { dst, lhs, rhs, .. }
             | Self::VecBitwise { dst, lhs, rhs, .. }
             | Self::VecCmp { dst, lhs, rhs, .. }
-            | Self::VecMinMax { dst, lhs, rhs, .. } => {
+            | Self::VecMinMax { dst, lhs, rhs, .. }
+            | Self::VecShift { dst, lhs, rhs, .. }
+            | Self::VecDiv { dst, lhs, rhs, .. } => {
                 collector.reg_use(lhs);
                 collector.reg_use(rhs);
                 collector.reg_def(dst);
+            }
+            Self::VecBitwiseNot { dst, src } => {
+                collector.reg_use(src);
+                collector.reg_def(dst);
+            }
+            Self::VecMla {
+                dst, acc, lhs, rhs, ..
+            } => {
+                // The leading `mov` copies `acc` into `dst` before the
+                // read-modify-write. `dst` reuses `acc`'s allocation (like
+                // `MovK`), so when the accumulator can be clobbered in place
+                // the copy becomes a self-move the emitter elides, giving a
+                // bare `mla` (the M70 mul+add fusion target).
+                collector.reg_use(acc);
+                collector.reg_use(lhs);
+                collector.reg_use(rhs);
+                collector.reg_reuse_def(dst, 0);
+            }
+            Self::VecSMull { dst, lhs, rhs, .. } => {
+                collector.reg_use(lhs);
+                collector.reg_use(rhs);
+                collector.reg_def(dst);
+            }
+            Self::VecNarrow { high, dst, acc, src } => {
+                if *high {
+                    // `xtn2` preserves the destination's low half: the leading
+                    // copy writes `dst` before the read-modify-write, so `dst`
+                    // must not alias any use (early def).
+                    collector.reg_use(acc);
+                    collector.reg_use(src);
+                    collector.reg_early_def(dst);
+                } else {
+                    collector.reg_use(src);
+                    collector.reg_def(dst);
+                }
             }
             Self::VecFmla {
                 dst, acc, lhs, rhs, ..
@@ -1267,7 +1395,12 @@ impl MachInst for MInst {
         match ty {
             I32 => (&[RegClass::Int], &[I32]),
             I64 => (&[RegClass::Int], &[I64]),
-            F32 => (&[RegClass::Float], &[F32]),
+            // f32 scalars share the NEON register bank with vectors: `sN` is
+            // the low 32 bits of `vN`, so a single RegClass lets the allocator
+            // prevent s/v aliasing (a Float-class vreg could otherwise be
+            // assigned the same hw_enc as a live Vector-class vreg and be
+            // silently clobbered). Emission renders these as `sN`.
+            F32 => (&[RegClass::Vector], &[F32]),
             V4I32 => (&[RegClass::Vector], &[V4I32]),
             V2I64 => (&[RegClass::Vector], &[V2I64]),
             V4F32 => (&[RegClass::Vector], &[V4F32]),
@@ -1409,6 +1542,13 @@ impl MachInstEmit for MInst {
             | Self::VecExtractLane { .. }
             | Self::VecInsertLane { .. }
             | Self::VecMinMax { .. }
+            | Self::VecShift { .. }
+            | Self::VecDiv { .. }
+            | Self::VecNeg { .. }
+            | Self::VecBitwiseNot { .. }
+            | Self::VecMla { .. }
+            | Self::VecSMull { .. }
+            | Self::VecNarrow { .. }
             | Self::FMovFromZero { .. }
             | Self::FAlu { .. }
             | Self::FCmp { .. }
@@ -1601,12 +1741,14 @@ fn emit_float_rr(ctx: &mut dyn EmitContext, op: &str, dst: Reg, src: &Reg) -> co
     emit_float_reg(ctx, *src, false)
 }
 fn emit_fmov(ctx: &mut dyn EmitContext, dst: Reg, src: &Reg) -> core::fmt::Result {
-    let dst_float = dst
-        .to_real_reg()
-        .is_none_or(|preg| preg.class() == RegClass::Float);
-    let src_float = src
-        .to_real_reg()
-        .is_none_or(|preg| preg.class() == RegClass::Float);
+    // f32 scalars live in Vector-class registers (`sN` ≡ `vN` lane 0), so
+    // both the scalar-FP class and the vector bank render as `sN`/`dN` here.
+    let is_f32_reg = |reg: Reg| {
+        reg.to_real_reg()
+            .is_none_or(|preg| matches!(preg.class(), RegClass::Float | RegClass::Vector))
+    };
+    let dst_float = is_f32_reg(dst);
+    let src_float = is_f32_reg(*src);
     write!(ctx, "fmov ")?;
     if dst_float {
         emit_float_reg(ctx, dst, false)?;
@@ -1707,7 +1849,10 @@ fn emit_data_reg(ctx: &mut dyn EmitContext, reg: Reg, ty: MemoryType) -> core::f
 }
 fn emit_float_reg(ctx: &mut dyn EmitContext, reg: Reg, is_double: bool) -> core::fmt::Result {
     match reg.to_real_reg() {
-        Some(preg) if preg.class() == RegClass::Float => {
+        // f32 scalars are Vector-class vregs; the scalar-FP view of a NEON
+        // register (`sN`/`dN`) is just its low 32/64 bits, so Float and
+        // Vector classes render identically in scalar-FP contexts.
+        Some(preg) if matches!(preg.class(), RegClass::Float | RegClass::Vector) => {
             write!(
                 ctx,
                 "{}{}",
@@ -1732,7 +1877,7 @@ fn emit_vec_scalar_reg(ctx: &mut dyn EmitContext, reg: Reg, shape: VecShape) -> 
         Some(preg) if preg.class() == RegClass::Int => {
             write!(ctx, "{}{}", if wide { "x" } else { "w" }, preg.hw_enc())
         }
-        Some(preg) if preg.class() == RegClass::Float => {
+        Some(preg) if matches!(preg.class(), RegClass::Float | RegClass::Vector) => {
             write!(ctx, "{}{}", if wide { "d" } else { "s" }, preg.hw_enc())
         }
         _ => ctx.write_reg(&reg),
@@ -1763,6 +1908,9 @@ fn vec_arith_name(op: VecArithOp) -> &'static str {
         VecArithOp::Add => "add",
         VecArithOp::Sub => "sub",
         VecArithOp::Mul => "mul",
+        VecArithOp::Fadd => "fadd",
+        VecArithOp::Fsub => "fsub",
+        VecArithOp::Fmul => "fmul",
     }
 }
 fn vec_bit_name(op: VecBitOp) -> &'static str {
@@ -1776,6 +1924,12 @@ fn vec_cmp_name(op: VecCmpOp) -> &'static str {
     match op {
         VecCmpOp::Eq => "cmeq",
         VecCmpOp::Gt => "cmgt",
+    }
+}
+fn vec_mla_name(op: VecMlaOp) -> &'static str {
+    match op {
+        VecMlaOp::Mla => "mla",
+        VecMlaOp::Mls => "mls",
     }
 }
 fn vec_cvt_name(op: VecCvtOp) -> &'static str {
@@ -1792,6 +1946,20 @@ fn vec_minmax_name(op: VecMinMaxOp) -> &'static str {
         VecMinMaxOp::Umax => "umax",
         VecMinMaxOp::Fmin => "fmin",
         VecMinMaxOp::Fmax => "fmax",
+    }
+}
+fn vec_shift_name(op: VecShiftOp, is_reg: bool) -> &'static str {
+    match (op, is_reg) {
+        // Immediate forms: `shl` / `ushr` / `sshr v.4s, v.4s, #imm`.
+        (VecShiftOp::Shl, false) => "shl",
+        (VecShiftOp::Shr, false) => "ushr",
+        (VecShiftOp::Sar, false) => "sshr",
+        // Register forms: `sshl` / `ushl v.4s, v.4s, v.4s`. Right shifts use
+        // a pre-negated amount vector (`neg` emitted before this), because
+        // NEON has no register-form right-shift instruction.
+        (VecShiftOp::Shl, true) => "sshl",
+        (VecShiftOp::Shr, true) => "ushl",
+        (VecShiftOp::Sar, true) => "sshl",
     }
 }
 fn emit_gpr(ctx: &mut dyn EmitContext, reg: &Gpr, size: OperandSize) -> core::fmt::Result {
@@ -2089,3 +2257,4 @@ fn is_logical_immediate(value: u64, size: OperandSize) -> bool {
 
 #[cfg(test)]
 mod tests;
+

@@ -168,19 +168,35 @@ impl SimplifyCFG {
             .map(|layout| layout.bb())
             .collect::<Vec<_>>();
         let mut rewrites = LogicalEdgeRewriter::new();
+        let mut skipped_targets = std::collections::HashSet::new();
         for source in blocks {
             for edge in outgoing_edges(data.curr_func_data(), source) {
                 if let Some(&target) = removable.get(&edge.target(data.curr_func_data())) {
                     let args = edge.args(data.curr_func_data()).to_vec();
+                    // The final target may carry parameters (the trivial
+                    // jump block itself is parameterless, but its target
+                    // need not be); retargeting with mismatched args would
+                    // panic in the rewriter. Skip the edge conservatively —
+                    // the candidate jump block stays in place (and is not
+                    // removed).
+                    if args.len() != data.bb_data(target).params().len() {
+                        skipped_targets.insert(edge.target(data.curr_func_data()));
+                        continue;
+                    }
                     rewrites.retarget(data.curr_func_data(), edge, target, args);
                 }
             }
         }
         rewrites.apply(data);
+        let mut removed_any = false;
         for &bb in removable.keys() {
+            if skipped_targets.contains(&bb) {
+                continue;
+            }
             data.curr_func_data_mut().remove_layout_basicblock(bb);
+            removed_any = true;
         }
-        true
+        removed_any
     }
 }
 

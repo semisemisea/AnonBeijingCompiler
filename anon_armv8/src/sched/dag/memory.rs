@@ -124,18 +124,44 @@ fn propagated_provenance(
 }
 
 fn memory_access(inst: &MInst, provenance: &FxHashMap<PReg, Provenance>) -> Option<MemAccess> {
-    let (kind, ty, address, pair) = match inst {
-        MInst::Load { ty, addr, .. } => (MemKind::Load, *ty, Some(addr), None),
-        MInst::Store { ty, addr, .. } => (MemKind::Store, *ty, Some(addr), None),
-        MInst::LoadPair { ty, addr, .. } => (MemKind::Load, *ty, None, Some(addr)),
-        MInst::StorePair { ty, addr, .. } => (MemKind::Store, *ty, None, Some(addr)),
+    let (kind, ty, address, pair, base) = match inst {
+        MInst::Load { ty, addr, .. } => (MemKind::Load, *ty, Some(addr), None, None),
+        MInst::Store { ty, addr, .. } => (MemKind::Store, *ty, Some(addr), None, None),
+        MInst::LoadPair { ty, addr, .. } => (MemKind::Load, *ty, None, Some(addr), None),
+        MInst::StorePair { ty, addr, .. } => (MemKind::Store, *ty, None, Some(addr), None),
+        // 128-bit vector load/store `ld1/st1 {v.16b}, [base]`: the base is a
+        // plain register (not an AMode). The scheduler must see these as real
+        // memory accesses or it may reorder them across alias-maybe scalar
+        // stores, corrupting stack-initializer order (79_var_name).
+        MInst::VecLd1 { base, .. } => (
+            MemKind::Load,
+            MemoryType::Vec128,
+            None,
+            None,
+            Some(*base),
+        ),
+        MInst::VecSt1 { base, .. } => (
+            MemKind::Store,
+            MemoryType::Vec128,
+            None,
+            None,
+            Some(*base),
+        ),
         _ => return None,
     };
 
     let size = ty.byte_size() * if pair.is_some() { 2 } else { 1 };
     let location = address
         .and_then(|addr| amode_location(addr, provenance))
-        .or_else(|| pair.and_then(|addr| pair_amode_location(addr, provenance)));
+        .or_else(|| pair.and_then(|addr| pair_amode_location(addr, provenance)))
+        .or_else(|| {
+            base.and_then(|b| {
+                reg_provenance(b, provenance).map(|mut p| {
+                    p.offset = 0;
+                    p
+                })
+            })
+        });
     Some(match location {
         Some(value) => MemAccess {
             kind,

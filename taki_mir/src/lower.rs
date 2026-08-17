@@ -144,6 +144,37 @@ pub fn fold_gep_constant_offset<I: VCodeInst>(
     Some((base, analysis.constant_offset))
 }
 
+/// Fold a constant-only continuation GEP into a load/store addressing mode
+/// even when the GEP is shared by multiple memory ops.
+///
+/// The 2x-unrolled vectorizer emits one continuation GEP (`getelemptr %base,
+/// 4`) consumed by both the unrolled vector load and its paired vector store.
+/// Every user of the GEP is a load or store that folds it into its own
+/// addressing mode, so the producer is never materialized. The sink is
+/// idempotent: the first memory consumer marks the GEP sunk, later consumers
+/// still fold it (the base register is materialized once via `put_value_in_reg`).
+pub fn fold_gep_constant_offset_shared<I: VCodeInst>(
+    ctx: &mut LowerContext<'_, I>,
+    arena: ArenaContext<'_>,
+    gep_inst: HirInst,
+    consumer: HirInst,
+    offset_ok: impl FnOnce(i64) -> bool,
+) -> Option<(Reg, i64)> {
+    let gep = match arena.inst_data(gep_inst).kind() {
+        InstKind::GetElemPtr(gep) => gep,
+        _ => return None,
+    };
+    let analysis = analyze_gep(arena, gep_inst, gep).ok()?;
+    if !analysis.dynamic_terms.is_empty() || !offset_ok(analysis.constant_offset) {
+        return None;
+    }
+    if !ctx.sink_pure_shared_memory_gep(gep_inst, consumer) {
+        return None;
+    }
+    let base = ctx.put_value_in_reg(analysis.base);
+    Some((base, analysis.constant_offset))
+}
+
 /// Sink a single-use GEP and return its full address decomposition.
 ///
 /// Unlike `fold_gep_constant_offset`, the `foldable` predicate sees the whole
@@ -296,6 +327,13 @@ pub trait LowerBackend {
     fn word_directive() -> &'static str;
 
     fn zero_directive() -> &'static str;
+
+    /// Alignment directive emitted before every global, or `""` for none.
+    /// AArch64 returns `.balign 16` so vector loads/stores (`ldr/str q`) over
+    /// globals never fault or split; the assembler pads each label to 16 bytes.
+    fn balign_directive() -> &'static str {
+        ""
+    }
 
     fn preg_name(preg: PReg) -> &'static str;
 
@@ -1109,6 +1147,47 @@ impl<'prog, I: VCodeInst> LowerContext<'prog, I> {
             return false;
         }
         self.inst_sunk.insert(producer)
+    }
+
+    /// Sink a constant-only continuation GEP whose every user is a load or
+    /// store into each user's addressing mode.
+    ///
+    /// Unlike `sink_pure_single_use_producer`, the GEP may be shared by
+    /// several memory ops: the 2x-unrolled vectorizer emits one continuation
+    /// GEP (`getelemptr %base, 4`) consumed by both the unrolled vector load
+    /// and its paired vector store. Every user folds the GEP into its own
+    /// addressing mode, so the producer is never materialized on its own.
+    /// The sink is idempotent: the first memory consumer marks the GEP sunk,
+    /// and later consumers still fold it.
+    pub fn sink_pure_shared_memory_gep(&mut self, producer: HirInst, consumer: HirInst) -> bool {
+        if producer == consumer || self.cur_inst != Some(consumer) {
+            return false;
+        }
+        if !matches!(
+            self.arena.inst_data(producer).kind(),
+            InstKind::GetElemPtr(_)
+        ) {
+            return false;
+        }
+        let users = self.arena.inst_data(producer).used_by();
+        if users.is_empty()
+            || !users
+                .iter()
+                .all(|u| matches!(self.arena.inst_data(*u).kind(), InstKind::Load(_) | InstKind::Store(_)))
+        {
+            return false;
+        }
+        if !users.contains(&consumer) {
+            return false;
+        }
+        if self.value_lowered_use.contains_key(&producer)
+            || self.arena.is_terminator(producer)
+            || self.arena.has_side_effect_when_lowering(producer)
+        {
+            return false;
+        }
+        self.inst_sunk.insert(producer);
+        true
     }
 
     /// Atomically mark a two-producer chain consumed while lowering `root`.

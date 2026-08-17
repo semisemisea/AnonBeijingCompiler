@@ -163,6 +163,7 @@ impl ABIMachineSpec for TestABI {
             scratch_by_class: [None; 3],
             post_ra_scratch_by_class: [vec![], vec![], vec![]],
             fixed_stack_slots: vec![],
+            aliased_banks: &[],
         });
         &ENV
     }
@@ -522,6 +523,7 @@ fn vector_values_allocate_through_moves_and_spills() {
         scratch_by_class: [None; 3],
         post_ra_scratch_by_class: [vec![], vec![], vec![]],
         fixed_stack_slots: vec![],
+        aliased_banks: &[],
     };
 
     let output = crate::reg_alloc::ion::run(&vcode, &env)

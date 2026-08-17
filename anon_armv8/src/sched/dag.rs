@@ -10,7 +10,7 @@ use rustc_hash::FxHashMap;
 use taki_mir::reg_alloc::reg::PReg;
 use taki_mir::register::Reg;
 
-use crate::instructions::{AMode, AluOp, MInst, PairAMode};
+use crate::instructions::{AMode, AluOp, MInst, MemoryType, PairAMode};
 use crate::labels::Label;
 use crate::regs::{FP, OperandSize, RegOrZr, int_preg, stack_preg};
 use crate::sched::aarch53::{InstrProfile, SchedClass, instr_profile};

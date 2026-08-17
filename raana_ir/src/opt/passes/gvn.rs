@@ -53,6 +53,10 @@ enum ValueKey {
         ty: Type,
         value: Inst,
     },
+    VectorSplat {
+        result_ty: Type,
+        src: ValueNumber,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -198,10 +202,23 @@ impl<'a> ValueNumbering<'a> {
             | InstKind::Branch(..)
             | InstKind::TailCall(..)
             | InstKind::Fma(..)
-            | InstKind::VectorSplat(..)
             | InstKind::VectorExtractElement(..)
             | InstKind::VectorInsertElement(..)
             | InstKind::VectorReduce(..) => (ValueKey::Identity { ty, value }, false),
+            // A splat is a pure value-to-vector fan-out: `splat(x)` always
+            // yields the same lanes for the same scalar `x`. The scalar is
+            // already numbered by value (Integer) or by identity (Load), so
+            // two splats sharing a scalar definition and vector type are
+            // structurally identical and merge. Loads are non-eliminable, so
+            // a splat-of-load never merges with a different load that a
+            // store intervened between — safe under the leader's dominance.
+            InstKind::VectorSplat(splat) => (
+                ValueKey::VectorSplat {
+                    result_ty: ty,
+                    src: self.number(data, splat.src()).number,
+                },
+                true,
+            ),
         };
 
         let number = *self.by_key.entry(key).or_insert_with(|| {
@@ -496,6 +513,14 @@ impl Pass for GlobalInstNumbering {
                 }
                 let numbered = numbers.number(data, value);
                 if !numbered.eliminable {
+                    continue;
+                }
+                // Skip CSE for GetElemPtr: two memory ops may share an
+                // address expression, but their consumers (vector loads
+                // re-typed by M42, scalar sibling loads) must keep their own
+                // address inst — sharing it lets a later pass rebuild one
+                // consumer from the other's type.
+                if matches!(data.inst_data(value).kind(), InstKind::GetElemPtr(..)) {
                     continue;
                 }
                 // Call leaders are tracked separately so a write can
@@ -1043,6 +1068,81 @@ mod tests {
         assert_eq!(
             binary_operands(program.func_data(function), result),
             (less, less)
+        );
+    }
+
+    #[test]
+    fn merges_identical_vector_splats() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "splat_cse".into(),
+            vec![Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let x = data.params()[0];
+        let v4i32 = Type::get_vector(Type::get_i32(), 4);
+        let splat_a = data.new_local_inst().vector_splat(x, v4i32.clone());
+        let splat_b = data.new_local_inst().vector_splat(x, v4i32.clone());
+        let idx_a = data.new_local_inst().integer(0);
+        let idx_b = data.new_local_inst().integer(0);
+        let lane_a = data.new_local_inst().vector_extract_element(splat_a, idx_a);
+        let lane_b = data.new_local_inst().vector_extract_element(splat_b, idx_b);
+        let sum = data.new_local_inst().binary(BinaryOp::Add, lane_a, lane_b);
+        let ret = data.new_local_inst().ret(Some(sum));
+        for value in [splat_a, splat_b, idx_a, idx_b, lane_a, lane_b, sum, ret] {
+            data.layout_mut().insert_inst(entry, value);
+        }
+
+        assert!(GlobalInstNumbering.run(&mut program));
+        let data = program.func_data(function);
+        assert!(
+            data.inst_data(splat_b).used_by().is_empty(),
+            "the duplicate splat must be replaced and dead"
+        );
+        let InstKind::VectorExtractElement(e_b) = data.inst_data(lane_b).kind() else {
+            panic!("expected vector extract element")
+        };
+        assert_eq!(e_b.src(), splat_a);
+    }
+
+    #[test]
+    fn does_not_merge_splats_of_loads_split_by_store() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_i32(), "splat_load".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let v4i32 = Type::get_vector(Type::get_i32(), 4);
+        let alloc = data.new_local_inst().alloc(Type::get_i32());
+        let load_a = data.new_local_inst().load(alloc);
+        let zero = data.new_local_inst().integer(0);
+        let store = data.new_local_inst().store(zero, alloc);
+        let load_b = data.new_local_inst().load(alloc);
+        let splat_a = data.new_local_inst().vector_splat(load_a, v4i32.clone());
+        let splat_b = data.new_local_inst().vector_splat(load_b, v4i32.clone());
+        let idx_a = data.new_local_inst().integer(0);
+        let idx_b = data.new_local_inst().integer(0);
+        let lane_a = data.new_local_inst().vector_extract_element(splat_a, idx_a);
+        let lane_b = data.new_local_inst().vector_extract_element(splat_b, idx_b);
+        let sum = data.new_local_inst().binary(BinaryOp::Add, lane_a, lane_b);
+        let ret = data.new_local_inst().ret(Some(sum));
+        for value in [
+            alloc, load_a, zero, store, load_b, splat_a, splat_b, idx_a, idx_b, lane_a,
+            lane_b, sum, ret,
+        ] {
+            data.layout_mut().insert_inst(entry, value);
+        }
+
+        GlobalInstNumbering.run(&mut program);
+        let data = program.func_data(function);
+        let InstKind::VectorExtractElement(e_b) = data.inst_data(lane_b).kind() else {
+            panic!("expected vector extract element")
+        };
+        assert_eq!(
+            e_b.src(),
+            splat_b,
+            "splats of loads split by a store must not merge"
         );
     }
 }

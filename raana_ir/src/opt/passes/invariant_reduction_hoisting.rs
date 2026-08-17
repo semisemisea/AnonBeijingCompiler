@@ -292,6 +292,28 @@ impl InvariantReductionHoisting {
                 continue;
             }
             let Some(final_acc) = trace_accumulator(data, &region, header, exit, p) else {
+                // A non-trip i32 param additively modified inside the nest but
+                // failing the accumulator trace (e.g. its value is also stored
+                // to memory) must still veto the transform: the clone runs the
+                // nest once, and the degraded loop only carries the chosen
+                // accumulator — any other loop-carried modification would be
+                // dropped (fuzz: case_0147, g_sum += 69 inside helper1548).
+                let has_acc_use = data
+                    .inst_data(p)
+                    .used_by()
+                    .iter()
+                    .any(|&u| {
+                        data.layout().parent_bb(u).is_some_and(|b| region.contains(&b))
+                            && matches!(
+                                data.inst_data(u).kind(),
+                                InstKind::Binary(b)
+                                    if matches!(b.op(), BinaryOp::Add | BinaryOp::Sub)
+                                        && (b.lhs() == p || b.rhs() == p)
+                            )
+                    });
+                if has_acc_use {
+                    return None;
+                }
                 continue;
             };
             if orig_back_args[idx] == final_acc
@@ -772,8 +794,20 @@ fn trace_invariant(
                     {
                         worklist.push_back(user);
                     }
-                    InstKind::Jump(jump)
-                        if jump.target() == header && jump.args().contains(&cur) => {}
+                    InstKind::Jump(jump) if jump.target() == header => {
+                        // r-derived values may only ride the r slot on the
+                        // back edge; an arg feeding the accumulator slot makes
+                        // the accumulator's delta D depend on r and the clone
+                        // (seeded with r = entering value) would compute a
+                        // wrong carrier (fuzz: case_0057, `g_sum += i589 - 30`).
+                        let params = data.bb_data(header).params();
+                        let r_pos = params.iter().position(|&p| p == r);
+                        if !r_pos
+                            .is_some_and(|i| jump.args().get(i).copied() == Some(cur))
+                        {
+                            return false;
+                        }
+                    }
                     _ => return false,
                 }
             } else {
@@ -1135,6 +1169,129 @@ mod tests {
         assert!(
             !run(&mut program, function),
             "a store in the body must veto"
+        );
+        assert_eq!(
+            program.func_data(function).layout().basicblocks().len(),
+            blocks
+        );
+    }
+
+    #[test]
+    fn skips_a_nest_whose_accumulator_delta_reads_the_trip_counter() {
+        // Regression (fuzz: case_0057): `acc = acc + (r + -30)` — the delta E
+        // reads the trip counter r. trace_invariant must veto: the clone is
+        // seeded with r = entering value, so the carrier would be computed
+        // from r = 0 and reused for every iteration. The back edge may only
+        // carry r-derived values in the r slot; an arg feeding the acc slot
+        // means D depends on r.
+        let mut program = Program::new();
+        let function =
+            program.new_function(Type::get_i32(), "delta_reads_r".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let bound = data.params()[0];
+        let outer = data
+            .new_basic_block()
+            .basic_block("outer".into(), vec![Type::get_i32(), Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [outer, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(outer, vec![zero, zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let r = data.bb_data(outer).params()[0];
+        let acc = data.bb_data(outer).params()[1];
+        let one = data.new_local_inst().integer(1);
+        let minus30 = data.new_local_inst().integer(-30);
+        let test = data.new_local_inst().binary(BinaryOp::Lt, r, bound);
+        let branch = data
+            .new_local_inst()
+            .branch(test, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(outer, test);
+        data.layout_mut().insert_inst(outer, branch);
+        // The nest is the latch: acc += (r + -30), r += 1.
+        let delta = data.new_local_inst().binary(BinaryOp::Add, r, minus30);
+        let acc2 = data.new_local_inst().binary(BinaryOp::Add, acc, delta);
+        let r2 = data.new_local_inst().binary(BinaryOp::Add, r, one);
+        let back = data.new_local_inst().jump(outer, vec![r2, acc2]);
+        for inst in [delta, acc2, r2, back] {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        let ret = data.new_local_inst().ret(Some(acc));
+        data.layout_mut().insert_inst(exit, ret);
+
+        let blocks = program.func_data(function).layout().basicblocks().len();
+        assert!(
+            !run(&mut program, function),
+            "a delta that reads the trip counter must veto"
+        );
+        assert_eq!(
+            program.func_data(function).layout().basicblocks().len(),
+            blocks
+        );
+    }
+
+    #[test]
+    fn skips_a_nest_with_a_second_non_traced_accumulation() {
+        // Regression (fuzz: case_0147): the nest accumulates a second
+        // loop-carried i32 value (g_sum += 69 inside an inlined helper) that
+        // fails the accumulator trace (its value is also stored to memory in
+        // the exit block). The transform would drop that accumulation — the
+        // clone runs the nest once and the degraded loop only carries the
+        // chosen accumulator — so any additive modification of a non-acc
+        // param must veto.
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "second_acc".into(),
+            vec![Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let bound = data.params()[0];
+        let outer = data
+            .new_basic_block()
+            .basic_block("outer".into(), vec![Type::get_i32(), Type::get_i32(), Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [outer, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(outer, vec![zero, zero, zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let r = data.bb_data(outer).params()[0];
+        let acc = data.bb_data(outer).params()[1];
+        let extra = data.bb_data(outer).params()[2];
+        let one = data.new_local_inst().integer(1);
+        let test = data.new_local_inst().binary(BinaryOp::Lt, r, bound);
+        let branch = data
+            .new_local_inst()
+            .branch(test, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(outer, test);
+        data.layout_mut().insert_inst(outer, branch);
+        let acc2 = data.new_local_inst().binary(BinaryOp::Add, acc, one);
+        let extra2 = data.new_local_inst().binary(BinaryOp::Add, extra, one);
+        let r2 = data.new_local_inst().binary(BinaryOp::Add, r, one);
+        let back = data.new_local_inst().jump(outer, vec![r2, acc2, extra2]);
+        for inst in [acc2, extra2, r2, back] {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        // extra's value is consumed by a store in the exit block, which makes
+        // trace_accumulator(extra) fail (not a clean accumulator candidate).
+        let slot = data.new_local_inst().alloc(Type::get_i32());
+        let store = data.new_local_inst().store(extra2, slot);
+        let ret = data.new_local_inst().ret(Some(acc));
+        for inst in [slot, store, ret] {
+            data.layout_mut().insert_inst(exit, inst);
+        }
+
+        let blocks = program.func_data(function).layout().basicblocks().len();
+        assert!(
+            !run(&mut program, function),
+            "a second additive modification must veto"
         );
         assert_eq!(
             program.func_data(function).layout().basicblocks().len(),

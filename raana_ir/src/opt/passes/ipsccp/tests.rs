@@ -332,7 +332,11 @@ fn mem_zero_makes_local_array_loads_zero() {
         let clear = data.new_local_value().mem_zero(alloc, 16);
         data.layout_mut().insert_inst(entry, clear);
         let zero = data.new_local_value().integer(0);
-        let gep = data.new_local_value().get_elem_ptr(alloc, vec![zero]);
+        // (0, 0) 双索引：对 *[i32;4] 数组取标量元素指针，load 才是 i32 标量。
+        // 单索引 (0) 得到聚合指针（*[i32;4]），load 出数组类型——聚合值
+        // 不该折叠成 int 0（IPSCCP 的零区间折叠只对 i32 标量 load 生效，
+        // 见 MemState::read 的类型 guard）。
+        let gep = data.new_local_value().get_elem_ptr(alloc, vec![zero, zero]);
         data.layout_mut().insert_inst(entry, gep);
         let load = data.new_local_value().load(gep);
         data.layout_mut().insert_inst(entry, load);
@@ -737,4 +741,35 @@ fn load_before_call_to_writer_stays_zero() {
             || matches!(kind, InstKind::Integer(integer) if integer.value() == 0),
         "load after a later call must not fold to the callee's value, got {kind:?}"
     );
+}
+
+/// f32 零初始化 load 不折叠：`Lattice::Constant` 只承载 i32 常量，f32 load
+/// 折叠成 int 0 会让 f32 运算拿到整数寄存器操作数——后端编码出
+/// `fadd s16, s4, x6` 这类非法指令（fuzzer 差分 case_0001，O2 汇编失败）。
+/// float load 保持运行时读取（保守）。
+#[test]
+fn zero_initialized_f32_global_load_stays_load() {
+    let mut program = Program::new();
+    let init = program.new_value().zero_init(Type::get_f32());
+    let global = program.new_value().global_alloc(init);
+    let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+    let (load, _ret) = {
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(main),
+        };
+        let entry = data.add_entry_block();
+        let zero = data.new_local_value().integer(0);
+        let gep = data.new_local_value().get_elem_ptr(global, vec![zero]);
+        data.layout_mut().insert_inst(entry, gep);
+        let load = data.new_local_value().load(gep);
+        data.layout_mut().insert_inst(entry, load);
+        let ret = data.new_local_value().ret(Some(load));
+        data.layout_mut().insert_inst(entry, ret);
+        (load, ret)
+    };
+
+    let _ = IPSCCP.run(&mut program);
+    let data = program.func_data(main);
+    assert!(matches!(data.inst_data(load).kind(), InstKind::Load(..)));
 }

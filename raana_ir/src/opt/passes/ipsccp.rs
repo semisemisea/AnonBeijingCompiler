@@ -309,13 +309,19 @@ impl MemState {
         // from the entry avoids every store preceding the load — otherwise
         // the load necessarily reads a stored value and folding 0 in would
         // be unsound (洞 2: single writer on one branch must not fold).
+        //
+        // 只对 i32 load 折叠：`Lattice::Constant` 只承载 i32 常量，f32 load
+        // 折叠成 int 0 是类型错误——f32 加法/比较拿到整数寄存器操作数，
+        // 后端编码出 `fadd s16, s4, x6` 这类非法指令（fuzzer 差分抓到的
+        // case_0001，O2 汇编失败）。float load 保持运行时读取（保守）。
         let root = key.root();
         let zero_covered = self.zero.get(&root).is_some_and(|ranges| {
             ranges
                 .iter()
                 .any(|&(from, to)| key.offset() >= from && key.offset() < to)
         });
-        if zero_covered && ord.init_reachable(load, &prior) {
+        let load_ty = ord.program.func_data(load.func).inst_data(load.inst).ty();
+        if zero_covered && load_ty.is_i32() && ord.init_reachable(load, &prior) {
             folded = folded.merge(Lattice::Constant(0));
         }
         if folded != Lattice::Top {

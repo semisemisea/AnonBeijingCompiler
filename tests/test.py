@@ -719,7 +719,7 @@ def parse_args(argv):
         "--backend",
         choices=["asm", "llvm"],
         default="asm",
-        help="compiler backend: asm (assemnly) or llvm (LLVM IR)",
+        help="compiler backend: asm (assembly) or llvm (LLVM IR)",
     )
     parser.add_argument(
         "--target",

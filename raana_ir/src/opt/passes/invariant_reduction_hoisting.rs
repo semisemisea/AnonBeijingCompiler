@@ -333,6 +333,32 @@ impl InvariantReductionHoisting {
             }
         };
 
+        // (6.5) No non-trip, non-acc loop-carried parameter may be modified
+        // in the body AND observed after the loop: the compute-once clone
+        // cannot reproduce a modification outside the nest, and the degraded
+        // loop would exit with the wrong value (fuzz: sd16 case_0031 —
+        // `v343 = -81` in the outer body, read by the post-loop condition,
+        // was dropped → the condition folded the wrong way and putint(-3)
+        // vanished). Modifications inside the nest are reproduced by the
+        // clone (case_0057's float selects) and stay allowed; a pure
+        // pass-through is always fine.
+        for (idx, p) in params.iter().enumerate() {
+            if idx == r_idx || idx == acc_idx {
+                continue;
+            }
+            if orig_back_args.get(idx) == Some(p) {
+                continue;
+            }
+            let live_at_exit = data
+                .inst_data(*p)
+                .used_by()
+                .iter()
+                .any(|&u| data.layout().parent_bb(u).is_some_and(|b| !region.contains(&b)));
+            if live_at_exit {
+                return None;
+            }
+        }
+
         // (7) The nest must not reference header-local computed values (only
         // header parameters, which the clone substitutes with their entering
         // values; a header-local value would not dominate the clone).
@@ -1172,7 +1198,67 @@ mod tests {
         );
         assert_eq!(
             program.func_data(function).layout().basicblocks().len(),
-            blocks
+            blocks,
+            "the transformed program must not grow blocks"
+        );
+    }
+
+    #[test]
+    fn skips_a_nest_with_a_body_modified_carried_param() {
+        // fuzz sd16 case_0031: `v343 = -81` in the outer body, read by the
+        // post-loop condition. A non-trip, non-acc loop-carried parameter
+        // modified in the body cannot be reproduced by the compute-once
+        // clone — the degraded loop exits with the wrong value. Must reject.
+        let mut program = Program::new();
+        let function =
+            program.new_function(Type::get_i32(), "modify_nest".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let bound = data.params()[0];
+        let outer = data.new_basic_block().basic_block(
+            "outer".into(),
+            vec![Type::get_i32(), Type::get_i32(), Type::get_i32()],
+        );
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [outer, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(outer, vec![zero, zero, zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let r = data.bb_data(outer).params()[0];
+        let acc = data.bb_data(outer).params()[1];
+        let extra = data.bb_data(outer).params()[2];
+        let one = data.new_local_inst().integer(1);
+        let test = data.new_local_inst().binary(BinaryOp::Lt, r, bound);
+        let branch = data
+            .new_local_inst()
+            .branch(test, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(outer, test);
+        data.layout_mut().insert_inst(outer, branch);
+        // extra is modified in the body: extra2 = extra - 81.
+        let eighty_one = data.new_local_inst().integer(81);
+        let extra2 = data.new_local_inst().binary(BinaryOp::Sub, extra, eighty_one);
+        let acc2 = data.new_local_inst().binary(BinaryOp::Add, acc, one);
+        let r2 = data.new_local_inst().binary(BinaryOp::Add, r, one);
+        for inst in [eighty_one, extra2, acc2, r2] {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        let back = data.new_local_inst().jump(outer, vec![r2, acc2, extra2]);
+        data.layout_mut().insert_inst(body, back);
+        let ret = data.new_local_inst().ret(Some(extra));
+        data.layout_mut().insert_inst(exit, ret);
+
+        let blocks = program.func_data(function).layout().basicblocks().len();
+        assert!(
+            !run(&mut program, function),
+            "a body-modified carried param must veto"
+        );
+        assert_eq!(
+            program.func_data(function).layout().basicblocks().len(),
+            blocks,
+            "the transformed program must not grow blocks"
         );
     }
 

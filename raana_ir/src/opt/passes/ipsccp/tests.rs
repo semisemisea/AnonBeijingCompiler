@@ -773,3 +773,48 @@ fn zero_initialized_f32_global_load_stays_load() {
     let data = program.func_data(main);
     assert!(matches!(data.inst_data(load).kind(), InstKind::Load(..)));
 }
+
+/// 动态索引 store 必须失效整个 root（fuzzer baseline case_0150）：局部
+/// 数组 memzero 后，循环内动态索引 store `a[i] = ...` 可能写 a[3]——
+/// 静态 load a[3] 不得折叠零区间 0（否则第二轮循环读到错误的 0 而非
+/// 上一轮写的 -12）。
+#[test]
+fn dynamic_index_store_invalidates_static_load() {
+    let mut program = Program::new();
+    // getint 是声明函数（无定义）：call 返回 Bottom，索引保持动态。
+    let getint = program.new_function(Type::get_i32(), "getint".into(), vec![]);
+    let main = program.new_function(Type::get_i32(), "main".into(), vec![]);
+    let (load, _ret) = {
+        let mut data = ArenaContextMut {
+            program: &mut program,
+            curr_func: Some(main),
+        };
+        let entry = data.add_entry_block();
+        let alloc = data
+            .new_local_value()
+            .alloc(Type::get_array(Type::get_i32(), 4));
+        data.layout_mut().insert_inst(entry, alloc);
+        let clear = data.new_local_value().mem_zero(alloc, 16);
+        data.layout_mut().insert_inst(entry, clear);
+        let idx = data.new_local_value().call(getint, vec![]);
+        data.layout_mut().insert_inst(entry, idx);
+        let gep_dyn = data.new_local_value().get_elem_ptr(alloc, vec![idx]);
+        data.layout_mut().insert_inst(entry, gep_dyn);
+        let five = data.new_local_value().integer(5);
+        let store = data.new_local_value().store(five, gep_dyn);
+        data.layout_mut().insert_inst(entry, store);
+        let zero = data.new_local_value().integer(0);
+        let gep3 = data.new_local_value().get_elem_ptr(alloc, vec![zero, zero]);
+        data.layout_mut().insert_inst(entry, gep3);
+        let load = data.new_local_value().load(gep3);
+        data.layout_mut().insert_inst(entry, load);
+        let ret = data.new_local_value().ret(Some(load));
+        data.layout_mut().insert_inst(entry, ret);
+        (load, ret)
+    };
+
+    let _ = IPSCCP.run(&mut program);
+    let data = program.func_data(main);
+    // 动态 store a[getint()] 可能写 a[0]：load 保持运行时读取。
+    assert!(matches!(data.inst_data(load).kind(), InstKind::Load(..)));
+}

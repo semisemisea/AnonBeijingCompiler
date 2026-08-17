@@ -283,6 +283,13 @@ impl MemState {
             return (folded, prior);
         };
         for (&(wfunc, writer), &v) in writers {
+            // Top contribution = 该 store 的源还没收敛（worklist 顺序上
+            // store 可能先于其 src 处理）。meet 忽略 Top 会让 load 只看到
+            // 部分 writer 的值——保守返回 Bottom，收敛后 store 重写会
+            // 触发 load 重读恢复正常折叠。
+            if v == Lattice::Top {
+                return (Lattice::Bottom, prior);
+            }
             if ord.writer_relation(writer, wfunc, load) != 0 {
                 folded = folded.merge(v);
                 prior.push((wfunc, ord.block_of(wfunc, writer)));
@@ -324,11 +331,12 @@ impl MemState {
         if zero_covered && load_ty.is_i32() && ord.init_reachable(load, &prior) {
             folded = folded.merge(Lattice::Constant(0));
         }
-        if folded != Lattice::Top {
+        let result = if folded != Lattice::Top {
             folded
         } else {
             Lattice::Bottom
-        }
+        };
+        result
     }
 
     /// Record a store `writer` (in function `func`) of `value` into `key`.
@@ -404,6 +412,12 @@ impl MemState {
         ctx: &ArenaContext<'_>,
     ) -> Option<Vec<RootKey>> {
         match analysis.targets_of(ctx, func, addr) {
+            // 空对象集合 = 分析器无法确定目标（如动态索引 getelemptr(0, i)），
+            // 语义上是"可能写任何位置"——返回 None 让调用方全清该 root 族。
+            // 曾把 Some([]) 当"无目标"→ 动态 store 不失效任何 root → 静态
+            // load 零区间错误折叠 0（fuzzer baseline 抓到 case_0150：
+            // a1536[i1542]=-12+a1536[3] 的 [3] load 折叠 0，第二轮应 -24）。
+            Some(objects) if objects.is_empty() => None,
             Some(objects) => {
                 let mut roots = Vec::new();
                 for o in objects {
@@ -1102,9 +1116,13 @@ impl Pass for IPSCCP {
                                 }
                             }
                             None => {
-                                let roots =
-                                    state.possible_targets(&analysis, func, store.dest(), &ctx);
-                                for root in roots.unwrap_or_default() {
+                                let roots = state
+                                    .possible_targets(&analysis, func, store.dest(), &ctx)
+                                    // None = "可能写任何 root"：全清（保守）。
+                                    // 曾用 unwrap_or_default 把 None 当空，
+                                    // 与空集合问题同源（case_0150）。
+                                    .unwrap_or_else(|| state.all_roots.iter().copied().collect());
+                                for root in roots {
                                     if state.clear(root, true) {
                                         if let Some(loaders) = state.root_loaders.get(&root) {
                                             mem_reschedule.extend(loaders.iter().copied());

@@ -113,6 +113,8 @@
 //! 全局项下降（`global_convert` 体系）、短路逻辑的编译期折叠、`is_complete_bb`
 //! 死代码跳过与自动补 `ret` 等机制——读代码时以本模块文档为索引，逐 impl 对照
 //! `items.rs` 的节点定义与 `utils.rs` 的上下文辅助即可。
+const ELEMENTWISE_FLAG: bool = true;
+
 use super::items;
 use crate::frontend::utils::{AstGenContext, Ident, Symbol, ToRaanaIR};
 use raana_ir::ir::{arena::Arena, builder_trait::*, *};
@@ -369,7 +371,7 @@ impl ToRaanaIR for items::ConstDecl {
             self.btype.btype.is_scalar(),
             "Unknown type for constant declaration."
         );
-        ctx.set_def_type(self.btype.btype.clone());
+        ctx.set_def_type(self.btype.clone());
         for const_def in &self.const_defs {
             const_def.convert(ctx);
         }
@@ -381,7 +383,7 @@ impl ToRaanaIR for items::ConstDecl {
             self.btype.btype.is_scalar(),
             "Unknown type for constant declaration."
         );
-        ctx.set_def_type(self.btype.btype.clone());
+        ctx.set_def_type(self.btype.clone());
         for const_def in &self.const_defs {
             const_def.global_convert(ctx);
         }
@@ -396,6 +398,7 @@ impl ToRaanaIR for items::ConstDef {
         let ty = ctx.curr_def_type().unwrap();
         // not an array
         if self.arr_dim.is_empty() {
+            let ty = ty.btype;
             // Get the init val
             let items::ConstInitVal::Normal(_) = self.const_init_val else {
                 panic!("Invalid assign: array to a integer")
@@ -411,6 +414,7 @@ impl ToRaanaIR for items::ConstDef {
         }
         // is an array
         else {
+            let ty = ty.btype;
             let array_shape = self
                 .arr_dim
                 .iter()
@@ -451,7 +455,8 @@ impl ToRaanaIR for items::ConstDef {
     fn global_convert(&self, ctx: &mut AstGenContext) {
         let ty = ctx.curr_def_type().unwrap();
         // is array
-        if self.arr_dim.is_empty() {
+        if self.arr_dim.is_empty() && !ty.is_tensor {
+            let ty = ty.btype;
             self.const_init_val.global_convert(ctx);
             let init_val = ctx.pop_val().unwrap();
             let init_val = ctx.coerce_global(init_val, &ty);
@@ -460,6 +465,7 @@ impl ToRaanaIR for items::ConstDef {
         }
         // not an array
         else {
+            let ty = ty.btype;
             let array_shape = self
                 .arr_dim
                 .iter()
@@ -563,7 +569,7 @@ impl ToRaanaIR for items::VarDecl {
             self.btype.btype.is_scalar(),
             "Unknown type for variable declaration"
         );
-        ctx.set_def_type(self.btype.btype.clone());
+        ctx.set_def_type(self.btype.clone());
         for var_def in &self.var_defs {
             var_def.convert(ctx);
         }
@@ -574,7 +580,7 @@ impl ToRaanaIR for items::VarDecl {
             self.btype.btype.is_scalar(),
             "Unknown type for variable declaration"
         );
-        ctx.set_def_type(self.btype.btype.clone());
+        ctx.set_def_type(self.btype.clone());
         for var_def in &self.var_defs {
             var_def.global_convert(ctx);
         }
@@ -588,7 +594,8 @@ impl ToRaanaIR for items::VarDef {
         }
         let ty = ctx.curr_def_type().unwrap();
         // Not an array
-        if self.arr_dim.is_empty() {
+        if self.arr_dim.is_empty() && !ty.is_tensor {
+            let ty = ty.btype;
             // Allocate a target type of variable.
             let alloc_var = ctx.new_local_value().alloc(ty.clone());
             ctx.set_value_name(alloc_var, self.ident.clone());
@@ -608,6 +615,7 @@ impl ToRaanaIR for items::VarDef {
         }
         // is an array
         else {
+            let ty = ty.btype;
             // for given expression like `a[x][y][z]`, we first take out each const exp in the []
             // bracket and calculated it as i32(only type we accept)
             // we calculate from `z` to `x`, and pop it from `x` to `z`.
@@ -636,20 +644,47 @@ impl ToRaanaIR for items::VarDef {
             // We handle the possible initial value.
             if let Some(ref init_val) = self.init_val {
                 // must be an array
-                if !matches!(init_val, items::InitVal::Array(_)) {
-                    panic!("Invalid assign: integer to an array")
-                };
-
-                let clear = ctx.new_local_value().mem_zero(alloc_var, byte_len);
-                ctx.push_inst(clear);
-                for (flat_index, exp) in init_val.explicit_init_vals(&array_shape) {
+                // if !matches!(init_val, items::InitVal::Array(_)) {
+                //     panic!("Invalid assign: integer: {:?} to an array", init_val)
+                // };
+                if let items::InitVal::Normal(exp) = init_val {
                     exp.convert(ctx);
-                    let value = ctx.pop_val().unwrap();
-                    let value = ctx.coerce_local(value, &ty);
-                    let dest = local_array_element_ptr(ctx, alloc_var, &array_shape, flat_index);
-                    ctx.push_inst(dest);
-                    let store = ctx.new_local_value().store(value, dest);
-                    ctx.push_inst(store);
+                    if ELEMENTWISE_FLAG {
+                        let len = array_shape.iter().product::<i32>() as usize;
+                        let mut vals = ctx.pop_n_val(len).unwrap();
+                        for &len in array_shape.iter().rev() {
+                            let t = vals
+                                .chunks_exact(len as usize)
+                                .map(|slice| slice.to_vec())
+                                .collect::<Vec<_>>();
+                            let mut new = vec![];
+                            for elem in t {
+                                new.push(ctx.new_local_value().aggregate(elem));
+                            }
+                            vals = new;
+                        }
+                        assert!(vals.len() == 1);
+                        eprintln!("{:?}", ctx.inst_data(vals[0]));
+                        let store = ctx.new_local_value().store(vals[0], alloc_var);
+                        ctx.push_inst(store);
+                    } else {
+                        let val = ctx.pop_val().unwrap();
+                        let store = ctx.new_local_value().store(val, alloc_var);
+                        ctx.push_inst(store);
+                    }
+                } else {
+                    let clear = ctx.new_local_value().mem_zero(alloc_var, byte_len);
+                    ctx.push_inst(clear);
+                    for (flat_index, exp) in init_val.explicit_init_vals(&array_shape) {
+                        exp.convert(ctx);
+                        let value = ctx.pop_val().unwrap();
+                        let value = ctx.coerce_local(value, &ty);
+                        let dest =
+                            local_array_element_ptr(ctx, alloc_var, &array_shape, flat_index);
+                        ctx.push_inst(dest);
+                        let store = ctx.new_local_value().store(value, dest);
+                        ctx.push_inst(store);
+                    }
                 }
             }
             ctx.insert_var(self.ident.clone(), alloc_var)
@@ -658,7 +693,8 @@ impl ToRaanaIR for items::VarDef {
 
     fn global_convert(&self, ctx: &mut AstGenContext) {
         let ty = ctx.curr_def_type().unwrap();
-        if self.arr_dim.is_empty() {
+        if self.arr_dim.is_empty() && !ty.is_tensor {
+            let ty = ty.btype;
             let init_val = if let Some(ref init_val) = self.init_val {
                 init_val.global_convert(ctx);
                 let val = ctx.pop_val().unwrap();
@@ -670,6 +706,7 @@ impl ToRaanaIR for items::VarDef {
             ctx.set_value_name(val, self.ident.clone());
             ctx.insert_var(self.ident.clone(), val)
         } else {
+            let ty = ty.btype;
             let array_shape = self
                 .arr_dim
                 .iter()
@@ -1557,6 +1594,63 @@ impl ToRaanaIR for BinaryOp {
         let lhs = ctx.pop_val().unwrap();
         let lhs_ty = ctx.inst_data(lhs).ty().clone();
         let rhs_ty = ctx.inst_data(rhs).ty().clone();
+
+        // tensor type arith
+        if lhs_ty.is_pointer() && lhs_ty.derefernce().is_array() {
+            if ELEMENTWISE_FLAG {
+                eprintln!("{:?}", lhs_ty.kind());
+                // shape must be match
+                assert!(lhs_ty == rhs_ty);
+                let array_shape = lhs_ty.derefernce().get_array_shape();
+
+                fn rec(
+                    array_shape: &[usize],
+                    idxs: &mut Vec<usize>,
+                    lhs: Inst,
+                    rhs: Inst,
+                    op: BinaryOp,
+                    ctx: &mut AstGenContext,
+                    dep: usize,
+                ) {
+                    if dep == array_shape.len() {
+                        let offsets = std::iter::once(0)
+                            .chain(idxs.iter().copied())
+                            .map(|idx| ctx.new_local_value().integer(idx as i32))
+                            .collect::<Vec<_>>();
+                        let gep_lhs = ctx.new_local_value().get_elem_ptr(lhs, offsets.clone());
+                        ctx.push_inst(gep_lhs);
+                        let load_lhs = ctx.new_local_value().load(gep_lhs);
+                        ctx.push_inst(load_lhs);
+                        let gep_rhs = ctx.new_local_value().get_elem_ptr(rhs, offsets);
+                        ctx.push_inst(gep_rhs);
+                        let load_rhs = ctx.new_local_value().load(gep_rhs);
+                        ctx.push_inst(load_rhs);
+                        let binary = ctx.new_local_value().binary(op, load_lhs, load_rhs);
+                        ctx.push_inst(binary);
+                        ctx.push_val(binary);
+                        return;
+                    }
+                    while idxs[dep] < array_shape[dep] {
+                        rec(array_shape, idxs, lhs, rhs, op, ctx, dep + 1);
+                        idxs[dep] += 1;
+                    }
+                    idxs[dep] = 0;
+                }
+
+                let mut idxs = vec![0; array_shape.len()];
+                rec(&array_shape, &mut idxs, lhs, rhs, *self, ctx, 0);
+            } else {
+                let l = ctx.new_local_value().load(lhs);
+                ctx.push_inst(l);
+                let r = ctx.new_local_value().load(rhs);
+                ctx.push_inst(r);
+                let op = ctx.new_local_value().binary(*self, l, r);
+                ctx.push_inst(op);
+                ctx.push_val(op);
+            }
+            return;
+        }
+
         let use_float = lhs_ty.is_f32() || rhs_ty.is_f32();
 
         if use_float {

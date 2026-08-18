@@ -65,12 +65,12 @@ pub trait LocalInstBuilder: ScalarInstBuilder {
         let lhs_type = self.inst_type(lhs);
         let rhs_type = self.inst_type(rhs);
         assert!(
-            lhs_type.is_scalar() || lhs_type.is_vector(),
-            "lhs of binary is neither scalar nor vector: {lhs_type}"
+            lhs_type.is_scalar() || lhs_type.is_vector() || lhs_type.is_array(),
+            "lhs of binary is neither scalar nor vector nor array: {lhs_type}"
         );
         assert!(
-            rhs_type.is_scalar() || rhs_type.is_vector(),
-            "rhs of binary is neither scalar nor vector: {rhs_type}"
+            rhs_type.is_scalar() || rhs_type.is_vector() || rhs_type.is_array(),
+            "rhs of binary is neither scalar nor vector nor array: {rhs_type}"
         );
         assert!(
             lhs_type == rhs_type,

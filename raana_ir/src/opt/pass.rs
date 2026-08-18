@@ -227,6 +227,8 @@ impl PassesManager {
 
         let ipsccp = Box::new(ipsccp::IPSCCP);
         p.register(ipsccp);
+        // let sccp = Box::new(const_prop::SparseConditionConstantPropagation);
+        // p.register(sccp);
 
         let simplify_cfg = Box::new(simplify_cfg::SimplifyCFG);
         p.register(simplify_cfg);
@@ -291,8 +293,8 @@ impl PassesManager {
 
         // Dead store elimination: drops GSP redundant write-backs and
         // covered stores so later passes see a cleaner memory image.
-        let dse = Box::new(dse::DSE);
-        p.register(dse);
+        // let dse = Box::new(dse::DSE);
+        // p.register(dse);
 
         let pointer_sr = Box::new(pointer_strength_reduction::PointerStrengthReduction);
         p.register(pointer_sr);

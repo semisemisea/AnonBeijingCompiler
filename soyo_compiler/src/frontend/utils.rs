@@ -180,7 +180,7 @@ pub struct AstGenContext {
     val_stack: Vec<Inst>,
     curr_bb: Option<BasicBlock>,
     symbol_table: Vec<SymbolTable>,
-    def_type: Option<Type>,
+    def_type: Option<BType>,
     loop_stack: Vec<(BasicBlock, BasicBlock)>,
 }
 
@@ -368,6 +368,15 @@ impl AstGenContext {
         self.val_stack.pop()
     }
 
+    pub fn pop_n_val(&mut self, n: usize) -> Option<Vec<Inst>> {
+        let len = self.val_stack.len();
+        if n > len {
+            None
+        } else {
+            Some(self.val_stack.split_off(len - n))
+        }
+    }
+
     pub fn register_bb(&mut self, bb: BasicBlock) {
         self.curr_func_data_mut().layout_mut().push_bb_back(bb);
     }
@@ -403,12 +412,12 @@ impl AstGenContext {
     }
 
     #[inline]
-    pub fn set_def_type(&mut self, ty: Type) -> Option<Type> {
+    pub fn set_def_type(&mut self, ty: BType) -> Option<BType> {
         self.def_type.replace(ty)
     }
 
     #[inline]
-    pub fn curr_def_type(&self) -> Option<Type> {
+    pub fn curr_def_type(&self) -> Option<BType> {
         self.def_type.clone()
     }
 

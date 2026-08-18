@@ -151,6 +151,24 @@ impl Type {
         }
     }
 
+    pub fn get_array_shape(&self) -> Vec<usize> {
+        let mut ty = self.0.clone();
+        let mut ret = vec![];
+        loop {
+            let bt;
+            match ty.as_ref() {
+                TypeKind::Array(base_ty, len) => {
+                    bt = base_ty;
+                    ret.push(*len);
+                }
+                _ => {
+                    return ret;
+                }
+            }
+            ty = bt.0.clone();
+        }
+    }
+
     pub fn is_unit(&self) -> bool {
         matches!(self.0.as_ref(), TypeKind::Unit)
     }

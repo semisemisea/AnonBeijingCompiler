@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import platform
+import queue
+import signal
+import subprocess
+import tempfile
+import threading
+import time
+from contextlib import suppress
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+MAX_REQUEST_BYTES = 64 * 1024 * 1024
+
+
+@dataclass
+class Job:
+    id: str
+    cpu: int
+    timeout: float
+    warmups: int
+    repeats: int
+    elf: bytes
+    input_data: bytes | None
+    status: str = 'QUEUED'
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    finished_at: float | None = None
+    result: dict[str, Any] | None = None
+    process: subprocess.Popen[bytes] | None = None
+
+
+class State:
+    def __init__(self) -> None:
+        self.jobs: dict[str, Job] = {}
+        self.pending: queue.Queue[str] = queue.Queue()
+        self.lock = threading.Lock()
+
+    def submit(self, payload: dict[str, Any]) -> Job:
+        job_id = payload['id']
+        with self.lock:
+            if job_id in self.jobs:
+                return self.jobs[job_id]
+            cpu = int(payload['cpu'])
+            if cpu not in os.sched_getaffinity(0):
+                raise ValueError(f'CPU {cpu} is not online')
+            job = Job(
+                id=job_id,
+                cpu=cpu,
+                timeout=float(payload['timeout']),
+                warmups=int(payload['warmups']),
+                repeats=int(payload['repeats']),
+                elf=base64.b64decode(payload['elf'], validate=True),
+                input_data=base64.b64decode(payload['input'], validate=True)
+                if payload.get('input') is not None
+                else None,
+            )
+            if job.timeout <= 0 or job.warmups < 0 or job.repeats < 1:
+                raise ValueError('invalid run parameters')
+            self.jobs[job_id] = job
+            self.pending.put(job_id)
+            return job
+
+    def cancel(self, job_id: str) -> bool:
+        processes = []
+        cancelled = False
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job and job.status in {'QUEUED', 'RUNNING'}:
+                job.status = 'CANCELLED'
+                job.finished_at = time.time()
+                cancelled = True
+                if job.process is not None:
+                    processes.append(job.process)
+        for process in processes:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        return cancelled
+
+    def public_job(self, job: Job, include_result: bool = False) -> dict[str, Any]:
+        value = {
+            'id': job.id,
+            'status': job.status,
+            'cpu': job.cpu,
+            'created_at': job.created_at,
+            'started_at': job.started_at,
+            'finished_at': job.finished_at,
+        }
+        if include_result:
+            value['result'] = job.result
+        return value
+
+
+STATE = State()
+
+
+def read_metric(path: str, default: str) -> str:
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return default
+
+
+def execute_sample(job: Job, program: Path, input_path: Path | None) -> dict[str, Any]:
+    input_stream = input_path.open('rb') if input_path else subprocess.DEVNULL
+    started_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    try:
+        process = subprocess.Popen(
+            [str(program)],
+            stdin=input_stream,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        with STATE.lock:
+            job.process = process
+        try:
+            stdout, stderr = process.communicate(timeout=job.timeout)
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+            timed_out = True
+    finally:
+        finished_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+        if input_path:
+            input_stream.close()
+    returncode = process.returncode if process.returncode >= 0 else 128 - process.returncode
+    return {
+        'elapsed_ns': finished_ns - started_ns,
+        'returncode': returncode,
+        'timed_out': timed_out,
+        'stdout': stdout.decode(errors='replace'),
+        'stderr': stderr.decode(errors='replace'),
+    }
+
+
+def execute(job: Job) -> dict[str, Any]:
+    os.sched_setaffinity(0, {job.cpu})
+    samples = []
+    warmup_samples = []
+    last: dict[str, Any] = {'stdout': '', 'stderr': '', 'returncode': 0, 'timed_out': False}
+    with tempfile.TemporaryDirectory(prefix='soyo-benchd-') as directory:
+        program = Path(directory) / 'program.elf'
+        program.write_bytes(job.elf)
+        program.chmod(0o700)
+        input_path = Path(directory) / 'input.in' if job.input_data is not None else None
+        if input_path:
+            input_path.write_bytes(job.input_data or b'')
+        for index in range(job.warmups + job.repeats):
+            with STATE.lock:
+                if job.status == 'CANCELLED':
+                    return {'cancelled': True}
+            last = execute_sample(job, program, input_path)
+            if last['timed_out']:
+                break
+            elapsed_ms = last['elapsed_ns'] / 1_000_000
+            (warmup_samples if index < job.warmups else samples).append(elapsed_ms)
+    return {
+        **last,
+        'clock': 'CLOCK_MONOTONIC_RAW',
+        'cpu': job.cpu,
+        'warmup_samples': warmup_samples,
+        'samples': samples,
+    }
+
+
+def worker() -> None:
+    while True:
+        job_id = STATE.pending.get()
+        with STATE.lock:
+            job = STATE.jobs[job_id]
+            if job.status == 'CANCELLED':
+                STATE.pending.task_done()
+                continue
+            job.status = 'RUNNING'
+            job.started_at = time.time()
+        try:
+            result = execute(job)
+            with STATE.lock:
+                if job.status != 'CANCELLED':
+                    job.result = result
+                    job.status = 'COMPLETE'
+                    job.finished_at = time.time()
+        except (OSError, ValueError) as error:
+            with STATE.lock:
+                job.result = {'error': str(error)}
+                job.status = 'ERROR'
+                job.finished_at = time.time()
+        finally:
+            with STATE.lock:
+                job.process = None
+            STATE.pending.task_done()
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def send_json(self, status: int, value: Any) -> None:
+        body = json.dumps(value, separators=(',', ':')).encode()
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def read_json(self) -> dict[str, Any]:
+        length = int(self.headers.get('Content-Length', '0'))
+        if length <= 0 or length > MAX_REQUEST_BYTES:
+            raise ValueError('invalid request size')
+        return json.loads(self.rfile.read(length))
+
+    def do_GET(self) -> None:
+        path = urlparse(self.path).path
+        if path == '/status':
+            with STATE.lock:
+                active = next(
+                    (job.id for job in STATE.jobs.values() if job.status == 'RUNNING'), None
+                )
+                queued = sum(job.status == 'QUEUED' for job in STATE.jobs.values())
+            self.send_json(
+                200,
+                {
+                    'online': True,
+                    'architecture': platform.machine(),
+                    'cpus': read_metric('/sys/devices/system/cpu/online', 'unknown'),
+                    'available_cpus': sorted(os.sched_getaffinity(0)),
+                    'frequency_khz': int(
+                        read_metric('/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq', '0')
+                    ),
+                    'temperature_millidegrees': int(
+                        read_metric('/sys/class/thermal/thermal_zone0/temp', '0')
+                    ),
+                    'active_job': active,
+                    'queued_jobs': queued,
+                },
+            )
+            return
+        if path == '/queue':
+            with STATE.lock:
+                jobs = [
+                    STATE.public_job(job)
+                    for job in STATE.jobs.values()
+                    if job.status in {'RUNNING', 'QUEUED'}
+                ]
+            self.send_json(200, jobs)
+            return
+        if path.startswith('/jobs/'):
+            job_id = path.removeprefix('/jobs/')
+            with STATE.lock:
+                job = STATE.jobs.get(job_id)
+                value = STATE.public_job(job, include_result=True) if job else None
+            self.send_json(200 if value else 404, value or {'error': 'unknown job'})
+            return
+        self.send_json(404, {'error': 'not found'})
+
+    def do_POST(self) -> None:
+        if urlparse(self.path).path != '/jobs':
+            self.send_json(404, {'error': 'not found'})
+            return
+        try:
+            job = STATE.submit(self.read_json())
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+            self.send_json(400, {'error': str(error)})
+            return
+        self.send_json(202, STATE.public_job(job))
+
+    def do_DELETE(self) -> None:
+        path = urlparse(self.path).path
+        if path.startswith('/jobs/'):
+            job_id = path.removeprefix('/jobs/')
+            with STATE.lock:
+                job = STATE.jobs.get(job_id)
+                if job and job.status in {'COMPLETE', 'ERROR', 'CANCELLED'}:
+                    del STATE.jobs[job_id]
+                    self.send_json(200, {'cancelled': False})
+                    return
+            cancelled = STATE.cancel(job_id)
+        else:
+            self.send_json(404, {'error': 'not found'})
+            return
+        self.send_json(200, {'cancelled': cancelled})
+
+    def log_message(self, format: str, *args: Any) -> None:
+        print(f'{self.address_string()} {format % args}', flush=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='Soyo board benchmark service')
+    parser.add_argument('--host', default='0.0.0.0')
+    parser.add_argument('--port', type=int, default=8766)
+    args = parser.parse_args()
+    threading.Thread(target=worker, daemon=True).start()
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f'listening on {server.server_address[0]}:{server.server_address[1]}', flush=True)
+    server.serve_forever()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,24 @@
+int sum10(int a0, int a1, int a2, int a3, int a4,
+          int a5, int a6, int a7, int a8, int a9) {
+  return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9;
+}
+
+int main() {
+  int big[5000];
+  int keep0 = 1;
+  int keep1 = 2;
+  int keep2 = 3;
+  int keep3 = 4;
+  int keep4 = 5;
+  int keep5 = 6;
+  int keep6 = 7;
+  int keep7 = 8;
+
+  big[0] = 7;
+  big[4999] = 9;
+  int result = sum10(big[0], keep0, keep1, keep2, keep3,
+                     keep4, keep5, keep6, keep7, big[4999]);
+  putint(result + big[4999]);
+  putch(10);
+  return 0;
+}

@@ -1,0 +1,13 @@
+int a[32][64];
+
+int main() {
+    int i = 0;
+    while (i < 32) {
+        a[i][3] = i + 1;
+        i = i + 1;
+    }
+
+    int sum = 0;
+     putch(10);
+    return 0;
+}

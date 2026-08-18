@@ -31,7 +31,7 @@ CompUnit: CompUnit = {
     // 2. Void Function (无歧义)
     "void" <ident: Ident> "(" <params: Comma<FuncFParam>> ")" <block: Block> => {
         CompUnit::FuncDef(FuncDef {
-            func_type: Type::get_unit(),
+            func_type: FuncType {is_tensor:false, btype: Type::get_unit()},
             ident,
             params,
             block,
@@ -46,11 +46,11 @@ CompUnit: CompUnit = {
 
 // 这是一个后缀规则，处理 BType Ident 之后的部分
 // 返回类型是一个闭包，接收 Type 和 Ident (Rc<str>)，返回 CompUnit
-ScalarSuffix: Box<dyn FnOnce(Type, std::rc::Rc<str>) -> CompUnit> = {
+ScalarSuffix: Box<dyn FnOnce(BType, std::rc::Rc<str>) -> CompUnit> = {
     // 分支 A: 遇到左括号 -> 函数定义
     "(" <params: Comma<FuncFParam>> ")" <block: Block> => {
-        Box::new(move |func_type, ident| CompUnit::FuncDef(FuncDef {
-            func_type,
+        Box::new(move |btype, ident| CompUnit::FuncDef(FuncDef {
+            func_type: FuncType {is_tensor: btype.is_tensor, btype: btype.btype},
             ident,
             params,
             block,
@@ -88,9 +88,11 @@ Decl: Decl = {
     <v_decl: VarDecl> => Decl::VarDecl(v_decl),
 };
 
-BType: Type = {
-    "int" => Type::get_i32(),
-    "float" => Type::get_f32(),
+BType: BType = {
+    "int" => BType {is_tensor: false, btype: Type::get_i32()},
+    "float" => BType {is_tensor: false, btype: Type::get_f32()},
+    "tensor int" => BType {is_tensor: true, btype: Type::get_i32()},
+    "tensor float" => BType {is_tensor: true, btype: Type::get_f32()},
 };
 
 ConstDecl: ConstDecl = "const" <btype: BType> <const_defs: Comma<ConstDef>> ";" => ConstDecl { 
@@ -133,10 +135,12 @@ FuncDef: FuncDef = {
   }
 };
 
-FuncType: Type = {
-    "int" => Type::get_i32(),
-    "float" => Type::get_f32(),
-    "void" => Type::get_unit(),
+FuncType: FuncType = {
+    "int" => FuncType {is_tensor: false, btype: Type::get_i32()},
+    "float" => FuncType {is_tensor: false, btype: Type::get_f32()},
+    "void" => FuncType {is_tensor: false, btype: Type::get_unit()},
+    "tensor int" => FuncType {is_tensor: true, btype: Type::get_i32()},
+    "tensor float" => FuncType {is_tensor: true, btype: Type::get_f32()},
 }
 
 Block: Block = "{" <block_items: BlockItem*> "}" => Block {block_items};
@@ -250,6 +254,7 @@ MulExpOnlyOp: BinaryOp = {
     "*" => BinaryOp::Mul,
     "/" => BinaryOp::Div,
     "%" => BinaryOp::Rem,
+    "@" => BinaryOp::MatMul,
 };
 
 MulExp: MulExp = {

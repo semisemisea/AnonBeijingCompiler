@@ -246,7 +246,7 @@ impl ToRaanaIR for items::FuncDef {
             .map(|x| x.ty_global(ctx))
             .collect::<Vec<_>>();
         let func = ctx.program.new_function(
-            self.func_type.clone(),
+            self.func_type.btype.clone(),
             self.ident.as_ref().to_string(),
             param_ty,
         );
@@ -364,10 +364,10 @@ impl ToRaanaIR for items::ConstDecl {
             return;
         }
         assert!(
-            self.btype.is_scalar(),
+            self.btype.btype.is_scalar(),
             "Unknown type for constant declaration."
         );
-        ctx.set_def_type(self.btype.clone());
+        ctx.set_def_type(self.btype.btype.clone());
         for const_def in &self.const_defs {
             const_def.convert(ctx);
         }
@@ -376,10 +376,10 @@ impl ToRaanaIR for items::ConstDecl {
     #[inline]
     fn global_convert(&self, ctx: &mut AstGenContext) {
         assert!(
-            self.btype.is_scalar(),
+            self.btype.btype.is_scalar(),
             "Unknown type for constant declaration."
         );
-        ctx.set_def_type(self.btype.clone());
+        ctx.set_def_type(self.btype.btype.clone());
         for const_def in &self.const_defs {
             const_def.global_convert(ctx);
         }
@@ -558,10 +558,10 @@ impl ToRaanaIR for items::VarDecl {
             return;
         }
         assert!(
-            self.btype.is_scalar(),
+            self.btype.btype.is_scalar(),
             "Unknown type for variable declaration"
         );
-        ctx.set_def_type(self.btype.clone());
+        ctx.set_def_type(self.btype.btype.clone());
         for var_def in &self.var_defs {
             var_def.convert(ctx);
         }
@@ -569,10 +569,10 @@ impl ToRaanaIR for items::VarDecl {
 
     fn global_convert(&self, ctx: &mut AstGenContext) {
         assert!(
-            self.btype.is_scalar(),
+            self.btype.btype.is_scalar(),
             "Unknown type for variable declaration"
         );
-        ctx.set_def_type(self.btype.clone());
+        ctx.set_def_type(self.btype.btype.clone());
         for var_def in &self.var_defs {
             var_def.global_convert(ctx);
         }

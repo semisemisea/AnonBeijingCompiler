@@ -1,0 +1,5 @@
+//test add of hex and oct
+= 0xf;
+    b = 0xc;
+    return a + b + 075;
+}

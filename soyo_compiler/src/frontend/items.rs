@@ -154,7 +154,7 @@ pub struct FuncDef {
 
 #[derive(Debug, Clone)]
 pub struct FuncFParam {
-    pub b_type: Type,
+    pub b_type: BType,
     pub ident: Ident,
     pub arr_ty: Option<Vec<ConstExp>>,
 }
@@ -164,14 +164,14 @@ impl FuncFParam {
         self.arr_ty
             .as_ref()
             .map(|arr_ty| {
-                Type::get_pointer(arr_ty.iter().rfold(self.b_type.clone(), |ty, off| {
+                Type::get_pointer(arr_ty.iter().rfold(self.b_type.btype.clone(), |ty, off| {
                     off.global_convert(ctx);
                     let idx = ctx.pop_i32() as usize;
                     Type::get_array(ty, idx)
                 }))
             })
             // BUG: what the fuck is this line.
-            .unwrap_or(self.b_type.clone())
+            .unwrap_or(self.b_type.btype.clone())
     }
 
     #[allow(unused)]
@@ -179,21 +179,25 @@ impl FuncFParam {
         self.arr_ty
             .as_ref()
             .map(|arr_ty| {
-                Type::get_pointer(arr_ty.iter().rfold(self.b_type.clone(), |ty, off| {
+                Type::get_pointer(arr_ty.iter().rfold(self.b_type.btype.clone(), |ty, off| {
                     off.convert(ctx);
                     let idx = ctx.pop_i32() as usize;
                     Type::get_array(ty, idx)
                 }))
             })
             // BUG: what the fuck is this line.
-            .unwrap_or(self.b_type.clone())
+            .unwrap_or(self.b_type.btype.clone())
     }
 }
 
 /// FuncType ::= "int" | "float";
 ///
 /// The return type of a function.
-pub type FuncType = Type;
+#[derive(Debug, Clone)]
+pub struct FuncType {
+    pub is_tensor: bool,
+    pub btype: Type,
+}
 
 /// Block ::= "{" {BlockItem} "}";
 ///
@@ -233,7 +237,15 @@ pub struct ConstDecl {
 /// BType ::= "int";
 ///
 /// The base type for variables and constants.
-pub type BType = Type;
+#[derive(Debug, Clone)]
+pub struct BType {
+    pub is_tensor: bool,
+    pub btype: Type,
+}
+
+pub struct TensorType {
+    pub btype: BType,
+}
 
 /// ConstDef ::= IDENT "=" ConstInitVal;
 ///

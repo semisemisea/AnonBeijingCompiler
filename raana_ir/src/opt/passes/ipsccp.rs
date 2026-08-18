@@ -592,16 +592,13 @@ impl<'a> OrderInfo<'a> {
             // 值不是初始值，折叠初始 0 会固化首轮值（fuzz: case_0030
             // `a309[1] = 1 - a309[1]` 跨外层轮次 0/1 交替）。按
             // maybe-prior 处理，配合 Top 防御使这类 load 不折叠。
-            let in_loop = self
-                .cfgs
-                .get(&load.func)
-                .is_some_and(|cfg| {
-                    let succs = cfg.successors_of(store_bb);
-                    succs.contains(&store_bb)
-                        || succs
-                            .iter()
-                            .any(|&s| s != store_bb && self.reach[&load.func][&s].contains(&store_bb))
-                });
+            let in_loop = self.cfgs.get(&load.func).is_some_and(|cfg| {
+                let succs = cfg.successors_of(store_bb);
+                succs.contains(&store_bb)
+                    || succs
+                        .iter()
+                        .any(|&s| s != store_bb && self.reach[&load.func][&s].contains(&store_bb))
+            });
             if in_loop {
                 return 1;
             }
@@ -1191,13 +1188,18 @@ impl Pass for IPSCCP {
                                 // not pin the first iteration's value across
                                 // outer iterations (fuzz: case_0030).
                                 let mut visited = FxHashSet::default();
-                                let value =
-                                    if src_reads_cell(program, env, func, store.src(), key, &mut visited)
-                                    {
-                                        Lattice::Bottom
-                                    } else {
-                                        value
-                                    };
+                                let value = if src_reads_cell(
+                                    program,
+                                    env,
+                                    func,
+                                    store.src(),
+                                    key,
+                                    &mut visited,
+                                ) {
+                                    Lattice::Bottom
+                                } else {
+                                    value
+                                };
                                 if state.write(key, func, inst, value) {
                                     if let Some(loaders) = state.root_loaders.get(&root) {
                                         mem_reschedule.extend(loaders.iter().copied());
@@ -1548,6 +1550,7 @@ fn mathematic_operation(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
         BinaryOp::Sar => lhs.wrapping_shr(rhs as u32),
         BinaryOp::Min => lhs.min(rhs),
         BinaryOp::Max => lhs.max(rhs),
+        BinaryOp::MatMul => unreachable!("tensor type should not reach here."),
     }
 }
 

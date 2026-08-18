@@ -59,6 +59,7 @@ pub enum BinaryOp {
     Min,
     /// Vector lane-wise maximum (signed for integers).
     Max,
+    MatMul,
 }
 
 impl BinaryOp {
@@ -140,6 +141,7 @@ impl std::fmt::Display for BinaryOp {
                 BinaryOp::Sar => "sar",
                 BinaryOp::Min => "min",
                 BinaryOp::Max => "max",
+                BinaryOp::MatMul => "matmul",
             }
         )
     }

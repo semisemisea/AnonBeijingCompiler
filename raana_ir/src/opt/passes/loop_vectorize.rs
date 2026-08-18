@@ -52,7 +52,9 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::ir::function::FunctionData;
 use crate::ir::{
+    BasicBlock, BinaryOp, Function, Inst, Program,
     arena::Arena,
     builder_trait::*,
     inst_kind::{
@@ -60,9 +62,7 @@ use crate::ir::{
         VectorExtractElement, VectorInsertElement, VectorReduce, VectorReduceOp, VectorSplat,
     },
     types::{Type, TypeKind},
-    BasicBlock, BinaryOp, Function, Inst, Program,
 };
-use crate::ir::function::FunctionData;
 use crate::opt::{
     analysis_passes::{
         dependence::{AccessKind, DependenceAnalysis, ReductionOp, Verdict},
@@ -76,7 +76,7 @@ use crate::opt::{
     },
     pass::{ArenaContext, ArenaContextMut, Pass},
     utils::cfg::CFG,
-    utils::logical_edge::{incoming_edges, LogicalEdge, LogicalEdgeRewriter},
+    utils::logical_edge::{LogicalEdge, LogicalEdgeRewriter, incoming_edges},
 };
 
 /// Vector width: 128-bit NEON registers over 4-byte elements.
@@ -452,6 +452,7 @@ fn inst_kind_name(kind: &InstKind) -> &'static str {
             BinaryOp::Add => "Add",
             BinaryOp::Sub => "Sub",
             BinaryOp::Mul => "Mul",
+            BinaryOp::MatMul => "MatMul",
         },
         InstKind::Select(_) => "Select",
         InstKind::Call(_) => "Call",
@@ -592,7 +593,11 @@ fn mod_reduction_bounds_hold(
     else {
         return false;
     };
-    let acc_min = ranges.range_of(acc).min().map(i64::from).unwrap_or(-(p - 1));
+    let acc_min = ranges
+        .range_of(acc)
+        .min()
+        .map(i64::from)
+        .unwrap_or(-(p - 1));
     let acc_max = ranges.range_of(acc).max().map(i64::from).unwrap_or(p - 1);
     let upper = acc_max + 4 * i64::from(vmax) + 4 * const_sum;
     let lower = acc_min + 4 * i64::from(vmin) + 4 * const_sum;
@@ -612,9 +617,17 @@ fn find_vectorizable(
     let (cfg, dom, loops) = LoopAnalysis::new(data);
     let dependence = DependenceAnalysis::new(program, func, effects, VF as u32);
     for looop in loops.loops() {
-        if let Some(plan) =
-            analyze_loop(&arena, data, &cfg, &dom, &loops, &dependence, looop, func, effects)
-        {
+        if let Some(plan) = analyze_loop(
+            &arena,
+            data,
+            &cfg,
+            &dom,
+            &loops,
+            &dependence,
+            looop,
+            func,
+            effects,
+        ) {
             return Some(plan);
         }
     }
@@ -789,8 +802,20 @@ fn fuse_block_into_succ(
         if s_in_edges.len() != 1 || s_in_edges[0].source() != b || a_b.len() != s_params.len() {
             return false;
         }
-        let b_insts: Vec<Inst> = fdata.layout().basicblock(b).insts().iter().copied().collect();
-        let s_insts: Vec<Inst> = fdata.layout().basicblock(s).insts().iter().copied().collect();
+        let b_insts: Vec<Inst> = fdata
+            .layout()
+            .basicblock(b)
+            .insts()
+            .iter()
+            .copied()
+            .collect();
+        let s_insts: Vec<Inst> = fdata
+            .layout()
+            .basicblock(s)
+            .insts()
+            .iter()
+            .copied()
+            .collect();
         (a_p, a_b, b_params, s_params, b_insts, s_insts)
     };
 
@@ -1137,8 +1162,7 @@ fn is_invariant_load(
     let Some(&elem_off) = gep.offsets().last() else {
         return false;
     };
-    !contains_iv(arena, elem_off, iv)
-        && is_loop_invariant(arena, elem_off, header, latch)
+    !contains_iv(arena, elem_off, iv) && is_loop_invariant(arena, elem_off, header, latch)
 }
 
 /// A contiguous In load: a GEP whose element offset (the last one) carries
@@ -1418,60 +1442,60 @@ fn analyze_loop(
         // direct target, failing the test-at-top header check below).
         multi_arm = build_multi_arm_plan(arena, data, looop, header, latch);
         if multi_arm.is_none() {
-        for &bb in looop.body() {
-            if bb == header || bb == latch {
-                continue;
-            }
-            let term = data.layout().basicblock(bb).terminator();
-            let InstKind::Branch(branch) = arena.inst_data(term).kind() else {
-                continue;
-            };
-            let arm = branch.f_target();
-            let merge = branch.t_target();
-            if !looop.contains(arm) || !looop.contains(merge) {
-                continue;
-            }
-            let arm_term = data.layout().basicblock(arm).terminator();
-            if let InstKind::Jump(jump) = arena.inst_data(arm_term).kind() {
-                if jump.target() == merge {
-                    arm_plan = Some(ArmPlan {
-                        body_br: bb,
-                        arm,
-                        merge,
-                        mask_cond: branch.cond(),
-                        branch: term,
-                        arm_on_true: false,
-                    });
-                    break;
+            for &bb in looop.body() {
+                if bb == header || bb == latch {
+                    continue;
                 }
-            }
-            // Masked-kernel shape: `br cond, payload, latch` — the
-            // payload sits on the *true* edge and jumps to the latch
-            // (the branch's false edge). Same masked-store rewrite, but
-            // the mask polarity flips (arm executes when cond != 0).
-            let payload = branch.t_target();
-            let target2 = branch.f_target();
-            if looop.contains(payload) && looop.contains(target2) {
-                let payload_term = data.layout().basicblock(payload).terminator();
-                if let InstKind::Jump(jump2) = arena.inst_data(payload_term).kind() {
-                    if jump2.target() == target2 {
+                let term = data.layout().basicblock(bb).terminator();
+                let InstKind::Branch(branch) = arena.inst_data(term).kind() else {
+                    continue;
+                };
+                let arm = branch.f_target();
+                let merge = branch.t_target();
+                if !looop.contains(arm) || !looop.contains(merge) {
+                    continue;
+                }
+                let arm_term = data.layout().basicblock(arm).terminator();
+                if let InstKind::Jump(jump) = arena.inst_data(arm_term).kind() {
+                    if jump.target() == merge {
                         arm_plan = Some(ArmPlan {
                             body_br: bb,
-                            arm: payload,
-                            merge: target2,
+                            arm,
+                            merge,
                             mask_cond: branch.cond(),
                             branch: term,
-                            arm_on_true: true,
+                            arm_on_true: false,
                         });
                         break;
                     }
                 }
+                // Masked-kernel shape: `br cond, payload, latch` — the
+                // payload sits on the *true* edge and jumps to the latch
+                // (the branch's false edge). Same masked-store rewrite, but
+                // the mask polarity flips (arm executes when cond != 0).
+                let payload = branch.t_target();
+                let target2 = branch.f_target();
+                if looop.contains(payload) && looop.contains(target2) {
+                    let payload_term = data.layout().basicblock(payload).terminator();
+                    if let InstKind::Jump(jump2) = arena.inst_data(payload_term).kind() {
+                        if jump2.target() == target2 {
+                            arm_plan = Some(ArmPlan {
+                                body_br: bb,
+                                arm: payload,
+                                merge: target2,
+                                mask_cond: branch.cond(),
+                                branch: term,
+                                arm_on_true: true,
+                            });
+                            break;
+                        }
+                    }
+                }
             }
-        }
-        if arm_plan.is_none() && multi_arm.is_none() {
-            trace(data, looop, "shape_body_not_2_blocks");
-            return None;
-        }
+            if arm_plan.is_none() && multi_arm.is_none() {
+                trace(data, looop, "shape_body_not_2_blocks");
+                return None;
+            }
         }
     }
     let header_insts = data.layout().basicblock(header).insts();
@@ -1626,87 +1650,90 @@ fn analyze_loop(
         trace(data, looop, "back_args_not_2");
         return None;
     }
-        if std::env::var("VECDBG_SHAPE").is_ok() {
-            let latch_term = data.layout().basicblock(latch).terminator();
-            let latch_kind = match arena.inst_data(latch_term).kind() {
-                InstKind::Jump(_) => "jump".to_string(),
-                InstKind::Branch(_) => "branch".to_string(),
-                other => format!("{other:?}"),
-            };
-            let slot_desc: Vec<String> = params
-                .iter()
-                .zip(back_args.iter())
-                .enumerate()
-                .map(|(i, (p, ba))| {
-                    let ba_kind = if ba == p {
-                        "IDENTITY".to_string()
-                    } else {
-                        match arena.inst_data(*ba).kind() {
-                            InstKind::Binary(b) => format!("binary:{:?}", b.op()),
-                            InstKind::BlockArgRef(_) => "blockarg".to_string(),
-                            InstKind::Integer(v) => format!("int({})", v.value()),
-                            other => format!("{other:?}"),
-                        }
-                    };
-                    format!("[{i}]p={p:?} ba={ba:?} {ba_kind}")
-                })
-                .collect();
-            eprintln!(
-                "[SHAPE-BACK] func={} header={:?} name={} test_at_top={test_at_top} latch={latch:?} latch_term={latch_kind} n_params={n_params} slots={}",
-                data.name(),
-                header,
-                data.bb_data(header).name(),
-                slot_desc.join(" | "),
-            );
-            if test_at_top {
-                let bound_kind = match arena.inst_data(bound_inst).kind() {
-                    InstKind::Integer(v) => format!("int({})", v.value()),
-                    InstKind::BlockArgRef(_) => "blockarg".to_string(),
-                    InstKind::Load(_) => "load".to_string(),
-                    InstKind::Binary(b) => format!("binary:{:?}", b.op()),
-                    InstKind::GlobalAlloc(_) => "global".to_string(),
-                    other => format!("{other:?}"),
-                };
-                let bound_const = constant_i64(arena, data, bound_inst).map(|v| v.to_string());
-                eprintln!(
-                    "[SHAPE-BOUND] func={} header={:?} name={} bound={bound_inst:?} kind={bound_kind} const={bound_const:?}",
-                    data.name(),
-                    header,
-                    data.bb_data(header).name(),
-                );
-            }
-            let exit_kind = match arena.inst_data(data.layout().basicblock(exit).terminator()).kind() {
-                InstKind::Jump(_) => "jump".to_string(),
-                InstKind::Branch(_) => "branch".to_string(),
-                other => format!("{other:?}"),
-            };
-            let exit_param_desc: Vec<String> = data
-                .bb_data(exit)
-                .params()
-                .iter()
-                .map(|p| format!("{p:?}"))
-                .collect();
-            let exit_arg_desc: Vec<String> = exit_args
-                .iter()
-                .map(|a| {
-                    let k = match arena.inst_data(*a).kind() {
+    if std::env::var("VECDBG_SHAPE").is_ok() {
+        let latch_term = data.layout().basicblock(latch).terminator();
+        let latch_kind = match arena.inst_data(latch_term).kind() {
+            InstKind::Jump(_) => "jump".to_string(),
+            InstKind::Branch(_) => "branch".to_string(),
+            other => format!("{other:?}"),
+        };
+        let slot_desc: Vec<String> = params
+            .iter()
+            .zip(back_args.iter())
+            .enumerate()
+            .map(|(i, (p, ba))| {
+                let ba_kind = if ba == p {
+                    "IDENTITY".to_string()
+                } else {
+                    match arena.inst_data(*ba).kind() {
                         InstKind::Binary(b) => format!("binary:{:?}", b.op()),
                         InstKind::BlockArgRef(_) => "blockarg".to_string(),
                         InstKind::Integer(v) => format!("int({})", v.value()),
                         other => format!("{other:?}"),
-                    };
-                    format!("{a:?}({k})")
-                })
-                .collect();
+                    }
+                };
+                format!("[{i}]p={p:?} ba={ba:?} {ba_kind}")
+            })
+            .collect();
+        eprintln!(
+            "[SHAPE-BACK] func={} header={:?} name={} test_at_top={test_at_top} latch={latch:?} latch_term={latch_kind} n_params={n_params} slots={}",
+            data.name(),
+            header,
+            data.bb_data(header).name(),
+            slot_desc.join(" | "),
+        );
+        if test_at_top {
+            let bound_kind = match arena.inst_data(bound_inst).kind() {
+                InstKind::Integer(v) => format!("int({})", v.value()),
+                InstKind::BlockArgRef(_) => "blockarg".to_string(),
+                InstKind::Load(_) => "load".to_string(),
+                InstKind::Binary(b) => format!("binary:{:?}", b.op()),
+                InstKind::GlobalAlloc(_) => "global".to_string(),
+                other => format!("{other:?}"),
+            };
+            let bound_const = constant_i64(arena, data, bound_inst).map(|v| v.to_string());
             eprintln!(
-                "[SHAPE-EXIT] func={} header={:?} name={} exit={exit:?} exit_term={exit_kind} exit_params={} exit_args={}",
+                "[SHAPE-BOUND] func={} header={:?} name={} bound={bound_inst:?} kind={bound_kind} const={bound_const:?}",
                 data.name(),
                 header,
                 data.bb_data(header).name(),
-                exit_param_desc.join(","),
-                exit_arg_desc.join(","),
             );
         }
+        let exit_kind = match arena
+            .inst_data(data.layout().basicblock(exit).terminator())
+            .kind()
+        {
+            InstKind::Jump(_) => "jump".to_string(),
+            InstKind::Branch(_) => "branch".to_string(),
+            other => format!("{other:?}"),
+        };
+        let exit_param_desc: Vec<String> = data
+            .bb_data(exit)
+            .params()
+            .iter()
+            .map(|p| format!("{p:?}"))
+            .collect();
+        let exit_arg_desc: Vec<String> = exit_args
+            .iter()
+            .map(|a| {
+                let k = match arena.inst_data(*a).kind() {
+                    InstKind::Binary(b) => format!("binary:{:?}", b.op()),
+                    InstKind::BlockArgRef(_) => "blockarg".to_string(),
+                    InstKind::Integer(v) => format!("int({})", v.value()),
+                    other => format!("{other:?}"),
+                };
+                format!("{a:?}({k})")
+            })
+            .collect();
+        eprintln!(
+            "[SHAPE-EXIT] func={} header={:?} name={} exit={exit:?} exit_term={exit_kind} exit_params={} exit_args={}",
+            data.name(),
+            header,
+            data.bb_data(header).name(),
+            exit_param_desc.join(","),
+            exit_arg_desc.join(","),
+        );
+    }
     // Passthrough slots: the back-edge argument is the parameter itself.
     // The trip counter is the last parameter (its back-edge arg is the
     // `t' = sub(t, 1)` condition, never the parameter itself).
@@ -1800,8 +1827,7 @@ fn analyze_loop(
                 continue;
             }
             let update = back_args[slot];
-            if let Some((value, const_sum, modulus)) =
-                decompose_mod_reduction(arena, update, param)
+            if let Some((value, const_sum, modulus)) = decompose_mod_reduction(arena, update, param)
             {
                 for &user in arena.inst_data(param).used_by() {
                     let Some(user_bb) = data.layout().parent_bb(user) else {
@@ -1816,14 +1842,7 @@ fn analyze_loop(
                     }
                 }
                 if !mod_reduction_bounds_hold(
-                    arena,
-                    data,
-                    cfg,
-                    loops,
-                    param,
-                    value,
-                    modulus,
-                    const_sum,
+                    arena, data, cfg, loops, param, value, modulus, const_sum,
                 ) {
                     trace(data, looop, "mod_bounds_overflow");
                     continue 'mod_scan;
@@ -1851,43 +1870,41 @@ fn analyze_loop(
         match effective.len() {
             1 => None,
             2 => {
-            let Verdict::Reducible { accumulator, op } = &dep.verdict else {
-                trace(data, looop, "b1_not_reducible");
-                return None;
-            };
-            let acc_slot = match params.iter().position(|&p| p == *accumulator) {
-                Some(slot) => slot,
-                None => {
-                    trace(data, looop, "b1_acc_not_param");
+                let Verdict::Reducible { accumulator, op } = &dep.verdict else {
+                    trace(data, looop, "b1_not_reducible");
+                    return None;
+                };
+                let acc_slot = match params.iter().position(|&p| p == *accumulator) {
+                    Some(slot) => slot,
+                    None => {
+                        trace(data, looop, "b1_acc_not_param");
+                        return None;
+                    }
+                };
+                if passthrough.contains(&acc_slot) || (!test_at_top && acc_slot == counter_slot) {
+                    // The counter slot only exists for rotated loops; a
+                    // test-at-top accumulator may legally be the last header
+                    // parameter (e.g. 01_mm1's kernel `[outer, iv, acc]`).
+                    trace(data, looop, "b1_acc_is_passthrough_or_counter");
                     return None;
                 }
-            };
-            if passthrough.contains(&acc_slot)
-                || (!test_at_top && acc_slot == counter_slot)
-            {
-                // The counter slot only exists for rotated loops; a
-                // test-at-top accumulator may legally be the last header
-                // parameter (e.g. 01_mm1's kernel `[outer, iv, acc]`).
-                trace(data, looop, "b1_acc_is_passthrough_or_counter");
+                let bop = match op {
+                    ReductionOp::IntAdd => BinaryOp::Add,
+                    ReductionOp::IntSub => BinaryOp::Sub,
+                    _ => {
+                        // IntMul/IntMin/IntMax accumulate differently; B1 keeps
+                        // them scalar.
+                        trace(data, looop, "b1_op_not_add_sub");
+                        return None;
+                    }
+                };
+                Some((*accumulator, acc_slot, bop))
+            }
+            _ => {
+                trace(data, looop, "params_not_2");
                 return None;
             }
-            let bop = match op {
-                ReductionOp::IntAdd => BinaryOp::Add,
-                ReductionOp::IntSub => BinaryOp::Sub,
-                _ => {
-                    // IntMul/IntMin/IntMax accumulate differently; B1 keeps
-                    // them scalar.
-                    trace(data, looop, "b1_op_not_add_sub");
-                    return None;
-                }
-            };
-            Some((*accumulator, acc_slot, bop))
         }
-        _ => {
-            trace(data, looop, "params_not_2");
-            return None;
-        }
-    }
     };
     for &p in params.iter() {
         if !arena.inst_data(p).ty().is_i32() {
@@ -1913,68 +1930,67 @@ fn analyze_loop(
         trace(data, looop, "exit_has_params");
         return None;
     }
-    let (iv, iv_next, iv_slot, counter, t_next): (Inst, Inst, usize, Inst, Inst) =
-        if test_at_top {
-            // The effective (non-passthrough) parameters are `[iv]` or
-            // `[iv, acc]` (B1). With an accumulator, the IV is the
-            // non-acc effective slot; otherwise it is effective[0].
-            // `iv' = add(iv, 1)` is its plain-jump argument in the latch.
-            // The remaining parameters are loop-invariant passthroughs.
-            let iv_slot = match acc_info {
-                Some((acc_inst, acc_slot, _)) => {
-                    let slots: Vec<usize> = effective
-                        .iter()
-                        .copied()
-                        .filter(|&i| i != acc_slot)
-                        .collect();
-                    // A fixed-point sibling pass (PSR) may have rewritten the
-                    // loop mid-iteration into a shape this analyzer does not
-                    // recognize — reject conservatively instead of indexing
-                    // out of bounds.
-                    if slots.len() != 1 {
-                        trace(data, looop, "multi_iv_slot");
-                        return None;
-                    }
-                    slots[0]
+    let (iv, iv_next, iv_slot, counter, t_next): (Inst, Inst, usize, Inst, Inst) = if test_at_top {
+        // The effective (non-passthrough) parameters are `[iv]` or
+        // `[iv, acc]` (B1). With an accumulator, the IV is the
+        // non-acc effective slot; otherwise it is effective[0].
+        // `iv' = add(iv, 1)` is its plain-jump argument in the latch.
+        // The remaining parameters are loop-invariant passthroughs.
+        let iv_slot = match acc_info {
+            Some((acc_inst, acc_slot, _)) => {
+                let slots: Vec<usize> = effective
+                    .iter()
+                    .copied()
+                    .filter(|&i| i != acc_slot)
+                    .collect();
+                // A fixed-point sibling pass (PSR) may have rewritten the
+                // loop mid-iteration into a shape this analyzer does not
+                // recognize — reject conservatively instead of indexing
+                // out of bounds.
+                if slots.len() != 1 {
+                    trace(data, looop, "multi_iv_slot");
+                    return None;
                 }
-                None => {
-                    if effective.len() != 1 {
-                        trace(data, looop, "multi_iv_slot");
-                        return None;
-                    }
-                    effective[0]
-                }
-            };
-            let iv = params[iv_slot];
-            let iv_next = back_args[iv_slot];
-            // Placeholders; unused for test-at-top (no counter yet).
-            (iv, iv_next, iv_slot, iv, iv_next)
-        } else {
-            let t_next = match arena.inst_data(latch_branch).kind() {
-                InstKind::Branch(b) => b.cond(),
-                _ => unreachable!(),
-            };
-            if back_args[counter_slot] != t_next {
-                trace(data, looop, "counter_not_cond");
-                return None;
+                slots[0]
             }
-            let counter = params[counter_slot];
-            let (iv, iv_next, iv_slot) = match acc_info {
-                Some((acc, acc_slot, _)) => {
-                    let slots: Vec<usize> = (0..n_params)
-                        .filter(|&i| i != acc_slot && i != counter_slot && !passthrough.contains(&i))
-                        .collect();
-                    debug_assert_eq!(slots.len(), 1);
-                    (params[slots[0]], back_args[slots[0]], slots[0])
+            None => {
+                if effective.len() != 1 {
+                    trace(data, looop, "multi_iv_slot");
+                    return None;
                 }
-                None => {
-                    debug_assert_eq!(effective.len(), 1);
-                    let slot = effective[0];
-                    (params[slot], back_args[slot], slot)
-                }
-            };
-            (iv, iv_next, iv_slot, counter, t_next)
+                effective[0]
+            }
         };
+        let iv = params[iv_slot];
+        let iv_next = back_args[iv_slot];
+        // Placeholders; unused for test-at-top (no counter yet).
+        (iv, iv_next, iv_slot, iv, iv_next)
+    } else {
+        let t_next = match arena.inst_data(latch_branch).kind() {
+            InstKind::Branch(b) => b.cond(),
+            _ => unreachable!(),
+        };
+        if back_args[counter_slot] != t_next {
+            trace(data, looop, "counter_not_cond");
+            return None;
+        }
+        let counter = params[counter_slot];
+        let (iv, iv_next, iv_slot) = match acc_info {
+            Some((acc, acc_slot, _)) => {
+                let slots: Vec<usize> = (0..n_params)
+                    .filter(|&i| i != acc_slot && i != counter_slot && !passthrough.contains(&i))
+                    .collect();
+                debug_assert_eq!(slots.len(), 1);
+                (params[slots[0]], back_args[slots[0]], slots[0])
+            }
+            None => {
+                debug_assert_eq!(effective.len(), 1);
+                let slot = effective[0];
+                (params[slot], back_args[slot], slot)
+            }
+        };
+        (iv, iv_next, iv_slot, counter, t_next)
+    };
     if !is_add_one(arena, iv_next, iv) {
         trace(data, looop, "non_unit_step");
         return None;
@@ -2076,9 +2092,7 @@ fn analyze_loop(
                 // B1 single-arm bodies: the body_br's branch forwards the
                 // untouched accumulator on its true edge (the mask's "no
                 // update" path), so the body_br block is a legal consumer.
-                let in_body_br = arm_plan
-                    .as_ref()
-                    .is_some_and(|a| user_bb == a.body_br);
+                let in_body_br = arm_plan.as_ref().is_some_and(|a| user_bb == a.body_br);
                 if user != update
                     && user_bb != latch
                     && !in_body_br
@@ -2116,10 +2130,7 @@ fn analyze_loop(
     }
     // Passthrough entry arguments: loop-invariant values forwarded to the
     // exit / epilogue chain after vectorization (their params stay i32).
-    let passthrough_args: Vec<Inst> = passthrough
-        .iter()
-        .map(|&slot| entry_args[slot])
-        .collect();
+    let passthrough_args: Vec<Inst> = passthrough.iter().map(|&slot| entry_args[slot]).collect();
 
     // 6b. Exit parameter classification: each exit parameter is fed one of
     //     three value classes at the rewritten exit edge — the final
@@ -2141,9 +2152,10 @@ fn analyze_loop(
         // exit parameter 0 — e.g. a min-reduction passes [i, min]).
         let spec = if arg == iv_next {
             ExitArgSpec::IvFinal
-        } else if let Some(idx) = passthrough.iter().position(|&slot| {
-            arg == params[slot] || arg == entry_args[slot]
-        }) {
+        } else if let Some(idx) = passthrough
+            .iter()
+            .position(|&slot| arg == params[slot] || arg == entry_args[slot])
+        {
             // `idx` is the index into `passthrough` / `passthrough_args`
             // (both are ordered identically), not the header slot.
             ExitArgSpec::Passthrough(idx)
@@ -2316,9 +2328,9 @@ fn analyze_loop(
                 && !multi_arm.as_ref().is_some_and(|m| {
                     // The multi-arm kernel's mask bounds and index math are
                     // computed inside the units' body_br / then blocks.
-                    m.units.iter().any(|u| {
-                        bb == Some(u.body_br) || bb == Some(u.then) || bb == Some(u.end)
-                    })
+                    m.units
+                        .iter()
+                        .any(|u| bb == Some(u.body_br) || bb == Some(u.then) || bb == Some(u.end))
                 })
             {
                 trace(data, looop, "test_at_top_exit_reads_iv");
@@ -2432,28 +2444,35 @@ fn analyze_loop(
                 // the base must be loop-invariant (a global, stack alloc,
                 // or a dominating value).
                 if !is_loop_invariant(arena, gep.base(), header, latch) {
-        trace(data, looop, "gep_base_loop_variant");
-        return None;
+                    trace(data, looop, "gep_base_loop_variant");
+                    return None;
                 }
                 for &offset in gep.offsets() {
                     if offset != iv
                         && !is_loop_invariant(arena, offset, header, latch)
                         && !index_math.contains(&offset)
                     {
-        trace(data, looop, "gep_offset_loop_variant");
-        return None;
+                        trace(data, looop, "gep_offset_loop_variant");
+                        return None;
                     }
                 }
                 classes.insert(inst, Class::Keep);
             }
             InstKind::Load(load) => {
                 let access = dep.accesses.iter().find(|a| a.inst == inst)?;
-                let Some((class, elem)) =
-                    classify_load(arena, func, effects, load.src(), access, &payload, header, latch)
-                else {
-                                        trace(data, looop, "load_unmodeled");
-        trace(data, looop, "load_classify");
-        return None;
+                let Some((class, elem)) = classify_load(
+                    arena,
+                    func,
+                    effects,
+                    load.src(),
+                    access,
+                    &payload,
+                    header,
+                    latch,
+                ) else {
+                    trace(data, looop, "load_unmodeled");
+                    trace(data, looop, "load_classify");
+                    return None;
                 };
                 merge_elem(&mut elem_ty, elem)?;
                 if class == Class::VecLoad {
@@ -2464,22 +2483,22 @@ fn analyze_loop(
             InstKind::Store(store) => {
                 let access = dep.accesses.iter().find(|a| a.inst == inst)?;
                 if access.kind != AccessKind::Write || access.byte_coefficient != VF {
-        trace(data, looop, "store_not_contig_write");
-        return None; // invariant / strided stores are not vectorized
+                    trace(data, looop, "store_not_contig_write");
+                    return None; // invariant / strided stores are not vectorized
                 }
                 if !base_is_16b_aligned(arena, effects, func, access.base) {
-        trace(data, looop, "base_not_aligned");
-        return None;
+                    trace(data, looop, "base_not_aligned");
+                    return None;
                 }
                 let elem = arena.inst_data(store.src()).ty().clone();
                 if !elem.is_i32() && !elem.is_f32() {
-        trace(data, looop, "elem_not_i32_f32");
-        return None;
+                    trace(data, looop, "elem_not_i32_f32");
+                    return None;
                 }
                 merge_elem(&mut elem_ty, elem)?;
                 if !is_address_operand(arena, store.dest(), &payload, header, latch) {
-        trace(data, looop, "store_dest_not_gep");
-        return None;
+                    trace(data, looop, "store_dest_not_gep");
+                    return None;
                 }
                 vectorized_any = true;
                 classes.insert(inst, Class::VecStore);
@@ -2535,8 +2554,8 @@ fn analyze_loop(
         };
         let ty = arena.inst_data(binary.lhs()).ty().clone();
         if !ty.is_i32() && !ty.is_f32() {
-        trace(data, looop, "binary_elem_not_scalar");
-        return None;
+            trace(data, looop, "binary_elem_not_scalar");
+            return None;
         }
         // Shifts and bitwise ops exist only for integers: NEON has no float
         // shift/and/or/xor forms and float shift semantics do not exist.
@@ -2595,9 +2614,7 @@ fn analyze_loop(
                     // to a vector in the mutation phase) is a legal vector
                     // operand even though its back-edge value changes: it
                     // feeds the arm's masked reduction update.
-                    let is_acc = acc_info
-                        .as_ref()
-                        .is_some_and(|(acc, _, _)| *acc == operand);
+                    let is_acc = acc_info.as_ref().is_some_and(|(acc, _, _)| *acc == operand);
                     if !is_acc && !is_loop_invariant(arena, operand, header, latch) {
                         trace(data, looop, "binary_operand_loop_variant");
                         return None;
@@ -2665,8 +2682,8 @@ fn analyze_loop(
                     continue;
                 }
                 if !is_loop_invariant(arena, store.src(), header, latch) {
-                                        trace(data, looop, "store_src_loop_variant");
-        return None;
+                    trace(data, looop, "store_src_loop_variant");
+                    return None;
                 }
             }
         }
@@ -2685,8 +2702,8 @@ fn analyze_loop(
                 continue;
             };
             if !looop.contains(user_bb) {
-        trace(data, looop, "value_escapes_loop");
-        return None;
+                trace(data, looop, "value_escapes_loop");
+                return None;
             }
         }
     }
@@ -2707,45 +2724,45 @@ fn analyze_loop(
         None
     } else {
         match acc_info {
-        None => None,
-        Some((acc, acc_slot, bop)) => {
-            let (update, delta) = acc_update.expect("acc_update set alongside acc_info");
-            // The accumulator seed is splatted as a zero vector and added
-            // back at the exit, so a block-arg seed (outer loop's `sum`)
-            // is no longer splatted directly. The exit `add(seed, Σc)`
-            // references the seed across loop levels — safe since IPSCCP
-            // no longer folds vector results to a constant (fixed
-            // 2026-08-05: VectorReduce etc. now take Lattice::Bottom).
-            let delta_class = payload
-                .iter()
-                .position(|&p| p == delta)
-                .and_then(|idx| classes.get(&payload[idx]).copied());
-            match delta_class {
-                Some(Class::VecLoad) | Some(Class::VecBinary) | Some(Class::Keep) => {}
-                Some(_) => {
-                    trace(data, looop, "b1_delta_not_vectorizable");
-                    return None;
-                }
-                None => {
-                    if !is_loop_invariant(arena, delta, header, latch) {
-                        trace(data, looop, "b1_delta_loop_variant");
+            None => None,
+            Some((acc, acc_slot, bop)) => {
+                let (update, delta) = acc_update.expect("acc_update set alongside acc_info");
+                // The accumulator seed is splatted as a zero vector and added
+                // back at the exit, so a block-arg seed (outer loop's `sum`)
+                // is no longer splatted directly. The exit `add(seed, Σc)`
+                // references the seed across loop levels — safe since IPSCCP
+                // no longer folds vector results to a constant (fixed
+                // 2026-08-05: VectorReduce etc. now take Lattice::Bottom).
+                let delta_class = payload
+                    .iter()
+                    .position(|&p| p == delta)
+                    .and_then(|idx| classes.get(&payload[idx]).copied());
+                match delta_class {
+                    Some(Class::VecLoad) | Some(Class::VecBinary) | Some(Class::Keep) => {}
+                    Some(_) => {
+                        trace(data, looop, "b1_delta_not_vectorizable");
                         return None;
                     }
+                    None => {
+                        if !is_loop_invariant(arena, delta, header, latch) {
+                            trace(data, looop, "b1_delta_loop_variant");
+                            return None;
+                        }
+                    }
                 }
+                Some(ReductionPlan {
+                    acc,
+                    acc_slot,
+                    op: bop,
+                    acc_update: update,
+                    delta,
+                    acc_init: entry_args[acc_slot],
+                    exit_acc_param: exit_specs
+                        .iter()
+                        .position(|spec| matches!(spec, ExitArgSpec::Acc))
+                        .map(|pos| exit_params[pos]),
+                })
             }
-            Some(ReductionPlan {
-                acc,
-                acc_slot,
-                op: bop,
-                acc_update: update,
-                delta,
-                acc_init: entry_args[acc_slot],
-                exit_acc_param: exit_specs
-                    .iter()
-                    .position(|spec| matches!(spec, ExitArgSpec::Acc))
-                    .map(|pos| exit_params[pos]),
-            })
-        }
         }
     };
     // Mod-wrapped scalar reduction: the element computation is vectorized
@@ -2976,20 +2993,34 @@ fn collect_index_math(
 /// *passthrough* parameter (an outer induction value the back edge forwards
 /// unchanged — its value does not vary across iterations). Header/latch
 /// block parameters with a real back-edge update are loop-variant.
-fn is_loop_invariant(arena: &ArenaContext<'_>, inst: Inst, header: BasicBlock, latch: BasicBlock) -> bool {
+fn is_loop_invariant(
+    arena: &ArenaContext<'_>,
+    inst: Inst,
+    header: BasicBlock,
+    latch: BasicBlock,
+) -> bool {
     if matches!(
         arena.inst_data(inst).kind(),
         InstKind::Integer(_) | InstKind::Float(_) | InstKind::ZeroInit
     ) {
         return true;
     }
-    if let Some(slot) = arena.bb_data(header).params().iter().position(|&p| p == inst) {
+    if let Some(slot) = arena
+        .bb_data(header)
+        .params()
+        .iter()
+        .position(|&p| p == inst)
+    {
         // A passthrough parameter (the back-edge argument is the parameter
         // itself) or a loop-invariant one (the back-edge argument is a
         // constant — crypto's md5/sha1 state loops forward constants like
         // 256000 / 1 alongside the real IV). Rotated loops branch back to
         // the header; test-at-top loops jump back to it.
-        let term = arena.curr_func_data().layout().basicblock(latch).terminator();
+        let term = arena
+            .curr_func_data()
+            .layout()
+            .basicblock(latch)
+            .terminator();
         return match arena.inst_data(term).kind() {
             InstKind::Branch(branch) => {
                 branch.t_args().get(slot) == Some(&inst)
@@ -3089,9 +3120,9 @@ fn merge_elem(slot: &mut Option<Type>, elem: Type) -> Option<()> {
 fn constant_i64(arena: &ArenaContext<'_>, data: &FunctionData, inst: Inst) -> Option<i64> {
     match arena.inst_data(inst).kind() {
         InstKind::Integer(value) => Some(i64::from(value.value())),
-        InstKind::Binary(binary) if binary.op() == BinaryOp::Sub => {
-            Some(constant_i64(arena, data, binary.lhs())? - constant_i64(arena, data, binary.rhs())?)
-        }
+        InstKind::Binary(binary) if binary.op() == BinaryOp::Sub => Some(
+            constant_i64(arena, data, binary.lhs())? - constant_i64(arena, data, binary.rhs())?,
+        ),
         _ => None,
     }
 }
@@ -3187,7 +3218,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             let index = data.bb_data(exit).params().len() + 1;
             let ep = alloc_inst(data, BlockArgRef::new_data(index, i32.clone()));
             data.bb_data_mut(exit).params_mut().push(ep);
-            for user in exit_users.into_iter().chain(post_exit_acc_users.iter().copied()) {
+            for user in exit_users
+                .into_iter()
+                .chain(post_exit_acc_users.iter().copied())
+            {
                 subst_operand(data, user, acc, ep);
             }
             Some(ep)
@@ -3258,12 +3292,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             data,
             Binary::new_data(cnt0, zero, BinaryOp::Gt, i32.clone()),
         );
-        let cnt_clamped = alloc_inst(
-            data,
-            Select::new_data(positive, cnt0, zero, i32.clone()),
-        );
+        let cnt_clamped = alloc_inst(data, Select::new_data(positive, cnt0, zero, i32.clone()));
         data.layout_mut().insert_inst_before(entry_edge, positive);
-        data.layout_mut().insert_inst_before(entry_edge, cnt_clamped);
+        data.layout_mut()
+            .insert_inst_before(entry_edge, cnt_clamped);
         let start = alloc_inst(
             data,
             Binary::new_data(i0_inst, cnt_clamped, BinaryOp::Add, i32.clone()),
@@ -3319,7 +3351,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         let param_index = data.bb_data(header).params().len() + 1;
         let bar = alloc_inst(data, BlockArgRef::new_data(param_index, i32.clone()));
         data.bb_data_mut(header).params_mut().push(bar);
-        let t = alloc_inst(data, Binary::new_data(bar, four, BinaryOp::Sub, i32.clone()));
+        let t = alloc_inst(
+            data,
+            Binary::new_data(bar, four, BinaryOp::Sub, i32.clone()),
+        );
         let latch_term = data.layout().basicblock(latch).terminator();
         data.layout_mut().insert_inst_before(latch_term, t);
         (bar, t)
@@ -3403,9 +3438,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             Binary::new_data(iv_t, runtime_bound, BinaryOp::Lt, i32.clone()),
         );
         let iv_final_rt = has_iv_final.then_some(runtime_bound);
-        let tail_acc =
-            reduction.as_ref().map(|_| data.bb_data(th).params()[1])
-                .or_else(|| mod_reduction.as_ref().map(|_| data.bb_data(th).params()[1]));
+        let tail_acc = reduction
+            .as_ref()
+            .map(|_| data.bb_data(th).params()[1])
+            .or_else(|| mod_reduction.as_ref().map(|_| data.bb_data(th).params()[1]));
         let mut exit_args = build_exit_args(&exit_specs, &passthrough_args, tail_acc, iv_final_rt);
         if let Some(_) = exit_extra_acc {
             // The freshly added exit parameter carries the final scalar
@@ -3463,8 +3499,15 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             old_src: &arm_old_src,
         });
         for &orig in &payload {
-            let cloned =
-                clone_payload_inst(data, orig, &mut map, iv, iv_t, arm_mask.as_ref(), &mut insts);
+            let cloned = clone_payload_inst(
+                data,
+                orig,
+                &mut map,
+                iv,
+                iv_t,
+                arm_mask.as_ref(),
+                &mut insts,
+            );
             insts.push(cloned);
         }
         let mut jump_args: Vec<Inst> = Vec::new();
@@ -3495,10 +3538,7 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             // the delta is a payload inst; invariant deltas are reused.
             let delta_k = map.get(&red.delta).copied().unwrap_or(red.delta);
             let acc_t = data.bb_data(th).params()[1];
-            let acc_k = alloc_inst(
-                data,
-                Binary::new_data(acc_t, delta_k, red.op, i32.clone()),
-            );
+            let acc_k = alloc_inst(data, Binary::new_data(acc_t, delta_k, red.op, i32.clone()));
             insts.push(acc_k);
             jump_args.push(acc_k);
         }
@@ -3658,14 +3698,12 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                     // computed `i0 + VF*q + r`: the peeled scalar
                     // iterations ran with `iv = i0 + 4q + k`, so the
                     // scalar exit value `i0 + trip` == `i0 + 4q + r`.
-                    let iv_final_const = has_iv_final
-                        .then(|| data.new_local_inst().integer((entry_i0 + step * q + r) as i32));
-                    let mut args = build_exit_args(
-                        &exit_specs,
-                        &passthrough_args,
-                        acc_value,
-                        iv_final_const,
-                    );
+                    let iv_final_const = has_iv_final.then(|| {
+                        data.new_local_inst()
+                            .integer((entry_i0 + step * q + r) as i32)
+                    });
+                    let mut args =
+                        build_exit_args(&exit_specs, &passthrough_args, acc_value, iv_final_const);
                     if let Some(_) = exit_extra_acc {
                         // The freshly added parameter carries the final
                         // scalar accumulator from the peeled iterations.
@@ -3698,13 +3736,13 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         // B1 masked reduction: the merge (latch) block's accumulator phi —
         // the back-edge argument for the accumulator slot — must become a
         // vector too (it carries the masked `select(cond, acc, acc+rhs)`).
-            if let Some(arm_plan) = &arm {
-                if let InstKind::Branch(b) = data.inst_data(latch_branch).kind() {
-                    if let Some(&merge_param) = b.t_args().get(red.acc_slot) {
-                        data.inst_data_mut(merge_param).set_type(vector_ty.clone());
-                    }
+        if let Some(arm_plan) = &arm {
+            if let InstKind::Branch(b) = data.inst_data(latch_branch).kind() {
+                if let Some(&merge_param) = b.t_args().get(red.acc_slot) {
+                    data.inst_data_mut(merge_param).set_type(vector_ty.clone());
                 }
             }
+        }
     }
     let mut splats = FxHashMap::<Inst, Inst>::default();
     // B3c: the index IV consumed as a payload *value* (a store src or a
@@ -3712,15 +3750,11 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     // to the lane counter `splat(iv) + [0, 1, .., VF-1]`, not a broadcast.
     // The lane-offset constant is built once here; it is loop-invariant and
     // LICM hoists it out of the body.
-    let iv_as_value = payload.iter().any(|&p| {
-        match data.inst_data(p).kind() {
-            InstKind::Binary(b) => b.lhs() == iv || b.rhs() == iv,
-            InstKind::Store(s) => s.src() == iv,
-            InstKind::Select(s) => {
-                s.cond() == iv || s.if_true() == iv || s.if_false() == iv
-            }
-            _ => false,
-        }
+    let iv_as_value = payload.iter().any(|&p| match data.inst_data(p).kind() {
+        InstKind::Binary(b) => b.lhs() == iv || b.rhs() == iv,
+        InstKind::Store(s) => s.src() == iv,
+        InstKind::Select(s) => s.cond() == iv || s.if_true() == iv || s.if_false() == iv,
+        _ => false,
     });
     if iv_as_value && !splats.contains_key(&iv) {
         let zero = data.new_local_inst().integer(0);
@@ -3797,14 +3831,16 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                     InstKind::Binary(binary) => (binary.op(), binary.lhs(), binary.rhs()),
                     _ => unreachable!(),
                 };
-                let vlhs = vector_operand(
-                    data, &mut splats, lhs, &payload, &classes, &vector_ty, inst,
-                );
-                let vrhs = vector_operand(
-                    data, &mut splats, rhs, &payload, &classes, &vector_ty, inst,
-                );
-                data.replace_inst_with(inst)
-                    .raw(Binary::new_data(vlhs, vrhs, op, vector_ty.clone()));
+                let vlhs =
+                    vector_operand(data, &mut splats, lhs, &payload, &classes, &vector_ty, inst);
+                let vrhs =
+                    vector_operand(data, &mut splats, rhs, &payload, &classes, &vector_ty, inst);
+                data.replace_inst_with(inst).raw(Binary::new_data(
+                    vlhs,
+                    vrhs,
+                    op,
+                    vector_ty.clone(),
+                ));
             }
             Some(Class::VecStore) => {
                 let (src, dest) = match data.inst_data(inst).kind() {
@@ -3840,10 +3876,22 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                             unreachable!("arm store without a same-address load or body store");
                         };
                         let vnew = vector_operand(
-                            data, &mut splats, src, &payload, &classes, &vector_ty, inst,
+                            data,
+                            &mut splats,
+                            src,
+                            &payload,
+                            &classes,
+                            &vector_ty,
+                            inst,
                         );
                         let vold = vector_operand(
-                            data, &mut splats, old, &payload, &classes, &vector_ty, inst,
+                            data,
+                            &mut splats,
+                            old,
+                            &payload,
+                            &classes,
+                            &vector_ty,
+                            inst,
                         );
                         let vcond = vector_operand(
                             data,
@@ -3857,10 +3905,22 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                         let zero = data.new_local_inst().integer(0);
                         let neg_one = data.new_local_inst().integer(-1);
                         let vzero = vector_operand(
-                            data, &mut splats, zero, &payload, &classes, &vector_ty, inst,
+                            data,
+                            &mut splats,
+                            zero,
+                            &payload,
+                            &classes,
+                            &vector_ty,
+                            inst,
                         );
                         let vneg = vector_operand(
-                            data, &mut splats, neg_one, &payload, &classes, &vector_ty, inst,
+                            data,
+                            &mut splats,
+                            neg_one,
+                            &payload,
+                            &classes,
+                            &vector_ty,
+                            inst,
                         );
                         let eq0 = alloc_inst(
                             data,
@@ -3907,10 +3967,10 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                         continue;
                     }
                 }
-                let vsrc = vector_operand(
-                    data, &mut splats, src, &payload, &classes, &vector_ty, inst,
-                );
-                data.replace_inst_with(inst).raw(Store::new_data(vsrc, dest));
+                let vsrc =
+                    vector_operand(data, &mut splats, src, &payload, &classes, &vector_ty, inst);
+                data.replace_inst_with(inst)
+                    .raw(Store::new_data(vsrc, dest));
             }
             Some(Class::VecSelect) => {
                 // `select(cond, t, f)` with a loop-invariant condition: the
@@ -3924,20 +3984,36 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                     }
                     _ => unreachable!(),
                 };
-                let vt =
-                    vector_operand(data, &mut splats, t, &payload, &classes, &vector_ty, inst);
-                let vf =
-                    vector_operand(data, &mut splats, f, &payload, &classes, &vector_ty, inst);
+                let vt = vector_operand(data, &mut splats, t, &payload, &classes, &vector_ty, inst);
+                let vf = vector_operand(data, &mut splats, f, &payload, &classes, &vector_ty, inst);
                 let vcond = vector_operand(
-                    data, &mut splats, cond, &payload, &classes, &vector_ty, inst,
+                    data,
+                    &mut splats,
+                    cond,
+                    &payload,
+                    &classes,
+                    &vector_ty,
+                    inst,
                 );
                 let zero = data.new_local_inst().integer(0);
                 let neg_one = data.new_local_inst().integer(-1);
                 let vzero = vector_operand(
-                    data, &mut splats, zero, &payload, &classes, &vector_ty, inst,
+                    data,
+                    &mut splats,
+                    zero,
+                    &payload,
+                    &classes,
+                    &vector_ty,
+                    inst,
                 );
                 let vneg = vector_operand(
-                    data, &mut splats, neg_one, &payload, &classes, &vector_ty, inst,
+                    data,
+                    &mut splats,
+                    neg_one,
+                    &payload,
+                    &classes,
+                    &vector_ty,
+                    inst,
                 );
                 let eq0 = alloc_inst(
                     data,
@@ -3963,8 +4039,12 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                     Binary::new_data(vf, m, BinaryOp::And, vector_ty.clone()),
                 );
                 data.layout_mut().insert_inst_before(inst, fa);
-                data.replace_inst_with(inst)
-                    .raw(Binary::new_data(ta, fa, BinaryOp::Or, vector_ty.clone()));
+                data.replace_inst_with(inst).raw(Binary::new_data(
+                    ta,
+                    fa,
+                    BinaryOp::Or,
+                    vector_ty.clone(),
+                ));
             }
             Some(Class::InvLoad) | Some(Class::Keep) => {}
             None => unreachable!("every payload inst is classified"),
@@ -3979,7 +4059,16 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     //     counter and IV already step by `step` (= 8) from the threading
     //     above; the tail / epilogue cover the `trip & 7` remainder.
     if unroll {
-        unroll_payload_2x(data, latch, &payload, &classes, &vector_ty, latch_branch, t_next, iv_next);
+        unroll_payload_2x(
+            data,
+            latch,
+            &payload,
+            &classes,
+            &vector_ty,
+            latch_branch,
+            t_next,
+            iv_next,
+        );
     }
 
     // 2b. B1: re-type the accumulator parameter to `<4 x T>` and rewrite its
@@ -4026,9 +4115,17 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         let zero = data.new_local_inst().integer(0);
         let mut prev = modr.acc;
         for &add in &modr.add_chain {
-            let rhs = if add == modr.add_chain[0] { total } else { zero };
-            data.replace_inst_with(add)
-                .raw(Binary::new_data(prev, rhs, BinaryOp::Add, i32.clone()));
+            let rhs = if add == modr.add_chain[0] {
+                total
+            } else {
+                zero
+            };
+            data.replace_inst_with(add).raw(Binary::new_data(
+                prev,
+                rhs,
+                BinaryOp::Add,
+                i32.clone(),
+            ));
             prev = add;
         }
         let p = data.new_local_inst().integer(modr.modulus);
@@ -4101,7 +4198,11 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             // The arm sits on the branch's true edge when `arm_on_true`:
             // then it executes when `cond != 0`, so `delta` is gated by
             // `~m` and `acc` by `m` (inverted from the false-edge case).
-            let (m_new, m_old) = if arm_plan.arm_on_true { (nm, m) } else { (m, nm) };
+            let (m_new, m_old) = if arm_plan.arm_on_true {
+                (nm, m)
+            } else {
+                (m, nm)
+            };
             // `delta` = the payload-rewritten `acc + rhs` (red.acc_update).
             let vdelta = red.acc_update;
             let tn = alloc_inst(
@@ -4128,7 +4229,12 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             // `tn = sel & m_new` while `sel = tn | fo`, an Inst-level cycle
             // (GVN then recurses forever on `And(Or(..),..) <-> Or(And(..),..)`).
             let arm_term = data.layout().basicblock(arm_plan.arm).terminator();
-            let users: Vec<Inst> = data.inst_data(red.acc_update).used_by().iter().copied().collect();
+            let users: Vec<Inst> = data
+                .inst_data(red.acc_update)
+                .used_by()
+                .iter()
+                .copied()
+                .collect();
             for user in users {
                 if data.layout().parent_bb(user) == Some(arm_plan.arm)
                     && user != tn
@@ -4149,8 +4255,12 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 &vector_ty,
                 red.acc_update,
             );
-            data.replace_inst_with(red.acc_update)
-                .raw(Binary::new_data(red.acc, delta_vec, red.op, vector_ty.clone()));
+            data.replace_inst_with(red.acc_update).raw(Binary::new_data(
+                red.acc,
+                delta_vec,
+                red.op,
+                vector_ty.clone(),
+            ));
         }
     }
 
@@ -4211,8 +4321,8 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             };
             (cond, t_target, t_args)
         };
-        let iv_final_const = has_iv_final
-            .then(|| data.new_local_inst().integer((entry_i0 + step * q) as i32));
+        let iv_final_const =
+            has_iv_final.then(|| data.new_local_inst().integer((entry_i0 + step * q) as i32));
         let (f_target, f_args) = if test_at_top {
             // B1 reduction: the false edge carries the vector accumulator
             // (the header parameter, re-typed at step 2b) to the reduce
@@ -4236,10 +4346,7 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             } else if runtime_trip {
                 let mut args = vec![iv0.expect("runtime iv0")];
                 args.extend(passthrough_args.iter().copied());
-                (
-                    tail_header.expect("tail built when runtime_trip"),
-                    args,
-                )
+                (tail_header.expect("tail built when runtime_trip"), args)
             } else if r > 0 {
                 (epi_blocks[0], passthrough_args.clone())
             } else {
@@ -4256,10 +4363,7 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 if runtime_trip {
                     let mut args = vec![iv0.expect("runtime iv0"), modr.acc_update];
                     args.extend(passthrough_args.iter().copied());
-                    (
-                        tail_header.expect("tail built when runtime_trip"),
-                        args,
-                    )
+                    (tail_header.expect("tail built when runtime_trip"), args)
                 } else {
                     (
                         exit,
@@ -4289,10 +4393,7 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                         // zero iterations.
                         let mut args = vec![iv0.expect("runtime iv0")];
                         args.extend(passthrough_args.iter().copied());
-                        (
-                            tail_header.expect("tail built when runtime_trip"),
-                            args,
-                        )
+                        (tail_header.expect("tail built when runtime_trip"), args)
                     }
                     None if r > 0 => (epi_blocks[0], passthrough_args.clone()),
                     None => {
@@ -4300,12 +4401,7 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                         // parameters are replaced by the computed constant.
                         (
                             exit,
-                            build_exit_args(
-                                &exit_specs,
-                                &passthrough_args,
-                                None,
-                                iv_final_const,
-                            ),
+                            build_exit_args(&exit_specs, &passthrough_args, None, iv_final_const),
                         )
                     }
                 }
@@ -4334,8 +4430,12 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             _ => unreachable!(),
         }
     } else {
-        data.replace_inst_with(eff_t_next)
-            .raw(Binary::new_data(eff_counter, four, BinaryOp::Sub, i32.clone()));
+        data.replace_inst_with(eff_t_next).raw(Binary::new_data(
+            eff_counter,
+            four,
+            BinaryOp::Sub,
+            i32.clone(),
+        ));
     }
 
     // 4. Entry edge: the counter enters at `4Q` (trip % 4 handled by the
@@ -4459,7 +4559,8 @@ fn apply_vectorize(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     //    terminator `jump merge` is preserved and becomes the merge's
     //    predecessor).
     if let Some(arm_plan) = &arm {
-        data.replace_inst_with(arm_plan.branch).jump(arm_plan.arm, vec![]);
+        data.replace_inst_with(arm_plan.branch)
+            .jump(arm_plan.arm, vec![]);
     }
 
     true
@@ -4523,8 +4624,10 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     // is covered stays vectorized; anything else stays scalar (conservative).
     if trip % step != 0 {
         if std::env::var("M44_TRACE").is_ok() {
-            eprintln!("[M44] func={} header={header:?} reject=multi_arm_runtime_unsupported",
-                data.name());
+            eprintln!(
+                "[M44] func={} header={header:?} reject=multi_arm_runtime_unsupported",
+                data.name()
+            );
         }
         return false;
     }
@@ -4560,7 +4663,8 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             Select::new_data(positive, cnt0, zero_cmp, i32.clone()),
         );
         data.layout_mut().insert_inst_before(entry_edge, positive);
-        data.layout_mut().insert_inst_before(entry_edge, cnt_clamped);
+        data.layout_mut()
+            .insert_inst_before(entry_edge, cnt_clamped);
         let start = alloc_inst(
             data,
             Binary::new_data(i0_inst, cnt_clamped, BinaryOp::Add, i32.clone()),
@@ -4592,7 +4696,8 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         Binary::new_data(counter_bar, four, BinaryOp::Sub, i32.clone()),
     );
     let latch_term = data.layout().basicblock(latch).terminator();
-    data.layout_mut().insert_inst_before(latch_term, counter_next);
+    data.layout_mut()
+        .insert_inst_before(latch_term, counter_next);
 
     // ---- 2. Re-type the accumulator chain to the vector type.
     //      The header carrier parameter and every unit's `end` parameter.
@@ -4616,7 +4721,10 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     }
     {
         let (cond, t_target, t_args, f_target, f_args) = {
-            let branch = data.layout().basicblock(multi.units[0].body_br).terminator();
+            let branch = data
+                .layout()
+                .basicblock(multi.units[0].body_br)
+                .terminator();
             match data.inst_data(branch).kind() {
                 InstKind::Branch(b) => (
                     b.cond(),
@@ -4628,7 +4736,10 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 _ => unreachable!(),
             }
         };
-        let branch = data.layout().basicblock(multi.units[0].body_br).terminator();
+        let branch = data
+            .layout()
+            .basicblock(multi.units[0].body_br)
+            .terminator();
         if f_args.len() == 1 {
             let mut f_args = f_args;
             f_args[0] = vzero;
@@ -4666,12 +4777,18 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             data,
             Binary::new_data(unit.cc, vf_m1, BinaryOp::Add, i32.clone()),
         );
-        let ge_hi = alloc_inst(data, Binary::new_data(cc_hi, zero, BinaryOp::Ge, i32.clone()));
+        let ge_hi = alloc_inst(
+            data,
+            Binary::new_data(cc_hi, zero, BinaryOp::Ge, i32.clone()),
+        );
         let lt_b = alloc_inst(
             data,
             Binary::new_data(unit.cc, unit.bound, BinaryOp::Lt, i32.clone()),
         );
-        let inner = alloc_inst(data, Binary::new_data(ge_hi, lt_b, BinaryOp::And, i32.clone()));
+        let inner = alloc_inst(
+            data,
+            Binary::new_data(ge_hi, lt_b, BinaryOp::And, i32.clone()),
+        );
         let mut cond = inner;
         if let Some(rr) = unit.rr_ok {
             cond = alloc_inst(data, Binary::new_data(cond, rr, BinaryOp::And, i32.clone()));
@@ -4692,11 +4809,16 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
     //      `then` blocks are reachable around each other via the mask's
     //      false edge (`br mask, then, end`), so no single `then` dominates
     //      the rest.
-    let body_br0_term = data.layout().basicblock(multi.units[0].body_br).terminator();
+    let body_br0_term = data
+        .layout()
+        .basicblock(multi.units[0].body_br)
+        .terminator();
     let iv_splat = alloc_inst(data, VectorSplat::new_data(iv, vector_ty.clone()));
-    data.layout_mut().insert_inst_before(body_br0_term, iv_splat);
+    data.layout_mut()
+        .insert_inst_before(body_br0_term, iv_splat);
     let mut lane_off = alloc_inst(data, VectorSplat::new_data(zero, vector_ty.clone()));
-    data.layout_mut().insert_inst_before(body_br0_term, lane_off);
+    data.layout_mut()
+        .insert_inst_before(body_br0_term, lane_off);
     for k in 1..VF as i64 {
         let c = data.new_local_inst().integer(k as i32);
         let idx = data.new_local_inst().integer(k as i32);
@@ -4704,7 +4826,8 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             data,
             VectorInsertElement::new_data(lane_off, c, idx, vector_ty.clone()),
         );
-        data.layout_mut().insert_inst_before(body_br0_term, lane_off);
+        data.layout_mut()
+            .insert_inst_before(body_br0_term, lane_off);
     }
     let iv_vec = alloc_inst(
         data,
@@ -4729,7 +4852,8 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
         data,
         VectorSplat::new_data(multi.units[0].bound, vector_ty.clone()),
     );
-    data.layout_mut().insert_inst_before(body_br0_term, bound_splat);
+    data.layout_mut()
+        .insert_inst_before(body_br0_term, bound_splat);
     shared_splats.insert(multi.units[0].bound, bound_splat);
 
     for unit in &multi.units {
@@ -4760,8 +4884,12 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             &vector_ty,
             unit.mul,
         );
-        data.replace_inst_with(unit.mul)
-            .raw(Binary::new_data(vl, vr, BinaryOp::Mul, vector_ty.clone()));
+        data.replace_inst_with(unit.mul).raw(Binary::new_data(
+            vl,
+            vr,
+            BinaryOp::Mul,
+            vector_ty.clone(),
+        ));
         // Mask: `m = (cc_vec >= 0) & (cc_vec < splat(bound)) &
         // splat(rr_ok)` with `cc_vec = iv_vec + splat(kc_off)`.
         let kc = data.new_local_inst().integer(unit.kc_off as i32);
@@ -4854,8 +4982,12 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
             &vector_ty,
             unit.add,
         );
-        data.replace_inst_with(unit.add)
-            .raw(Binary::new_data(acc_v, mul_masked, BinaryOp::Add, vector_ty.clone()));
+        data.replace_inst_with(unit.add).raw(Binary::new_data(
+            acc_v,
+            mul_masked,
+            BinaryOp::Add,
+            vector_ty.clone(),
+        ));
     }
 
     // The scalar tail (runtime trips) references each unit's row-bound
@@ -4925,7 +5057,11 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                             let step_off = data.new_local_inst().integer(VF as i32);
                             let gep = alloc_inst(
                                 data,
-                                GetElemPtr::new_data(p, vec![step_off], data.inst_data(p).ty().clone()),
+                                GetElemPtr::new_data(
+                                    p,
+                                    vec![step_off],
+                                    data.inst_data(p).ty().clone(),
+                                ),
                             );
                             data.layout_mut().insert_inst_before(latch_term, gep);
                             args[slot] = gep;
@@ -5093,7 +5229,8 @@ fn apply_multi_arm(data: &mut ArenaContextMut<'_>, plan: VecPlan) -> bool {
                 Binary::new_data(counter_bar, zero, BinaryOp::NotEq, i32.clone()),
             )
         };
-        data.layout_mut().insert_inst_before(header_term, counter_test);
+        data.layout_mut()
+            .insert_inst_before(header_term, counter_test);
         let body_target = multi.units[0].body_br;
         let mut reduce_args = vec![multi.acc];
         reduce_args.extend(passthrough_args.iter().copied());
@@ -5206,7 +5343,10 @@ fn build_multi_arm_tail(
     data.layout_mut().insert_bb_after(tail_h, tail_l);
     let iv_t = data.bb_data(tail_h).params()[0];
     let acc_t = data.bb_data(tail_h).params()[1];
-    let cond = alloc_inst(data, Binary::new_data(iv_t, bound, BinaryOp::Lt, i32.clone()));
+    let cond = alloc_inst(
+        data,
+        Binary::new_data(iv_t, bound, BinaryOp::Lt, i32.clone()),
+    );
     let exit_args = build_exit_args(
         exit_specs,
         passthrough_args,
@@ -5229,9 +5369,15 @@ fn build_multi_arm_tail(
         let kc = data.new_local_inst().integer(unit.kc_off as i32);
         let cc_t = alloc_inst(data, Binary::new_data(iv_t, kc, BinaryOp::Add, i32.clone()));
         insts.push(cc_t);
-        let ge0 = alloc_inst(data, Binary::new_data(cc_t, zero, BinaryOp::Ge, i32.clone()));
+        let ge0 = alloc_inst(
+            data,
+            Binary::new_data(cc_t, zero, BinaryOp::Ge, i32.clone()),
+        );
         insts.push(ge0);
-        let lt = alloc_inst(data, Binary::new_data(cc_t, bound, BinaryOp::Lt, i32.clone()));
+        let lt = alloc_inst(
+            data,
+            Binary::new_data(cc_t, bound, BinaryOp::Lt, i32.clone()),
+        );
         insts.push(lt);
         let mut m = alloc_inst(data, Binary::new_data(ge0, lt, BinaryOp::And, i32.clone()));
         insts.push(m);
@@ -5242,10 +5388,9 @@ fn build_multi_arm_tail(
         // In[rr][cc] = *(In_base + off), off = row_off + cc_t.
         let (in_base, off) = match data.inst_data(unit.load_in).kind() {
             InstKind::Load(l) => match data.inst_data(l.src()).kind() {
-                InstKind::GetElemPtr(g) => (
-                    g.base(),
-                    g.offsets().last().copied().unwrap_or(unit.cc),
-                ),
+                InstKind::GetElemPtr(g) => {
+                    (g.base(), g.offsets().last().copied().unwrap_or(unit.cc))
+                }
                 _ => unreachable!(),
             },
             _ => unreachable!(),
@@ -5263,7 +5408,10 @@ fn build_multi_arm_tail(
             }
             _ => off,
         };
-        let off_t = alloc_inst(data, Binary::new_data(inv_part, cc_t, BinaryOp::Add, i32.clone()));
+        let off_t = alloc_inst(
+            data,
+            Binary::new_data(inv_part, cc_t, BinaryOp::Add, i32.clone()),
+        );
         insts.push(off_t);
         let addr_t = alloc_inst(
             data,
@@ -5275,10 +5423,7 @@ fn build_multi_arm_tail(
         // K[k].
         let (k_base, k_off) = match data.inst_data(unit.load_k).kind() {
             InstKind::Load(l) => match data.inst_data(l.src()).kind() {
-                InstKind::GetElemPtr(g) => (
-                    g.base(),
-                    g.offsets().last().copied().unwrap(),
-                ),
+                InstKind::GetElemPtr(g) => (g.base(), g.offsets().last().copied().unwrap()),
                 _ => unreachable!(),
             },
             _ => unreachable!(),
@@ -5290,11 +5435,17 @@ fn build_multi_arm_tail(
         insts.push(k_addr);
         let ld_k = alloc_inst(data, Load::new_data(k_addr, i32.clone()));
         insts.push(ld_k);
-        let mul = alloc_inst(data, Binary::new_data(ld_in, ld_k, BinaryOp::Mul, i32.clone()));
+        let mul = alloc_inst(
+            data,
+            Binary::new_data(ld_in, ld_k, BinaryOp::Mul, i32.clone()),
+        );
         insts.push(mul);
         let delta = alloc_inst(data, Select::new_data(m, mul, zero, i32.clone()));
         insts.push(delta);
-        acc_cur = alloc_inst(data, Binary::new_data(acc_cur, delta, BinaryOp::Add, i32.clone()));
+        acc_cur = alloc_inst(
+            data,
+            Binary::new_data(acc_cur, delta, BinaryOp::Add, i32.clone()),
+        );
         insts.push(acc_cur);
     }
     // Out[iv_t] = acc: `out_base + (out_row_off + iv_t)`.
@@ -5305,12 +5456,19 @@ fn build_multi_arm_tail(
     insts.push(out_off);
     let out_addr = alloc_inst(
         data,
-        GetElemPtr::new_data(out_base, vec![out_off], data.inst_data(out_base).ty().clone()),
+        GetElemPtr::new_data(
+            out_base,
+            vec![out_off],
+            data.inst_data(out_base).ty().clone(),
+        ),
     );
     insts.push(out_addr);
     let out_store = alloc_inst(data, Store::new_data(acc_cur, out_addr));
     insts.push(out_store);
-    let iv_t_next = alloc_inst(data, Binary::new_data(iv_t, one, BinaryOp::Add, i32.clone()));
+    let iv_t_next = alloc_inst(
+        data,
+        Binary::new_data(iv_t, one, BinaryOp::Add, i32.clone()),
+    );
     insts.push(iv_t_next);
     let mut back_args: Vec<Inst> = vec![iv_t_next, zero];
     back_args.extend(passthrough_args.iter().copied());
@@ -5388,20 +5546,24 @@ fn unroll_payload_2x(
 
     // Continuation GEP per distinct address GEP (created on demand, shared
     // between the load and store clones of the same array).
-    let ensure_cont = |data: &mut ArenaContextMut<'_>,
-                       cont_of: &mut FxHashMap<Inst, Inst>,
-                       base: Inst|
-     -> Inst {
-        *cont_of.entry(base).or_insert_with(|| {
-            let ty = data.inst_data(base).ty().clone();
-            alloc_inst(data, GetElemPtr::new_data(base, vec![four], ty))
-        })
-    };
+    let ensure_cont =
+        |data: &mut ArenaContextMut<'_>, cont_of: &mut FxHashMap<Inst, Inst>, base: Inst| -> Inst {
+            *cont_of.entry(base).or_insert_with(|| {
+                let ty = data.inst_data(base).ty().clone();
+                alloc_inst(data, GetElemPtr::new_data(base, vec![four], ty))
+            })
+        };
 
     // Partition the latch body: payload (by class), loop-invariant splat
     // helpers (created by `vector_operand` during step 2), and the three
     // machinery instructions (kept at the tail).
-    let latch_insts: Vec<Inst> = data.layout().basicblock(latch).insts().iter().copied().collect();
+    let latch_insts: Vec<Inst> = data
+        .layout()
+        .basicblock(latch)
+        .insts()
+        .iter()
+        .copied()
+        .collect();
     let payload_set: FxHashSet<Inst> = payload.iter().copied().collect();
     let mut geps: Vec<Inst> = Vec::new();
     let mut loads: Vec<Inst> = Vec::new();
@@ -5441,11 +5603,15 @@ fn unroll_payload_2x(
         insert(data, gep);
     }
     for &load in &loads {
-        let InstKind::Load(ld) = data.inst_data(load).kind() else { unreachable!() };
+        let InstKind::Load(ld) = data.inst_data(load).kind() else {
+            unreachable!()
+        };
         ensure_cont(data, &mut cont_of, ld.src());
     }
     for &store in &stores {
-        let InstKind::Store(st) = data.inst_data(store).kind() else { unreachable!() };
+        let InstKind::Store(st) = data.inst_data(store).kind() else {
+            unreachable!()
+        };
         ensure_cont(data, &mut cont_of, st.dest());
     }
     for &cont in cont_of.values() {
@@ -5455,7 +5621,9 @@ fn unroll_payload_2x(
     // 2. Loads: `[load0, load1]` per array — the clone reads the
     //    continuation GEP so the pair shares the base register.
     for &load in &loads {
-        let InstKind::Load(ld) = data.inst_data(load).kind() else { unreachable!() };
+        let InstKind::Load(ld) = data.inst_data(load).kind() else {
+            unreachable!()
+        };
         let cont = cont_of[&ld.src()];
         let clone = alloc_inst(data, Load::new_data(cont, vector_ty.clone()));
         clone_of.insert(load, clone);
@@ -5505,7 +5673,9 @@ fn unroll_payload_2x(
     // 5. Stores: `[store0, store1]` per array — the clone writes the
     //    continuation GEP, adjacent to the original store.
     for &store in &stores {
-        let InstKind::Store(st) = data.inst_data(store).kind() else { unreachable!() };
+        let InstKind::Store(st) = data.inst_data(store).kind() else {
+            unreachable!()
+        };
         let cont = cont_of[&st.dest()];
         let clone = alloc_inst(data, Store::new_data(resolve(&clone_of, st.src()), cont));
         clone_of.insert(store, clone);
@@ -5526,9 +5696,7 @@ fn build_exit_args(
     exit_specs
         .iter()
         .map(|spec| match spec {
-            ExitArgSpec::Acc => {
-                acc_value.expect("Acc exit spec requires the reduced accumulator")
-            }
+            ExitArgSpec::Acc => acc_value.expect("Acc exit spec requires the reduced accumulator"),
             ExitArgSpec::Passthrough(slot) => passthrough_args[*slot],
             ExitArgSpec::IvFinal => {
                 iv_final_value.expect("IvFinal exit spec requires the computed final value")
@@ -5622,10 +5790,9 @@ fn clone_payload_inst(
                 .collect(),
             ty,
         ),
-        InstKind::Load(load) => Load::new_data(
-            map_operand(data, load.src(), map, iv, subst_iv),
-            ty,
-        ),
+        InstKind::Load(load) => {
+            Load::new_data(map_operand(data, load.src(), map, iv, subst_iv), ty)
+        }
         InstKind::Store(store) => {
             let dest = map_operand(data, store.dest(), map, iv, subst_iv);
             if let Some(arm) = arm_mask {
@@ -5640,10 +5807,8 @@ fn clone_payload_inst(
                     let old = map_operand(data, old_src, map, iv, subst_iv);
                     let cond = map.get(&arm.mask_cond).copied().unwrap_or(arm.mask_cond);
                     let zero = data.new_local_inst().integer(0);
-                    let eq0 = alloc_inst(
-                        data,
-                        Binary::new_data(cond, zero, BinaryOp::Eq, ty.clone()),
-                    );
+                    let eq0 =
+                        alloc_inst(data, Binary::new_data(cond, zero, BinaryOp::Eq, ty.clone()));
                     let sel = alloc_inst(data, Select::new_data(eq0, new, old, ty.clone()));
                     let cloned = alloc_inst(data, Store::new_data(sel, dest));
                     map.insert(orig, cloned);
@@ -5652,10 +5817,7 @@ fn clone_payload_inst(
                     return cloned;
                 }
             }
-            Store::new_data(
-                map_operand(data, store.src(), map, iv, subst_iv),
-                dest,
-            )
+            Store::new_data(map_operand(data, store.src(), map, iv, subst_iv), dest)
         }
         InstKind::Binary(binary) => Binary::new_data(
             map_operand(data, binary.lhs(), map, iv, subst_iv),
@@ -5703,7 +5865,10 @@ fn map_operand(
         }
         InstKind::ZeroInit => {
             let ty = data.inst_data(operand).ty().clone();
-            alloc_inst(data, crate::ir::instruction::InstData::new(ty, InstKind::ZeroInit))
+            alloc_inst(
+                data,
+                crate::ir::instruction::InstData::new(ty, InstKind::ZeroInit),
+            )
         }
         _ => operand, // global or dominating value: reused as-is
     }
@@ -5748,8 +5913,18 @@ mod tests {
     /// Global arrays `a`/`b` plus a rotated count-up loop
     /// `for (i = 0; i < trip; i++) b[i] = a[i] * 2 + 1` over them.
     /// `trip` must be a compile-time constant (exact-trip requirement).
-    fn build_elementwise(program: &mut Program, elem: Type, trip: i32) -> (Function, BasicBlock, BasicBlock, BasicBlock) {
-        build_op_chain(program, elem, trip, &[BinaryOp::Mul, BinaryOp::Add], &[2, 1])
+    fn build_elementwise(
+        program: &mut Program,
+        elem: Type,
+        trip: i32,
+    ) -> (Function, BasicBlock, BasicBlock, BasicBlock) {
+        build_op_chain(
+            program,
+            elem,
+            trip,
+            &[BinaryOp::Mul, BinaryOp::Add],
+            &[2, 1],
+        )
     }
 
     /// Like `build_elementwise`, but the payload is `b[i] = chain(a[i])`
@@ -5850,7 +6025,15 @@ mod tests {
         program: &mut Program,
         op: BinaryOp,
         trip: i32,
-    ) -> (Function, BasicBlock, BasicBlock, BasicBlock, Inst, Inst, Inst) {
+    ) -> (
+        Function,
+        BasicBlock,
+        BasicBlock,
+        BasicBlock,
+        Inst,
+        Inst,
+        Inst,
+    ) {
         let i32 = Type::get_i32();
         let arr = Type::get_array(i32.clone(), 64);
         let a = {
@@ -5875,7 +6058,9 @@ mod tests {
         }
         let zero = data.new_local_inst().integer(0);
         let trip_inst = data.new_local_inst().integer(trip);
-        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero, trip_inst]);
+        let entry_jump = data
+            .new_local_inst()
+            .jump(header, vec![zero, zero, trip_inst]);
         data.layout_mut().insert_inst(entry, zero);
         data.layout_mut().insert_inst(entry, trip_inst);
         data.layout_mut().insert_inst(entry, entry_jump);
@@ -6073,7 +6258,12 @@ mod tests {
         let updates: Vec<Inst> = insts
             .iter()
             .copied()
-            .filter(|&i| matches!(program.func_data(function).inst_data(i).kind(), InstKind::Binary(_)))
+            .filter(|&i| {
+                matches!(
+                    program.func_data(function).inst_data(i).kind(),
+                    InstKind::Binary(_)
+                )
+            })
             .collect();
         assert!(updates.iter().any(|i| step_is(i, BinaryOp::Add)));
         assert!(updates.iter().any(|i| step_is(i, BinaryOp::Sub)));
@@ -6123,8 +6313,7 @@ mod tests {
                 .iter()
                 .filter_map(|&i| match data.inst_data(i).kind() {
                     InstKind::GetElemPtr(gep) => {
-                        let InstKind::Integer(v) = data.inst_data(gep.offsets()[1]).kind()
-                        else {
+                        let InstKind::Integer(v) = data.inst_data(gep.offsets()[1]).kind() else {
                             return None;
                         };
                         Some(v.value())
@@ -6149,7 +6338,10 @@ mod tests {
         indexes.sort_unstable();
         indexes.dedup();
         assert_eq!(indexes, vec![16, 17]);
-        assert!(scalar_load_count(&program, function) >= 2, "epilogue keeps scalar loads");
+        assert!(
+            scalar_load_count(&program, function) >= 2,
+            "epilogue keeps scalar loads"
+        );
     }
 
     #[test]
@@ -6200,7 +6392,9 @@ mod tests {
         let t_next = lb.binary(BinaryOp::Sub, counter, one);
         let back = lb.branch(t_next, header, vec![iv_next, t_next], exit, vec![]);
         drop(lb);
-        for inst in [one, two, twice_iv, gep_a, load_a, gep_b, store, iv_next, t_next, back] {
+        for inst in [
+            one, two, twice_iv, gep_a, load_a, gep_b, store, iv_next, t_next, back,
+        ] {
             data.layout_mut().insert_inst(latch, inst);
         }
         let _tmp_inst2 = data.new_local_inst().ret(None);
@@ -6243,7 +6437,9 @@ mod tests {
         }
         let zero = data.new_local_inst().integer(0);
         let trip_inst = data.new_local_inst().integer(16);
-        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero, trip_inst]);
+        let entry_jump = data
+            .new_local_inst()
+            .jump(header, vec![zero, zero, trip_inst]);
         data.layout_mut().insert_inst(entry, zero);
         data.layout_mut().insert_inst(entry, trip_inst);
         data.layout_mut().insert_inst(entry, entry_jump);
@@ -6328,7 +6524,9 @@ mod tests {
         }
         let zero = data.new_local_inst().integer(0);
         let trip_inst = data.new_local_inst().integer(16);
-        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero, trip_inst]);
+        let entry_jump = data
+            .new_local_inst()
+            .jump(header, vec![zero, zero, trip_inst]);
         data.layout_mut().insert_inst(entry, zero);
         data.layout_mut().insert_inst(entry, trip_inst);
         data.layout_mut().insert_inst(entry, entry_jump);
@@ -6350,11 +6548,17 @@ mod tests {
         let mod1000 = lb.binary(BinaryOp::Rem, sum, thousand);
         let iv_next = lb.binary(BinaryOp::Add, iv, one);
         let t_next = lb.binary(BinaryOp::Sub, counter, one);
-        let back =
-            lb.branch(t_next, header, vec![iv_next, mod1000, t_next], exit, vec![mod1000]);
+        let back = lb.branch(
+            t_next,
+            header,
+            vec![iv_next, mod1000, t_next],
+            exit,
+            vec![mod1000],
+        );
         drop(lb);
-        for inst in [one, hundred, thousand, gep_a, load_a, mod100, sum, mod1000, iv_next, t_next, back]
-        {
+        for inst in [
+            one, hundred, thousand, gep_a, load_a, mod100, sum, mod1000, iv_next, t_next, back,
+        ] {
             data.layout_mut().insert_inst(latch, inst);
         }
         let exit_acc = data.bb_data(exit).params()[0];
@@ -6508,7 +6712,9 @@ mod tests {
         }
         let zero = data.new_local_inst().integer(0);
         let trip_inst = data.new_local_inst().integer(16);
-        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero, trip_inst]);
+        let entry_jump = data
+            .new_local_inst()
+            .jump(header, vec![zero, zero, trip_inst]);
         data.layout_mut().insert_inst(entry, zero);
         data.layout_mut().insert_inst(entry, trip_inst);
         data.layout_mut().insert_inst(entry, entry_jump);
@@ -6613,10 +6819,7 @@ mod tests {
             panic!("runtime counter test must be a comparison");
         };
         assert_eq!(gt.op(), BinaryOp::Gt, "counter test is gt(counter, 0)");
-        assert_eq!(
-            branch.t_target(), header,
-            "the true edge keeps looping"
-        );
+        assert_eq!(branch.t_target(), header, "the true edge keeps looping");
         // The entry is a guarded branch: `gt(cnt0, 0)` — the vector loop
         // is a do-while, so a zero/negative `cnt0` (trip < 4) must skip
         // it entirely and enter the scalar tail directly. The true edge
@@ -6750,9 +6953,10 @@ mod tests {
             .new_basic_block()
             .basic_block("header".into(), vec![i32.clone(), i32.clone()]);
         let fwd = data.new_basic_block().basic_block("fwd".into(), vec![]);
-        let idx_latch = data
-            .new_basic_block()
-            .basic_block("idx_latch".into(), vec![i32.clone(), i32.clone(), i32.clone()]);
+        let idx_latch = data.new_basic_block().basic_block(
+            "idx_latch".into(),
+            vec![i32.clone(), i32.clone(), i32.clone()],
+        );
         let payload = data
             .new_basic_block()
             .basic_block("payload".into(), vec![i32.clone()]);
@@ -6767,9 +6971,7 @@ mod tests {
         let sum = data.bb_data(header).params()[0];
         let c = data.bb_data(header).params()[1];
         let cmp = data.new_local_inst().binary(BinaryOp::Lt, c, n);
-        let br = data
-            .new_local_inst()
-            .branch(cmp, fwd, vec![], exit, vec![]);
+        let br = data.new_local_inst().branch(cmp, fwd, vec![], exit, vec![]);
         data.layout_mut().insert_inst(header, cmp);
         data.layout_mut().insert_inst(header, br);
         let fwd_jump = data.new_local_inst().jump(idx_latch, vec![r, c, n]);
@@ -6804,8 +7006,14 @@ mod tests {
             run(&mut program, kernel),
             "the inlined-idx chain must fuse and vectorize"
         );
-        assert!(vector_load_count(&program, kernel) >= 1, "vector load emitted");
-        assert!(vector_reduce_count(&program, kernel) >= 1, "reduction vectorized");
+        assert!(
+            vector_load_count(&program, kernel) >= 1,
+            "vector load emitted"
+        );
+        assert!(
+            vector_reduce_count(&program, kernel) >= 1,
+            "reduction vectorized"
+        );
     }
 
     #[test]
@@ -6830,7 +7038,10 @@ mod tests {
             run(&mut program, kernel),
             "an all-aligned parameter base must vectorize (IPA)"
         );
-        assert!(vector_load_count(&program, kernel) >= 1, "vector load emitted");
+        assert!(
+            vector_load_count(&program, kernel) >= 1,
+            "vector load emitted"
+        );
     }
 
     #[test]
@@ -7146,7 +7357,9 @@ mod tests {
         let iv = data.bb_data(header).params()[0];
         let bound = data.new_local_inst().integer(bound);
         let cond = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
-        let header_br = data.new_local_inst().branch(cond, latch, vec![], exit, vec![]);
+        let header_br = data
+            .new_local_inst()
+            .branch(cond, latch, vec![], exit, vec![]);
         // Constants never occupy layout; the header holds exactly
         // [lt, branch] for the test-at-top shape.
         data.layout_mut().insert_inst(header, cond);
@@ -7163,9 +7376,7 @@ mod tests {
         drop(lb);
         let iv_next = data.new_local_inst().binary(BinaryOp::Add, iv, one);
         let latch_jump = data.new_local_inst().jump(header, vec![iv_next]);
-        for inst in [
-            one, gep_a, load_a, sum, gep_b, store, iv_next, latch_jump,
-        ] {
+        for inst in [one, gep_a, load_a, sum, gep_b, store, iv_next, latch_jump] {
             data.layout_mut().insert_inst(latch, inst);
         }
         let ret = data.new_local_inst().ret(None);
@@ -7265,9 +7476,7 @@ mod tests {
         let latch_jump = data
             .new_local_inst()
             .jump(header, vec![passthrough_i, iv_next]);
-        for inst in [
-            one, gep_a, load_a, sum, gep_b, store, iv_next, latch_jump,
-        ] {
+        for inst in [one, gep_a, load_a, sum, gep_b, store, iv_next, latch_jump] {
             data.layout_mut().insert_inst(latch, inst);
         }
         let exit_param = data.bb_data(exit).params()[0];
@@ -7317,7 +7526,9 @@ mod tests {
         let seven = data.new_local_inst().integer(7);
         let zero = data.new_local_inst().integer(0);
         let trip_inst = data.new_local_inst().integer(trip);
-        let entry_jump = data.new_local_inst().jump(header, vec![seven, zero, trip_inst]);
+        let entry_jump = data
+            .new_local_inst()
+            .jump(header, vec![seven, zero, trip_inst]);
         data.layout_mut().insert_inst(entry, seven);
         data.layout_mut().insert_inst(entry, zero);
         data.layout_mut().insert_inst(entry, trip_inst);
@@ -7385,7 +7596,11 @@ mod tests {
         // The header gained the materialized counter as its last parameter:
         // [passthrough_i, iv, t].
         let params = data.bb_data(header).params();
-        assert_eq!(params.len(), 3, "counter appended after [passthrough_i, iv]");
+        assert_eq!(
+            params.len(),
+            3,
+            "counter appended after [passthrough_i, iv]"
+        );
         assert!(
             data.inst_data(params[2]).ty().is_i32(),
             "materialized counter stays scalar i32"
@@ -7445,8 +7660,7 @@ mod tests {
         // `i0 + VF*q = 16` instead of the latch's per-iteration update,
         // and the back edge keeps stepping the IV by 4.
         let mut program = Program::new();
-        let (function, header, latch, exit, seven) =
-            build_rotated_exit_iv_final(&mut program, 16);
+        let (function, header, latch, exit, seven) = build_rotated_exit_iv_final(&mut program, 16);
         assert!(
             run(&mut program, function),
             "exit-iv-final loop must vectorize"
@@ -7462,7 +7676,11 @@ mod tests {
         );
         // Rotated header parameters are untouched: [passthrough_i, iv, t].
         let params = data.bb_data(header).params();
-        assert_eq!(params.len(), 3, "rotated header keeps [passthrough_i, iv, t]");
+        assert_eq!(
+            params.len(),
+            3,
+            "rotated header keeps [passthrough_i, iv, t]"
+        );
         // r == 0 and no reduction: the latch branch still targets the exit
         // directly; the IV-final slot now carries the computed constant.
         let latch_term = data.layout().basicblock(latch).terminator();
@@ -7479,11 +7697,7 @@ mod tests {
         let InstKind::Integer(iv_final) = data.inst_data(f_args[1]).kind() else {
             panic!("the exit's iv-final arg must be the computed constant");
         };
-        assert_eq!(
-            iv_final.value(),
-            16,
-            "iv_final = i0 + step*q = 0 + 8*2"
-        );
+        assert_eq!(iv_final.value(), 16, "iv_final = i0 + step*q = 0 + 8*2");
         // The back edge steps the IV by the unrolled vector width.
         let t_args = branch.t_args().to_vec();
         let InstKind::Binary(step) = data.inst_data(t_args[1]).kind() else {
@@ -7548,7 +7762,9 @@ mod tests {
         data.layout_mut().insert_inst(entry, entry_jump);
         let iv = data.bb_data(header).params()[0];
         let cond = data.new_local_inst().binary(BinaryOp::Lt, iv, iv);
-        let header_br = data.new_local_inst().branch(cond, latch, vec![], exit, vec![]);
+        let header_br = data
+            .new_local_inst()
+            .branch(cond, latch, vec![], exit, vec![]);
         data.layout_mut().insert_inst(header, cond);
         data.layout_mut().insert_inst(header, header_br);
         let one = data.new_local_inst().integer(1);
@@ -7563,9 +7779,7 @@ mod tests {
         drop(lb);
         let iv_next = data.new_local_inst().binary(BinaryOp::Add, iv, one);
         let latch_jump = data.new_local_inst().jump(header, vec![iv_next]);
-        for inst in [
-            one, gep_a, load_a, sum, gep_b, store, iv_next, latch_jump,
-        ] {
+        for inst in [one, gep_a, load_a, sum, gep_b, store, iv_next, latch_jump] {
             data.layout_mut().insert_inst(latch, inst);
         }
         let ret = data.new_local_inst().ret(None);
@@ -7607,10 +7821,9 @@ mod tests {
             curr_func: Some(function),
         };
         let entry = data.add_entry_block();
-        let header = data.new_basic_block().basic_block(
-            "header".into(),
-            vec![i32.clone(), i32.clone(), i32.clone()],
-        );
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone(), i32.clone()]);
         let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
         let exit = if exit_has_passthrough_param {
             data.new_basic_block()
@@ -7738,12 +7951,8 @@ mod tests {
         // The two invariant constants are re-forwarded unchanged (their back
         // arguments are the constants themselves, not the header parameters
         // — the crypto md5/sha1 shape); only the IV steps by one.
-        let latch_jump = data
-            .new_local_inst()
-            .jump(header, vec![iv_next, k1, k2]);
-        for inst in [
-            one, gep_a, load_a, sum, gep_b, store, iv_next, latch_jump,
-        ] {
+        let latch_jump = data.new_local_inst().jump(header, vec![iv_next, k1, k2]);
+        for inst in [one, gep_a, load_a, sum, gep_b, store, iv_next, latch_jump] {
             data.layout_mut().insert_inst(latch, inst);
         }
         assert!(
@@ -7822,7 +8031,10 @@ mod tests {
             "the added exit param receives the scalar sum"
         );
         // Idempotence: a second application changes nothing.
-        assert!(!run(&mut program, function), "vectorized loop must not re-fire");
+        assert!(
+            !run(&mut program, function),
+            "vectorized loop must not re-fire"
+        );
     }
 
     #[test]
@@ -7869,7 +8081,10 @@ mod tests {
             data.inst_data(jump.args()[1]).ty().is_i32(),
             "the appended param receives the scalar sum"
         );
-        assert!(!run(&mut program, function), "vectorized loop must not re-fire");
+        assert!(
+            !run(&mut program, function),
+            "vectorized loop must not re-fire"
+        );
     }
 
     #[test]
@@ -7914,7 +8129,9 @@ mod tests {
         let x = data.bb_data(header).params()[1];
         let bound = data.new_local_inst().integer(16);
         let cond = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
-        let header_br = data.new_local_inst().branch(cond, latch, vec![], exit, vec![]);
+        let header_br = data
+            .new_local_inst()
+            .branch(cond, latch, vec![], exit, vec![]);
         data.layout_mut().insert_inst(header, cond);
         data.layout_mut().insert_inst(header, header_br);
         let one = data.new_local_inst().integer(1);
@@ -8007,7 +8224,9 @@ mod tests {
         data.layout_mut().insert_inst(entry, entry_jump);
         let iv = data.bb_data(header).params()[0];
         let cond = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
-        let header_br = data.new_local_inst().branch(cond, latch, vec![], exit, vec![]);
+        let header_br = data
+            .new_local_inst()
+            .branch(cond, latch, vec![], exit, vec![]);
         data.layout_mut().insert_inst(header, cond);
         data.layout_mut().insert_inst(header, header_br);
         let one = data.new_local_inst().integer(1);
@@ -8022,9 +8241,7 @@ mod tests {
         drop(lb);
         let iv_next = data.new_local_inst().binary(BinaryOp::Add, iv, one);
         let latch_jump = data.new_local_inst().jump(header, vec![iv_next]);
-        for inst in [
-            one, gep_a, load_a, sum, gep_b, store, iv_next, latch_jump,
-        ] {
+        for inst in [one, gep_a, load_a, sum, gep_b, store, iv_next, latch_jump] {
             data.layout_mut().insert_inst(latch, inst);
         }
         let ret = if exit_reads_iv {
@@ -8114,11 +8331,16 @@ mod tests {
         assert_eq!(gt.op(), BinaryOp::Gt);
         // The header's false edge targets the tail.
         assert!(
-            data.bb_data(branch.f_target()).name().starts_with("vec_tail"),
+            data.bb_data(branch.f_target())
+                .name()
+                .starts_with("vec_tail"),
             "counter-zero edge enters the tail"
         );
         // Idempotence: the tail (and the vector loop) must not re-fire.
-        assert!(!run(&mut program, function), "tail must not be re-vectorized");
+        assert!(
+            !run(&mut program, function),
+            "tail must not be re-vectorized"
+        );
     }
 
     #[test]
@@ -8333,16 +8555,14 @@ mod tests {
             panic!("runtime counter test must be a comparison");
         };
         assert_eq!(gt.op(), BinaryOp::Gt, "counter test is gt(counter, 0)");
-        assert_eq!(
-            branch.t_target(),
-            header,
-            "the true edge keeps looping"
-        );
+        assert_eq!(branch.t_target(), header, "the true edge keeps looping");
         // The false edge enters the scalar tail at `iv0 = i0 + max(cnt0,0)`
         // with the passthrough forwarded.
         let f_args = branch.f_args().to_vec();
         assert!(
-            data.bb_data(branch.f_target()).name().starts_with("vec_tail"),
+            data.bb_data(branch.f_target())
+                .name()
+                .starts_with("vec_tail"),
             "counter-zero edge enters the tail"
         );
         assert_eq!(f_args.len(), 2, "tail entry is [iv0, passthrough]");
@@ -8505,7 +8725,15 @@ mod tests {
     /// `acc' = acc + load(a[iv])`, exit receiving `[acc']`.
     fn build_rotated_runtime_reduction(
         program: &mut Program,
-    ) -> (Function, BasicBlock, BasicBlock, BasicBlock, Inst, Inst, Inst) {
+    ) -> (
+        Function,
+        BasicBlock,
+        BasicBlock,
+        BasicBlock,
+        Inst,
+        Inst,
+        Inst,
+    ) {
         let i32 = Type::get_i32();
         let arr = Type::get_array(i32.clone(), 64);
         let a = {
@@ -8605,11 +8833,7 @@ mod tests {
             data.bb_data(rj.target()).name().starts_with("vec_tail"),
             "reduce must feed the scalar tail"
         );
-        assert_eq!(
-            rj.args().len(),
-            2,
-            "tail entry is [iv0, sum]"
-        );
+        assert_eq!(rj.args().len(), 2, "tail entry is [iv0, sum]");
         let tail = data
             .layout()
             .basicblocks()
@@ -8633,7 +8857,9 @@ mod tests {
         };
         assert_eq!(gt.op(), BinaryOp::Gt, "counter test is gt(counter, 0)");
         assert!(
-            data.bb_data(branch.f_target()).name().starts_with("vec_reduce"),
+            data.bb_data(branch.f_target())
+                .name()
+                .starts_with("vec_reduce"),
             "counter-zero edge carries the vector accumulator to the reduce block"
         );
         // The entry is a guarded branch: `gt(cnt0, 0)` — the vector loop
@@ -8704,10 +8930,9 @@ mod tests {
             curr_func: Some(function),
         };
         let entry = data.add_entry_block();
-        let header = data.new_basic_block().basic_block(
-            "header".into(),
-            vec![i32.clone(), i32.clone(), i32.clone()],
-        );
+        let header = data
+            .new_basic_block()
+            .basic_block("header".into(), vec![i32.clone(), i32.clone(), i32.clone()]);
         let latch = data.new_basic_block().basic_block("latch".into(), vec![]);
         let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
         for bb in [header, latch, exit] {
@@ -8730,7 +8955,9 @@ mod tests {
         let iv = data.bb_data(header).params()[1];
         let acc = data.bb_data(header).params()[2];
         let cond = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
-        let header_br = data.new_local_inst().branch(cond, latch, vec![], exit, vec![]);
+        let header_br = data
+            .new_local_inst()
+            .branch(cond, latch, vec![], exit, vec![]);
         data.layout_mut().insert_inst(header, cond);
         data.layout_mut().insert_inst(header, header_br);
         let one = data.new_local_inst().integer(1);
@@ -8831,7 +9058,10 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(scalar_accumulates, 1, "the tail keeps the scalar acc update");
+        assert_eq!(
+            scalar_accumulates, 1,
+            "the tail keeps the scalar acc update"
+        );
         // The header's counter-zero edge enters the reduce block with the
         // vector accumulator; the reduce block's own edge leaves the tail.
         let term = data.layout().basicblock(header).terminator();
@@ -8854,7 +9084,10 @@ mod tests {
         assert_eq!(tb.f_target(), exit);
         assert_eq!(tb.f_args().to_vec(), vec![tail_params[1]]);
         // Idempotence: neither the tail nor the vector loop re-fires.
-        assert!(!run(&mut program, function), "vectorized loop must not re-fire");
+        assert!(
+            !run(&mut program, function),
+            "vectorized loop must not re-fire"
+        );
     }
 
     /// Build a rotated elementwise loop with a payload select:
@@ -8914,10 +9147,10 @@ mod tests {
         drop(lb);
         let iv_next = data.new_local_inst().binary(BinaryOp::Add, iv, one);
         let t_next = data.new_local_inst().binary(BinaryOp::Sub, counter, one);
-        let back = data.new_local_inst().branch(t_next, header, vec![iv_next, t_next], exit, vec![]);
-        let mut latch_insts = vec![
-            one, gep_a, load_a, sel, gep_b, store, iv_next, t_next, back,
-        ];
+        let back =
+            data.new_local_inst()
+                .branch(t_next, header, vec![iv_next, t_next], exit, vec![]);
+        let mut latch_insts = vec![one, gep_a, load_a, sel, gep_b, store, iv_next, t_next, back];
         if lane_cond {
             // The lane-wise comparison lives in the latch; the invariant
             // flag is already laid out in the entry block.
@@ -9027,7 +9260,9 @@ mod tests {
         // latch: iv', t', back branch
         let iv_next = data.new_local_inst().binary(BinaryOp::Add, iv, one);
         let t_next = data.new_local_inst().binary(BinaryOp::Sub, counter, one);
-        let back = data.new_local_inst().branch(t_next, header, vec![iv_next, t_next], exit, vec![]);
+        let back =
+            data.new_local_inst()
+                .branch(t_next, header, vec![iv_next, t_next], exit, vec![]);
         for inst in [iv_next, t_next, back] {
             data.layout_mut().insert_inst(latch, inst);
         }
@@ -9066,9 +9301,7 @@ mod tests {
             .basicblocks()
             .iter()
             .flat_map(|l| l.insts().iter().copied())
-            .filter(|&inst| {
-                matches!(data.inst_data(inst).kind(), InstKind::Branch(_))
-            })
+            .filter(|&inst| matches!(data.inst_data(inst).kind(), InstKind::Branch(_)))
             .count();
         assert_eq!(body_br_insts, 1, "only the latch back-branch remains");
     }
@@ -9127,7 +9360,9 @@ mod tests {
         }
         let zero = data.new_local_inst().integer(0);
         let trip_inst = data.new_local_inst().integer(16);
-        let entry_jump = data.new_local_inst().jump(header, vec![zero, zero, trip_inst]);
+        let entry_jump = data
+            .new_local_inst()
+            .jump(header, vec![zero, zero, trip_inst]);
         for inst in [zero, trip_inst, entry_jump] {
             data.layout_mut().insert_inst(entry, inst);
         }
@@ -9219,8 +9454,7 @@ mod tests {
             }
             let insts: Vec<Inst> = l.insts().iter().copied().collect();
             for (idx, &inst) in insts.iter().enumerate() {
-                let defined_before: FxHashSet<Inst> =
-                    insts.iter().take(idx).copied().collect();
+                let defined_before: FxHashSet<Inst> = insts.iter().take(idx).copied().collect();
                 for used in data.inst_data(inst).inst_usage() {
                     // Only enforce intra-block ordering: a use defined in
                     // another block is governed by dominance, not layout.
@@ -9310,7 +9544,9 @@ mod tests {
         }
         let iv = data.bb_data(header).params()[0];
         let header_cond = data.new_local_inst().binary(BinaryOp::Lt, iv, bound);
-        let header_br = data.new_local_inst().branch(header_cond, body_brs[0], vec![], exit, vec![]);
+        let header_br =
+            data.new_local_inst()
+                .branch(header_cond, body_brs[0], vec![], exit, vec![]);
         data.layout_mut().insert_inst(header, header_cond);
         data.layout_mut().insert_inst(header, header_br);
         let mut prev_end_param: Option<Inst> = None;
@@ -9449,7 +9685,10 @@ mod tests {
                 matches!(data.inst_data(inst).kind(), InstKind::Load(_))
                     && data.inst_data(inst).ty().is_vector()
             });
-        assert!(has_vector_load, "a unit's In load must become a vector load");
+        assert!(
+            has_vector_load,
+            "a unit's In load must become a vector load"
+        );
         let has_vector_add = data
             .layout()
             .basicblocks()
@@ -9477,7 +9716,10 @@ mod tests {
             .iter()
             .flat_map(|l| l.insts().iter().copied())
             .any(|inst| matches!(data.inst_data(inst).kind(), InstKind::VectorReduce(_)));
-        assert!(has_reduce, "the vector accumulator must be horizontally reduced at the exit");
+        assert!(
+            has_reduce,
+            "the vector accumulator must be horizontally reduced at the exit"
+        );
     }
 
     #[test]
@@ -9564,27 +9806,28 @@ mod tests {
         let exit_i_jump = data.new_local_inst().jump(b2, vec![]);
         data.layout_mut().insert_inst(exit_i, exit_i_jump);
 
-        assert!(run(&mut program, function), "the innermost loop is vectorized");
+        assert!(
+            run(&mut program, function),
+            "the innermost loop is vectorized"
+        );
         let data = program.func_data(function);
         // The outer latch (b2) still steps by 1: it was not vectorized.
-        let outer_steps_unit = data
-            .layout()
-            .basicblock(b2)
-            .insts()
-            .iter()
-            .any(|&inst| {
-                matches!(
-                    data.inst_data(inst).kind(),
-                    InstKind::Binary(b)
-                        if b.op() == BinaryOp::Add
-                            && b.lhs() == iv_o
-                            && matches!(
-                                data.inst_data(b.rhs()).kind(),
-                                InstKind::Integer(v) if v.value() == 1
-                            )
-                )
-            });
-        assert!(outer_steps_unit, "outer loop must stay scalar (non-innermost)");
+        let outer_steps_unit = data.layout().basicblock(b2).insts().iter().any(|&inst| {
+            matches!(
+                data.inst_data(inst).kind(),
+                InstKind::Binary(b)
+                    if b.op() == BinaryOp::Add
+                        && b.lhs() == iv_o
+                        && matches!(
+                            data.inst_data(b.rhs()).kind(),
+                            InstKind::Integer(v) if v.value() == 1
+                        )
+            )
+        });
+        assert!(
+            outer_steps_unit,
+            "outer loop must stay scalar (non-innermost)"
+        );
         assert_eq!(
             vector_load_count(&program, function),
             2,

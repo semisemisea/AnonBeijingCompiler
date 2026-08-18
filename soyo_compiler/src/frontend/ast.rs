@@ -1595,19 +1595,25 @@ impl ToRaanaIR for BinaryOp {
         let lhs_ty = ctx.inst_data(lhs).ty().clone();
         let rhs_ty = ctx.inst_data(rhs).ty().clone();
 
+        let lhs_tensor = lhs_ty.is_pointer() && lhs_ty.derefernce().is_array();
+        let rhs_tensor = rhs_ty.is_pointer() && rhs_ty.derefernce().is_array();
+
         // tensor type arith
-        if lhs_ty.is_pointer() && lhs_ty.derefernce().is_array() {
+        if lhs_tensor || rhs_tensor {
             if ELEMENTWISE_FLAG {
                 eprintln!("{:?}", lhs_ty.kind());
                 // shape must be match
-                assert!(lhs_ty == rhs_ty);
+                // assert!(lhs_ty == rhs_ty);
                 let array_shape = lhs_ty.derefernce().get_array_shape();
 
+                #[allow(clippy::too_many_arguments)]
                 fn rec(
                     array_shape: &[usize],
                     idxs: &mut Vec<usize>,
                     lhs: Inst,
                     rhs: Inst,
+                    lhs_tensor: bool,
+                    rhs_tensor: bool,
                     op: BinaryOp,
                     ctx: &mut AstGenContext,
                     dep: usize,
@@ -1617,28 +1623,58 @@ impl ToRaanaIR for BinaryOp {
                             .chain(idxs.iter().copied())
                             .map(|idx| ctx.new_local_value().integer(idx as i32))
                             .collect::<Vec<_>>();
-                        let gep_lhs = ctx.new_local_value().get_elem_ptr(lhs, offsets.clone());
-                        ctx.push_inst(gep_lhs);
-                        let load_lhs = ctx.new_local_value().load(gep_lhs);
-                        ctx.push_inst(load_lhs);
-                        let gep_rhs = ctx.new_local_value().get_elem_ptr(rhs, offsets);
-                        ctx.push_inst(gep_rhs);
-                        let load_rhs = ctx.new_local_value().load(gep_rhs);
-                        ctx.push_inst(load_rhs);
-                        let binary = ctx.new_local_value().binary(op, load_lhs, load_rhs);
+                        let lhs = if lhs_tensor {
+                            let gep_lhs = ctx.new_local_value().get_elem_ptr(lhs, offsets.clone());
+                            ctx.push_inst(gep_lhs);
+                            let load_lhs = ctx.new_local_value().load(gep_lhs);
+                            ctx.push_inst(load_lhs);
+                            load_lhs
+                        } else {
+                            lhs
+                        };
+                        let rhs = if rhs_tensor {
+                            let gep_rhs = ctx.new_local_value().get_elem_ptr(rhs, offsets);
+                            ctx.push_inst(gep_rhs);
+                            let load_rhs = ctx.new_local_value().load(gep_rhs);
+                            ctx.push_inst(load_rhs);
+                            load_rhs
+                        } else {
+                            rhs
+                        };
+                        let binary = ctx.new_local_value().binary(op, lhs, rhs);
                         ctx.push_inst(binary);
                         ctx.push_val(binary);
                         return;
                     }
                     while idxs[dep] < array_shape[dep] {
-                        rec(array_shape, idxs, lhs, rhs, op, ctx, dep + 1);
+                        rec(
+                            array_shape,
+                            idxs,
+                            lhs,
+                            rhs,
+                            lhs_tensor,
+                            rhs_tensor,
+                            op,
+                            ctx,
+                            dep + 1,
+                        );
                         idxs[dep] += 1;
                     }
                     idxs[dep] = 0;
                 }
 
                 let mut idxs = vec![0; array_shape.len()];
-                rec(&array_shape, &mut idxs, lhs, rhs, *self, ctx, 0);
+                rec(
+                    &array_shape,
+                    &mut idxs,
+                    lhs,
+                    rhs,
+                    lhs_tensor,
+                    rhs_tensor,
+                    *self,
+                    ctx,
+                    0,
+                );
             } else {
                 let l = ctx.new_local_value().load(lhs);
                 ctx.push_inst(l);

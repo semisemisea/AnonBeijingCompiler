@@ -1,0 +1,15 @@
+int main() {
+  tensor int a[4] = {1, 2, 3, 4};
+  tensor int b[4] = {5, 6, 7, 8};
+
+  putarray(4, a);
+  putarray(4, b);
+
+  tensor int A[2][3] = {{1, 2, 3}, {4, 5, 6}};
+  tensor int B[3][2] = {{7, 8}, {9, 10}, {11, 12}};
+
+  putarray(2 * 3, A);
+  putarray(3 * 2, B);
+
+  return 0;
+}

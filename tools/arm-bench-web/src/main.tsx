@@ -1950,7 +1950,7 @@ function App() {
                       className='task-main'
                       onClick={() => {
                         setSelection({ type: 'task', taskId: task.id })
-                        toggleTask(task.id)
+                        // toggleTask(task.id)
                       }}
                     >
                       <span className='task-label'>{taskLabel(task)}</span>
@@ -1960,7 +1960,7 @@ function App() {
                       aria-label={isExpanded ? '收起用例' : '展开用例'}
                       onClick={() => {
                         setSelection({ type: 'task', taskId: task.id })
-                        toggleTask(task.id)
+                        // toggleTask(task.id)
                       }}
                     >
                       <Progress task={task} />

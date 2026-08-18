@@ -215,7 +215,7 @@ def test_board_service_times_out_and_cancels_jobs(benchd):
 def test_repository_cases_are_discovered():
     cases = server.list_cases()
     assert len(cases) == 212
-    assert {case.suite for case in cases} == {'functional', 'h_functional', 'perf'}
+    assert {case.suite for case in cases} == {'tensor', 'functional', 'h_functional', 'perf'}
 
 
 def test_resolve_case_rejects_path_traversal():

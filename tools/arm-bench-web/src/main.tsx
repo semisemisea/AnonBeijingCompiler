@@ -52,7 +52,7 @@ type TestCase = {
 
 type EditableTestCase = {
   id: string
-  suite: 'functional' | 'h_functional' | 'perf'
+  suite: 'tensor' | 'functional' | 'h_functional' | 'perf'
   name: string
   source: string
   input: string | null
@@ -224,7 +224,7 @@ const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
     try {
       const body = JSON.parse(text)
       message = body.detail || message
-    } catch {}
+    } catch { }
     throw new Error(message)
   }
   if (response.status === 204) return undefined as T
@@ -753,6 +753,7 @@ function CaseEditorPanel({
                   })
                 }
               >
+                <option value='tensor'>tensor</option>
                 <option value='functional'>functional</option>
                 <option value='h_functional'>h_functional</option>
                 <option value='perf'>perf</option>
@@ -1636,22 +1637,22 @@ function App() {
             current.map((task) =>
               task.id === event.taskId
                 ? {
-                    ...task,
-                    cases: task.cases.map((item) =>
-                      item.id === event.caseId
-                        ? {
-                            ...item,
-                            status,
-                            started_at:
-                              status === 'COMP'
-                                ? (event.payload.started_at as number)
-                                : item.started_at,
-                            run_started_at:
-                              status === 'RUN' ? (event.payload.run_started_at as number) : null,
-                          }
-                        : item,
-                    ),
-                  }
+                  ...task,
+                  cases: task.cases.map((item) =>
+                    item.id === event.caseId
+                      ? {
+                        ...item,
+                        status,
+                        started_at:
+                          status === 'COMP'
+                            ? (event.payload.started_at as number)
+                            : item.started_at,
+                        run_started_at:
+                          status === 'RUN' ? (event.payload.run_started_at as number) : null,
+                      }
+                      : item,
+                  ),
+                }
                 : task,
             ),
           )

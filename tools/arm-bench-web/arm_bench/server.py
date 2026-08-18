@@ -28,7 +28,7 @@ ROOT = HERE.parents[1]
 TESTS = ROOT / 'tests'
 DATA = HERE / 'data'
 DB_PATH = DATA / 'arm-bench.sqlite3'
-CASE_SUITES = ('functional', 'h_functional', 'perf')
+CASE_SUITES = ('tensor', 'functional', 'h_functional', 'perf')
 CASE_NAME_PATTERN = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
 
 TERMINAL_TASK_STATUSES = {'COMPLETE', 'CANCELLED', 'ERROR'}
@@ -105,7 +105,7 @@ class TaskCreate(BaseModel):
 
 
 class CaseWrite(BaseModel):
-    suite: Literal['functional', 'h_functional', 'perf']
+    suite: Literal['tensor', 'functional', 'h_functional', 'perf']
     name: str
     source: str
     input: str | None = None

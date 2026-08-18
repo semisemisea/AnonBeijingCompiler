@@ -10,311 +10,327 @@ pub(super) fn lower_binary(
 ) -> LoweredOutput {
     let result = ctx.result_reg(inst);
     let dst = Writable::from_reg(result);
-    if matches!(
-        arena.inst_data(binary.lhs()).ty().kind(),
-        TypeKind::Vector(..)
-    ) {
-        return lower_vector_binary(ctx, arena, inst, binary);
-    }
-    if matches!(arena.inst_data(binary.lhs()).ty().kind(), TypeKind::Float32) {
-        let lhs = ctx.put_value_in_reg(binary.lhs());
-        let rhs = ctx.put_value_in_reg(binary.rhs());
-        match binary.op() {
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-                ctx.emit(MInst::FAlu {
-                    op: float_alu_op(binary.op()),
-                    dst,
-                    lhs,
-                    rhs,
-                });
+    match arena.inst_data(binary.lhs()).ty().kind() {
+        TypeKind::Float32 => {
+            let lhs = ctx.put_value_in_reg(binary.lhs());
+            let rhs = ctx.put_value_in_reg(binary.rhs());
+            match binary.op() {
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+                    ctx.emit(MInst::FAlu {
+                        op: float_alu_op(binary.op()),
+                        dst,
+                        lhs,
+                        rhs,
+                    });
+                }
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Gt
+                | BinaryOp::Lt
+                | BinaryOp::Ge
+                | BinaryOp::Le => {
+                    ctx.emit(MInst::FCmp { lhs, rhs });
+                    ctx.emit(MInst::CSet {
+                        cond: float_comparison_cond(binary.op()),
+                        dst,
+                    });
+                }
+                op => {
+                    ctx.lowering_panic(
+                        "AArch64 instruction selection",
+                        format!("floating binary operation {op:?} is unsupported"),
+                        Some(arena.inst_data(binary.lhs()).ty()),
+                        Some(arena.inst_data(inst).ty()),
+                    );
+                }
             }
-            BinaryOp::Eq
-            | BinaryOp::NotEq
-            | BinaryOp::Gt
-            | BinaryOp::Lt
-            | BinaryOp::Ge
-            | BinaryOp::Le => {
-                ctx.emit(MInst::FCmp { lhs, rhs });
-                ctx.emit(MInst::CSet {
-                    cond: float_comparison_cond(binary.op()),
-                    dst,
-                });
-            }
-            op => {
-                ctx.lowering_panic(
-                    "AArch64 instruction selection",
-                    format!("floating binary operation {op:?} is unsupported"),
-                    Some(arena.inst_data(binary.lhs()).ty()),
-                    Some(arena.inst_data(inst).ty()),
-                );
-            }
+            LoweredOutput::Value(result)
         }
-        return LoweredOutput::Value(result);
-    }
-    let size = operand_size(arena.inst_data(binary.lhs()).ty().kind());
-    if let Some((op, lhs, rhs, addend)) = fold_mul_add_sub(
-        ctx,
-        arena,
-        inst,
-        binary.op(),
-        binary.lhs(),
-        binary.rhs(),
-        size,
-    ) {
-        match op {
-            BinaryOp::Add => ctx.emit(MInst::MAdd {
+        TypeKind::Vector(_, _) => lower_vector_binary(ctx, arena, inst, binary),
+        TypeKind::Unit
+        | TypeKind::Int32
+        | TypeKind::String
+        | TypeKind::Array(_, _)
+        | TypeKind::Pointer(_)
+        | TypeKind::Function(_, _)
+        | TypeKind::ArgList => {
+            let size = operand_size(arena.inst_data(binary.lhs()).ty().kind());
+            if let Some((op, lhs, rhs, addend)) = fold_mul_add_sub(
+                ctx,
+                arena,
+                inst,
+                binary.op(),
+                binary.lhs(),
+                binary.rhs(),
                 size,
-                dst,
-                lhs,
-                rhs,
-                addend,
-            }),
-            BinaryOp::Sub => ctx.emit(MInst::MSub {
-                size,
-                dst,
-                lhs,
-                rhs,
-                subtrahend: addend,
-            }),
-            _ => unreachable!("multiply-accumulate folding only selects add or sub"),
-        }
-        return LoweredOutput::Value(result);
-    }
-    // A constant multiplier with a single-instruction form folds before any
-    // operand is materialized, so the constant itself never loads.
-    if binary.op() == BinaryOp::Mul {
-        if let Some(output) = try_fold_mul_constant(ctx, arena, inst, binary, dst) {
-            return output;
-        }
-    }
-    if binary.op() == BinaryOp::Sub && integer_constant(arena, binary.lhs()) == Some(-1) {
-        let rhs = ctx.put_value_in_reg(binary.rhs());
-        ctx.emit(MInst::AluRRR {
-            op: AluOp::Orn,
-            size,
-            dst,
-            lhs: RegOrZr::Zr,
-            rhs: RegOrZr::Reg(rhs),
-        });
-        return LoweredOutput::Value(result);
-    }
-    let lhs = ctx.put_value_in_reg(binary.lhs());
-    let rhs_imm = integer_constant(arena, binary.rhs());
+            ) {
+                match op {
+                    BinaryOp::Add => ctx.emit(MInst::MAdd {
+                        size,
+                        dst,
+                        lhs,
+                        rhs,
+                        addend,
+                    }),
+                    BinaryOp::Sub => ctx.emit(MInst::MSub {
+                        size,
+                        dst,
+                        lhs,
+                        rhs,
+                        subtrahend: addend,
+                    }),
+                    _ => unreachable!("multiply-accumulate folding only selects add or sub"),
+                }
+                return LoweredOutput::Value(result);
+            }
+            // A constant multiplier with a single-instruction form folds before any
+            // operand is materialized, so the constant itself never loads.
+            if binary.op() == BinaryOp::Mul {
+                if let Some(output) = try_fold_mul_constant(ctx, arena, inst, binary, dst) {
+                    return output;
+                }
+            }
 
-    if binary.op() == BinaryOp::Div && rhs_imm == Some(1) {
-        return LoweredOutput::Value(lhs);
-    }
-
-    if matches!(arena.inst_data(inst).ty().kind(), TypeKind::Int32)
-        && matches!(binary.op(), BinaryOp::Div | BinaryOp::Rem)
-        && rhs_imm.is_some_and(|divisor| {
-            lower_signed_div_rem_power_of_two(ctx, binary.op(), dst, lhs, divisor)
-                || lower_signed_div_rem_magic(ctx, binary.op(), dst, lhs, divisor)
-        })
-    {
-        return LoweredOutput::Value(result);
-    }
-
-    match binary.op() {
-        BinaryOp::Add | BinaryOp::Sub => {
-            if binary.op() == BinaryOp::Add && integer_constant(arena, binary.lhs()) == Some(0) {
-                let rhs = ctx.put_value_in_reg(binary.rhs());
-                ctx.emit(MInst::Mov {
-                    size,
-                    dst,
-                    src: rhs,
-                });
-            } else if rhs_imm == Some(0) {
-                ctx.emit(MInst::Mov {
-                    size,
-                    dst,
-                    src: lhs,
-                });
-            } else if binary.op() == BinaryOp::Sub
-                && integer_constant(arena, binary.lhs()) == Some(0)
-            {
+            // 针对减去-1做优化
+            if binary.op() == BinaryOp::Sub && integer_constant(arena, binary.lhs()) == Some(-1) {
                 let rhs = ctx.put_value_in_reg(binary.rhs());
                 ctx.emit(MInst::AluRRR {
-                    op: AluOp::Sub,
+                    op: AluOp::Orn,
                     size,
                     dst,
                     lhs: RegOrZr::Zr,
                     rhs: RegOrZr::Reg(rhs),
                 });
-            } else if let Some((op, imm)) = add_sub_immediate(binary.op(), rhs_imm) {
-                ctx.emit(MInst::AluRRImm12 {
-                    op,
-                    size,
-                    dst,
-                    src: lhs,
-                    imm,
-                });
-            } else if let Some((rhs, shift, amount)) =
-                fold_shifted_rhs(ctx, arena, inst, binary.rhs(), size)
-            {
-                ctx.emit(MInst::AluRRRShift {
-                    op: alu_op(binary.op()),
-                    size,
-                    dst,
-                    lhs: RegOrZr::Reg(lhs),
-                    rhs: RegOrZr::Reg(rhs),
-                    shift,
-                    amount,
-                });
-            } else {
-                let rhs = ctx.put_value_in_reg(binary.rhs());
-                ctx.emit(MInst::AluRRR {
-                    op: alu_op(binary.op()),
-                    size,
-                    dst,
-                    lhs: RegOrZr::Reg(lhs),
-                    rhs: RegOrZr::Reg(rhs),
-                });
+                return LoweredOutput::Value(result);
             }
-        }
-        BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
-            let lhs_imm = integer_constant(arena, binary.lhs());
-            if binary.op() == BinaryOp::And && (lhs_imm == Some(0) || rhs_imm == Some(0)) {
-                ctx.emit(MInst::MovFromZero { size, dst });
-            } else if matches!(binary.op(), BinaryOp::Or | BinaryOp::Xor) && lhs_imm == Some(0) {
-                let rhs = ctx.put_value_in_reg(binary.rhs());
-                ctx.emit(MInst::Mov {
-                    size,
-                    dst,
-                    src: rhs,
-                });
-            } else if matches!(binary.op(), BinaryOp::Or | BinaryOp::Xor) && rhs_imm == Some(0) {
-                ctx.emit(MInst::Mov {
-                    size,
-                    dst,
-                    src: lhs,
-                });
-            } else if let Some(imm) =
-                rhs_imm.and_then(|value| ImmLogic::new(integer_bits(value, size), size))
-            {
-                ctx.emit(MInst::AluRRImmLogic {
-                    op: alu_op(binary.op()),
-                    size,
-                    dst,
-                    src: RegOrZr::Reg(lhs),
-                    imm,
-                });
-            } else if let Some((rhs, shift, amount)) =
-                fold_shifted_rhs(ctx, arena, inst, binary.rhs(), size)
-            {
-                ctx.emit(MInst::AluRRRShift {
-                    op: alu_op(binary.op()),
-                    size,
-                    dst,
-                    lhs: RegOrZr::Reg(lhs),
-                    rhs: RegOrZr::Reg(rhs),
-                    shift,
-                    amount,
-                });
-            } else {
-                let rhs = ctx.put_value_in_reg(binary.rhs());
-                ctx.emit(MInst::AluRRR {
-                    op: alu_op(binary.op()),
-                    size,
-                    dst,
-                    lhs: RegOrZr::Reg(lhs),
-                    rhs: RegOrZr::Reg(rhs),
-                });
+            let lhs = ctx.put_value_in_reg(binary.lhs());
+            let rhs_imm = integer_constant(arena, binary.rhs());
+
+            // 除以1短路处理
+            if binary.op() == BinaryOp::Div && rhs_imm == Some(1) {
+                return LoweredOutput::Value(lhs);
             }
-        }
-        BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Sar => {
-            if let Some(shift) = rhs_imm
-                .and_then(|value| u8::try_from(value).ok())
-                .and_then(|value| ImmShift::new(value, size))
+
+            // 整数快速除法取余数
+            if matches!(arena.inst_data(inst).ty().kind(), TypeKind::Int32)
+                && matches!(binary.op(), BinaryOp::Div | BinaryOp::Rem)
+                && rhs_imm.is_some_and(|divisor| {
+                    lower_signed_div_rem_power_of_two(ctx, binary.op(), dst, lhs, divisor)
+                        || lower_signed_div_rem_magic(ctx, binary.op(), dst, lhs, divisor)
+                })
             {
-                ctx.emit(MInst::AluRRImmShift {
-                    op: alu_op(binary.op()),
-                    size,
-                    dst,
-                    src: lhs,
-                    shift,
-                });
-            } else {
-                let rhs = ctx.put_value_in_reg(binary.rhs());
-                ctx.emit(MInst::AluRRR {
-                    op: alu_op(binary.op()),
-                    size,
-                    dst,
-                    lhs: RegOrZr::Reg(lhs),
-                    rhs: RegOrZr::Reg(rhs),
-                });
+                return LoweredOutput::Value(result);
             }
-        }
-        BinaryOp::Mul => {
-            let rhs = ctx.put_value_in_reg(binary.rhs());
-            ctx.emit(MInst::AluRRR {
-                op: alu_op(binary.op()),
-                size,
-                dst,
-                lhs: RegOrZr::Reg(lhs),
-                rhs: RegOrZr::Reg(rhs),
-            });
-        }
-        BinaryOp::Div => {
-            let rhs = ctx.put_value_in_reg(binary.rhs());
-            ctx.emit(MInst::SDiv {
-                size,
-                dst,
-                lhs,
-                rhs,
-            });
-        }
-        BinaryOp::Rem => {
-            let quotient = ctx.alloc_tmp(HirType::get_i32());
-            let rhs = ctx.put_value_in_reg(binary.rhs());
-            ctx.emit(MInst::SDiv {
-                size,
-                dst: Writable::from_reg(quotient),
-                lhs,
-                rhs,
-            });
-            ctx.emit(MInst::MSub {
-                size,
-                dst,
-                lhs: quotient,
-                rhs,
-                subtrahend: lhs,
-            });
-        }
-        BinaryOp::Eq
-        | BinaryOp::NotEq
-        | BinaryOp::Gt
-        | BinaryOp::Lt
-        | BinaryOp::Ge
-        | BinaryOp::Le => {
-            if let Some(imm) = rhs_imm.and_then(positive_imm12) {
-                ctx.emit(MInst::CmpImm { size, lhs, imm });
-            } else {
-                let rhs = ctx.put_value_in_reg(binary.rhs());
-                ctx.emit(MInst::CmpRR {
-                    size,
-                    lhs,
-                    rhs: RegOrZr::Reg(rhs),
-                });
+
+            // 正常处理运算符
+            match binary.op() {
+                BinaryOp::Add | BinaryOp::Sub => {
+                    if binary.op() == BinaryOp::Add
+                        && integer_constant(arena, binary.lhs()) == Some(0)
+                    {
+                        let rhs = ctx.put_value_in_reg(binary.rhs());
+                        ctx.emit(MInst::Mov {
+                            size,
+                            dst,
+                            src: rhs,
+                        });
+                    } else if rhs_imm == Some(0) {
+                        ctx.emit(MInst::Mov {
+                            size,
+                            dst,
+                            src: lhs,
+                        });
+                    } else if binary.op() == BinaryOp::Sub
+                        && integer_constant(arena, binary.lhs()) == Some(0)
+                    {
+                        let rhs = ctx.put_value_in_reg(binary.rhs());
+                        ctx.emit(MInst::AluRRR {
+                            op: AluOp::Sub,
+                            size,
+                            dst,
+                            lhs: RegOrZr::Zr,
+                            rhs: RegOrZr::Reg(rhs),
+                        });
+                    } else if let Some((op, imm)) = add_sub_immediate(binary.op(), rhs_imm) {
+                        ctx.emit(MInst::AluRRImm12 {
+                            op,
+                            size,
+                            dst,
+                            src: lhs,
+                            imm,
+                        });
+                    } else if let Some((rhs, shift, amount)) =
+                        fold_shifted_rhs(ctx, arena, inst, binary.rhs(), size)
+                    {
+                        ctx.emit(MInst::AluRRRShift {
+                            op: alu_op(binary.op()),
+                            size,
+                            dst,
+                            lhs: RegOrZr::Reg(lhs),
+                            rhs: RegOrZr::Reg(rhs),
+                            shift,
+                            amount,
+                        });
+                    } else {
+                        let rhs = ctx.put_value_in_reg(binary.rhs());
+                        ctx.emit(MInst::AluRRR {
+                            op: alu_op(binary.op()),
+                            size,
+                            dst,
+                            lhs: RegOrZr::Reg(lhs),
+                            rhs: RegOrZr::Reg(rhs),
+                        });
+                    }
+                }
+                BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
+                    let lhs_imm = integer_constant(arena, binary.lhs());
+                    if binary.op() == BinaryOp::And && (lhs_imm == Some(0) || rhs_imm == Some(0)) {
+                        ctx.emit(MInst::MovFromZero { size, dst });
+                    } else if matches!(binary.op(), BinaryOp::Or | BinaryOp::Xor)
+                        && lhs_imm == Some(0)
+                    {
+                        let rhs = ctx.put_value_in_reg(binary.rhs());
+                        ctx.emit(MInst::Mov {
+                            size,
+                            dst,
+                            src: rhs,
+                        });
+                    } else if matches!(binary.op(), BinaryOp::Or | BinaryOp::Xor)
+                        && rhs_imm == Some(0)
+                    {
+                        ctx.emit(MInst::Mov {
+                            size,
+                            dst,
+                            src: lhs,
+                        });
+                    } else if let Some(imm) =
+                        rhs_imm.and_then(|value| ImmLogic::new(integer_bits(value, size), size))
+                    {
+                        ctx.emit(MInst::AluRRImmLogic {
+                            op: alu_op(binary.op()),
+                            size,
+                            dst,
+                            src: RegOrZr::Reg(lhs),
+                            imm,
+                        });
+                    } else if let Some((rhs, shift, amount)) =
+                        fold_shifted_rhs(ctx, arena, inst, binary.rhs(), size)
+                    {
+                        ctx.emit(MInst::AluRRRShift {
+                            op: alu_op(binary.op()),
+                            size,
+                            dst,
+                            lhs: RegOrZr::Reg(lhs),
+                            rhs: RegOrZr::Reg(rhs),
+                            shift,
+                            amount,
+                        });
+                    } else {
+                        let rhs = ctx.put_value_in_reg(binary.rhs());
+                        ctx.emit(MInst::AluRRR {
+                            op: alu_op(binary.op()),
+                            size,
+                            dst,
+                            lhs: RegOrZr::Reg(lhs),
+                            rhs: RegOrZr::Reg(rhs),
+                        });
+                    }
+                }
+                BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Sar => {
+                    if let Some(shift) = rhs_imm
+                        .and_then(|value| u8::try_from(value).ok())
+                        .and_then(|value| ImmShift::new(value, size))
+                    {
+                        ctx.emit(MInst::AluRRImmShift {
+                            op: alu_op(binary.op()),
+                            size,
+                            dst,
+                            src: lhs,
+                            shift,
+                        });
+                    } else {
+                        let rhs = ctx.put_value_in_reg(binary.rhs());
+                        ctx.emit(MInst::AluRRR {
+                            op: alu_op(binary.op()),
+                            size,
+                            dst,
+                            lhs: RegOrZr::Reg(lhs),
+                            rhs: RegOrZr::Reg(rhs),
+                        });
+                    }
+                }
+                BinaryOp::Mul => {
+                    let rhs = ctx.put_value_in_reg(binary.rhs());
+                    ctx.emit(MInst::AluRRR {
+                        op: alu_op(binary.op()),
+                        size,
+                        dst,
+                        lhs: RegOrZr::Reg(lhs),
+                        rhs: RegOrZr::Reg(rhs),
+                    });
+                }
+                BinaryOp::Div => {
+                    let rhs = ctx.put_value_in_reg(binary.rhs());
+                    ctx.emit(MInst::SDiv {
+                        size,
+                        dst,
+                        lhs,
+                        rhs,
+                    });
+                }
+                BinaryOp::Rem => {
+                    let quotient = ctx.alloc_tmp(HirType::get_i32());
+                    let rhs = ctx.put_value_in_reg(binary.rhs());
+                    ctx.emit(MInst::SDiv {
+                        size,
+                        dst: Writable::from_reg(quotient),
+                        lhs,
+                        rhs,
+                    });
+                    ctx.emit(MInst::MSub {
+                        size,
+                        dst,
+                        lhs: quotient,
+                        rhs,
+                        subtrahend: lhs,
+                    });
+                }
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Gt
+                | BinaryOp::Lt
+                | BinaryOp::Ge
+                | BinaryOp::Le => {
+                    if let Some(imm) = rhs_imm.and_then(positive_imm12) {
+                        ctx.emit(MInst::CmpImm { size, lhs, imm });
+                    } else {
+                        let rhs = ctx.put_value_in_reg(binary.rhs());
+                        ctx.emit(MInst::CmpRR {
+                            size,
+                            lhs,
+                            rhs: RegOrZr::Reg(rhs),
+                        });
+                    }
+                    ctx.emit(MInst::CSet {
+                        cond: comparison_cond(binary.op()),
+                        dst,
+                    });
+                }
+                BinaryOp::Min | BinaryOp::Max => {
+                    ctx.lowering_panic(
+                        "AArch64 instruction selection",
+                        format!(
+                            "scalar {:?} is unsupported; min/max is vector-only",
+                            binary.op()
+                        ),
+                        Some(arena.inst_data(binary.lhs()).ty()),
+                        Some(arena.inst_data(inst).ty()),
+                    );
+                }
             }
-            ctx.emit(MInst::CSet {
-                cond: comparison_cond(binary.op()),
-                dst,
-            });
-        }
-        BinaryOp::Min | BinaryOp::Max => {
-            ctx.lowering_panic(
-                "AArch64 instruction selection",
-                format!(
-                    "scalar {:?} is unsupported; min/max is vector-only",
-                    binary.op()
-                ),
-                Some(arena.inst_data(binary.lhs()).ty()),
-                Some(arena.inst_data(inst).ty()),
-            );
+            LoweredOutput::Value(result)
         }
     }
-    LoweredOutput::Value(result)
 }
 
 pub(super) fn lower_cast(

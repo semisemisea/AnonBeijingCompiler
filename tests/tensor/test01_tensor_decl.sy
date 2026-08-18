@@ -1,15 +1,19 @@
 int main() {
   tensor int a[4] = {1, 2, 3, 4};
   tensor int b[4] = {5, 6, 7, 8};
+  tensor int c[114514] = {1, 9, 1, 9, 8, 1, 0};
 
   putarray(4, a);
   putarray(4, b);
+  putarray(10, c);
 
   tensor int A[2][3] = {{1, 2, 3}, {4, 5, 6}};
   tensor int B[3][2] = {{7, 8}, {9, 10}, {11, 12}};
+  tensor int C[3][2][5][3][2][5][3][2][5] = {};
 
   putarray(2 * 3, A);
   putarray(3 * 2, B);
+  putarray(10, C);
 
   return 0;
 }

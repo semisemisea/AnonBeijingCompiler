@@ -135,6 +135,9 @@ fn alu_op_for_hir_binary(op: BinaryOp, ty: &HirType) -> AluRRROP {
         (BinaryOp::Min | BinaryOp::Max, _) => {
             unreachable!("vector min/max requires a vector-capable backend")
         }
+        (BinaryOp::MatMul, _) => {
+            todo!();
+        }
     }
 }
 
@@ -786,6 +789,7 @@ fn lower_binary(
                 }
             }
             BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Min | BinaryOp::Max => {}
+            BinaryOp::MatMul => todo!(),
         }
         // A constant multiplier that decomposes as 2^n or 2^n +/- 1 folds to
         // shift plus optional add/sub before either operand is materialized.
@@ -871,6 +875,7 @@ fn lower_binary(
                     Some(arena.inst_data(inst).ty()),
                 );
             }
+            BinaryOp::MatMul => todo!(),
         }
     }
     LoweredOutput::Value(def)

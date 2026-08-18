@@ -162,6 +162,7 @@ fn eval_i32_binary(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
         BinaryOp::Min | BinaryOp::Max => {
             unreachable!("min/max is vector-only and never produced by the frontend")
         }
+        BinaryOp::MatMul => todo!(),
     }
 }
 
@@ -187,6 +188,7 @@ fn eval_f32_binary(op: BinaryOp, lhs: f32, rhs: f32) -> items::Number {
         BinaryOp::Min | BinaryOp::Max => {
             unreachable!("min/max is vector-only and never produced by the frontend")
         }
+        BinaryOp::MatMul => todo!(),
     }
 }
 

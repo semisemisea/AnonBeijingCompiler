@@ -2,6 +2,7 @@
 
 use super::vector::{lower_vector_binary, vector_shape};
 use super::*;
+pub use log::{debug, error, info, trace, warn};
 pub(super) fn lower_binary(
     ctx: &mut LowerContext<'_, MInst>,
     arena: ArenaContext<'_>,
@@ -50,7 +51,6 @@ pub(super) fn lower_binary(
         TypeKind::Unit
         | TypeKind::Int32
         | TypeKind::String
-        | TypeKind::Array(_, _)
         | TypeKind::Pointer(_)
         | TypeKind::Function(_, _)
         | TypeKind::ArgList => {
@@ -83,6 +83,7 @@ pub(super) fn lower_binary(
                 }
                 return LoweredOutput::Value(result);
             }
+
             // A constant multiplier with a single-instruction form folds before any
             // operand is materialized, so the constant itself never loads.
             if binary.op() == BinaryOp::Mul {
@@ -316,6 +317,120 @@ pub(super) fn lower_binary(
                         dst,
                     });
                 }
+                BinaryOp::Min | BinaryOp::Max => {
+                    ctx.lowering_panic(
+                        "AArch64 instruction selection",
+                        format!(
+                            "scalar {:?} is unsupported; min/max is vector-only",
+                            binary.op()
+                        ),
+                        Some(arena.inst_data(binary.lhs()).ty()),
+                        Some(arena.inst_data(inst).ty()),
+                    );
+                }
+                BinaryOp::MatMul => {
+                    ctx.lowering_panic(
+                        "AArch64 instruction selection",
+                        format!(
+                            "scalar {:?} is unsupported; min/max is tensor-only",
+                            binary.op()
+                        ),
+                        Some(arena.inst_data(binary.lhs()).ty()),
+                        Some(arena.inst_data(inst).ty()),
+                    );
+                }
+            }
+            LoweredOutput::Value(result)
+        }
+        TypeKind::Array(ty, size) => {
+            debug!("Lowering Array Binary Ops");
+            let size = operand_size(arena.inst_data(binary.lhs()).ty().kind());
+            let lhs = ctx.put_value_in_reg(binary.lhs());
+            match binary.op() {
+                BinaryOp::Add | BinaryOp::Sub => {
+                    let rhs = ctx.put_value_in_reg(binary.rhs());
+                    ctx.emit(MInst::AluRRR {
+                        op: alu_op(binary.op()),
+                        size,
+                        dst,
+                        lhs: RegOrZr::Reg(lhs),
+                        rhs: RegOrZr::Reg(rhs),
+                    });
+                }
+                BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
+                    let rhs = ctx.put_value_in_reg(binary.rhs());
+                    ctx.emit(MInst::AluRRR {
+                        op: alu_op(binary.op()),
+                        size,
+                        dst,
+                        lhs: RegOrZr::Reg(lhs),
+                        rhs: RegOrZr::Reg(rhs),
+                    });
+                }
+                BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Sar => {
+                    let rhs = ctx.put_value_in_reg(binary.rhs());
+                    ctx.emit(MInst::AluRRR {
+                        op: alu_op(binary.op()),
+                        size,
+                        dst,
+                        lhs: RegOrZr::Reg(lhs),
+                        rhs: RegOrZr::Reg(rhs),
+                    });
+                }
+                BinaryOp::Mul => {
+                    let rhs = ctx.put_value_in_reg(binary.rhs());
+                    ctx.emit(MInst::AluRRR {
+                        op: alu_op(binary.op()),
+                        size,
+                        dst,
+                        lhs: RegOrZr::Reg(lhs),
+                        rhs: RegOrZr::Reg(rhs),
+                    });
+                }
+                BinaryOp::Div => {
+                    let rhs = ctx.put_value_in_reg(binary.rhs());
+                    ctx.emit(MInst::SDiv {
+                        size,
+                        dst,
+                        lhs,
+                        rhs,
+                    });
+                }
+                BinaryOp::Rem => {
+                    let quotient = ctx.alloc_tmp(HirType::get_i32());
+                    let rhs = ctx.put_value_in_reg(binary.rhs());
+                    ctx.emit(MInst::SDiv {
+                        size,
+                        dst: Writable::from_reg(quotient),
+                        lhs,
+                        rhs,
+                    });
+                    ctx.emit(MInst::MSub {
+                        size,
+                        dst,
+                        lhs: quotient,
+                        rhs,
+                        subtrahend: lhs,
+                    });
+                }
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Gt
+                | BinaryOp::Lt
+                | BinaryOp::Ge
+                | BinaryOp::Le => {
+                    let rhs = ctx.put_value_in_reg(binary.rhs());
+                    ctx.emit(MInst::CmpRR {
+                        size,
+                        lhs,
+                        rhs: RegOrZr::Reg(rhs),
+                    });
+                    ctx.emit(MInst::CSet {
+                        cond: comparison_cond(binary.op()),
+                        dst,
+                    });
+                }
+                BinaryOp::MatMul => todo!(),
                 BinaryOp::Min | BinaryOp::Max => {
                     ctx.lowering_panic(
                         "AArch64 instruction selection",

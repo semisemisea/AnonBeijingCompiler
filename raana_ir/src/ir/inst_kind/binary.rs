@@ -59,6 +59,7 @@ pub enum BinaryOp {
     Min,
     /// Vector lane-wise maximum (signed for integers).
     Max,
+    /// Tensor Matrix Multiply
     MatMul,
 }
 

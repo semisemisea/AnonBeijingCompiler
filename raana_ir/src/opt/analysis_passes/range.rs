@@ -1310,7 +1310,7 @@ fn fold_binary(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
         BinaryOp::Sar => lhs.wrapping_shr(rhs as u32),
         BinaryOp::Min => lhs.min(rhs),
         BinaryOp::Max => lhs.max(rhs),
-        BinaryOp::MatMul => unreachable!("tensor type should not reach here."),
+        BinaryOp::MatMul => todo!(),
     }
 }
 

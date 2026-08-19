@@ -1981,6 +1981,7 @@ fn store(ctx: &mut AstGenContext, dest: Inst, i: usize, k: usize, src: Inst) {
     let store = ctx.new_local_value().store(src, res);
     ctx.push_inst(store);
 }
+
 fn tensor_for_each_loopify(
     ctx: &mut AstGenContext,
     tensor: Inst,

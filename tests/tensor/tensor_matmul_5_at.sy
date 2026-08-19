@@ -24,12 +24,12 @@ tensor int matmul(tensor int lhs[][99], tensor int rhs[][99], int a, int b, int 
           int l1 = lhs[i + 1][j];
           c10 = c10 + l1 * r0;
           if (flag_k) {
-            int r1 = lhs[j][k + 1];
+            int r1 = rhs[j][k + 1];
             c01 = c01 + l0 * r1;
             c11 = c11 + l1 * r1;
           }
         } else if (flag_k) {
-          int r1 = lhs[j][k + 1];
+          int r1 = rhs[j][k + 1];
           c01 = c01 + l0 * r1;
         }
 
@@ -50,6 +50,28 @@ tensor int matmul(tensor int lhs[][99], tensor int rhs[][99], int a, int b, int 
       k = k + 2;
     }
     i = i + 2;
+  }
+  return ans;
+}
+
+tensor int matmul_naive(tensor int lhs[][99], tensor int rhs[][99], int a, int b, int c) {
+  tensor int ans[99][99];
+
+  int i = 0;
+  while (i < a) {
+    int k = 0;
+    while (k < c) {
+      int j = 0;
+      int sum = 0;
+      while (j < b) {
+        sum = sum + lhs[i][j] * rhs[j][k];
+        j = j + 1;
+      }
+      ans[i][k] = sum;
+
+      k = k + 1;
+    }
+    i = i + 1;
   }
   return ans;
 }
@@ -85,8 +107,9 @@ void test() {
     }
   }
 
-  // tensor int c[99][99] = a @ b;
-  tensor int c[99][99] = matmul(a, b, x, y, z);
+  tensor int c[99][99] = a @ b;
+  // tensor int c[99][99] = matmul_naive(a, b, x, y, z);
+  // tensor int c[99][99] = matmul(a, b, x, y, z);
 
 
   {

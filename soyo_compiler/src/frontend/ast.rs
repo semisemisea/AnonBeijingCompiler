@@ -115,7 +115,11 @@
 //! `items.rs` 的节点定义与 `utils.rs` 的上下文辅助即可。
 
 use super::items;
-use crate::frontend::utils::{AstGenContext, Ident, Symbol, ToRaanaIR};
+use crate::frontend::{
+    items::{AssignStmt, Block, BlockItem, ConstDef, Decl, Stmt},
+    utils::{AstGenContext, Ident, Symbol, ToRaanaIR},
+};
+use inst_kind::binary;
 use raana_ir::ir::{arena::Arena, builder_trait::*, *};
 
 fn binary_requires_int(op: BinaryOp) -> bool {
@@ -250,6 +254,10 @@ fn tensor_get_elem(ctx: &mut AstGenContext, inst: Inst, idxs: &[usize]) -> Inst 
     load
 }
 
+fn get_type_from_shape(shape: &[usize]) {
+    todo!();
+}
+
 impl ToRaanaIR for items::CompUnits {
     fn convert(&self, ctx: &mut AstGenContext) {
         ctx.decl_library_functions();
@@ -277,8 +285,68 @@ impl ToRaanaIR for items::CompUnit {
     }
 }
 
+fn collect_stmt_shape(ctx: &mut AstGenContext, stmt: Stmt) {
+    match stmt {
+        Stmt::Assign(assign_stmt) => {
+            todo!();
+            // let lval = assign_stmt.l_val;
+            // let ident = lval.ident.clone();
+            // ctx.tensor_table_mut().insert()
+        }
+        Stmt::Block(block) => collect_ret_shape(ctx, block),
+        Stmt::Single(_) => todo!(),
+        Stmt::IfStmt(if_stmt) => {
+            collect_stmt_shape(ctx, *if_stmt.then_branch);
+            if let Some(else_stmt) = if_stmt.else_branch {
+                collect_stmt_shape(ctx, *else_stmt);
+            }
+        }
+        Stmt::WhileStmt(while_stmt) => collect_stmt_shape(ctx, *while_stmt.body),
+        Stmt::Break(_) => {}
+        Stmt::Continue(_) => {}
+        Stmt::Return(return_stmt) => {
+            let Some(exp) = return_stmt.exp else { return };
+            let lor = exp.lor_exp;
+            todo!();
+        }
+    }
+}
+
+fn collect_ret_shape(ctx: &mut AstGenContext, block: Block) {
+    for item in block.block_items {
+        match item {
+            BlockItem::Decl(decl) => match decl {
+                Decl::ConstDecl(decl) => {
+                    if !decl.btype.is_tensor {
+                        return;
+                    }
+                    decl.const_defs.iter().for_each(|def: &ConstDef| {
+                        let shape = def
+                            .arr_dim
+                            .iter()
+                            .map(|exp| {
+                                exp.global_convert(ctx);
+                                ctx.pop_i32()
+                            })
+                            .collect::<Vec<_>>();
+                    })
+                }
+                Decl::VarDecl(decl) => {}
+            },
+            BlockItem::Stmt(stmt) => {
+                collect_stmt_shape(ctx, stmt);
+            }
+        }
+    }
+}
+
 impl ToRaanaIR for items::FuncDef {
     fn convert(&self, ctx: &mut AstGenContext) {
+        // 检查返回tensor形状
+        if self.func_type.is_tensor {
+            collect_ret_shape(ctx, self.block.clone());
+        }
+
         // Register the function to get handle
         let param_ty = self
             .params

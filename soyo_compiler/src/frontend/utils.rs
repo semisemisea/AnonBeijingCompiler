@@ -180,6 +180,7 @@ pub struct AstGenContext {
     val_stack: Vec<Inst>,
     curr_bb: Option<BasicBlock>,
     symbol_table: Vec<SymbolTable>,
+    tensor_table: Vec<HashMap<Ident, Type>>,
     def_type: Option<BType>,
     loop_stack: Vec<(BasicBlock, BasicBlock)>,
 }
@@ -210,6 +211,7 @@ impl AstGenContext {
             val_stack: Vec::new(),
             curr_bb: None,
             symbol_table: vec![SymbolTable::new()],
+            tensor_table: vec![HashMap::new()],
             def_type: None,
             loop_stack: Vec::new(),
         }
@@ -249,6 +251,14 @@ impl AstGenContext {
 
     pub fn global_scope(&self) -> &SymbolTable {
         self.symbol_table.first().unwrap()
+    }
+
+    pub fn tensor_table(&self) -> &HashMap<Ident, Type> {
+        self.tensor_table.last().unwrap()
+    }
+
+    pub fn tensor_table_mut(&mut self) -> &mut HashMap<Ident, Type> {
+        self.tensor_table.last_mut().unwrap()
     }
 
     pub fn new_global_value(&mut self) -> GlobalBuilder<'_> {

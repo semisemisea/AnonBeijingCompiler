@@ -1786,7 +1786,7 @@ impl ToRaanaIR for BinaryOp {
         // tensor type arith
         if lhs_tensor || rhs_tensor {
             let result = match self {
-                BinaryOp::MatMul => lower_matmul(ctx, lhs, rhs),
+                BinaryOp::MatMul => lower_matmul_native_loop(ctx, lhs, rhs),
                 _ => lower_elementwise_native_loop(ctx, lhs, rhs, *self, lhs_tensor, rhs_tensor),
             };
             ctx.push_val(result);
@@ -1888,6 +1888,177 @@ fn copy_tensor(ctx: &mut AstGenContext, src: Inst, dst: Inst) {
         let store = ctx.new_local_value().store(s, d);
         ctx.push_inst(store);
     });
+}
+
+fn lower_matmul_native_loop(ctx: &mut AstGenContext, lhs: Inst, rhs: Inst) -> Inst {
+    let lhs_ty = tensor_shape_type(ctx, lhs);
+    let rhs_ty = tensor_shape_type(ctx, rhs);
+    assert!(lhs_ty.array_base_scalar_type() == rhs_ty.array_base_scalar_type());
+
+    let base_ty = lhs_ty.array_base_scalar_type();
+    let lhs_shape = lhs_ty.get_array_shape();
+    let rhs_shape = rhs_ty.get_array_shape();
+
+    assert!(lhs_shape.len() == 2, "lhs must have rank 2");
+    assert!(rhs_shape.len() == 2, "rhs must have rank 2");
+    assert!(lhs_shape[1] == rhs_shape[0]);
+
+    let &[a, _] = lhs_shape.as_slice() else {
+        unreachable!()
+    };
+    let &[b, c] = rhs_shape.as_slice() else {
+        unreachable!()
+    };
+
+    let result_ty = get_type_from_shape(base_ty.clone(), &[a, c]);
+    let ans = ctx.new_local_value().alloc(result_ty);
+    ctx.push_inst(ans);
+
+    // i k j ->-> a c b
+
+    let (entry, body, end) = create_loop_blocks(ctx);
+
+    // jump into while entry block unconditionally, with zero-init induction variable.
+    let zero_init_induction_variable = ctx.new_local_value().integer(0);
+    let jump_to_while_entry = ctx
+        .new_local_value()
+        .jump(entry, vec![zero_init_induction_variable]);
+    ctx.push_inst(jump_to_while_entry);
+
+    // manual set the entry
+    // It only contains a comparison with tensor length limit.
+    ctx.set_curr_bb(entry);
+    let entry_params = ctx.bb_params(entry);
+    assert!(entry_params.len() == 1);
+    let i = entry_params[0];
+
+    let target = ctx.new_local_value().integer(a as i32);
+    let cond_val = ctx.new_local_value().binary(BinaryOp::Lt, i, target);
+    ctx.push_inst(cond_val);
+    let branch = ctx
+        .new_local_value()
+        .branch(cond_val, body, vec![], end, vec![]);
+    ctx.push_inst(branch);
+
+    ctx.set_curr_bb(body);
+
+    // should start recursion here
+
+    {
+        let (entry, body, end) = create_loop_blocks(ctx);
+
+        // jump into while entry block unconditionally, with zero-init induction variable.
+        let zero_init_induction_variable = ctx.new_local_value().integer(0);
+        let jump_to_while_entry = ctx
+            .new_local_value()
+            .jump(entry, vec![zero_init_induction_variable]);
+        ctx.push_inst(jump_to_while_entry);
+
+        // manual set the entry
+        // It only contains a comparison with tensor length limit.
+        ctx.set_curr_bb(entry);
+        let entry_params = ctx.bb_params(entry);
+        assert!(entry_params.len() == 1);
+        let k = entry_params[0];
+
+        let target = ctx.new_local_value().integer(c as i32);
+        let cond_val = ctx.new_local_value().binary(BinaryOp::Lt, k, target);
+        ctx.push_inst(cond_val);
+        let branch = ctx
+            .new_local_value()
+            .branch(cond_val, body, vec![], end, vec![]);
+        ctx.push_inst(branch);
+
+        ctx.set_curr_bb(body);
+
+        // should start recursion here
+        {
+            let (entry, body, end) = {
+                let entry = ctx.new_basic_block().basic_block(
+                    "while_entry_tensor_elementwise".into(),
+                    vec![Type::get_i32(), Type::get_i32()],
+                );
+                ctx.register_bb(entry);
+                let body = ctx
+                    .new_basic_block()
+                    .basic_block("while_body_tensor_elementwise".into(), vec![]);
+                ctx.register_bb(body);
+                let end = ctx
+                    .new_basic_block()
+                    .basic_block("while_end_tensor_elementwise".into(), vec![]);
+                ctx.register_bb(end);
+                ctx.push_loop(entry, end);
+                (entry, body, end)
+            };
+
+            // jump into while entry block unconditionally, with zero-init induction variable.
+            let zero_init_induction_variable = ctx.new_local_value().integer(0);
+            let acc = ctx.new_local_value().integer(0);
+            let jump_to_while_entry = ctx
+                .new_local_value()
+                .jump(entry, vec![zero_init_induction_variable, acc]);
+            ctx.push_inst(jump_to_while_entry);
+
+            // manual set the entry
+            // It only contains a comparison with tensor length limit.
+            ctx.set_curr_bb(entry);
+            let entry_params = ctx.bb_params(entry);
+            assert!(entry_params.len() == 2);
+            let j = entry_params[0];
+            let acc = entry_params[1];
+
+            let target = ctx.new_local_value().integer(b as i32);
+            let cond_val = ctx.new_local_value().binary(BinaryOp::Lt, j, target);
+            ctx.push_inst(cond_val);
+            let branch = ctx
+                .new_local_value()
+                .branch(cond_val, body, vec![], end, vec![]);
+            ctx.push_inst(branch);
+
+            ctx.set_curr_bb(body);
+
+            // main content of matmul
+            let lhs = tensor_get_elem_raw(ctx, lhs, vec![i, j].as_slice());
+            let rhs = tensor_get_elem_raw(ctx, rhs, vec![j, k].as_slice());
+            let mul = ctx.new_local_value().binary(BinaryOp::Mul, lhs, rhs);
+            ctx.push_inst(mul);
+
+            // add the while a unconditional jump to entry to have a comparison.
+            let one = ctx.new_local_value().integer(1);
+            let add = ctx.new_local_value().binary(BinaryOp::Add, j, one);
+            ctx.push_inst(add);
+            let add_acc = ctx.new_local_value().binary(BinaryOp::Add, acc, mul);
+            let jump = ctx.new_local_value().jump(entry, vec![add, add_acc]);
+            ctx.push_inst(jump);
+
+            ctx.pop_loop();
+            ctx.set_curr_bb(end);
+
+            let target_res = tensor_elem_ptr_raw(ctx, ans, vec![i, k].as_slice());
+            let store = ctx.new_local_value().store(acc, target_res);
+            ctx.push_inst(store);
+        }
+
+        // add the while a unconditional jump to entry to have a comparison.
+        let one = ctx.new_local_value().integer(1);
+        let add = ctx.new_local_value().binary(BinaryOp::Add, k, one);
+        ctx.push_inst(add);
+        let jump = ctx.new_local_value().jump(entry, vec![add]);
+        ctx.push_inst(jump);
+
+        ctx.pop_loop();
+        ctx.set_curr_bb(end);
+    }
+    // add the while a unconditional jump to entry to have a comparison.
+    let one = ctx.new_local_value().integer(1);
+    let add = ctx.new_local_value().binary(BinaryOp::Add, i, one);
+    ctx.push_inst(add);
+    let jump = ctx.new_local_value().jump(entry, vec![add]);
+    ctx.push_inst(jump);
+
+    ctx.pop_loop();
+    ctx.set_curr_bb(end);
+    ans
 }
 
 fn lower_matmul(ctx: &mut AstGenContext, lhs: Inst, rhs: Inst) -> Inst {

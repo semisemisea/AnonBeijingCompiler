@@ -1993,7 +1993,11 @@ fn lower_matmul_native_loop(ctx: &mut AstGenContext, lhs: Inst, rhs: Inst) -> In
 
             // jump into while entry block unconditionally, with zero-init induction variable.
             let zero_init_induction_variable = ctx.new_local_value().integer(0);
-            let acc = ctx.new_local_value().integer(0);
+            let acc = match base_ty.kind() {
+                TypeKind::Int32 => ctx.new_local_value().integer(0),
+                TypeKind::Float32 => ctx.new_local_value().float(0.0),
+                _ => unreachable!(),
+            };
             let jump_to_while_entry = ctx
                 .new_local_value()
                 .jump(entry, vec![zero_init_induction_variable, acc]);

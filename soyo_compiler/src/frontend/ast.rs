@@ -231,6 +231,22 @@ fn tensor_elem_ty(ctx: &AstGenContext, inst: Inst) -> Type {
     }
 }
 
+fn tensor_elem_ptr_raw(ctx: &mut AstGenContext, inst: Inst, idxs: &[Inst]) -> Inst {
+    let ty = ctx.inst_data(inst).ty();
+
+    let offsets = if ty.is_pointer() {
+        std::iter::once(ctx.new_local_value().integer(0))
+            .chain(idxs.iter().copied())
+            .collect::<Vec<_>>()
+    } else {
+        idxs.to_vec()
+    };
+
+    let gep = ctx.new_local_value().get_elem_ptr(inst, offsets);
+    ctx.push_inst(gep);
+    gep
+}
+
 fn tensor_elem_ptr(ctx: &mut AstGenContext, inst: Inst, idxs: &[usize]) -> Inst {
     let ty = ctx.inst_data(inst).ty();
 
@@ -248,6 +264,13 @@ fn tensor_elem_ptr(ctx: &mut AstGenContext, inst: Inst, idxs: &[usize]) -> Inst 
     let gep = ctx.new_local_value().get_elem_ptr(inst, offsets);
     ctx.push_inst(gep);
     gep
+}
+
+fn tensor_get_elem_raw(ctx: &mut AstGenContext, inst: Inst, idxs: &[Inst]) -> Inst {
+    let gep = tensor_elem_ptr_raw(ctx, inst, idxs);
+    let load = ctx.new_local_value().load(gep);
+    ctx.push_inst(load);
+    load
 }
 
 fn tensor_get_elem(ctx: &mut AstGenContext, inst: Inst, idxs: &[usize]) -> Inst {
@@ -1764,7 +1787,7 @@ impl ToRaanaIR for BinaryOp {
         if lhs_tensor || rhs_tensor {
             let result = match self {
                 BinaryOp::MatMul => lower_matmul(ctx, lhs, rhs),
-                _ => lower_elementwise(ctx, lhs, rhs, *self, lhs_tensor, rhs_tensor),
+                _ => lower_elementwise_native_loop(ctx, lhs, rhs, *self, lhs_tensor, rhs_tensor),
             };
             ctx.push_val(result);
             return;
@@ -1859,9 +1882,9 @@ fn copy_tensor(ctx: &mut AstGenContext, src: Inst, dst: Inst) {
     let lhs_shape = src_ty.get_array_shape();
     let rhs_shape = dst_ty.get_array_shape();
     assert!(lhs_shape == rhs_shape);
-    tensor_for_each(ctx, dst, |ctx, idxs| {
-        let s = tensor_get_elem(ctx, src, idxs);
-        let d = tensor_elem_ptr(ctx, dst, idxs);
+    tensor_for_each_loopify(ctx, dst, |ctx, idxs| {
+        let s = tensor_get_elem_raw(ctx, src, idxs);
+        let d = tensor_elem_ptr_raw(ctx, dst, idxs);
         let store = ctx.new_local_value().store(s, d);
         ctx.push_inst(store);
     });
@@ -1928,6 +1951,64 @@ fn store(ctx: &mut AstGenContext, src: Inst, dest: Inst) {
     ctx.push_inst(store);
 }
 
+fn tensor_for_each_loopify(
+    ctx: &mut AstGenContext,
+    tensor: Inst,
+    mut f: impl FnMut(&mut AstGenContext, &[Inst]),
+) {
+    fn rec(
+        ctx: &mut AstGenContext,
+        shape: &[usize],
+        dep: usize,
+        idxs: &mut Vec<Inst>,
+        f: &mut impl FnMut(&mut AstGenContext, &[Inst]),
+    ) {
+        if dep == shape.len() {
+            f(ctx, idxs);
+            return;
+        }
+        let (entry, body, end) = create_loop_blocks(ctx);
+
+        // jump into while entry block unconditionally, with zero-init induction variable.
+        let zero_init_induction_variable = ctx.new_local_value().integer(0);
+        let jump_to_while_entry = ctx
+            .new_local_value()
+            .jump(entry, vec![zero_init_induction_variable]);
+        ctx.push_inst(jump_to_while_entry);
+
+        // manual set the entry
+        // It only contains a comparison with tensor length limit.
+        ctx.set_curr_bb(entry);
+        let entry_params = ctx.bb_params(entry);
+        assert!(entry_params.len() == 1);
+        let idx_var = entry_params[0];
+        idxs.push(idx_var);
+
+        let target = ctx.new_local_value().integer(shape[dep] as i32);
+        let cond_val = ctx.new_local_value().binary(BinaryOp::Lt, idx_var, target);
+        ctx.push_inst(cond_val);
+        let branch = ctx
+            .new_local_value()
+            .branch(cond_val, body, vec![], end, vec![]);
+        ctx.push_inst(branch);
+
+        ctx.set_curr_bb(body);
+
+        // should start recursion here
+        rec(ctx, shape, dep + 1, idxs, f);
+
+        // add the while a unconditional jump to entry to have a comparison.
+        let one = ctx.new_local_value().integer(1);
+        let add = ctx.new_local_value().binary(BinaryOp::Add, idx_var, one);
+        ctx.push_inst(add);
+        let jump = ctx.new_local_value().jump(entry, vec![add]);
+        ctx.push_inst(jump);
+
+        ctx.pop_loop();
+        ctx.set_curr_bb(end);
+    }
+}
+
 fn tensor_for_each(
     ctx: &mut AstGenContext,
     tensor: Inst,
@@ -1953,6 +2034,163 @@ fn tensor_for_each(
     }
     let mut idxs = vec![0; array_shape.len()];
     rec(ctx, &array_shape, &mut idxs, 0, &mut f);
+}
+
+fn create_loop_blocks(ctx: &mut AstGenContext) -> (BasicBlock, BasicBlock, BasicBlock) {
+    let entry = ctx.new_basic_block().basic_block(
+        "while_entry_tensor_elementwise".into(),
+        vec![Type::get_i32()],
+    );
+    ctx.register_bb(entry);
+    let body = ctx
+        .new_basic_block()
+        .basic_block("while_body_tensor_elementwise".into(), vec![]);
+    ctx.register_bb(body);
+    let end = ctx
+        .new_basic_block()
+        .basic_block("while_end_tensor_elementwise".into(), vec![]);
+    ctx.register_bb(end);
+    ctx.push_loop(entry, end);
+    (entry, body, end)
+}
+
+fn lower_elementwise_native_loop(
+    ctx: &mut AstGenContext,
+    lhs: Inst,
+    rhs: Inst,
+    op: BinaryOp,
+    lhs_tensor: bool,
+    rhs_tensor: bool,
+) -> Inst {
+    #[allow(clippy::too_many_arguments)]
+    fn rec(
+        ctx: &mut AstGenContext,
+        shape: &[usize],
+        dep: usize,
+        idxs: &mut Vec<Inst>,
+        lhs: Inst,
+        rhs: Inst,
+        op: BinaryOp,
+        lhs_tensor: bool,
+        rhs_tensor: bool,
+        target_tensor: Inst,
+    ) {
+        if dep == shape.len() {
+            leaf(
+                ctx,
+                idxs,
+                lhs,
+                rhs,
+                op,
+                lhs_tensor,
+                rhs_tensor,
+                target_tensor,
+            );
+            return;
+        }
+        // create 3 basic blocks for while loop
+        let (entry, body, end) = create_loop_blocks(ctx);
+
+        // jump into while entry block unconditionally, with zero-init induction variable.
+        let zero_init_induction_variable = ctx.new_local_value().integer(0);
+        let jump_to_while_entry = ctx
+            .new_local_value()
+            .jump(entry, vec![zero_init_induction_variable]);
+        ctx.push_inst(jump_to_while_entry);
+
+        // manual set the entry
+        // It only contains a comparison with tensor length limit.
+        ctx.set_curr_bb(entry);
+        let entry_params = ctx.bb_params(entry);
+        assert!(entry_params.len() == 1);
+        let idx_var = entry_params[0];
+        idxs.push(idx_var);
+
+        let target = ctx.new_local_value().integer(shape[dep] as i32);
+        let cond_val = ctx.new_local_value().binary(BinaryOp::Lt, idx_var, target);
+        ctx.push_inst(cond_val);
+        let branch = ctx
+            .new_local_value()
+            .branch(cond_val, body, vec![], end, vec![]);
+        ctx.push_inst(branch);
+
+        ctx.set_curr_bb(body);
+
+        // should start recursion here
+        rec(
+            ctx,
+            shape,
+            dep + 1,
+            idxs,
+            lhs,
+            rhs,
+            op,
+            lhs_tensor,
+            rhs_tensor,
+            target_tensor,
+        );
+
+        // add the while a unconditional jump to entry to have a comparison.
+        let one = ctx.new_local_value().integer(1);
+        let add = ctx.new_local_value().binary(BinaryOp::Add, idx_var, one);
+        ctx.push_inst(add);
+        let jump = ctx.new_local_value().jump(entry, vec![add]);
+        ctx.push_inst(jump);
+
+        ctx.pop_loop();
+        ctx.set_curr_bb(end);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn leaf(
+        ctx: &mut AstGenContext,
+        idxs: &[Inst],
+        lhs: Inst,
+        rhs: Inst,
+        op: BinaryOp,
+        lhs_tensor: bool,
+        rhs_tensor: bool,
+        target_tensor: Inst,
+    ) {
+        let arr_ty = tensor_shape_type(ctx, if lhs_tensor { lhs } else { rhs });
+        let base_ty = arr_ty.array_base_scalar_type();
+
+        let lhs = if lhs_tensor {
+            lhs
+        } else {
+            ctx.coerce_local(lhs, &base_ty)
+        };
+        let rhs = if rhs_tensor {
+            rhs
+        } else {
+            ctx.coerce_local(rhs, &base_ty)
+        };
+        let lhs = if lhs_tensor {
+            tensor_get_elem_raw(ctx, lhs, idxs)
+        } else {
+            lhs
+        };
+        let rhs = if rhs_tensor {
+            tensor_get_elem_raw(ctx, rhs, idxs)
+        } else {
+            rhs
+        };
+        let binary = ctx.new_local_value().binary(op, lhs, rhs);
+        ctx.push_inst(binary);
+        let res = tensor_elem_ptr_raw(ctx, target_tensor, idxs);
+        let store = ctx.new_local_value().store(binary, res);
+        ctx.push_inst(store);
+    }
+    let arr_ty = tensor_shape_type(ctx, if lhs_tensor { lhs } else { rhs });
+    let shape = arr_ty.get_array_shape();
+    let temp = ctx.new_local_value().alloc(arr_ty);
+    ctx.push_inst(temp);
+
+    let mut idxs = vec![];
+    rec(
+        ctx, &shape, 0, &mut idxs, lhs, rhs, op, lhs_tensor, rhs_tensor, temp,
+    );
+    temp
 }
 
 fn lower_elementwise(
@@ -2017,7 +2255,7 @@ impl ToRaanaIR for items::UnaryOp {
             let inst = match self {
                 Self::Minus => {
                     let zero = ctx.new_local_value().integer(0);
-                    lower_elementwise(ctx, zero, rhs, BinaryOp::Sub, false, true)
+                    lower_elementwise_native_loop(ctx, zero, rhs, BinaryOp::Sub, false, true)
                 }
                 _ => unreachable!(),
             };

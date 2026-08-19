@@ -116,7 +116,10 @@
 
 use super::items;
 use crate::frontend::{
-    items::{AssignStmt, Block, BlockItem, ConstDef, Decl, Stmt, VarDef},
+    items::{
+        AddExp, AssignStmt, Block, BlockItem, ConstDef, Decl, EqExp, Exp, LAndExp, LOrExp, MulExp,
+        PrimaryExp, RelExp, Stmt, UnaryExp, VarDef,
+    },
     utils::{AstGenContext, Ident, Symbol, ToRaanaIR},
 };
 use inst_kind::binary;
@@ -281,86 +284,143 @@ impl ToRaanaIR for items::CompUnit {
     }
 }
 
-fn collect_stmt_shape(ctx: &mut AstGenContext, stmt: Stmt) {
+fn infer_exp_shape(ctx: &AstGenContext, exp: &Exp) -> Option<Type> {
+    let lor = &exp.lor_exp;
+    let LOrExp::LAndExp(land) = lor else {
+        return None;
+    };
+    let LAndExp::EqExp(eq) = land else {
+        return None;
+    };
+    let EqExp::RelExp(rel) = eq else { return None };
+    let RelExp::AddExp(add) = rel else {
+        return None;
+    };
+    let AddExp::MulExp(mul) = add else {
+        return None;
+    };
+    let MulExp::UnaryExp(unary) = mul else {
+        return None;
+    };
+    match unary {
+        UnaryExp::FuncCall(call) => None,
+        UnaryExp::PrimaryExp(primary) => {
+            let PrimaryExp::LVal(ref lval) = **primary else {
+                return None;
+            };
+            dbg!(&lval);
+            ctx.tensor_table().get(&lval.ident).cloned()
+        }
+        UnaryExp::Unary(op, expr) => None,
+    }
+}
+
+fn collect_stmt_shape(ctx: &mut AstGenContext, stmt: &Stmt) -> Option<Type> {
     match stmt {
         Stmt::Assign(assign_stmt) => {
-            todo!();
+            // todo!();
             // let lval = assign_stmt.l_val;
             // let ident = lval.ident.clone();
             // ctx.tensor_table_mut().insert()
+            None
         }
         Stmt::Block(block) => collect_ret_shape(ctx, block),
         Stmt::Single(_) => todo!(),
         Stmt::IfStmt(if_stmt) => {
-            collect_stmt_shape(ctx, *if_stmt.then_branch);
-            if let Some(else_stmt) = if_stmt.else_branch {
-                collect_stmt_shape(ctx, *else_stmt);
+            let shape = collect_stmt_shape(ctx, &if_stmt.then_branch);
+            if let Some(ref else_stmt) = if_stmt.else_branch {
+                // collect_stmt_shape(ctx, *else_stmt);
             }
+            shape
         }
-        Stmt::WhileStmt(while_stmt) => collect_stmt_shape(ctx, *while_stmt.body),
-        Stmt::Break(_) => {}
-        Stmt::Continue(_) => {}
+        Stmt::WhileStmt(while_stmt) => collect_stmt_shape(ctx, &while_stmt.body),
+        Stmt::Break(_) => None,
+        Stmt::Continue(_) => None,
         Stmt::Return(return_stmt) => {
-            let Some(exp) = return_stmt.exp else { return };
-            let lor = exp.lor_exp;
-            todo!();
+            let Some(ref exp) = return_stmt.exp else {
+                return None;
+            };
+            dbg!(&exp);
+            infer_exp_shape(ctx, exp)
         }
     }
 }
 
-fn collect_ret_shape(ctx: &mut AstGenContext, block: Block) {
-    for item in block.block_items {
-        match item {
-            BlockItem::Decl(decl) => match decl {
-                Decl::ConstDecl(decl) => {
-                    if !decl.btype.is_tensor {
-                        return;
+fn collect_ret_shape(ctx: &mut AstGenContext, block: &Block) -> Option<Type> {
+    let types = block
+        .block_items
+        .iter()
+        .map(|item| {
+            dbg!(&item);
+            match item {
+                BlockItem::Decl(decl) => match decl {
+                    Decl::ConstDecl(decl) => {
+                        if !decl.btype.is_tensor {
+                            return None;
+                        }
+                        decl.const_defs.iter().for_each(|def: &ConstDef| {
+                            let base_ty = decl.btype.btype.array_base_scalar_type();
+                            let shape = def
+                                .arr_dim
+                                .iter()
+                                .map(|exp| {
+                                    exp.global_convert(ctx);
+                                    ctx.pop_i32() as usize
+                                })
+                                .collect::<Vec<_>>();
+                            let ty = get_type_from_shape(base_ty, &shape);
+                            ctx.tensor_table_mut().insert(def.ident.clone(), ty);
+                        });
+                        None
                     }
-                    decl.const_defs.iter().for_each(|def: &ConstDef| {
-                        let shape = def
-                            .arr_dim
-                            .iter()
-                            .map(|exp| {
-                                exp.global_convert(ctx);
-                                ctx.pop_i32() as usize
-                            })
-                            .collect::<Vec<_>>();
-                        let ty = get_type_from_shape(&shape);
-                        ctx.tensor_table_mut().insert(def.ident.clone(), ty);
-                    })
-                }
-                Decl::VarDecl(decl) => {
-                    if !decl.btype.is_tensor {
-                        return;
+                    Decl::VarDecl(decl) => {
+                        if !decl.btype.is_tensor {
+                            return None;
+                        }
+                        decl.var_defs.iter().for_each(|def: &VarDef| {
+                            let base_ty = decl.btype.btype.array_base_scalar_type().clone();
+                            let shape = def
+                                .arr_dim
+                                .iter()
+                                .map(|exp| {
+                                    exp.global_convert(ctx);
+                                    ctx.pop_i32() as usize
+                                })
+                                .collect::<Vec<_>>();
+                            let ty = get_type_from_shape(base_ty, &shape);
+                            ctx.tensor_table_mut().insert(def.ident.clone(), ty);
+                        });
+                        None
                     }
-                    decl.var_defs.iter().for_each(|def: &VarDef| {
-                        let shape = def
-                            .arr_dim
-                            .iter()
-                            .map(|exp| {
-                                exp.global_convert(ctx);
-                                ctx.pop_i32() as usize
-                            })
-                            .collect::<Vec<_>>();
-                        let ty = get_type_from_shape(&shape);
-                        ctx.tensor_table_mut().insert(def.ident.clone(), ty);
-                    })
+                },
+                BlockItem::Stmt(stmt) => {
+                    let result = collect_stmt_shape(ctx, &stmt);
+                    dbg!(&result);
+                    result
                 }
-            },
-            BlockItem::Stmt(stmt) => {
-                collect_stmt_shape(ctx, stmt);
             }
-        }
-    }
+        })
+        .collect::<Vec<_>>();
+    dbg!(&types);
+    let types = types
+        .iter()
+        .filter(|ty| ty.is_some())
+        .map(|ty| ty.clone().unwrap())
+        .collect::<Vec<Type>>();
+    types.first().cloned()
 }
 
 impl ToRaanaIR for items::FuncDef {
     fn convert(&self, ctx: &mut AstGenContext) {
         // 检查返回tensor形状
-        if self.func_type.is_tensor {
-            collect_ret_shape(ctx, self.block.clone());
-        }
-        dbg!(ctx.tensor_table());
+        let ret_ty = if self.func_type.is_tensor {
+            // dbg!(&self.block.block_items);
+            Type::get_pointer(collect_ret_shape(ctx, &self.block).unwrap())
+        } else {
+            self.func_type.btype.clone()
+        };
+
+        dbg!(&self.ident, &ret_ty);
 
         // Register the function to get handle
         let param_ty = self
@@ -368,11 +428,9 @@ impl ToRaanaIR for items::FuncDef {
             .iter()
             .map(|x| x.ty_global(ctx))
             .collect::<Vec<_>>();
-        let func = ctx.program.new_function(
-            self.func_type.btype.clone(),
-            self.ident.as_ref().to_string(),
-            param_ty,
-        );
+        let func = ctx
+            .program
+            .new_function(ret_ty, self.ident.as_ref().to_string(), param_ty);
         // Prologue
         // - Add function to the stack
         // - Insert the "entry" basic block and save it.
@@ -1514,9 +1572,10 @@ impl ToRaanaIR for items::FuncCall {
         let call = ctx.new_local_value().call(target_func, args);
         ctx.push_inst(call);
         if ret_ty.is_tensor() {
-            let temp = ctx.new_local_value().alloc(ret_ty);
+            dbg!(&ret_ty, &ret_ty.derefernce());
+            let temp = ctx.new_local_value().alloc(ret_ty.derefernce());
             ctx.push_inst(temp);
-            todo!("copy tensor call to temp");
+            copy_tensor(ctx, call, temp);
             ctx.push_val(temp);
         } else if !ctx.inst_data(call).ty().is_unit() {
             ctx.push_val(call);
@@ -1792,6 +1851,7 @@ fn is_tensor(ctx: &mut AstGenContext, tensor: Inst) -> bool {
 }
 
 fn tensor_shape_type(ctx: &mut AstGenContext, tensor: Inst) -> Type {
+    dbg!(ctx.inst_data(tensor).ty());
     assert!(is_tensor(ctx, tensor));
     let ty = ctx.inst_data(tensor).ty().clone();
     if ty.is_pointer() { ty.derefernce() } else { ty }

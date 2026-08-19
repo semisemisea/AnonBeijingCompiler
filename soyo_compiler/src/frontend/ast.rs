@@ -2028,6 +2028,7 @@ fn lower_matmul_native_loop(ctx: &mut AstGenContext, lhs: Inst, rhs: Inst) -> In
             let add = ctx.new_local_value().binary(BinaryOp::Add, j, one);
             ctx.push_inst(add);
             let add_acc = ctx.new_local_value().binary(BinaryOp::Add, acc, mul);
+            ctx.push_inst(add_acc);
             let jump = ctx.new_local_value().jump(entry, vec![add, add_acc]);
             ctx.push_inst(jump);
 

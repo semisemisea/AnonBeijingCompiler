@@ -1877,8 +1877,8 @@ fn get_type_from_shape(base_ty: Type, shape: &[usize]) -> Type {
 }
 
 fn copy_tensor(ctx: &mut AstGenContext, src: Inst, dst: Inst) {
-    let src_ty = ctx.inst_data(src).ty();
-    let dst_ty = ctx.inst_data(dst).ty();
+    let src_ty = tensor_shape_type(ctx, src);
+    let dst_ty = tensor_shape_type(ctx, dst);
     let lhs_shape = src_ty.get_array_shape();
     let rhs_shape = dst_ty.get_array_shape();
     assert!(lhs_shape == rhs_shape);

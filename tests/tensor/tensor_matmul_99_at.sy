@@ -107,9 +107,9 @@ void test() {
     }
   }
 
-  tensor int c[99][99] = a @ b;
+  // tensor int c[99][99] = a @ b;
   // tensor int c[99][99] = matmul_naive(a, b, x, y, z);
-  // tensor int c[99][99] = matmul(a, b, x, y, z);
+  tensor int c[99][99] = matmul(a, b, x, y, z);
 
 
   {

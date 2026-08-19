@@ -156,6 +156,7 @@ impl Type {
     }
 
     pub fn get_array_shape(&self) -> Vec<usize> {
+        assert!(self.is_array());
         let mut ty = self.0.clone();
         let mut ret = vec![];
         loop {

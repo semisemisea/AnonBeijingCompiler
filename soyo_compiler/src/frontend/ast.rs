@@ -226,10 +226,10 @@ fn tensor_elem_ty(ctx: &AstGenContext, inst: Inst) -> Type {
     }
 }
 
-fn tensor_elem_ptr(ctx: &mut AstGenContext, inst: Inst, idxs: &[i32]) -> Inst {
+fn tensor_elem_ptr(ctx: &mut AstGenContext, inst: Inst, idxs: &[usize]) -> Inst {
     let offsets = idxs
         .iter()
-        .map(|idx| ctx.new_local_value().integer(*idx))
+        .map(|&idx| ctx.new_local_value().integer(idx as i32))
         .collect::<Vec<_>>();
     let inst = if ctx.inst_data(inst).ty().is_pointer() {
         let zero_offset = vec![ctx.new_local_value().integer(0)];
@@ -242,7 +242,7 @@ fn tensor_elem_ptr(ctx: &mut AstGenContext, inst: Inst, idxs: &[i32]) -> Inst {
     ctx.new_local_value().get_elem_ptr(inst, offsets)
 }
 
-fn tensor_get_elem(ctx: &mut AstGenContext, inst: Inst, idxs: &[i32]) -> Inst {
+fn tensor_get_elem(ctx: &mut AstGenContext, inst: Inst, idxs: &[usize]) -> Inst {
     let ptr = tensor_elem_ptr(ctx, inst, idxs);
     ctx.push_inst(ptr);
     ctx.new_local_value().load(ptr)
@@ -1631,143 +1631,16 @@ impl ToRaanaIR for BinaryOp {
         let lhs_ty = ctx.inst_data(lhs).ty().clone();
         let rhs_ty = ctx.inst_data(rhs).ty().clone();
 
-        let lhs_tensor =
-            (lhs_ty.is_pointer() && lhs_ty.derefernce().is_array()) || lhs_ty.is_array();
-        let rhs_tensor =
-            (rhs_ty.is_pointer() && rhs_ty.derefernce().is_array()) || rhs_ty.is_array();
-
-        let lhs_pointer = lhs_ty.is_pointer();
-        let rhs_pointer = rhs_ty.is_pointer();
+        let lhs_tensor = lhs_ty.is_tensor();
+        let rhs_tensor = rhs_ty.is_tensor();
 
         // tensor type arith
         if lhs_tensor || rhs_tensor {
-            if ELEMENTWISE_FLAG {
-                eprintln!("{:?}", lhs_ty.kind());
-                // shape must be match
-                // assert!(lhs_ty == rhs_ty);
-                let array_shape = if lhs_pointer {
-                    lhs_ty.derefernce().get_array_shape()
-                } else {
-                    lhs_ty.get_array_shape()
-                };
-
-                #[allow(clippy::too_many_arguments)]
-                fn rec(
-                    array_shape: &[usize],
-                    idxs: &mut Vec<usize>,
-                    collect: &mut Vec<Inst>,
-                    lhs: Inst,
-                    rhs: Inst,
-                    lhs_tensor: bool,
-                    lhs_pointer: bool,
-                    rhs_tensor: bool,
-                    rhs_pointer: bool,
-                    op: BinaryOp,
-                    ctx: &mut AstGenContext,
-                    dep: usize,
-                ) {
-                    if dep == array_shape.len() {
-                        fn make_offsets(
-                            idxs: &Vec<usize>,
-                            ctx: &mut AstGenContext,
-                            pointer: bool,
-                        ) -> Vec<Inst> {
-                            if pointer {
-                                std::iter::once(0)
-                                    .chain(idxs.iter().copied())
-                                    .map(|idx| ctx.new_local_value().integer(idx as i32))
-                                    .collect::<Vec<_>>()
-                            } else {
-                                idxs.iter()
-                                    .copied()
-                                    .map(|idx| ctx.new_local_value().integer(idx as i32))
-                                    .collect::<Vec<_>>()
-                            }
-                        }
-                        let lhs = if lhs_tensor {
-                            let offsets = make_offsets(idxs, ctx, lhs_pointer);
-                            let gep_lhs = ctx.new_local_value().get_elem_ptr(lhs, offsets);
-                            ctx.push_inst(gep_lhs);
-                            let load_lhs = ctx.new_local_value().load(gep_lhs);
-                            ctx.push_inst(load_lhs);
-                            load_lhs
-                        } else {
-                            lhs
-                        };
-                        let rhs = if rhs_tensor {
-                            let offsets = make_offsets(idxs, ctx, rhs_pointer);
-                            let gep_rhs = ctx.new_local_value().get_elem_ptr(rhs, offsets);
-                            ctx.push_inst(gep_rhs);
-                            let load_rhs = ctx.new_local_value().load(gep_rhs);
-                            ctx.push_inst(load_rhs);
-                            load_rhs
-                        } else {
-                            rhs
-                        };
-                        let binary = ctx.new_local_value().binary(op, lhs, rhs);
-                        ctx.push_inst(binary);
-                        collect.push(binary);
-                        return;
-                    }
-                    while idxs[dep] < array_shape[dep] {
-                        rec(
-                            array_shape,
-                            idxs,
-                            collect,
-                            lhs,
-                            rhs,
-                            lhs_tensor,
-                            lhs_pointer,
-                            rhs_tensor,
-                            rhs_pointer,
-                            op,
-                            ctx,
-                            dep + 1,
-                        );
-                        idxs[dep] += 1;
-                    }
-                    idxs[dep] = 0;
-                }
-
-                let mut idxs = vec![0; array_shape.len()];
-                let mut collect = vec![];
-                rec(
-                    &array_shape,
-                    &mut idxs,
-                    &mut collect,
-                    lhs,
-                    rhs,
-                    lhs_tensor,
-                    lhs_pointer,
-                    rhs_tensor,
-                    rhs_pointer,
-                    *self,
-                    ctx,
-                    0,
-                );
-
-                for &len in array_shape.iter().rev() {
-                    let t = collect
-                        .chunks_exact(len)
-                        .map(|slice| slice.to_vec())
-                        .collect::<Vec<_>>();
-                    let mut new = vec![];
-                    for elem in t {
-                        new.push(ctx.new_local_value().aggregate(elem));
-                    }
-                    collect = new;
-                }
-                assert!(collect.len() == 1);
-                ctx.push_val(collect[0]);
-            } else {
-                let l = ctx.new_local_value().load(lhs);
-                ctx.push_inst(l);
-                let r = ctx.new_local_value().load(rhs);
-                ctx.push_inst(r);
-                let op = ctx.new_local_value().binary(*self, l, r);
-                ctx.push_inst(op);
-                ctx.push_val(op);
-            }
+            let result = match self {
+                BinaryOp::MatMul => lower_matmul(ctx, lhs, rhs),
+                _ => lower_elementwise(ctx, lhs, rhs, *self, lhs_tensor, rhs_tensor),
+            };
+            ctx.push_val(result);
             return;
         }
 
@@ -1834,6 +1707,136 @@ impl ToRaanaIR for BinaryOp {
             ctx.push_val(val);
         }
     }
+}
+
+fn is_tensor(ctx: &mut AstGenContext, tensor: Inst) -> bool {
+    ctx.inst_data(tensor).ty().is_tensor()
+}
+
+fn tensor_shape_type(ctx: &mut AstGenContext, tensor: Inst) -> Type {
+    assert!(is_tensor(ctx, tensor));
+    let ty = ctx.inst_data(tensor).ty().clone();
+    if ty.is_pointer() { ty.derefernce() } else { ty }
+}
+
+fn get_type_from_shape(shape: &[usize]) -> Type {
+    todo!()
+}
+
+fn lower_matmul(ctx: &mut AstGenContext, lhs: Inst, rhs: Inst) -> Inst {
+    let lhs_ty = tensor_shape_type(ctx, lhs);
+    let rhs_ty = tensor_shape_type(ctx, rhs);
+    let lhs_shape = lhs_ty.get_array_shape();
+    let rhs_shape = rhs_ty.get_array_shape();
+    assert!(lhs_shape.len() == 2, "lhs must have rank 2");
+    assert!(rhs_shape.len() == 2, "rhs must have rank 2");
+    assert!(lhs_shape[1] == rhs_shape[0]);
+    let &[a, b] = lhs_shape.as_slice() else {
+        unreachable!()
+    };
+    let &[b, c] = rhs_shape.as_slice() else {
+        unreachable!()
+    };
+
+    let result_ty = get_type_from_shape(&[a, c]);
+    let temp = ctx.new_local_value().alloc(result_ty);
+
+    for i in 0..a {
+        for k in 0..c {
+            let mut acc = None;
+            // let res = tensor_get_elem(ctx, inst, vec![i, k]);
+            for j in 0..b {
+                let l = tensor_get_elem(ctx, lhs, vec![i, j].as_slice());
+                let r = tensor_get_elem(ctx, rhs, vec![j, k].as_slice());
+                let p = ctx.new_local_value().binary(BinaryOp::Mul, l, r);
+                ctx.push_inst(p);
+                acc = Some(match acc {
+                    None => p,
+                    Some(acc) => {
+                        let add = ctx.new_local_value().binary(BinaryOp::Add, acc, p);
+                        ctx.push_inst(add);
+                        add
+                    }
+                });
+            }
+            let res = tensor_elem_ptr(ctx, temp, vec![i, k].as_slice());
+            let store = ctx.new_local_value().store(acc.unwrap(), res);
+            ctx.push_inst(store);
+        }
+    }
+    temp
+}
+
+fn tensor_for_each(
+    ctx: &mut AstGenContext,
+    tensor: Inst,
+    mut f: impl FnMut(&mut AstGenContext, &[usize]),
+) {
+    let array_shape = tensor_shape_type(ctx, tensor).get_array_shape();
+    fn rec(
+        ctx: &mut AstGenContext,
+        array_shape: &[usize],
+        idxs: &mut [usize],
+        dep: usize,
+        mut f: impl FnMut(&mut AstGenContext, &[usize]),
+    ) {
+        if dep == idxs.len() {
+            f(ctx, idxs);
+            return;
+        }
+        while idxs[dep] < array_shape[dep] {
+            idxs[dep] += 1;
+        }
+        idxs[dep] = 0;
+    }
+    let mut idxs = vec![0; array_shape.len()];
+    rec(ctx, &array_shape, &mut idxs, 0, f);
+}
+
+fn lower_elementwise(
+    ctx: &mut AstGenContext,
+    lhs: Inst,
+    rhs: Inst,
+    op: BinaryOp,
+    lhs_tensor: bool,
+    rhs_tensor: bool,
+) -> Inst {
+    let arr_ty = tensor_shape_type(ctx, if lhs_tensor { lhs } else { rhs });
+    let base_ty = arr_ty.array_base_scalar_type();
+    // let shape = arr_ty.get_array_shape();
+
+    let lhs = if lhs_tensor {
+        lhs
+    } else {
+        ctx.coerce_local(lhs, &base_ty)
+    };
+    let rhs = if rhs_tensor {
+        rhs
+    } else {
+        ctx.coerce_local(rhs, &base_ty)
+    };
+
+    let temp = ctx.new_local_value().alloc(arr_ty);
+    ctx.push_inst(temp);
+    tensor_for_each(ctx, temp, |ctx, idxs| {
+        let lhs = if lhs_tensor {
+            tensor_get_elem(ctx, lhs, idxs)
+        } else {
+            lhs
+        };
+        let rhs = if rhs_tensor {
+            tensor_get_elem(ctx, rhs, idxs)
+        } else {
+            rhs
+        };
+        let binary = ctx.new_local_value().binary(op, lhs, rhs);
+        ctx.push_inst(binary);
+        let res = tensor_elem_ptr(ctx, temp, idxs);
+        ctx.push_inst(res);
+        let store = ctx.new_local_value().store(binary, res);
+        ctx.push_inst(store);
+    });
+    temp
 }
 
 impl ToRaanaIR for items::UnaryOp {

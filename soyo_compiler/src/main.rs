@@ -44,7 +44,6 @@ fn run(args: cli::Arg) -> Result<(), String> {
     let aarch64_config = args.aarch64_codegen_config();
     let ir_config = args.ir_optimization_config();
     let source_code = std::fs::read_to_string(&args.input_path).unwrap();
-    let tensor_flag = source_code.find("tensor").is_some();
 
     let ast = sysy::CompUnitsParser::new().parse(&source_code).unwrap();
     let mut ctx = AstGenContext::new();
@@ -52,12 +51,10 @@ fn run(args: cli::Arg) -> Result<(), String> {
 
     let mut program = ctx.program;
 
-    if !tensor_flag {
-        let mut pass_manager = raana_ir::opt::pass::PassesManager::from_config(ir_config);
-        let pass_stats = pass_manager.run_passes(&mut program);
-        if args.pass_stats {
-            print_pass_stats(&pass_stats);
-        }
+    let mut pass_manager = raana_ir::opt::pass::PassesManager::from_config(ir_config);
+    let pass_stats = pass_manager.run_passes(&mut program);
+    if args.pass_stats {
+        print_pass_stats(&pass_stats);
     }
 
     let emit = if args.emit.is_empty() {

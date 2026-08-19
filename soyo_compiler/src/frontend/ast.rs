@@ -113,11 +113,9 @@
 //! 全局项下降（`global_convert` 体系）、短路逻辑的编译期折叠、`is_complete_bb`
 //! 死代码跳过与自动补 `ret` 等机制——读代码时以本模块文档为索引，逐 impl 对照
 //! `items.rs` 的节点定义与 `utils.rs` 的上下文辅助即可。
-const ELEMENTWISE_FLAG: bool = true;
 
 use super::items;
 use crate::frontend::utils::{AstGenContext, Ident, Symbol, ToRaanaIR};
-use inst_kind::binary;
 use raana_ir::ir::{arena::Arena, builder_trait::*, *};
 
 fn binary_requires_int(op: BinaryOp) -> bool {
@@ -227,25 +225,29 @@ fn tensor_elem_ty(ctx: &AstGenContext, inst: Inst) -> Type {
 }
 
 fn tensor_elem_ptr(ctx: &mut AstGenContext, inst: Inst, idxs: &[usize]) -> Inst {
-    let offsets = idxs
-        .iter()
-        .map(|&idx| ctx.new_local_value().integer(idx as i32))
-        .collect::<Vec<_>>();
-    let inst = if ctx.inst_data(inst).ty().is_pointer() {
-        let zero_offset = vec![ctx.new_local_value().integer(0)];
-        let inst = ctx.new_local_value().get_elem_ptr(inst, zero_offset);
-        ctx.push_inst(inst);
-        inst
+    let ty = ctx.inst_data(inst).ty();
+
+    let offsets = if ty.is_pointer() {
+        std::iter::once(0usize)
+            .chain(idxs.iter().copied())
+            .map(|idx| ctx.new_local_value().integer(idx as i32))
+            .collect::<Vec<_>>()
     } else {
-        inst
+        idxs.iter()
+            .map(|&idx| ctx.new_local_value().integer(idx as i32))
+            .collect::<Vec<_>>()
     };
-    ctx.new_local_value().get_elem_ptr(inst, offsets)
+
+    let gep = ctx.new_local_value().get_elem_ptr(inst, offsets);
+    ctx.push_inst(gep);
+    gep
 }
 
 fn tensor_get_elem(ctx: &mut AstGenContext, inst: Inst, idxs: &[usize]) -> Inst {
     let ptr = tensor_elem_ptr(ctx, inst, idxs);
-    ctx.push_inst(ptr);
-    ctx.new_local_value().load(ptr)
+    let load = ctx.new_local_value().load(ptr);
+    ctx.push_inst(load);
+    load
 }
 
 impl ToRaanaIR for items::CompUnits {
@@ -698,7 +700,6 @@ impl ToRaanaIR for items::VarDef {
                         }
                     }
                 }
-                if let items::InitVal::Normal(exp) = init_val {}
             }
             ctx.insert_var(self.ident.clone(), alloc_var)
         }
@@ -1000,13 +1001,6 @@ impl ToRaanaIR for items::AssignStmt {
             // is tensor
             let val = ctx.pop_val().unwrap();
             copy_tensor(ctx, val, lhs_l_val);
-            // let rhs_exp_type = ctx.new_local_value().inst_type(rhs_exp);
-            // // assert!(
-            // //     Type::get_pointer(rhs_exp_type.clone()) == lhs_ptr_type.clone(),
-            // //     "Type not match. {rhs_exp_type} can't store in {lhs_ptr_type}"
-            // // );
-            // let store = ctx.new_local_value().store(rhs_exp, lhs_l_val);
-            // ctx.push_inst(store);
         } else {
             let rhs_exp = ctx.pop_val().unwrap();
             let rhs_exp = ctx.coerce_local(rhs_exp, &lhs_type);
@@ -1843,7 +1837,6 @@ fn lower_elementwise(
         let binary = ctx.new_local_value().binary(op, lhs, rhs);
         ctx.push_inst(binary);
         let res = tensor_elem_ptr(ctx, temp, idxs);
-        ctx.push_inst(res);
         let store = ctx.new_local_value().store(binary, res);
         ctx.push_inst(store);
     });

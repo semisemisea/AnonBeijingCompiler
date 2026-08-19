@@ -2007,6 +2007,10 @@ fn tensor_for_each_loopify(
         ctx.pop_loop();
         ctx.set_curr_bb(end);
     }
+    let arr_ty = ctx.inst_data(tensor).ty();
+    let shape = arr_ty.get_array_shape();
+    let mut idxs = vec![];
+    rec(ctx, &shape, 0, &mut idxs, &mut f);
 }
 
 fn tensor_for_each(

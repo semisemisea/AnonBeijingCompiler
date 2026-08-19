@@ -403,6 +403,10 @@ impl AstGenContext {
                 TypeKind::Unit => None,
                 TypeKind::Int32 => Some(self.new_local_value().integer(0)),
                 TypeKind::Float32 => Some(self.new_local_value().float(0.0)),
+                TypeKind::Pointer(ty) => {
+                    let ty = ty.clone();
+                    Some(self.new_local_value().undef(ty))
+                }
                 _ => unreachable!(),
             };
             let ret = self.new_local_value().ret(ret_val);

@@ -116,7 +116,7 @@
 
 use super::items;
 use crate::frontend::{
-    items::{AssignStmt, Block, BlockItem, ConstDef, Decl, Stmt},
+    items::{AssignStmt, Block, BlockItem, ConstDef, Decl, Stmt, VarDef},
     utils::{AstGenContext, Ident, Symbol, ToRaanaIR},
 };
 use inst_kind::binary;
@@ -254,10 +254,6 @@ fn tensor_get_elem(ctx: &mut AstGenContext, inst: Inst, idxs: &[usize]) -> Inst 
     load
 }
 
-fn get_type_from_shape(shape: &[usize]) {
-    todo!();
-}
-
 impl ToRaanaIR for items::CompUnits {
     fn convert(&self, ctx: &mut AstGenContext) {
         ctx.decl_library_functions();
@@ -326,12 +322,30 @@ fn collect_ret_shape(ctx: &mut AstGenContext, block: Block) {
                             .iter()
                             .map(|exp| {
                                 exp.global_convert(ctx);
-                                ctx.pop_i32()
+                                ctx.pop_i32() as usize
                             })
                             .collect::<Vec<_>>();
+                        let ty = get_type_from_shape(&shape);
+                        ctx.tensor_table_mut().insert(def.ident.clone(), ty);
                     })
                 }
-                Decl::VarDecl(decl) => {}
+                Decl::VarDecl(decl) => {
+                    if !decl.btype.is_tensor {
+                        return;
+                    }
+                    decl.var_defs.iter().for_each(|def: &VarDef| {
+                        let shape = def
+                            .arr_dim
+                            .iter()
+                            .map(|exp| {
+                                exp.global_convert(ctx);
+                                ctx.pop_i32() as usize
+                            })
+                            .collect::<Vec<_>>();
+                        let ty = get_type_from_shape(&shape);
+                        ctx.tensor_table_mut().insert(def.ident.clone(), ty);
+                    })
+                }
             },
             BlockItem::Stmt(stmt) => {
                 collect_stmt_shape(ctx, stmt);
@@ -346,6 +360,7 @@ impl ToRaanaIR for items::FuncDef {
         if self.func_type.is_tensor {
             collect_ret_shape(ctx, self.block.clone());
         }
+        dbg!(ctx.tensor_table());
 
         // Register the function to get handle
         let param_ty = self
@@ -395,6 +410,10 @@ impl ToRaanaIR for items::FuncDef {
             TypeKind::Unit => None,
             TypeKind::Int32 => Some(ctx.new_local_value().integer(0)),
             TypeKind::Float32 => Some(ctx.new_local_value().float(0.0)),
+            TypeKind::Pointer(ty) => {
+                let ty = ty.clone();
+                Some(ctx.new_local_value().undef(ty))
+            }
             _ => unreachable!(),
         };
         let ret = ctx.new_local_value().ret(ret_val);
@@ -1490,9 +1509,16 @@ impl ToRaanaIR for items::FuncCall {
                 }
             })
             .collect::<Vec<_>>();
+
+        let ret_ty = ctx.func_data(target_func).ret_ty().clone();
         let call = ctx.new_local_value().call(target_func, args);
         ctx.push_inst(call);
-        if !ctx.inst_data(call).ty().is_unit() {
+        if ret_ty.is_tensor() {
+            let temp = ctx.new_local_value().alloc(ret_ty);
+            ctx.push_inst(temp);
+            todo!("copy tensor call to temp");
+            ctx.push_val(temp);
+        } else if !ctx.inst_data(call).ty().is_unit() {
             ctx.push_val(call);
         }
     }

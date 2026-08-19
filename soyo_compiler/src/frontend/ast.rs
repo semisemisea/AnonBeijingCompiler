@@ -1976,7 +1976,7 @@ fn lower_matmul_native_loop(ctx: &mut AstGenContext, lhs: Inst, rhs: Inst) -> In
             let (entry, body, end) = {
                 let entry = ctx.new_basic_block().basic_block(
                     "while_entry_tensor_elementwise".into(),
-                    vec![Type::get_i32(), Type::get_i32()],
+                    vec![Type::get_i32(), base_ty.clone()],
                 );
                 ctx.register_bb(entry);
                 let body = ctx

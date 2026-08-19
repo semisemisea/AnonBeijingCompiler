@@ -677,28 +677,28 @@ impl ToRaanaIR for items::VarDef {
 
             // We handle the possible initial value.
             if let Some(ref init_val) = self.init_val {
-                // must be an array
-                // if !matches!(init_val, items::InitVal::Array(_)) {
-                //     panic!("Invalid assign: integer: {:?} to an array", init_val)
-                // };
-                if let items::InitVal::Normal(exp) = init_val {
-                    exp.convert(ctx);
-                    let val = ctx.pop_val().unwrap();
-                    let store = ctx.new_local_value().store(val, alloc_var);
-                    ctx.push_inst(store);
-                    let clear = ctx.new_local_value().mem_zero(alloc_var, byte_len);
-                    ctx.push_inst(clear);
-                    for (flat_index, exp) in init_val.explicit_init_vals(&array_shape) {
+                match init_val {
+                    items::InitVal::Normal(exp) => {
                         exp.convert(ctx);
-                        let value = ctx.pop_val().unwrap();
-                        let value = ctx.coerce_local(value, &ty);
-                        let dest =
-                            local_array_element_ptr(ctx, alloc_var, &array_shape, flat_index);
-                        ctx.push_inst(dest);
-                        let store = ctx.new_local_value().store(value, dest);
-                        ctx.push_inst(store);
+                        let val = ctx.pop_val().unwrap();
+                        copy_tensor(ctx, val, alloc_var);
+                    }
+                    items::InitVal::Array(..) => {
+                        let clear = ctx.new_local_value().mem_zero(alloc_var, byte_len);
+                        ctx.push_inst(clear);
+                        for (flat_index, exp) in init_val.explicit_init_vals(&array_shape) {
+                            exp.convert(ctx);
+                            let value = ctx.pop_val().unwrap();
+                            let value = ctx.coerce_local(value, &ty);
+                            let dest =
+                                local_array_element_ptr(ctx, alloc_var, &array_shape, flat_index);
+                            ctx.push_inst(dest);
+                            let store = ctx.new_local_value().store(value, dest);
+                            ctx.push_inst(store);
+                        }
                     }
                 }
+                if let items::InitVal::Normal(exp) = init_val {}
             }
             ctx.insert_var(self.ident.clone(), alloc_var)
         }
@@ -998,18 +998,8 @@ impl ToRaanaIR for items::AssignStmt {
         let lhs_type = lhs_ptr_type.derefernce();
         if !lhs_type.is_scalar() {
             // is tensor
-            // eprintln!("data: {:?}", ctx.inst_data(rhs_exp));
-            // if let InstKind::Binary(binary) = ctx.inst_data(rhs_exp).kind() {
-            //     eprintln!("lhs: {:?}", ctx.inst_data(binary.lhs()));
-            //     eprintln!("rhs: {:?}", ctx.inst_data(binary.rhs()));
-            // }
-
-            let array_shape = lhs_type.get_array_shape();
-            eprintln!("shape:{:?}", array_shape);
             let val = ctx.pop_val().unwrap();
-            let store = ctx.new_local_value().store(val, lhs_l_val);
-            ctx.push_inst(store);
-
+            copy_tensor(ctx, val, lhs_l_val);
             // let rhs_exp_type = ctx.new_local_value().inst_type(rhs_exp);
             // // assert!(
             // //     Type::get_pointer(rhs_exp_type.clone()) == lhs_ptr_type.clone(),
@@ -1719,13 +1709,33 @@ fn tensor_shape_type(ctx: &mut AstGenContext, tensor: Inst) -> Type {
     if ty.is_pointer() { ty.derefernce() } else { ty }
 }
 
-fn get_type_from_shape(shape: &[usize]) -> Type {
-    todo!()
+fn get_type_from_shape(base_ty: Type, shape: &[usize]) -> Type {
+    let mut ty = base_ty;
+    for &len in shape.iter().rev() {
+        ty = Type::get_array(ty, len);
+    }
+    ty
+}
+
+fn copy_tensor(ctx: &mut AstGenContext, src: Inst, dst: Inst) {
+    let src_ty = ctx.inst_data(src).ty();
+    let dst_ty = ctx.inst_data(dst).ty();
+    let lhs_shape = src_ty.get_array_shape();
+    let rhs_shape = dst_ty.get_array_shape();
+    assert!(lhs_shape == rhs_shape);
+    tensor_for_each(ctx, dst, |ctx, idxs| {
+        let s = tensor_get_elem(ctx, src, idxs);
+        let d = tensor_elem_ptr(ctx, dst, idxs);
+        let store = ctx.new_local_value().store(s, d);
+        ctx.push_inst(store);
+    });
 }
 
 fn lower_matmul(ctx: &mut AstGenContext, lhs: Inst, rhs: Inst) -> Inst {
     let lhs_ty = tensor_shape_type(ctx, lhs);
     let rhs_ty = tensor_shape_type(ctx, rhs);
+    assert!(lhs_ty.array_base_scalar_type() == rhs_ty.array_base_scalar_type());
+    let base_ty = lhs_ty.array_base_scalar_type();
     let lhs_shape = lhs_ty.get_array_shape();
     let rhs_shape = rhs_ty.get_array_shape();
     assert!(lhs_shape.len() == 2, "lhs must have rank 2");
@@ -1738,7 +1748,7 @@ fn lower_matmul(ctx: &mut AstGenContext, lhs: Inst, rhs: Inst) -> Inst {
         unreachable!()
     };
 
-    let result_ty = get_type_from_shape(&[a, c]);
+    let result_ty = get_type_from_shape(base_ty, &[a, c]);
     let temp = ctx.new_local_value().alloc(result_ty);
 
     for i in 0..a {
@@ -1770,7 +1780,7 @@ fn lower_matmul(ctx: &mut AstGenContext, lhs: Inst, rhs: Inst) -> Inst {
 fn tensor_for_each(
     ctx: &mut AstGenContext,
     tensor: Inst,
-    mut f: impl FnMut(&mut AstGenContext, &[usize]),
+    mut f: impl FnMut(&mut AstGenContext, &[usize]) + Copy,
 ) {
     let array_shape = tensor_shape_type(ctx, tensor).get_array_shape();
     fn rec(
@@ -1778,13 +1788,14 @@ fn tensor_for_each(
         array_shape: &[usize],
         idxs: &mut [usize],
         dep: usize,
-        mut f: impl FnMut(&mut AstGenContext, &[usize]),
+        mut f: impl FnMut(&mut AstGenContext, &[usize]) + Copy,
     ) {
         if dep == idxs.len() {
             f(ctx, idxs);
             return;
         }
         while idxs[dep] < array_shape[dep] {
+            rec(ctx, array_shape, idxs, dep + 1, f);
             idxs[dep] += 1;
         }
         idxs[dep] = 0;

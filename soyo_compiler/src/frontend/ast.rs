@@ -214,6 +214,39 @@ fn local_array_element_ptr(
     ctx.new_local_value().get_elem_ptr(alloc, offsets)
 }
 
+fn tensor_elem_ty(ctx: &AstGenContext, inst: Inst) -> Type {
+    let ty = ctx.inst_data(inst).ty();
+    assert!(ty.is_tensor(), "not a tensor");
+    if ty.is_array() {
+        ty.get_array_elem_ty()
+    } else {
+        // is pointer
+        ty.derefernce().get_array_elem_ty()
+    }
+}
+
+fn tensor_elem_ptr(ctx: &mut AstGenContext, inst: Inst, idxs: &[i32]) -> Inst {
+    let offsets = idxs
+        .iter()
+        .map(|idx| ctx.new_local_value().integer(*idx))
+        .collect::<Vec<_>>();
+    let inst = if ctx.inst_data(inst).ty().is_pointer() {
+        let zero_offset = vec![ctx.new_local_value().integer(0)];
+        let inst = ctx.new_local_value().get_elem_ptr(inst, zero_offset);
+        ctx.push_inst(inst);
+        inst
+    } else {
+        inst
+    };
+    ctx.new_local_value().get_elem_ptr(inst, offsets)
+}
+
+fn tensor_get_elem(ctx: &mut AstGenContext, inst: Inst, idxs: &[i32]) -> Inst {
+    let ptr = tensor_elem_ptr(ctx, inst, idxs);
+    ctx.push_inst(ptr);
+    ctx.new_local_value().load(ptr)
+}
+
 impl ToRaanaIR for items::CompUnits {
     fn convert(&self, ctx: &mut AstGenContext) {
         ctx.decl_library_functions();

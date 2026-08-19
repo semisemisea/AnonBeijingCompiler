@@ -144,6 +144,10 @@ impl Type {
         matches!(self.0.as_ref(), TypeKind::Vector(..))
     }
 
+    pub fn is_tensor(&self) -> bool {
+        self.is_array() || (self.is_pointer() && self.derefernce().is_array())
+    }
+
     pub fn get_array_info(&self) -> (Type, usize) {
         match self.0.as_ref() {
             TypeKind::Array(base, len) => (base.clone(), *len),

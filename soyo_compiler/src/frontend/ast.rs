@@ -1896,18 +1896,28 @@ fn lower_matmul(ctx: &mut AstGenContext, lhs: Inst, rhs: Inst) -> Inst {
         unreachable!()
     };
 
-    let result_ty = get_type_from_shape(base_ty, &[a, c]);
+    let result_ty = get_type_from_shape(base_ty.clone(), &[a, c]);
     let temp = ctx.new_local_value().alloc(result_ty);
 
     for i in 0..a {
         for k in 0..c {
+            // let acc = ctx.new_local_value().alloc(base_ty.clone());
+            // let zero = ctx.new_local_value().integer(0);
+            // let store = ctx.new_local_value().store(zero, acc);
+            // ctx.push_inst(acc);
+            // ctx.push_inst(store);
             let mut acc = None;
-            // let res = tensor_get_elem(ctx, inst, vec![i, k]);
             for j in 0..b {
                 let l = tensor_get_elem(ctx, lhs, vec![i, j].as_slice());
                 let r = tensor_get_elem(ctx, rhs, vec![j, k].as_slice());
                 let p = ctx.new_local_value().binary(BinaryOp::Mul, l, r);
                 ctx.push_inst(p);
+                // let load = ctx.new_local_value().load(acc);
+                // ctx.push_inst(load);
+                // let add = ctx.new_local_value().binary(BinaryOp::Add, load, p);
+                // ctx.push_inst(add);
+                // let store = ctx.new_local_value().store(add, acc);
+                // ctx.push_inst(store);
                 acc = Some(match acc {
                     None => p,
                     Some(acc) => {
@@ -1918,6 +1928,9 @@ fn lower_matmul(ctx: &mut AstGenContext, lhs: Inst, rhs: Inst) -> Inst {
                 });
             }
             let res = tensor_elem_ptr(ctx, temp, vec![i, k].as_slice());
+            // let load = ctx.new_local_value().load(acc);
+            // ctx.push_inst(load);
+            // let store = ctx.new_local_value().store(load, res);
             let store = ctx.new_local_value().store(acc.unwrap(), res);
             ctx.push_inst(store);
         }
@@ -2008,6 +2021,19 @@ impl ToRaanaIR for items::UnaryOp {
         }
 
         let rhs = ctx.pop_val().unwrap();
+
+        let is_tensor = is_tensor(ctx, rhs);
+        if is_tensor {
+            let inst = match self {
+                Self::Minus => {
+                    let zero = ctx.new_local_value().integer(0);
+                    lower_elementwise(ctx, zero, rhs, BinaryOp::Sub, false, true)
+                }
+                _ => unreachable!(),
+            };
+            ctx.push_val(inst);
+            return;
+        }
 
         //Constant folding
         let rhs_val = ctx.inst_data(rhs);

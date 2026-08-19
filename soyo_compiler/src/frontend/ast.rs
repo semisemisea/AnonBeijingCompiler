@@ -1894,13 +1894,16 @@ fn lower_matmul(ctx: &mut AstGenContext, lhs: Inst, rhs: Inst) -> Inst {
     let lhs_ty = tensor_shape_type(ctx, lhs);
     let rhs_ty = tensor_shape_type(ctx, rhs);
     assert!(lhs_ty.array_base_scalar_type() == rhs_ty.array_base_scalar_type());
+
     let base_ty = lhs_ty.array_base_scalar_type();
     let lhs_shape = lhs_ty.get_array_shape();
     let rhs_shape = rhs_ty.get_array_shape();
+
     assert!(lhs_shape.len() == 2, "lhs must have rank 2");
     assert!(rhs_shape.len() == 2, "rhs must have rank 2");
     assert!(lhs_shape[1] == rhs_shape[0]);
-    let &[a, b] = lhs_shape.as_slice() else {
+
+    let &[a, _] = lhs_shape.as_slice() else {
         unreachable!()
     };
     let &[b, c] = rhs_shape.as_slice() else {
@@ -1908,49 +1911,76 @@ fn lower_matmul(ctx: &mut AstGenContext, lhs: Inst, rhs: Inst) -> Inst {
     };
 
     let result_ty = get_type_from_shape(base_ty.clone(), &[a, c]);
-    let temp = ctx.new_local_value().alloc(result_ty);
-    ctx.push_inst(temp);
+    let ans = ctx.new_local_value().alloc(result_ty);
+    ctx.push_inst(ans);
 
-    for i in 0..a {
-        for k in 0..c {
-            let mut acc = None;
+    let mut i = 0;
+    while i < a {
+        let flag_i = i + 1 < a;
+
+        let mut k = 0;
+        while k < c {
+            let flag_k = k + 1 < c;
+
+            let (mut c00, mut c01, mut c10, mut c11) = (None, None, None, None);
+
             for j in 0..b {
-                let l = tensor_get_elem(ctx, lhs, vec![i, j].as_slice());
-                let r = tensor_get_elem(ctx, rhs, vec![j, k].as_slice());
-                let p = ctx.new_local_value().binary(BinaryOp::Mul, l, r);
-                ctx.push_inst(p);
-                acc = accumulate(ctx, acc, p);
+                let l0 = tensor_get_elem(ctx, lhs, vec![i, j].as_slice());
+                let r0 = tensor_get_elem(ctx, rhs, vec![j, k].as_slice());
+
+                c00 = mul_then_acc(ctx, c00, l0, r0);
+                if flag_i {
+                    let l1 = tensor_get_elem(ctx, lhs, vec![i + 1, j].as_slice());
+                    c10 = mul_then_acc(ctx, c10, l1, r0);
+                    if flag_k {
+                        let r1 = tensor_get_elem(ctx, rhs, vec![j, k + 1].as_slice());
+                        c01 = mul_then_acc(ctx, c01, l0, r1);
+                        c11 = mul_then_acc(ctx, c11, l1, r1);
+                    }
+                } else if flag_k {
+                    let r1 = tensor_get_elem(ctx, rhs, vec![j, k + 1].as_slice());
+                    c01 = mul_then_acc(ctx, c01, l0, r1);
+                }
             }
-            let res = tensor_elem_ptr(ctx, temp, vec![i, k].as_slice());
-            let store = ctx.new_local_value().store(acc.unwrap(), res);
-            ctx.push_inst(store);
+
+            store(ctx, ans, i, k, c00.unwrap());
+            if flag_i {
+                store(ctx, ans, i + 1, k, c10.unwrap());
+            }
+            if flag_k {
+                store(ctx, ans, i, k + 1, c01.unwrap());
+            }
+            if flag_i && flag_k {
+                store(ctx, ans, i + 1, k + 1, c11.unwrap());
+            }
+
+            k += 2;
         }
+        i += 2;
     }
-    temp
+    ans
 }
 
-fn accumulate(ctx: &mut AstGenContext, acc: Option<Inst>, diff: Inst) -> Option<Inst> {
-    match acc {
-        None => Some(diff),
+/// dest += l * r
+fn mul_then_acc(ctx: &mut AstGenContext, dest: Option<Inst>, l: Inst, r: Inst) -> Option<Inst> {
+    let mul = ctx.new_local_value().binary(BinaryOp::Mul, l, r);
+    ctx.push_inst(mul);
+    match dest {
+        None => Some(mul),
         Some(acc) => {
-            let add = ctx.new_local_value().binary(BinaryOp::Add, acc, diff);
+            let add = ctx.new_local_value().binary(BinaryOp::Add, acc, mul);
             ctx.push_inst(add);
             Some(add)
         }
     }
 }
 
-fn mul(ctx: &mut AstGenContext, lhs: Inst, rhs: Inst) -> Inst {
-    let mul = ctx.new_local_value().binary(BinaryOp::Mul, lhs, rhs);
-    ctx.push_inst(mul);
-    mul
-}
-
-fn store(ctx: &mut AstGenContext, src: Inst, dest: Inst) {
-    let store = ctx.new_local_value().store(src, dest);
+/// dest[i][k] += src
+fn store(ctx: &mut AstGenContext, dest: Inst, i: usize, k: usize, src: Inst) {
+    let res = tensor_elem_ptr(ctx, dest, vec![i, k].as_slice());
+    let store = ctx.new_local_value().store(src, res);
     ctx.push_inst(store);
 }
-
 fn tensor_for_each_loopify(
     ctx: &mut AstGenContext,
     tensor: Inst,

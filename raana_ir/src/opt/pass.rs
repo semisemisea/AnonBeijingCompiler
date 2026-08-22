@@ -227,6 +227,8 @@ impl PassesManager {
 
         let ipsccp = Box::new(ipsccp::IPSCCP);
         p.register(ipsccp);
+        // let sccp = Box::new(const_prop::SparseConditionConstantPropagation);
+        // p.register(sccp);
 
         let simplify_cfg = Box::new(simplify_cfg::SimplifyCFG);
         p.register(simplify_cfg);
@@ -247,6 +249,15 @@ impl PassesManager {
         let rotate_loops = Box::new(rotate_loops::RotateLoops);
         p.register(rotate_loops);
 
+        // Swap the two innermost loops of perfect i-j-k nests so the new
+        // inner loop accesses contiguous memory (matmul1). AArch64-only: it
+        // exists to unlock loop vectorization and must run after rotation
+        // (the pass consumes the test-at-bottom form).
+        if config.target.enable_chain_to_switch {
+            let loop_interchange = Box::new(loop_interchange::LoopInterchange);
+            p.register(loop_interchange);
+        }
+
         // Collapse zero-initialization loops into a single runtime-length
         // `MemZero` (`bl memset` on AArch64). AArch64-only for now; it runs
         // after rotation so it sees the countdown form.
@@ -262,6 +273,15 @@ impl PassesManager {
             p.register(chain_to_switch);
         }
 
+        // Vectorize innermost exact-trip loops with contiguous 4-byte
+        // accesses (NEON, VF=4, i32/f32). AArch64-only; RISC-V keeps scalar
+        // loops. Runs after chain_to_switch (shaping sees scalar bodies) and
+        // before LICM.
+        if config.target.enable_chain_to_switch {
+            let loop_vectorize = Box::new(loop_vectorize::LoopVectorize::new());
+            p.register(loop_vectorize);
+        }
+
         // Hoist loop-invariant pure expressions to the preheader.
         let licm = Box::new(licm::LICM::with_computed_load_limit(
             config.target.enable_chain_to_switch,
@@ -273,8 +293,8 @@ impl PassesManager {
 
         // Dead store elimination: drops GSP redundant write-backs and
         // covered stores so later passes see a cleaner memory image.
-        let dse = Box::new(dse::DSE);
-        p.register(dse);
+        // let dse = Box::new(dse::DSE);
+        // p.register(dse);
 
         let pointer_sr = Box::new(pointer_strength_reduction::PointerStrengthReduction);
         p.register(pointer_sr);

@@ -1,3 +1,92 @@
+//! # GVN：全局值编号（GlobalInstNumbering）
+//!
+//! 给函数内每个值分配一个**值编号**：结构相同（类型、操作数编号、运算符一致）
+//! 的表达式共享同一编号，后出现的冗余计算被替换为最早的定义（leader）。本
+//! pass 只做函数内**域内完全冗余合并**（CSE 风格），不跨边插入重算——这与
+//! `gvn_pre`（跨边部分冗余消除）互补。术语（SSA / block 参数（Phi）/ 支配 /
+//! GVN 值编号）：见 `docs/offline-handbook/glossary.md`。
+//!
+//! ## 变换形态（IR 示例）
+//!
+//! 同一支配区域内重复出现的表达式只保留一份：
+//!
+//! ```text
+//! %a = add %x, %y        %a = add %x, %y
+//! %d = add %x, %y  →    %d 的所有使用点重写为 %a（含 block 参数实参）；
+//!                       %d 成为死值，留给 DCE 清除
+//! ```
+//!
+//! 跨块同样成立：只要 leader 支配使用者即可（父块的 `add %x, %y` 可替换子块
+//! 里的重复计算，见测试 `reuses_a_parent_block_leader`）。
+//!
+//! ## 触发 / 放弃条件
+//!
+//! `ValueNumbering::number` 把指令映射为 `ValueKey`，据此决定是否可合并：
+//!
+//! - 函数没有入口块（`entry_bb().is_none()`，未完成布局）时直接返回 false；
+//! - **可合并**（`eliminable = true`）：`Integer` / `Float` / `Binary` /
+//!   `Cast` / `Select` / `GetElemPtr`，以及**只读 `Call`**——只有
+//!   `EffectAnalysis::is_removable` 判定 callee 无 I/O、无 timer、无外部写
+//!   时才共享编号；
+//! - **不可合并**（`ValueKey::Identity`，`eliminable = false`）：`Load` /
+//!   `Alloc` / `GlobalAlloc` / `BlockArgRef` / `Aggregate` / `Undef` /
+//!   `ZeroInit` / `Store` / `MemZero` / `Return` / `Jump` / `Branch` /
+//!   `TailCall` / `Fma` / `VectorSplat` / `VectorExtractElement` /
+//!   `VectorInsertElement` / `VectorReduce`；有副作用的 call（如 `getint`）
+//!   同样独占编号——两次调用读不同输入，共享编号会把它们的消费者错误合并；
+//! - **load 按地址指令 CSE**（`ScopedLoadLeaders`），且高度保守：任意
+//!   `Store` / `MemZero` / 可写内存的 `Call` 都触发 `record_store()` 使
+//!   **全部** load leader 失效（may-alias 从宽：任何写都可能命中任何地址）；
+//!   循环头入口也强制失效一次（回边上的循环体可能写任意地址，从 preheader
+//!   或上一轮迭代 CSE 出的 load 会读到旧值）；只读 call 不会清空 load
+//!   leader（写不了内存就不会破坏已 load 的值）；
+//! - **call leader 失效精确化**（`ScopedCallLeaders`）：`Store` / `MemZero`
+//!   用 `targets_of` 求写入目标，按 `call_may_read` 只淘汰读得到该目标的
+//!   callee；兄弟 `Call` 用 `call_read_roots` 与 `call_may_write` 判断其写集
+//!   是否命中 leader 的读集（读集未知则退化为 callee 是否可写内存）；
+//! - 只替换**仍有使用者**的冗余值（`!used_by().is_empty()`），死值留给 DCE。
+//!
+//! ## 正确性
+//!
+//! - **leader 可见性 = 支配**：`ScopedLeaders` / `ScopedLoadLeaders` /
+//!   `ScopedCallLeaders` 三张表按 enter_scope / exit_scope 随支配树 DFS
+//!   进出块（`Visit::Enter` / `Visit::Exit` 工作表），出块弹栈——leader 只在
+//!   其定义块支配的区域内可见，兄弟分支互不串用
+//!   （`uses_dominating_leaders_without_crossing_siblings`）；
+//! - **typed value numbering**：类型参与每个 `ValueKey`，同比特不同型不合并
+//!   （`keeps_cast_result_types_separate`）；浮点**不做**交换律规范化——
+//!   `x + y` 与 `y + x` 整数合并、浮点不合并
+//!   （`commutes_integer_but_not_float_arithmetic`）；
+//! - **操作数规范化**：二元操作数按编号排序（`lhs > rhs` 时），交换律操作经
+//!   `is_commutative_for` 直接换位，比较操作经 `swap_compare_args` 翻向，
+//!   `x < y` 与 `y > x` 归到同一编号（`canonicalizes_swapped_comparisons`）；
+//! - **单轮收敛**：编号按 key 全局记账（`by_key`），传递同余一轮塌缩，
+//!   第二次 `run_on` 返回 false（`eliminates_transitive_congruence_in_one_run`）；
+//! - 替换前断言类型相等（`assert_eq!`），`utils::visit_and_replace` 重写全部
+//!   使用点——包括不可合并指令的实参（TailCall 的参数照常被合并重写，见
+//!   `keeps_tail_calls_unique_and_rewrites_their_arguments`）。
+//!
+//! ## 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，fixpoint 段
+//!   （271 行附近）：`licm` 之后、`dse` **之前**，顺序为 IPSCCP /
+//!   SimplifyCFG / LoopUnroll / RotateLoops / ZeroStoreLoop / ChainToSwitch /
+//!   LICM → **GVN** → DSE / PointerStrengthReduction / GuardElimination /
+//!   ModFold / SR / … / IfConversion / TCO / TailRecursiveInline /
+//!   BooleanSimplification / GVNPRE / DeadPhiElim / DCE；
+//! - 无目标门控、无 config 开关（AArch64 / RISC-V 都跑）；
+//! - 函数级 `EffectAnalysis` 每次 `run_on` 只构建一次：本 pass 只替换值、
+//!   不引入副作用，分析结果全程有效。
+//!
+//! ## 验证
+//!
+//! - 本文件 `mod tests`（文件末尾）覆盖：传递同余单轮收敛、cast 类型隔离、
+//!   整数交换 / 浮点不交换、父块 leader 复用、兄弟块不串用、store 使 load
+//!   leader 失效、副作用 call 不合并、只读 call 合并、写全局阻断 / 写局部
+//!   不阻断 call CSE、只读 call 不使 load leader 失效、TailCall 参数重写、
+//!   比较翻向规范化；
+//! - 端到端：`make test` 差分比对。
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::opt::{
@@ -52,6 +141,10 @@ enum ValueKey {
     Identity {
         ty: Type,
         value: Inst,
+    },
+    VectorSplat {
+        result_ty: Type,
+        src: ValueNumber,
     },
 }
 
@@ -198,10 +291,23 @@ impl<'a> ValueNumbering<'a> {
             | InstKind::Branch(..)
             | InstKind::TailCall(..)
             | InstKind::Fma(..)
-            | InstKind::VectorSplat(..)
             | InstKind::VectorExtractElement(..)
             | InstKind::VectorInsertElement(..)
             | InstKind::VectorReduce(..) => (ValueKey::Identity { ty, value }, false),
+            // A splat is a pure value-to-vector fan-out: `splat(x)` always
+            // yields the same lanes for the same scalar `x`. The scalar is
+            // already numbered by value (Integer) or by identity (Load), so
+            // two splats sharing a scalar definition and vector type are
+            // structurally identical and merge. Loads are non-eliminable, so
+            // a splat-of-load never merges with a different load that a
+            // store intervened between — safe under the leader's dominance.
+            InstKind::VectorSplat(splat) => (
+                ValueKey::VectorSplat {
+                    result_ty: ty,
+                    src: self.number(data, splat.src()).number,
+                },
+                true,
+            ),
         };
 
         let number = *self.by_key.entry(key).or_insert_with(|| {
@@ -368,6 +474,35 @@ impl Pass for GlobalInstNumbering {
         // Function-level effects do not change while this pass runs (GVN
         // only replaces values), so analyze once per invocation.
         let analysis = EffectAnalysis::new(data.program);
+        // A write on any predecessor path of a join is invisible to the
+        // dominance-tree DFS until the sibling arm is processed (children
+        // are pushed in reverse, so the join is visited before the arm that
+        // holds the store). A load in the join could then CSE with a
+        // pre-join leader across the store. Precompute "some predecessor
+        // path contains a write" in RPO (predecessors before successors)
+        // and invalidate load leaders on entry of such blocks
+        // (fuzz: case_0086/0025/0005).
+        let bb_has_write = |data: &ArenaContextMut<'_>, bb: usize| -> bool {
+            data.layout()
+                .basicblock(bb_alloc.search_id(bb))
+                .insts()
+                .iter()
+                .any(|&inst| match data.inst_data(inst).kind() {
+                    InstKind::Store(..) | InstKind::MemZero(..) => true,
+                    InstKind::Call(call) => analysis.effects_of(call.callee()).may_write_memory(),
+                    _ => false,
+                })
+        };
+        let mut pred_path_has_store = FxHashMap::default();
+        for &b in &rpo {
+            let has = predecessors.get(&b).is_some_and(|preds| {
+                preds.iter().any(|&p| {
+                    pred_path_has_store.get(&p).copied().unwrap_or(false)
+                        || bb_has_write(data, p)
+                })
+            });
+            pred_path_has_store.insert(b, has);
+        }
         let mut numbers = ValueNumbering::new(&analysis);
         let mut leaders = ScopedLeaders::new();
 
@@ -404,6 +539,13 @@ impl Pass for GlobalInstNumbering {
                     .any(|&p| rpo_pos.get(&p).is_some_and(|&pi| pi > rpo_pos[&bb_id]))
             });
             if is_loop_header {
+                load_leaders.record_store();
+            }
+            // A write on any predecessor path of this join block invalidates
+            // load leaders: the store may sit between the leader and this
+            // block on some path, but the DFS visits this block before the
+            // store-holding sibling arm (fuzz: case_0086/0025/0005).
+            if pred_path_has_store.get(&bb_id).copied().unwrap_or(false) {
                 load_leaders.record_store();
             }
             let values = data
@@ -496,6 +638,14 @@ impl Pass for GlobalInstNumbering {
                 }
                 let numbered = numbers.number(data, value);
                 if !numbered.eliminable {
+                    continue;
+                }
+                // Skip CSE for GetElemPtr: two memory ops may share an
+                // address expression, but their consumers (vector loads
+                // re-typed by M42, scalar sibling loads) must keep their own
+                // address inst — sharing it lets a later pass rebuild one
+                // consumer from the other's type.
+                if matches!(data.inst_data(value).kind(), InstKind::GetElemPtr(..)) {
                     continue;
                 }
                 // Call leaders are tracked separately so a write can
@@ -998,6 +1148,53 @@ mod tests {
     }
 
     #[test]
+    fn no_load_cse_across_a_store_in_a_sibling_branch() {
+        // Regression: the dominance-tree DFS pushes children in reverse, so
+        // the join block is visited before the store-holding sibling arm; a
+        // load in the join must not CSE with a pre-join leader across the
+        // store (fuzz: case_0086/0025/0005).
+        let mut program = Program::new();
+        let function =
+            program.new_function(Type::get_i32(), "join_store".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let arm_a = data.new_basic_block().basic_block("arm_a".into(), vec![]);
+        let arm_b = data.new_basic_block().basic_block("arm_b".into(), vec![]);
+        let join = data.new_basic_block().basic_block("join".into(), vec![]);
+        for bb in [arm_a, arm_b, join] {
+            data.layout_mut().push_bb_back(bb);
+        }
+        let cond = data.params()[0];
+        let alloc = data.new_local_inst().alloc(Type::get_i32());
+        let load_a = data.new_local_inst().load(alloc);
+        let branch = data.new_local_inst().branch(cond, arm_a, vec![], arm_b, vec![]);
+        for value in [alloc, load_a, branch] {
+            data.layout_mut().insert_inst(entry, value);
+        }
+        let five = data.new_local_inst().integer(5);
+        let store = data.new_local_inst().store(five, alloc);
+        let arm_a_jump = data.new_local_inst().jump(join, vec![]);
+        for value in [five, store, arm_a_jump] {
+            data.layout_mut().insert_inst(arm_a, value);
+        }
+        let arm_b_jump = data.new_local_inst().jump(join, vec![]);
+        data.layout_mut().insert_inst(arm_b, arm_b_jump);
+        let load_b = data.new_local_inst().load(alloc);
+        let ret = data.new_local_inst().ret(Some(load_b));
+        for value in [load_b, ret] {
+            data.layout_mut().insert_inst(join, value);
+        }
+
+        assert!(!GlobalInstNumbering.run(&mut program));
+        let data = program.func_data(function);
+        assert_eq!(
+            return_value(data, join),
+            load_b,
+            "the store in a sibling arm must prevent CSE in the join"
+        );
+    }
+
+    #[test]
     fn keeps_tail_calls_unique_and_rewrites_their_arguments() {
         let mut program = Program::new();
         let function =
@@ -1043,6 +1240,81 @@ mod tests {
         assert_eq!(
             binary_operands(program.func_data(function), result),
             (less, less)
+        );
+    }
+
+    #[test]
+    fn merges_identical_vector_splats() {
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "splat_cse".into(),
+            vec![Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let x = data.params()[0];
+        let v4i32 = Type::get_vector(Type::get_i32(), 4);
+        let splat_a = data.new_local_inst().vector_splat(x, v4i32.clone());
+        let splat_b = data.new_local_inst().vector_splat(x, v4i32.clone());
+        let idx_a = data.new_local_inst().integer(0);
+        let idx_b = data.new_local_inst().integer(0);
+        let lane_a = data.new_local_inst().vector_extract_element(splat_a, idx_a);
+        let lane_b = data.new_local_inst().vector_extract_element(splat_b, idx_b);
+        let sum = data.new_local_inst().binary(BinaryOp::Add, lane_a, lane_b);
+        let ret = data.new_local_inst().ret(Some(sum));
+        for value in [splat_a, splat_b, idx_a, idx_b, lane_a, lane_b, sum, ret] {
+            data.layout_mut().insert_inst(entry, value);
+        }
+
+        assert!(GlobalInstNumbering.run(&mut program));
+        let data = program.func_data(function);
+        assert!(
+            data.inst_data(splat_b).used_by().is_empty(),
+            "the duplicate splat must be replaced and dead"
+        );
+        let InstKind::VectorExtractElement(e_b) = data.inst_data(lane_b).kind() else {
+            panic!("expected vector extract element")
+        };
+        assert_eq!(e_b.src(), splat_a);
+    }
+
+    #[test]
+    fn does_not_merge_splats_of_loads_split_by_store() {
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_i32(), "splat_load".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let v4i32 = Type::get_vector(Type::get_i32(), 4);
+        let alloc = data.new_local_inst().alloc(Type::get_i32());
+        let load_a = data.new_local_inst().load(alloc);
+        let zero = data.new_local_inst().integer(0);
+        let store = data.new_local_inst().store(zero, alloc);
+        let load_b = data.new_local_inst().load(alloc);
+        let splat_a = data.new_local_inst().vector_splat(load_a, v4i32.clone());
+        let splat_b = data.new_local_inst().vector_splat(load_b, v4i32.clone());
+        let idx_a = data.new_local_inst().integer(0);
+        let idx_b = data.new_local_inst().integer(0);
+        let lane_a = data.new_local_inst().vector_extract_element(splat_a, idx_a);
+        let lane_b = data.new_local_inst().vector_extract_element(splat_b, idx_b);
+        let sum = data.new_local_inst().binary(BinaryOp::Add, lane_a, lane_b);
+        let ret = data.new_local_inst().ret(Some(sum));
+        for value in [
+            alloc, load_a, zero, store, load_b, splat_a, splat_b, idx_a, idx_b, lane_a,
+            lane_b, sum, ret,
+        ] {
+            data.layout_mut().insert_inst(entry, value);
+        }
+
+        GlobalInstNumbering.run(&mut program);
+        let data = program.func_data(function);
+        let InstKind::VectorExtractElement(e_b) = data.inst_data(lane_b).kind() else {
+            panic!("expected vector extract element")
+        };
+        assert_eq!(
+            e_b.src(),
+            splat_b,
+            "splats of loads split by a store must not merge"
         );
     }
 }

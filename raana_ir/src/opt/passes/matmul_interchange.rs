@@ -34,6 +34,102 @@
 //! pointer `gep Aroot (0,0) → (0,j)`, and an inner pointer-carrying reduction
 //! `acc += load(Crow[k]) * load(ptr); ptr += row_stride` whose exit block
 //! stores `acc` to `A[i][j]`.
+//!
+//! ---
+//!
+//! ## 补充说明（中文）
+//!
+//! 术语：GEMM（通用矩阵乘）/ 循环交换（loop interchange）/ 行主序
+//! （row-major）/ 栈行缓冲 / BIV / 严格 exit / latch / header / pointee 等见
+//! `docs/offline-handbook/glossary.md`。
+//!
+//! ### 一句话定位与动机
+//!
+//! many_mat_cal 热点 `A[i][j] = Σ_k C[i][k] * A[k][j]`（就地矩阵乘）的循环
+//! 交换 pass：把 i-j-k 顺序换成 i-k-j + 栈行缓冲。动机：原内层 k 循环每次
+//! 迭代通过一个跨 `row_stride` 元素（4096 字节）步进的列指针读 `A[k][j]`，
+//! 每个 load 都 miss 缓存；交换后最内层是固定 k 的一整行连续读（行主序），
+//! 且结果行先在栈上缓冲累积、整行一次写回。
+//!
+//! ### 变换形态
+//!
+//! 具体 IR 形状见上文英文图，此处仅补充实现要点：每个 i 迭代在 i 循环体
+//! （算 `Crow` 的块）里 `alloc` 一个 `[i32; T]` 栈行缓冲并
+//! `mem_zero(buf, T*4)` 零化一次；k 循环体里算 `cik = load C[i][k]`（提出
+//! j 循环，经 j header 参数携带）；最内层 j 循环做 `buf[j] += cik * A[k][j]`；
+//! k 循环结束后由 writeback 循环（`mm_wb_header` / `mm_wb_body`）把整行
+//! `A[i][j] = buf[j]` 连续写回，再进 i latch。实现共新建 8 块
+//! （`mm_k_header` / `mm_k_body` / `mm_k_exit` / `mm_j_header` / `mm_j_body`
+//! / `mm_j_latch` / `mm_wb_header` / `mm_wb_body`），移除旧 j/k 共 5 块。
+//!
+//! ### 触发条件（`find_candidate`）
+//!
+//! 纯结构识别（不匹配名字 / 基准），需同时满足：
+//!
+//! - **三层嵌套与共享边界**：k 是 j 的内层、j 是 i 的内层（按
+//!   `LoopAnalysis` 父子关系）；三循环的严格 exit 共享同一个
+//!   `bound`（`k_exit.bound() == j_exit.bound() == i_bound`）；i / j / k 的
+//!   IV 都前向、步长 1；
+//! - **i IV 取结构偏移**：`crow = gep Croot (0,i)` 的第二偏移必须是 i
+//!   header 的参数（i 回边经 `BlockArgRef` 穿值时 BIV 会失效，故不依赖
+//!   BIV 而取 GEP 偏移）；
+//! - **k 循环是纯指针携带归约**：header 恰好 3 个参数（k IV / i32 累加器
+//!   `acc` / 指针 `ptr`）；循环体 2 块、单 latch 且 latch 无参数；回边是
+//!   `ptr' = getelemptr ptr, const_stride`（`stride` 为正值常量）与
+//!   `acc' = add acc, mul(load(Crow[k]), load(ptr))`；循环体纯净（无 store /
+//!   call / tailcall / memzero / globalalloc），`acc` 不被循环体其它指令使用；
+//! - **j 循环形状**：单 BIV、单 latch；循环体内（非 header / latch、不在 k
+//!   循环内）恰好有一块以 `jump k_header` 结尾——即构造列指针
+//!   `gep Aroot (0,0) → (0,j)` 的块；j latch 里 `store acc → gep Arow (0,j)`；
+//! - **行缓冲尺寸与根约束**：`Arow = gep Aroot (0,i)`；`row_length`（Arow
+//!   pointee 数组元素数，即行缓冲大小 `T`）必须等于指针步长 `stride`；
+//!   `Croot != Aroot`。注意循环迭代上界是共享的运行期 `bound`，`T` 只决定
+//!   缓冲分配大小（字节数 `T*4`）。
+//!
+//! ### 放弃条件
+//!
+//! 上述任一检查不满足即 `return None`（`find_candidate` 逐项检查；典型拒绝
+//! 如：k header 参数数 ≠ 3、回边不是常量正步长 GEP、归约不是
+//! `add acc, mul(load,load)` 形态、三循环 bound 不一致、j latch 里找不到
+//! `store acc → A[i][j]`、C / A 同根、`row_length` 不可求或 ≠ stride）。
+//! `run_on` 层面：声明块（`data.layout().is_decl()`）与非循环 CFG
+//! （`cfg.is_acyclic()`）直接跳过；每轮 `run_on` 应用**一个**候选后即返回
+//! true，剩余候选交给 fixpoint 下一轮。
+//!
+//! ### 正确性要点（就地乘法的别名）
+//!
+//! 写 `A[i][j]` 的同时要读 `A[k][j]`，逐 i 迭代论证：
+//!
+//! - `k < i`：第 k 行已被更早的 i 迭代完整写回，改写后从 A 读到的状态与
+//!   原 i-j-k 顺序完全一致（i 外层顺序不变）；
+//! - `k == i`：累加行 i 尚未写回——缓冲要等整个 k 循环结束才 spill，
+//!   `A[i][j]` 仍是旧值，正是原文 `k == i` 项（`C[i][i] * A[i][j]`）需要的读；
+//! - `k > i`：尚未触碰的旧行。
+//!
+//! 因此**栈行缓冲是必要的**：若边算边把部分和写进 `A[i][j]`，`k == i` 及
+//! 其后的读会被本轮结果污染，k 循环就再也读不到旧值。每个 `(i, j)` 对按 k
+//! 的累加顺序不变，i32 溢出语义逐位保持。
+//!
+//! ### 管线位置与门控
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，fixpoint 段
+//!   （`p.register`），`sr` 之后、`invariant_reduction_hoisting` 之前；
+//! - 顺序理由（pass.rs 注册点注释）：`sr` 先把直接的 `A[k][j]` 索引降为
+//!   指针携带的内层归约（本 pass 识别器依赖该形态），故在 `sr` 之后；
+//!   `invariant_reduction_hoisting` 会把外层 trip 循环退化为每轮一条
+//!   `acc += D_total`，故本 pass 必须在其之前看到原始的 i-j-k 嵌套；
+//! - 门控：`config.target.enable_chain_to_switch`——仅 AArch64 启用，RISC-V
+//!   不注册；无独立 config 开关 / CLI 选项。
+//!
+//! ### 验证
+//!
+//! - 本文件 `mod tests`（768 行起）：`interchanges_the_matmul_nest` 手工构造
+//!   many_mat_cal 嵌套，断言返回 true、块数 +8 −5、`mm_k_header` /
+//!   `mm_j_header` / `mm_wb_header` 存在、旧 j/k 块被移除；
+//!   `is_idempotent_on_a_second_run` 断言重跑不再命中（新 i-k-j 形态不匹配
+//!   识别器）；
+//! - 端到端：`make test` 差分比对（见项目根 AGENTS.md）；本地快速回归
+//!   `cargo test -p raana_ir`。
 
 use itertools::Itertools;
 
@@ -83,6 +179,11 @@ impl MatmulInterchange {
         loop_analysis: &LoopAnalysis,
         k_loop: &Loop,
     ) -> Option<Candidate> {
+        // 形态识别（M58）：三层嵌套 i-j-k 的 GEMM。自内向外逐层验证——
+        // 先识别内层 k 循环（指针携带的归约：acc += C[k]*A[k]，ptr 按常量
+        // 步长推进），再确认中层 j 循环（body 构建列指针跳入 k 循环），
+        // 最后是外层 i 循环（C 行/A 行的 (0,i) 偏移，三者共享同一 bound）。
+        // 全部命中才改写（宁漏勿错），把 i-j-k 交换为 i-k-j + 行缓冲。
         // ---- inner k loop: a pointer-carrying reduction ----
         let k_header = k_loop.header();
         if k_loop.body().len() != 2 || k_loop.latches().len() != 1 {
@@ -367,6 +468,13 @@ impl MatmulInterchange {
     }
 
     fn apply(data: &mut ArenaContextMut<'_>, cand: &Candidate) -> bool {
+        // 改写（M58）：生成新嵌套 i → (k 循环 → j 循环) → wb 写回循环。
+        // 结构：i_body 里 alloc+mem_zero 行缓冲 → 跳 k_header；k_header(k)
+        // 读 C[k] 与 A 行指针 arow_k 后跳 j_header；j_header(j) 内层做
+        // buf[j] += cik * A[k][j]；j_latch 推进 k；k_exit 跳 wb_header；
+        // wb 循环把 buf 整行写回 A[i][j]；最后删掉旧 j/k 块并修复 i-latch
+        // 的悬空参数。关键正确性：行缓冲写回发生在 k 循环结束后（见模块
+        // 文档的 k<i / k==i / k>i 逐项论证，Mout==M2 别名场景）。
         let i32_ty = Type::get_i32();
         let zero = data.new_local_value().integer(0);
         let one = data.new_local_value().integer(1);
@@ -414,6 +522,10 @@ impl MatmulInterchange {
         }
 
         // ---- the row buffer (zeroed once per i) ----
+        // 每轮 i 分配一个零初始化的栈行缓冲（A 的一行），k 循环把部分和
+        // 累加进缓冲而不是直接写 A[i][j]：改写后 A[i][j] 在 k 循环结束前
+        // 保持旧值，k==i 项（C[i][i]*A[i][j]）与 k>i 的旧行读才能拿到
+        // 原语义的值。k 循环结束后整行一次写回（wb 循环）。
         let buf = data.new_local_value().alloc(buf_ty);
         let mz = data.new_local_value().mem_zero(buf, cand.row_len * 4);
         data.layout_mut().insert_before_terminator(i_body, buf);

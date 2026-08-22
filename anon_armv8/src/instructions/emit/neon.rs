@@ -1,13 +1,14 @@
 //! Emission for NEON and scalar floating-point instructions.
 
+use taki_mir::reg_alloc::reg::RegClass;
 use taki_mir::vcode::EmitContext;
 
 use crate::regs::OperandSize;
 
 use super::super::{
-    MInst, emit_float_reg, emit_float_rr, emit_float_rrr, emit_fmov, emit_reg, emit_vec_reg,
-    emit_vec_rrr, emit_vec_scalar_reg, fpu_name, vec_arith_name, vec_bit_name, vec_cmp_name,
-    vec_cvt_name, vec_minmax_name,
+    MInst, VecShape, emit_float_reg, emit_float_rr, emit_float_rrr, emit_fmov, emit_reg,
+    emit_vec_reg, emit_vec_rrr, emit_vec_scalar_reg, fpu_name, vec_arith_name, vec_bit_name,
+    vec_cmp_name, vec_cvt_name, vec_minmax_name, vec_mla_name, vec_shift_name,
 };
 
 pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result {
@@ -38,7 +39,24 @@ pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result
             write!(ctx, "dup ")?;
             emit_vec_reg(ctx, dst.to_reg())?;
             write!(ctx, ".{}, ", shape.arrangement())?;
-            emit_vec_scalar_reg(ctx, *src, *shape)
+            // A float scalar source is read through the aliased vector
+            // register (`sN` is the low 32 bits of `vN`): LLVM MC rejects
+            // `dup vd.4s, sn`; the accepted form is the element form
+            // `dup vd.4s, vn.s[0]` (clang emits the same for vdupq_n_f32).
+            // f32 scalars are Vector-class vregs (sN ≡ vN lane 0), so the
+            // element form covers both the old Float-class pins and the
+            // current Vector-class allocations.
+            match src.to_real_reg() {
+                Some(preg) if matches!(preg.class(), RegClass::Float | RegClass::Vector) => {
+                    write!(
+                        ctx,
+                        "v{}.{}[0]",
+                        preg.hw_enc(),
+                        if *shape == VecShape::TwoD { "d" } else { "s" }
+                    )
+                }
+                _ => emit_vec_scalar_reg(ctx, *src, *shape),
+            }
         }
         MInst::VecArithRRR {
             op,
@@ -144,7 +162,14 @@ pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result
             lane,
         } => {
             write!(ctx, "mov ")?;
-            emit_reg(ctx, dst.to_reg(), *size)?;
+            // The extracted scalar is a GPR (i32/i64) or an f32 in a
+            // Vector-class register (`sN`); render the scalar side by class.
+            match dst.to_reg().to_real_reg() {
+                Some(preg) if matches!(preg.class(), RegClass::Float | RegClass::Vector) => {
+                    emit_float_reg(ctx, dst.to_reg(), *size == OperandSize::Size64)?;
+                }
+                _ => emit_reg(ctx, dst.to_reg(), *size)?,
+            }
             write!(ctx, ", ")?;
             emit_vec_reg(ctx, *src)?;
             write!(
@@ -183,7 +208,14 @@ pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result
                 },
                 lane
             )?;
-            emit_reg(ctx, *src, *size)
+            // The inserted scalar is a GPR (i32/i64) or an f32 in a
+            // Vector-class register (`sN`); render the scalar side by class.
+            match src.to_real_reg() {
+                Some(preg) if matches!(preg.class(), RegClass::Float | RegClass::Vector) => {
+                    emit_float_reg(ctx, *src, *size == OperandSize::Size64)
+                }
+                _ => emit_reg(ctx, *src, *size),
+            }
         }
         MInst::VecMinMax {
             op,
@@ -192,6 +224,111 @@ pub(crate) fn emit(inst: &MInst, ctx: &mut dyn EmitContext) -> core::fmt::Result
             lhs,
             rhs,
         } => emit_vec_rrr(ctx, vec_minmax_name(*op), *dst, *shape, *lhs, *rhs),
+        MInst::VecShift {
+            op,
+            shape,
+            dst,
+            lhs,
+            rhs,
+            imm,
+        } => {
+            let is_reg = imm.is_none();
+            write!(ctx, "{} ", vec_shift_name(*op, is_reg))?;
+            emit_vec_reg(ctx, dst.to_reg())?;
+            write!(ctx, ".{}, ", shape.arrangement())?;
+            emit_vec_reg(ctx, *lhs)?;
+            write!(ctx, ".{}, ", shape.arrangement())?;
+            match imm {
+                Some(imm) => write!(ctx, "#{imm}"),
+                None => {
+                    emit_vec_reg(ctx, *rhs)?;
+                    write!(ctx, ".{}", shape.arrangement())
+                }
+            }
+        }
+        MInst::VecDiv {
+            shape,
+            dst,
+            lhs,
+            rhs,
+        } => {
+            write!(ctx, "fdiv ")?;
+            emit_vec_reg(ctx, dst.to_reg())?;
+            write!(ctx, ".{}, ", shape.arrangement())?;
+            emit_vec_reg(ctx, *lhs)?;
+            write!(ctx, ".{}, ", shape.arrangement())?;
+            emit_vec_reg(ctx, *rhs)?;
+            write!(ctx, ".{}", shape.arrangement())
+        }
+        MInst::VecNeg { shape, dst, src } => {
+            write!(ctx, "neg ")?;
+            emit_vec_reg(ctx, dst.to_reg())?;
+            write!(ctx, ".{}, ", shape.arrangement())?;
+            emit_vec_reg(ctx, *src)?;
+            write!(ctx, ".{}", shape.arrangement())
+        }
+        MInst::VecBitwiseNot { dst, src } => {
+            write!(ctx, "mvn ")?;
+            emit_vec_reg(ctx, dst.to_reg())?;
+            write!(ctx, ".16b, ")?;
+            emit_vec_reg(ctx, *src)?;
+            write!(ctx, ".16b")
+        }
+        MInst::VecMla {
+            op,
+            shape,
+            dst,
+            acc,
+            lhs,
+            rhs,
+        } => {
+            if dst.to_reg() != *acc {
+                write!(ctx, "mov ")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".16b, ")?;
+                emit_vec_reg(ctx, *acc)?;
+                write!(ctx, ".16b")?;
+                ctx.end_inst()?;
+            }
+            write!(ctx, "{} ", vec_mla_name(*op))?;
+            emit_vec_reg(ctx, dst.to_reg())?;
+            write!(ctx, ".{}, ", shape.arrangement())?;
+            emit_vec_reg(ctx, *lhs)?;
+            write!(ctx, ".{}, ", shape.arrangement())?;
+            emit_vec_reg(ctx, *rhs)?;
+            write!(ctx, ".{}", shape.arrangement())
+        }
+        MInst::VecSMull {
+            high,
+            dst,
+            lhs,
+            rhs,
+        } => {
+            write!(ctx, "{} ", if *high { "smull2" } else { "smull" })?;
+            emit_vec_reg(ctx, dst.to_reg())?;
+            write!(ctx, ".2d, ")?;
+            emit_vec_reg(ctx, *lhs)?;
+            write!(ctx, ".{}, ", if *high { "4s" } else { "2s" })?;
+            emit_vec_reg(ctx, *rhs)?;
+            write!(ctx, ".{}", if *high { "4s" } else { "2s" })
+        }
+        MInst::VecNarrow { high, dst, acc, src } => {
+            if *high {
+                write!(ctx, "mov ")?;
+                emit_vec_reg(ctx, dst.to_reg())?;
+                write!(ctx, ".16b, ")?;
+                emit_vec_reg(ctx, *acc)?;
+                write!(ctx, ".16b")?;
+                ctx.end_inst()?;
+            }
+            // `xtn vd.2s, vn.2d` writes the low half (narrowed lane
+            // count); `xtn2 vd.4s, vn.2d` writes the upper half.
+            write!(ctx, "{} ", if *high { "xtn2" } else { "xtn" })?;
+            emit_vec_reg(ctx, dst.to_reg())?;
+            write!(ctx, ".{}, ", if *high { "4s" } else { "2s" })?;
+            emit_vec_reg(ctx, *src)?;
+            write!(ctx, ".2d")
+        }
         MInst::FMovFromZero { dst } => {
             write!(ctx, "fmov ")?;
             emit_float_reg(ctx, dst.to_reg(), false)?;

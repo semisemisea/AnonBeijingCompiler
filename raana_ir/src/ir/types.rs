@@ -144,10 +144,33 @@ impl Type {
         matches!(self.0.as_ref(), TypeKind::Vector(..))
     }
 
+    pub fn is_tensor(&self) -> bool {
+        self.is_array() || (self.is_pointer() && self.derefernce().is_array())
+    }
+
     pub fn get_array_info(&self) -> (Type, usize) {
         match self.0.as_ref() {
             TypeKind::Array(base, len) => (base.clone(), *len),
             _ => panic!("{self} is not an array"),
+        }
+    }
+
+    pub fn get_array_shape(&self) -> Vec<usize> {
+        assert!(self.is_array());
+        let mut ty = self.0.clone();
+        let mut ret = vec![];
+        loop {
+            let bt;
+            match ty.as_ref() {
+                TypeKind::Array(base_ty, len) => {
+                    bt = base_ty;
+                    ret.push(*len);
+                }
+                _ => {
+                    return ret;
+                }
+            }
+            ty = bt.0.clone();
         }
     }
 

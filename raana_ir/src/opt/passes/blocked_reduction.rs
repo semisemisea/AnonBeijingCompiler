@@ -33,6 +33,111 @@
 //! `ptr0..ptr3` (`ptr_l` starts at `base + l*stride`, steps `4*stride`); the
 //! scalar epilogue re-enters the original header at `k = bound & ~3`,
 //! `ctr = bound & 3`, `acc = acc_in + Σ lanes`, `ptr = lane0's ptr`.
+//!
+//! ---
+//!
+//! ## 补充说明（中文）
+//!
+//! 术语：header / latch / preheader / backedge / trip count / test-at-bottom /
+//! 归纳变量（IV）/ 固定点 / 支配 / 掩码 等见
+//! `docs/offline-handbook/glossary.md`（"循环"与"优化与 pass 概念"分组）。
+//!
+//! ### 一句话定位
+//!
+//! 寄存器分块（register blocking）矩阵归约 pass：把 stride 访存的 msub 归约
+//! 环 `acc -= A[i][k] * B[k][j]` 改写成 4 路累加器 + 4 路列指针的主循环，让
+//! `k, k+1, k+2, k+3` 的列加载背靠背发射、互相掩盖缓存缺失延迟（in-order
+//! Cortex-A53 上串行 `msub` 依赖链也一并断开）。面向 h-5 / matmul 热点
+//! （M67，见 `TODO.md`：h-5 QEMU 7.16s → 4.49s）；只命中这一形态，宁漏勿错。
+//!
+//! ### 变换形态
+//!
+//! 英文示例即 `rotate_loops` 产出的 test-at-bottom 倒数式原环（header 只
+//! `jump body`，latch 里 `br ctr2, header, exit`），不重复。改写后：
+//!
+//! ```text
+//! preheader:           jump blocked_guard
+//! blocked_guard:       br bound >= 4, blocked_main_header, header(原实参)
+//! blocked_main_header: jump blocked_main_body
+//! blocked_main_body:   4 条车道：acc_l / ptr_l 各 4 份；k 取 k_m+0..3
+//!                      br ctr_m-4, blocked_main_header, blocked_main_exit
+//! blocked_main_exit:   acc_final = acc_in + Σ acc_l; ctr_final = bound & 3
+//!                      br ctr_final, header(尾参), exit(重建实参)
+//! ```
+//!
+//! 主循环参数布局 `[acc0..acc3, k_m, ctr_m, ptr0..ptr3, pt...]`
+//! （`main_block_types`）。车道 l 的列指针初值 `ptr_in + l*stride`、每轮步进
+//! `4*stride`（`stride4`），即车道 l 依次访问 `k = l, l+4, l+8, ...`。
+//!
+//! ### 触发 / 放弃条件
+//!
+//! `run_on` 先排除 decl（`layout().is_decl()`）和无环 CFG（`cfg.is_acyclic()`）；
+//! `find_candidate` 对每个循环做 (a)-(h) 逐项检查，任一不满足即放弃：
+//!
+//! - 形状 (a)-(b)：恰好 2 块的循环（header + 唯一 latch，即循环体）；header
+//!   终结符是 `jump`（test-at-bottom）；latch 的 `branch` 一条臂回 header、
+//!   另一条臂出循环；
+//! - 参数角色 (c)：header 参数逐个对照回边实参——`ctr-1`
+//!   （`BinaryOp::Sub`、右操作数常量 1）、`k+1`（`BinaryOp::Add` + 常量 1）、
+//!   `acc - X`（`X` 是 `Mul`）、`get_elem_ptr(ptr, ...)`；其余必须纯透传
+//!   （实参 == 参数本身）。四个角色缺一不可，出现其它更新形态即放弃；
+//! - (d) `branch.cond()` 必须是 `ctr` 的更新值（倒数计数器在底部被测试）；
+//! - (e) 累加更新必须是 `acc - mul(row_load, col_load)`：两操作数都是 `load`；
+//!   `col` 的 GEP 基址是 `ptr_param`；`row` 的 GEP 偏移含 `k_param` 且基址
+//!   定义在循环外（循环内定义基址即放弃）；
+//! - (f) `ptr_back` 必须是恰好一个常量偏移的 `get_elem_ptr`
+//!   （`constant_offset`），由此提取 `stride`；
+//! - (g) 循环体（除终结符）不得含 `Store` / `Call` / `TailCall` / `MemZero` /
+//!   `GlobalAlloc`（有副作用即放弃）；
+//! - (g2) 原循环 exit 边的每个实参必须是透传值、`k_back` 或 `acc_back` 之一
+//!   ——主循环出口必须能重建它们（`apply` 里重建失败是 `unreachable!`）；
+//! - (h) trip bound 取 `ctr` 的入口初值（`init_arg`，恰好一条非回边提供），
+//!   且必须支配循环入口（`dominates_loop_entry`：全局 / 常量 / 严格支配
+//!   header 的块内定义）——版本化 guard 在 preheader 里要读它；
+//! - `apply` 还要求恰好一个循环外前驱（`ensure_preheader`）锚定版本化块。
+//!
+//! ### 正确性要点
+//!
+//! - 主循环迭代数 = `bound & ~3`（`masked`），guard `bound >= 4` 保证至少跑
+//!   一轮；`ctr_m` 每轮减 4、在底部测试（镜像原环的 test-at-bottom 语义）；
+//! - 余数 `bound & 3` 由原环承接：`blocked_main_exit` 里
+//!   `br ctr_final, header(尾参), exit(重建实参)`——余数非零重进原环、为零直跳
+//!   exit。不能无条件重进：原环是 test-at-bottom，`ctr = 0` 重进会多跑一次
+//!   迭代（英文注释 510-515 行同款论证）；
+//! - 车道初值 `acc_l = 0`，各自累积自己的 k 切片乘积；出口
+//!   `acc_final = acc_in + Σ acc_l` 与原环 `acc -= Σ A[k]*B[k]` 一致；k 的
+//!   最终值 `bound & ~3` 交给标量尾循环继续；
+//! - 透传参数逐位搬运进主循环（`pt...`）；exit 实参按 `k_back`→最终 k、
+//!   `acc_back`→`acc_final`、透传→主循环参数重建；
+//! - `BlockLaneMapper` 克隆循环体：`k_param`→`k_m + lane`、`acc_param`→车道
+//!   参数、`ptr_param`→车道指针；循环外定义的不变值共享不克隆（SSA 引用仍
+//!   合法）；单块纯循环体不可能引用其它块（`map_block` 直接 panic）。
+//!
+//! ### 管线位置与门控
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，fixpoint 段，
+//!   `reduction_unroll` **之后**、`if_conversion` 之前。`reduction_unroll`
+//!   处理纯 `acc += a[j]` 形态（4 路拆分打断串行链），本 pass 处理带列指针的
+//!   stride 形态，两者互补；命中形态由上游 `rotate_loops`（test-at-bottom
+//!   countdown 化）、`pointer_strength_reduction`（列指针携带）等产出，
+//!   同热点链上的 `matmul_interchange`（AArch64 门控）负责 GEMM 内层交换；
+//! - 门控：`config.blocked_reduction`，默认开启（`opt/config.rs`），CLI
+//!   `--enable-blocked-reduction` / `--disable-blocked-reduction`
+//!   （`soyo_compiler/src/cli.rs`）做 A/B 测量；**无目标门控**（AArch64 /
+//!   RISC-V 都跑，收益在 AArch64 上体现）；
+//! - 一次 `run_on` 只改写一个循环：循环分析（`LoopAnalysis::from_cfg`）是
+//!   快照，改写后立即失效，返回 true 交给 fixpoint 基于新状态重跑
+//!   （`run_passes`，最多 100 轮）。
+//!
+//! ### 验证
+//!
+//! - 本文件 `mod tests`（765 行起）：
+//!   `blocks_a_bound_eight_countdown_reduction`（bound = 8 命中：块数 +4、
+//!   guard 存在且以 branch 终结）、`leaves_a_two_trip_countdown_loop_alone`
+//!   （bound = 2 < 4：pass 仍改写、guard 恒走原环、块数同样 +4）；
+//! - 全量：`cargo test -p raana_ir`（236 个单测）；端到端 `make test
+//!   ARGS="-O 2"`（Docker harness）。M67 记录：h-5 QEMU 7.16s → 4.49s
+//!   （-37%），输出逐字节一致。
 
 use rustc_hash::FxHashMap;
 
@@ -112,6 +217,19 @@ impl BlockedReduction {
         _loop_analysis: &LoopAnalysis,
         looop: &Loop,
     ) -> Option<Candidate> {
+        // 形态识别（M67）：目标是被 rotate_loops/PSR 预处理过的"倒数式
+        // countdown 归约环"——test-at-bottom、ctr 递减、acc 累加
+        // row*col 乘积。识别分 8 步 (a)-(h)，全部命中才改写（宁漏勿错）：
+        //   (a) 两块循环：header + 唯一 body（latch）；
+        //   (b) header 直落 body，body 以 countdown 计数器分支回退/退出；
+        //   (c) header 参数按回边实参分类：k(+1) / acc(-mul) / ctr(-1) /
+        //       ptr(GEP) / 纯 pass-through；
+        //   (d) 分支条件 = ctr 的更新；
+        //   (e) acc 更新是 acc - mul(row_load(k), col_load(ptr))；
+        //   (f) 列指针步长是编译期常量；
+        //   (g) body 无 store/call；
+        //   (g2) 退出实参必须可重建（pass-through / k_back / acc_back）；
+        //   (h) trip bound 是 ctr 初值且支配循环入口（守卫可读）。
         // (a) A two-block loop: header plus a single pure body block (latch).
         if looop.body().len() != 2 || looop.latches().len() != 1 {
             return None;
@@ -295,6 +413,8 @@ impl BlockedReduction {
 
         // (h) The trip bound is `ctr`'s initializer and must dominate the loop
         // entry so the versioning guard in the preheader can read it.
+        // 守卫必须在 preheader 里读 bound 做版本化（bound>=4 才进主循环），
+        // 所以 bound 必须支配循环入口；否则（如 bound 是循环内算的）保守拒绝。
         let bound = init_arg(data, cfg, looop, header, ctr_param)?;
         if !dominates_loop_entry(data, dom_tree, looop, bound) {
             return None;
@@ -357,6 +477,9 @@ impl BlockedReduction {
         let ptr_in = orig_args[ptr_idx];
 
         let pt_count = cand.passthroughs.len();
+        // 主循环参数布局：4 路 acc + k_m + ctr_m + 4 路列指针 + pass-through。
+        // 用 4 路累加器打破 acc -= row*col 的串行依赖链（每轮 4 个乘积可
+        // 并行），这是 M67 收益的核心（h-5-01 -37%）。
         let main_arg_count = UNROLL_FACTOR * 2 + 2 + pt_count;
         let main_types = main_block_types(data, cand);
         let version = data
@@ -384,6 +507,10 @@ impl BlockedReduction {
         let pt_start = UNROLL_FACTOR * 2 + 2;
 
         // ---- versioning block: guard bound >= 4 ----
+        // 版本化：bound >= 4 走 4 路主循环，否则（bound < 4）原样进原循环
+        // 头。主循环的 ctr 从 bound & ~3 起步（4 的倍数），列指针按 stride
+        // 错开 4 路（lane 0 用原始 ptr_in，其余加 lane*stride 偏移），
+        // 保证 4 路各自读不同的列。
         let zero = data.new_local_value().integer(0);
         let four = data.new_local_value().integer(4);
         let neg_four = data.new_local_value().integer(-4);
@@ -513,6 +640,11 @@ impl BlockedReduction {
         // jump straight to the original exit (the original loop is test-at-
         // bottom, so re-entering the header with a zero counter would run one
         // extra iteration). ----
+        // 主循环出口：把 4 路 acc 相加（两两相加成树形）再加上 acc_in 得
+        // 最终值。余数 ctr_final = bound & 3：非零则余数分支重新进入原
+        // header（跑完剩余 1-3 轮）；为零则直接跳原 exit——原循环是
+        // test-at-bottom（do-while），ctr 归零再进 header 会多跑一轮。
+        // 这是 M67 修复过的 off-by-one 正确性要点。
         let s01 = data.new_local_value().binary(
             BinaryOp::Add,
             exit_params[acc_start],

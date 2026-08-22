@@ -1,0 +1,12 @@
+[Unit]
+Description=Soyo benchmark service
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/soyo-benchd --host 0.0.0.0 --port 8766
+Restart=on-failure
+User=charlie
+CPUAffinity=0 1 2 3
+
+[Install]
+WantedBy=multi-user.target

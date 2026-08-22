@@ -207,6 +207,57 @@ pub(super) fn lower_const_mem_zero(
         }
         return LoweredOutput::None;
     }
+    // Vector-batched inline zeroing for small compile-time sizes (16-128B,
+    // multiples of 16): `movi v0.4s,#0` + one 16B `st1` per block replaces a
+    // `bl memset` call. This is cheaper than a call for sizes below the
+    // runtime `memset`/`memzero` setup cost (the crypto-1 `words[80]={0}`
+    // 320B case stays a call; the hot per-block `words[80]` under the sha1
+    // loop is 320B too, so the vector path targets the smaller locals).
+    if byte_len % 16 == 0 && byte_len <= 128 {
+        let alloc = matches!(arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
+            .then_some(mem_zero.dest());
+        let (dest, stack_offset) = if let Some(alloc) = alloc {
+            let pointee = arena.inst_data(alloc).ty().derefernce();
+            let offset = i64::from(ctx.alloc_stackslot_or_get(alloc, pointee));
+            (
+                ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32())),
+                Some(offset),
+            )
+        } else {
+            (ctx.put_value_in_reg(mem_zero.dest()), None)
+        };
+        if let Some(offset) = stack_offset {
+            ctx.emit(<AArch64Abi as ABIMachineSpec>::gen_get_stack_addr(
+                StackAMode::Slot(offset),
+                Writable::from_reg(dest),
+            ));
+        }
+        let vzero = ctx.alloc_tmp(HirType::get_vector(HirType::get_i32(), 4));
+        ctx.emit(MInst::VecMovImm {
+            shape: VecShape::FourS,
+            dst: Writable::from_reg(vzero),
+            imm: 0,
+            shift: 0,
+        });
+        let mut base = dest;
+        for _ in 0..(byte_len / 16) {
+            ctx.emit(MInst::VecSt1 {
+                src: vzero,
+                base,
+            });
+            // Advance the base by one 16B block.
+            let next = ctx.alloc_tmp(HirType::get_pointer(HirType::get_i32()));
+            ctx.emit(MInst::AluRRImm12 {
+                op: AluOp::Add,
+                size: OperandSize::Size64,
+                dst: Writable::from_reg(next),
+                src: base,
+                imm: Imm12::new(16, false).unwrap(),
+            });
+            base = next;
+        }
+        return LoweredOutput::None;
+    }
 
     let alloc = matches!(arena.inst_data(mem_zero.dest()).kind(), InstKind::Alloc)
         .then_some(mem_zero.dest());
@@ -429,10 +480,15 @@ pub(super) fn memory_address(
     AMode::Reg { base: address }
 }
 
-/// Fold a single-use constant GEP into a `(base, offset)` pair whose offset is
+/// Fold a constant GEP into a `(base, offset)` pair whose offset is
 /// encodable in AArch64 load/store addressing for `width`-byte accesses.
-/// Returns `None` for dynamic-index GEPs, unencodable offsets, or multi-user
-/// GEPs; callers then materialize the address as before.
+/// Returns `None` for dynamic-index GEPs or unencodable offsets; callers then
+/// materialize the address as before.
+///
+/// Unlike the single-use variant, the GEP may be shared by several loads and
+/// stores (e.g. a 2x-unrolled vectorizer continuation GEP consumed by both the
+/// unrolled vector load and its paired store): every memory user folds it into
+/// its own addressing mode, so the producer is never materialized.
 pub(super) fn try_fold_gep_offset(
     ctx: &mut LowerContext<'_, MInst>,
     arena: ArenaContext<'_>,
@@ -440,7 +496,7 @@ pub(super) fn try_fold_gep_offset(
     consumer: HirInst,
     width: u8,
 ) -> Option<(taki_mir::register::Reg, i64)> {
-    fold_gep_constant_offset(ctx, arena, gep, consumer, |off| {
+    fold_gep_constant_offset_shared(ctx, arena, gep, consumer, |off| {
         crate::instructions::UImm12Scaled::new(off as u64, width).is_some()
             || i16::try_from(off)
                 .ok()

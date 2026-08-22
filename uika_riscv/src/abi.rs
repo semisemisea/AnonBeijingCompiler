@@ -708,5 +708,7 @@ fn create_reg_environment() -> MachineEnv {
         fixed_stack_slots: vec![],
         scratch_by_class: [Some(px_reg(31)), None, None],
         post_ra_scratch_by_class: [vec![px_reg(30), px_reg(31)], vec![], vec![]],
+        // RISC-V FP (`f0`-`f31`) and RVV (`v0`-`v31`) are distinct banks.
+        aliased_banks: &[],
     }
 }

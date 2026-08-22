@@ -1,0 +1,11 @@
+int probe(int p[][600], int row, int col) {
+    p[row][col] = 11;
+    p[0][3] = 7;
+    p[1][0] = 5;
+    return p[row][col] + p[0][3] + p[1][0];
+}
+
+int main() {
+    int a[2][600];
+    return probe(a, 1, 2) - 23;
+}

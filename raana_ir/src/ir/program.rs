@@ -101,6 +101,14 @@ impl Program {
         self.main_function.unwrap()
     }
 
+    /// Whether a `main` function was declared. Passes that require an entry
+    /// point (e.g. IPSCCP's ICFG worklist) call [`Self::get_main_function`]
+    /// which panics without one; empty compilation units (empty source,
+    /// declarations only) must be rejected before reaching them.
+    pub fn has_main(&self) -> bool {
+        self.main_function.is_some()
+    }
+
     pub fn function_layout(&self) -> &[Function] {
         &self.function_layout
     }

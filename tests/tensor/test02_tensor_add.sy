@@ -1,0 +1,30 @@
+int main() {
+  tensor int a[4] = {1, 2, 3, 4};
+  tensor int b[4] = {5, 6, 7, 8};
+
+  tensor int c[4] = a + b + 10;
+  tensor int c0[4] = {};
+  c0 = a + b;
+  c0 = b + c0 + 1;
+  c0 = c0 + 4;
+
+  putarray(4, c);
+  putarray(4, c0);
+
+  tensor int d[4] = +a + +b;
+  tensor int e[4] = a + + +(a + +b) + +b;
+  tensor int f[4] = ((1 + a) + (b + 2) + (1 + 2)) + a + 1 + b;
+
+  putarray(4, d);
+  putarray(4, e);
+  putarray(4, f);
+
+  tensor int x[114514] = {1, 9, 1, 9, 8, 1, 0};
+  x = x + x;
+  x = x + x;
+  x = x + x;
+
+  putarray(10, x);
+
+  return 0;
+}

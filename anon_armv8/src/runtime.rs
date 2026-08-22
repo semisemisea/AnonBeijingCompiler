@@ -1,3 +1,18 @@
+//! 编译器内嵌运行时符号与汇编片段。
+//!
+//! 本模块持有编译器自己注入的符号（[`EmbeddedSymbol`]）及对应汇编片段
+//! （`runtime/` 目录下的 `.S` 文件，经 `include_str!` 编译期嵌入，与用户代码
+//! 输出到同一个汇编单元）。这些符号**刻意区别于**用户源码函数与外部 libc 符号：
+//!
+//! - [`EmbeddedSymbol::Memset`]：`MemZero`/`MemZeroLen` 指令展开时的内存清零助手，
+//!   小尺寸内联为 store 序列（`INLINE_MEMZERO_MAX_STORES`），大尺寸调用此符号；
+//! - [`EmbeddedSymbol::Calloc`]：零扩展两个 32 位参数后尾调用 glibc `calloc`
+//!   （递归记忆化 IR pass（里程碑 M68）为缓存分配内存时使用）。
+//!
+//! 每个变体必须有私有、碰撞安全的本地汇编标签，并在 `EMBEDDED_ASSEMBLIES`
+//! 里有对应条目。新增内嵌符号时三个位置要同步：枚举变体、标签映射、
+//! 汇编片段。
+
 use raana_ir::ir::InstKind;
 use raana_ir::ir::inst_kind::MemZeroLen;
 use taki_mir::prelude::{Arena, HirProgram};

@@ -1,3 +1,67 @@
+//! # SparseConditionConstantPropagation：稀疏条件常量传播（SCCP）
+//!
+//! 经典 SCCP（Sparse Conditional Constant Propagation）的函数内实现：
+//! 用 Top / Constant / Bottom 三值格沿 def-use 与 CFG 双向传播常量，
+//! 常量已知的分支只探索可达路径（稀疏性），最后替换常量、折叠已知分支、
+//! 清理死块与单前驱 Phi。
+//!
+//! ⚠ **管线状态**：本模块**未注册**进 `PassesManager::from_config` 的管线
+//! （`opt/pass.rs` 无实例化）；功能上已被 `ipsccp`（过程间 SCCP）取代，
+//! 保留作算法参考。写测试/调试时注意它不会自动运行。
+//!
+//! ## 算法（三值格 + 双工作队列）
+//!
+//! 每个值有一个格状态，只降不升（Top → Constant → Bottom）：
+//!
+//! ```text
+//!        Top（未知，最乐观）
+//!         │ 发现矛盾/无法确定
+//!   Constant(i32) ─────────→ Bottom（非常量，最保守）
+//! ```
+//!
+//! - 常量指令（`InstKind::Integer`）初始为 `Constant`；函数参数与地址类
+//!   指令（GEP/load/Alloc）为 `Bottom`；
+//! - 两个队列：**flow_worklist**（(源块, 目标块) 边，`(0,0)` 虚拟边触发
+//!   entry）与 **ssa_worklist**（待处理的指令）。一条边首次访问时把目标
+//!   块的全部指令入队；处理指令时把受影响的用户/边入队；
+//! - `process_instruction` 按指令种类：
+//!   - `Binary`：两操作数都已知 → 折叠（`mathematic_operation`，wrapping
+//!     语义、Div/Rem 断言除数非 0）；否则降为 Bottom；
+//!   - `Select`：条件已知选一臂；条件 Bottom 但两臂同为常量 → 该常量；
+//!   - `Branch`：条件 Constant → 只推可达臂；Top → 两臂都不推（保守，
+//!     等后续迭代暴露）；Bottom → 两臂都推；
+//!   - `Jump`：边实参传播到目标块参数；
+//!   - `Call` → Bottom（函数间传播交给 ipsccp）；`Cast` f32→i32 可折叠
+//!     （复用 ipsccp 的 `fold_f32_to_i32`）。
+//!
+//! ## 收尾清理
+//!
+//! 传播结束后一次遍历：
+//!
+//! 1. 状态为 `Constant` 的指令替换为立即数并脱离布局；
+//! 2. 条件已成常量的 `br` → `jump`；
+//! 3. 无使用者的非 entry 块删除（`remove_layout_basicblock`）+ 复用
+//!    `dce::UnreachableBasicBlock` 清不可达块；
+//! 4. **单前驱 Phi 消除**：只有一条入边的块，把参数就地替换为边实参
+//!    （`visit_and_replace`）并清空参数（代码里有一处 `// TODO: Is this
+//!    correct for used_by?` 待核实）。
+//!
+//! ## 正确性
+//!
+//! - 格下降单调，双队列工作集算法保证传播到不动点；只替换状态为
+//!   `Constant` 的值——Bottom 绝不替换；
+//! - 替换发生在传播完成后，避免半途改写破坏分析。
+//!
+//! ## 管线位置（参考）
+//!
+//! - 若未来启用：应放在 initial 或 fixpoint 早期（常量信息是其它 pass 的
+//!   前提）；现役的 `ipsccp` 在 fixpoint 段首位。
+//!
+//! ## 验证
+//!
+//! - 本文件**无** `#[cfg(test)]` 测试模块（533 行内无 `mod tests`）；
+//! - 端到端：`make test` 差分比对（经 ipsccp 间接覆盖）。
+
 use std::collections::VecDeque;
 
 use rustc_hash::FxHashSet as HashSet;
@@ -529,5 +593,6 @@ fn mathematic_operation(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
         BinaryOp::Sar => lhs.wrapping_shr(rhs as u32),
         BinaryOp::Min => lhs.min(rhs),
         BinaryOp::Max => lhs.max(rhs),
+        BinaryOp::MatMul => unreachable!("tensor type should not reach here."),
     }
 }

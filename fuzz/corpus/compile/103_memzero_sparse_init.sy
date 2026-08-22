@@ -1,0 +1,23 @@
+int order = 0;
+
+int next(int value) {
+    order = order * 10 + value;
+    return value;
+}
+
+int main() {
+    int a[3][3] = {{next(1)}, {}, {next(2), next(3)}};
+    putint(order);
+    putch(10);
+    putint(a[0][1]);
+    putch(10);
+    putint(a[1][2]);
+    putch(10);
+    putint(a[2][0]);
+    putch(10);
+    putint(a[2][1]);
+    putch(10);
+    putint(a[2][2]);
+    putch(10);
+    return 0;
+}

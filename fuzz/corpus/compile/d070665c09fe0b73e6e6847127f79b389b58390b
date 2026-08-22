@@ -1,0 +1,10 @@
+//test domain   int a, b;
+    a = 070;
+    b = 0xar define and local d%fine
+int a = 3;
+int b = 5;
+
+int main(){
+    int a =$5;
+    return a + b;
+}

@@ -15,6 +15,23 @@
  */
 
 //! Main allocation loop that processes bundles.
+//!
+//! 这是 ION 分配器的**心脏**：`Env::process_bundles` 按 bundle 优先级
+//! （活跃区间长度之和，`compute_bundle_prio`）从大到小处理每个 bundle，
+//! 核心决策路径：
+//!
+//! 1. [`try_to_allocate_bundle_to_reg`](Env::try_to_allocate_bundle_to_reg)：
+//!    为 bundle 找一个可用物理寄存器（考虑固定约束 requirement 与
+//!    `RegTraversalIter` 的遍历顺序）；
+//! 2. 失败时按权重博弈：[`evict_bundle`](Env::evict_bundle) 驱逐权重更低的
+//!    occupant 并重新入队，或 [`split_and_requeue_bundle`](Env::split_and_requeue_bundle)
+//!    把区间在冲突点分裂，或 [`get_or_create_spill_bundle`](Env::get_or_create_spill_bundle)
+//!    直接溢出；
+//! 3. [`process_bundle`](Env::process_bundle) 是单个 bundle 的完整处理入口。
+//!
+//! 辅助设施：`recompute_bundle_properties`（权重/亲和性重算）、
+//! `split_into_minimal_bundles`（按使用点彻底拆分的兜底策略）、
+//! `maximum_spill_weight_in_bundle_set`（博弈比较用）。
 
 use super::{
     Env, LiveBundleIndex, LiveBundleVec, LiveRangeFlag, LiveRangeIndex, LiveRangeKey,
@@ -42,7 +59,19 @@ pub enum AllocRegResult<'a> {
     ConflictHighCost,
 }
 
+/// Owned early-exit from [`Env::scan_preg_allocations`] (the owned form is
+/// required so a PReg scan does not hold onto the caller's `conflicts`
+/// buffer across the second, aliased-bank scan).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ScanPregError {
+    HighCost,
+    Fixed { max_conflict_weight: u32, point: ProgPoint },
+}
+
 impl<F: Function> Env<'_, F> {
+    /// 分配主循环（Ion 回溯分配器核心）：不断从优先级队列取出 bundle，
+    /// 尝试分配寄存器；冲突则按 SpillWeight 博弈——驱逐权重更低的 occupant
+    /// 并把它重新入队（被驱逐者可能再分裂/溢出）。队列清空即分配完成。
     pub fn process_bundles(&mut self) -> Result<(), String> {
         while let Some((bundle, hint)) = self.ctx.allocation_queue.pop() {
             self.process_bundle(bundle, hint)?;
@@ -51,20 +80,31 @@ impl<F: Function> Env<'_, F> {
         Ok(())
     }
 
-    pub fn try_to_allocate_bundle_to_reg<'b>(
+    /// Scan a single PReg's allocation BTree for ranges overlapping
+    /// `bundle`'s live ranges, appending conflicting bundles to `conflicts`
+    /// (deduplicated through `self.ctx.conflict_set`). Returns the first
+    /// conflict program point, or `Err` for the `ConflictHighCost` /
+    /// `ConflictWithFixed` early exits that the caller must propagate.
+    ///
+    /// `aliased_scan` marks a cross-class (aliased-bank) scan: a fixed
+    /// clobber reservation that starts exactly at the bundle's birth point is
+    /// then skipped, because the def is the value that survives (e.g. a call
+    /// returns a float in `s0` while also clobbering the aliased `v0`). The
+    /// primary, same-class scan must NOT skip these -- a coincident-start
+    /// clobber there can mask a genuine conflict.
+    fn scan_preg_allocations(
         &mut self,
         bundle: LiveBundleIndex,
-        reg: PRegIndex,
+        preg_index: usize,
         // if the max bundle weight in the conflict set exceeds this
-        // cost (if provided), just return
-        // `AllocRegResult::ConflictHighCost`.
+        // cost (if provided), just return `ScanPregError::HighCost`.
         max_allowable_cost: Option<u32>,
-        conflicts: &'b mut LiveBundleVec,
-    ) -> AllocRegResult<'b> {
-        trace!("try_to_allocate_bundle_to_reg: {:?} -> {:?}", bundle, reg);
-        conflicts.clear();
-        self.ctx.conflict_set.clear();
-        let mut max_conflict_weight = 0;
+        conflicts: &mut LiveBundleVec,
+        aliased_scan: bool,
+    ) -> Result<Option<ProgPoint>, ScanPregError> {
+        // 两段有序区间流同时推进（bundle 的 range 列表与 PReg 的 BTreeMap
+        // 均有序）：先跳到 >= 当前 bundle range 的位置，再判断是否重叠。
+        // 每 16 次跳过就重定位迭代器，避免 BTree 遍历退化。
         // Traverse the BTreeMap in order by requesting the whole
         // range spanned by the bundle and iterating over that
         // concurrently with our ranges. Because our ranges are in
@@ -83,18 +123,19 @@ impl<F: Function> Env<'_, F> {
             from: bundle_ranges.first().unwrap().range.from,
             to: bundle_ranges.first().unwrap().range.from,
         });
-        let mut preg_range_iter = self.ctx.pregs[reg.index()]
+        let mut preg_range_iter = self.ctx.pregs[preg_index]
             .allocations
             .btree
             .range(from_key..)
             .peekable();
         trace!(
             "alloc map for {:?} in range {:?}..: {:?}",
-            reg,
+            PReg::from_index(preg_index),
             from_key,
-            self.ctx.pregs[reg.index()].allocations.btree
+            self.ctx.pregs[preg_index].allocations.btree
         );
         let mut first_conflict: Option<ProgPoint> = None;
+        let mut max_conflict_weight = 0;
 
         'ranges: for entry in bundle_ranges {
             trace!(" -> range LR {:?}: {:?}", entry.index, entry.range);
@@ -121,7 +162,7 @@ impl<F: Function> Env<'_, F> {
                             from: from_pos,
                             to: from_pos,
                         });
-                        preg_range_iter = self.ctx.pregs[reg.index()]
+                        preg_range_iter = self.ctx.pregs[preg_index]
                             .allocations
                             .btree
                             .range(from_key..)
@@ -150,6 +191,18 @@ impl<F: Function> Env<'_, F> {
                 // Otherwise, there is a conflict.
                 let preg_key = *preg_range_iter.peek().unwrap().0;
                 debug_assert_eq!(preg_key, key); // Assert that this range overlaps.
+                // An aliased-bank clobber reservation that starts at the exact
+                // point a value is born does not corrupt it (e.g. a call
+                // returns a float in `s0` while also clobbering the aliased
+                // `v0`; the def is the value that survives). The primary
+                // same-class scan must not skip coincident clobbers.
+                if aliased_scan
+                    && preg_key.from == key.from
+                    && !preg_range_iter.peek().unwrap().1.is_valid()
+                {
+                    preg_range_iter.next();
+                    continue 'alloc;
+                }
                 let preg_range = preg_range_iter.next().unwrap().1;
 
                 trace!(" -> btree contains range {:?} that overlaps", preg_range);
@@ -169,7 +222,7 @@ impl<F: Function> Env<'_, F> {
                             && max_conflict_weight > max_allowable_cost.unwrap()
                         {
                             trace!("   -> reached high cost, retrying early");
-                            return AllocRegResult::ConflictHighCost;
+                            return Err(ScanPregError::HighCost);
                         }
                     }
 
@@ -182,11 +235,81 @@ impl<F: Function> Env<'_, F> {
                 } else {
                     trace!("   -> conflict with fixed reservation");
                     // range from a direct use of the PReg (due to clobber).
-                    return AllocRegResult::ConflictWithFixed(
+                    return Err(ScanPregError::Fixed {
                         max_conflict_weight,
-                        ProgPoint::from_index(preg_key.from),
-                    );
+                        point: ProgPoint::from_index(preg_key.from),
+                    });
                 }
+            }
+        }
+
+        Ok(first_conflict)
+    }
+
+    pub fn try_to_allocate_bundle_to_reg<'b>(
+        &mut self,
+        bundle: LiveBundleIndex,
+        reg: PRegIndex,
+        // if the max bundle weight in the conflict set exceeds this
+        // cost (if provided), just return
+        // `AllocRegResult::ConflictHighCost`.
+        max_allowable_cost: Option<u32>,
+        conflicts: &'b mut LiveBundleVec,
+    ) -> AllocRegResult<'b> {
+        trace!("try_to_allocate_bundle_to_reg: {:?} -> {:?}", bundle, reg);
+        conflicts.clear();
+        self.ctx.conflict_set.clear();
+
+        // Scan the target PReg's allocation BTree for overlaps with this
+        // bundle, collecting conflicting bundles into `conflicts`.
+        let mut first_conflict = match self.scan_preg_allocations(
+            bundle,
+            reg.index(),
+            max_allowable_cost,
+            conflicts,
+            /* aliased_scan = */ false,
+        ) {
+            Ok(point) => point,
+            Err(ScanPregError::HighCost) => return AllocRegResult::ConflictHighCost,
+            Err(ScanPregError::Fixed {
+                max_conflict_weight,
+                point,
+            }) => return AllocRegResult::ConflictWithFixed(max_conflict_weight, point),
+        };
+
+        // Also scan the aliased bank: on targets where two classes share the
+        // same `hw_enc` (AArch64: `sN` is the low 32 bits of `vN`), a value
+        // held in one class is clobbered by a write through the other, so
+        // they must interfere on a shared `hw_enc` even though the allocator
+        // keeps the classes distinct.
+        let preg = PReg::from_index(reg.index());
+        let class = self.ctx.spillsets[self.ctx.bundles[bundle].spillset].class;
+        if let Some(alias_class) = self.env.aliased_banks.iter().find_map(|&(a, b)| {
+            if a == class {
+                Some(b)
+            } else if b == class {
+                Some(a)
+            } else {
+                None
+            }
+        }) {
+            let alias_preg = PReg::new(preg.hw_enc(), alias_class);
+            let alias_first = match self.scan_preg_allocations(
+                bundle,
+                alias_preg.index(),
+                max_allowable_cost,
+                conflicts,
+                /* aliased_scan = */ true,
+            ) {
+                Ok(point) => point,
+                Err(ScanPregError::HighCost) => return AllocRegResult::ConflictHighCost,
+                Err(ScanPregError::Fixed {
+                    max_conflict_weight,
+                    point,
+                }) => return AllocRegResult::ConflictWithFixed(max_conflict_weight, point),
+            };
+            if first_conflict.is_none() {
+                first_conflict = alias_first;
             }
         }
 
@@ -265,6 +388,9 @@ impl<F: Function> Env<'_, F> {
     /// Local equivalent of regalloc2's priority computation. taki_mir does
     /// not keep the upstream per-bundle priority cache, so use total covered
     /// instruction extent and retain a nonzero denominator for spill weights.
+    /// bundle 优先级 = 其所有 LiveRange 的指令跨度之和（max(1) 防除零）。
+    /// 优先级决定处理顺序：跨度大的 bundle 先分配（贪心：难分配的先用
+    /// 最好的寄存器池），同时是驱逐博弈的权重基数。
     fn compute_bundle_prio(&self, bundle: LiveBundleIndex) -> u32 {
         self.ctx.bundles[bundle]
             .ranges
@@ -290,6 +416,15 @@ impl<F: Function> Env<'_, F> {
     pub fn recompute_bundle_properties(&mut self, bundle: LiveBundleIndex) {
         trace!("recompute bundle properties: bundle {:?}", bundle);
 
+        // 驱逐/分裂后重新推导 bundle 的属性：优先级、寄存器编码上限
+        // （limit，来自 OperandConstraint::Limit 的最小值）、是否 fixed
+        // （含 fixed def）、是否 Stack 约束、是否 minimal。
+        // minimal = 单 LiveRange 且至多一个 use、区间不超出"该 use 的
+        // 最小区间"（用 contains 而非 exact：比最小还小的区间如死 def
+        // 也合法，避免对"小于最小"的区间活锁）。
+        // spill weight 分层：minimal 用固定小权重（fixed/limited/普通三档），
+        // 非 minimal 累加各 range 的 uses_spill_weight——权重决定驱逐博弈
+        // 与 spill 排序，不决定处理顺序（顺序看 prio）。
         let minimal;
         let mut fixed = false;
         let mut fixed_def = false;
@@ -472,6 +607,11 @@ impl<F: Function> Env<'_, F> {
         // spill bundle?
         mut trim_ends_into_spill_bundle: bool,
     ) {
+        // 分裂与重新入队：被驱逐后无处可去的 bundle 在此处"瘦身"——
+        // 在 split_at 处把区间切开，产生更小（更易分配）的子 bundle 并
+        // 重新入队。分裂计数有上限（MAX_SPLITS_PER_SPILLSET），超限或
+        // 区间只跨一条指令时退化为"全拆成 minimal bundle + 共享 spill
+        // bundle"（split_into_minimal_bundles），保证终止不活锁。
         trace!(
             "split bundle {bundle:?} at {split_at:?} and requeue with reg hint (for first part) {hint:?}"
         );

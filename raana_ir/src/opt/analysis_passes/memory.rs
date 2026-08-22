@@ -19,6 +19,197 @@
 //! an argument of the same function. Argument-vs-global and
 //! argument-vs-argument pairs are conservatively `MayAlias` here; the
 //! interprocedural points-to refinement lives in `analysis_passes/effects.rs`.
+//!
+//! ---
+//!
+//! ## 补充说明（中文）
+//!
+//! 一句话定位：这是 raana_ir 的**过程内基对象（base-object）别名分析**。SysY 没有指针
+//! 类型、没有取地址、没有强制转换、没有堆分配，所以每条「地址形态」的指令
+//! （`Alloc`、`GlobalAlloc`、`GetElemPtr`、`Load`、`BlockArgRef`）最终都源自三种基对象
+//! 之一；本模块把每条地址指令归约成「基对象 + 常量字节偏移」，再用「基对象不相交 +
+//! 偏移区间不重叠」两条规则回答「两条内存访问是否可能重叠」。它是别名信息的过程内
+//! 地基：`effects.rs` 在其上叠加过程间 points-to 精化，`dse.rs` / `ipsccp.rs` 直接复用
+//! 它的地址解析做存储建模。文中术语（固定点、pass、SSA、块参数/phi 等）见
+//! `docs/offline-handbook/glossary.md`。
+//!
+//! ## 数据结构
+//!
+//! - `MemObject`：基对象枚举，四种变体：
+//!   - `Alloc(Inst)`：函数局部栈对象，由某条 `Alloc` 指令标识；
+//!   - `Global(Inst)`：全局对象，由某条 `GlobalAlloc` 指令标识；
+//!   - `Param(usize)`：本函数入口块第 `usize` 个参数（SysY 的数组参数 = 指针）；
+//!   - `Unknown`：来源未知（可能是任何东西）。`is_unknown()` 判断是否为它。
+//! - `AliasResult`：别名判定结果，三值：`NoAlias`（绝无重叠字节）/ `MayAlias`
+//!   （可能重叠，保守）/ `MustAlias`（证明访问同一字节）。`may_alias()` = 结果不是
+//!   `NoAlias`，即「必须当作冲突处理」。
+//! - `BaseEnv`：**每函数一份**的过程内基址环境，内部五张表：
+//!   - `param_position`：块参数 → `(所属块, 位置下标)`，供经入边实参解析块参数；
+//!   - `slots`：指针槽表——「恰好写一次」的局部 `Alloc` → 写入的值（前端
+//!     `alloc <**T>; store %param, %slot` 数组实参下沉模式）；
+//!   - `entry_params`：函数入口参数列表（`FunctionData::params()`）；
+//!   - `base_table`：每条地址形态指令的基对象（预计算）；
+//!   - `offset_table`：每条地址形态指令的常量字节偏移，`None` 条目 = 偏移不能
+//!     静态确定（预计算）。
+//!
+//! ## API 详解
+//!
+//! 构造与预计算：
+//!
+//! - `BaseEnv::new(data: &FunctionData) -> BaseEnv`：只读扫描一个函数的数据：登记所有
+//!   块参数的位置，并识别 store-once 指针槽。只需要 `FunctionData`、不需要 arena 就能
+//!   看到全局指令。
+//! - `BaseEnv::build_tables(&mut self, arena, func)`：预计算 `base_table` 与
+//!   `offset_table` 的固定点 pass，**必须在 `new` 之后调用一次**（传入能触达全局指令
+//!   的 arena，如 `ArenaContext`）；之后所有查询都是 O(1) 查表，不再有逐查询递归。
+//!
+//! 查询（全部 `&self` 只读）：
+//!
+//! - `base_of(&self, arena, ptr) -> MemObject`：`ptr` 的基对象。O(1) 查表；
+//!   `GlobalAlloc` 直接返回 `Global(ptr)`（绕过表）；表里没有的指令（或解析为未知）
+//!   保守返回 `Unknown`。
+//! - `constant_offset(&self, arena, ptr) -> Option<i64>`：`ptr` 相对其基对象的字节
+//!   偏移；裸基对象（`Alloc` / `GlobalAlloc` / 入口参数）为 0；GEP 链上任一维下标不是
+//!   编译期常量则返回 `None`。`GlobalAlloc` 直接返回 `Some(0)`。
+//! - `alias(&self, arena, a, b) -> AliasResult`：两条地址 `a`、`b` 的过程内别名判定。
+//!   先判 `a == b`（同一条指令 → `MustAlias`），再取双方基对象走 `alias_with_bases`。
+//! - `alias_with_bases(&self, arena, a, b, base_a, base_b) -> AliasResult`：带预计算
+//!   基对象的判定，供 `effects.rs` 复用（它先用 points-to 精化「参数 vs 参数 /
+//!   参数 vs 全局」组合，剩余组合回退到这里）。判定矩阵见「正确性 / 边界」。
+//!
+//! 内部实现（私有，仅供理解）：
+//!
+//! - `compute_base(&self, arena, ptr, work) -> Option<MemObject>`：基对象固定点的单步
+//!   求值，规则见「算法」。`work` 是「指令 → 当前基对象」的工作表。
+//! - `compute_offset(&self, arena, ptr, work) -> Option<Option<i64>>`：偏移固定点的
+//!   单步。外层 `None` = 依赖未就绪（挂起）；`Some(None)` = 已定为非常量；
+//!   `Some(Some(off))` = 常量偏移。
+//! - `offset_alias(&self, arena, a, b) -> AliasResult`：同基对象时的偏移区间精化。
+//!
+//! 模块级辅助函数：
+//!
+//! - `access_size(arena, addr) -> i64`：经 `addr` 一次访问的字节数（其指针类型的
+//!   pointee 大小）。目前只在 `offset_alias` 内部使用（`pub` 但全仓库无外部调用）。
+//! - `integer_constant(arena, inst) -> Option<i32>`：`inst` 是 `Integer` 常量时返回
+//!   其值。注意：`sr.rs` / `column_major.rs` / `boolean_simplify.rs` /
+//!   `induction_variable.rs` 等文件里也有同名 `integer_constant`，那是**各自的局部
+//!   副本**，与本模块导出的这个无关（见「使用方清单」的反例）。
+//!
+//! ## 算法
+//!
+//! ### 基对象解析（`compute_base` 单步）
+//!
+//! 三种基对象的来源规则：
+//!
+//! 1. `Alloc` → `Alloc(ptr)`；`GlobalAlloc` → `Global(ptr)`——这两种是基对象的
+//!    「源头」，直接定案；
+//! 2. `GetElemPtr(gep)` → 沿 `gep.base()` 追到基对象（base 是全局时短路为
+//!    `Global(base)`）；
+//! 3. 其余指令一律 `Unknown`，除两种特殊形态：
+//!    - `Load`：源地址在指针槽表 `slots` 中 → 取槽内存入值的基对象；否则 `Unknown`
+//!      （从任意地址读出的指针来源不可知，不能瞎猜）；
+//!    - `BlockArgRef`：若是入口参数 → `Param(下标)`；否则查 `param_position` 定位
+//!      所属块与位置，遍历该块 `used_by` 中每条 `Jump` / `Branch` 入边，取对应位置
+//!      的实参并求其基对象——所有入边**一致**才定案，任一条未解析、为 `Unknown` 或
+//!      彼此冲突 → `Unknown`。
+//!
+//! ### 指针槽模式（store-once slot）
+//!
+//! `BaseEnv::new` 扫描全函数指令：只把「目标是函数局部 `Alloc`」的 `Store` 当作候选；
+//! 同一槽被写**两次**或曾被 `MemZero` 触碰 → 移出 `slots` 并标记 ambiguous（不可
+//! 解析）；全局目标直接跳过（`FunctionData` 看不到全局指令，且只有局部 `Alloc` 才能
+//! 当指针槽）。`Load` 只有从这类「恰好写一次」的槽读出时才能解析回写入值，否则
+//! 保守 `Unknown`。
+//!
+//! ### 块参数经入边实参解析
+//!
+//! RaanaIR 的 phi 就是块参数（`BlockArgRef`），其值由每条入边实参提供。解析一个块
+//! 参数：在 `used_by` 里找所有跳到该块的 `Jump` / `Branch`，按下标取实参，再求每个
+//! 实参的基对象；全部入边一致才用，否则 `Unknown`。这正是循环回边（phi 自引用）能
+//! 收敛的关键——见下。
+//!
+//! ### 固定点收敛
+//!
+//! `build_tables` 对 base 与 offset 各跑一轮不动点：反复对每条地址指令求
+//! `compute_base` / `compute_offset`，直到整表不再变化。工作表用「`None` = 未解析
+//! （可继续精化）」与「`Some(Unknown)` = 已定未知（不再变化）」区分，因此循环 phi
+//! 链不会震荡，而是收敛到保守的 `Unknown`。偏移表同理，`Some(None)` = 已定为
+//! 非常量。GEP 偏移 = 基偏移 + Σ(常量下标 × `gep_index_stride` 给出的字节步长)，
+//! 任一维下标非常量（经 `integer_constant` 提取）或加法溢出即整体非常量。
+//!
+//! ## 使用方清单
+//!
+//! - `analysis_passes/effects.rs`（过程间层，**核心使用方**；import
+//!   `{AliasResult, BaseEnv, MemObject}`）：`EffectAnalysis::new` 为每个有 body 的函数
+//!   `BaseEnv::new` + `build_tables`，存入 `envs` 表，经 `env_of(func)` 对外暴露；用
+//!   `base_of` 把地址映射成抽象对象集合（`targets_of`，约 252 行）；`alias` 用
+//!   points-to 集合精化「参数 vs 参数 / 参数 vs 全局」组合，其余回退
+//!   `alias_with_bases`（约 463 行）——本模块是它的过程内地基，它是本模块的
+//!   interprocedural 细化。
+//! - `opt/passes/dse.rs`（死存储消除；import `{BaseEnv, MemObject}`）：经
+//!   `analysis.env_of(func)` 取 `BaseEnv`，在 `resolve_cell`（约 148 行）里用
+//!   `constant_offset` + `base_of` 把地址归约为 `Cell = (MemObject, i64)`；只认
+//!   `Alloc` / `Global` 有单元语义，参数指针与未知基址返回 `None`（调用方按「可能
+//!   别名一切」保守处理）。
+//! - `opt/passes/ipsccp.rs`（过程间稀疏条件常量传播；import `{BaseEnv, MemObject}`）：
+//!   同样经 `analysis.env_of(func)` 取 `BaseEnv`，在 `resolve_cell`（约 449 行）里把
+//!   `Load` / `Store` / `MemZero` 的地址解析成 `(CellKey, RootKey)` 做内存单元建模。
+//! - `opt/passes/licm.rs`（循环不变代码外提）：**不直接 import 本模块**，经
+//!   `EffectAnalysis::alias`（effects.rs 的过程间别名）判断循环内 store / MemZero
+//!   是否可能与外提的 load 冲突（licm.rs:759 起）——间接使用。
+//!
+//! 反例（grep 实证，避免误认）：`opt/utils/gep.rs` 里的局部变量 `constant_offset`、
+//! `pointer_strength_reduction_cost.rs` / `sr.rs` / `column_major.rs` /
+//! `boolean_simplify.rs` / `induction_variable.rs` / `pointer_strength_reduction/` 里的
+//! `integer_constant` 都是各文件**自己的局部定义**，与本模块无关；全仓库 import
+//! `analysis_passes::memory::...` 的只有 effects.rs / dse.rs / ipsccp.rs 三个文件。
+//!
+//! ## 正确性 / 边界
+//!
+//! 别名判定矩阵（`alias_with_bases`，对应 `docs/memory_alias_analysis.md` §3.2）：
+//!
+//! | 基对象组合 | 结果 | 理由 |
+//! | --- | --- | --- |
+//! | 任一方 `Unknown` | `MayAlias` | 来源未知，必须保守 |
+//! | `Alloc(x)` vs `Alloc(y)`（x≠y） | `NoAlias` | 不同局部对象永不重叠 |
+//! | `Global(x)` vs `Global(y)`（x≠y） | `NoAlias` | 不同全局对象永不重叠 |
+//! | `Alloc` vs `Global` | `NoAlias` | 局部永不别名全局 |
+//! | `Alloc` vs `Param` | `NoAlias` | 局部永不别名本函数实参（实参在别处） |
+//! | `Param` vs `Param` / `Param` vs `Global` | `MayAlias` | 无 points-to 信息，保守；interprocedural 细化在 `effects.rs` |
+//! | 同一基对象 | `offset_alias` 精化 | 见下 |
+//!
+//! 同基精化（`offset_alias`）：两侧偏移都取到常量后，用 `access_size` 得到访问区间；
+//! 区间不相交（`off_a + size_a <= off_b` 或反之）→ `NoAlias`；起点相同 → `MustAlias`；
+//! 其余 → `MayAlias`。任何一侧偏移非常量（如 GEP 带变量下标）→ 直接 `MayAlias`。
+//!
+//! 其它边界：
+//!
+//! - `a == b`（同一条指令）→ `MustAlias`，不经过基对象表；
+//! - **快照性**：`BaseEnv` 与调用图分析一样是快照，任何 IR 修改（新增 store 改写槽、
+//!   增删 GEP、改块参数）都会使其过期。实践中它随 `EffectAnalysis` 每次 `Pass::run`
+//!   重建，pass 内不可跨修改复用 env；
+//! - 指针槽只在「恰好写一次且未被 `MemZero` 触碰」时成立，条件不满足就退回
+//!   `Unknown`——宁可保守也不给错答案；
+//! - 块参数要求所有入边一致，这是循环收敛与正确性的前提；
+//! - 与 `effects.rs` 的分工：本模块是**过程内**规则，参数相关组合一律保守
+//!   `MayAlias`；`effects.rs` 用调用点的 points-to 集合把 `Param(i)` 展开成具体对象
+//!   集合，两集合不相交即可判 `NoAlias`——这是 §3.2 规则的 interprocedural 细化，
+//!   不是本模块的替代。
+//!
+//! ## 验证
+//!
+//! 本文件 `mod tests`（约 492-800 行）共 10 个单元测试，按主题分四组：
+//!
+//! - 基对象解析：`base_of_alloc_and_global`、`base_of_gep_walks_to_base`、
+//!   `base_of_resolves_frontend_pointer_slot`、`base_of_load_of_non_slot_is_unknown`；
+//! - 常量偏移：`constant_offset_of_flat_and_multi_dim_geps`、
+//!   `constant_offset_rejects_variable_index`；
+//! - 别名矩阵：`intra_alias_rules_matrix`、`same_base_constant_offsets_disentangle`；
+//! - 块参数：`block_param_resolves_through_uniform_incoming_edges`、
+//!   `conflicting_block_param_edges_yield_unknown`。
+//!
+//! 另由 `effects.rs` 的测试间接覆盖（其 `alias` 用例逐项断言 interprocedural 精化，
+//! 如 931 / 976 / 1075 行），以及 `cargo test -p raana_ir` 全量回归。
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -262,6 +453,7 @@ impl BaseEnv {
                 };
                 let mut result: Option<MemObject> = None;
                 let mut all_set = true;
+                let mut saw_independent_edge = false;
                 for &user in arena.bb_data(block).used_by() {
                     let arg = match arena.inst_data(user).kind() {
                         InstKind::Jump(jump) if jump.target() == block => {
@@ -281,6 +473,21 @@ impl BaseEnv {
                     let Some(arg) = arg else {
                         return Some(MemObject::Unknown);
                     };
+                    // A back edge that forwards the parameter itself, or a
+                    // GEP of the parameter itself (a loop-carried pointer
+                    // bump), carries the *same* base as this parameter — it
+                    // must not introduce a self-dependency that otherwise
+                    // stalls the fixed point. Skip it: the base is decided
+                    // by the independent incoming edges.
+                    if arg == ptr
+                        || matches!(
+                            arena.inst_data(arg).kind(),
+                            InstKind::GetElemPtr(gep) if gep.base() == ptr
+                        )
+                    {
+                        continue;
+                    }
+                    saw_independent_edge = true;
                     match work.get(&arg) {
                         None => all_set = false,
                         Some(Some(MemObject::Unknown)) => return Some(MemObject::Unknown),
@@ -293,6 +500,10 @@ impl BaseEnv {
                 }
                 if all_set {
                     result.or(Some(MemObject::Unknown))
+                } else if !saw_independent_edge {
+                    // Only self-referential back edges (no independent
+                    // incoming value): the base is genuinely unprovable.
+                    Some(MemObject::Unknown)
                 } else {
                     None
                 }
@@ -493,7 +704,9 @@ pub fn integer_constant<A: Arena + ?Sized>(arena: &A, inst: Inst) -> Option<i32>
 mod tests {
     use super::*;
     use crate::{
-        ir::{Program, Type, arena::Arena, builder_trait::*},
+        ir::{
+            Program, Type, arena::Arena, builder_trait::*, inst_kind::GetElemPtr,
+        },
         opt::pass::ArenaContext,
     };
 
@@ -796,5 +1009,58 @@ mod tests {
 
         let (env, ctx) = env_of(&program, function);
         assert_eq!(env.base_of(&ctx, param), MemObject::Unknown);
+    }
+
+    #[test]
+    fn loop_carried_bumped_row_pointer_resolves_through_back_edge() {
+        // A loop header row-pointer parameter whose back edge forwards a GEP
+        // of the parameter itself (a pointer bump) must still resolve to the
+        // alloc base carried by the entry edge. Before the fix the
+        // self-referential back edge stalled the base fixed point, so the
+        // header parameter (and every load through it) came out Unknown.
+        let mut program = Program::new();
+        let function = program.new_function(Type::get_unit(), "f".into(), vec![]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+
+        let base_alloc = data.new_local_inst().alloc(Type::get_i32());
+        data.layout_mut().insert_inst(entry, base_alloc);
+        let zero = data.new_local_inst().integer(0);
+        data.layout_mut().insert_inst(entry, zero);
+        let row = data.new_local_inst().raw(GetElemPtr::new_data(
+            base_alloc,
+            vec![zero],
+            Type::get_i32().reference(),
+        ));
+        data.layout_mut().insert_inst(entry, row);
+        let stride = data.new_local_inst().integer(4);
+        data.layout_mut().insert_inst(entry, stride);
+
+        let head = data
+            .new_basic_block()
+            .basic_block("head".into(), vec![Type::get_i32().reference()]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        data.layout_mut().push_bb_back(head);
+        data.layout_mut().push_bb_back(exit);
+
+        let param = data.bb_data(head).params()[0];
+        let entry_jump = data.new_local_inst().jump(head, vec![row]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        // Back edge: `%param' = gep %param, 4` forwarded to the header.
+        let bumped = data.new_local_inst().raw(GetElemPtr::new_data(
+            param,
+            vec![stride],
+            Type::get_i32().reference(),
+        ));
+        data.layout_mut().insert_inst(head, bumped);
+        let back_jump = data.new_local_inst().jump(head, vec![bumped]);
+        data.layout_mut().insert_inst(head, back_jump);
+        let ret_head = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(head, ret_head);
+        let ret_exit = data.new_local_inst().ret(None);
+        data.layout_mut().insert_inst(exit, ret_exit);
+
+        let (env, ctx) = env_of(&program, function);
+        assert_eq!(env.base_of(&ctx, param), MemObject::Alloc(base_alloc));
     }
 }

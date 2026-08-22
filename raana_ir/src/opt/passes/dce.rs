@@ -1,3 +1,216 @@
+//! # DCE 家族：指令级 / Phi 级 / 块级 / 函数级死代码消除
+//!
+//! 本模块清掉四类"不会被程序观察到的"IR 成分——结果未使用的指令
+//! （`DeadCodeElimination`）、死 / 转发 Phi 参数（`DeadPhiElimination`）、从入口
+//! 不可达的基本块（`UnreachableBasicBlock`）、从 `main` 沿调用图不可达的函数
+//! （`DeadFunctionElimination`）——另有一个已声明但实现被注释掉、尚未启用的跳转块
+//! 消除 `JumpOnlyElimination`。它们共同把其它 pass 留下的"垃圾"收敛干净，缩小后续
+//! pass 与后端的工作面。
+//!
+//! 术语：SSA、block 参数（本项目的 Phi）、used_by / def-use 链、结构边 vs 逻辑边、
+//! 固定点（fixpoint）、DCE / DFE 等见 `docs/offline-handbook/glossary.md`，这里不
+//! 展开。文件内已有的英文行注释描述各实现的局部细节，本文档给整体视图。
+//!
+//! ## DeadCodeElimination：指令级死代码消除（mark-and-sweep）
+//!
+//! 经典的标记-清扫（mark and sweep）：先标记所有"关键"指令，再沿 def-use 反向
+//! 传播把关键指令的操作数也标记为存活，最后清扫未标记指令。
+//!
+//! ```text
+//! // 变换前                                   // 变换后
+//! entry:                                    entry:
+//!   %a = Integer 1                           %a = Integer 1
+//!   %b = Binary Add %a, %a    // 结果未使用   →（删除）
+//!   %c = Call pure_fn()        // 纯函数、结果未使用 →（删除）
+//!   ret %a                                    ret %a
+//! ```
+//!
+//! - 标记种子：`is_critical` 判定——`Branch` / `Jump` / `Store` / `MemZero` /
+//!   `Return` / `TailCall` 恒为关键（控制流与副作用不能删）；`Call` 只有在全程序
+//!   纯度分析（`EffectAnalysis::new` + `is_removable`）确认被调者无副作用且结果
+//!   未用时才不关键（注释 "rdf is not ready"：按需 def-use 尚未就绪，调用默认按
+//!   关键处理）；纯计算类（`Cast` / `Load` / `Binary` / `Select` / `Fma` /
+//!   `GetElemPtr` / `Vector*`）不是种子，只靠被关键指令使用才存活；`Integer` /
+//!   `Aggregate` / `BlockArgRef` / `Undef` / `ZeroInit` / `GlobalAlloc` 在
+//!   `is_critical` 里是 `unreachable!()`——它们永远不会是种子，靠使用者存活。
+//! - 生长：从 worklist 弹出后按指令 kind 逐个标记操作数（`mark_live!` 宏；全局值
+//!   `is_global` 跳过，全局由 `GlobalAlloc` 语义单独管理）。弹出时先查
+//!   `has_inst_data`：前面的 pass（如过程间 SCCP）可能替换指令留下悬空操作数，
+//!   直接跳过。
+//! - 清扫：收集所有未标记指令（连同所在块），`remove_layout_inst` 逐条删除，
+//!   返回是否发生变化。
+//!
+//! 入口有两个：
+//! - `run`（整程序）：先做全程序纯度分析，把对无副作用被调者且结果未用的调用收进
+//!   `removable_calls`，再逐函数跑 `run_on_func`；
+//! - `run_on`（单函数）：不带纯度分析，`removable_calls` 为空——历史保守行为，
+//!   任何 `Call` 都不删。
+//!
+//! 触发 / 放弃条件：
+//! - 触发：指令不在存活集合中（结果未被任何关键指令传递引用）；
+//! - 放弃：I/O 类调用（`getint` 等经 I/O 标志保留）、会写全局变量的函数调用
+//!   （经全局 / 指针改写内存使其不纯）、结果仍被使用的调用——分别由测试
+//!   `keeps_call_to_io_function` / `keeps_call_to_function_writing_a_global` /
+//!   `keeps_call_whose_result_is_used` 锁定；`has_side_effect` 是预留的副作用规则
+//!   占位（`#[allow(dead_code)]`，恒返回 true，尚未接入判定）。
+//!
+//! 正确性要点：控制流与副作用指令作为种子必然存活；存活沿 def-use 反向传播，被
+//! 使用的值不会被误删；`MemZero` 的分配与长度（`MemZeroLen::Value` 形态）和
+//! `Store` 一样被标记（测试 `preserves_mem_zero_and_its_allocation`）。
+//!
+//! ## DeadPhiElimination：死 Phi / 转发 Phi 清理
+//!
+//! block 参数即本项目的 Phi（见术语表）。本 pass 清理两类"死"参数：①转发参数——
+//! 所有逻辑入边喂进来的是同一个值，参数只是拷贝，直接替换为源值；②未使用参数——
+//! `used_by` 为空，连同每个前驱终结符对应位置的实参一起删掉。
+//!
+//! ① 转发参数（单值转发）：
+//! ```text
+//! // 变换前                                  // 变换后
+//! entry:      jump merge(%v)                entry:      jump merge
+//! merge(%p):  %r = ret %p                   merge:       %r = ret %v
+//! ```
+//! ② 未使用参数（死参数，`%p` 无人引用）：
+//! ```text
+//! // 变换前                                       // 变换后
+//! entry:      br %cond, merge(%z), merge(%o)      entry:      br %cond, merge, merge
+//! merge(%p):  ret                                 merge:      ret
+//! ```
+//!
+//! 流程（都在 `run_on` 里）：
+//! - 转发：`CFG::new` 建快照 → `forwarded_block_params` 找"每条逻辑入边都喂同一
+//!   SSA 值"的参数（注意结构边 vs 逻辑边：branch 两臂指向同一块时仍按两臂分别
+//!   比对，双臂值不同时不误报）→ `resolve_forwarded_params` 把转发链解到终点值
+//!   （成环的链放弃）→ `utils::visit_and_replace` 在函数内替换所有使用点；
+//! - 死参数：按 `params[i].used_by().is_empty()` 找索引（**降序**收集，`remove`
+//!   保持其余参数的相对顺序——`swap_remove` 会打乱尾部，而前驱的实参向量必须做
+//!   同样的位置置换才能与块参数保持对齐）；
+//! - 重写前驱：`bb_data(bb).used_by()` 找到跳进本块的终结符，`Jump` 删对应位置
+//!   实参、`Branch` 两臂**分别**删（同一块可能同时是 t_target 与 f_target），
+//!   `replace_inst_with` 重建终结符。
+//!
+//! 触发 / 放弃条件：
+//! - 触发：转发参数（所有逻辑入边值相同且不等于参数自身）或死参数（`used_by`
+//!   为空）；
+//! - 放弃：**entry 块参数永不处理**——它们是函数 ABI 参数，由 `FunctionData::params`
+//!   独立跟踪，删除会使两处失同步留下悬空引用；回边也不转发 entry 参数（测试
+//!   `never_forwards_entry_abi_parameters_from_backedges`）。
+//!
+//! 正确性要点：删除的是无使用者的参数，替换后无悬空 def-use；实参删除与参数删除
+//! 索引一一对应，SSA 边参数对齐跨多轮运行保持（`jump_args_stay_aligned_when_
+//! trailing_params_are_dead`：9 个参数只死尾部两个，跳转实参仍精确剩 7 个）。
+//!
+//! ## UnreachableBasicBlock：不可达块删除
+//!
+//! 删除从函数入口不可达的基本块。固定点循环：每轮从零重建 CFG 快照
+//! （`cfg::build_cfg_both`），找出没有前驱的块删除，直到删不动为止。
+//!
+//! ```text
+//! // 变换前                                    // 变换后
+//! entry:      br %cond, live, dead             entry:      br %cond, live, dead
+//! dead:       %x = Integer 1; ret              （%x 无 used_by → 整块删除）
+//! live:       ret                              live:       ret
+//! ```
+//!
+//! 触发 / 放弃条件：
+//! - 候选：CFG 快照里入度为零的块（`prece[id].is_empty()`）或根本不在快照里的块
+//!   （`get_id_safe` 为 None）；
+//! - **安全闸**：块内所有指令 `used_by` 全空才删——不可达块仍可能向可达块供值
+//!   （例如 LICM 外提到死块里的 GEP 被幸存循环体使用），删掉会留下悬空操作数；
+//! - 无入口块直接返回 false；一轮删不动（候选都有活值）就停止——后续迭代不可能
+//!   再进步；`removed_any` 为真才继续下一轮（删块可能让更多块变不可达，连锁效应
+//!   靠下一轮的新快照发现）。
+//!
+//! 正确性要点：只在整块指令都无使用者时删除，不破坏 def-use；本 pass 只从 layout
+//! 移除块（`remove_layout_basicblock`），不重写指向已删块的终结符——每轮重建快照
+//! 时它们自然消失，悬空终结符留给调用方 / 后续 pass。
+//!
+//! 管线位置：**不在** `from_config` 主管线里注册——被 `ssa.rs`（SSATransform
+//! 收尾）和 `const_prop.rs` 直接调用（`super::dce::UnreachableBasicBlock`），作为
+//! 这两个 pass 的清理步骤。
+//!
+//! ## DeadFunctionElimination：死函数消除
+//!
+//! 从 `main` 出发沿调用图做可达性闭包，把不可达的**已定义**函数移出函数布局。
+//! 动机：指令级 DCE 只删指令，会留下整段无用函数，其内部调用点随之被拖进汇编
+//! （例如一个未被使用的 crypto helper 保留着它的 rotl / and 调用）。
+//!
+//! ```text
+//! // 变换前（main 出发的调用图）                 // 变换后
+//! main:   call a; ret         main:   call a; ret
+//! a:      call b; ret         a:      call b; ret
+//! b:      ret                 b:      ret
+//! c:      call d; ret         （c、d 从 main 不可达 → 移出函数布局）
+//! d:      ret
+//! ```
+//!
+//! 流程（`run`，整程序）：`call_graph::CallGraph::new` 建调用图 →
+//! `get_main_function` 为根，队列 BFS（`callees_in` 展开）得 `reachable` 集合 →
+//! 布局中不在集合内且非声明桩（`!layout().is_decl()`）的函数判死 →
+//! `program.remove_function` 逐个移除。
+//!
+//! 触发 / 放弃条件：
+//! - 触发：从 `main` 不可达（传递闭包）且不是声明桩；
+//! - 可达性判定是闭包而非调用点计数——自递归且无外部调用者的函数也被删
+//!   （`removes_a_self_recursive_function`，计数法会误判为"被调用过"）；
+//! - 放弃：声明桩（运行时库接口，`preserves_decl_and_main`）与 `main` 本身
+//!   （闭包根）恒保留。
+//!
+//! 正确性要点：只从函数布局移除，`FunctionData` 仍留在 arena——函数句柄是下标，
+//! arena 级删除会失效所有后续句柄；调用链上传递保留（`removes_transitively_dead_
+//! functions`：d → e 一起被删）。
+//!
+//! ## JumpOnlyElimination：跳转块消除（仅声明，未启用）
+//!
+//! 消除"纯转发"块：块内只有一条无实参 `jump`、目标块也没有参数（不携带任何 Phi
+//! 值），把前驱终结符直接重定向到目标块后删除该块。目前**仅声明**了结构体
+//! （本文件 `pub struct JumpOnlyElimination;`），`impl Pass` 整体被注释掉（文件
+//! 底部，TODO 注明：这是 SimplifyCFG，应迁到独立的 pass 文件）——未注册、未运行。
+//! 以下形态与条件取自注释掉的实现意图：
+//!
+//! ```text
+//! // 变换前                // 变换后
+//! a:  jump b              a:  jump c
+//! b:  jump c              （b 被删除，a 的终结符直接指向 c）
+//! c:  ret                 c:  ret
+//! ```
+//!
+//! - 候选：块首条指令是 `jump` 且 `jump.args()` 与目标块 `params()` 均为空；
+//! - 重写：经 `bb.used_by()` 找前驱终结符——`Jump` 改 `target`、`Branch` 改对应臂
+//!   （`true_bb_mut` / `false_bb_mut`）；删除 entry 块的分支被注释掉（不删入口）。
+//!
+//! ## 管线位置与门控
+//!
+//! 注册点都在 `opt/pass.rs` 的 `PassesManager::from_config`，fixpoint 段**末尾**
+//! （`gvn_pre::GVNPRE` 之后）：
+//!
+//! - `DeadPhiElimination` → `DeadCodeElimination` 紧邻注册（`p.register`）；
+//! - `DeadFunctionElimination` 受 `config.dead_function_elimination` 门控，为 true
+//!   才挂载——ABI 观察测试走不带它的管线（它们断言"优化了但不可达的 helper"的
+//!   参数绑定）；
+//! - `UnreachableBasicBlock` 不在 from_config（见上，由 `ssa.rs` / `const_prop.rs`
+//!   直接调用）；`JumpOnlyElimination` 未注册。
+//!
+//! fixpoint 语义（见术语表）：整段反复执行到一轮内无任何 pass 改变 IR（上限 100
+//! 轮）——前面的 pass 每轮新造的死代码，由本模块在后续轮次收敛干净。
+//!
+//! ## 验证
+//!
+//! - 本文件 `mod tests`（242 行起）：DCE 的 7 个用例——`preserves_mem_zero_and_
+//!   its_allocation` / `removes_call_to_pure_function_with_unused_result` /
+//!   `keeps_call_to_io_function` / `keeps_call_to_function_writing_a_global` /
+//!   `keeps_call_whose_result_is_used` / `removes_pure_unused_calls_but_keeps_io_
+//!   calls` / `keeps_pure_calls_whose_result_is_used`；
+//! - `mod dead_phi_tests`（580 行起）：DeadPhiElimination 的 4 例
+//!   （`never_forwards_entry_abi_parameters_from_backedges` /
+//!   `removes_dead_param_from_both_same_target_branch_arms` /
+//!   `eliminates_a_block_parameter_forwarding_one_value` /
+//!   `jump_args_stay_aligned_when_trailing_params_are_dead`）+ DeadFunctionElimination
+//!   的 3 例（`removes_transitively_dead_functions` / `removes_a_self_recursive_
+//!   function` / `preserves_decl_and_main`）；
+//! - 端到端：`make test` 差分比对（stdout + 退出码 vs `.out`）；本地快速回归：
+//!   `cargo test -p raana_ir`。
+//!
 use crate::opt::{
     analysis_passes::effects::EffectAnalysis,
     prelude::*,

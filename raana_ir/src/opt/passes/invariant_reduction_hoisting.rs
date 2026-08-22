@@ -34,6 +34,115 @@
 //! This is a structure-only optimization (per `docs/Illegal_optimization.md`
 //! rule two; see TODO.md §2.6): it never matches names, strings, or
 //! benchmark-specific bounds.
+//!
+//! ## 补充说明（中文）
+//!
+//! ### 一句话定位与动机
+//!
+//! 把**外层 trip 循环体里整棵不变归约巢**外提为单次计算（`many_mat_cal`
+//! 热点）：外层循环每次迭代只剩 `acc = acc + D_total` 一次加法。
+//! `many_mat_cal-1/2/3` 是语料中仅有的三个外层循环呈此形态的程序——`R` 次
+//! trip 的循环每轮都重算 `T×T` 平方和（约 1.5×10¹⁰ 次元素运算）；降级后归约巢
+//! 只跑一次（约 10⁶ 次）再加 `R` 次平凡加法，与 gcc 对该基准的处理一致。
+//!
+//! 术语（归约 / 外层循环、内层循环 / 纯函数 / trip 计数 / latch / preheader /
+//! backedge 等）以 `docs/offline-handbook/glossary.md` 为准，本文不展开。
+//!
+//! ### 变换形态
+//!
+//! 原始形态（外层 trip 循环 + 内层归约巢，见上方英文示例）：
+//!
+//! ```text
+//! L_out(r, ..., acc, ...):  br r < R, entry, exit
+//! entry:                    jump i_header(...)
+//! i_header(...):            ... 只读内存、只做 acc = acc ± D_i 的嵌套循环 ...
+//! latch:                    r = r + 1; jump L_out(..., acc, r, ...)
+//! exit:                     ... 使用 acc ...
+//! ```
+//!
+//! 变换后（`apply`）：
+//!
+//! ```text
+//! preheader:    jump entry_clone        // 归约巢克隆一份：seed acc = 0、r = 0
+//! entry_clone:  ... 原巢克隆（只跑一次，得出 D_total）...
+//! latch_clone:  jump compute_done(D_total)
+//! compute_done: jump L_out(..., acc, r, ..., D_total)  // D_total 作新 carrier 参数
+//! L_out(r, ..., acc, ..., carrier):  br r < R, irh_latch, exit  // 跳过巢
+//! irh_latch:    acc2 = acc + carrier; r2 = r ± step; jump L_out(...)
+//! exit:         ... 使用 acc ...
+//! ```
+//!
+//! 要点：header 追加一个循环携带参数 `carrier`（承载 `D_total`，每轮不变）；
+//! 原 header 终结符改为直接分支到新建的 `irh_latch`（降级 latch）；原 latch 与
+//! 归约巢整体变成不可达代码，留给 DCE。
+//!
+//! ### 触发条件
+//!
+//! `find_outer` 对每个循环按 7 项检查，全部满足才接受：
+//!
+//! 1. header 终结符是 `branch`，continue 边进巢、exit 边出环，且巢入口块无参数
+//!    （克隆体以空 `jump` 开始）；
+//! 2. 出口测试形如 `r < bound` 或 `bound > r`，被比较的 header 参数 `r` 即 trip
+//!    计数器；不用通用 BIV 分析（`r` 先穿过嵌套循环头才在 latch 更新，BIV 看不
+//!    到它），结构测试 + `trace_invariant` 才是关键；
+//! 3. 恰好 1 个 latch，且巢（循环体去掉 header）≥ 2 块并包含 latch；
+//! 4. 巢内无 `store` / `call` / `tail_call` / `memzero` / `global_alloc`，块引用
+//!    只能落在巢内或回 header；`trace_invariant` 证明巢不依赖 `r`（`r` 只允许穿
+//!    过嵌套循环头参数透传、在 latch 里做 trip 更新）；
+//! 5. latch 以 `jump header` 结尾，回边实参个数与 header 参数个数一致；
+//! 6. **恰好一个**累加器：非 trip 的 i32 header 参数，巢内每处使用都是
+//!    `acc ± E`（`Add` / `Sub`，另一操作数不是 `acc` 自身）或透传进嵌套循环头，
+//!    且追踪终点恰是 latch 回边里 acc 自己的槽位（`trace_accumulator`）；出现两
+//!    个候选则拒绝；
+//! 7. 巢只引用 header **参数**，不引用 header 内计算的局部值（克隆体没有它们的
+//!    支配定义）。
+//!
+//! ### 放弃条件
+//!
+//! - `run_on`：decl 函数、无环 CFG（`is_acyclic`）直接返回；`find_outer` 拒绝即
+//!   跳过该循环；
+//! - `apply`：`ensure_preheader` 失败；preheader 终结符不是 `jump` 或实参个数不
+//!   匹配；原 latch 的 trip 更新不是 `r ± const`（`Add` / `Sub` 且恰好一个常量
+//!   操作数——否则建不出降级 latch 的步长）；
+//! - preheader 是新建的（`EnsurePreheader::Created`）时本轮只返回"已改动"，真正
+//!   的改写留到下一轮 fixpoint 迭代（届时 preheader 已存在）。
+//!
+//! ### 正确性
+//!
+//! - 巢**纯**（无 store / call / memzero）且只读循环不变内存 → 克隆跑一次不复制
+//!   任何副作用；
+//! - `acc` 在巢内只做加法累加：`nest(acc) = acc + D`，`D` 与 `acc` 无关，`R` 次
+//!   应用等于 `acc_init + D_total × R`（i32 按 mod 2³² 回绕）；
+//! - 巢不读 trip 计数器 `r`（`trace_invariant`）→ `D` 与迭代无关，单次克隆计算
+//!   合法；
+//! - 克隆体 SSA 合法性：header 参数按映射替换（累加器与 `r` → 0，其余 → 进入值，
+//!   进入值支配克隆体）；巢内值克隆、巢外定义的值（全局 / 常量 / 循环不变）共享；
+//! - 陈旧回边补齐：header 增加 `carrier` 参数后，所有仍指向 header 的终结符（含
+//!   不可达的原 latch）实参个数必须同步补齐，否则遍历 `used_by` 的消费者（如
+//!   DeadPhiElimination）会因参数不匹配 panic（many_mat_cal 回归点）；补的哑值
+//!   永不执行；
+//! - 原 latch 引用巢内值，不可达后不能复用为降级 latch，故新建 `irh_latch`，
+//!   只接触可达值（header 自身参数 + `carrier`）。
+//!
+//! 纯结构优化（`docs/Illegal_optimization.md` 规则二，见 TODO.md §2.6）：不匹配
+//! 任何函数名 / 字符串 / 基准特定边界。
+//!
+//! ### 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，fixpoint 段，
+//!   **`matmul_interchange` 之后**、**`reduction_unroll` 之前**——靠前才能看到
+//!   未被分片破坏的原始嵌套归约巢（`matmul_interchange` 自身受
+//!   `enable_chain_to_switch` 门控，本 pass 不带门控、无 config 开关）；
+//! - 与 `reduction_unroll` 先后配合：本 pass 先把整巢降级成 `acc += D_total`，
+//!   `reduction_unroll` 再拆单累加器循环为四条独立车道。
+//!
+//! ### 验证
+//!
+//! - 本文件 `mod tests`（750 行起）：`degrades_an_invariant_outer_reduction_nest`
+//!   验证降级改写、`carrier` 参数、陈旧回边补齐与幂等性（二次运行不再改写）；
+//!   `skips_a_nest_with_a_store_in_the_outer_body` 验证巢内有 `store` 时拒绝且
+//!   不改写；
+//! - 全量：`make test`（Docker harness 差分比对），性能口径见 AGENTS.md。
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
@@ -69,6 +178,18 @@ struct OuterCandidate {
 
 impl InvariantReductionHoisting {
     fn find_outer(data: &ArenaContextMut<'_>, looop: &Loop) -> Option<OuterCandidate> {
+        // 识别（M48）：外层 trip 循环包着一个"循环不变归约巢"——巢对 trip
+        // 计数器 r 不变、纯（无副作用）、累加器在巢内只做加法。识别分 7 步：
+        //   (1) header 分支：真进巢、假出循环；
+        //   (2) exit 测试用 header 参数 r 对 bound（r < bound / r > bound 形态，
+        //       结构性识别，不走 BIV——r 经嵌套 header 穿线后 BIV 看不见）；
+        //   (3) 唯一 latch，巢非平凡（≥2 块）；
+        //   (4) 巢纯 + 只引用 header/巢内块，r 不被任何计算使用（trace_invariant）；
+        //   (5) latch 以 jump 回 header；
+        //   (6) 恰一个"加性累加"的 header 参数 acc（trace_accumulator）；
+        //   (7) 巢不引用 header 局部计算值（只有参数，克隆可替换）。
+        // 改写的核心洞见：巢对 r 不变 → 整巢 R 次执行 = 跑一次乘 R——
+        // 克隆巢一次算出 D_total = acc 的增量，循环体降级为 acc += D_total。
         let header = looop.header();
         let params = data.bb_data(header).params().to_vec();
 
@@ -171,6 +292,28 @@ impl InvariantReductionHoisting {
                 continue;
             }
             let Some(final_acc) = trace_accumulator(data, &region, header, exit, p) else {
+                // A non-trip i32 param additively modified inside the nest but
+                // failing the accumulator trace (e.g. its value is also stored
+                // to memory) must still veto the transform: the clone runs the
+                // nest once, and the degraded loop only carries the chosen
+                // accumulator — any other loop-carried modification would be
+                // dropped (fuzz: case_0147, g_sum += 69 inside helper1548).
+                let has_acc_use = data
+                    .inst_data(p)
+                    .used_by()
+                    .iter()
+                    .any(|&u| {
+                        data.layout().parent_bb(u).is_some_and(|b| region.contains(&b))
+                            && matches!(
+                                data.inst_data(u).kind(),
+                                InstKind::Binary(b)
+                                    if matches!(b.op(), BinaryOp::Add | BinaryOp::Sub)
+                                        && (b.lhs() == p || b.rhs() == p)
+                            )
+                    });
+                if has_acc_use {
+                    return None;
+                }
                 continue;
             };
             if orig_back_args[idx] == final_acc
@@ -189,6 +332,32 @@ impl InvariantReductionHoisting {
                 return None;
             }
         };
+
+        // (6.5) No non-trip, non-acc loop-carried parameter may be modified
+        // in the body AND observed after the loop: the compute-once clone
+        // cannot reproduce a modification outside the nest, and the degraded
+        // loop would exit with the wrong value (fuzz: sd16 case_0031 —
+        // `v343 = -81` in the outer body, read by the post-loop condition,
+        // was dropped → the condition folded the wrong way and putint(-3)
+        // vanished). Modifications inside the nest are reproduced by the
+        // clone (case_0057's float selects) and stay allowed; a pure
+        // pass-through is always fine.
+        for (idx, p) in params.iter().enumerate() {
+            if idx == r_idx || idx == acc_idx {
+                continue;
+            }
+            if orig_back_args.get(idx) == Some(p) {
+                continue;
+            }
+            let live_at_exit = data
+                .inst_data(*p)
+                .used_by()
+                .iter()
+                .any(|&u| data.layout().parent_bb(u).is_some_and(|b| !region.contains(&b)));
+            if live_at_exit {
+                return None;
+            }
+        }
 
         // (7) The nest must not reference header-local computed values (only
         // header parameters, which the clone substitutes with their entering
@@ -231,6 +400,13 @@ impl InvariantReductionHoisting {
         looop: &Loop,
         cand: &OuterCandidate,
     ) -> bool {
+        // 改写（M48）：克隆整巢跑一次算 D_total，原循环降级为
+        // `acc += D_total; r += step` 的裸 trip 循环。
+        // 具体：preheader 重定向进克隆巢（acc 种子 0、r 种子进入值）；
+        // 巢出口把 D_total 经新 header 参数 carrier 带回降级循环；
+        // 新建 irh_latch 只接触可达值（acc + carrier、r + step）；
+        // 原 header 分支改为直接跳降级 latch（不再进巢）；
+        // 原 latch 因引用巢内值不可复用（不可达后悬空），必须新建。
         let Some(preheader) = ensure_preheader(data, cfg, looop) else {
             return false;
         };
@@ -644,8 +820,20 @@ fn trace_invariant(
                     {
                         worklist.push_back(user);
                     }
-                    InstKind::Jump(jump)
-                        if jump.target() == header && jump.args().contains(&cur) => {}
+                    InstKind::Jump(jump) if jump.target() == header => {
+                        // r-derived values may only ride the r slot on the
+                        // back edge; an arg feeding the accumulator slot makes
+                        // the accumulator's delta D depend on r and the clone
+                        // (seeded with r = entering value) would compute a
+                        // wrong carrier (fuzz: case_0057, `g_sum += i589 - 30`).
+                        let params = data.bb_data(header).params();
+                        let r_pos = params.iter().position(|&p| p == r);
+                        if !r_pos
+                            .is_some_and(|i| jump.args().get(i).copied() == Some(cur))
+                        {
+                            return false;
+                        }
+                    }
                     _ => return false,
                 }
             } else {
@@ -1007,6 +1195,189 @@ mod tests {
         assert!(
             !run(&mut program, function),
             "a store in the body must veto"
+        );
+        assert_eq!(
+            program.func_data(function).layout().basicblocks().len(),
+            blocks,
+            "the transformed program must not grow blocks"
+        );
+    }
+
+    #[test]
+    fn skips_a_nest_with_a_body_modified_carried_param() {
+        // fuzz sd16 case_0031: `v343 = -81` in the outer body, read by the
+        // post-loop condition. A non-trip, non-acc loop-carried parameter
+        // modified in the body cannot be reproduced by the compute-once
+        // clone — the degraded loop exits with the wrong value. Must reject.
+        let mut program = Program::new();
+        let function =
+            program.new_function(Type::get_i32(), "modify_nest".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let bound = data.params()[0];
+        let outer = data.new_basic_block().basic_block(
+            "outer".into(),
+            vec![Type::get_i32(), Type::get_i32(), Type::get_i32()],
+        );
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [outer, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(outer, vec![zero, zero, zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let r = data.bb_data(outer).params()[0];
+        let acc = data.bb_data(outer).params()[1];
+        let extra = data.bb_data(outer).params()[2];
+        let one = data.new_local_inst().integer(1);
+        let test = data.new_local_inst().binary(BinaryOp::Lt, r, bound);
+        let branch = data
+            .new_local_inst()
+            .branch(test, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(outer, test);
+        data.layout_mut().insert_inst(outer, branch);
+        // extra is modified in the body: extra2 = extra - 81.
+        let eighty_one = data.new_local_inst().integer(81);
+        let extra2 = data.new_local_inst().binary(BinaryOp::Sub, extra, eighty_one);
+        let acc2 = data.new_local_inst().binary(BinaryOp::Add, acc, one);
+        let r2 = data.new_local_inst().binary(BinaryOp::Add, r, one);
+        for inst in [eighty_one, extra2, acc2, r2] {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        let back = data.new_local_inst().jump(outer, vec![r2, acc2, extra2]);
+        data.layout_mut().insert_inst(body, back);
+        let ret = data.new_local_inst().ret(Some(extra));
+        data.layout_mut().insert_inst(exit, ret);
+
+        let blocks = program.func_data(function).layout().basicblocks().len();
+        assert!(
+            !run(&mut program, function),
+            "a body-modified carried param must veto"
+        );
+        assert_eq!(
+            program.func_data(function).layout().basicblocks().len(),
+            blocks,
+            "the transformed program must not grow blocks"
+        );
+    }
+
+    #[test]
+    fn skips_a_nest_whose_accumulator_delta_reads_the_trip_counter() {
+        // Regression (fuzz: case_0057): `acc = acc + (r + -30)` — the delta E
+        // reads the trip counter r. trace_invariant must veto: the clone is
+        // seeded with r = entering value, so the carrier would be computed
+        // from r = 0 and reused for every iteration. The back edge may only
+        // carry r-derived values in the r slot; an arg feeding the acc slot
+        // means D depends on r.
+        let mut program = Program::new();
+        let function =
+            program.new_function(Type::get_i32(), "delta_reads_r".into(), vec![Type::get_i32()]);
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let bound = data.params()[0];
+        let outer = data
+            .new_basic_block()
+            .basic_block("outer".into(), vec![Type::get_i32(), Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [outer, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(outer, vec![zero, zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let r = data.bb_data(outer).params()[0];
+        let acc = data.bb_data(outer).params()[1];
+        let one = data.new_local_inst().integer(1);
+        let minus30 = data.new_local_inst().integer(-30);
+        let test = data.new_local_inst().binary(BinaryOp::Lt, r, bound);
+        let branch = data
+            .new_local_inst()
+            .branch(test, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(outer, test);
+        data.layout_mut().insert_inst(outer, branch);
+        // The nest is the latch: acc += (r + -30), r += 1.
+        let delta = data.new_local_inst().binary(BinaryOp::Add, r, minus30);
+        let acc2 = data.new_local_inst().binary(BinaryOp::Add, acc, delta);
+        let r2 = data.new_local_inst().binary(BinaryOp::Add, r, one);
+        let back = data.new_local_inst().jump(outer, vec![r2, acc2]);
+        for inst in [delta, acc2, r2, back] {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        let ret = data.new_local_inst().ret(Some(acc));
+        data.layout_mut().insert_inst(exit, ret);
+
+        let blocks = program.func_data(function).layout().basicblocks().len();
+        assert!(
+            !run(&mut program, function),
+            "a delta that reads the trip counter must veto"
+        );
+        assert_eq!(
+            program.func_data(function).layout().basicblocks().len(),
+            blocks
+        );
+    }
+
+    #[test]
+    fn skips_a_nest_with_a_second_non_traced_accumulation() {
+        // Regression (fuzz: case_0147): the nest accumulates a second
+        // loop-carried i32 value (g_sum += 69 inside an inlined helper) that
+        // fails the accumulator trace (its value is also stored to memory in
+        // the exit block). The transform would drop that accumulation — the
+        // clone runs the nest once and the degraded loop only carries the
+        // chosen accumulator — so any additive modification of a non-acc
+        // param must veto.
+        let mut program = Program::new();
+        let function = program.new_function(
+            Type::get_i32(),
+            "second_acc".into(),
+            vec![Type::get_i32()],
+        );
+        let data = program.func_data_mut(function);
+        let entry = data.add_entry_block();
+        let bound = data.params()[0];
+        let outer = data
+            .new_basic_block()
+            .basic_block("outer".into(), vec![Type::get_i32(), Type::get_i32(), Type::get_i32()]);
+        let body = data.new_basic_block().basic_block("body".into(), vec![]);
+        let exit = data.new_basic_block().basic_block("exit".into(), vec![]);
+        for block in [outer, body, exit] {
+            data.layout_mut().push_bb_back(block);
+        }
+        let zero = data.new_local_inst().integer(0);
+        let entry_jump = data.new_local_inst().jump(outer, vec![zero, zero, zero]);
+        data.layout_mut().insert_inst(entry, entry_jump);
+        let r = data.bb_data(outer).params()[0];
+        let acc = data.bb_data(outer).params()[1];
+        let extra = data.bb_data(outer).params()[2];
+        let one = data.new_local_inst().integer(1);
+        let test = data.new_local_inst().binary(BinaryOp::Lt, r, bound);
+        let branch = data
+            .new_local_inst()
+            .branch(test, body, vec![], exit, vec![]);
+        data.layout_mut().insert_inst(outer, test);
+        data.layout_mut().insert_inst(outer, branch);
+        let acc2 = data.new_local_inst().binary(BinaryOp::Add, acc, one);
+        let extra2 = data.new_local_inst().binary(BinaryOp::Add, extra, one);
+        let r2 = data.new_local_inst().binary(BinaryOp::Add, r, one);
+        let back = data.new_local_inst().jump(outer, vec![r2, acc2, extra2]);
+        for inst in [acc2, extra2, r2, back] {
+            data.layout_mut().insert_inst(body, inst);
+        }
+        // extra's value is consumed by a store in the exit block, which makes
+        // trace_accumulator(extra) fail (not a clean accumulator candidate).
+        let slot = data.new_local_inst().alloc(Type::get_i32());
+        let store = data.new_local_inst().store(extra2, slot);
+        let ret = data.new_local_inst().ret(Some(acc));
+        for inst in [slot, store, ret] {
+            data.layout_mut().insert_inst(exit, inst);
+        }
+
+        let blocks = program.func_data(function).layout().basicblocks().len();
+        assert!(
+            !run(&mut program, function),
+            "a second additive modification must veto"
         );
         assert_eq!(
             program.func_data(function).layout().basicblocks().len(),

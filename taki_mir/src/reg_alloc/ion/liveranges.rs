@@ -13,6 +13,22 @@
  */
 
 //! Live-range computation.
+//!
+//! 逐指令扫描函数体，为每个 VReg 计算**活跃区间**（LiveRange：从定义点覆盖到
+//! 最后一次使用的连续指令区间）。`Liveness` 同时产出 block 级 livein/liveout。
+//!
+//! [`SpillWeight`] 是回溯博弈的关键输入。**权重按每个使用点（Use）计算后累加
+//! 聚合**（`spill_weight_from_constraint`）：
+//!
+//! ```text
+//! 单点权重 = hot_bonus（基础 1000，循环深度每层 ×4：1000 → 4000 → 16000…）
+//!          + def_bonus（定义点 +2000）
+//!          + constraint_bonus（无约束 Any +1000；寄存器约束 Reg/FixedReg +2000）
+//! ```
+//!
+//! 权重高的 bundle 在驱逐博弈与 spill 排序中占优。**调溢出策略**改
+//! `liveranges.rs` 里的这些 bonus 常量（注意：处理顺序由
+//! `compute_bundle_prio` 决定，不受这些常量影响）。
 
 use super::IndexSet;
 use super::data_structures::{
@@ -42,6 +58,14 @@ pub fn spill_weight_from_constraint(
     loop_depth: usize,
     is_def: bool,
 ) -> SpillWeight {
+    // 溢出权重 = 热度加成 + 定义加成 + 约束加成：
+    //   热度：每层循环 ×4（1000/4000/16000…，封顶 10 层）——循环内的
+    //   值被 spill 的代价远高于循环外，权重高者优先保住寄存器；
+    //   定义：def 位置 +2000（值被定义后立即 spill 会多一对存取）；
+    //   约束：Reg/FixedReg 要求寄存器的操作数权重更高（spill 会引入
+    //   额外的移动）。
+    // 该权重是驱逐博弈与 spill 排序的依据（谁被挤掉、谁先进栈），
+    // 不决定处理顺序（顺序由 bundle 优先级 prio 决定）。
     // A bonus of 1000 for one loop level, 4000 for two loop levels,
     // 16000 for three loop levels, etc. Avoids exponentiation.
     let loop_depth = core::cmp::min(10, loop_depth);
@@ -154,6 +178,15 @@ impl<F: Function> Env<'_, F> {
         vreg: VRegIndex,
         mut range: CodeRange,
     ) -> LiveRangeIndex {
+        // 活跃区间插入：把 [from, to) 区间并入 vreg 的区间链表。
+        // 关键不变量——活跃性构建期指令恒自底向上处理，新区间总是
+        // "先于"已存在区间创建（按 from 递减），因此：
+        // ① 只需与链尾（= 当前最小的 from）比较即可判定是否邻接，
+        //    邻接则直接扩展（O(1) 合并），否则新建节点——避免 O(n) 扫描，
+        //    否则整体活跃性构建会退化为 O(n²)；
+        // ② 区间以逆序存储，compute_liveness 结束时统一反转。
+        // allow_multiple_vreg_defs（固定物理寄存器多 def）时允许重叠，
+        // 重叠即复用既有区间；部分重叠则截断尾部保证可合并。
         trace!("add_liverange_to_vreg: vreg {:?} range {:?}", vreg, range);
 
         // Invariant: as we are building liveness information, we

@@ -17,6 +17,85 @@
 //! `base_of` + `constant_offset`, including pointer-slot resolution and
 //! block-parameter phi offsets). Everything conservative: an unresolvable
 //! address never triggers a deletion or rewrite.
+//!
+//! ---
+//!
+//! ## 补充说明（中文）
+//!
+//! 死存储消除（DSE）：删掉"写了也不会被读到"的 store，并把"刚写入的值"
+//! 直接转发给紧接着的 load，减少内存往返。术语：SSA / block 参数（Phi）/
+//! 死存储 / used_by / def-use 链 等见 `docs/offline-handbook/glossary.md`
+//! 的"IR 与 SSA 基础"与"优化与 pass 概念"分组；GSP（标量全局提升 pass）
+//! 见 `scalar_global_promotion.rs`。
+//!
+//! ### 一句话定位 + 动机
+//!
+//! 函数内（within-function）的存储优化：`run` 对每个非 decl 函数跑一遍
+//! `run_on_func`，消除不可能被观察到的写入。动机：GSP 把可观察性受限的
+//! 标量全局提升为 SSA 值、寄存器保存副本（"load once, write back once"），
+//! 若函数内没人改过内存，写回的就是 load 出来的原值——纯开销；DSE 顺手
+//! 清掉被覆盖的 store、做 store-to-load 转发，让后续 pass 看到更干净的内存图。
+//!
+//! ### 变换形态（英文文档所列四类的简要版）
+//!
+//! 1. **GSP 冗余写回删除**：`store v, p` 且 `v` 是 `load p` 的结果，该单元
+//!    在函数内没有其它写、任何调用都不会写它、也无 MemZero 覆盖 → 写回
+//!    原值原样，是死操作，删除。
+//! 2. **覆盖存储删除**：同一单元两次 store、中间无读 → 前一个 store 的值
+//!    必然被覆盖，删除。
+//! 3. **store-to-load 转发**：load 的单元最近一次"未被读过的操作"是 store
+//!    （中间无写、无可能读）→ load 用被存的值替换（`visit_and_replace`
+//!    重写使用点）。
+//! 4. **覆盖 MemZero 删除**：MemZero 的整个字节区间被后续 store 覆盖（同
+//!    base、常量偏移、已知 store 宽度、中间无读/调用）→ 删除
+//!    （`LiveMemZero` + `record_coverage` 用排序不相交区间并集跟踪覆盖）。
+//!
+//! ### 触发 / 放弃条件
+//!
+//! 地址解析是热路径：`resolve_cell`（`BaseEnv::base_of` + `constant_offset`，
+//! 含指针槽解析与 block 参数 phi 偏移）把地址归约成 `Cell = (MemObject, i64)`；
+//! **只有栈分配（`MemObject::Alloc`）和全局（`Global`）有单元语义**，参数
+//! （ABI 指针）与未知 base 解析为 `None`。解析不出就什么都不做——全部保守。
+//! 具体放弃点：
+//! - 冗余写回（Transform 1）：单元被函数内其它写命中（`writes[cell].len() != 1`）、
+//!   store 的源不是同单元的 load、任何调用可能写它（`call_write_roots` 为
+//!   `None` 视为全写屏障）或 MemZero 可能覆盖它；
+//! - 覆盖存储 / 转发（Transform 2+3，块内前向扫描）：遇到**不可解析地址**
+//!   的 store/load/MemZero（可能别名任意单元）时清空 `pending`；调用按
+//!   `call_write_roots` / `call_read_roots` / `call_may_read` 保守保留可能
+//!   被写/被读的 pending store；MemZero 对其区间内的 pending store 同样是屏障；
+//! - 覆盖 MemZero（Transform 4）：只有常量长度（`MemZeroLen::Const`）才可能
+//!   被证明完全覆盖；运行时长度（M53 零存储循环，`MemZeroLen::Value`）视为
+//!   无限区间，永不删除。
+//!
+//! ### 正确性要点
+//!
+//! - 全保守：任何解析不出 / 无法证明的地址、调用、MemZero 都按"可能读写
+//!   一切"处理；
+//! - 转发只发生在同一基本块内、按指令序前向扫描，且仅当单元的最新操作是
+//!   尚未被观察的 pending store；被转发的 load 留在布局中（不消耗 pending
+//!   store，后面同单元的 store 仍可覆盖删除它），失去使用者的死 load 交给
+//!   DCE 收尾；
+//! - MemZero 覆盖只累计"已被后续 store 覆盖"的字节，任何对区间内字节的
+//!   load 都使 MemZero 必须保留；
+//! - 删除用 `remove_layout_inst`、改写用 `visit_and_replace`，保持 arena 与
+//!   used_by 一致。
+//!
+//! ### 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`，fixpoint 段，
+//!   **`gvn` 之后、`pointer_strength_reduction` 之前**（注册处注释：让
+//!   后续 pass 看到更干净的内存图）；
+//! - 前后配合：GVN 先做值编号 / 冗余消除，DSE 再清内存图，PSR 随后把
+//!   仿射地址计算改写为指针递进；
+//! - 无目标门控、无 config 开关（AArch64 / RISC-V 都跑）。
+//!
+//! ### 验证
+//!
+//! - 本文件 `mod tests`（449 行起）覆盖：冗余写回删除 / 单元被改后写回保留 /
+//!   覆盖存储删除 / 中间读转发 / 不可解析地址屏障 / MemZero 屏障 /
+//!   MemZero 完全覆盖删除 / 部分覆盖保留 / 中间读保留；
+//! - 端到端：`make test` 差分比对。
 
 use crate::ir::inst_kind::mem_zero::MemZeroLen;
 use crate::opt::{
@@ -29,12 +108,17 @@ use crate::opt::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Dead store elimination.
+/// DSE pass 本体（无状态）。本文件只含这一个 pass，调度入口在 `run`。
 pub struct DSE;
 
 impl Pass for DSE {
     fn run(&mut self, program: &mut Program) -> bool {
         let analysis = EffectAnalysis::new(program);
+        // 一次性构建全程序的 EffectAnalysis：提供 BaseEnv（基址 + 常量偏移
+        // 解析）与各函数的调用读写根集合，供所有函数共享。
         let mut changed = false;
+        // `to_vec()` 先克隆函数句柄列表：循环体内要可变借用 `program`
+        // 构建 `ArenaContextMut`，不能同时持有布局的迭代借用。
         for func in program.function_layout().to_vec() {
             if program.func_data(func).layout().is_decl() {
                 continue; // declarations have no body and no base env
@@ -55,6 +139,12 @@ type Cell = (MemObject, i64);
 /// Resolve an address to a concrete cell when its base and offset are both
 /// compile-time known. Only stack allocs and globals have cell semantics;
 /// parameters (ABI pointers) and unknown bases resolve to `None`.
+///
+/// 地址解析入口（BaseEnv 单元格解析）：把一条地址指令归约成
+/// `Cell = (基对象, 字节偏移)`，两步走——`constant_offset` 求偏移、
+/// `base_of` 求基对象。只有栈分配（`MemObject::Alloc`）与全局
+/// （`Global`）有单元语义；参数指针与未知基址返回 `None`，调用方
+/// 遇到 `None` 只能按"可能别名一切"保守处理。
 fn resolve_cell(env: &BaseEnv, ctx: &ArenaContext<'_>, addr: Inst) -> Option<Cell> {
     let off = env.constant_offset(ctx, addr)?;
     match env.base_of(ctx, addr) {
@@ -64,6 +154,10 @@ fn resolve_cell(env: &BaseEnv, ctx: &ArenaContext<'_>, addr: Inst) -> Option<Cel
 }
 
 /// Core per-function scan.
+/// 单函数核心流程，四步：Pass A 只读收集（writes / 调用 / MemZero）→
+/// Transform 1 全函数级冗余写回删除 → Transform 2/3 块内前向扫描
+/// （覆盖 store 删除 + store-to-load 转发 + 覆盖 MemZero 删除）→
+/// 统一落地（转发改写 + 指令摘除）。返回是否有任何改动。
 fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> bool {
     let func = data.curr_func.unwrap();
     let env = analysis.env_of(func);
@@ -79,10 +173,16 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
     let mut writing_calls: Vec<Inst> = Vec::new();
     // memzero ranges: (root, offset, len)
     let mut memzeros: Vec<(MemObject, i64, i64)> = Vec::new();
+    // 三类统计的用途：`writes` 与 `memzeros` 供 Transform 1 做全函数范围
+    // 检查（单写判断、MemZero 覆盖判断）；`writing_calls` 归并成"可能被
+    // 调用写到的基对象集合"后同样供 Transform 1 使用。Transform 2/3 的
+    // 块内扫描不依赖这些全局表，边走边维护局部状态。
 
     // Address resolution is the hot path (every store/load/memzero);
     // memoize per instruction since GEPs are shared across accesses.
     let mut cell_cache: FxHashMap<Inst, Option<Cell>> = FxHashMap::default();
+    // 解析结果按地址指令缓存：同一个 GEP 常被多处 load/store 共享，
+    // 避免同一地址反复走 BaseEnv。
     let mut resolve = |addr: Inst| -> Option<Cell> {
         *cell_cache
             .entry(addr)
@@ -93,6 +193,8 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
         for &inst in bb.insts() {
             match data.inst_data(inst).kind() {
                 InstKind::Store(store) => {
+                    // 只登记能解析出具体单元的 store；解析不出的忽略即可，
+                    // 反正 Transform 1 对它们天然保守。
                     if let Some(cell) = resolve(store.dest()) {
                         writes.entry(cell).or_default().push(inst);
                     }
@@ -131,6 +233,15 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
     // Precompute the set of bases that any call may write, so the per-cell
     // check stays O(1) instead of O(#calls) (large functions with many
     // stores and calls would otherwise blow up quadratically).
+    //
+    // （中文）Transform 1 的删除条件，全部满足才删，任一不满足即保守保留：
+    //   a) 该单元在函数内只被这一条 store 写过（`writes[cell].len() == 1`）；
+    //   b) store 的源值是同一单元的 load（写回的是原值，纯开销）；
+    //   c) 无任何调用可能写该单元（`call_writes_unknown` 或基对象命中
+    //      `call_written_bases` 都视为"可能被写"）；
+    //   d) 无 MemZero 覆盖该单元。
+    // 预计算"可能被调用写到的基对象集合"，把 c) 的每单元检查从
+    // O(调用数) 降到 O(1)——大函数 store/调用都多时避免二次方复杂度。
     let mut call_written_bases: FxHashSet<MemObject> = FxHashSet::default();
     let mut call_writes_unknown = false;
     for &call_inst in &writing_calls {
@@ -150,6 +261,8 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
         }
     }
     let mut writeback_removals: Vec<Inst> = Vec::new();
+    // 逐单元核对条件 a)–d)：a) 由 `insts.len() == 1` 保证，随后依次
+    // 验证 b) c) d)，全部通过才把该 store 记入删除清单。
     for (cell, insts) in writes.iter() {
         if insts.len() != 1 {
             continue; // the cell is written elsewhere in the function
@@ -188,6 +301,14 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
     // store to the same cell appears before any read of that cell. A load
     // of a cell whose latest operation is a pending store is replaced by
     // the stored value (forwarding).
+    // （中文）Transform 2 + 3：同一基本块内的前向扫描。核心数据结构是
+    // `pending`——"单元 -> (store, 被存的值)"，表示该值已写入内存但尚未
+    // 被任何读观察到（store 存活性）。规则：
+    //   - 再遇同单元 store：旧的 pending store 必被覆盖 → 删除；
+    //   - 遇同单元 load：用被存的值替换（转发）；
+    //   - 遇不可解析地址 / 调用 / MemZero：按屏障语义清空或裁剪 pending。
+    // 只在块内扫描，跨块信息（循环、汇合点、其它路径的读写）一律不利用，
+    // 这是本 pass 的保守边界之一。
     let mut covered_removals: Vec<Inst> = Vec::new();
     // (load inst, replacement value)
     let mut forwardings: Vec<(Inst, Inst)> = Vec::new();
@@ -199,16 +320,23 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
         let mut pending: FxHashMap<Cell, (Inst, Inst)> = FxHashMap::default();
         // MemZeros in this block that later stores may still cover fully.
         let mut live_memzeros: Vec<LiveMemZero> = Vec::new();
+        // 每个块开始时空表：块内前向扫描的状态只从本块第一条指令起累积，
+        // 函数入口/前驱块写入的值一律视为"已读"——跨块不追踪（保守）。
         for &inst in bb.insts() {
             match data.inst_data(inst).kind() {
                 InstKind::Store(store) => match resolve(store.dest()) {
                     Some(cell) => {
+                        // `insert` 返回旧值：同单元已有一条未被读过的 store，
+                        // 中间无读，旧的必被覆盖 → 记入 covered_removals。
                         if let Some((prev, _)) = pending.insert(cell, (inst, store.src())) {
                             covered_removals.push(prev);
                         }
                         // Each byte of the stored value overwrites any live
                         // MemZero range it lands in. The store width is the
                         // byte size of the stored value's type (i32 -> 4).
+                        // 顺带为覆盖 MemZero 服务：把本次 store 的覆盖区间
+                        // `[off_s, off_s+width)` 并入同 base 的每个存活 MemZero 的
+                        // 已覆盖区间表；完全覆盖者立即判死摘除。
                         let width = data.inst_data(store.src()).ty().size() as i64;
                         if width > 0 {
                             let (root_s, off_s) = cell;
@@ -241,6 +369,9 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                     // Unknown destination: may alias anything, so every
                     // pending store is conservatively treated as observed,
                     // and no MemZero coverage can be proven.
+                    // 不可解析的 store 目标：可能别名任意单元。所有 pending store 都可能
+                    // 已被这次写覆盖、MemZero 覆盖证明全部作废——两个表一并清空，
+                    // 扫描状态回到"一无所知"（保守）。
                     None => {
                         pending.clear();
                         live_memzeros.clear();
@@ -248,19 +379,27 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                 },
                 InstKind::Load(load) => match resolve(load.src()) {
                     Some(cell) => {
+                        // 命中 pending：登记转发 `(load, 被存的值)`，落地阶段
+                        // 统一用 `visit_and_replace` 改写使用点。
                         if let Some(&(_, value)) = pending.get(&cell) {
                             forwardings.push((inst, value));
                             // The store's memory value is still unread; it
                             // stays pending so a later covering store can
                             // still remove it.
                         } else {
+                            // 无 pending：读到的是更早（函数入口/其它路径）
+                            // 写入的旧值。`remove` 无键可删，纯防御性写法。
                             pending.remove(&cell);
                         }
                         // A load of any byte in a live MemZero's range
                         // observes the zeroing: the MemZero must stay.
+                        // load 屏障（对 MemZero）：区间内任何字节被读到都说明零初始化可能
+                        // 被观察，该候选必须保留——从列表剔除命中的，其余继续参与覆盖累计。
                         live_memzeros.retain(|m| !cell_in_range(&cell, m.root, m.off, m.len));
                     }
                     None => {
+                        // 地址不可解析的 load：可能读到任何单元，同 store
+                        // 屏障，清空两个表。
                         pending.clear();
                         live_memzeros.clear();
                     }
@@ -269,6 +408,9 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                     // A call may read any memory (and may write it), so no
                     // MemZero coverage can be proven past it.
                     live_memzeros.clear();
+                    // 调用是双向屏障：先无条件清空 MemZero 覆盖候选——调用
+                    // 可能读任意内存，之前的零初始化此后可能被观察到。
+                    // pending 则按被调函数的写/读根集合精确裁剪，见下。
                     let callee = call.callee();
                     match analysis.call_write_roots(callee, func) {
                         None => pending.clear(),
@@ -289,6 +431,9 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                                         // The call may also read through a
                                         // target set we cannot express as
                                         // roots; be conservative.
+                                        // 读写根都没命中仍不能放心：调用还可能通过无法表示
+                                        // 成根的间接目标读内存。再查 `call_may_read` 兜底，
+                                        // 仍可能读就保守丢弃该 pending store。
                                         let mut targets = rustc_hash::FxHashSet::default();
                                         let obj = cell_to_object(cell, func);
                                         targets.insert(obj);
@@ -301,6 +446,9 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                 }
                 InstKind::MemZero(mem_zero) => {
                     if let Some((root, off)) = resolve(mem_zero.dest()) {
+                        // MemZero 兼作写屏障与读屏障：区间内的 pending store
+                        // 被清零覆盖，无法再证明存活；与其它存活候选区间
+                        // 重叠时，覆盖证明互相作废。自身随后登记为删除候选。
                         let len = match mem_zero.byte_len_len() {
                             MemZeroLen::Const(n) => *n as i64,
                             MemZeroLen::Value(_) => i64::MAX,
@@ -324,6 +472,7 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
                             });
                         }
                     } else {
+                        // 地址不可解析的 MemZero：可能清零任意字节，同屏障。
                         pending.clear();
                         live_memzeros.clear();
                     }
@@ -334,6 +483,8 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
     }
 
     let mut changed = false;
+    // 落地阶段：先做转发（改写 load 的使用点，保持 arena 与 used_by 一致），
+    // 再统一删除三类死指令。
     for (load, value) in forwardings {
         utils::visit_and_replace(data, load, value);
         changed = true;
@@ -343,6 +494,8 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
         .chain(covered_removals)
         .chain(memzero_removals)
     {
+        // 三类删除清单合并处理：按父基本块摘除指令。`if let` 是防御性写法，
+        // 指令若已不在布局中则静默跳过。
         if let Some(bb) = data.layout().parent_bb(inst) {
             data.remove_layout_inst(bb, inst);
             changed = true;
@@ -352,6 +505,8 @@ fn run_on_func(data: &mut ArenaContextMut<'_>, analysis: &EffectAnalysis) -> boo
 }
 
 /// Convert a cell to the abstract object used by the effects analysis.
+/// 把单元映射为 effects 分析的抽象对象（`Global`/`Alloc`），
+/// 供 `call_may_read` 的间接读检查使用。
 fn cell_to_object(
     cell: &Cell,
     func: Function,
@@ -364,6 +519,8 @@ fn cell_to_object(
 }
 
 /// Convert a write root to its base object.
+/// 写根 -> 基对象（丢弃偏移信息），用于 Transform 1 的
+/// `call_written_bases` 预计算。
 fn root_to_base(root: &crate::opt::analysis_passes::effects::WriteRoot) -> MemObject {
     match root {
         crate::opt::analysis_passes::effects::WriteRoot::Global(g) => MemObject::Global(*g),
@@ -372,6 +529,8 @@ fn root_to_base(root: &crate::opt::analysis_passes::effects::WriteRoot) -> MemOb
 }
 
 /// Whether a write root (as reported by `call_write_roots`) covers `cell`.
+/// 判断调用写根集合是否命中某单元：基对象相同即命中，不比较偏移——
+/// 写根是粗粒度近似，宁滥勿缺（保守）。
 fn cell_matches_root(cell: &Cell, root: &crate::opt::analysis_passes::effects::WriteRoot) -> bool {
     match (cell.0, root) {
         (MemObject::Global(g), crate::opt::analysis_passes::effects::WriteRoot::Global(rg)) => {
@@ -385,6 +544,8 @@ fn cell_matches_root(cell: &Cell, root: &crate::opt::analysis_passes::effects::W
 }
 
 /// Whether a MemZero range `[off, off+len)` of `root` covers `cell`'s offset.
+/// 判断单元偏移是否落在 MemZero 的 `[off, off+len)` 字节区间内
+/// （基对象必须相同；半开区间语义）。
 fn cell_in_range(cell: &Cell, root: MemObject, off: i64, len: i64) -> bool {
     if cell.0 != root {
         return false;
@@ -397,6 +558,9 @@ fn cell_in_range(cell: &Cell, root: MemObject, off: i64, len: i64) -> bool {
 /// `covered` is the sorted, disjoint union of byte ranges of
 /// `[off, off+len)` already overwritten by later stores. Once the union
 /// covers the whole range the MemZero is dead.
+/// 块内扫描中"可能被后续 store 完全覆盖"的 MemZero 候选。
+/// `covered` 保存已覆盖字节区间的排序不相交并集；并集一旦铺满
+/// `[off, off+len)` 全体（无洞），该 MemZero 即判死。
 struct LiveMemZero {
     inst: Inst,
     root: MemObject,
@@ -408,6 +572,9 @@ struct LiveMemZero {
 /// Record that byte range `[s, e)` of `m`'s range was overwritten by a
 /// later store, merging into the sorted disjoint `covered` intervals.
 /// Returns `true` iff `[off, off+len)` is now fully covered.
+/// 把新覆盖区间 `[s, e)` 并入 `covered`（重叠/相邻区间自动合并），
+/// 返回该 MemZero 是否已被完全覆盖。两步：先线性扫描合并相交区间，
+/// 再检查并集是否无洞地覆盖整个 `[off, off+len)`。
 fn record_coverage(m: &mut LiveMemZero, s: i64, e: i64) -> bool {
     if s >= e {
         return false;
@@ -433,6 +600,8 @@ fn record_coverage(m: &mut LiveMemZero, s: i64, e: i64) -> bool {
     m.covered.insert(i, (new_s, new_e));
     // Check whether the merged union now spans `[off, off+len)` without holes.
     let end = m.off + m.len;
+    // 无洞检查：`cur` 记录已覆盖的最远边界，按序推进；并集一旦出现间隙
+    // （`a > cur`）说明还没铺满，返回 false；推进到 `end` 即完全覆盖。
     let mut cur = m.off;
     for &(a, b) in m.covered.iter() {
         if a > cur {

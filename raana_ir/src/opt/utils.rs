@@ -295,6 +295,12 @@ fn visit_and_replace_single(
                 } else {
                     (branch.t_target(), branch.t_args().to_vec())
                 };
+                // 分支坍缩为 jump 时，args 里的 rep 同样必须替换成 rep_with，
+                // 否则新 jump 仍引用即将被删除的指令（used_by 断言会失败）。
+                let args = args
+                    .iter()
+                    .map(|&v| if v == rep { rep_with } else { v })
+                    .collect();
                 data.replace_inst_with(used_by).jump(target, args);
             } else {
                 let t_args = branch

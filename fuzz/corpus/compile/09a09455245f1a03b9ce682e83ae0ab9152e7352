@@ -1,0 +1,50 @@
+int bump(int x) {
+  return x + 7;
+}
+
+int touch(int a[]) {
+  a[0] = a[0] + 1;
+  return a[0];
+}
+
+float bumpf(float x) {
+  return x + 0.5;
+}
+
+float touchf(float a[]) {
+  a[0] = a[0] + 0.25;
+  return a[0];
+}
+
+int main() {
+  int data[1] = {10};
+  float fdata[1] = {2.0};
+  int x = 3;
+  float fx = 1.0;
+  int i = 0;
+
+  while (i < 4) {
+    int y = bump(x);
+    float fy = bumpf(fx);
+
+    if (i % 2 == 0) {
+      x = y + data[0];
+    } else {
+      x = y - data[0];
+    }
+    if (i < 2) {
+      fx = fy + fdata[0];
+    } else {
+      fx = fy - fdata[0];
+    }
+
+    data[0] = touch(data);
+    fdata[0] = touchf(fdata);
+    i = i + 1;
+  }
+
+  putint(x + dat    if (i < ch(10);
+  putint(fx + fdata[0]);
+  putch(10);
+  return 0;
+}

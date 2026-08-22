@@ -1,3 +1,83 @@
+//! # VCode：后端共享的机器中间表示
+//!
+//! 定位链：SysY 源码 → RaanaIR（平台无关 SSA，`raana_ir` crate）→ **VCode**
+//! （机器指令级）→ 汇编。**lower** = 把 RaanaIR 指令翻译成机器指令的指令
+//! 选择阶段（AArch64 在 `anon_armv8/src/lower.rs`）。
+//!
+//! VCode 是**机器指令级**的中间表示：每条指令已选定目标指令形式（AArch64 的
+//! `MInst` 或 RISC-V 的对应类型），操作数是
+//! 虚拟寄存器（VReg）/物理寄存器/立即数/内存地址。VCode 夹在 lower 与发射之间，
+//! 是寄存器分配、MIR pass、最终汇编发射共同操作的对象。
+//!
+//! 本模块对指令类型**泛型**（`I: VCodeInst`），后端通过实现 [`MachInst`] +
+//! [`MachInstEmit`] 接入，容器与分配/发射基础设施完全复用。
+//!
+//! ## 核心 trait 体系
+//!
+//! | trait | 要求指令实现 | 作用 |
+//! |-------|-------------|------|
+//! | [`MachInst`] | 操作数收集（[`get_operands`](MachInst::get_operands)）、是否 move、terminator 类型、类型→寄存器类映射（[`rc_for_type`](MachInst::rc_for_type)）、跳转生成（[`gen_jump`](MachInst::gen_jump)）、形式验证 | 寄存器分配与 pass 只通过它读/改指令 |
+//! | [`MachInstEmit`] | [`emit`](MachInstEmit::emit) 把指令打印成汇编文本 | 发射阶段 |
+//! | [`VCodeInst`] | 空标记 trait = MachInst + MachInstEmit | 容器约束 |
+//! | [`EmitContext`] | 发射时的写入接口 | 由 emit_buffer 实现，提供寄存器/标签/分支的符号化输出 |
+//!
+//! 术语：**操作数表** = `build` 时经 `get_operands` 收集的每条指令 vreg 读写
+//! 清单（分配器算活跃性用）；**符号化输出** = `write_label_ref`/
+//! `write_function_label` 把 block 索引/函数/全局量写成汇编符号（而非地址），
+//! 由 emit_buffer 在 `finish()` 统一解析。
+//!
+//! [`MachTerminator`] 标注指令是否结束基本块：`None`（普通指令）/`Return`/
+//! `TailReturn`/`Branch`。
+//!
+//! ## 容器与构建器
+//!
+//! - [`VCodeBuilder`]（实现在 `vcode/builder.rs`，`vcode.rs` 重新导出）：**写**
+//!   入口。lower 阶段逐块 push 指令、声明 block 参数
+//!   （[`add_block_param`](VCodeBuilder::add_block_param)）、登记后继与参数值
+//!   （[`add_succ`](VCodeBuilder::add_succ)），最后 [`build`](VCodeBuilder::build)
+//!   收集操作数表并产出容器。
+//! - [`VCodeContainer`]：**读/改**入口。持有指令序列、block 区间、
+//!   操作数表与 ABI（[`abi`](VCodeContainer::abi) 字段）。MIR pass 通过
+//!   [`inst_mut`](VCodeContainer::inst_mut)/[`insts_mut`](VCodeContainer::insts_mut)
+//!   改写指令；寄存器分配后 [`write_back_allocs`](VCodeContainer::write_back_allocs)
+//!   把虚拟寄存器替换为物理寄存器，[`finalize_for_emission`](VCodeContainer::finalize_for_emission)
+//!   做发射前最终化（块参数 move 落定等）。
+//!
+//! ## 生命周期（从 lower 到汇编）
+//!
+//! ```text
+//! lower（指令选择）
+//!   → VCodeBuilder::push 逐条产出 MInst
+//!   → build() → VCodeContainer
+//!   → Pre-RA MIR passes（DCE/peephole/chain fusion/const CSE）
+//!   → reg_alloc::ion::run(&vcode, machine_env) → Output
+//!   → write_back_allocs(Output)       （虚拟寄存器 → 物理寄存器）
+//!   → abi.compute_frame_layout(..)    （溢出槽 → 栈帧布局）
+//!   → finalize_for_emission(Output)   （block 参数 move、溢出指令落定）
+//!   → Post-RA MIR passes（pair combine/list scheduler）
+//!   → emit：每条指令 MachInstEmit::emit 写入 AsmWriter
+//! ```
+//!
+//! 注意：pass 分 **pre-RA / post-RA 两段**，见 `anon_armv8::passes::
+//! build_pipeline`；`machine_env` = 物理寄存器偏好集合（来自 ABI）。分配算法
+//! 与 `Output` 结构详见 [`crate::reg_alloc`] 模块文档；发射缓冲见
+//! [`crate::emit_buffer`]。
+//!
+//! ## 如何加一条新指令（四步）
+//!
+//! 1. **定义形式**：在后端 `instructions.rs` 里定义指令枚举变体与操作数类型
+//!    （RISC-V：`uika_riscv/src/instructions.rs`）；
+//! 2. **实现 [`MachInst`]**：`get_operands` 上报操作数（分配器需要）、
+//!    `is_move`/`is_term`/`rc_for_type`/`gen_jump` 按语义填写；
+//! 3. **实现 [`MachInstEmit`]**：`emit` 里用 `EmitContext` 打印汇编文本；
+//! 4. **在 lower 中选择它**：AArch64 在 `anon_armv8/src/lower.rs` 的
+//!    `lower`/`lower_branch` 匹配对应 HIR 指令并产出新指令（RISC-V：
+//!    `uika_riscv/src/lower.rs`）。
+//!
+//! 调度信息**仅 AArch64 需要**（RISC-V 无调度器）：更新
+//! `anon_armv8/src/sched/` 的延迟表。**验证**：`cargo test -p taki_mir
+//! -p anon_armv8` + 本地 `compiler -S -O 2` 编一个用例目检 `.s`。
+
 use std::fmt::Debug;
 
 use rustc_hash::FxHashMap;
@@ -215,12 +295,14 @@ impl<I: VCodeInst> VCodeContainer<I> {
         let mut new_block_range = Ranges::default();
 
         // Resolve the width of an allocator edit's value from the vreg type
-        // table when it is a vector; fall back to a 128-bit vector default so
-        // vector-class edits never panic even if the type was not recorded.
+        // table. Vector-class vregs are normally 128-bit vector values, but
+        // on AArch64 f32 scalars also allocate from the Vector bank (sN ≡ vN),
+        // so the recorded type must win: an F32-typed vreg yields a 32-bit
+        // move/spill rather than a 128-bit one. Fall back to a 128-bit vector
+        // default so edits never panic even if the type was not recorded.
         let vector_ty = |vreg: Option<u32>| {
             vreg.and_then(|v| self.vreg_types.get(v as usize))
                 .copied()
-                .filter(|ty| ty.is_vector())
                 .unwrap_or(V4I32)
         };
 
@@ -1028,3 +1110,4 @@ pub use builder::VCodeBuilder;
 
 #[cfg(test)]
 mod tests;
+

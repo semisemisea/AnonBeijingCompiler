@@ -1,3 +1,75 @@
+//! # GVNPRE：全局值编号 + 部分冗余消除
+//!
+//! 经典 GVN-PRE 的一个保守子集：对 **join 块**（≥ 2 条入边）里的 i32 二元
+//! 表达式，消除跨边的完全冗余（full redundancy）与部分冗余（partial
+//! redundancy）。文件下方保留了一份英文实现状态/路线图注释（Implemented /
+//! Current safety boundary / Next steps），中文版要点如下。
+//!
+//! ## 核心思想
+//!
+//! 两条路径汇入 join 块时，同一条表达式可能在其中几条路径上已经算过
+//! （leader 可用），在另外的路径上没有。用 **block 参数**（Phi）把各边
+//! 已有的值收进 join 块，替代重复计算：
+//!
+//! ```text
+//!      A: a = x + y            A: a = x + y          A: a = x + y
+//!     /                        /                       \
+//!    J: b = x + y     →      J(join):                  J(join):
+//!   / \                    参 a  参 a'              参 a  参 a'
+//!   X   Y                  b 用参 a（A 边）          b 用参 a'（B 边插入 x+y）
+//! ```
+//!
+//! 左：A、B 两条路径都算出过 `x + y`（A 有 leader，B 没有）→ join 块加参数，
+//! A 边传 `a`，B 边**插入** `x + y` 再传。join 块里的 `b = x + y` 被参数替换。
+//!
+//! - **完全冗余**（所有入边都有 leader）：各边直接把 leader 作为实参追加到
+//!   新加的 block 参数上（`apply`）；
+//! - **部分冗余**（恰好一条边缺 leader）：在缺失边上插入重算
+//!   （`apply_insertion`）——若缺失边是 `branch` 的一臂（critical edge，
+//!   边上插指令会同时影响两条路径），先拆出 `gvn_pre_split` 块再插入。
+//!
+//! ## 操作数翻译（Phi 翻译）
+//!
+//! 表达式出现在 join 块里时，其操作数可能是本块的 block 参数（由不同入边
+//! 传不同值）。逐条入边把操作数翻译成该边实参（`translated_operand`）再
+//! 编号，才能找到"每条路径上实际的值"对应的 leader。
+//!
+//! ## 触发 / 安全边界（保守子集）
+//!
+//! - 只处理 **i32** 的 `Add/Sub/Mul/And/Or/Xor` 与整数比较；交换律操作
+//!   （Add/Mul/And/Or/Xor/Eq/NotEq）操作数规范化（按值编号排序），比较
+//!   用 `swap_compare_args` 翻向；
+//! - **排除**：移位、Div/Rem、浮点、load/store、call、cast、GEP、Undef、
+//!   内存操作；
+//! - join 块的入边不得有回边（`dominates(bb, edge.from)` 即拒绝——循环头
+//!   插入会破坏分析快照）；
+//! - 缺失边多于一条 → 放弃（多边缺失留给路线图里的收益模型）；
+//! - 每次函数调用**至多一次结构改写**（`apply` / `apply_insertion` 后立即
+//!   return）——改写会使 CFG/支配/值编号快照过期，下一轮 fixpoint 迭代再
+//!   处理下一个；
+//! - 完全冗余时各边 leader 完全相同则跳过（无新信息）。
+//!
+//! ## 正确性
+//!
+//! - 值可用性（`value_available_before`）按支配 + 指令位置检查：leader 必须
+//!   在缺失边/各边终结符之前可见，保证插入与参数引用都满足 SSA 支配；
+//! - 插入的重算与原表达式操作数/类型一致（typed value numbering 保证同号
+//!   同义）；
+//! - 纯计算无副作用，插入只增加执行次数不改变结果。
+//!
+//! ## 管线位置
+//!
+//! - 注册：`opt/pass.rs` 的 `from_config`，fixpoint 段，`boolean_simplify`
+//!   之后、`dce` 之前；与 `gvn`（同函数内冗余合并）互补：PRE 跨边消除，
+//!   GVN 域内消除；
+//! - 无目标门控、无 config 开关。
+//!
+//! ## 验证
+//!
+//! - 本文件 `mod tests`（619 行起）覆盖 diamond / critical edge / parallel
+//!   edge / Phi 翻译 / 循环拒绝 / 幂等；
+//! - 端到端：`make test` 差分比对。
+
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::opt::analysis_passes::dom_tree::v2::DominanceTree;
@@ -116,6 +188,10 @@ impl ValueNumbers {
         }
     }
 
+    /// 值编号（VN）：把每个值映射到同余类的编号。整数按 (类型, 值) 编号，
+    /// Binary 表达式按操作数编号（递归求）编号，其余值按身份编号。
+    /// 同余的两个表达式得到同一编号——这是 PRE 判断"边上前导可复用"的
+    /// 基础。
     fn number(&mut self, data: &ArenaContextMut<'_>, value: Inst) -> ValueNumber {
         if let Some(&number) = self.values.get(&value) {
             return number;
@@ -138,6 +214,9 @@ impl ValueNumbers {
         number
     }
 
+    /// 规范化表达式键：把操作数编号化并做交换律排序（加/乘/与/或/异或/
+    /// 相等比较交换操作数，顺序比较换成对称形式），使 `a+b` 与 `b+a`
+    /// 同键。非 i32 或不支持的操作返回 None（保持身份编号，宁漏勿错）。
     fn expr(
         &mut self,
         data: &ArenaContextMut<'_>,
@@ -464,6 +543,16 @@ impl GVNPRE {
 
 impl Pass for GVNPRE {
     fn run_on(&mut self, data: &mut ArenaContextMut<'_>) -> bool {
+        // 主流程：一次 run_on 只消除/插入一个表达式（返回 true 让 fixpoint
+        // 重跑），保证任何分析结果都不会在 CFG 改写后被复用——CFG/支配树
+        // 是快照，改写后立即失效。
+        // 三步：① 对每个多入边块（≥2 条 incoming），把块内 Binary 表达式的
+        // 操作数沿各条入边做 phi 翻译（translated_operand），收集"请求"的
+        // 表达式集合；② 沿支配树前序 DFS 维护作用域化 leader 表，算出每个
+        // 请求表达式在各前驱块里可用的 leader（requested_leaders）；③ 逐
+        // 候选判定：全可用 → 直接替换为块参数（完全 PRE）；恰一条边缺 →
+        // 缺的那条边插入计算（部分 PRE）；缺多条 → 放弃（保持单缺失边
+        // 的保守设计）。
         let Some(cfg) = CFG::new(data.curr_func_data()) else {
             return false;
         };

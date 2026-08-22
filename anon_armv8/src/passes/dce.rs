@@ -136,6 +136,9 @@ fn is_dce_removable(inst: &MInst) -> bool {
             | MInst::VecExtractLane { .. }
             | MInst::VecInsertLane { .. }
             | MInst::VecMinMax { .. }
+            | MInst::VecShift { .. }
+            | MInst::VecDiv { .. }
+            | MInst::VecNeg { .. }
             | MInst::FMovFromZero { .. }
             | MInst::FAlu { .. }
             | MInst::Scvtf { .. }

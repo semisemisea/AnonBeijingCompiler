@@ -39,6 +39,15 @@ impl CFGInfo {
         Ok(info)
     }
 
+    // 一次扫描建立分配器需要的全部控制流信息：
+    //   postorder —— 块的后序（活跃区间分析按此顺序合并）；
+    //   domtree  —— 立即支配者表（支配查询）；
+    //   insn_block / block_entry / block_exit —— 指令↔块归属与块的
+    //   程序点边界（活跃区间跨块合并用）；
+    //   approx_loop_depth —— 每块近似循环深度（spill 权重的热度加成）；
+    // 同时校验**关键边已分裂**（分裂后的边复制在源块尾执行，仅当后继
+    // 单前驱或源终结符无普通操作数时安全，否则报错——Ion 要求输入
+    // 无未分裂关键边）。
     pub fn init<F: Function>(&mut self, function: &F, ctx: &mut CFGInfoCtx) -> Result<(), String> {
         let num_blocks = function.num_blocks();
         if num_blocks == 0 {

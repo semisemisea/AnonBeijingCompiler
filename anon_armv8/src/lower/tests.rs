@@ -759,10 +759,11 @@ fn vector_ir_function_emits_neon_float_surface() {
     data.layout_mut().insert_inst(entry, ret);
 
     let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
-    // dup from a float scalar is `dup v.4s, s0`; scvtf converts the lanes;
-    // fmla fuses the multiply-add.
+    // dup from a float scalar reads the aliased vector register
+    // (`dup v.4s, v.s[0]` — LLVM MC rejects `dup v.4s, sn`); scvtf
+    // converts the lanes; fmla fuses the multiply-add.
     assert!(assembly.contains("dup v"), "{assembly}");
-    assert!(assembly.contains(".4s, s"), "{assembly}");
+    assert!(assembly.contains(".s[0]"), "{assembly}");
     assert!(assembly.contains("scvtf"), "{assembly}");
     assert!(assembly.contains("fmla"), "{assembly}");
 }
@@ -799,6 +800,101 @@ fn vector_ir_function_emits_neon_load_store_and_reduce() {
     assert!(assembly.contains("str q"), "{assembly}");
     assert!(assembly.contains("ldr q"), "{assembly}");
     assert!(assembly.contains("addv s"), "{assembly}");
+}
+
+#[test]
+fn f32_scalars_do_not_alias_live_vector_results() {
+    use raana_ir::ir::builder_trait::*;
+
+    // The h-10 kernel shape: `X = X / diag + 1` — a vector divide whose
+    // divisor is an f32 scalar splat, plus a second splat of an f32
+    // constant whose live range overlaps the divide result. Before the
+    // s/v aliasing fix, the constant's register (`fmov s0`) and the div
+    // result (`fdiv v0`) shared hw_enc 0 and silently corrupted the
+    // splat: `dup v1.4s, v0.s[0]` read the div result, not 1.0f.
+    let v4f32 = Type::get_vector(Type::get_f32(), 4);
+    let mut program = Program::new();
+    let function = program.new_function(
+        v4f32.clone(),
+        "f32_splat_div_kernel".into(),
+        vec![v4f32.clone(), Type::get_f32()],
+    );
+    let data = program.func_data_mut(function);
+    let entry = data.add_entry_block();
+    let x = data.params()[0];
+    let diag = data.params()[1];
+
+    let splat_diag = data.new_local_inst().vector_splat(diag, v4f32.clone());
+    let div = data.new_local_inst().binary(BinaryOp::Div, x, splat_diag);
+    let one = data.new_local_inst().float(1.0);
+    let splat_one = data.new_local_inst().vector_splat(one, v4f32.clone());
+    let add = data.new_local_inst().binary(BinaryOp::Add, div, splat_one);
+
+    // Note: the `one` constant is intentionally NOT inserted into the
+    // layout — the lowering driver rematerializes float constants.
+    for inst in [splat_diag, div, splat_one, add] {
+        data.layout_mut().insert_inst(entry, inst);
+    }
+    let ret = data.new_local_inst().ret(Some(add));
+    data.layout_mut().insert_inst(entry, ret);
+
+    let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+    assert!(assembly.contains("fdiv v"), "{assembly}");
+    assert!(assembly.contains("dup v"), "{assembly}");
+    assert!(assembly.contains("fadd v"), "{assembly}");
+
+    // Every scalar f32 view that is live across the vector divide must be
+    // assigned a different hw_enc than the divide result.
+    let fdiv_dst = assembly
+        .lines()
+        .find_map(|line| {
+            let idx = line.find("fdiv v")?;
+            let digits: String = line[idx + 6..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            digits.parse::<u8>().ok()
+        })
+        .expect("vector fdiv must be present");
+
+    for line in assembly.lines() {
+        if let Some(idx) = line.find("dup v") {
+            // `dup v<d>.<arr>, v<s>.s[0]` — the scalar source register
+            // must not alias the fdiv destination.
+            let rest = &line[idx + 5..];
+            if let Some(src_idx) = rest.find(", v") {
+                let digits: String = rest[src_idx + 3..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(src) = digits.parse::<u8>() {
+                    assert_ne!(
+                        src,
+                        fdiv_dst,
+                        "splat scalar source must not alias the fdiv result:\n{assembly}"
+                    );
+                }
+                // GPR source (`dup vd.4s, wn`): constants route through a
+                // GPR, which lives in a different domain than the vector
+                // registers — no aliasing possible.
+            }
+        }
+        if let Some(idx) = line.find("fmov s") {
+            // `fmov s<d>, w...` — the f32 constant's register must not
+            // alias the fdiv destination.
+            let digits: String = line[idx + 6..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(dst) = digits.parse::<u8>() {
+                assert_ne!(
+                    dst,
+                    fdiv_dst,
+                    "f32 constant must not alias the fdiv result:\n{assembly}"
+                );
+            }
+        }
+    }
 }
 
 /// Determinism gate: compiling the vector kernel at each `-O` level must be
@@ -893,6 +989,327 @@ fn vector_kernel_is_deterministic_across_opt_levels() {
     }
 }
 
+/// Vector constant divide/remainder (M69c): the magic sequence widens with
+/// `smull/smull2`, arithmetic-shifts the 64-bit lanes, narrows with
+/// `xtn/xtn2`, and the remainder subtracts the product back with `mls`.
+fn compile_vector_const_div_rem(op: BinaryOp, divisor: i32) -> String {
+    use raana_ir::ir::builder_trait::*;
+
+    let v4i32 = Type::get_vector(Type::get_i32(), 4);
+    let mut program = Program::new();
+    let function = program.new_function(
+        v4i32.clone(),
+        "vec_div_const".into(),
+        vec![v4i32.clone()],
+    );
+    let data = program.func_data_mut(function);
+    let entry = data.add_entry_block();
+    let v = data.params()[0];
+    let constant = data.new_local_inst().integer(divisor);
+    let splat = data.new_local_inst().vector_splat(constant, v4i32.clone());
+    let binary = data.new_local_inst().binary(op, v, splat);
+    for inst in [splat, binary] {
+        data.layout_mut().insert_inst(entry, inst);
+    }
+    let ret = data.new_local_inst().ret(Some(binary));
+    data.layout_mut().insert_inst(entry, ret);
+    taki_mir::compile::<crate::lower::AArch64Backend>(&program)
+}
+
+#[test]
+fn vector_constant_division_uses_the_neon_magic_sequence() {
+    for divisor in [3, 7, 11, 100, -7, 1000000007] {
+        let assembly = compile_vector_const_div_rem(BinaryOp::Div, divisor);
+        assert!(assembly.contains("smull"), "{divisor}:\n{assembly}");
+        assert!(assembly.contains("xtn2"), "{divisor}:\n{assembly}");
+        assert!(!assembly.contains("sdiv"), "{divisor}:\n{assembly}");
+    }
+}
+
+#[test]
+fn vector_constant_remainder_uses_mls() {
+    for divisor in [3, 10, 100, 11] {
+        let assembly = compile_vector_const_div_rem(BinaryOp::Rem, divisor);
+        assert!(assembly.contains("smull"), "{divisor}:\n{assembly}");
+        assert!(assembly.contains("xtn2"), "{divisor}:\n{assembly}");
+        assert!(assembly.contains("mls"), "{divisor}:\n{assembly}");
+        assert!(!assembly.contains("sdiv"), "{divisor}:\n{assembly}");
+    }
+}
+
+/// Vector comparison completion: every missing predicate decomposes onto
+/// `cmgt`/`cmeq` plus `mvn`, and a splat-constant shift folds to the
+/// immediate `shl`/`sshr`/`ushr` forms.
+fn compile_vector_predicates_and_shifts() -> String {
+    use raana_ir::ir::builder_trait::*;
+
+    let v4i32 = Type::get_vector(Type::get_i32(), 4);
+    let mut program = Program::new();
+    let function = program.new_function(
+        Type::get_i32(),
+        "vec_pred".into(),
+        vec![v4i32.clone(), v4i32.clone(), Type::get_i32()],
+    );
+    let data = program.func_data_mut(function);
+    let entry = data.add_entry_block();
+    let v = data.params()[0];
+    let w = data.params()[1];
+    let s = data.params()[2];
+
+    let one = data.new_local_inst().integer(1);
+    let sh_amt = data.new_local_inst().vector_splat(one, v4i32.clone());
+    let two = data.new_local_inst().integer(2);
+    let sh_amt2 = data.new_local_inst().vector_splat(two, v4i32.clone());
+
+    let lt = data.new_local_inst().binary(BinaryOp::Lt, v, w);
+    let le = data.new_local_inst().binary(BinaryOp::Le, v, w);
+    let ge = data.new_local_inst().binary(BinaryOp::Ge, v, w);
+    let ne = data.new_local_inst().binary(BinaryOp::NotEq, v, w);
+
+    let shl = data.new_local_inst().binary(BinaryOp::Shl, v, sh_amt);
+    let shr = data.new_local_inst().binary(BinaryOp::Shr, v, sh_amt2);
+    let sar = data.new_local_inst().binary(BinaryOp::Sar, v, sh_amt2);
+
+    let sum1 = data.new_local_inst().binary(BinaryOp::Add, lt, le);
+    let sum2 = data.new_local_inst().binary(BinaryOp::Add, ge, ne);
+    let sum3 = data.new_local_inst().binary(BinaryOp::Add, shl, shr);
+    let acc1 = data.new_local_inst().binary(BinaryOp::Add, sar, sum3);
+    let acc2 = data.new_local_inst().binary(BinaryOp::Add, acc1, sum2);
+    let acc3 = data.new_local_inst().binary(BinaryOp::Add, acc2, sum1);
+    let reduce = data
+        .new_local_inst()
+        .vector_reduce(raana_ir::ir::VectorReduceOp::Add, acc3);
+    for inst in [
+        sh_amt, sh_amt2, shl, shr, sar, lt, le, ge, ne, sum1, sum2, sum3, acc1, acc2, acc3,
+        reduce,
+    ] {
+        data.layout_mut().insert_inst(entry, inst);
+    }
+    let ret = data.new_local_inst().ret(Some(reduce));
+    data.layout_mut().insert_inst(entry, ret);
+    taki_mir::compile::<crate::lower::AArch64Backend>(&program)
+}
+
+#[test]
+fn vector_comparisons_and_shifts_decompose_onto_neon() {
+    let assembly = compile_vector_predicates_and_shifts();
+    assert!(assembly.contains("cmgt"), "{assembly}");
+    assert!(assembly.contains("cmeq"), "{assembly}");
+    assert!(assembly.contains("mvn v"), "{assembly}");
+    assert!(assembly.contains("shl v"), "{assembly}");
+    assert!(assembly.contains("sshr v"), "{assembly}");
+    assert!(assembly.contains("ushr v"), "{assembly}");
+    assert!(assembly.contains("addv s"), "{assembly}");
+}
+
+/// Pointer-to-pointer cast is a no-op bitcast (`*i32 -> *<4 x i32>`), the
+/// channel that retypes a scalar pointer for a vector load/store.
+#[test]
+fn pointer_cast_is_a_noop_bitcast() {
+    use raana_ir::ir::builder_trait::*;
+
+    let v4i32 = Type::get_vector(Type::get_i32(), 4);
+    let mut program = Program::new();
+    let function = program.new_function(
+        Type::get_i32(),
+        "ptr_cast".into(),
+        vec![Type::get_pointer(Type::get_i32())],
+    );
+    let data = program.func_data_mut(function);
+    let entry = data.add_entry_block();
+    let ptr = data.params()[0];
+    let vec_ptr = data.new_local_inst().cast(ptr, Type::get_pointer(v4i32.clone()));
+    let loaded = data.new_local_inst().load(vec_ptr);
+    let sum = data
+        .new_local_inst()
+        .vector_reduce(raana_ir::ir::VectorReduceOp::Add, loaded);
+    for inst in [vec_ptr, loaded, sum] {
+        data.layout_mut().insert_inst(entry, inst);
+    }
+    let ret = data.new_local_inst().ret(Some(sum));
+    data.layout_mut().insert_inst(entry, ret);
+
+    let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+    assert!(assembly.contains("ldr q"), "{assembly}");
+}
+
+/// Every 16-byte (vector-sized) global is 16-byte aligned so
+/// `ldr/str q` over vector data never faults.
+#[test]
+fn globals_are_16_byte_aligned() {
+    use raana_ir::ir::builder_trait::*;
+
+    let mut program = Program::new();
+    let mut builder = program.new_value();
+    let forty_two = builder.integer(42);
+    builder.global_alloc(forty_two);
+    let v4i32 = Type::get_vector(Type::get_i32(), 4);
+    let zero = builder.zero_init(v4i32);
+    builder.global_alloc(zero);
+
+    let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+    let baligns = assembly.matches(".p2align 4").count();
+    assert_eq!(baligns, 1, "{assembly}");
+}
+
+/// Builds a single-loop program: entry (also the preheader) jumps to a
+/// header that branches to `body`/`exit`; `body` uses constant `c` in
+/// two adds (results stored to pointer params to keep them alive) and
+/// jumps back to the header (latch); `exit` returns 0.
+fn compile_loop_with_const_uses(c: i32, body_uses: usize) -> String {
+    use raana_ir::ir::builder_trait::*;
+    let mut program = Program::new();
+    let function = program.new_function(
+        Type::get_i32(),
+        "loop_const".to_owned(),
+        vec![
+            Type::get_i32(),
+            Type::get_i32(),
+            Type::get_pointer(Type::get_i32()),
+            Type::get_pointer(Type::get_i32()),
+        ],
+    );
+    let data = program.func_data_mut(function);
+    let entry = data.add_entry_block();
+    let header = data.new_basic_block().basic_block("header".to_owned(), vec![]);
+    let body = data.new_basic_block().basic_block("body".to_owned(), vec![]);
+    let exit = data.new_basic_block().basic_block("exit".to_owned(), vec![]);
+    for bb in [header, body, exit] {
+        data.layout_mut().push_bb_back(bb);
+    }
+    let a = data.params()[0];
+    let b = data.params()[1];
+    let stores = [data.params()[2], data.params()[3]];
+    // entry -> header (entry is the unique loop-outside predecessor).
+    let entry_jump = data.new_local_inst().jump(header, vec![]);
+    data.layout_mut().insert_inst(entry, entry_jump);
+    // header: branch to body/exit on a constant condition.
+    let one = data.new_local_inst().integer(1);
+    let header_branch =
+        data.new_local_inst().branch(one, body, vec![], exit, vec![]);
+    data.layout_mut().insert_inst(header, header_branch);
+    // body: `body_uses` adds with the same constant, each stored to a
+    // pointer param (side effect keeps the add alive), then the back edge.
+    let mut insts = vec![];
+    let mut last = a;
+    for i in 0..body_uses {
+        let constant = data.new_local_inst().integer(c);
+        let add = data.new_local_inst().binary(BinaryOp::Add, last, constant);
+        let store = data.new_local_inst().store(add, stores[i]);
+        insts.extend([add, store]);
+        last = add;
+    }
+    let back = data.new_local_inst().jump(header, vec![]);
+    insts.push(back);
+    for inst in insts {
+        data.layout_mut().insert_inst(body, inst);
+    }
+    // exit: return 0.
+    let zero = data.new_local_inst().integer(0);
+    let ret = data.new_local_inst().ret(Some(zero));
+    data.layout_mut().insert_inst(exit, ret);
+    taki_mir::compile::<crate::lower::AArch64Backend>(&program)
+}
+
+fn movz_count_for(assembly: &str, value_hex: &str) -> usize {
+    assembly
+        .split("movz w")
+        .skip(1)
+        .filter(|rest| rest.contains(value_hex))
+        .count()
+}
+
+#[test]
+fn shares_loop_constant_in_preheader() {
+    let assembly = compile_loop_with_const_uses(0xc811, 2);
+    // The 0xc811 chain must move out of the loop body into the
+    // preheader (the entry block): one movz total.
+    assert_eq!(
+        movz_count_for(&assembly, "0xc811"),
+        1,
+        "two uses in a loop body must materialize once in the preheader:\n{assembly}"
+    );
+}
+
+#[test]
+fn does_not_share_single_use_loop_constant() {
+    let assembly = compile_loop_with_const_uses(0xc811, 1);
+    // Single-use constants keep their per-use materialization.
+    assert_eq!(
+        movz_count_for(&assembly, "0xc811"),
+        1,
+        "single-use loop constant keeps per-use materialization:\n{assembly}"
+    );
+}
+
+/// Two loop-outside predecessors of the header: `get_preheader` returns
+/// `None`, so the loop must not share (per-use materialization stays).
+#[test]
+fn does_not_share_loop_without_preheader() {
+    use raana_ir::ir::builder_trait::*;
+    let mut program = Program::new();
+    let function = program.new_function(
+        Type::get_i32(),
+        "no_preheader".to_owned(),
+        vec![
+            Type::get_i32(),
+            Type::get_i32(),
+            Type::get_pointer(Type::get_i32()),
+            Type::get_pointer(Type::get_i32()),
+        ],
+    );
+    let data = program.func_data_mut(function);
+    let entry = data.add_entry_block();
+    let extra = data.new_basic_block().basic_block("extra".to_owned(), vec![]);
+    let header = data.new_basic_block().basic_block("header".to_owned(), vec![]);
+    let body1 = data.new_basic_block().basic_block("body1".to_owned(), vec![]);
+    let body2 = data.new_basic_block().basic_block("body2".to_owned(), vec![]);
+    let exit = data.new_basic_block().basic_block("exit".to_owned(), vec![]);
+    for bb in [extra, header, body1, body2, exit] {
+        data.layout_mut().push_bb_back(bb);
+    }
+    let a = data.params()[0];
+    let b = data.params()[1];
+    let stores = [data.params()[2], data.params()[3]];
+    // entry jumps to `extra`, and `extra` branches to header/exit: the
+    // candidate preheader has two successors, so `get_preheader` returns
+    // `None` and the loop must not share.
+    let entry_jump = data.new_local_inst().jump(extra, vec![]);
+    data.layout_mut().insert_inst(entry, entry_jump);
+    let extra_cond = data.new_local_inst().integer(1);
+    let extra_branch =
+        data.new_local_inst().branch(extra_cond, header, vec![], exit, vec![]);
+    data.layout_mut().insert_inst(extra, extra_branch);
+    let one = data.new_local_inst().integer(1);
+    let header_branch =
+        data.new_local_inst().branch(one, body1, vec![], exit, vec![]);
+    data.layout_mut().insert_inst(header, header_branch);
+    let c1 = data.new_local_inst().integer(0xc811);
+    let add1 = data.new_local_inst().binary(BinaryOp::Add, a, c1);
+    let s1 = data.new_local_inst().store(add1, stores[0]);
+    let one2 = data.new_local_inst().integer(1);
+    let back1 = data.new_local_inst().branch(one2, body2, vec![], header, vec![]);
+    for inst in [add1, s1, back1] {
+        data.layout_mut().insert_inst(body1, inst);
+    }
+    let c2 = data.new_local_inst().integer(0xc811);
+    let add2 = data.new_local_inst().binary(BinaryOp::Add, b, c2);
+    let s2 = data.new_local_inst().store(add2, stores[1]);
+    let back2 = data.new_local_inst().jump(header, vec![]);
+    for inst in [add2, s2, back2] {
+        data.layout_mut().insert_inst(body2, inst);
+    }
+    let zero = data.new_local_inst().integer(0);
+    let ret = data.new_local_inst().ret(Some(zero));
+    data.layout_mut().insert_inst(exit, ret);
+    let assembly = taki_mir::compile::<crate::lower::AArch64Backend>(&program);
+    // No preheader: each use materializes on its own.
+    assert_eq!(
+        movz_count_for(&assembly, "0xc811"),
+        2,
+        "loop without a preheader must not share:\n{assembly}"
+    );
+}
 /// Builds `r = ((a + C) + (b + C))` with two same-value constant uses in
 /// one block, and returns the assembly.
 fn compile_two_same_constant_adds(c: i32) -> String {

@@ -1,3 +1,42 @@
+//! # 汇编文本发射（AsmWriter 与顶层入口）
+//!
+//! 把寄存器分配完成、`finalize_for_emission` 之后的 [`VCodeContainer`] 翻译成
+//! 汇编文本。真正的指令打印由每条指令的 [`MachInstEmit::emit`] 完成，本模块
+//! 负责**组织**：函数头/块标签/序言尾声的顺序、EmitBuffer 的装配与渲染。
+//!
+//! ## 结构
+//!
+//! - [`AsmWriter`]：一次函数发射的写入器。持有输出串、函数数据、程序与
+//!   branch_opt 开关；[`write_function`](AsmWriter::write_function) 是主流程：
+//!   写全局指令与函数标签 → 建 [`EmitBuffer`](crate::emit_buffer::EmitBuffer)
+//!   → 逐块发射（prologue/body/epilogue）→ buffer `finish()` 渲染回输出串。
+//! - [`emit_vcode_assembly`]：**顶层入口**——给定程序/函数/已 finalize 的
+//!   VCode，返回整段汇编文本。后端可直接用它发射手工构造的机器层程序
+//!   （如显式 SIMD VCode 验证）。
+//! - `emit_legalized`：发射前先跑 `ABISpec::legalize_inst` 做**伪寻址展开**——
+//!   把分配后依赖栈帧的伪寻址指令（`MInst::StackAddr` + `AMode::FrameSlot`）
+//!   展开成实际 sp 偏移的指令（`FrameLayout` 已知），再逐条 emit。**仅作用于
+//!   ABI 生成的序言/尾声指令**；正文 VCode 指令已 finalize，直接走
+//!   `inst.emit`。实现见 `anon_armv8/src/abi.rs` 的 `legalize_inst`。
+//!
+//! ## 与 emit_buffer 的分工
+//!
+//! 指令文本先以 **text slot** 形式进 [`EmitBuffer`](crate::emit_buffer::EmitBuffer)
+//! （每条指令一个槽，固定 4 字节宽度），分支则作为符号化 `Branch` 槽保存
+//! 目标（`MirBlockIndex`）。分支优化与标签解析由 `write_function` **显式调用**
+//! `buffer.optimize_branches()` → `buffer.resolve()` 完成，`finish()` 只负责
+//! 把槽渲染成最终汇编字符串。详见 [`emit_buffer`](crate::emit_buffer) 模块文档。
+//!
+//! 前置概念（VCodeContainer/寄存器分配/finalize_for_emission）见
+//! [`vcode`](crate::vcode) 模块文档。
+//!
+//! ## 常见修改点
+//!
+//! - 加分支优化规则 → `emit_buffer.rs` 的 `optimize_branches` 规则区
+//!   （+ `LABEL_LIST_THRESHOLD` 防退化）；
+//! - 改输出文本格式 → `EmitBuffer::finish`；
+//! - 改分支可达范围 → `emit_buffer.rs` 的 `LabelKind` 常量（BRANCH14/BRANCH19…）。
+
 use core::fmt::Write;
 
 use crate::abi::{ABIMachineSpec, FrameLayout};

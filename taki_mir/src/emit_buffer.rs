@@ -1,6 +1,6 @@
 //! Text-level machine-code emission buffer, modeled on Cranelift's MachBuffer.
 //!
-//! Every slot corresponds to exactly one fixed-width (4-byte) instruction.
+//! Every **text** slot corresponds to exactly one fixed-width (4-byte) instruction.
 //! Instructions are accumulated as text templates, so branch optimization can
 //! truncate, invert, or retarget a branch in O(1) without patching bytes.
 //!
@@ -13,6 +13,30 @@
 //! Milestone M25 introduces the buffer and moves every backend through it
 //! without enabling any branch optimization. The `optimize_branches` and
 //! `resolve` (range-check + veneer) machinery is wired up in later milestones.
+//!
+//! ## 为什么需要 buffer（动机）
+//!
+//! 指令文本先以 text slot 进缓冲、分支以符号化 `Branch` 槽进缓冲，**而不是
+//! 直接写字符串**，是为了让分支优化能在 O(1) 内做：截断/取反/改写分支只需
+//! 改槽内容，无需回填字节偏移；标签解析推迟到 `finish()` 一次完成。这是
+//! Cranelift MachBuffer 的设计（见上方英文说明）。
+//!
+//! ## 发射三阶段（中文速览）
+//!
+//! 1. **填充**：`bind_label` 绑定块标签位置；每条指令以 text slot（固定 4
+//!    字节宽）写入，分支以符号化 [`BranchRef`] 槽写入（目标仍是
+//!    `MirBlockIndex`，尚未定址）；
+//! 2. **优化**：[`optimize_branches`](EmitBuffer::optimize_branches) 在
+//!    O(1) 内截断/取反/改写分支（条件翻转、`goto next` 消除、标签别名合并，
+//!    受 `LABEL_LIST_THRESHOLD` 防二次方退化）；
+//! 3. **解析与输出**：[`resolve`](EmitBuffer::resolve) 做范围检查（超出
+//!    `LabelKind` 可达范围的分支插入 veneer 跳板），[`finish`](EmitBuffer::finish)
+//!    把全部槽渲染成最终汇编字符串。
+//!
+//! [`Slot`] 是缓冲区的核心（定义在 `emit_buffer/label.rs`），枚举成员只有
+//! 三类：`Text`（普通指令文本）、`Branch`（符号化分支）、`Veneer`（跳板）——
+//! **没有独立的 Label 槽**，标签位置由 `bind_label` 记录在单独的结构里
+//! （branch 的簿记记录持有 `labels_at_this_branch`）。
 
 use core::fmt::Write as _;
 use std::marker::PhantomData;
@@ -575,3 +599,4 @@ impl<B: LowerBackend> EmitContext for EmitBuffer<'_, B> {
 
 #[cfg(test)]
 mod tests;
+

@@ -15,6 +15,10 @@
  */
 
 //! Move resolution.
+//!
+//! 寄存器分配完成后，跨 block 边界传递的值（block 参数 blockparam）可能落在
+//! 不同的物理寄存器/栈槽上——本模块负责在边界**插入 move 指令**（并遵循
+//! `InsertMovePrio` 的优先级，处理并行移动/循环边界的交换问题）。
 
 use super::data_structures::{
     BlockparamIn, BlockparamOut, CodeRange, Edits, FixedRegFixupLevel, LiveRangeKey,
@@ -81,6 +85,14 @@ impl<F: Function> Env<'_, F> {
     }
 
     pub fn apply_allocations_and_insert_moves(&mut self) -> InsertedMoves {
+        // 分配落定与移动插入（move resolution）：分配完成后，block 参数
+        // （blockparam_in/out）在 CFG 边界两侧可能落在不同物理寄存器/栈槽，
+        // 本函数沿边界插入 move 指令。流程：先把分裂后的区间列表按序整理
+        // （vreg.ranges 重排），再对每条 blockparam 边界生成
+        // ParallelMoves 并 resolve（处理循环边界的交换/破环），按
+        // InsertMovePrio 优先级决定插入位置（块头/块尾/分裂点），最后经
+        // 冗余移动消除（RedundantMoveEliminator）与固定寄存器 fixup
+        // （MultiFixedRegFixup）收尾。
         trace!("apply_allocations_and_insert_moves");
         trace!("blockparam_ins: {:?}", self.blockparam_ins);
         trace!("blockparam_outs: {:?}", self.blockparam_outs);

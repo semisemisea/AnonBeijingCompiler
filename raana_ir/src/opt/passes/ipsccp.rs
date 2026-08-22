@@ -1,15 +1,116 @@
 //! Implementation of *Interprocedural Sparse Condition Constant Propagation*
+//!
+//! ---
+//!
+//! # IPSCCP：过程间稀疏条件常量传播
+//!
+//! 在**整个程序**（而非单个函数）上做稀疏条件常量传播：沿调用边把常量实参
+//! 传入被调函数的形参、沿返回边把常量返回值传回调用点，并据此折叠条件已知
+//! 的分支。动机：函数内 SCCP（`opt/passes/const_prop.rs`，未注册、已被本模块
+//! 取代）在 `Call` 处直接降 Bottom，跨函数边界的常量信息完全丢失；本 pass 用
+//! ICFG + 内存摘要把传播打通到过程间。术语：SSA / block 参数（Phi）、ICFG、
+//! 格 Top-Bottom、固定点、支配等见 `docs/offline-handbook/glossary.md`，不在此
+//! 展开。
+//!
+//! ## 核心机制
+//!
+//! - **三值格**：`Lattice` = Top（未知，默认，最乐观）→ `Constant(i32)` →
+//!   Bottom（非常量，最保守），只降不升；`merge` 是格 meet，`update` 返回是否
+//!   变化。初始化：`InstKind::Integer` → Constant，`Float` → Bottom（`new_var`），
+//!   其余缺席即 Top；零初始化全局先登记为零区间。
+//! - **ICFG 边**（`opt/analysis_passes/icfg.rs` 的 `EdgeType`）：`Normal` /
+//!   `Call` / `Return` / `CallToReturn` 四类。`Call` 边把调用点实参的格值写入
+//!   被调函数形参（`Node::new(callee, param)`）；`Return` 边把返回值格值写回
+//!   调用点的 `.call` 节点（`call_site_before` 解析）；一条虚设的 `start_edge`
+//!   （`src == dst` 的 Normal 自环）触发 main 入口。
+//! - **双工作队列**：`edge_worklist` 存边，目标节点首次到达时入队（`node_visited`
+//!   去重），并记录所属块已访问（`block_visited`）；`node_worklist` 按指令种类
+//!   求格值，变化时沿 `used_by` 扩散（`extend_affected_node_used_by`，只进入已
+//!   访问块的指令）并重推出边——没被边到达的代码不参与，构成"稀疏"。
+//! - **节点求值**：`Binary` 双操作数都是 Constant 才折叠
+//!   （`mathematic_operation`，wrapping 语义）；`Select` 条件已知选一臂、Bottom
+//!   时两臂 meet；`Cast` 仅 i32 目标且源是常量 `Float` 时可折叠（`fold_f32_to_i32`）；
+//!   `GetElemPtr` / `Alloc`（地址不是 i32 常量）→ Bottom；vector 类指令 → Top；
+//!   `Branch` 条件为 Constant 只推可达臂，Top 两臂都不推（保守，等后续迭代
+//!   暴露），Bottom 两臂都推。
+//! - **调用边传播**：`Call` / `TailCall` 的实参格值 zip 进形参（`is_decl` 的
+//!   外部函数降 Bottom）。尾调用必须同样传播：否则递归尾调用间变化的实参会
+//!   被误传播成常量（测试 `tail_call_args_prevent_constant_mispropagation`）。
+//! - **返回值中继**：`Return` 沿出边把 `ret` 值写回调用点；尾调用是中继节点
+//!   （故意不在 `callsite_by_continuation` 里），返回值先写入它，再靠
+//!   `relay_targets` 重调度，让其 `TailCall` 臂沿 Return 边继续向上转发。
+//! - **内存摘要**：`MemState` 模拟常量偏移内存。`CellKey` =（局部/全局对象 +
+//!   字节偏移），`RootKey` = 整个对象；每 cell 按写者存格值，折叠值 = 写者的
+//!   meet；`MemZero` 与零初始化全局用零区间回答 load。`EffectAnalysis`
+//!   （`opt/analysis_passes/effects.rs`）提供基址/偏移解析（`BaseEnv` 的
+//!   `constant_offset` / `base_of`）、不可解析地址的 points-to 目标
+//!   （`targets_of`）与被调函数写集（`call_write_roots`）。
+//! - **调用失效**：`invalidate_call` 按 `call_write_roots` 清掉被调函数可达的
+//!   根并重调度受影响的 load；写集未知时清全部，并把根加入 `cleared_roots`
+//!   ——未知写可能落在任意 store 与 load 之间，此后该根不再折叠 load。load 用
+//!   `insert_or_replace`（快照语义）而非 merge，避免新旧快照 meet 错误塌缩成
+//!   Bottom。
+//!
+//! ## 变换形态（IR 示例）
+//!
+//! ```text
+//! // 传播前
+//! main:   a = 10
+//!         b = call inc(a)          // Call 边：实参 a 的格值 10 流入 inc 的形参 p
+//!         br b != 0, L1, L2        // b 是 inc 的返回值
+//! inc(p): q = p + 1                // p 格 = Constant(10)，q 折叠为 Constant(11)
+//!         ret q                    // Return 边：11 写回调用点 → b 格 = Constant(11)
+//!
+//! // 传播后（常量替换 + 分支折叠）
+//! main:   b = 11                   // 调用点被替换为立即数，inc 不再被调用
+//!         jump L1                  // 11 != 0 恒真：br 折叠为无条件 jump
+//! ```
+//!
+//! ## 正确性要点
+//!
+//! - 格值只降不升、工作队列覆盖所有可达节点，有限格上必然收敛到固定点；
+//! - 只有格值为 `Constant` 的节点才被替换，Bottom 绝不替换；
+//! - 替换在传播收敛后一次性进行：有使用者的 `Call` / `TailCall` /
+//!   `BlockArgRef` 用 `visit_and_replace` 换成新建的立即数指令，其余用
+//!   `replace_inst_with` 后脱离布局（`detach_layout_inst`）；
+//! - 分支折叠只发生在条件被传播成 `InstKind::Integer` 的终结符上；块删除要求
+//!   非入口且块内**每条指令**都无使用（防止删掉仍被可达块引用的 LICM 外提值）；
+//! - 常量 `Div` / `Rem` 折叠断言除数非 0；`fold_f32_to_i32` 只折叠可表示的
+//!   有限值（截断向零），饱和 `as` 转换与目标指令不符，其余保持运行时转换。
+//!
+//! ## 管线位置与门控
+//!
+//! - 注册：`opt/pass.rs` 的 `PassesManager::from_config`——initial 段（SSA →
+//!   Specialize → [MulmodRecognize / RecursiveMemoize，仅 AArch64] → Inline →
+//!   TCO → ColumnMajor → ScalarGlobalPromotion）之后，**fixpoint 段首位**
+//!   （第一个 `register`，即 `fixed_point_start` 处），其后是 `simplify_cfg`、
+//!   `loop_unroll`（`--loop-unroll` 门控）等。常量信息是后续 pass 的前提，故
+//!   排在 fixpoint 最前；
+//! - 无独立 config 开关、无目标门控（AArch64 / RISC-V 都跑）；`-O0` 时
+//!   `from_config` 直接返回空管线，本 pass 不挂载；
+//! - fixpoint 循环（`run_passes`）最多迭代 `MAX_PIPELINE_ITERATIONS`（100）轮
+//!   直到整段无变化。
+//!
+//! ## 验证
+//!
+//! - 本文件 `#[cfg(test)] mod tests` 位于 `passes/ipsccp/tests.rs`（533 行）：
+//!   f32→i32 折叠边界、尾调用实参防误传播、常量形参替换、全局 cell 的
+//!   store/load 往返、零初始化全局 load、`MemZero`、调用写者失效、确定性写者
+//!   折叠、不同偏移隔离、写者分歧 merge 为 Bottom 等；
+//! - 端到端：`make test` 差分比对；静态指令数回归用 `scripts/perf_compare.sh`。
+//!
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ir::inst_kind::mem_zero::MemZeroLen;
 use crate::opt::{
     analysis_passes::{
+        dom_tree::v2::DominanceTree,
         effects::{EffectAnalysis, WriteRoot},
-        icfg::{Edge, EdgeType},
+        icfg::{Edge, EdgeType, ICFG},
         memory::{BaseEnv, MemObject},
     },
     prelude::*,
-    utils::visit_and_replace,
+    utils::{cfg::CFG, visit_and_replace},
 };
 
 pub struct IPSCCP;
@@ -140,8 +241,11 @@ impl CellKey {
 /// writers. Zero ranges model `MemZero` and zero-initialized globals.
 #[derive(Default)]
 struct MemState {
-    /// cell -> writer store instruction -> contribution lattice.
-    cells: FxHashMap<CellKey, FxHashMap<Inst, Lattice>>,
+    /// cell -> (writer 函数, writer store 指令) -> contribution lattice.
+    /// writer 必须带函数：`Inst` 的 id 是**每函数独立 arena** 分配的
+    /// （`ir/instruction.rs`，本地从 1 起），跨函数会撞 id——裸 `Inst`
+    /// 不足以定位一条 store。
+    cells: FxHashMap<CellKey, FxHashMap<(Function, Inst), Lattice>>,
     /// root -> merged zero byte intervals [from, to).
     zero: FxHashMap<RootKey, Vec<(i64, i64)>>,
     /// root -> cells currently tracked (for MemZero range removal).
@@ -159,17 +263,46 @@ struct MemState {
 }
 
 impl MemState {
-    /// Folded value of a cell: meet of the writer contributions.
-    fn cell_fold(&self, key: CellKey) -> Lattice {
-        match self.cells.get(&key) {
-            None => Lattice::Top,
-            Some(writers) => writers.values().fold(Lattice::Top, |acc, &v| acc.merge(v)),
+    /// Folded value of a cell **at load `load`'s program point**: the meet
+    /// of the writer contributions whose store may precede the load
+    /// (D∪R, see `docs/ipsccp_memory_order_fix.md` §4.1), plus the list of
+    /// those writers `(function, block)` for `init_reachable`. Writers that
+    /// execute *after* the load in program order (same-block later
+    /// position, or disjoint paths) are excluded — a load must never read
+    /// a value written later, which is exactly the bug class of case_0019
+    /// (洞 1/2/3 share this single root cause).
+    fn cell_fold(
+        &self,
+        key: CellKey,
+        load: Node,
+        ord: &OrderInfo,
+    ) -> (Lattice, Vec<(Function, BasicBlock)>) {
+        let mut folded = Lattice::Top;
+        let mut prior = Vec::new();
+        let Some(writers) = self.cells.get(&key) else {
+            return (folded, prior);
+        };
+        for (&(wfunc, writer), &v) in writers {
+            // Top contribution = 该 store 的源还没收敛（worklist 顺序上
+            // store 可能先于其 src 处理）。meet 忽略 Top 会让 load 只看到
+            // 部分 writer 的值——保守返回 Bottom，收敛后 store 重写会
+            // 触发 load 重读恢复正常折叠。
+            if v == Lattice::Top {
+                return (Lattice::Bottom, prior);
+            }
+            if ord.writer_relation(writer, wfunc, load) != 0 {
+                folded = folded.merge(v);
+                prior.push((wfunc, ord.block_of(wfunc, writer)));
+            }
         }
+        (folded, prior)
     }
 
-    /// The value a load of `key` reads: the cell if any store wrote it,
-    /// else a zero-range value if covered, else Bottom (unknown).
-    fn read(&self, key: CellKey) -> Lattice {
+    /// The value a load of `key` reads at its own program point: the cell
+    /// contribution of the writers that precede it, merged with the initial
+    /// zero when a store-free path to the load exists; else Bottom
+    /// (unknown). Roots invalidated by an unknown write never fold again.
+    fn read(&self, key: CellKey, load: Node, ord: &OrderInfo) -> Lattice {
         // A root invalidated by an unknown write (dynamic-index store,
         // may-write call) never folds again: the write may sit between
         // any store and any load of the root, and re-scheduled loads
@@ -178,28 +311,53 @@ impl MemState {
         if self.cleared_roots.contains(&key.root()) {
             return Lattice::Bottom;
         }
-        let cell = self.cell_fold(key);
-        if cell != Lattice::Top {
-            return cell;
-        }
+        let (mut folded, prior) = self.cell_fold(key, load, ord);
+        // Initial value: a zero-range covered cell answers 0 when a path
+        // from the entry avoids every store preceding the load — otherwise
+        // the load necessarily reads a stored value and folding 0 in would
+        // be unsound (洞 2: single writer on one branch must not fold).
+        //
+        // 只对 i32 load 折叠：`Lattice::Constant` 只承载 i32 常量，f32 load
+        // 折叠成 int 0 是类型错误——f32 加法/比较拿到整数寄存器操作数，
+        // 后端编码出 `fadd s16, s4, x6` 这类非法指令（fuzzer 差分抓到的
+        // case_0001，O2 汇编失败）。float load 保持运行时读取（保守）。
         let root = key.root();
-        let covered = self.zero.get(&root).is_some_and(|ranges| {
+        let zero_covered = self.zero.get(&root).is_some_and(|ranges| {
             ranges
                 .iter()
                 .any(|&(from, to)| key.offset() >= from && key.offset() < to)
         });
-        if covered {
-            Lattice::Constant(0)
+        let load_ty = ord.program.func_data(load.func).inst_data(load.inst).ty();
+        // 跨函数 writer（caller 写全局、callee 读）：writer_relation 给
+        // 不出确定序（callee 可能被其它调用点调用），writer 被过滤出
+        // `prior`——但初始 0 仍可能已被改写，zero-merge 折叠 0 会把
+        // getint() 等调用结果固化（fuzz: functional/70_dijkstra 的
+        // `n = getint(); ... Dijkstra() 读 gv_n` 被折叠成 0，整个算法
+        // 的循环全死）。有跨函数 writer 的 cell 禁止 zero-merge。
+        let has_cross_func_writer = self
+            .cells
+            .get(&key)
+            .is_some_and(|writers| writers.keys().any(|&(wf, _)| wf != load.func));
+        if zero_covered
+            && load_ty.is_i32()
+            && !has_cross_func_writer
+            && ord.init_reachable(load, &prior)
+        {
+            folded = folded.merge(Lattice::Constant(0));
+        }
+        let result = if folded != Lattice::Top {
+            folded
         } else {
             Lattice::Bottom
-        }
+        };
+        result
     }
 
-    /// Record a store `writer` of `value` into `key`. A Top source writes
-    /// an unknown value (Bottom contribution) but may recover when the
-    /// source refines and the writer is re-visited. Returns whether the
-    /// folded cell value changed.
-    fn write(&mut self, key: CellKey, writer: Inst, value: Lattice) -> bool {
+    /// Record a store `writer` (in function `func`) of `value` into `key`.
+    /// A Top source writes an unknown value (Bottom contribution) but may
+    /// recover when the source refines and the writer is re-visited. Returns
+    /// whether the folded cell value changed.
+    fn write(&mut self, key: CellKey, func: Function, writer: Inst, value: Lattice) -> bool {
         let contribution = if value == Lattice::Top {
             Lattice::Bottom
         } else {
@@ -212,7 +370,7 @@ impl MemState {
         if writers.is_empty() {
             self.root_cells.entry(root).or_default().push(key);
         }
-        writers.insert(writer, contribution);
+        writers.insert((func, writer), contribution);
         let after = writers.values().fold(Lattice::Top, |acc, &v| acc.merge(v));
         before != after
     }
@@ -268,6 +426,12 @@ impl MemState {
         ctx: &ArenaContext<'_>,
     ) -> Option<Vec<RootKey>> {
         match analysis.targets_of(ctx, func, addr) {
+            // 空对象集合 = 分析器无法确定目标（如动态索引 getelemptr(0, i)），
+            // 语义上是"可能写任何位置"——返回 None 让调用方全清该 root 族。
+            // 曾把 Some([]) 当"无目标"→ 动态 store 不失效任何 root → 静态
+            // load 零区间错误折叠 0（fuzzer baseline 抓到 case_0150：
+            // a1536[i1542]=-12+a1536[3] 的 [3] load 折叠 0，第二轮应 -24）。
+            Some(objects) if objects.is_empty() => None,
             Some(objects) => {
                 let mut roots = Vec::new();
                 for o in objects {
@@ -291,6 +455,322 @@ impl MemState {
             // Unresolvable address: conservatively everything modeled.
             Some(self.all_roots.iter().copied().collect())
         })
+    }
+}
+
+/// 静态程序位置信息：一次构建，供 `MemState::read` 判定"writer（store 指令）
+/// 相对 load 的程序顺序"。所有量只依赖指令位置与块结构（支配树、块可达闭包、
+/// 块内 layout 序），不依赖 lattice 值，因此可以在 worklist 之外构建一次复用。
+///
+/// 位置分类（见 `docs/ipsccp_memory_order_fix.md` §4.1）：
+/// - **D**（确定先于）：每条到 load 的执行路径都执行该 store——同函数
+///   store 块支配 load 块（同块则 store 指令先于 load）；跨函数 caller 内
+///   call 块支配 load 块（同块则 call 先于 load）且 callee 内 store 块
+///   支配 callee 全部 return 块（callee 每次被调用必执行该 store）。
+/// - **R**（可能先于）：部分路径执行该 store——同函数 store 块可达 load
+///   块但非支配；跨函数 callee 内 store 块可达某 return 块且 caller 内
+///   该 call 的 continuation 可达 load 块（同块则 continuation 先于 load）。
+///
+/// 其余 writer（store 在 load 之后执行、或与 load 路径不相交）对 load 不可
+/// 见：load 绝不允许读到程序序上更晚写入的值——这正是 case_0019 的缺陷类
+/// （洞 1/2/3 的同一个病根）。
+struct OrderInfo<'a> {
+    program: &'a Program,
+    icfg: &'a ICFG,
+    /// 每函数支配树（仅定义函数；声明函数无 CFG，不收录）。
+    dom_trees: FxHashMap<Function, DominanceTree>,
+    /// 每函数块级 CFG（可达块及其后继，终结符已解析）。
+    cfgs: FxHashMap<Function, CFG>,
+    /// 每函数块可达闭包：src 块 -> 可达块集合（含自身）。
+    reach: FxHashMap<Function, FxHashMap<BasicBlock, FxHashSet<BasicBlock>>>,
+    /// 每函数块内指令位置：inst -> layout 序 index。
+    inst_pos: FxHashMap<Function, FxHashMap<Inst, usize>>,
+    /// 每函数 return 块集合（终结符为 Return 的块）。
+    return_blocks: FxHashMap<Function, FxHashSet<BasicBlock>>,
+    /// 每函数 entry 块。
+    entry_blocks: FxHashMap<Function, BasicBlock>,
+}
+
+impl<'a> OrderInfo<'a> {
+    fn new(program: &'a Program, icfg: &'a ICFG) -> Self {
+        let mut dom_trees = FxHashMap::default();
+        let mut cfgs = FxHashMap::default();
+        let mut reach = FxHashMap::default();
+        let mut inst_pos = FxHashMap::default();
+        let mut return_blocks: FxHashMap<Function, FxHashSet<BasicBlock>> = FxHashMap::default();
+        let mut entry_blocks = FxHashMap::default();
+        for &func in program.function_layout() {
+            let data = program.func_data(func);
+            if data.layout().is_decl() {
+                continue;
+            }
+            let mut pos_map = FxHashMap::default();
+            for bb_layout in data.layout().basicblocks() {
+                let bb = bb_layout.bb();
+                let terminator = *bb_layout.insts().get_last().unwrap();
+                for (idx, &inst) in bb_layout.insts().iter().enumerate() {
+                    pos_map.insert(inst, idx);
+                }
+                if matches!(data.inst_data(terminator).kind(), InstKind::Return(..)) {
+                    return_blocks.entry(func).or_default().insert(bb);
+                }
+            }
+            inst_pos.insert(func, pos_map);
+            entry_blocks.insert(func, data.layout().entry_bb().unwrap().bb());
+            let Some(cfg) = CFG::new(data) else {
+                continue;
+            };
+            // 块可达闭包：逐块 BFS（函数块数小，BFS 足够）。
+            let mut fn_reach: FxHashMap<BasicBlock, FxHashSet<BasicBlock>> = FxHashMap::default();
+            for &src in cfg.blocks() {
+                let mut visited = FxHashSet::default();
+                let mut stack = vec![src];
+                while let Some(bb) = stack.pop() {
+                    if !visited.insert(bb) {
+                        continue;
+                    }
+                    for &succ in cfg.successors_of(bb) {
+                        stack.push(succ);
+                    }
+                }
+                fn_reach.insert(src, visited);
+            }
+            reach.insert(func, fn_reach);
+            dom_trees.insert(func, DominanceTree::from_cfg(&cfg));
+            cfgs.insert(func, cfg);
+        }
+        Self {
+            program,
+            icfg,
+            dom_trees,
+            cfgs,
+            reach,
+            inst_pos,
+            return_blocks,
+            entry_blocks,
+        }
+    }
+
+    fn block_of(&self, func: Function, inst: Inst) -> BasicBlock {
+        self.program
+            .func_data(func)
+            .layout()
+            .parent_bb(inst)
+            .unwrap()
+    }
+
+    /// writer S 相对 load L 的程序顺序：
+    /// `2` = 确定先于（D）；`1` = 可能先于（R）；`0` = 不可见（S 在 L 之后
+    /// 执行，或与 L 的路径不相交）。
+    fn writer_relation(&self, writer: Inst, writer_func: Function, load: Node) -> u8 {
+        let load_bb = self.block_of(load.func, load.inst);
+        let store_bb = self.block_of(writer_func, writer);
+        if writer_func == load.func {
+            self.same_func_relation(writer, store_bb, load, load_bb)
+        } else {
+            self.cross_func_relation(writer_func, store_bb, load, load_bb)
+        }
+    }
+
+    fn same_func_relation(
+        &self,
+        writer: Inst,
+        store_bb: BasicBlock,
+        load: Node,
+        load_bb: BasicBlock,
+    ) -> u8 {
+        if store_bb == load_bb {
+            // 同块：只有 layout 序上 store 先于 load 才算确定先于；
+            // store 在 load 之后（case_0019 形态）对 load 不可见。
+            let sp = self.inst_pos[&load.func][&writer];
+            let lp = self.inst_pos[&load.func][&load.inst];
+            if sp < lp {
+                return 2;
+            }
+            // store 在 load 之后但块在循环内（自环边或后继可达回本块）：
+            // 回边使 store 在后续迭代先于 load 执行——循环携带 cell 的
+            // 值不是初始值，折叠初始 0 会固化首轮值（fuzz: case_0030
+            // `a309[1] = 1 - a309[1]` 跨外层轮次 0/1 交替）。按
+            // maybe-prior 处理，配合 Top 防御使这类 load 不折叠。
+            let in_loop = self.cfgs.get(&load.func).is_some_and(|cfg| {
+                let succs = cfg.successors_of(store_bb);
+                succs.contains(&store_bb)
+                    || succs
+                        .iter()
+                        .any(|&s| s != store_bb && self.reach[&load.func][&s].contains(&store_bb))
+            });
+            if in_loop {
+                return 1;
+            }
+            return 0;
+        }
+        let Some(tree) = self.dom_trees.get(&load.func) else {
+            return 0;
+        };
+        // CFG/支配树只含可达块：不可达块上的 store 永不执行，不参与。
+        if !tree.contains(store_bb) || !tree.contains(load_bb) {
+            return 0;
+        }
+        if tree.dominates(store_bb, load_bb) {
+            return 2;
+        }
+        if self.reach[&load.func][&store_bb].contains(&load_bb) {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn cross_func_relation(
+        &self,
+        callee: Function,
+        store_bb: BasicBlock,
+        load: Node,
+        load_bb: BasicBlock,
+    ) -> u8 {
+        let Some(callee_tree) = self.dom_trees.get(&callee) else {
+            return 0;
+        };
+        if !callee_tree.contains(store_bb) {
+            return 0;
+        }
+        let Some(caller_tree) = self.dom_trees.get(&load.func) else {
+            return 0;
+        };
+        if !caller_tree.contains(load_bb) {
+            return 0;
+        }
+        // S 支配 callee 全部 return 块：callee 每次被调用必执行 S。
+        let store_dominates_all_returns = self
+            .return_blocks
+            .get(&callee)
+            .is_some_and(|rbs| rbs.iter().all(|&rb| callee_tree.dominates(store_bb, rb)));
+        // S 可达 callee 某 return 块：部分调用路径执行 S。
+        let store_reaches_return = self.return_blocks.get(&callee).is_some_and(|rbs| {
+            rbs.iter()
+                .any(|&rb| self.reach[&callee][&store_bb].contains(&rb))
+        });
+        let mut dominates = false;
+        let mut reaches = false;
+        // `call_sites_of` 按 **caller** 索引：遍历 load 所在函数的所有调用点，
+        // 筛出调用 `callee` 的。
+        for cs in self.icfg.call_sites_of(load.func) {
+            if cs.callee != callee {
+                continue;
+            }
+            let call_bb = self.block_of(load.func, cs.call);
+            if !caller_tree.contains(call_bb) {
+                continue;
+            }
+            // caller 侧"必经"：call 块支配 load 块（同块则 call 指令先于 load）。
+            let call_before_load = if call_bb == load_bb {
+                self.inst_pos[&load.func][&cs.call] < self.inst_pos[&load.func][&load.inst]
+            } else {
+                caller_tree.dominates(call_bb, load_bb)
+            };
+            if call_before_load && store_dominates_all_returns {
+                dominates = true;
+            }
+            // caller 侧"可达"：call 的 continuation 可达 load 块（同块则
+            // continuation 先于 load）。
+            if store_reaches_return {
+                let cont_bb = self.block_of(load.func, cs.continuation);
+                let cont_reaches_load = if cont_bb == load_bb {
+                    self.inst_pos[&load.func][&cs.continuation]
+                        < self.inst_pos[&load.func][&load.inst]
+                } else {
+                    self.reach[&load.func][&cont_bb].contains(&load_bb)
+                };
+                if cont_reaches_load {
+                    reaches = true;
+                }
+            }
+        }
+        if dominates {
+            2
+        } else if reaches {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// 是否存在从程序入口到 load、避开全部 `prior` writer 块的真实路径：
+    /// 有则初始值（零区间）可能被读到；无则必经某个先于 load 的 store，
+    /// 初始值不可达。同函数 writer 避开其所在块；跨函数 writer 拦截
+    /// "必经 callee store"的 call 块（callee 内 entry→return 全路径都经过
+    /// store 块时，调用该 callee 必然执行 store）。
+    fn init_reachable(&self, load: Node, prior: &[(Function, BasicBlock)]) -> bool {
+        let func = load.func;
+        let load_bb = self.block_of(func, load.inst);
+        let mut same_writer_blocks = FxHashSet::default();
+        let mut cross_writers: FxHashMap<Function, FxHashSet<BasicBlock>> = FxHashMap::default();
+        for &(f, bb) in prior {
+            if f == func {
+                same_writer_blocks.insert(bb);
+            } else {
+                cross_writers.entry(f).or_default().insert(bb);
+            }
+        }
+        // 跨函数 writer：callee 内不存在避开其全部 store 块的 entry→return
+        // 路径时，该 callee 的调用点视作路径拦截点。
+        let mut blocked_calls = FxHashSet::default();
+        for (callee, store_bbs) in &cross_writers {
+            if self.callee_avoids(*callee, store_bbs) {
+                continue;
+            }
+            // `call_sites_of` 按 caller 索引：筛出本函数内调用 `callee` 的。
+            for cs in self.icfg.call_sites_of(func) {
+                if cs.callee == *callee {
+                    blocked_calls.insert(self.block_of(func, cs.call));
+                }
+            }
+        }
+        let entry = self.entry_blocks[&func];
+        let mut stack = vec![entry];
+        let mut visited = FxHashSet::default();
+        while let Some(bb) = stack.pop() {
+            if same_writer_blocks.contains(&bb) || blocked_calls.contains(&bb) {
+                continue;
+            }
+            if bb == load_bb {
+                return true;
+            }
+            for &succ in self.cfgs[&func].successors_of(bb) {
+                if visited.insert(succ) {
+                    stack.push(succ);
+                }
+            }
+        }
+        false
+    }
+
+    /// callee 内是否存在避开 `avoid` 全部块的 entry → 任一 return 块路径。
+    fn callee_avoids(&self, callee: Function, avoid: &FxHashSet<BasicBlock>) -> bool {
+        let Some(cfg) = self.cfgs.get(&callee) else {
+            return false;
+        };
+        let entry = self.entry_blocks[&callee];
+        let mut stack = vec![entry];
+        let mut visited = FxHashSet::default();
+        while let Some(bb) = stack.pop() {
+            if avoid.contains(&bb) {
+                continue;
+            }
+            if self
+                .return_blocks
+                .get(&callee)
+                .is_some_and(|rbs| rbs.contains(&bb))
+            {
+                return true;
+            }
+            for &succ in cfg.successors_of(bb) {
+                if visited.insert(succ) {
+                    stack.push(succ);
+                }
+            }
+        }
+        false
     }
 }
 
@@ -366,6 +846,47 @@ fn resolve_cell(
     }
 }
 
+/// Does `inst`'s operand chain (transitively through pure operands) read
+/// the same cell `key`? A store whose source reads the very cell it writes
+/// is loop-carried: its value is the loop's fixed point, not a compile-time
+/// constant. Folding it would pin the first iteration's value for every
+/// iteration (fuzz: case_0030, `a309[1] = 1 - a309[1]` alternating 0/1
+/// across the outer loop; case_0150's `a1536[3] = -12 + a1536[3]`).
+/// Self-referential writers contribute Bottom.
+fn src_reads_cell(
+    program: &Program,
+    env: &BaseEnv,
+    func: Function,
+    inst: Inst,
+    key: CellKey,
+    visited: &mut FxHashSet<Inst>,
+) -> bool {
+    if !visited.insert(inst) {
+        return false;
+    }
+    let data = program.func_data(func);
+    match data.inst_data(inst).kind() {
+        InstKind::Load(load) => {
+            let ctx = ArenaContext {
+                program,
+                curr_func: Some(func),
+            };
+            resolve_cell(env, &ctx, func, load.src()).is_some_and(|(k, _)| k == key)
+        }
+        InstKind::Binary(binary) => {
+            src_reads_cell(program, env, func, binary.lhs(), key, visited)
+                || src_reads_cell(program, env, func, binary.rhs(), key, visited)
+        }
+        InstKind::Select(select) => {
+            src_reads_cell(program, env, func, select.cond(), key, visited)
+                || src_reads_cell(program, env, func, select.if_true(), key, visited)
+                || src_reads_cell(program, env, func, select.if_false(), key, visited)
+        }
+        InstKind::Cast(cast) => src_reads_cell(program, env, func, cast.src(), key, visited),
+        _ => false,
+    }
+}
+
 impl Pass for IPSCCP {
     fn run(&mut self, program: &mut Program) -> bool {
         // Stage 0: Variables initialization.
@@ -425,6 +946,9 @@ impl Pass for IPSCCP {
         // Stage 0.2
         // Build ICFG. Ready to start the worklist algorithm.
         let icfg = icfg::ICFG::new(program);
+        // 静态位置信息（支配树/块可达闭包/块内序/inst 属主）——worklist 阶段
+        // 的 MemState::read 用它过滤"程序序上先于 load"的 writer。
+        let ord = OrderInfo::new(program, &icfg);
         let main_func = program.get_main_function();
         let entry_bb_layout = program.func_data(main_func).layout().entry_bb().unwrap();
         let first_inst = *entry_bb_layout.insts().get_first().unwrap();
@@ -527,7 +1051,8 @@ impl Pass for IPSCCP {
                         };
                         match resolve_cell(env, &ctx, func, load.src()) {
                             Some((key, root)) => {
-                                let value = state.read(key);
+                                // 位置感知读：只折叠程序序上先于本 load 的 writer。
+                                let value = state.read(key, node, &ord);
                                 // Overwrite: the load mirrors the current
                                 // memory snapshot, not a meet of historical
                                 // snapshots.
@@ -587,7 +1112,14 @@ impl Pass for IPSCCP {
                     | InstKind::VectorExtractElement(..)
                     | InstKind::VectorInsertElement(..)
                     | InstKind::VectorReduce(..) => {
-                        merge_and_extend(node, Lattice::Top, &mut lattice_map);
+                        // These vector ops cannot be constant-folded, but
+                        // their results are *definitely* not constants.
+                        // Marking them Top (undef) lets the optimistic SCCP
+                        // merge fold a loop block-param to the entry edge's
+                        // constant (e.g. `sum` -> 0 for `sum += c[i][j]`
+                        // nested loops), silently zeroing the accumulator.
+                        // Bottom (overdefined) is the correct lattice value.
+                        merge_and_extend(node, Lattice::Bottom, &mut lattice_map);
                     }
                     InstKind::Jump(jump) => {
                         let params = data.bb_data(jump.target()).params();
@@ -650,16 +1182,38 @@ impl Pass for IPSCCP {
                         let value = lattice_map.get(Node::new(func, store.src()));
                         match resolve_cell(env, &ctx, func, store.dest()) {
                             Some((key, root)) => {
-                                if state.write(key, inst, value) {
+                                // A store whose source reads the same cell is
+                                // loop-carried (fixed point), never a constant:
+                                // fold its contribution as unknown so loads do
+                                // not pin the first iteration's value across
+                                // outer iterations (fuzz: case_0030).
+                                let mut visited = FxHashSet::default();
+                                let value = if src_reads_cell(
+                                    program,
+                                    env,
+                                    func,
+                                    store.src(),
+                                    key,
+                                    &mut visited,
+                                ) {
+                                    Lattice::Bottom
+                                } else {
+                                    value
+                                };
+                                if state.write(key, func, inst, value) {
                                     if let Some(loaders) = state.root_loaders.get(&root) {
                                         mem_reschedule.extend(loaders.iter().copied());
                                     }
                                 }
                             }
                             None => {
-                                let roots =
-                                    state.possible_targets(&analysis, func, store.dest(), &ctx);
-                                for root in roots.unwrap_or_default() {
+                                let roots = state
+                                    .possible_targets(&analysis, func, store.dest(), &ctx)
+                                    // None = "可能写任何 root"：全清（保守）。
+                                    // 曾用 unwrap_or_default 把 None 当空，
+                                    // 与空集合问题同源（case_0150）。
+                                    .unwrap_or_else(|| state.all_roots.iter().copied().collect());
+                                for root in roots {
                                     if state.clear(root, true) {
                                         if let Some(loaders) = state.root_loaders.get(&root) {
                                             mem_reschedule.extend(loaders.iter().copied());
@@ -996,6 +1550,7 @@ fn mathematic_operation(op: BinaryOp, lhs: i32, rhs: i32) -> i32 {
         BinaryOp::Sar => lhs.wrapping_shr(rhs as u32),
         BinaryOp::Min => lhs.min(rhs),
         BinaryOp::Max => lhs.max(rhs),
+        BinaryOp::MatMul => unreachable!("tensor type should not reach here."),
     }
 }
 

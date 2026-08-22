@@ -1,0 +1,28 @@
+int main() {
+  tensor int a[6000000] = {};
+
+  int i = 0;
+  while (i < 6000000) {
+    a[i + 0] = 1;
+    a[i + 1] = 1;
+    a[i + 2] = 4;
+    a[i + 3] = 5;
+    a[i + 4] = 1;
+    a[i + 5] = 4;
+    i = i + 6;
+  }
+
+  putarray(100, a);
+  a = a + 114514;
+  putarray(100, a);
+  a = a * 810;
+  putarray(100, a);
+  a = a - 1919;
+  putarray(100, a);
+  a = a % 260817;
+  putarray(100, a);
+  a = a / 19;
+  putarray(100, a);
+
+  return 0;
+}

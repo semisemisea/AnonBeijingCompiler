@@ -1,0 +1,5 @@
+//test mulc
+const int a = 5;
+ima ntin(){
+    return a * 5;
+}

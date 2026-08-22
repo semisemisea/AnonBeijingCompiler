@@ -3,8 +3,8 @@
 use rustc_hash::FxHashSet;
 
 use raana_ir::ir::{
-    Binary, BinaryOp, Call, Cast, Fma, GetElemPtr, InstKind, Load, Return, Select, Store, TailCall,
-    Type as HirType, TypeKind, VectorExtractElement, VectorInsertElement, VectorReduce,
+    Binary, BinaryOp, Call, Cast, Fma, GetElemPtr, InstKind, Integer, Load, Return, Select, Store,
+    TailCall, Type as HirType, TypeKind, VectorExtractElement, VectorInsertElement, VectorReduce,
     VectorReduceOp, VectorSplat,
     arena::Arena,
     inst_kind::{MemZero, MemZeroLen},
@@ -14,7 +14,7 @@ use taki_mir::{
     block_order::{LoweredBlock, MirBlockIndex},
     div_magic::{MagicCorrection, signed_magic_i32},
     lower::{
-        LowerBackend, LowerContext, LoweredOutput, analyze_gep, fold_gep_constant_offset,
+        LowerBackend, LowerContext, LoweredOutput, analyze_gep, fold_gep_constant_offset_shared,
         sink_gep_into_address,
     },
     prelude::{ArenaContext, HirFunction, HirFunctionData, HirInst},
@@ -28,7 +28,7 @@ use crate::{
     instructions::{
         AMode, AluOp, CCmpStep, Cond, ExtendOp, FpuOp, Imm12, ImmLogic, ImmShift, MInst,
         MemoryType, SelectCmp, SelectValue, ShiftOp, VecArithOp, VecBitOp, VecCmpOp, VecCvtOp,
-        VecMinMaxOp, VecShape, invert_cond,
+        VecMlaOp, VecMinMaxOp, VecShape, VecShiftOp, invert_cond,
     },
     labels::Label,
     regs::{self, OperandSize, RegOrZr},
@@ -168,6 +168,10 @@ impl LowerBackend for AArch64Backend {
 
     fn zero_directive() -> &'static str {
         ".zero"
+    }
+
+    fn balign_directive() -> &'static str {
+        ".balign 16"
     }
 
     fn preg_name(preg: PReg) -> &'static str {
